@@ -52,6 +52,10 @@ from .learning import (
     record_event_in_connection,
     record_events,
 )
+from .associations import run_association_provider
+from .association_sources.openlibrary import OpenLibraryListProvider
+from .association_sources.librarything import LibraryThingProvider
+from .association_sources.google_books import GoogleBooksAssociatedProvider
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
@@ -193,6 +197,40 @@ async def handle_job(kind: str):
         except ValueError as exc:
             raise ValueError("Invalid shadow policy job") from exc
         return await run_shadow_policy(policy_id)
+    if kind.startswith("association:"):
+        provider_name = kind.partition(":")[2]
+        provider_settings = safe_association_settings()
+        reads = rows("SELECT * FROM reads ORDER BY id")
+        if provider_name == "openlibrary":
+            if not provider_settings["openlibrary_enabled"]:
+                return {"skipped": "disabled", "provider": provider_name}
+            provider = OpenLibraryListProvider()
+            result = await run_association_provider(provider, reads)
+        elif provider_name == "librarything":
+            if not provider_settings["librarything_enabled"]:
+                return {"skipped": "disabled", "provider": provider_name}
+            api_key = config.get("association_librarything_api_key", "")
+            if not api_key:
+                raise ValueError("LibraryThing API key is not configured")
+            provider = LibraryThingProvider(api_key)
+            result = await run_association_provider(provider, reads)
+        elif provider_name == "google_books":
+            # Google results remain process-memory-only. The job records a
+            # provider run and counts edges but never stores Google content.
+            provider = GoogleBooksAssociatedProvider(
+                config.get("association_google_books_api_key", "")
+            )
+            result = await run_association_provider(provider, reads, persist=False)
+        else:
+            raise ValueError("Unknown association provider")
+        return {
+            "run_id": result.id,
+            "provider": result.provider,
+            "status": result.status,
+            "seeds": result.seeds,
+            "edges": result.edges,
+            "persisted": result.persisted,
+        }
     if kind == "rebuild_embeddings":
         # Embedding vectors are model-specific. Rebuild the selected provider's
         # set first, then remove incompatible vectors only after success so an
@@ -417,6 +455,15 @@ class EngineSettings(BaseModel):
         if self.librarr_url:
             allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
             validate_service_url(self.librarr_url, allowed)
+
+
+class AssociationSettingsIn(BaseModel):
+    openlibrary_enabled: bool = False
+    openlibrary_contact: str = Field(default="", max_length=200)
+    librarything_enabled: bool = False
+    librarything_api_key: str | None = Field(default=None, max_length=500)
+    google_books_api_key: str | None = Field(default=None, max_length=500)
+
 
 def api_token_list():
     """Return token metadata without ever returning a token value."""
@@ -871,10 +918,134 @@ def job(job_id:str):
     if not found: raise HTTPException(404,"Job not found")
     return found
 
+
+@app.get("/api/associations/settings")
+def association_settings():
+    return safe_association_settings()
+
+
+@app.put("/api/associations/settings")
+def update_association_settings(payload: AssociationSettingsIn):
+    current = private_settings()
+    values = {
+        "association_openlibrary_enabled": "1" if payload.openlibrary_enabled else "0",
+        "association_openlibrary_contact": payload.openlibrary_contact.strip(),
+        "association_librarything_enabled": "1" if payload.librarything_enabled else "0",
+        "association_librarything_api_key": (
+            current.get("association_librarything_api_key", "")
+            if payload.librarything_api_key is None
+            else payload.librarything_api_key.strip()
+        ),
+        "association_google_books_api_key": (
+            current.get("association_google_books_api_key", "")
+            if payload.google_books_api_key is None
+            else payload.google_books_api_key.strip()
+        ),
+    }
+    if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
+        raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    with transaction() as con:
+        for key, value in values.items():
+            secret = key.endswith("api_key")
+            stored = seal(value) if secret and value else value
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
+                (key, stored, 1 if secret else 0),
+            )
+    return {"saved": True, "associations": safe_association_settings()}
+
+
+def _association_provider_name(value: str) -> str:
+    provider = value.strip().casefold()
+    aliases = {
+        "openlibrary": "openlibrary",
+        "openlibrary_lists": "openlibrary",
+        "librarything": "librarything",
+        "librarything_multirecommendations": "librarything",
+        "google": "google_books",
+        "google_books": "google_books",
+        "google_books_associated": "google_books",
+    }
+    normalized = aliases.get(provider)
+    if not normalized:
+        raise HTTPException(404, "Unknown association provider")
+    return normalized
+
+
+@app.post("/api/associations/{provider}/run")
+def run_associations(provider: str):
+    normalized = _association_provider_name(provider)
+    configured = safe_association_settings()
+    if normalized == "librarything":
+        if not configured["librarything_enabled"]:
+            raise HTTPException(409, "Enable LibraryThing associations first")
+        if not configured["librarything_api_key_set"]:
+            raise HTTPException(409, "Configure a LibraryThing API key first")
+    if normalized == "openlibrary" and not configured["openlibrary_enabled"]:
+        raise HTTPException(409, "Enable Open Library associations first")
+    return {"job_id": enqueue_job(f"association:{normalized}")}
+
+
+@app.post("/api/associations/google_books/preview")
+async def preview_google_book_associations():
+    """Return ephemeral Google associations without writing provider content."""
+
+    config = private_settings()
+    provider = GoogleBooksAssociatedProvider(config.get("association_google_books_api_key", ""))
+    try:
+        associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+    return {
+        "provider": provider.provider,
+        "count": len(associations),
+        "results": [
+            {
+                "title": item.title,
+                "author": item.author,
+                "rank": item.rank,
+                "source_url": item.source_url,
+                "metadata": dict(item.metadata),
+            }
+            for item in associations
+        ],
+        "persistent": False,
+    }
+
+
+@app.get("/api/associations/runs")
+def association_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return {
+        "runs": rows(
+            "SELECT id,provider,status,seed_count,edge_count,error,started_at,finished_at "
+            "FROM association_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        ),
+        "librarything_requests_today": rows(
+            "SELECT COUNT(*) AS count FROM association_requests "
+            "WHERE provider=? AND requested_at>=date('now')",
+            ("librarything_multirecommendations",),
+        )[0]["count"],
+    }
+
 def private_settings():
     return {
         item["key"]: unseal(item["value"]) if item["secret"] else item["value"]
         for item in rows("SELECT key,value,secret FROM settings")
+    }
+
+
+def safe_association_settings():
+    private = private_settings()
+    return {
+        "openlibrary_enabled": private.get("association_openlibrary_enabled", "0") == "1",
+        "openlibrary_contact": private.get(
+            "association_openlibrary_contact", settings.openlibrary_contact
+        ),
+        "librarything_enabled": private.get("association_librarything_enabled", "0") == "1",
+        "librarything_api_key_set": bool(private.get("association_librarything_api_key")),
+        "google_books_api_key_set": bool(private.get("association_google_books_api_key")),
     }
 
 
@@ -897,6 +1068,7 @@ def safe_settings(*, include_api_tokens: bool = True):
         "digest": digest,
         "llm_connections": safe_connections(),
         "llm_policies": safe_policies(),
+        "associations": safe_association_settings(),
     }
     if include_api_tokens:
         result["api_tokens"] = api_token_list()
@@ -1360,6 +1532,26 @@ async def api_sync():
 @api_v1.post("/score")
 async def api_score():
     return await score()
+
+
+@api_v1.get("/associations/settings")
+def api_association_settings():
+    return association_settings()
+
+
+@api_v1.get("/associations/runs")
+def api_association_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return association_runs(limit=limit)
+
+
+@api_v1.post("/associations/{provider}/run")
+def api_run_associations(provider: str):
+    return run_associations(provider)
+
+
+@api_v1.post("/associations/google_books/preview")
+async def api_preview_google_book_associations():
+    return await preview_google_book_associations()
 
 
 @api_v1.get("/jobs/{job_id}")

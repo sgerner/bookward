@@ -364,14 +364,16 @@ def persist_associations(
 async def run_association_provider(
     provider: AssociationProvider,
     reads: Sequence[Mapping[str, Any]],
+    *,
+    persist: bool = True,
 ) -> AssociationRunResult:
-    """Run, persist, and audit a provider without touching recommendation scores."""
+    """Run, optionally persist, and audit a provider without scoring results."""
 
     seeds = select_seed_reads(reads)
     run_id = begin_association_run(provider.provider, seed_count=len(seeds))
     try:
         associations = await provider.collect(seeds)
-        persisted = persist_associations(associations, run_id=run_id)
+        persisted = persist_associations(associations, run_id=run_id) if persist else 0
     except Exception as exc:
         finish_association_run(run_id, status="failed", error=str(exc))
         raise
