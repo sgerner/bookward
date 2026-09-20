@@ -2,8 +2,10 @@ import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { engine, EngineError } from "$lib/server/engine";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 
 type Overview = {
+  recommendation_run_id?: string;
   recommendations: Array<{
     id: number;
     title: string;
@@ -89,10 +91,25 @@ type DigestSettings = {
   } | null;
 };
 
-export const load: PageServerLoad = async ({ url }) => {
+const SESSION_COOKIE = "bookward_session";
+
+export const load: PageServerLoad = async ({ url, cookies }) => {
+  const existingSession = cookies?.get(SESSION_COOKIE);
+  const sessionId = existingSession || randomUUID();
+  if (cookies && !existingSession) {
+    cookies.set(SESSION_COOKIE, sessionId, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "lax",
+      secure: url.protocol === "https:",
+      maxAge: 60 * 60 * 24 * 365,
+    });
+  }
   let overview: Overview;
   try {
-    overview = await engine<Overview>("/api/overview");
+    overview = await engine<Overview>("/api/overview", {
+      headers: { "x-bookward-session": sessionId },
+    });
   } catch (cause) {
     throw httpError(503, {
       message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
@@ -118,6 +135,7 @@ export const load: PageServerLoad = async ({ url }) => {
     }
   }
   return {
+    recommendation_run_id: overview.recommendation_run_id ?? "",
     books: overview.recommendations.map((book) => ({
       ...book,
       cover_url: publicUrl(book.cover_url),
@@ -205,6 +223,13 @@ export const actions: Actions = {
   decide: async ({ request }) => {
     const data = await request.formData();
     const id = idSchema.safeParse(data.get("id"));
+    const runId = z
+      .string()
+      .trim()
+      .max(128)
+      .or(z.literal(""))
+      .catch("")
+      .parse(data.get("run_id"));
     const status = z
       .enum(["saved", "rejected", "recommended"])
       .safeParse(data.get("status"));
@@ -218,7 +243,7 @@ export const actions: Actions = {
     try {
       await engine(`/api/recommendations/${id.data}/feedback`, {
         method: "POST",
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, ...(runId ? { run_id: runId } : {}) }),
       });
       return {
         message:
@@ -650,7 +675,15 @@ export const actions: Actions = {
     }
   },
   shortlistBulk: async ({ request }) => {
-    const ids = (await request.formData())
+    const formData = await request.formData();
+    const runId = z
+      .string()
+      .trim()
+      .max(128)
+      .or(z.literal(""))
+      .catch("")
+      .parse(formData.get("run_id"));
+    const ids = formData
       .getAll("ids")
       .map((value) => idSchema.safeParse(value))
       .filter((result): result is { success: true; data: number } => result.success)
@@ -662,7 +695,11 @@ export const actions: Actions = {
         "/api/recommendations/bulk-feedback",
         {
           method: "POST",
-          body: JSON.stringify({ ids: uniqueIds, action: "save" }),
+          body: JSON.stringify({
+            ids: uniqueIds,
+            action: "save",
+            ...(runId ? { run_id: runId } : {}),
+          }),
         },
       );
       return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
