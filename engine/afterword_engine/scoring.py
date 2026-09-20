@@ -1,7 +1,8 @@
 import json
 import math
 from .database import rows, row, transaction
-from .embeddings import get_embedder, cosine, content_hash, vector_blob, blob_vector
+from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
+from .ranking import rank_candidates
 
 def document(item):
     genres = item.get("genres", "[]")
@@ -35,29 +36,16 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
     return vectors
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
-    reads = rows("SELECT * FROM reads WHERE rating IS NOT NULL")
+    reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
     candidates = rows("SELECT c.*, s.name source_name, s.weight source_weight FROM candidates c JOIN sources s ON s.id=c.source_id WHERE c.status IN ('new','recommended') AND s.enabled=1 AND book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads)")
     if not candidates: return 0
-    positives = [r for r in reads if (r.get("rating") or 0) >= 4]
-    negatives = [r for r in reads if 0 < (r.get("rating") or 0) <= 2]
     embedder = embedder or get_embedder(backend, model, url, api_key)
-    pos_vectors = await cached_vectors(embedder,"read",positives)
-    neg_vectors = await cached_vectors(embedder,"read",negatives)
+    read_vectors = await cached_vectors(embedder,"read",reads)
     candidate_vectors = await cached_vectors(embedder,"candidate",candidates)
+    ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
     with transaction() as con:
-        for candidate, vector in zip(candidates, candidate_vectors):
-            best_positive = max((cosine(vector, other) for other in pos_vectors), default=.25)
-            best_negative = max((cosine(vector, other) for other in neg_vectors), default=0)
-            author_match = any(r["author"].casefold() == candidate["author"].casefold() for r in positives)
-            source_weight = float(candidate.get("source_weight") or 1)
-            score = max(0, min(100, 42 + best_positive * 48 - best_negative * 24 + (7 if author_match else 0) + (source_weight - 1) * 5))
-            explanation = []
-            if author_match: explanation.append("An author you have rated highly")
-            if best_positive > .45: explanation.append("Strong thematic similarity to books you loved")
-            elif best_positive > .25: explanation.append("Moderate similarity to your positive reading history")
-            if best_negative > .5: explanation.append("Reduced for similarity to books you disliked")
-            if candidate.get("source_name"): explanation.append(f"From {candidate['source_name']}")
-            con.execute("UPDATE candidates SET score=?, explanation=?, status=CASE WHEN status='new' THEN 'recommended' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (round(score, 1), json.dumps(explanation), candidate["id"]))
+        for candidate in ranked:
+            con.execute("UPDATE candidates SET score=?, explanation=?, status=CASE WHEN status='new' THEN 'recommended' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate["score"], json.dumps(candidate["explanation"]), candidate["id"]))
     return len(candidates)
 
 
