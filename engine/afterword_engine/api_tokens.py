@@ -40,8 +40,9 @@ def legacy_hash_api_token(token: str) -> str:
     releases; successful authentication upgrades the row to PBKDF2 below.
     """
 
-    # codeql[py/weak-sensitive-data-hashing]
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        token.encode("utf-8")  # lgtm[py/weak-sensitive-data-hashing]
+    ).hexdigest()
 
 
 def token_prefix(token: str) -> str:
