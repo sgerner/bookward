@@ -8,6 +8,7 @@
 		THEMES,
 		applyTheme,
 		getStoredPreferences,
+		loadTheme,
 		persistPreferences,
 		type SkeletonThemeName,
 		type ThemeMode,
@@ -24,7 +25,12 @@
 	let appearanceOpen = $state(false);
 	let pickerRoot = $state<HTMLDivElement | null>(null);
 
-	function chooseTheme(nextTheme: SkeletonThemeName) {
+	async function chooseTheme(nextTheme: SkeletonThemeName) {
+		try {
+			await loadTheme(nextTheme);
+		} catch {
+			return;
+		}
 		theme = nextTheme;
 		persistPreferences(theme, mode);
 		applyTheme(theme, mode);
@@ -46,13 +52,18 @@
 	}
 
 	onMount(() => {
-		const sync = () => {
+		const sync = async () => {
 			const stored = getStoredPreferences();
+			try {
+				await loadTheme(stored.theme);
+			} catch {
+				return;
+			}
 			theme = stored.theme;
 			mode = stored.mode;
 			applyTheme(theme, mode);
 		};
-		sync();
+		void sync();
 		window.addEventListener('storage', sync);
 		const onKeydown = (event: KeyboardEvent) => {
 			if (event.key === 'Escape' && appearanceOpen) closeAppearance();
