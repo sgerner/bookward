@@ -1,7 +1,13 @@
 import json
 import math
+
+import numpy as np
+
 from .database import rows, transaction
-from .embeddings import get_embedder, cosine, content_hash, vector_blob, blob_vector
+from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
+
+
+SCORING_BATCH_SIZE = 256
 
 def document(item):
     genres = item.get("genres", "[]")
@@ -52,6 +58,34 @@ async def cached_vectors(embedder, entity_type, items):
                 con.execute("INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",(entity_type,item["id"],embedder.name,embedder.model,vector_blob(vector),len(vector),digest))
     return vectors
 
+
+def _normalized_vectors(vectors):
+    if not vectors:
+        return np.empty((0, 0), dtype=np.float32)
+
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms != 0)
+
+
+def _max_cosine_similarities(vectors, references, default):
+    if not vectors:
+        return np.empty(0, dtype=np.float32)
+    if not references:
+        return np.full(len(vectors), default, dtype=np.float32)
+
+    normalized_vectors = _normalized_vectors(vectors)
+    normalized_references = _normalized_vectors(references)
+    best = np.empty(len(vectors), dtype=np.float32)
+    reference_transpose = normalized_references.T
+
+    for start in range(0, len(vectors), SCORING_BATCH_SIZE):
+        end = start + SCORING_BATCH_SIZE
+        similarities = normalized_vectors[start:end] @ reference_transpose
+        best[start:end] = similarities.max(axis=1)
+
+    return best
+
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating IS NOT NULL")
     candidates = rows("SELECT c.*, s.name source_name, s.weight source_weight FROM candidates c JOIN sources s ON s.id=c.source_id WHERE c.status IN ('new','recommended') AND s.enabled=1")
@@ -62,18 +96,21 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     pos_vectors = await cached_vectors(embedder,"read",positives)
     neg_vectors = await cached_vectors(embedder,"read",negatives)
     candidate_vectors = await cached_vectors(embedder,"candidate",candidates)
+    best_positive = _max_cosine_similarities(candidate_vectors, pos_vectors, .25)
+    best_negative = _max_cosine_similarities(candidate_vectors, neg_vectors, 0)
+    positive_authors = {item["author"].casefold() for item in positives}
     with transaction() as con:
-        for candidate, vector in zip(candidates, candidate_vectors):
-            best_positive = max((cosine(vector, other) for other in pos_vectors), default=.25)
-            best_negative = max((cosine(vector, other) for other in neg_vectors), default=0)
-            author_match = any(r["author"].casefold() == candidate["author"].casefold() for r in positives)
+        for index, candidate in enumerate(candidates):
+            candidate_best_positive = float(best_positive[index])
+            candidate_best_negative = float(best_negative[index])
+            author_match = candidate["author"].casefold() in positive_authors
             source_weight = float(candidate.get("source_weight") or 1)
-            score = max(0, min(100, 42 + best_positive * 48 - best_negative * 24 + (7 if author_match else 0) + (source_weight - 1) * 5))
+            score = max(0, min(100, 42 + candidate_best_positive * 48 - candidate_best_negative * 24 + (7 if author_match else 0) + (source_weight - 1) * 5))
             explanation = []
             if author_match: explanation.append("An author you have rated highly")
-            if best_positive > .45: explanation.append("Strong thematic similarity to books you loved")
-            elif best_positive > .25: explanation.append("Moderate similarity to your positive reading history")
-            if best_negative > .5: explanation.append("Reduced for similarity to books you disliked")
+            if candidate_best_positive > .45: explanation.append("Strong thematic similarity to books you loved")
+            elif candidate_best_positive > .25: explanation.append("Moderate similarity to your positive reading history")
+            if candidate_best_negative > .5: explanation.append("Reduced for similarity to books you disliked")
             if candidate.get("source_name"): explanation.append(f"From {candidate['source_name']}")
             con.execute("UPDATE candidates SET score=?, explanation=?, status=CASE WHEN status='new' THEN 'recommended' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (round(score, 1), json.dumps(explanation), candidate["id"]))
     return len(candidates)
