@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import date, timedelta
 from .config import settings
 from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover_url
+from .identity import book_identity
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -121,6 +122,7 @@ def connect():
     Path(settings.db).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(settings.db, timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    con.create_function("book_identity", 2, book_identity, deterministic=True)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=5000")

@@ -34,6 +34,7 @@
   } from "@lucide/svelte";
   import ThemePicker from "$lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "$lib/api-token-clipboard";
+  import { tokenForView } from "$lib/api-token-ui";
   import bookwardMark from "$lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "sources" | "settings";
@@ -82,6 +83,7 @@
   let digestDiscordOverride = $state<boolean | null>(null);
   let digestEmailOverride = $state<boolean | null>(null);
   let apiTokenCopyMessage = $state<string | null>(null);
+  let revealedApiToken = $state<string | null>(null);
 
   const navItems: NavItem[] = [
     {
@@ -215,6 +217,7 @@
       : "discover";
   }
   function go(view: View) {
+    revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
@@ -421,10 +424,15 @@
 
   async function copyApiToken() {
     apiTokenCopyMessage = await copyApiTokenText(
-      formState?.token ?? "",
+      revealedApiToken ?? "",
       navigator.clipboard,
     );
   }
+
+  $effect(() => {
+    if (formState?.token) revealedApiToken = formState.token;
+    else if (formState) revealedApiToken = null;
+  });
 
   $effect(() => {
     activeView;
@@ -525,9 +533,11 @@
 
   onMount(() => {
     const onPopState = () => {
-      activeView = readView(
+      const nextView = readView(
         new URL(window.location.href).searchParams.get("view"),
       );
+      revealedApiToken = tokenForView(nextView, revealedApiToken);
+      activeView = nextView;
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
     const onKeydown = (event: KeyboardEvent) => {
@@ -1532,14 +1542,14 @@
                   <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
-                {#if formState?.token}
+                {#if revealedApiToken}
                   <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
                     <div class="flex items-start gap-3">
                       <Check size={18} class="mt-0.5 shrink-0" />
                       <div class="min-w-0 flex-1">
                         <p class="font-semibold">Copy this token now</p>
                         <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
-                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{formState.token}</code>
+                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
                         class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"

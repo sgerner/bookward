@@ -33,6 +33,7 @@ from .digest import (
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
+SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 
@@ -63,7 +64,7 @@ def source_sync_is_due():
         return False
     now = datetime.now(timezone.utc)
     sources = rows(
-        "SELECT last_scanned_at FROM sources "
+        "SELECT last_scanned_at,last_status FROM sources "
         "WHERE enabled=1 AND kind!='builtin' AND lifecycle='permanent'"
     )
     for source in sources:
@@ -77,6 +78,10 @@ def source_sync_is_due():
             return True
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
+        if str(source["last_status"] or "").startswith("error:"):
+            if now - last >= timedelta(seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS):
+                return True
+            continue
         if now - last >= timedelta(hours=interval):
             return True
     return False
@@ -366,8 +371,23 @@ async def health():
 def overview():
     return overview_payload()
 
-def recommendation_list():
-    result = rows("SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100")
+def recommendation_list(status: str | None = None, limit: int = 100):
+    clauses = [
+        "c.status!='rejected'",
+        "(c.status IN ('saved','imported') OR s.enabled=1)",
+        "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
+    ]
+    params: list[Any] = []
+    if status and status != "all":
+        clauses.append("c.status=?")
+        params.append(status)
+    result = rows(
+        "SELECT c.*,s.name source_name FROM candidates c "
+        "LEFT JOIN sources s ON s.id=c.source_id WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ?",
+        (*params, limit),
+    )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
@@ -864,10 +884,7 @@ def api_recommendations(
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
 ):
-    recommendations = recommendation_list()
-    if status and status != "all":
-        recommendations = [item for item in recommendations if item["status"] == status]
-    return recommendations[:limit]
+    return recommendation_list(status=status, limit=limit)
 
 
 @api_v1.post("/recommendations/bulk-feedback")
