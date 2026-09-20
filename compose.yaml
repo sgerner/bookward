@@ -1,0 +1,48 @@
+services:
+  afterword:
+    build: .
+    restart: unless-stopped
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:3000:3000"]
+    environment:
+      ENGINE_URL: http://engine:8000
+      ORIGIN: ${ORIGIN:-http://127.0.0.1:3000}
+      BODY_SIZE_LIMIT: 12M
+      AFTERWORD_AUTH_USERNAME: ${AFTERWORD_AUTH_USERNAME:-bookward}
+      AFTERWORD_AUTH_PASSWORD: ${AFTERWORD_AUTH_PASSWORD:-}
+    depends_on:
+      engine:
+        condition: service_healthy
+    networks: ["books"]
+
+  engine:
+    build: ./engine
+    restart: unless-stopped
+    environment:
+      AFTERWORD_DB: /data/afterword.db
+      AFTERWORD_EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-local}
+      AFTERWORD_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-hashing-768}
+      AFTERWORD_EMBEDDING_URL: ${EMBEDDING_URL:-http://ollama:11434}
+      AFTERWORD_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      AFTERWORD_SOURCE_SYNC_INTERVAL_HOURS: ${SOURCE_SYNC_INTERVAL_HOURS:-24}
+      AFTERWORD_PUBLIC_URL: ${AFTERWORD_PUBLIC_URL:-http://127.0.0.1:3000}
+      AFTERWORD_SECRET_KEY: ${AFTERWORD_SECRET_KEY:-}
+      AFTERWORD_LIBRARR_ALLOWED_HOSTS: ${LIBRARR_ALLOWED_HOSTS:-librarr}
+    volumes: ["afterword-data:/data"]
+    expose: ["8000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    networks: ["books"]
+
+  ollama:
+    image: ollama/ollama:0.34.1@sha256:0c0a83210471fb50226bcdc2d6611d20ab13ae87e024cc304c94a6a5765c5e65
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes: ["ollama-models:/root/.ollama"]
+    expose: ["11434"]
+    networks: ["books"]
+
+volumes:
+  afterword-data:
+  ollama-models:
+
+networks:
+  books:

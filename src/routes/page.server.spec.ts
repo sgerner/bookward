@@ -1,0 +1,221 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { actions } from "./+page.server";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("page actions", () => {
+  it("maps shortlist decisions to the engine feedback contract", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ id: 7, status: "saved" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "7");
+    body.set("status", "saved");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Saved to your shortlist." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/7/feedback",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "save" }),
+      }),
+    );
+  });
+
+  it("does not save a custom source when preview finds no books", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ count: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("label", "Empty list");
+    body.set("url", "https://books.example/list");
+    const result = (await actions.source!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(result.status).toBe(400);
+    expect(result.data.message).toContain("No recognizable books");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves the permanent-source refresh cadence", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ saved: true, interval_hours: 24 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("intervalHours", "24");
+    const result = await actions.configureSourceSchedule!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Permanent sources will be scanned daily (UTC).",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/sources/schedule",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ interval_hours: 24 }),
+      }),
+    );
+  });
+
+  it("preserves an existing Librarr key while changing the default format", async () => {
+    const overview = {
+      sources: [],
+      recommendations: [],
+      history: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "http://librarr:5050",
+        librarr_api_key_set: true,
+        librarr_media_type: "audiobook",
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "http://librarr:5050");
+    body.set("apiKey", "");
+    body.set("mediaType", "ebook");
+    const result = await actions.configureLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Librarr connection saved for ebooks." });
+    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toMatchObject({
+      librarr_api_key: "",
+      librarr_media_type: "ebook",
+    });
+  });
+
+  it("queues an embedding rebuild and waits for its background job", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"embeddings":8}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await actions.rebuildEmbeddings!({} as never);
+    expect(result).toEqual({
+      message: "Embeddings rebuilt and recommendations refreshed.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/embeddings/rebuild",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/job-123",
+    );
+  });
+
+  it("persists digest timing and channel settings without sending blank secrets", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ saved: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("enabled", "on");
+    body.append("channels", "discord");
+    body.append("channels", "email");
+    body.set("day", "2");
+    body.set("time", "08:30");
+    body.set("timezone", "America/Phoenix");
+    body.set("minimumScore", "84");
+    body.set("maximumBooks", "6");
+    body.set("onlyNew", "on");
+    body.set("appUrl", "https://afterword.example");
+    body.set("emailTo", "reader@example.com");
+    body.set("emailFrom", "afterword@example.com");
+    body.set("smtpHost", "smtp.example.com");
+    body.set("smtpPort", "587");
+    body.set("smtpSecurity", "starttls");
+    const result = await actions.configureDigest!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Weekly digest settings saved." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/digest/settings",
+      expect.objectContaining({
+        method: "PUT",
+        body: expect.not.stringContaining("discord_webhook_url"),
+      }),
+    );
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toMatchObject({
+      enabled: true,
+      channels: ["discord", "email"],
+      day: 2,
+      minimum_score: 84,
+      maximum_books: 6,
+      smtp_security: "starttls",
+    });
+  });
+
+  it("shortlists a selected digest batch in one engine call", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ updated: 2 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.append("ids", "7");
+    body.append("ids", "8");
+    const result = await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "2 books added to your shortlist." });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+    });
+  });
+});

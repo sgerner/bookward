@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      frontend-runtime:
+        dependency-type: production
+      frontend-tooling:
+        dependency-type: development
+
+  - package-ecosystem: pip
+    directory: /engine
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      engine-runtime:
+        dependency-type: production
+      engine-tooling:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      actions:
+        patterns:
+          - "*"
