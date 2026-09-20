@@ -328,6 +328,45 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
             headers={"Authorization": f"Bearer {token}"},
         ).status_code == 401
 
+
+def test_api_recommendation_status_filter_applies_before_limit(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='recommended', source_id=?, score=100",
+            (source_id,),
+        )
+        for index in range(101):
+            con.execute(
+                "INSERT INTO candidates(title,author,status,score,normalized_key,source_id) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    f"Recommended {index}",
+                    "Author",
+                    "recommended",
+                    100 - index,
+                    f"recommended {index} author",
+                    source_id,
+                ),
+            )
+        con.execute(
+            "UPDATE candidates SET status='saved' WHERE title='Recommended 100'"
+        )
+
+    with TestClient(app) as client:
+        token = client.post(
+            "/api/settings/api-tokens", json={"name": "Filter test"}
+        ).json()["token"]
+        response = client.get(
+            "/api/v1/recommendations?status=saved&limit=100",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        assert [item["title"] for item in response.json()] == ["Recommended 100"]
+
+
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
     with pytest.raises(ValueError): import_goodreads_csv(payload)
