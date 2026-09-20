@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .database import row, rows, transaction
-from .security import validate_public_url
+from .security import safe_error_message, validate_public_url
 
 
 CHANNELS = {"discord", "email"}
@@ -286,9 +286,14 @@ def _discord_payload(items: list[dict], config: dict, key: str, test=False) -> d
 
 async def _send_discord(config: dict, payload: dict) -> str:
     validate_public_url(config["discord_webhook_url"])
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
-        response = await client.post(config["discord_webhook_url"], json=payload)
-        response.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
+            response = await client.post(config["discord_webhook_url"], json=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Discord webhook returned HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError("Discord webhook request failed") from exc
     return "discord webhook"
 
 
@@ -346,7 +351,7 @@ def _delivery_result(delivery_id: str, success: bool, error: str | None = None) 
         else:
             con.execute(
                 "UPDATE notification_deliveries SET status='failed',attempts=attempts+1,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (str(error or "Delivery failed")[:2000], delivery_id),
+                (safe_error_message(error, limit=2000), delivery_id),
             )
 
 
@@ -454,8 +459,9 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
             _delivery_result(delivery_id, True)
             deliveries.append({"id": delivery_id, "channel": channel, "status": "sent"})
         except Exception as exc:
-            _delivery_result(delivery_id, False, str(exc))
-            deliveries.append({"id": delivery_id, "channel": channel, "status": "failed", "error": str(exc)[:400]})
+            error = safe_error_message(exc)
+            _delivery_result(delivery_id, False, error)
+            deliveries.append({"id": delivery_id, "channel": channel, "status": "failed", "error": error})
     successful = {
         item["channel"]
         for item in deliveries
@@ -517,8 +523,9 @@ async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
             _mark_period_sent(delivery["period_key"], candidate_ids)
         return {"id": delivery_id, "status": "sent"}
     except Exception as exc:
-        _delivery_result(delivery_id, False, str(exc))
-        return {"id": delivery_id, "status": "failed", "error": str(exc)[:400]}
+        error = safe_error_message(exc)
+        _delivery_result(delivery_id, False, error)
+        return {"id": delivery_id, "status": "failed", "error": error}
 
 
 def safe_digest_settings(values: dict | None = None, connection=None) -> dict:
