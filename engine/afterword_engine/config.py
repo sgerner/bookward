@@ -25,5 +25,10 @@ class Settings(BaseSettings):
     models_catalog_ttl_hours: int = 24
     llm_timeout_seconds: float = 45.0
     llm_shadow_max_reads: int = 300
+    # Exploration is deliberately opt-in.  The ranking path and response
+    # order remain deterministic until an operator enables this flag.
+    exploration_enabled: bool = False
+    exploration_epsilon: float = 0.0
+    exploration_stable_top_k: int = 4
 
 settings = Settings()

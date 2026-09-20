@@ -99,8 +99,8 @@ def create_recommendation_run(
 ) -> str:
     """Persist a ranked response and return its opaque run identifier.
 
-    ``propensity=1`` is intentional for the current deterministic policy. A
-    future exploration policy can replace it with its exact probability.
+    Callers may attach the exact marginal ``propensity`` emitted by an
+    exploration policy.  Deterministic responses default to one.
     """
 
     if session_id:
@@ -126,10 +126,16 @@ def create_recommendation_run(
             ),
         )
         for rank, item in enumerate(items, 1):
+            try:
+                propensity = float(item.get("propensity", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Recommendation propensity must be numeric") from exc
+            if not math.isfinite(propensity) or not 0 < propensity <= 1:
+                raise ValueError("Recommendation propensity must be between 0 and 1")
             con.execute(
                 "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (run_id, int(item["id"]), rank, float(item.get("score") or 0), 1.0, now),
+                (run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
             )
     return run_id
 

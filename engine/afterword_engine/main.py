@@ -29,6 +29,7 @@ from .librarr import download as librarr_download, normalize_media_type, search 
 from .llm_catalog import get_catalog
 from .llm import validate_endpoint
 from .llm_shadow import run_shadow_policy, safe_connections, safe_policies
+from .exploration import epsilon_tail_explore
 from .digest import (
     digest_config,
     digest_is_due,
@@ -414,6 +415,15 @@ def tracked_recommendations(
     session_id: str = "",
 ):
     recommendations = recommendation_list(status=status, limit=limit)
+    # Keep exploration outside the scorer and behind an environment flag.  A
+    # disabled deployment receives the same deterministic order and scores as
+    # before, while enabled traffic records exact tail propensities.
+    if settings.exploration_enabled:
+        recommendations = epsilon_tail_explore(
+            recommendations,
+            epsilon=settings.exploration_epsilon,
+            stable_top_k=settings.exploration_stable_top_k,
+        )
     run_id = create_recommendation_run(
         recommendations,
         session_id=session_id,
