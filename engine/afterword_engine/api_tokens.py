@@ -40,8 +40,9 @@ def legacy_hash_api_token(token: str) -> str:
     ``hash_api_token`` immediately.
     """
 
-    # lgtm[py/weak-cryptographic-algorithm]
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hashlib.sha256(  # lgtm[py/weak-sensitive-data-hashing]
+        token.encode("utf-8")
+    ).hexdigest()
 
 
 def token_prefix(token: str) -> str:
