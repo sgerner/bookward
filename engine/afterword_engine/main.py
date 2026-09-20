@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl
 from .config import settings
-from .database import initialize, row, rows, transaction
+from .database import connect, initialize, row, rows, transaction
 from .api_tokens import generate_api_token, hash_api_token, token_prefix
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
@@ -37,7 +37,7 @@ SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 
 
-def source_sync_interval_hours():
+def source_sync_interval_hours(private=None):
     """Return the persisted permanent-source cadence in hours.
 
     ``0`` means manual-only. Keeping the value in SQLite makes the schedule
@@ -45,7 +45,8 @@ def source_sync_interval_hours():
     useful first-install default.
     """
 
-    raw = private_settings().get(
+    values = private if private is not None else private_settings()
+    raw = values.get(
         "source_sync_interval_hours", str(settings.source_sync_interval_hours)
     )
     try:
@@ -323,29 +324,46 @@ class EngineSettings(BaseModel):
             allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
             validate_service_url(self.librarr_url, allowed)
 
-def api_token_list():
+def api_token_list(connection=None):
     """Return token metadata without ever returning a token value."""
 
-    return rows(
+    query = (
         "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
         "FROM api_tokens ORDER BY created_at DESC, id DESC"
+    )
+    return (
+        [dict(item) for item in connection.execute(query).fetchall()]
+        if connection is not None
+        else rows(query)
     )
 
 
 def overview_payload(*, include_api_tokens: bool = True):
-    counts = {
-        name: row(f"SELECT COUNT(*) count FROM {name}")["count"]
-        for name in ("reads", "candidates", "sources")
-    }
-    return {
-        "counts": counts,
-        "recommendations": recommendation_list(),
-        "sources": rows("SELECT * FROM sources ORDER BY is_default DESC,name"),
-        "history": rows(
-            "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
-        ),
-        "settings": safe_settings(include_api_tokens=include_api_tokens),
-    }
+    with connect() as connection:
+        counts = {
+            name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
+            for name in ("reads", "candidates", "sources")
+        }
+        return {
+            "counts": counts,
+            "recommendations": recommendation_list(connection),
+            "sources": [
+                dict(item)
+                for item in connection.execute(
+                    "SELECT * FROM sources ORDER BY is_default DESC,name"
+                ).fetchall()
+            ],
+            "history": [
+                dict(item)
+                for item in connection.execute(
+                    "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+                ).fetchall()
+            ],
+            "settings": safe_settings(
+                include_api_tokens=include_api_tokens,
+                connection=connection,
+            ),
+        }
 
 
 @app.get("/api/health")
@@ -366,8 +384,13 @@ async def health():
 def overview():
     return overview_payload()
 
-def recommendation_list():
-    result = rows("SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100")
+def recommendation_list(connection=None):
+    query = "SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100"
+    result = (
+        [dict(item) for item in connection.execute(query).fetchall()]
+        if connection is not None
+        else rows(query)
+    )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
@@ -667,20 +690,22 @@ def job(job_id:str):
     if not found: raise HTTPException(404,"Job not found")
     return found
 
-def private_settings():
+def private_settings(connection=None):
+    query = "SELECT key,value,secret FROM settings"
+    items = connection.execute(query).fetchall() if connection is not None else rows(query)
     return {
         item["key"]: unseal(item["value"]) if item["secret"] else item["value"]
-        for item in rows("SELECT key,value,secret FROM settings")
+        for item in items
     }
 
 
-def safe_settings(*, include_api_tokens: bool = True):
-    private = private_settings()
+def safe_settings(*, include_api_tokens: bool = True, connection=None):
+    private = private_settings(connection)
     try:
         media_type = normalize_media_type(private.get("librarr_media_type"))
     except ValueError:
         media_type = "audiobook"
-    digest = safe_digest_settings(private)
+    digest = safe_digest_settings(private, connection)
     result = {
         "embedding_backend": private.get("embedding_backend", settings.embedding_backend),
         "embedding_model": private.get("embedding_model", settings.embedding_model),
@@ -689,11 +714,11 @@ def safe_settings(*, include_api_tokens: bool = True):
         "librarr_url": private.get("librarr_url", ""),
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
         "librarr_media_type": media_type,
-        "source_sync_interval_hours": source_sync_interval_hours(),
+        "source_sync_interval_hours": source_sync_interval_hours(private),
         "digest": digest,
     }
     if include_api_tokens:
-        result["api_tokens"] = api_token_list()
+        result["api_tokens"] = api_token_list(connection)
     return result
 
 

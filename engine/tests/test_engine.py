@@ -230,6 +230,26 @@ def test_api_boots_and_serves_recommendations(database):
         rebuild = client.post("/api/embeddings/rebuild")
         assert rebuild.status_code == 200 and rebuild.json()["job_id"]
 
+
+def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
+    import afterword_engine.main as main_module
+
+    connections = []
+    original_connect = main_module.connect
+
+    def capture_connect():
+        connection = original_connect()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(main_module, "connect", capture_connect)
+    overview = main_module.overview_payload()
+
+    assert len(overview["recommendations"]) == 4
+    assert "api_tokens" in overview["settings"]
+    assert len(connections) == 1
+
+
 def test_settings_encrypt_and_preserve_api_keys(database):
     payload = {"embedding_backend":"local","embedding_model":"anything","embedding_url":"","embedding_api_key":"embedding-secret","librarr_url":"http://librarr:5050","librarr_api_key":"librarr-secret","librarr_media_type":"ebook"}
     with TestClient(app) as client:
