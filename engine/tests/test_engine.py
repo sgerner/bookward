@@ -22,7 +22,7 @@ from afterword_engine.covers import (
     resolve_cover_url,
     safe_cover_url,
 )
-from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
+from afterword_engine.ingestion import enrich_book_metadata, import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
 from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
 from afterword_engine.scoring import rebuild_all_embeddings
 from afterword_engine.embeddings import get_embedder
@@ -653,6 +653,35 @@ def test_book_metadata_lookup_supplies_summary_and_year():
     assert metadata["release_date"] == "1998-01-01"
     assert metadata["date_kind"] == "year"
     assert metadata["cover_url"] == "https://covers.openlibrary.org/b/id/12345-L.jpg"
+
+
+@respx.mock
+def test_metadata_enrichment_reuses_duplicate_provider_lookups():
+    route = respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "title": "A Book",
+                        "cover_i": 12345,
+                        "first_publish_year": 1998,
+                        "first_sentence": ["A quiet story about becoming brave."],
+                    }
+                ]
+            },
+        )
+    )
+    items = [
+        {"title": "A Book", "author": "An Author"},
+        {"title": "A Book", "author": "An Author"},
+    ]
+
+    enriched = asyncio.run(enrich_book_metadata(items))
+
+    assert route.call_count == 1
+    assert len(enriched) == 2
+    assert all(item["release_date"] == "1998-01-01" for item in enriched)
 
 def test_existing_seed_isbn_cover_urls_are_migrated(database):
     with transaction() as con:
