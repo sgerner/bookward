@@ -6,7 +6,8 @@ RUN apt-get update \
     && npm install --global --ignore-scripts=false @openai/codex@0.155.1 @anthropic-ai/claude-code@2.1.278 \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 COPY afterword_engine ./afterword_engine
 RUN pip install --no-cache-dir .
 RUN useradd --create-home --uid 10001 afterword \
