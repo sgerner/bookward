@@ -106,6 +106,18 @@ def test_source_parsers_handle_apple_open_library_and_goodreads_formats():
     nyt_items = parse_book_items(nyt, "application/json", "https://api.nytimes.com/svc/books/v3/lists/overview.json")
     assert nyt_items[0]["title"] == "NYT Pick" and nyt_items[0]["release_date"] == "2027-02-03"
 
+
+def test_source_parser_provider_dispatch_requires_matching_host_and_path():
+    payload = json.dumps({"works": [{"title": "A New World", "authors": [{"name": "A Writer"}]}]}).encode()
+
+    items = parse_book_items(
+        payload,
+        "application/json",
+        "https://example.com/feed?source=openlibrary.org/subjects/science_fiction.json",
+    )
+
+    assert items == []
+
 @respx.mock
 def test_scan_source_persists_provider_metadata(database, monkeypatch):
     url = "https://openlibrary.org/subjects/science_fiction.json?limit=1"
