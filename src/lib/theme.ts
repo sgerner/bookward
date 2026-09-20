@@ -83,7 +83,6 @@ export const THEME_SWATCHES: Record<SkeletonThemeName, ThemeSwatch> = {
 	vox: { primary: 'oklch(82.71% 0.1 51.5deg)', secondary: 'oklch(92.54% 0.17 123.36deg)', tertiary: 'oklch(80.24% 0.12 298.53deg)' },
 	wintry: { primary: 'oklch(62.31% 0.19 259.81deg)', secondary: 'oklch(68.47% 0.15 237.31deg)', tertiary: 'oklch(66.28% 0.18 280.87deg)' },
 };
-
 /**
  * Keep the default palette in the critical stylesheet. Alternate palettes are
  * loaded only when a user selects one, so the initial page does not download
