@@ -48,7 +48,7 @@ def test_feedback_uses_latest_explicit_event_and_only_prior_unrelated_reads(monk
     vector = np.array([1, 0], dtype=np.float32)
     candidate = {"id": 9, "title": "Candidate", "author": "Writer", "status": "rejected"}
     data = {"candidates": [candidate], "feedback": [
-        {"id": 1, "candidate_id": 9, "action": "reject", "created_at": "2025-06-01"},
+        {"id": 3, "candidate_id": 9, "action": "reject", "created_at": "2025-05-01"},
         {"id": 2, "candidate_id": 9, "action": "save", "created_at": "2025-06-01"},
     ], "embeddings": [{"entity_type": "candidate", "entity_id": 9, "backend": "test", "model": "fixed",
                          "content_hash": evaluation.content_hash(evaluation.document(candidate)),

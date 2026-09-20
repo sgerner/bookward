@@ -130,7 +130,9 @@ def feedback_check(data, records, selected):
     cache = {e["entity_id"]: e for e in data["embeddings"]
              if e["entity_type"] == "candidate" and (e["backend"], e["model"]) == selected}
     latest = {}
-    for event in sorted(data.get("feedback", []), key=lambda e: e["id"]):
+    dated_events = [(read_time(e["created_at"]), e) for e in data.get("feedback", [])]
+    for _, event in sorted(((date, e) for date, e in dated_events if date is not None),
+                           key=lambda pair: (pair[0], pair[1]["id"])):
         latest[event["candidate_id"]] = event
     labels, old, new = [], [], []
     for candidate_id, event in latest.items():
