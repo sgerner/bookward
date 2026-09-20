@@ -46,6 +46,70 @@ export type SkeletonThemeName = (typeof THEMES)[number]['id'];
 
 const THEME_NAMES = new Set<string>(THEMES.map((theme) => theme.id));
 
+/**
+ * Keep the default palette in the critical stylesheet. Alternate palettes are
+ * loaded only when a user selects one, so the initial page does not download
+ * every available theme.
+ */
+export const THEME_LOADERS: Record<SkeletonThemeName, () => Promise<unknown>> = {
+	catppuccin: () => import('@skeletonlabs/skeleton/themes/catppuccin?raw'),
+	cerberus: () => Promise.resolve(),
+	concord: () => import('@skeletonlabs/skeleton/themes/concord?raw'),
+	crimson: () => import('@skeletonlabs/skeleton/themes/crimson?raw'),
+	dracula: () => import('@skeletonlabs/skeleton/themes/dracula?raw'),
+	fennec: () => import('@skeletonlabs/skeleton/themes/fennec?raw'),
+	hamlindigo: () => import('@skeletonlabs/skeleton/themes/hamlindigo?raw'),
+	legacy: () => import('@skeletonlabs/skeleton/themes/legacy?raw'),
+	mint: () => import('@skeletonlabs/skeleton/themes/mint?raw'),
+	modern: () => import('@skeletonlabs/skeleton/themes/modern?raw'),
+	mona: () => import('@skeletonlabs/skeleton/themes/mona?raw'),
+	nosh: () => import('@skeletonlabs/skeleton/themes/nosh?raw'),
+	nouveau: () => import('@skeletonlabs/skeleton/themes/nouveau?raw'),
+	pine: () => import('@skeletonlabs/skeleton/themes/pine?raw'),
+	reign: () => import('@skeletonlabs/skeleton/themes/reign?raw'),
+	rocket: () => import('@skeletonlabs/skeleton/themes/rocket?raw'),
+	rose: () => import('@skeletonlabs/skeleton/themes/rose?raw'),
+	rosepine: () => import('@skeletonlabs/skeleton/themes/rosepine?raw'),
+	sahara: () => import('@skeletonlabs/skeleton/themes/sahara?raw'),
+	seafoam: () => import('@skeletonlabs/skeleton/themes/seafoam?raw'),
+	terminus: () => import('@skeletonlabs/skeleton/themes/terminus?raw'),
+	vintage: () => import('@skeletonlabs/skeleton/themes/vintage?raw'),
+	vox: () => import('@skeletonlabs/skeleton/themes/vox?raw'),
+	wintry: () => import('@skeletonlabs/skeleton/themes/wintry?raw'),
+};
+
+const themeLoads = new Map<SkeletonThemeName, Promise<void>>([
+	[DEFAULT_THEME, Promise.resolve()],
+]);
+
+/** Load a palette stylesheet once before applying its data-theme attribute. */
+export function loadTheme(theme: SkeletonThemeName): Promise<void> {
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	const existing = themeLoads.get(nextTheme);
+	if (existing) return existing;
+
+	const pending = THEME_LOADERS[nextTheme]().then(
+		(module) => {
+			if (nextTheme === DEFAULT_THEME || typeof document === 'undefined') return;
+			if (document.head.querySelector(`style[data-bookward-theme="${nextTheme}"]`)) return;
+			const stylesheet = typeof module === 'string'
+				? module
+				: (module as { default?: unknown }).default;
+			if (typeof stylesheet !== 'string') throw new Error(`Theme stylesheet for ${nextTheme} was unavailable`);
+			const style = document.createElement('style');
+			style.dataset.bookwardTheme = nextTheme;
+			style.textContent = stylesheet;
+			document.head.append(style);
+		},
+		(error) => {
+			themeLoads.delete(nextTheme);
+			throw error;
+		},
+	);
+	themeLoads.set(nextTheme, pending);
+	return pending;
+}
+
 export function isThemeName(value: unknown): value is SkeletonThemeName {
 	return typeof value === 'string' && THEME_NAMES.has(value);
 }

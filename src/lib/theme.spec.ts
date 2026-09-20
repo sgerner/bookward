@@ -5,6 +5,7 @@ import {
 	DEFAULT_MODE,
 	DEFAULT_THEME,
 	MODE_STORAGE_KEY,
+	THEME_LOADERS,
 	THEME_STORAGE_KEY,
 	THEMES,
 	applyTheme,
@@ -12,6 +13,7 @@ import {
 	initAppearance,
 	isThemeMode,
 	isThemeName,
+	loadTheme,
 	resolveMode,
 	setTheme,
 	type ThemeMode,
@@ -83,8 +85,10 @@ describe('theme preferences', () => {
 		expect(new Set(pickerThemes).size).toBe(pickerThemes.length);
 
 		const stylesheet = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
-		for (const theme of pickerThemes) {
-			expect(stylesheet).toContain(`@import '@skeletonlabs/skeleton/themes/${theme}'`);
+		expect(stylesheet).toContain(`@import '@skeletonlabs/skeleton/themes/${DEFAULT_THEME}'`);
+		for (const theme of pickerThemes) expect(THEME_LOADERS[theme]).toEqual(expect.any(Function));
+		for (const theme of pickerThemes.filter((theme) => theme !== DEFAULT_THEME)) {
+			expect(stylesheet).not.toContain(`@import '@skeletonlabs/skeleton/themes/${theme}'`);
 		}
 	});
 
@@ -94,6 +98,25 @@ describe('theme preferences', () => {
 		expect(isThemeName(null)).toBe(false);
 		for (const mode of ['light', 'dark', 'system'] satisfies ThemeMode[]) expect(isThemeMode(mode)).toBe(true);
 		expect(isThemeMode('auto')).toBe(false);
+	});
+
+	it('injects an alternate stylesheet only once before it is selected', async () => {
+		const originalLoader = THEME_LOADERS.mint;
+		const append = vi.fn();
+		const style = { dataset: {} as DOMStringMap, textContent: '' };
+		THEME_LOADERS.mint = () => Promise.resolve({ default: '[data-theme="mint"] {}' });
+		vi.stubGlobal('document', {
+			head: { querySelector: vi.fn(() => null), append },
+			createElement: vi.fn(() => style),
+		});
+
+		await loadTheme('mint');
+		await loadTheme('mint');
+
+		expect(style.dataset.bookwardTheme).toBe('mint');
+		expect(style.textContent).toContain('[data-theme="mint"]');
+		expect(append).toHaveBeenCalledTimes(1);
+		THEME_LOADERS.mint = originalLoader;
 	});
 
 	it('falls back safely when storage contains stale or invalid values', () => {
