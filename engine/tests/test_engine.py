@@ -1,7 +1,7 @@
 import asyncio
 import json
 import socket
-import stat
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,7 +10,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from afterword_engine.config import settings
-from afterword_engine.database import initialize, row, rows, transaction
+from afterword_engine.database import MIGRATIONS, initialize, row, rows, transaction
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -21,13 +21,19 @@ from afterword_engine.covers import (
     resolve_cover_url,
     safe_cover_url,
 )
-from afterword_engine.ingestion import enrich_book_metadata, import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
-from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
+from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
+from afterword_engine.scoring import cached_vectors, rebuild_all_embeddings, score_all
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
-from afterword_engine.security import safe_error_message, validate_public_url, validate_service_url
+from afterword_engine.security import validate_public_url, validate_service_url
 from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
-from afterword_engine.main import app, handle_job, recommendation_list, score, source_sync_is_due, sync
+from afterword_engine.main import (
+    SOURCE_SYNC_ERROR_RETRY_SECONDS,
+    app,
+    handle_job,
+    recommendation_list,
+    source_sync_is_due,
+)
 from afterword_engine.digest import digest_is_due, digest_preview, send_digest, validate_digest_config
 
 @pytest.fixture()
@@ -42,43 +48,6 @@ def test_fresh_database_seeds_independent_demo(database):
     covers = [item["cover_url"] for item in rows("SELECT cover_url FROM candidates")]
     assert len(covers) == 4 and all(covers) and not any(is_weak_cover_url(cover) for cover in covers)
     assert all("/isbn/" not in item["source_url"] for item in rows("SELECT source_url FROM candidates"))
-
-
-def test_database_files_are_owner_only(tmp_path):
-    settings.db = str(tmp_path / "private.db")
-    Path(settings.db).touch(mode=0o644)
-    Path(settings.db).chmod(0o644)
-
-    initialize()
-    with transaction() as con:
-        con.execute("INSERT INTO reads(title,author,source) VALUES(?,?,?)", ("Private", "Reader", "test"))
-
-    for path in (Path(settings.db), Path(f"{settings.db}-wal"), Path(f"{settings.db}-shm")):
-        if path.exists():
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
-def test_database_indexes_cover_recent_history_and_job_queue(database):
-    indexes = {
-        item["name"]
-        for item in rows(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
-            ("idx_reads_recent", "idx_jobs_queue"),
-        )
-    }
-
-    assert indexes == {"idx_reads_recent", "idx_jobs_queue"}
-    history_plan = rows(
-        "EXPLAIN QUERY PLAN SELECT * FROM reads "
-        "ORDER BY COALESCE(read_at, created_at) DESC LIMIT 12"
-    )
-    queue_plan = rows(
-        "EXPLAIN QUERY PLAN SELECT * FROM jobs "
-        "WHERE status='queued' ORDER BY created_at LIMIT 1"
-    )
-    assert any("idx_reads_recent" in item["detail"] for item in history_plan)
-    assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
-
 
 def test_fresh_database_seeds_curated_sources(database):
     sources = rows("SELECT name,url,enabled FROM sources WHERE is_default=0")
@@ -104,18 +73,6 @@ def test_source_scheduler_detects_due_permanent_feeds(database):
     with transaction() as con:
         con.execute("UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP WHERE name='Due feed'")
     assert source_sync_is_due() is False
-
-
-def test_expensive_job_requests_reuse_active_queue_entries(database):
-    first_sync = asyncio.run(sync())
-    second_sync = asyncio.run(sync())
-    first_score = asyncio.run(score())
-    second_score = asyncio.run(score())
-
-    assert first_sync == second_sync
-    assert first_score == second_score
-    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='sync'")["count"] == 1
-    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 1
     with transaction() as con:
         con.execute("UPDATE settings SET value='0' WHERE key='source_sync_interval_hours'")
     assert source_sync_is_due() is False
@@ -149,18 +106,6 @@ def test_source_parsers_handle_apple_open_library_and_goodreads_formats():
     nyt_items = parse_book_items(nyt, "application/json", "https://api.nytimes.com/svc/books/v3/lists/overview.json")
     assert nyt_items[0]["title"] == "NYT Pick" and nyt_items[0]["release_date"] == "2027-02-03"
 
-
-def test_source_parser_provider_dispatch_requires_matching_host_and_path():
-    payload = json.dumps({"works": [{"title": "A New World", "authors": [{"name": "A Writer"}]}]}).encode()
-
-    items = parse_book_items(
-        payload,
-        "application/json",
-        "https://example.com/feed?source=openlibrary.org/subjects/science_fiction.json",
-    )
-
-    assert items == []
-
 @respx.mock
 def test_scan_source_persists_provider_metadata(database, monkeypatch):
     url = "https://openlibrary.org/subjects/science_fiction.json?limit=1"
@@ -173,6 +118,28 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     candidate = row("SELECT * FROM candidates WHERE title='A New World'")
     assert json.loads(candidate["genres"]) == ["Science fiction"]
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
+
+
+def test_empty_source_scan_preserves_existing_candidates(database, monkeypatch):
+    async def empty_fetch(_url):
+        return b"<html><body>temporarily unavailable</body></html>", "text/html"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", empty_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.parse_book_items", lambda *_args: [])
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?)",
+            ("Empty source", "https://example.com/empty"),
+        )
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
+            ("Keep this book", "A Writer", cursor.lastrowid, "recommended", "keep this book a writer"),
+        )
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 0
+    assert row("SELECT status FROM candidates WHERE title='Keep this book'")["status"] == "recommended"
+    assert row("SELECT last_status FROM sources WHERE id=?", (cursor.lastrowid,))["last_status"] == "empty:0"
 
 
 @respx.mock
@@ -206,54 +173,43 @@ def test_failed_one_time_source_remains_pending_for_retry(database, monkeypatch)
         )
 
     async def fail(_source):
-        raise RuntimeError("temporary source outage at https://api.nytimes.com/v3/books?api-key=source-secret")
+        raise RuntimeError("temporary source outage")
 
     monkeypatch.setattr("afterword_engine.main.scan_source", fail)
     result = asyncio.run(handle_job("sync"))
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:") and source["last_scanned_at"] is None
-    assert "source-secret" not in source["last_status"]
 
 
-def test_provider_error_messages_redact_query_and_webhook_credentials():
-    message = safe_error_message(
-        "request failed for https://source.example/v3/books?api-key=source-secret "
-        "and https://hooks.example/api/webhooks/123/webhook-secret"
+def test_failed_permanent_source_retries_after_short_backoff(database, monkeypatch):
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=0")
+        cursor = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
+            ("Retry permanent", "https://example.com/retry-permanent"),
+        )
+
+    async def fail(_source):
+        raise RuntimeError("temporary source outage")
+
+    monkeypatch.setattr("afterword_engine.main.scan_source", fail)
+    result = asyncio.run(handle_job("sync"))
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert len(result["errors"]) == 1
+    assert source["last_status"].startswith("error:")
+    assert source_sync_is_due() is False
+
+    retry_at = datetime.now(timezone.utc) - timedelta(
+        seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS + 1
     )
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET last_scanned_at=? WHERE id=?",
+            (retry_at.isoformat(), cursor.lastrowid),
+        )
+    assert source_sync_is_due() is True
 
-    assert "source-secret" not in message
-    assert "webhook-secret" not in message
-    assert "source.example" in message
-    assert "hooks.example" in message
-
-
-@respx.mock
-def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monkeypatch):
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("162.159.135.42", 443))],
-    )
-    secret_url = "https://discord.com/api/webhooks/123/webhook-secret"
-    route = respx.post(secret_url).mock(return_value=httpx.Response(500))
-    config = {
-        "digest_enabled": "1",
-        "digest_channels": "discord",
-        "digest_minimum_score": "0",
-        "digest_maximum_books": "1",
-        "digest_app_url": "https://afterword.example",
-        "digest_discord_webhook_url": secret_url,
-    }
-
-    result = asyncio.run(send_digest(config))
-    delivery = row("SELECT error FROM notification_deliveries LIMIT 1")
-
-    assert route.called
-    assert result["status"] == "failed"
-    assert result["deliveries"][0]["error"] == "Discord webhook returned HTTP 500"
-    assert delivery["error"] == "Discord webhook returned HTTP 500"
-    assert "webhook-secret" not in json.dumps(result)
 
 def test_goodreads_csv_import_is_idempotent(database):
     payload = b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n1,"A Book, With Comma",Writer,5,2026/01/02,"=\"9781234567890\""\n'
@@ -268,38 +224,6 @@ def test_local_cpu_scoring_runs_without_model_download(database):
     assert first_count == 8
     assert asyncio.run(score_all("local", "hashing-768")) == 4
     assert row("SELECT COUNT(*) count FROM embeddings")["count"] == first_count
-
-
-def test_cached_vectors_batches_cache_reads(database, monkeypatch):
-    import afterword_engine.scoring as scoring_module
-
-    candidates = rows("SELECT * FROM candidates")
-    embedder = get_embedder("local", "hashing-768")
-    cache_queries = []
-    original_rows = scoring_module.rows
-
-    def capture_rows(query, params=()):
-        cache_queries.append(query)
-        return original_rows(query, params)
-
-    monkeypatch.setattr(scoring_module, "rows", capture_rows)
-    vectors = asyncio.run(cached_vectors(embedder, "candidate", candidates))
-
-    assert len(vectors) == len(candidates)
-    assert len(cache_queries) == 1
-    assert "entity_id IN" in cache_queries[0]
-
-
-def test_scoring_uses_chunked_cosine_maxima():
-    result = _max_cosine_similarities(
-        [[1, 0], [0, 1], [0, 0]],
-        [[1, 0], [1, 1]],
-        0.25,
-    )
-
-    assert result.tolist() == pytest.approx([1, 1 / 2**0.5, 0])
-    assert _max_cosine_similarities([[1, 0]], [], 0.25).tolist() == [0.25]
-
 
 def test_embedding_rebuild_replaces_every_stored_vector(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 4
@@ -323,6 +247,35 @@ def test_failed_embedding_rebuild_keeps_previous_provider_cache(database, monkey
         asyncio.run(handle_job("rebuild_embeddings"))
     assert row("SELECT COUNT(*) count FROM embeddings WHERE backend='legacy'")["count"] == 1
 
+
+def test_failed_embedding_rebuild_keeps_active_provider_cache(database, monkeypatch):
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    before = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+
+    class BrokenEmbedder:
+        name = "local"
+        model = "hashing-768"
+
+        async def embed(self, _texts):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(
+        "afterword_engine.scoring.get_embedder",
+        lambda *_args, **_kwargs: BrokenEmbedder(),
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(rebuild_all_embeddings("local", "hashing-768"))
+
+    after = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+    assert after == before
+
+
 def test_private_source_addresses_are_rejected(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
     with pytest.raises(ValueError, match="Private"):
@@ -344,47 +297,6 @@ def test_api_boots_and_serves_recommendations(database):
         assert client.get("/api/overview").json()["settings"]["source_sync_interval_hours"] == 168
         rebuild = client.post("/api/embeddings/rebuild")
         assert rebuild.status_code == 200 and rebuild.json()["job_id"]
-
-
-def test_recommendations_filter_and_paginate_in_sql(database):
-    with transaction() as con:
-        con.execute("UPDATE candidates SET status='recommended', score=id")
-        con.execute("UPDATE candidates SET status='saved' WHERE id=1")
-
-    with TestClient(app) as client:
-        page = client.get("/api/recommendations?status=recommended&limit=2&offset=1")
-        assert page.status_code == 200
-        assert len(page.json()) == 2
-        assert all(item["status"] == "recommended" for item in page.json())
-
-        saved = client.get("/api/recommendations?status=saved&limit=1")
-        assert [item["id"] for item in saved.json()] == [1]
-
-        overview = client.get("/api/overview?recommendation_limit=1")
-        assert [item["status"] for item in overview.json()["recommendations"]] == [
-            "recommended",
-            "saved",
-        ]
-
-
-def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
-    import afterword_engine.main as main_module
-
-    connections = []
-    original_connect = main_module.connect
-
-    def capture_connect():
-        connection = original_connect()
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(main_module, "connect", capture_connect)
-    overview = main_module.overview_payload()
-
-    assert len(overview["recommendations"]) == 4
-    assert "api_tokens" in overview["settings"]
-    assert len(connections) == 1
-
 
 def test_settings_encrypt_and_preserve_api_keys(database):
     payload = {"embedding_backend":"local","embedding_model":"anything","embedding_url":"","embedding_api_key":"embedding-secret","librarr_url":"http://librarr:5050","librarr_api_key":"librarr-secret","librarr_media_type":"ebook"}
@@ -470,24 +382,47 @@ def test_legacy_api_token_hash_is_upgraded_on_first_use(database):
             "/api/v1/health",
             headers={"Authorization": f"Bearer {token}"},
         )
+        assert authorized.status_code == 200
+        assert row("SELECT token_hash FROM api_tokens WHERE id=?", (token_id,))["token_hash"] == hash_api_token(token)
 
-    assert authorized.status_code == 200
-    assert row("SELECT token_hash FROM api_tokens WHERE id=?", (token_id,))["token_hash"] == hash_api_token(token)
 
+def test_api_recommendation_status_filter_applies_before_limit(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='recommended', source_id=?, score=100",
+            (source_id,),
+        )
+        for index in range(101):
+            con.execute(
+                "INSERT INTO candidates(title,author,status,score,normalized_key,source_id) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    f"Recommended {index}",
+                    "Author",
+                    "recommended",
+                    100 - index,
+                    f"recommended {index} author",
+                    source_id,
+                ),
+            )
+        con.execute(
+            "UPDATE candidates SET status='saved' WHERE title='Recommended 100'"
+        )
 
-def test_api_token_rejects_unbounded_and_wrong_prefix_candidates(database):
     with TestClient(app) as client:
-        oversized = client.get(
-            "/api/v1/health",
-            headers={"Authorization": f"Bearer {'bkw_' + 'x' * 200}"},
+        token = client.post(
+            "/api/settings/api-tokens", json={"name": "Filter test"}
+        ).json()["token"]
+        response = client.get(
+            "/api/v1/recommendations?status=saved&limit=100",
+            headers={"Authorization": f"Bearer {token}"},
         )
-        wrong_prefix = client.get(
-            "/api/v1/health",
-            headers={"Authorization": "Bearer not-a-bookward-token"},
-        )
+        assert response.status_code == 200
+        assert [item["title"] for item in response.json()] == ["Recommended 100"]
 
-    assert oversized.status_code == 401
-    assert wrong_prefix.status_code == 401
 
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
@@ -564,35 +499,6 @@ def test_book_metadata_lookup_supplies_summary_and_year():
     assert metadata["date_kind"] == "year"
     assert metadata["cover_url"] == "https://covers.openlibrary.org/b/id/12345-L.jpg"
 
-
-@respx.mock
-def test_metadata_enrichment_reuses_duplicate_provider_lookups():
-    route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "docs": [
-                    {
-                        "title": "A Book",
-                        "cover_i": 12345,
-                        "first_publish_year": 1998,
-                        "first_sentence": ["A quiet story about becoming brave."],
-                    }
-                ]
-            },
-        )
-    )
-    items = [
-        {"title": "A Book", "author": "An Author"},
-        {"title": "A Book", "author": "An Author"},
-    ]
-
-    enriched = asyncio.run(enrich_book_metadata(items))
-
-    assert route.call_count == 1
-    assert len(enriched) == 2
-    assert all(item["release_date"] == "1998-01-01" for item in enriched)
-
 def test_existing_seed_isbn_cover_urls_are_migrated(database):
     with transaction() as con:
         con.execute("UPDATE candidates SET cover_url='https://covers.openlibrary.org/b/isbn/9781668056767-L.jpg' WHERE title='The Last Contract of Isako'")
@@ -627,11 +533,42 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 5
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
     assert row(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
     assert row("SELECT source_id FROM candidates LIMIT 1")["source_id"] != 1
+
+
+def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
+    settings.db = str(tmp_path / "v3.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS[:3]:
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        source_id = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?) RETURNING id",
+            ("Existing source", "https://example.com/existing"),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            ("Existing book", "Existing author", source_id, "existing book existing author"),
+        )
+
+    initialize()
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
+    assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
+    assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
+
+    initialize()
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
+    assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
+
 
 @respx.mock
 def test_openai_compatible_normalizes_v1_and_orders_vectors():

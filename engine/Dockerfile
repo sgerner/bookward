@@ -2,12 +2,16 @@ FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 AFTERWORD_DB=/data/afterword.db
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends nodejs npm tzdata \
+    && npm install --global --ignore-scripts=false @openai/codex@0.155.1 @anthropic-ai/claude-code@2.1.278 \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml uv.lock requirements.lock ./
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock
+COPY pyproject.toml ./
 COPY afterword_engine ./afterword_engine
-RUN useradd --create-home --uid 10001 afterword && mkdir -p /data && chown -R afterword:afterword /app /data
+RUN pip install --no-cache-dir .
+RUN useradd --create-home --uid 10001 afterword \
+    && mkdir -p /data/codex-home /data/claude-home \
+    && chown -R afterword:afterword /app /data
 USER afterword
 VOLUME ["/data"]
 EXPOSE 8000
