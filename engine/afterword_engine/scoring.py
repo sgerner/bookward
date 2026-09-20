@@ -1,13 +1,8 @@
 import json
 import math
-<<<<<<< HEAD
 from .database import rows, transaction
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
-=======
-from .database import rows, transaction
-from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
->>>>>>> 78de922 (perf: batch embedding cache lookups)
 
 def document(item):
     genres = item.get("genres", "[]")
