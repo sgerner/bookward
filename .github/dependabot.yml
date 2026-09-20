@@ -10,6 +10,10 @@ updates:
         dependency-type: production
       frontend-tooling:
         dependency-type: development
+    ignore:
+      - dependency-name: typescript
+        versions:
+          - ">=7.0.0"
 
   - package-ecosystem: pip
     directory: /engine
