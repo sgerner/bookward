@@ -1,9 +1,87 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { actions } from "./+page.server";
+import { actions, load } from "./+page.server";
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("page actions", () => {
+  it("keeps the Settings view compatible with an engine before the token migration", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          recommendations: [],
+          history: [],
+          sources: [],
+          settings: {
+            embedding_backend: "local",
+            embedding_model: "hashing-768",
+            embedding_url: "",
+            embedding_api_key_set: false,
+            librarr_url: "",
+            librarr_api_key_set: false,
+            librarr_media_type: "audiobook",
+            digest: {},
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+    } as never)) as { profile: { api_tokens: unknown[] } };
+    expect(result.profile.api_tokens).toEqual([]);
+  });
+
+  it("creates and revokes API tokens through the engine actions", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: "bkw_one-time-secret" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ revoked: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const createBody = new FormData();
+    createBody.set("name", "Home Assistant");
+    await expect(
+      actions.createApiToken!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: createBody,
+        }),
+      } as never),
+    ).resolves.toEqual({
+      message: "API token created. Copy it now; it will not be shown again.",
+      token: "bkw_one-time-secret",
+    });
+
+    const revokeBody = new FormData();
+    revokeBody.set("id", "4");
+    await expect(
+      actions.revokeApiToken!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: revokeBody,
+        }),
+      } as never),
+    ).resolves.toEqual({ message: "API token revoked." });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/settings/api-tokens",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/settings/api-tokens/4",
+    );
+  });
+
   it("maps shortlist decisions to the engine feedback contract", async () => {
     const fetchMock = vi
       .fn()

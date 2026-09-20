@@ -60,6 +60,38 @@ Bring in your reading history, choose an embedding provider, connect Librarr if 
 - Public source fetching rejects private, loopback, link-local, and metadata addresses.
 - Docker images are built in CI and published to GitHub Container Registry from version tags.
 
+## API
+
+Bookward exposes a versioned API for automations and other applications. Open Settings → API access, name a token, and select **Generate token**. The full token is displayed only once; store it in the calling application and revoke it from the same screen if it is no longer needed.
+
+When upgrading an existing install, restart the engine once so the token-table migration is applied before generating a token.
+
+The public base URL is:
+
+~~~
+https://your-bookward-host.example/api/v1
+~~~
+
+Send the token with every request:
+
+~~~bash
+curl https://your-bookward-host.example/api/v1/recommendations \
+  -H 'Authorization: Bearer bkw_…'
+~~~
+
+The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
+
+- `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|all` and `limit`.
+- `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, or `restore`.
+- `GET /api/v1/sources` — list configured sources.
+- `POST /api/v1/sync` — queue a source refresh and return a job ID.
+- `GET /api/v1/jobs/{id}` — check a background job.
+
+The engine also publishes the complete interactive OpenAPI schema at `/openapi.json` and Swagger UI at `/docs` when it is run directly. The web application proxy keeps `/api/v1` available at the public Bookward URL.
+
+Keep the engine port private; the versioned web proxy is the intended external API boundary. API tokens currently grant the full v1 API and do not expire, so revoke them promptly if they are compromised.
+
 ## How it works
 
 ~~~

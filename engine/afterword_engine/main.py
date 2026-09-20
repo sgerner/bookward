@@ -6,11 +6,13 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl
 from .config import settings
 from .database import initialize, row, rows, transaction
+from .api_tokens import generate_api_token, hash_api_token, token_prefix
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import import_goodreads_csv, import_goodreads_rss, preview_source, refresh_missing_candidate_metadata, scan_source
@@ -239,7 +241,17 @@ async def lifespan(app):
     stop.set(); await scheduler; await digest_scheduler; await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[settings.cors_origin], allow_methods=["GET","POST","PUT","DELETE"], allow_headers=["content-type"], allow_credentials=False)
+app.add_middleware(
+    CORSMiddleware,
+    # The web app's public proxy owns cross-origin access. Keep the engine's
+    # internal surface restricted to its configured browser origin so exposing
+    # the engine port does not turn every legacy endpoint into a wildcard CORS
+    # API.
+    allow_origins=[settings.cors_origin],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key"],
+    allow_credentials=False,
+)
 
 class SourceIn(BaseModel):
     name: str = Field(min_length=2, max_length=100)
@@ -286,6 +298,10 @@ class BulkFeedbackIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["save", "reject", "restore"]
 
+
+class ApiTokenCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
 class EngineSettings(BaseModel):
     embedding_backend: str = "local"
     embedding_model: str = "hashing-768"
@@ -307,15 +323,48 @@ class EngineSettings(BaseModel):
             allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
             validate_service_url(self.librarr_url, allowed)
 
+def api_token_list():
+    """Return token metadata without ever returning a token value."""
+
+    return rows(
+        "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
+        "FROM api_tokens ORDER BY created_at DESC, id DESC"
+    )
+
+
+def overview_payload(*, include_api_tokens: bool = True):
+    counts = {
+        name: row(f"SELECT COUNT(*) count FROM {name}")["count"]
+        for name in ("reads", "candidates", "sources")
+    }
+    return {
+        "counts": counts,
+        "recommendations": recommendation_list(),
+        "sources": rows("SELECT * FROM sources ORDER BY is_default DESC,name"),
+        "history": rows(
+            "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+        ),
+        "settings": safe_settings(include_api_tokens=include_api_tokens),
+    }
+
+
 @app.get("/api/health")
 async def health():
-    config = safe_settings()
-    return {"ok": True, "database": True, "embedding": {"backend":config["embedding_backend"],"model":config["embedding_model"],"configured":True}}
+    config = safe_settings(include_api_tokens=False)
+    return {
+        "ok": True,
+        "database": True,
+        "embedding": {
+            "backend": config["embedding_backend"],
+            "model": config["embedding_model"],
+            "configured": True,
+        },
+    }
+
 
 @app.get("/api/overview")
 def overview():
-    counts = {name: row(f"SELECT COUNT(*) count FROM {name}")["count"] for name in ("reads","candidates","sources")}
-    return {"counts": counts, "recommendations": recommendation_list(), "sources": rows("SELECT * FROM sources ORDER BY is_default DESC,name"), "history": rows("SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"), "settings": safe_settings()}
+    return overview_payload()
 
 def recommendation_list():
     result = rows("SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100")
@@ -618,13 +667,97 @@ def job(job_id:str):
     if not found: raise HTTPException(404,"Job not found")
     return found
 
-def private_settings(): return {item["key"]:unseal(item["value"]) if item["secret"] else item["value"] for item in rows("SELECT key,value,secret FROM settings")}
-def safe_settings():
-    private=private_settings()
-    try: media_type=normalize_media_type(private.get("librarr_media_type"))
-    except ValueError: media_type="audiobook"
+def private_settings():
+    return {
+        item["key"]: unseal(item["value"]) if item["secret"] else item["value"]
+        for item in rows("SELECT key,value,secret FROM settings")
+    }
+
+
+def safe_settings(*, include_api_tokens: bool = True):
+    private = private_settings()
+    try:
+        media_type = normalize_media_type(private.get("librarr_media_type"))
+    except ValueError:
+        media_type = "audiobook"
     digest = safe_digest_settings(private)
-    return {"embedding_backend":private.get("embedding_backend",settings.embedding_backend),"embedding_model":private.get("embedding_model",settings.embedding_model),"embedding_url":private.get("embedding_url",settings.embedding_url),"embedding_api_key_set":bool(private.get("embedding_api_key")),"librarr_url":private.get("librarr_url", ""),"librarr_api_key_set":bool(private.get("librarr_api_key")),"librarr_media_type":media_type,"source_sync_interval_hours":source_sync_interval_hours(),"digest":digest}
+    result = {
+        "embedding_backend": private.get("embedding_backend", settings.embedding_backend),
+        "embedding_model": private.get("embedding_model", settings.embedding_model),
+        "embedding_url": private.get("embedding_url", settings.embedding_url),
+        "embedding_api_key_set": bool(private.get("embedding_api_key")),
+        "librarr_url": private.get("librarr_url", ""),
+        "librarr_api_key_set": bool(private.get("librarr_api_key")),
+        "librarr_media_type": media_type,
+        "source_sync_interval_hours": source_sync_interval_hours(),
+        "digest": digest,
+    }
+    if include_api_tokens:
+        result["api_tokens"] = api_token_list()
+    return result
+
+
+def _create_api_token(name: str):
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(400, "Token name cannot be blank")
+    token = generate_api_token()
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO api_tokens(name,token_prefix,token_hash) VALUES(?,?,?)",
+            (clean_name, token_prefix(token), hash_api_token(token)),
+        )
+        token_id = cursor.lastrowid
+        created = con.execute(
+            "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
+            "FROM api_tokens WHERE id=?",
+            (token_id,),
+        ).fetchone()
+    return {
+        "token": token,
+        "id": created["id"],
+        "name": created["name"],
+        "token_prefix": created["token_prefix"],
+        "created_at": created["created_at"],
+        "last_used_at": created["last_used_at"],
+        "revoked_at": created["revoked_at"],
+    }
+
+
+def _revoke_api_token(token_id: int):
+    with transaction() as con:
+        found = con.execute("SELECT id FROM api_tokens WHERE id=?", (token_id,)).fetchone()
+        if not found:
+            raise HTTPException(404, "API token not found")
+        con.execute(
+            "UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) WHERE id=?",
+            (token_id,),
+        )
+    return {"revoked": True, "id": token_id}
+
+
+@app.get("/api/settings/api-tokens")
+@app.get("/api/tokens")
+def list_api_tokens():
+    return {"tokens": api_token_list()}
+
+
+@app.post("/api/settings/api-tokens")
+@app.post("/api/tokens")
+def create_api_token(payload: ApiTokenCreateIn):
+    return _create_api_token(payload.name)
+
+
+@app.delete("/api/settings/api-tokens/{token_id}")
+@app.delete("/api/tokens/{token_id}")
+def delete_api_token(token_id: int):
+    return _revoke_api_token(token_id)
+
+
+@app.post("/api/settings/api-tokens/{token_id}/revoke")
+@app.post("/api/tokens/{token_id}/revoke")
+def revoke_api_token(token_id: int):
+    return _revoke_api_token(token_id)
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
@@ -643,3 +776,171 @@ async def update_settings(payload: EngineSettings):
             stored = seal(value) if secret and value else value
             con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
     return {"saved":True,"embedding":health}
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_api_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """Authenticate the public API without accepting browser credentials.
+
+    ``HTTPBearer`` is used as a dependency rather than parsing the header by
+    hand so FastAPI advertises the authentication requirement in OpenAPI.
+    ``X-API-Key`` remains supported for clients that use API-key conventions.
+    """
+
+    candidate = credentials.credentials.strip() if credentials else ""
+    if not candidate and x_api_key:
+        candidate = x_api_key.strip()
+    if not candidate or any(character.isspace() for character in candidate):
+        raise HTTPException(
+            status_code=401,
+            detail="A valid API token is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    found = row(
+        "SELECT id,name FROM api_tokens "
+        "WHERE token_hash=? AND revoked_at IS NULL",
+        (hash_api_token(candidate),),
+    )
+    if not found:
+        raise HTTPException(
+            status_code=401,
+            detail="A valid API token is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    with transaction() as con:
+        con.execute(
+            "UPDATE api_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+            (found["id"],),
+        )
+    return found
+
+
+api_v1 = APIRouter(
+    prefix="/api/v1",
+    dependencies=[Depends(require_api_token)],
+    tags=["public-api"],
+)
+
+
+@api_v1.get("")
+def api_root():
+    return {
+        "name": "Bookward API",
+        "version": "1",
+        "authentication": "Bearer API token",
+        "documentation": "GET /openapi.json or /docs on the engine",
+        "endpoints": {
+            "overview": "GET /api/v1/overview",
+            "recommendations": "GET /api/v1/recommendations",
+            "feedback": "POST /api/v1/recommendations/{id}/feedback",
+            "sources": "GET /api/v1/sources",
+            "sync": "POST /api/v1/sync",
+        },
+    }
+
+
+@api_v1.get("/health")
+async def api_health():
+    return await health()
+
+
+@api_v1.get("/overview")
+def api_overview():
+    return overview_payload(include_api_tokens=False)
+
+
+@api_v1.get("/settings")
+def api_settings():
+    return safe_settings(include_api_tokens=False)
+
+
+@api_v1.get("/recommendations")
+def api_recommendations(
+    status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+):
+    recommendations = recommendation_list()
+    if status and status != "all":
+        recommendations = [item for item in recommendations if item["status"] == status]
+    return recommendations[:limit]
+
+
+@api_v1.post("/recommendations/bulk-feedback")
+def api_bulk_feedback(payload: BulkFeedbackIn):
+    return bulk_feedback(payload)
+
+
+@api_v1.post("/recommendations/{candidate_id}/feedback")
+def api_feedback(candidate_id: int, payload: FeedbackIn):
+    return feedback(candidate_id, payload)
+
+
+@api_v1.post("/recommendations/{candidate_id}/import")
+async def api_import_librarr(candidate_id: int):
+    return await import_librarr(candidate_id)
+
+
+@api_v1.get("/sources")
+def api_sources():
+    return rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+
+
+@api_v1.post("/sources/preview")
+async def api_source_preview(payload: UrlIn):
+    return await source_preview(payload)
+
+
+@api_v1.post("/sources")
+def api_add_source(payload: SourceIn):
+    return add_source(payload)
+
+
+@api_v1.put("/sources/{source_id}/toggle")
+def api_toggle_source(source_id: int):
+    return toggle_source(source_id)
+
+
+@api_v1.put("/sources/schedule")
+def api_update_source_schedule(payload: SourceScheduleIn):
+    return update_source_schedule(payload)
+
+
+@api_v1.post("/import/goodreads/rss")
+async def api_goodreads_rss(payload: UrlIn):
+    return await goodreads_rss(payload)
+
+
+@api_v1.post("/sync")
+async def api_sync():
+    return await sync()
+
+
+@api_v1.post("/score")
+async def api_score():
+    return await score()
+
+
+@api_v1.get("/jobs/{job_id}")
+def api_job(job_id: str):
+    return job(job_id)
+
+
+@api_v1.get("/librarr/search")
+async def api_librarr_search(
+    q: str = Query(min_length=2, max_length=200),
+    media_type: str = Query(default="audiobook"),
+):
+    return await search_librarr(q=q, media_type=media_type)
+
+
+@api_v1.post("/librarr/download")
+async def api_librarr_download(payload: LibrarrDownloadIn):
+    return await download_librarr(payload)
+
+
+app.include_router(api_v1)

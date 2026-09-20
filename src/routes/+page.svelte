@@ -15,7 +15,9 @@
     ChevronDown,
     CircleHelp,
     Compass,
+    Copy,
     ExternalLink,
+    KeyRound,
     Library,
     Link2,
     Mail,
@@ -26,6 +28,7 @@
     Settings2,
     Sparkles,
     TriangleAlert,
+    Trash2,
     Upload,
     X,
   } from "@lucide/svelte";
@@ -39,7 +42,7 @@
     icon: typeof Compass;
     shortLabel: string;
   };
-  type FormState = { message?: string; error?: boolean } | null | undefined;
+  type FormState = { message?: string; error?: boolean; token?: string } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
   type LibrarrResult = Record<string, unknown>;
@@ -1493,6 +1496,89 @@
                     >
                   </form>
                 </div>
+              </section>
+              <section
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
+              >
+                <div class="mb-5 flex items-start gap-3">
+                  <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
+                    ><KeyRound size={19} /></span
+                  >
+                  <div class="min-w-0 flex-1">
+                    <h2 class="text-lg font-semibold text-surface-950-50">API access</h2>
+                    <p class="mt-1 text-sm leading-6 text-surface-700-300">
+                      Connect automations and other apps to Bookward with a token. Tokens are shown only once when created.
+                    </p>
+                  </div>
+                </div>
+
+                <div class="mb-5 border border-surface-300-700/50 p-3 text-sm">
+                  <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
+                  <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
+                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
+                </div>
+
+                {#if formState?.token}
+                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
+                    <div class="flex items-start gap-3">
+                      <Check size={18} class="mt-0.5 shrink-0" />
+                      <div class="min-w-0 flex-1">
+                        <p class="font-semibold">Copy this token now</p>
+                        <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{formState.token}</code>
+                      </div>
+                      <button
+                        class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"
+                        type="button"
+                        title="Copy API token"
+                        aria-label="Copy API token"
+                        onclick={() => void navigator.clipboard?.writeText(formState?.token ?? "")}
+                      ><Copy size={14} /> Copy</button>
+                    </div>
+                  </div>
+                {/if}
+
+                <form method="POST" action="?/createApiToken" use:enhance={setPending("create-api-token")} class="flex flex-col gap-3 sm:flex-row sm:items-end">
+                  <label class="block min-w-0 flex-1 text-sm font-medium text-surface-800-200">
+                    Token name
+                    <input class="input mt-2" name="name" maxlength="100" placeholder="Home Assistant" required />
+                  </label>
+                  <button class="btn min-h-11 preset-filled-primary-500" type="submit" disabled={isPending("create-api-token")} aria-busy={isPending("create-api-token")}>
+                    {#if isPending("create-api-token")}<RefreshCw size={16} class="animate-spin" />{:else}<KeyRound size={16} />{/if} Generate token
+                  </button>
+                </form>
+
+                {#if data.profile.api_tokens.length}
+                  <div class="mt-6 border-t border-surface-300-700/40 pt-5">
+                    <h3 class="text-sm font-semibold text-surface-950-50">Existing tokens</h3>
+                    <ul class="mt-3 divide-y divide-surface-300-700/40 border border-surface-300-700/40">
+                      {#each data.profile.api_tokens as token (token.id)}
+                        <li class="flex flex-wrap items-center gap-3 p-3">
+                          <div class="min-w-0 flex-1">
+                            <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
+                            <p class="mt-1 text-xs text-surface-700-300"><code>{token.token_prefix}…</code> · Created {token.created_at}</p>
+                            {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
+                          </div>
+                          {#if token.revoked_at}
+                            <span class="badge preset-tonal-error">Revoked</span>
+                          {:else}
+                            <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`)}>
+                              <input type="hidden" name="id" value={token.id} />
+                              <button class="btn btn-sm min-h-9 preset-tonal-error" type="submit" disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>
+                                {#if isPending(`revoke-api-token-${token.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Trash2 size={14} />{/if} Revoke
+                              </button>
+                            </form>
+                          {/if}
+                        </li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
               </section>
               <section
                 in:fly={{

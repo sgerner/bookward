@@ -57,6 +57,22 @@ MIGRATIONS = [
             ON notification_deliveries(status, updated_at);
         """,
     ),
+    (
+        4,
+        """
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_prefix TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at TEXT,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_active
+            ON api_tokens(revoked_at, created_at DESC);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
