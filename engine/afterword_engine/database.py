@@ -132,6 +132,73 @@ MIGRATIONS = [
             ON recommendation_outcomes(read_id, attributed_at DESC);
         """,
     ),
+    (
+        6,
+        """
+        CREATE TABLE IF NOT EXISTS llm_connections (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL DEFAULT '',
+            auth_type TEXT NOT NULL DEFAULT 'api_key',
+            secret TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_status TEXT,
+            last_error TEXT,
+            last_used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(auth_type IN ('api_key'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_connections_enabled
+            ON llm_connections(enabled, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_policies (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            top_k INTEGER NOT NULL DEFAULT 20,
+            prompt_version TEXT NOT NULL DEFAULT 'shadow-v1',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(top_k BETWEEN 1 AND 100)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_policies_enabled
+            ON llm_policies(enabled, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_runs (
+            id TEXT PRIMARY KEY,
+            policy_id INTEGER NOT NULL REFERENCES llm_policies(id),
+            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
+            request_hash TEXT NOT NULL,
+            candidate_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_runs_policy_created
+            ON llm_runs(policy_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_llm_runs_request
+            ON llm_runs(request_hash, created_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_scores (
+            run_id TEXT NOT NULL REFERENCES llm_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+            rank INTEGER NOT NULL,
+            score REAL NOT NULL,
+            confidence REAL,
+            reason_codes TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY(run_id, candidate_id),
+            UNIQUE(run_id, rank)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_scores_candidate
+            ON llm_scores(candidate_id, run_id);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

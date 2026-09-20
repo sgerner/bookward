@@ -27,6 +27,8 @@ from .scoring import rebuild_all_embeddings, score_all
 from .secrets import seal, unseal
 from .librarr import download as librarr_download, normalize_media_type, search as librarr_search
 from .llm_catalog import get_catalog
+from .llm import validate_endpoint
+from .llm_shadow import run_shadow_policy, safe_connections, safe_policies
 from .digest import (
     digest_config,
     digest_is_due,
@@ -177,6 +179,12 @@ async def handle_job(kind: str):
     if kind.startswith("notification_retry:"):
         delivery_id = kind.partition(":")[2]
         return await retry_delivery(delivery_id, config)
+    if kind.startswith("llm_shadow:"):
+        try:
+            policy_id = int(kind.partition(":")[2])
+        except ValueError as exc:
+            raise ValueError("Invalid shadow policy job") from exc
+        return await run_shadow_policy(policy_id)
     if kind == "rebuild_embeddings":
         # Embedding vectors are model-specific. Rebuild the selected provider's
         # set first, then remove incompatible vectors only after success so an
@@ -351,6 +359,23 @@ class BulkFeedbackIn(BaseModel):
 
 class ApiTokenCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+
+
+class LLMConnectionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    model_id: str = Field(min_length=1, max_length=300)
+    endpoint: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=20_000)
+    enabled: bool = True
+
+
+class LLMPolicyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    connection_id: int = Field(gt=0)
+    top_k: int = Field(default=20, ge=1, le=100)
+    prompt_version: str = Field(default="shadow-v1", min_length=1, max_length=100)
+    enabled: bool = True
 
 class EngineSettings(BaseModel):
     embedding_backend: str = "local"
@@ -841,6 +866,8 @@ def safe_settings(*, include_api_tokens: bool = True):
         "librarr_media_type": media_type,
         "source_sync_interval_hours": source_sync_interval_hours(),
         "digest": digest,
+        "llm_connections": safe_connections(),
+        "llm_policies": safe_policies(),
     }
     if include_api_tokens:
         result["api_tokens"] = api_token_list()
@@ -898,6 +925,139 @@ async def llm_catalog(refresh: bool = Query(default=False)):
         return await get_catalog(force=refresh)
     except ValueError as exc:
         raise HTTPException(503, str(exc)) from exc
+
+
+def _llm_default_endpoint(provider_id: str) -> str:
+    return {
+        "openai": "https://api.openai.com/v1",
+        "anthropic": "https://api.anthropic.com/v1",
+    }.get(provider_id.strip().lower(), "")
+
+
+def _llm_connection_values(payload: LLMConnectionIn, current_key: str = "") -> tuple[str, str]:
+    provider_id = payload.provider_id.strip()
+    endpoint = validate_endpoint(payload.endpoint, default=_llm_default_endpoint(provider_id))
+    key = payload.api_key.strip() if payload.api_key is not None else current_key
+    if not key:
+        raise HTTPException(400, "An API key is required for this connection")
+    return endpoint, key
+
+
+@app.get("/api/llm/connections")
+def llm_connections():
+    return {"connections": safe_connections()}
+
+
+@app.post("/api/llm/connections")
+def create_llm_connection(payload: LLMConnectionIn):
+    try:
+        endpoint, key = _llm_connection_values(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,auth_type,secret,enabled) VALUES(?,?,?,?,?,?,?)",
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, "api_key", seal(key), int(payload.enabled)),
+        )
+    return {"id": cursor.lastrowid, "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid)}
+
+
+@app.put("/api/llm/connections/{connection_id}")
+def update_llm_connection(connection_id: int, payload: LLMConnectionIn):
+    current = row("SELECT * FROM llm_connections WHERE id=?", (connection_id,))
+    if not current:
+        raise HTTPException(404, "LLM connection not found")
+    try:
+        endpoint, key = _llm_connection_values(payload, unseal(current["secret"]) if current["secret"] else "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET name=?,provider_id=?,model_id=?,endpoint=?,auth_type='api_key',secret=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, seal(key), int(payload.enabled), connection_id),
+        )
+    return {"id": connection_id, "connection": next(item for item in safe_connections() if item["id"] == connection_id)}
+
+
+@app.delete("/api/llm/connections/{connection_id}")
+def disable_llm_connection(connection_id: int):
+    with transaction() as con:
+        changed = con.execute(
+            "UPDATE llm_connections SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (connection_id,),
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "LLM connection not found")
+    return {"id": connection_id, "enabled": False}
+
+
+@app.get("/api/llm/policies")
+def llm_policies():
+    return {"policies": safe_policies()}
+
+
+@app.post("/api/llm/policies")
+def create_llm_policy(payload: LLMPolicyIn):
+    if not row("SELECT id FROM llm_connections WHERE id=?", (payload.connection_id,)):
+        raise HTTPException(404, "LLM connection not found")
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO llm_policies(name,connection_id,enabled,top_k,prompt_version) VALUES(?,?,?,?,?)",
+            (payload.name.strip(), payload.connection_id, int(payload.enabled), payload.top_k, payload.prompt_version.strip()),
+        )
+    return {"id": cursor.lastrowid, "policy": next(item for item in safe_policies() if item["id"] == cursor.lastrowid)}
+
+
+@app.put("/api/llm/policies/{policy_id}")
+def update_llm_policy(policy_id: int, payload: LLMPolicyIn):
+    if not row("SELECT id FROM llm_policies WHERE id=?", (policy_id,)):
+        raise HTTPException(404, "LLM policy not found")
+    if not row("SELECT id FROM llm_connections WHERE id=?", (payload.connection_id,)):
+        raise HTTPException(404, "LLM connection not found")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_policies SET name=?,connection_id=?,enabled=?,top_k=?,prompt_version=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.name.strip(), payload.connection_id, int(payload.enabled), payload.top_k, payload.prompt_version.strip(), policy_id),
+        )
+    return {"id": policy_id, "policy": next(item for item in safe_policies() if item["id"] == policy_id)}
+
+
+@app.delete("/api/llm/policies/{policy_id}")
+def disable_llm_policy(policy_id: int):
+    with transaction() as con:
+        changed = con.execute(
+            "UPDATE llm_policies SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (policy_id,),
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "LLM policy not found")
+    return {"id": policy_id, "enabled": False}
+
+
+@app.post("/api/llm/policies/{policy_id}/run")
+def run_llm_policy(policy_id: int):
+    if not row("SELECT id FROM llm_policies WHERE id=?", (policy_id,)):
+        raise HTTPException(404, "LLM policy not found")
+    return {"job_id": enqueue_job(f"llm_shadow:{policy_id}", dedupe=True)}
+
+
+@app.get("/api/llm/runs")
+def llm_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return {"runs": rows("SELECT id,policy_id,connection_id,request_hash,candidate_hash,status,candidate_count,latency_ms,input_tokens,output_tokens,error,created_at,finished_at FROM llm_runs ORDER BY created_at DESC LIMIT ?", (limit,))}
+
+
+@app.get("/api/llm/runs/{run_id}")
+def llm_run(run_id: str):
+    found = row("SELECT id,policy_id,connection_id,request_hash,candidate_hash,status,candidate_count,latency_ms,input_tokens,output_tokens,error,created_at,finished_at FROM llm_runs WHERE id=?", (run_id,))
+    if not found:
+        raise HTTPException(404, "LLM run not found")
+    found["scores"] = rows("SELECT candidate_id,rank,score,confidence,reason_codes FROM llm_scores WHERE run_id=? ORDER BY rank", (run_id,))
+    for score in found["scores"]:
+        try:
+            score["reason_codes"] = json.loads(score["reason_codes"] or "[]")
+        except ValueError:
+            score["reason_codes"] = []
+    return found
 
 
 @app.post("/api/settings/api-tokens")
