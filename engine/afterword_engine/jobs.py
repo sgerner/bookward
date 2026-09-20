@@ -2,6 +2,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from .database import transaction
+from .security import safe_error_message
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -35,4 +36,4 @@ async def worker_loop(handler, stop):
             result = await handler(job["kind"])
             with transaction() as con: con.execute("UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=? WHERE id=?", (json.dumps(result), now(), job["id"]))
         except Exception as exc:
-            with transaction() as con: con.execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE id=?", (str(exc)[:2000], now(), job["id"]))
+            with transaction() as con: con.execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE id=?", (safe_error_message(exc, limit=2000), now(), job["id"]))

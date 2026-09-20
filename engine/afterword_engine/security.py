@@ -1,8 +1,35 @@
 import ipaddress
+import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata.google.internal"}
+_ERROR_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
+def _redact_error_url(match):
+    raw = match.group(0)
+    trailing = ""
+    while raw and raw[-1] in ".,;:)]}":
+        trailing = raw[-1] + trailing
+        raw = raw[:-1]
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        authority = hostname + port
+        path = "/[redacted]" if "/webhooks/" in parsed.path.casefold() else parsed.path
+        query = "[redacted]" if parsed.query else ""
+        return urlunsplit((parsed.scheme, authority, path, query, "")) + trailing
+    except ValueError:
+        return "[redacted URL]" + trailing
+
+
+def safe_error_message(error, limit=400):
+    """Keep provider failures useful without persisting URL credentials."""
+
+    message = str(error or "").strip() or "Request failed"
+    return _ERROR_URL_RE.sub(_redact_error_url, message)[:limit]
 
 def resolve_public_target(url: str, allow_http=False):
     parsed = urlparse(url)
