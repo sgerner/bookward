@@ -20,7 +20,16 @@ export function authorized(request: Request, username: string, password: string)
 }
 
 export function isPublicApiPath(pathname: string) {
-  return pathname === '/api/v1' || pathname.startsWith('/api/v1/');
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname).replaceAll('\\', '/');
+  } catch {
+    return false;
+  }
+  if (decoded.split('/').some((segment) => segment === '.' || segment === '..')) {
+    return false;
+  }
+  return decoded === '/api/v1' || decoded.startsWith('/api/v1/');
 }
 
 export const handle: Handle = async ({ event, resolve }) => {
