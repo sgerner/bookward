@@ -1,11 +1,12 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
+	import {
 	DEFAULT_MODE,
 	DEFAULT_THEME,
 	MODE_STORAGE_KEY,
 	THEME_LOADERS,
+	THEME_SWATCHES,
 	THEME_STORAGE_KEY,
 	THEMES,
 	applyTheme,
@@ -87,6 +88,13 @@ describe('theme preferences', () => {
 		const stylesheet = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
 		expect(stylesheet).toContain(`@import '@skeletonlabs/skeleton/themes/${DEFAULT_THEME}'`);
 		for (const theme of pickerThemes) expect(THEME_LOADERS[theme]).toEqual(expect.any(Function));
+		for (const theme of pickerThemes) {
+			const source = readFileSync(join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme}.css`), 'utf8');
+			for (const color of ['primary', 'secondary', 'tertiary'] as const) {
+				const value = source.match(new RegExp(`--color-${color}-500:\\s*([^;]+)`))?.[1]?.trim();
+				expect(value).toBe(THEME_SWATCHES[theme][color]);
+			}
+		}
 		for (const theme of pickerThemes.filter((theme) => theme !== DEFAULT_THEME)) {
 			expect(stylesheet).not.toContain(`@import '@skeletonlabs/skeleton/themes/${theme}'`);
 		}

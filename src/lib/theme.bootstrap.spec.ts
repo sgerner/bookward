@@ -11,7 +11,11 @@ type BootstrapRoot = {
 };
 
 const appHtml = readFileSync(join(process.cwd(), 'src/app.html'), 'utf8');
-const bootstrap = appHtml.match(/<script>\s*([\s\S]*?)\s*<\/script>/)?.[1];
+const scriptStart = appHtml.indexOf('<script>');
+const scriptEnd = scriptStart < 0 ? -1 : appHtml.indexOf('</script>', scriptStart + '<script>'.length);
+const bootstrap = scriptStart >= 0 && scriptEnd >= 0
+	? appHtml.slice(scriptStart + '<script>'.length, scriptEnd).trim()
+	: undefined;
 
 function executeBootstrap(options: {
 	readStorage?: (key: string) => string | null;
