@@ -33,5 +33,10 @@ class Settings(BaseSettings):
     llm_codex_home: str = "/data/codex-home"
     llm_claude_command: str = "claude"
     llm_subscription_timeout_seconds: float = 90.0
+    # Exploration is deliberately opt-in.  The ranking path and response
+    # order remain deterministic until an operator enables this flag.
+    exploration_enabled: bool = False
+    exploration_epsilon: float = 0.0
+    exploration_stable_top_k: int = 4
 
 settings = Settings()

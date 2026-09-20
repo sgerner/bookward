@@ -33,6 +33,50 @@ describe("page actions", () => {
     expect(result.profile.api_tokens).toEqual([]);
   });
 
+  it("persists an opaque session and forwards it with recommendation loads", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          recommendation_run_id: "run-1234",
+          recommendations: [],
+          history: [],
+          sources: [],
+          settings: {
+            embedding_backend: "local",
+            embedding_model: "hashing-768",
+            embedding_url: "",
+            embedding_api_key_set: false,
+            librarr_url: "",
+            librarr_api_key_set: false,
+            librarr_media_type: "audiobook",
+            digest: {},
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const cookies = {
+      get: vi.fn().mockReturnValue(undefined),
+      set: vi.fn(),
+    };
+    const result = (await load({
+      url: new URL("http://afterword.test/"),
+      cookies,
+    } as never)) as { recommendation_run_id: string };
+    expect(result.recommendation_run_id).toBe("run-1234");
+    expect(cookies.set).toHaveBeenCalledWith(
+      "bookward_session",
+      expect.any(String),
+      expect.objectContaining({ httpOnly: true, sameSite: "lax", path: "/" }),
+    );
+    expect(fetchMock.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ "x-bookward-session": expect.any(String) }),
+      }),
+    );
+  });
+
   it("creates and revokes API tokens through the engine actions", async () => {
     const fetchMock = vi
       .fn()
@@ -106,6 +150,27 @@ describe("page actions", () => {
         body: JSON.stringify({ action: "save" }),
       }),
     );
+  });
+
+  it("forwards the recommendation run with explicit feedback", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 7, status: "saved" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "7");
+    body.set("status", "saved");
+    body.set("run_id", "run-1234");
+    await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "save",
+      run_id: "run-1234",
+    });
   });
 
   it("does not save a custom source when preview finds no books", async () => {
