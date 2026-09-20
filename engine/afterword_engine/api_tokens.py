@@ -7,9 +7,12 @@ the Settings screen when a user needs to identify a token later.
 
 import hashlib
 import secrets
+from .secrets import installation_key
 
 
 TOKEN_PREFIX = "bkw_"
+TOKEN_HASH_SALT = b"bookward-api-token-v1:"
+TOKEN_HASH_ITERATIONS = 600_000
 
 
 def generate_api_token() -> str:
@@ -19,9 +22,14 @@ def generate_api_token() -> str:
 
 
 def hash_api_token(token: str) -> str:
-    """Hash a token for storage and lookup without retaining the secret."""
+    """Derive a slow, installation-bound digest without retaining the token."""
 
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        token.encode("utf-8"),
+        TOKEN_HASH_SALT + installation_key(),
+        TOKEN_HASH_ITERATIONS,
+    ).hex()
 
 
 def token_prefix(token: str) -> str:
