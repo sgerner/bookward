@@ -26,6 +26,7 @@ from .jobs import enqueue_job, worker_loop
 from .scoring import rebuild_all_embeddings, score_all
 from .secrets import seal, unseal
 from .librarr import download as librarr_download, normalize_media_type, search as librarr_search
+from .llm_catalog import get_catalog
 from .digest import (
     digest_config,
     digest_is_due,
@@ -765,6 +766,14 @@ def _revoke_api_token(token_id: int):
 @app.get("/api/tokens")
 def list_api_tokens():
     return {"tokens": api_token_list()}
+
+
+@app.get("/api/llm/catalog")
+async def llm_catalog(refresh: bool = Query(default=False)):
+    try:
+        return await get_catalog(force=refresh)
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.post("/api/settings/api-tokens")
