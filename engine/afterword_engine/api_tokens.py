@@ -11,6 +11,7 @@ from .secrets import installation_key
 
 
 TOKEN_PREFIX = "bkw_"
+TOKEN_MAX_LENGTH = 128
 TOKEN_HASH_SALT = b"bookward-api-token-v1:"
 TOKEN_HASH_ITERATIONS = 600_000
 

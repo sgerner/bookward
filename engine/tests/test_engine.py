@@ -544,6 +544,19 @@ def test_api_recommendation_status_filter_applies_before_limit(database):
         assert response.status_code == 200
         assert [item["title"] for item in response.json()] == ["Recommended 100"]
 
+def test_api_token_rejects_unbounded_and_wrong_prefix_candidates(database):
+    with TestClient(app) as client:
+        oversized = client.get(
+            "/api/v1/health",
+            headers={"Authorization": f"Bearer {'bkw_' + 'x' * 200}"},
+        )
+        wrong_prefix = client.get(
+            "/api/v1/health",
+            headers={"Authorization": "Bearer not-a-bookward-token"},
+        )
+
+    assert oversized.status_code == 401
+    assert wrong_prefix.status_code == 401
 
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
