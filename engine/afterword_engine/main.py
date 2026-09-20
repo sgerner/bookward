@@ -375,6 +375,7 @@ def recommendation_list(status: str | None = None, limit: int = 100):
     clauses = [
         "c.status!='rejected'",
         "(c.status IN ('saved','imported') OR s.enabled=1)",
+        "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
     ]
     params: list[Any] = []
     if status and status != "all":

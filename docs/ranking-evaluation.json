@@ -1,0 +1,68 @@
+{
+  "backend": "ollama",
+  "model": "qwen3-embedding:4b",
+  "works": 1766,
+  "excluded": {
+    "unrated": 50,
+    "undated": 0,
+    "missing_or_stale_vector": 15,
+    "duplicate_work": 3
+  },
+  "labels": "4-5 stars positive; 1-3 stars non-positive",
+  "protocol": "chronological 60/20/20 by unique work; whole-day boundaries; frozen formula",
+  "limitations": "One reader, title/author read documents; retrospective ranking among read books, not live acceptance.",
+  "validation": {
+    "training": 1059,
+    "held_out": 353,
+    "positive_rate": 0.24079320113314448,
+    "baseline": {
+      "auc": 0.578270412642669,
+      "precision_at_20": 0.35,
+      "ndcg_at_20": 0.5049049429868785
+    },
+    "neighborhood": {
+      "auc": 0.6404521510096576,
+      "precision_at_20": 0.55,
+      "ndcg_at_20": 0.6623786617772673
+    },
+    "auc_delta_bootstrap_95_percent": [
+      0.015066454415377885,
+      0.11023756189523105
+    ]
+  },
+  "test": {
+    "training": 1412,
+    "held_out": 354,
+    "positive_rate": 0.4406779661016949,
+    "baseline": {
+      "auc": 0.5905367780367781,
+      "precision_at_20": 0.65,
+      "ndcg_at_20": 0.6219356172802871
+    },
+    "neighborhood": {
+      "auc": 0.6289497539497539,
+      "precision_at_20": 0.85,
+      "ndcg_at_20": 0.8961432483707652
+    },
+    "auc_delta_bootstrap_95_percent": [
+      -0.00912418399912381,
+      0.08630027096858836
+    ]
+  },
+  "explicit_feedback_diagnostic": {
+    "usable_candidates": 47,
+    "saved": 27,
+    "excluded_candidates": 19,
+    "baseline": {
+      "auc": 0.5842592592592593,
+      "precision_at_20": 0.6,
+      "ndcg_at_20": 0.5220648027051961
+    },
+    "neighborhood": {
+      "auc": 0.6157407407407407,
+      "precision_at_20": 0.7,
+      "ndcg_at_20": 0.5693119029961257
+    },
+    "limitations": "Small intent sample, current metadata, no impression log; not a rating or live A/B test."
+  }
+}
