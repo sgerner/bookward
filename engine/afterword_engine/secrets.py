@@ -3,9 +3,9 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 
-def _fernet():
+def installation_key():
     configured = os.getenv("AFTERWORD_SECRET_KEY", "").encode()
-    if configured: return Fernet(configured)
+    if configured: return configured
     path = Path(settings.db).with_name("secret.key")
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -13,7 +13,9 @@ def _fernet():
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "wb") as handle: handle.write(Fernet.generate_key())
         except FileExistsError: pass
-    return Fernet(path.read_bytes().strip())
+    return path.read_bytes().strip()
+
+def _fernet(): return Fernet(installation_key())
 
 def seal(value: str): return "fernet:" + _fernet().encrypt(value.encode()).decode()
 

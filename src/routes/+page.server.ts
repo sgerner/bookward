@@ -47,6 +47,14 @@ type Overview = {
     librarr_media_type: "ebook" | "audiobook";
     source_sync_interval_hours: number;
     digest: DigestSettings;
+    api_tokens: Array<{
+      id: number;
+      name: string;
+      token_prefix: string;
+      created_at: string;
+      last_used_at: string | null;
+      revoked_at: string | null;
+    }>;
   };
 };
 
@@ -134,6 +142,11 @@ export const load: PageServerLoad = async ({ url }) => {
       ...overview.settings,
       source_sync_interval_hours: overview.settings.source_sync_interval_hours ?? 24,
       digest: overview.settings.digest,
+      // Keep the UI compatible while an already-running engine is being
+      // restarted onto the API-token migration.
+      api_tokens: Array.isArray(overview.settings.api_tokens)
+        ? overview.settings.api_tokens
+        : [],
     },
   };
 };
@@ -158,6 +171,37 @@ const publicUrl = (value: string) => {
 };
 
 export const actions: Actions = {
+  createApiToken: async ({ request }) => {
+    const name = z.string().trim().min(1).max(100).safeParse(
+      (await request.formData()).get("name"),
+    );
+    if (!name.success) return fail(400, { message: "Give the API token a name." });
+    try {
+      const result = await engine<{ token: string }>("/api/settings/api-tokens", {
+        method: "POST",
+        body: JSON.stringify({ name: name.data }),
+      });
+      return {
+        message: "API token created. Copy it now; it will not be shown again.",
+        token: result.token,
+      };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  revokeApiToken: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid API token." });
+    try {
+      await engine(`/api/settings/api-tokens/${id.data}`, {
+        method: "DELETE",
+        body: "",
+      });
+      return { message: "API token revoked." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
   decide: async ({ request }) => {
     const data = await request.formData();
     const id = idSchema.safeParse(data.get("id"));

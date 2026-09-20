@@ -219,6 +219,64 @@ def test_settings_encrypt_and_preserve_api_keys(database):
     assert stored["secret"] == 1 and stored["value"].startswith("fernet:") and "librarr-secret" not in stored["value"]
     assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
 
+
+def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
+    with TestClient(app) as client:
+        unauthorized = client.get("/api/v1/recommendations")
+        assert unauthorized.status_code == 401
+        assert unauthorized.headers["www-authenticate"] == "Bearer"
+        schema = client.get("/openapi.json").json()
+        assert schema["components"]["securitySchemes"]["HTTPBearer"] == {
+            "type": "http",
+            "scheme": "bearer",
+        }
+        assert schema["paths"]["/api/v1/recommendations"]["get"]["security"] == [
+            {"HTTPBearer": []}
+        ]
+        cross_origin = client.options(
+            "/api/v1/recommendations",
+            headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        assert cross_origin.headers.get("access-control-allow-origin") != "https://untrusted.example"
+        created = client.post("/api/settings/api-tokens", json={"name": "Home Assistant"})
+        assert created.status_code == 200
+        token = created.json()["token"]
+        assert token.startswith("bkw_")
+
+        listed = client.get("/api/settings/api-tokens").json()["tokens"]
+        assert listed[0]["name"] == "Home Assistant"
+        assert "token" not in listed[0]
+        stored = row("SELECT token_hash FROM api_tokens WHERE id=?", (created.json()["id"],))
+        assert stored["token_hash"] != token
+
+        authorized = client.get(
+            "/api/v1/recommendations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert authorized.status_code == 200
+        assert len(authorized.json()) == 4
+        assert row("SELECT last_used_at FROM api_tokens WHERE id=?", (created.json()["id"],))["last_used_at"]
+        public_overview = client.get(
+            "/api/v1/overview",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        assert "api_tokens" not in public_overview["settings"]
+        assert client.get(
+            "/api/v1/recommendations",
+            headers={"X-API-Key": token},
+        ).status_code == 200
+
+        revoked = client.delete(f"/api/settings/api-tokens/{created.json()['id']}")
+        assert revoked.status_code == 200
+        assert client.get(
+            "/api/v1/recommendations",
+            headers={"Authorization": f"Bearer {token}"},
+        ).status_code == 401
+
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
     with pytest.raises(ValueError): import_goodreads_csv(payload)
@@ -328,7 +386,10 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 3
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 4
+    assert row(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
+    )["name"] == "api_tokens"
     assert row("SELECT source_id FROM candidates LIMIT 1")["source_id"] != 1
 
 @respx.mock

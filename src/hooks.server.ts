@@ -19,7 +19,15 @@ export function authorized(request: Request, username: string, password: string)
   return equal(suppliedUser,username) && equal(suppliedPassword,password);
 }
 
+export function isPublicApiPath(pathname: string) {
+  return pathname === '/api/v1' || pathname.startsWith('/api/v1/');
+}
+
 export const handle: Handle = async ({ event, resolve }) => {
+  // The public API authenticates with a Bookward API token. Keep it separate
+  // from the optional browser Basic-auth prompt so integrations do not need
+  // to know deployment credentials.
+  if (isPublicApiPath(event.url.pathname)) return resolve(event);
   const password=env.AFTERWORD_AUTH_PASSWORD;
   if(!password) return resolve(event);
   const username=env.AFTERWORD_AUTH_USERNAME || 'bookward';
