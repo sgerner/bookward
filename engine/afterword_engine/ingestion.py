@@ -11,7 +11,7 @@ import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from .config import settings
-from .covers import is_weak_cover_url, resolve_book_metadata, resolve_cover_url, safe_cover_url
+from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, resolve_cover_url, safe_cover_url
 from .database import normalize_key, rows, transaction
 from .security import resolve_public_target
 
@@ -366,44 +366,57 @@ async def enrich_cover_urls(items):
     item receives a deterministic placeholder URL from ``resolve_cover_url``.
     """
 
+    if not items:
+        return []
     semaphore = asyncio.Semaphore(8)
 
-    async def enrich(item):
-        async with semaphore:
-            cover = await resolve_cover_url(
-                item["title"], item.get("author", "Unknown author"), item.get("cover_url", ""), item.get("source_url", "")
-            )
-            return {**item, "cover_url": cover}
+    async with metadata_client() as client:
+        async def enrich(item):
+            async with semaphore:
+                cover = await resolve_cover_url(
+                    item["title"],
+                    item.get("author", "Unknown author"),
+                    item.get("cover_url", ""),
+                    item.get("source_url", ""),
+                    client=client,
+                )
+                return {**item, "cover_url": cover}
 
-    return await asyncio.gather(*(enrich(item) for item in items))
+        return await asyncio.gather(*(enrich(item) for item in items))
 
 
 async def enrich_book_metadata(items):
     """Fill summaries and publication dates while preserving source metadata."""
 
+    if not items:
+        return []
     semaphore = asyncio.Semaphore(8)
+    lookup_cache = {}
 
-    async def enrich(item):
-        async with semaphore:
-            metadata = await resolve_book_metadata(
-                item["title"],
-                item.get("author", "Unknown author"),
-                item.get("cover_url", ""),
-                item.get("source_url", ""),
-                item.get("description", ""),
-                item.get("release_date", ""),
-            )
-            enriched = {**item, "cover_url": metadata["cover_url"]}
-            if not enriched.get("description") and metadata["description"]:
-                enriched["description"] = metadata["description"]
-            if not enriched.get("release_date") and metadata["release_date"]:
-                enriched["release_date"] = metadata["release_date"]
-                enriched["date_kind"] = metadata.get("date_kind") or "day"
-            elif enriched.get("release_date") and not enriched.get("date_kind"):
-                enriched["date_kind"] = "source"
-            return enriched
+    async with metadata_client() as client:
+        async def enrich(item):
+            async with semaphore:
+                metadata = await resolve_book_metadata(
+                    item["title"],
+                    item.get("author", "Unknown author"),
+                    item.get("cover_url", ""),
+                    item.get("source_url", ""),
+                    item.get("description", ""),
+                    item.get("release_date", ""),
+                    client=client,
+                    lookup_cache=lookup_cache,
+                )
+                enriched = {**item, "cover_url": metadata["cover_url"]}
+                if not enriched.get("description") and metadata["description"]:
+                    enriched["description"] = metadata["description"]
+                if not enriched.get("release_date") and metadata["release_date"]:
+                    enriched["release_date"] = metadata["release_date"]
+                    enriched["date_kind"] = metadata.get("date_kind") or "day"
+                elif enriched.get("release_date") and not enriched.get("date_kind"):
+                    enriched["date_kind"] = "source"
+                return enriched
 
-    return await asyncio.gather(*(enrich(item) for item in items))
+        return await asyncio.gather(*(enrich(item) for item in items))
 
 
 async def refresh_missing_candidate_metadata():
