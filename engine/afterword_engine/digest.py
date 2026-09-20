@@ -222,7 +222,8 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     query = (
         "SELECT c.*, s.name AS source_name FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
-        "WHERE c.status='recommended' AND c.score>=? AND COALESCE(s.enabled, 1)=1"
+        "WHERE c.status='recommended' AND c.score>=? AND COALESCE(s.enabled, 1)=1 "
+        "AND book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads)"
     )
     if not include_seen and config["only_new"]:
         query += " AND NOT EXISTS (SELECT 1 FROM digest_items d WHERE d.candidate_id=c.id)"

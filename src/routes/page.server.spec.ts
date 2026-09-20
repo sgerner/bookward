@@ -33,6 +33,50 @@ describe("page actions", () => {
     expect(result.profile.api_tokens).toEqual([]);
   });
 
+  it("persists an opaque session and forwards it with recommendation loads", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          recommendation_run_id: "run-1234",
+          recommendations: [],
+          history: [],
+          sources: [],
+          settings: {
+            embedding_backend: "local",
+            embedding_model: "hashing-768",
+            embedding_url: "",
+            embedding_api_key_set: false,
+            librarr_url: "",
+            librarr_api_key_set: false,
+            librarr_media_type: "audiobook",
+            digest: {},
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const cookies = {
+      get: vi.fn().mockReturnValue(undefined),
+      set: vi.fn(),
+    };
+    const result = (await load({
+      url: new URL("http://afterword.test/"),
+      cookies,
+    } as never)) as { recommendation_run_id: string };
+    expect(result.recommendation_run_id).toBe("run-1234");
+    expect(cookies.set).toHaveBeenCalledWith(
+      "bookward_session",
+      expect.any(String),
+      expect.objectContaining({ httpOnly: true, sameSite: "lax", path: "/" }),
+    );
+    expect(fetchMock.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ "x-bookward-session": expect.any(String) }),
+      }),
+    );
+  });
+
   it("creates and revokes API tokens through the engine actions", async () => {
     const fetchMock = vi
       .fn()
@@ -106,6 +150,27 @@ describe("page actions", () => {
         body: JSON.stringify({ action: "save" }),
       }),
     );
+  });
+
+  it("forwards the recommendation run with explicit feedback", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 7, status: "saved" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "7");
+    body.set("status", "saved");
+    body.set("run_id", "run-1234");
+    await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "save",
+      run_id: "run-1234",
+    });
   });
 
   it("does not save a custom source when preview finds no books", async () => {
@@ -295,5 +360,82 @@ describe("page actions", () => {
       ids: [7, 8],
       action: "save",
     });
+  });
+
+  it("loads the model catalog through the server action and refreshes on demand", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ providers: [{ id: "openai", models: [] }], stale: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("refresh", "on");
+    const result = await actions.loadLlmCatalog!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      llmCatalog: { providers: [{ id: "openai", models: [] }], stale: false },
+      message: "Model catalog loaded.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/llm/catalog?refresh=true");
+  });
+
+  it("saves connection secrets server-side without returning them to the form", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 3, connection: { id: 3, provider_id: "openai" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("name", "OpenAI ranking");
+    body.set("providerId", "openai");
+    body.set("modelId", "gpt-4.1-mini");
+    body.set("authType", "api_key");
+    body.set("apiKey", "sk-live-secret");
+    body.set("endpoint", "");
+    const result = await actions.saveLlmConnection!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "OpenAI ranking connection saved." });
+    const payload = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(payload).toMatchObject({ provider_id: "openai", model_id: "gpt-4.1-mini", api_key: "sk-live-secret" });
+    expect(JSON.stringify(result)).not.toContain("sk-live-secret");
+  });
+
+  it("starts device login and forwards only token-free status", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "pending", login_id: "login-1", user_code: "ABCD-1234", verification_url: "https://auth.example/device" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await actions.openaiDeviceLoginStart!({} as never);
+    expect(result).toEqual({
+      deviceLogin: { status: "pending", login_id: "login-1", user_code: "ABCD-1234", verification_url: "https://auth.example/device" },
+      message: "OpenAI device login started.",
+    });
+    expect(JSON.stringify(result)).not.toMatch(/token|secret/i);
+  });
+
+  it("queues a shadow run without exposing the engine job payload", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ job_id: "job-shadow-1234" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    const result = await actions.runLlmPolicy!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Shadow run queued (job-shad)." });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/llm/policies/9/run");
   });
 });

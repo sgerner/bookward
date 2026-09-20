@@ -34,13 +34,15 @@ def hash_api_token(token: str) -> str:
 
 
 def legacy_hash_api_token(token: str) -> str:
-    """Return the digest used before installation-bound token hashing.
+    """Return the SHA-256 digest used before installation-bound hashing.
 
-    This compatibility path is only used to recognize tokens stored by older
-    releases; successful authentication upgrades the row to PBKDF2 below.
+    This deliberately weak digest is retained only to recognize tokens stored
+    by pre-PBKDF2 releases; successful legacy authentication is upgraded to
+    ``hash_api_token`` immediately.
     """
 
-    # lgtm[py/weak-sensitive-data-hashing]
+    # This compatibility digest is only used to recognize pre-PBKDF2 records;
+    # successful authentication upgrades the stored value immediately.
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 

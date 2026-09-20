@@ -33,6 +33,10 @@
     X,
   } from "@lucide/svelte";
   import ThemePicker from "$lib/components/ThemePicker.svelte";
+  import LlmSettings from "$lib/components/LlmSettings.svelte";
+  import { copyApiTokenText } from "$lib/api-token-clipboard";
+  import { tokenForView } from "$lib/api-token-ui";
+  import { createTelemetryClient } from "$lib/telemetry";
   import bookwardMark from "$lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "sources" | "settings";
@@ -42,7 +46,14 @@
     icon: typeof Compass;
     shortLabel: string;
   };
-  type FormState = { message?: string; error?: boolean; token?: string } | null | undefined;
+  type FormState = {
+    message?: string;
+    error?: boolean;
+    token?: string;
+    llmCatalog?: any;
+    deviceLogin?: any;
+    llmRuns?: any[];
+  } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
   type LibrarrResult = Record<string, unknown>;
@@ -86,6 +97,9 @@
   let digestOnlyNewOverride = $state<boolean | null>(null);
   let digestDiscordOverride = $state<boolean | null>(null);
   let digestEmailOverride = $state<boolean | null>(null);
+  let apiTokenCopyMessage = $state<string | null>(null);
+  let revealedApiToken = $state<string | null>(null);
+  const telemetry = createTelemetryClient();
 
   const navItems: NavItem[] = [
     {
@@ -221,6 +235,7 @@
       : "discover";
   }
   function go(view: View) {
+    revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
@@ -460,6 +475,70 @@
     librarrSearchOpen = false;
   }
 
+  function recordBookEvent(
+    candidateId: number,
+    eventType: "visible" | "detail_open" | "source_open" | "librarr_search" | "librarr_import",
+    metadata: Record<string, unknown> = {},
+  ) {
+    const runId = String(data.recommendation_run_id || "");
+    telemetry.enqueue({
+      candidate_id: candidateId,
+      event_type: eventType,
+      ...(runId.length >= 8 ? { run_id: runId } : {}),
+      metadata,
+    });
+  }
+
+  function trackRecommendation(
+    node: HTMLElement,
+    detail: { candidateId: number },
+  ) {
+    let sent = false;
+    const markVisible = () => {
+      if (sent) return;
+      sent = true;
+      recordBookEvent(detail.candidateId, "visible");
+      observer?.disconnect();
+    };
+    const observer =
+      typeof IntersectionObserver === "undefined"
+        ? undefined
+        : new IntersectionObserver(
+            (entries) => {
+              if (entries.some((entry) => entry.isIntersecting)) markVisible();
+            },
+            { threshold: 0.25 },
+          );
+    if (observer) observer.observe(node);
+    else markVisible();
+    return {
+      destroy() {
+        observer?.disconnect();
+      },
+    };
+  }
+
+  async function copyApiToken() {
+    apiTokenCopyMessage = await copyApiTokenText(
+      revealedApiToken ?? "",
+      navigator.clipboard,
+    );
+  }
+
+  $effect(() => {
+    if (formState?.token) revealedApiToken = formState.token;
+    else if (formState) revealedApiToken = null;
+  });
+
+  $effect(() => {
+    const nextBooks = data.books;
+    if (previousDataBooks === nextBooks) return;
+    previousDataBooks = nextBooks;
+    additionalDiscoverBooks = [];
+    discoverHasMore = true;
+    discoverLoadError = "";
+  });
+
   $effect(() => {
     const nextBooks = data.books;
     if (previousDataBooks === nextBooks) return;
@@ -519,6 +598,7 @@
         q: query,
         media_type: librarrMediaType,
       });
+      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
       const response = await fetch(`/api/librarr/search?${params.toString()}`);
       const payload = (await response.json().catch(() => ({}))) as {
         results?: unknown[];
@@ -555,6 +635,7 @@
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
       librarrAdded = new Set([...librarrAdded, index]);
+      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
     } catch (error) {
       librarrSearchError =
@@ -568,9 +649,11 @@
 
   onMount(() => {
     const onPopState = () => {
-      activeView = readView(
+      const nextView = readView(
         new URL(window.location.href).searchParams.get("view"),
       );
+      revealedApiToken = tokenForView(nextView, revealedApiToken);
+      activeView = nextView;
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
     const onKeydown = (event: KeyboardEvent) => {
@@ -616,6 +699,7 @@
               const body = new URLSearchParams({
                 id: String(id),
                 status: "saved",
+                run_id: String(data.recommendation_run_id || ""),
               });
               const response = await fetch("?/decide", {
                 method: "POST",
@@ -640,6 +724,8 @@
     }
     return () => {
       lifecycle.abort();
+      void telemetry.flush({ beacon: true });
+      telemetry.destroy();
       window.removeEventListener("popstate", onPopState);
       window.removeEventListener("keydown", onKeydown);
     };
@@ -804,6 +890,7 @@
               <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
+                  <input type="hidden" name="run_id" value={data.recommendation_run_id} />
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -819,6 +906,7 @@
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             <article
+              use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
@@ -865,6 +953,7 @@
                       href={book.source_url}
                       target="_blank"
                       rel="noreferrer"
+                      onclick={() => recordBookEvent(book.id, "source_open")}
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
                 </div>
@@ -875,7 +964,11 @@
                 <details
                   class="group/details text-base text-surface-700-300"
                   open={detailsId === book.id}
-                  ontoggle={(event) => (detailsId = (event.currentTarget as HTMLDetailsElement).open ? book.id : null)}
+                  ontoggle={(event) => {
+                    const open = (event.currentTarget as HTMLDetailsElement).open;
+                    if (open) recordBookEvent(book.id, "detail_open");
+                    detailsId = open ? book.id : null;
+                  }}
                 >
                   <summary class="flex min-h-11 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
                     <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
@@ -892,10 +985,10 @@
                   {#if book.status === "recommended"}
                     {#if data.profile.librar_connected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
                     </form>
                   {:else if book.status === "saved"}
                     {#if data.profile.librar_connected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
@@ -903,7 +996,7 @@
                       <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" disabled={!data.profile.librar_connected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {data.profile.librar_connected ? `Add ${data.profile.librarr_media_type === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                     </form>
                   {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-11 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
                 </div>
@@ -1575,23 +1668,26 @@
                   <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
-                {#if formState?.token}
+                {#if revealedApiToken}
                   <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
                     <div class="flex items-start gap-3">
                       <Check size={18} class="mt-0.5 shrink-0" />
                       <div class="min-w-0 flex-1">
                         <p class="font-semibold">Copy this token now</p>
                         <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
-                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{formState.token}</code>
+                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
                         class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"
                         type="button"
                         title="Copy API token"
                         aria-label="Copy API token"
-                        onclick={() => void navigator.clipboard?.writeText(formState?.token ?? "")}
+                        onclick={() => void copyApiToken()}
                       ><Copy size={14} /> Copy</button>
                     </div>
+                    {#if apiTokenCopyMessage}
+                      <p class="mt-3 text-xs" role="status">{apiTokenCopyMessage}</p>
+                    {/if}
                   </div>
                 {/if}
 
@@ -1765,6 +1861,12 @@
                   </div>
                 {/if}
               </section>
+              <LlmSettings
+                llm={data.llm}
+                formState={formState}
+                {setPending}
+                {isPending}
+              />
               <section
                 in:fly={{
                   y: 12,

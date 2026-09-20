@@ -6,10 +6,10 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
 from .database import connect, initialize, row, rows, transaction
 from .api_tokens import (
@@ -28,6 +28,17 @@ from .jobs import enqueue_job, worker_loop
 from .scoring import rebuild_all_embeddings, score_all
 from .secrets import seal, unseal
 from .librarr import download as librarr_download, normalize_media_type, search as librarr_search
+from .llm_catalog import get_catalog
+from .llm import validate_endpoint
+from .llm_shadow import run_shadow_policy, safe_connections, safe_policies
+from .llm_subscriptions import (
+    AUTH_TYPE_API_KEY,
+    AUTH_TYPE_CLAUDE_CODE,
+    AUTH_TYPE_OPENAI_CODEX,
+    codex_login_manager,
+    normalize_auth_type,
+)
+from .exploration import epsilon_tail_explore
 from .digest import (
     digest_config,
     digest_is_due,
@@ -37,14 +48,25 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .learning import (
+    EVENT_TYPES,
+    create_recommendation_run,
+    record_event_in_connection,
+    record_events,
+)
+from .associations import run_association_provider
+from .association_sources.openlibrary import OpenLibraryListProvider
+from .association_sources.librarything import LibraryThingProvider
+from .association_sources.google_books import GoogleBooksAssociatedProvider
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
+SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 
 
-def source_sync_interval_hours(private=None):
+def source_sync_interval_hours():
     """Return the persisted permanent-source cadence in hours.
 
     ``0`` means manual-only. Keeping the value in SQLite makes the schedule
@@ -52,8 +74,7 @@ def source_sync_interval_hours(private=None):
     useful first-install default.
     """
 
-    values = private if private is not None else private_settings()
-    raw = values.get(
+    raw = private_settings().get(
         "source_sync_interval_hours", str(settings.source_sync_interval_hours)
     )
     try:
@@ -71,7 +92,7 @@ def source_sync_is_due():
         return False
     now = datetime.now(timezone.utc)
     sources = rows(
-        "SELECT last_scanned_at FROM sources "
+        "SELECT last_scanned_at,last_status FROM sources "
         "WHERE enabled=1 AND kind!='builtin' AND lifecycle='permanent'"
     )
     for source in sources:
@@ -85,6 +106,10 @@ def source_sync_is_due():
             return True
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
+        if str(source["last_status"] or "").startswith("error:"):
+            if now - last >= timedelta(seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS):
+                return True
+            continue
         if now - last >= timedelta(hours=interval):
             return True
     return False
@@ -168,6 +193,46 @@ async def handle_job(kind: str):
     if kind.startswith("notification_retry:"):
         delivery_id = kind.partition(":")[2]
         return await retry_delivery(delivery_id, config)
+    if kind.startswith("llm_shadow:"):
+        try:
+            policy_id = int(kind.partition(":")[2])
+        except ValueError as exc:
+            raise ValueError("Invalid shadow policy job") from exc
+        return await run_shadow_policy(policy_id)
+    if kind.startswith("association:"):
+        provider_name = kind.partition(":")[2]
+        provider_settings = safe_association_settings()
+        reads = rows("SELECT * FROM reads ORDER BY id")
+        if provider_name == "openlibrary":
+            if not provider_settings["openlibrary_enabled"]:
+                return {"skipped": "disabled", "provider": provider_name}
+            provider = OpenLibraryListProvider()
+            result = await run_association_provider(provider, reads)
+        elif provider_name == "librarything":
+            if not provider_settings["librarything_enabled"]:
+                return {"skipped": "disabled", "provider": provider_name}
+            api_key = config.get("association_librarything_api_key", "")
+            if not api_key:
+                raise ValueError("LibraryThing API key is not configured")
+            provider = LibraryThingProvider(api_key)
+            result = await run_association_provider(provider, reads)
+        elif provider_name == "google_books":
+            # Google results remain process-memory-only. The job records a
+            # provider run and counts edges but never stores Google content.
+            provider = GoogleBooksAssociatedProvider(
+                config.get("association_google_books_api_key", "")
+            )
+            result = await run_association_provider(provider, reads, persist=False)
+        else:
+            raise ValueError("Unknown association provider")
+        return {
+            "run_id": result.id,
+            "provider": result.provider,
+            "status": result.status,
+            "seeds": result.seeds,
+            "edges": result.edges,
+            "persisted": result.persisted,
+        }
     if kind == "rebuild_embeddings":
         # Embedding vectors are model-specific. Rebuild the selected provider's
         # set first, then remove incompatible vectors only after success so an
@@ -299,16 +364,78 @@ class DigestTestIn(BaseModel):
     channel: Literal["discord", "email"] | None = None
 
 class UrlIn(BaseModel): url: HttpUrl
-class FeedbackIn(BaseModel): action: str
+
+
+class FeedbackIn(BaseModel):
+    action: str
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class TelemetryEventIn(BaseModel):
+    event_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+    candidate_id: int = Field(gt=0)
+    event_type: str
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+    value: float | None = None
+    source: str = Field(default="ui", min_length=1, max_length=32)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("event_type")
+    @classmethod
+    def valid_event_type(cls, value: str) -> str:
+        if value not in EVENT_TYPES - {"save", "reject", "restore", "read"}:
+            raise ValueError("Unsupported recommendation event type")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def valid_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 32:
+            raise ValueError("Event metadata must have at most 32 fields")
+        return value
+
+
+class TelemetryBatchIn(BaseModel):
+    events: list[TelemetryEventIn] = Field(min_length=1, max_length=100)
 
 
 class BulkFeedbackIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["save", "reject", "restore"]
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class ApiTokenCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+
+
+class LLMConnectionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    model_id: str = Field(min_length=1, max_length=300)
+    endpoint: str = Field(default="", max_length=500)
+    auth_type: str = Field(default=AUTH_TYPE_API_KEY, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    api_key: str | None = Field(default=None, max_length=20_000)
+    oauth_token: str | None = Field(default=None, max_length=20_000)
+    enabled: bool = True
+
+
+class OpenAIDeviceLoginCancelIn(BaseModel):
+    login_id: str = Field(min_length=1, max_length=200)
+
+
+class ClaudeOAuthTokenIn(BaseModel):
+    connection_id: int = Field(gt=0)
+    oauth_token: str | None = Field(default=None, min_length=1, max_length=20_000)
+    token: str | None = Field(default=None, min_length=1, max_length=20_000)
+
+
+class LLMPolicyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    connection_id: int = Field(gt=0)
+    top_k: int = Field(default=20, ge=1, le=100)
+    prompt_version: str = Field(default="shadow-v1", min_length=1, max_length=100)
+    enabled: bool = True
 
 class EngineSettings(BaseModel):
     embedding_backend: str = "local"
@@ -331,43 +458,80 @@ class EngineSettings(BaseModel):
             allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
             validate_service_url(self.librarr_url, allowed)
 
-def api_token_list(connection=None):
+
+class AssociationSettingsIn(BaseModel):
+    openlibrary_enabled: bool = False
+    openlibrary_contact: str = Field(default="", max_length=200)
+    librarything_enabled: bool = False
+    librarything_api_key: str | None = Field(default=None, max_length=500)
+    google_books_api_key: str | None = Field(default=None, max_length=500)
+
+
+def api_token_list():
     """Return token metadata without ever returning a token value."""
 
-    query = (
+    return rows(
         "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
         "FROM api_tokens ORDER BY created_at DESC, id DESC"
     )
-    return (
-        [dict(item) for item in connection.execute(query).fetchall()]
-        if connection is not None
-        else rows(query)
+
+
+def tracked_recommendations(
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    connection=None,
+    recommended_limit: int | None = None,
+    session_id: str = "",
+):
+    recommendations = recommendation_list(
+        connection,
+        status=status,
+        limit=limit,
+        offset=offset,
+        recommended_limit=recommended_limit,
     )
+    # Keep exploration outside the scorer and behind an environment flag.  A
+    # disabled deployment receives the same deterministic order and scores as
+    # before, while enabled traffic records exact tail propensities.
+    if settings.exploration_enabled:
+        recommendations = epsilon_tail_explore(
+            recommendations,
+            epsilon=settings.exploration_epsilon,
+            stable_top_k=settings.exploration_stable_top_k,
+        )
+    run_id = create_recommendation_run(
+        recommendations,
+        session_id=session_id,
+        status=status,
+        limit=limit,
+    )
+    return recommendations, run_id
 
 
-def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None):
+def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None, session_id: str = ""):
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
             for name in ("reads", "candidates", "sources")
         }
+        recommendations, run_id = tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            session_id=session_id,
+        )
         return {
             "counts": counts,
-            "recommendations": recommendation_list(
-                connection, recommended_limit=recommendation_limit
-            ),
-            "sources": [
-                dict(item)
-                for item in connection.execute(
-                    "SELECT * FROM sources ORDER BY is_default DESC,name"
-                ).fetchall()
-            ],
-            "history": [
-                dict(item)
-                for item in connection.execute(
-                    "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
-                ).fetchall()
-            ],
+            "recommendations": recommendations,
+            "recommendation_run_id": run_id,
+            "sources": [dict(item) for item in connection.execute(
+                "SELECT * FROM sources ORDER BY is_default DESC,name"
+            ).fetchall()],
+            "history": [dict(item) for item in connection.execute(
+                "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+            ).fetchall()],
             "settings": safe_settings(
                 include_api_tokens=include_api_tokens,
                 connection=connection,
@@ -390,8 +554,11 @@ async def health():
 
 
 @app.get("/api/overview")
-def overview(recommendation_limit: int | None = Query(default=None, ge=1, le=100)):
-    return overview_payload(recommendation_limit=recommendation_limit)
+def overview(
+    recommendation_limit: int | None = Query(default=None, ge=1, le=100),
+    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
+):
+    return overview_payload(recommendation_limit=recommendation_limit, session_id=x_bookward_session or "")
 
 def _recommendation_rows(
     connection=None,
@@ -403,6 +570,7 @@ def _recommendation_rows(
     clauses = [
         "c.status!='rejected'",
         "(c.status IN ('saved','imported') OR s.enabled=1)",
+        "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
     ]
     params: list[object] = []
     if statuses:
@@ -457,11 +625,20 @@ def recommendation_list(
 
 @app.get("/api/recommendations")
 def recommendations(
+    response: Response,
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
+    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
 ):
-    return recommendation_list(status=status, limit=limit, offset=offset)
+    values, run_id = tracked_recommendations(
+        status=status,
+        limit=limit,
+        offset=offset,
+        session_id=x_bookward_session or "",
+    )
+    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    return values
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
 def feedback(candidate_id: int, payload: FeedbackIn):
@@ -470,7 +647,25 @@ def feedback(candidate_id: int, payload: FeedbackIn):
     with transaction() as con:
         if not con.execute("SELECT 1 FROM candidates WHERE id=?", (candidate_id,)).fetchone(): raise HTTPException(404, "Recommendation not found")
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
-        con.execute("INSERT INTO feedback(candidate_id,action) VALUES(?,?)", (candidate_id,payload.action))
+        feedback_id = con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            (candidate_id, payload.action),
+        ).lastrowid
+        label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
+        try:
+            record_event_in_connection(
+                con,
+                event_key=f"feedback:{feedback_id}",
+                candidate_id=candidate_id,
+                event_type=payload.action,
+                run_id=payload.run_id,
+                source="ui",
+                label=label,
+                label_kind="explicit_feedback" if label is not None else None,
+                confidence=0.8 if payload.run_id and label is not None else 0.5,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"id":candidate_id,"status":status}
 
 
@@ -486,8 +681,49 @@ def bulk_feedback(payload: BulkFeedbackIn):
         }
         for candidate_id in found:
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
-            con.execute("INSERT INTO feedback(candidate_id,action) VALUES(?,?)", (candidate_id, payload.action))
+            feedback_id = con.execute(
+                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                (candidate_id, payload.action),
+            ).lastrowid
+            label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
+            try:
+                record_event_in_connection(
+                    con,
+                    event_key=f"feedback:{feedback_id}",
+                    candidate_id=candidate_id,
+                    event_type=payload.action,
+                    run_id=payload.run_id,
+                    source="ui",
+                    label=label,
+                    label_kind="explicit_feedback" if label is not None else None,
+                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
     return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
+
+
+def telemetry_events(payload: TelemetryBatchIn):
+    try:
+        return record_events(
+            {
+                "event_key": event.event_key,
+                "candidate_id": event.candidate_id,
+                "event_type": event.event_type,
+                "run_id": event.run_id,
+                "value": event.value,
+                "source": event.source,
+                "metadata": event.metadata,
+            }
+            for event in payload.events
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/telemetry/events")
+def post_telemetry_events(payload: TelemetryBatchIn):
+    return telemetry_events(payload)
 
 @app.post("/api/recommendations/{candidate_id}/import")
 async def import_librarr(candidate_id: int):
@@ -754,12 +990,135 @@ def job(job_id:str):
     if not found: raise HTTPException(404,"Job not found")
     return found
 
+
+@app.get("/api/associations/settings")
+def association_settings():
+    return safe_association_settings()
+
+
+@app.put("/api/associations/settings")
+def update_association_settings(payload: AssociationSettingsIn):
+    current = private_settings()
+    values = {
+        "association_openlibrary_enabled": "1" if payload.openlibrary_enabled else "0",
+        "association_openlibrary_contact": payload.openlibrary_contact.strip(),
+        "association_librarything_enabled": "1" if payload.librarything_enabled else "0",
+        "association_librarything_api_key": (
+            current.get("association_librarything_api_key", "")
+            if payload.librarything_api_key is None
+            else payload.librarything_api_key.strip()
+        ),
+        "association_google_books_api_key": (
+            current.get("association_google_books_api_key", "")
+            if payload.google_books_api_key is None
+            else payload.google_books_api_key.strip()
+        ),
+    }
+    if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
+        raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    with transaction() as con:
+        for key, value in values.items():
+            secret = key.endswith("api_key")
+            stored = seal(value) if secret and value else value
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
+                (key, stored, 1 if secret else 0),
+            )
+    return {"saved": True, "associations": safe_association_settings()}
+
+
+def _association_provider_name(value: str) -> str:
+    provider = value.strip().casefold()
+    aliases = {
+        "openlibrary": "openlibrary",
+        "openlibrary_lists": "openlibrary",
+        "librarything": "librarything",
+        "librarything_multirecommendations": "librarything",
+        "google": "google_books",
+        "google_books": "google_books",
+        "google_books_associated": "google_books",
+    }
+    normalized = aliases.get(provider)
+    if not normalized:
+        raise HTTPException(404, "Unknown association provider")
+    return normalized
+
+
+@app.post("/api/associations/{provider}/run")
+def run_associations(provider: str):
+    normalized = _association_provider_name(provider)
+    configured = safe_association_settings()
+    if normalized == "librarything":
+        if not configured["librarything_enabled"]:
+            raise HTTPException(409, "Enable LibraryThing associations first")
+        if not configured["librarything_api_key_set"]:
+            raise HTTPException(409, "Configure a LibraryThing API key first")
+    if normalized == "openlibrary" and not configured["openlibrary_enabled"]:
+        raise HTTPException(409, "Enable Open Library associations first")
+    return {"job_id": enqueue_job(f"association:{normalized}")}
+
+
+@app.post("/api/associations/google_books/preview")
+async def preview_google_book_associations():
+    """Return ephemeral Google associations without writing provider content."""
+
+    config = private_settings()
+    provider = GoogleBooksAssociatedProvider(config.get("association_google_books_api_key", ""))
+    try:
+        associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+    return {
+        "provider": provider.provider,
+        "count": len(associations),
+        "results": [
+            {
+                "title": item.title,
+                "author": item.author,
+                "rank": item.rank,
+                "source_url": item.source_url,
+                "metadata": dict(item.metadata),
+            }
+            for item in associations
+        ],
+        "persistent": False,
+    }
+
+
+@app.get("/api/associations/runs")
+def association_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return {
+        "runs": rows(
+            "SELECT id,provider,status,seed_count,edge_count,error,started_at,finished_at "
+            "FROM association_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        ),
+        "librarything_requests_today": rows(
+            "SELECT COUNT(*) AS count FROM association_requests "
+            "WHERE provider=? AND requested_at>=date('now')",
+            ("librarything_multirecommendations",),
+        )[0]["count"],
+    }
+
 def private_settings(connection=None):
-    query = "SELECT key,value,secret FROM settings"
-    items = connection.execute(query).fetchall() if connection is not None else rows(query)
+    items = connection.execute("SELECT key,value,secret FROM settings").fetchall() if connection is not None else rows("SELECT key,value,secret FROM settings")
     return {
         item["key"]: unseal(item["value"]) if item["secret"] else item["value"]
         for item in items
+    }
+
+
+def safe_association_settings(connection=None):
+    private = private_settings(connection)
+    return {
+        "openlibrary_enabled": private.get("association_openlibrary_enabled", "0") == "1",
+        "openlibrary_contact": private.get(
+            "association_openlibrary_contact", settings.openlibrary_contact
+        ),
+        "librarything_enabled": private.get("association_librarything_enabled", "0") == "1",
+        "librarything_api_key_set": bool(private.get("association_librarything_api_key")),
+        "google_books_api_key_set": bool(private.get("association_google_books_api_key")),
     }
 
 
@@ -778,11 +1137,14 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "librarr_url": private.get("librarr_url", ""),
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
         "librarr_media_type": media_type,
-        "source_sync_interval_hours": source_sync_interval_hours(private),
+        "source_sync_interval_hours": source_sync_interval_hours(),
         "digest": digest,
+        "llm_connections": safe_connections(),
+        "llm_policies": safe_policies(),
+        "associations": safe_association_settings(connection),
     }
     if include_api_tokens:
-        result["api_tokens"] = api_token_list(connection)
+        result["api_tokens"] = api_token_list()
     return result
 
 
@@ -829,6 +1191,222 @@ def _revoke_api_token(token_id: int):
 @app.get("/api/tokens")
 def list_api_tokens():
     return {"tokens": api_token_list()}
+
+
+@app.get("/api/llm/catalog")
+async def llm_catalog(refresh: bool = Query(default=False)):
+    try:
+        return await get_catalog(force=refresh)
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/llm/openai/device/status")
+@app.get("/api/llm/subscriptions/openai/device/status")
+@app.get("/api/llm/openai/device-code/status")
+@app.get("/api/llm/subscriptions/openai/device-code/status")
+def openai_device_login_status():
+    return codex_login_manager().status()
+
+
+@app.post("/api/llm/openai/device/start")
+@app.post("/api/llm/subscriptions/openai/device/start")
+@app.post("/api/llm/openai/device-code/start")
+@app.post("/api/llm/subscriptions/openai/device-code/start")
+def openai_device_login_start():
+    try:
+        return codex_login_manager().start()
+    except Exception as exc:
+        # Provider diagnostics can contain implementation details or command
+        # paths.  Keep the API error generic and token-free.
+        raise HTTPException(503, "OpenAI device login is unavailable") from exc
+
+
+@app.post("/api/llm/openai/device/cancel")
+@app.post("/api/llm/subscriptions/openai/device/cancel")
+@app.post("/api/llm/openai/device-code/cancel")
+@app.post("/api/llm/subscriptions/openai/device-code/cancel")
+def openai_device_login_cancel(payload: OpenAIDeviceLoginCancelIn):
+    try:
+        return codex_login_manager().cancel(payload.login_id)
+    except KeyError as exc:
+        raise HTTPException(404, "OpenAI device login was not found") from exc
+    except Exception as exc:
+        raise HTTPException(503, "OpenAI device login cancellation is unavailable") from exc
+
+
+@app.post("/api/llm/openai/device/logout")
+@app.post("/api/llm/subscriptions/openai/device/logout")
+@app.post("/api/llm/openai/device-code/logout")
+@app.post("/api/llm/subscriptions/openai/device-code/logout")
+def openai_device_logout():
+    return codex_login_manager().logout()
+
+
+@app.post("/api/llm/claude/oauth")
+@app.post("/api/llm/subscriptions/claude/oauth")
+def set_claude_oauth_token(payload: ClaudeOAuthTokenIn):
+    connection = row("SELECT * FROM llm_connections WHERE id=?", (payload.connection_id,))
+    if not connection:
+        raise HTTPException(404, "LLM connection not found")
+    if connection["provider_id"].strip().lower() != "anthropic":
+        raise HTTPException(400, "Claude OAuth requires the anthropic provider")
+    token = (payload.oauth_token or payload.token or "").strip()
+    if not token:
+        raise HTTPException(400, "A Claude OAuth token is required")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET auth_type=?,secret=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (AUTH_TYPE_CLAUDE_CODE, seal(token), payload.connection_id),
+        )
+    return {"id": payload.connection_id, "connection": next(item for item in safe_connections() if item["id"] == payload.connection_id)}
+
+
+def _llm_default_endpoint(provider_id: str) -> str:
+    return {
+        "openai": "https://api.openai.com/v1",
+        "anthropic": "https://api.anthropic.com/v1",
+    }.get(provider_id.strip().lower(), "")
+
+
+def _llm_connection_values(payload: LLMConnectionIn, current_key: str = "") -> tuple[str, str, str]:
+    provider_id = payload.provider_id.strip()
+    auth_type = normalize_auth_type(payload.auth_type)
+    endpoint = validate_endpoint(payload.endpoint, default=_llm_default_endpoint(provider_id))
+    if auth_type == AUTH_TYPE_OPENAI_CODEX and provider_id.lower() != "openai":
+        raise HTTPException(400, "OpenAI Codex auth requires the openai provider")
+    if auth_type == AUTH_TYPE_CLAUDE_CODE and provider_id.lower() != "anthropic":
+        raise HTTPException(400, "Claude Code auth requires the anthropic provider")
+    if auth_type == AUTH_TYPE_OPENAI_CODEX:
+        return endpoint, "", auth_type
+    if auth_type == AUTH_TYPE_CLAUDE_CODE:
+        key = payload.oauth_token.strip() if payload.oauth_token is not None else (
+            payload.api_key.strip() if payload.api_key is not None else current_key
+        )
+        if not key:
+            raise HTTPException(400, "A Claude OAuth token is required for this connection")
+        return endpoint, key, auth_type
+    key = payload.api_key.strip() if payload.api_key is not None else current_key
+    if not key:
+        raise HTTPException(400, "An API key is required for this connection")
+    return endpoint, key, auth_type
+
+
+@app.get("/api/llm/connections")
+def llm_connections():
+    return {"connections": safe_connections()}
+
+
+@app.post("/api/llm/connections")
+def create_llm_connection(payload: LLMConnectionIn):
+    try:
+        endpoint, key, auth_type = _llm_connection_values(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,auth_type,secret,enabled) VALUES(?,?,?,?,?,?,?)",
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled)),
+        )
+    return {"id": cursor.lastrowid, "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid)}
+
+
+@app.put("/api/llm/connections/{connection_id}")
+def update_llm_connection(connection_id: int, payload: LLMConnectionIn):
+    current = row("SELECT * FROM llm_connections WHERE id=?", (connection_id,))
+    if not current:
+        raise HTTPException(404, "LLM connection not found")
+    try:
+        endpoint, key, auth_type = _llm_connection_values(payload, unseal(current["secret"]) if current["secret"] else "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET name=?,provider_id=?,model_id=?,endpoint=?,auth_type=?,secret=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled), connection_id),
+        )
+    return {"id": connection_id, "connection": next(item for item in safe_connections() if item["id"] == connection_id)}
+
+
+@app.delete("/api/llm/connections/{connection_id}")
+def disable_llm_connection(connection_id: int):
+    with transaction() as con:
+        changed = con.execute(
+            "UPDATE llm_connections SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (connection_id,),
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "LLM connection not found")
+    return {"id": connection_id, "enabled": False}
+
+
+@app.get("/api/llm/policies")
+def llm_policies():
+    return {"policies": safe_policies()}
+
+
+@app.post("/api/llm/policies")
+def create_llm_policy(payload: LLMPolicyIn):
+    if not row("SELECT id FROM llm_connections WHERE id=?", (payload.connection_id,)):
+        raise HTTPException(404, "LLM connection not found")
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO llm_policies(name,connection_id,enabled,top_k,prompt_version) VALUES(?,?,?,?,?)",
+            (payload.name.strip(), payload.connection_id, int(payload.enabled), payload.top_k, payload.prompt_version.strip()),
+        )
+    return {"id": cursor.lastrowid, "policy": next(item for item in safe_policies() if item["id"] == cursor.lastrowid)}
+
+
+@app.put("/api/llm/policies/{policy_id}")
+def update_llm_policy(policy_id: int, payload: LLMPolicyIn):
+    if not row("SELECT id FROM llm_policies WHERE id=?", (policy_id,)):
+        raise HTTPException(404, "LLM policy not found")
+    if not row("SELECT id FROM llm_connections WHERE id=?", (payload.connection_id,)):
+        raise HTTPException(404, "LLM connection not found")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_policies SET name=?,connection_id=?,enabled=?,top_k=?,prompt_version=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.name.strip(), payload.connection_id, int(payload.enabled), payload.top_k, payload.prompt_version.strip(), policy_id),
+        )
+    return {"id": policy_id, "policy": next(item for item in safe_policies() if item["id"] == policy_id)}
+
+
+@app.delete("/api/llm/policies/{policy_id}")
+def disable_llm_policy(policy_id: int):
+    with transaction() as con:
+        changed = con.execute(
+            "UPDATE llm_policies SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (policy_id,),
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "LLM policy not found")
+    return {"id": policy_id, "enabled": False}
+
+
+@app.post("/api/llm/policies/{policy_id}/run")
+def run_llm_policy(policy_id: int):
+    if not row("SELECT id FROM llm_policies WHERE id=?", (policy_id,)):
+        raise HTTPException(404, "LLM policy not found")
+    return {"job_id": enqueue_job(f"llm_shadow:{policy_id}", dedupe=True)}
+
+
+@app.get("/api/llm/runs")
+def llm_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return {"runs": rows("SELECT id,policy_id,connection_id,request_hash,candidate_hash,status,candidate_count,latency_ms,input_tokens,output_tokens,error,created_at,finished_at FROM llm_runs ORDER BY created_at DESC LIMIT ?", (limit,))}
+
+
+@app.get("/api/llm/runs/{run_id}")
+def llm_run(run_id: str):
+    found = row("SELECT id,policy_id,connection_id,request_hash,candidate_hash,status,candidate_count,latency_ms,input_tokens,output_tokens,error,created_at,finished_at FROM llm_runs WHERE id=?", (run_id,))
+    if not found:
+        raise HTTPException(404, "LLM run not found")
+    found["scores"] = rows("SELECT candidate_id,rank,score,confidence,reason_codes FROM llm_scores WHERE run_id=? ORDER BY rank", (run_id,))
+    for score in found["scores"]:
+        try:
+            score["reason_codes"] = json.loads(score["reason_codes"] or "[]")
+        except ValueError:
+            score["reason_codes"] = []
+    return found
 
 
 @app.post("/api/settings/api-tokens")
@@ -916,8 +1494,10 @@ def require_api_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     with transaction() as con:
-        if legacy_hash and found["token_hash"] == legacy_hash:
-            # The predicate keeps concurrent first-use upgrades harmless.
+        if found["token_hash"] == legacy_hash:
+            # Tokens created before the PBKDF2 upgrade remain valid and are
+            # upgraded on their first successful use. The predicate makes
+            # concurrent requests harmless if another request wins the race.
             con.execute(
                 "UPDATE api_tokens SET token_hash=? WHERE id=? AND token_hash=?",
                 (current_hash, found["id"], legacy_hash),
@@ -970,11 +1550,14 @@ def api_settings():
 
 @api_v1.get("/recommendations")
 def api_recommendations(
+    response: Response,
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    return recommendation_list(status=status, limit=limit, offset=offset)
+    values, run_id = tracked_recommendations(status=status, limit=limit, offset=offset)
+    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    return values
 
 
 @api_v1.post("/recommendations/bulk-feedback")
@@ -985,6 +1568,11 @@ def api_bulk_feedback(payload: BulkFeedbackIn):
 @api_v1.post("/recommendations/{candidate_id}/feedback")
 def api_feedback(candidate_id: int, payload: FeedbackIn):
     return feedback(candidate_id, payload)
+
+
+@api_v1.post("/telemetry/events")
+def api_telemetry_events(payload: TelemetryBatchIn):
+    return telemetry_events(payload)
 
 
 @api_v1.post("/recommendations/{candidate_id}/import")
@@ -1030,6 +1618,26 @@ async def api_sync():
 @api_v1.post("/score")
 async def api_score():
     return await score()
+
+
+@api_v1.get("/associations/settings")
+def api_association_settings():
+    return association_settings()
+
+
+@api_v1.get("/associations/runs")
+def api_association_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return association_runs(limit=limit)
+
+
+@api_v1.post("/associations/{provider}/run")
+def api_run_associations(provider: str):
+    return run_associations(provider)
+
+
+@api_v1.post("/associations/google_books/preview")
+async def api_preview_google_book_associations():
+    return await preview_google_book_associations()
 
 
 @api_v1.get("/jobs/{job_id}")
