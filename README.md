@@ -1,97 +1,272 @@
 # Bookward
 
-Bookward is a completely independent, self-hosted reading recommender. A SvelteKit/Skeleton UI web application talks to its own Python ingestion and scoring engine, backed by SQLite. It imports Goodreads CSV or RSS history, scans trusted book-list sources, generates explainable recommendations, and sends approved titles to a Librarr wishlist.
+[![CI](https://github.com/sgerner/bookward/actions/workflows/ci.yml/badge.svg)](https://github.com/sgerner/bookward/actions/workflows/ci.yml)
 
-## Run locally
+### A private, explainable way to find your next great read.
 
-```bash
-npm install
-```
+Bookward turns your reading history and the book lists you trust into a calm, personal shortlist. It runs on your own machine, shows why a recommendation appeared, and lets you send only the books you approve to Librarr.
 
-In another terminal:
+It is for readers who want recommendations that feel personal without handing their entire library to another black-box service.
 
-```bash
-cd engine
-python -m venv .venv
-. .venv/bin/activate
-pip install -e .
-AFTERWORD_DB=../data/afterword.db uvicorn afterword_engine.main:app --reload
-```
+## See it in action
 
-Leave that engine terminal running while the web server is open. If the engine is stopped, the web app intentionally shows a retryable `503` page instead of a blank dashboard.
+These screenshots use Bookward's sanitized offline demo data. A fresh install gets the same small sample so you can explore the product before connecting your own library.
 
-Then start the web application:
+![Bookward's Discover screen showing explainable recommendations with match scores, covers, and Shortlist or Pass actions.](docs/screenshots/discover.png)
 
-```bash
-npm run dev
-```
+The Discover screen keeps the important question close to every book: *why might this be for me?* Expand a card to see its explanation, source, genres, and release date.
 
-The engine creates a versioned database and a clearly labeled, sanitized offline demo automatically. The bundled books are sample data—not a live editorial feed—and can be disabled. No production credentials or personal reading records are included.
+![Bookward's Sources screen showing built-in feeds, permanent source controls, refresh cadence, and the Add a source form.](docs/screenshots/sources.png)
+
+Choose which feeds shape your recommendations. Keep a source fresh on a schedule, or import a one-time list and leave it in your discovery pool without polling it again.
+
+![Bookward's Settings screen showing Goodreads import, Librarr connection, and the local embedding provider.](docs/screenshots/settings.png)
+
+Bring in your reading history, choose an embedding provider, connect Librarr if you use it, and optionally turn on a weekly digest.
+
+## Why Bookward?
+
+- **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads credentials. The default Docker binding is localhost.
+- **Recommendations are explainable.** Each book includes a match score, source, and plain-language reasons instead of an unexplained ranking.
+- **You control the inputs.** Import your Goodreads history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
+- **Discovery can become action.** Shortlist the books you want to remember, pass on the rest, and optionally add a title to a Librarr ebook or audiobook waitlist.
+- **Automation is optional and gentle.** Scheduled source refreshes and weekly Discord or email digests are off until you choose them. Delivery is recorded and retryable.
+- **It is comfortable to use.** The responsive interface includes keyboard-friendly controls, a skip-to-content link, accessible labels, light/dark/system modes, and reduced-motion support.
+
+## Features
+
+### For readers
+
+- Import a complete Goodreads CSV export, including ratings and read dates.
+- Refresh recent Goodreads reads through a public read-shelf RSS feed.
+- Combine reading history with author, genre, and semantic similarity signals.
+- Review recommendations in Discover, then shortlist, pass, or restore them.
+- Search Librarr from a recommendation and add a matching ebook or audiobook directly.
+- Choose the visual theme and appearance mode that work best for you.
+
+### For curious tinkerers
+
+- Start with a zero-download local hashing embedder that works on CPU-only machines.
+- Switch to FastEmbed, Ollama, or an OpenAI-compatible remote embedding endpoint when you want to experiment.
+- Add permanent feeds or one-time imports from public, HTTPS-accessible pages.
+- Set source refresh cadence to manual-only, every 6 hours, daily, or weekly.
+- Send weekly digests to Discord, SMTP email, or both, with minimum-score and “only new books” controls.
+
+### For self-hosters
+
+- SvelteKit frontend and FastAPI engine run independently, with no external scheduler required.
+- SQLite stores the catalog, feedback, jobs, settings, and delivery history in one persistent volume.
+- Integration keys are encrypted in the engine database and are never returned to the browser.
+- Public source fetching rejects private, loopback, link-local, and metadata addresses.
+- Docker images are built in CI and published to GitHub Container Registry from version tags.
+
+## How it works
+
+~~~
+Goodreads CSV / RSS + trusted public lists
+                    |
+                    v
+          FastAPI engine + SQLite
+          import -> enrich -> score
+                    |
+                    v
+              SvelteKit UI
+       explain -> shortlist -> decide
+                    |
+          +---------+----------+
+          |                    |
+       Librarr            Discord / SMTP
+     (optional)           weekly digest
+~~~
+
+Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, and digest scheduling.
+
+## Quick start for development
+
+### Prerequisites
+
+- Node.js 24 or newer
+- Python 3.12 or newer
+- [uv](https://docs.astral.sh/uv/) for the Python environment
+- Docker and Docker Compose are optional for local development
+
+### 1. Install dependencies
+
+~~~
+git clone https://github.com/sgerner/bookward.git
+cd bookward
+
+npm ci
+uv sync --project engine --extra dev --frozen
+~~~
+
+If you do not use `uv`, create a virtual environment and install the engine package directly:
+
+~~~
+python3.12 -m venv engine/.venv
+. engine/.venv/bin/activate
+pip install -e engine
+~~~
+
+### 2. Start the recommendation engine
+
+From the repository root, in one terminal:
+
+~~~
+AFTERWORD_DB=./data/afterword.db \
+  uv run --project engine uvicorn afterword_engine.main:app \
+  --reload --host 127.0.0.1 --port 8000
+~~~
+
+The `AFTERWORD_` environment prefix and `afterword_engine` Python package are retained for compatibility with the project's earlier name.
+
+### 3. Start the web app
+
+In a second terminal:
+
+~~~
+ENGINE_URL=http://127.0.0.1:8000 \
+  npm run dev -- --host 127.0.0.1 --port 5173
+~~~
+
+Open <http://127.0.0.1:5173>. The engine creates the SQLite database and a clearly labeled, sanitized demo catalog on a fresh install. Those books are sample data, not a live editorial feed; disable the demo source from **Sources** when you are ready to use your own inputs.
+
+### 4. Make it yours
+
+1. Open **Settings** and import a full Goodreads CSV export. RSS is useful for incremental refreshes, but a CSV export is the way to bring in your complete history.
+2. Open **Sources** and keep only the public lists you trust. Add your own permanent feeds or one-time imports when you find a good list.
+3. Review the explanation on each recommendation, then shortlist the books you want to keep.
+4. Optionally connect Librarr under **Settings** and choose ebook or audiobook as the default waitlist format.
+5. If you want a nudge, configure a weekly Discord or email digest. Use the per-channel test buttons before enabling it.
 
 ## Run with Docker
 
-```bash
+Docker is the easiest way to run Bookward as a small self-hosted service.
+
+~~~
+cp .env.example .env
+~~~
+
+Before exposing Bookward beyond your own machine, set a strong `AFTERWORD_AUTH_PASSWORD` and set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. The default `BIND_ADDRESS=127.0.0.1` keeps the service local.
+
+~~~
 docker compose up --build -d
-```
+~~~
 
-Copy `.env.example` to `.env`, set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact public URL you will open, and set a strong `AFTERWORD_AUTH_PASSWORD` before binding beyond localhost. Open `http://127.0.0.1:3000`. SQLite and the generated encryption key are stored in the `afterword-data` volume. Put Bookward and Librarr on the same Docker network, keep `librarr` in `LIBRARR_ALLOWED_HOSTS`, then enter its internal URL (normally `http://librarr:5050`) and API key under Settings. `AFTERWORD_PUBLIC_URL` seeds links in Discord and email digests; it can be changed later in the digest panel.
+Open <http://127.0.0.1:3000>. Bookward stores SQLite data and the generated encryption key in the `afterword-data` volume. Stop the stack with:
 
-For an optional Ollama service:
+~~~
+docker compose down
+~~~
 
-```bash
+The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. To try Ollama locally:
+
+~~~
 docker compose --profile ollama up --build -d
 docker compose exec ollama ollama pull qwen3-embedding:0.6b
-```
+~~~
 
-For NVIDIA GPU acceleration, install the NVIDIA Container Toolkit and add `-f compose.yaml -f compose.gpu.yaml` to the Compose command. The ordinary profile remains CPU-compatible.
+For NVIDIA acceleration, install the NVIDIA Container Toolkit and add the GPU Compose override:
 
-The default `local` backend needs no model download and works on CPU-only machines. For stronger CPU embeddings, select FastEmbed with `BAAI/bge-small-en-v1.5`; the model is downloaded once into the data volume. Settings also supports any Ollama Qwen embedding model or an OpenAI-compatible remote endpoint. For an embedding server running directly on the Docker host, use `http://host.docker.internal:PORT`.
+~~~
+docker compose -f compose.yaml -f compose.gpu.yaml \
+  --profile ollama up --build -d
+~~~
 
-## Product flow
+If Librarr runs in another container, put both services on the same Docker network, allow its hostname through `LIBRARR_ALLOWED_HOSTS`, and use its internal URL (usually `http://librarr:5050`) in **Settings**.
 
-Appearance is personal to each browser. The header appearance picker offers every bundled Skeleton theme with primary, secondary, and tertiary color previews, plus Light, Dark, and System modes. Theme and mode are remembered locally and applied before the page renders; System follows changes to the device appearance. All application surfaces use Skeleton's paired light/dark tokens.
+## Configuration at a glance
 
-1. Import a complete Goodreads CSV export, with optional RSS refreshes for recent reads.
-2. Keep or disable the built-in upcoming-books source and add trusted public source links. Each source can be permanent (kept fresh) or one-time (imported once and retained without polling).
-3. Review evidence-backed recommendations, shortlist the good ones, and pass on the rest.
-4. Send shortlisted books to Librarr via its server-side `POST /api/wishlist` integration. Settings lets each user choose ebook or audiobook as the default waitlist format; connected users can also search Librarr and call its direct ebook/audiobook download endpoint from the recommendation card.
-5. Optionally enable a weekly digest. The engine evaluates the schedule independently of the browser, selects new high-scoring recommendations, and delivers the same report to Discord, SMTP email, or both. Each delivery is recorded with an idempotency key, encrypted credentials, and a retry action for transient failures. The message links back to a period-specific `?view=discover&digest=1&digest_period=YYYY-Www` review, where the reader can select several books and add them to the shortlist in one action.
+Copy `.env.example` to `.env` for Docker, or export variables in the shell for a local run.
 
-Fresh installs also receive an idempotent catalog of curated sources: Apple Books top audiobooks and paid ebooks, Open Library science-fiction and fantasy subjects, and Goodreads science-fiction, speculative-fiction, mystery-thriller, and literary-fiction pages. They are ordinary user-toggleable sources, so an installation can keep only the shelves that fit its taste. Open Library's mystery and literary subjects are included disabled as additional options. The New York Times Books overview is listed disabled because the API requires a user key; Amazon list pages are intentionally not enabled because their public pages are bot-protected and do not expose a stable book feed.
+| Variable | Purpose |
+| --- | --- |
+| `ORIGIN` | Canonical browser origin used by the web server. |
+| `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
+| `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
+| `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional HTTP Basic authentication for the web app. |
+| `AFTERWORD_DB` | SQLite path for a local engine run. Docker uses `/data/afterword.db`. |
+| `EMBEDDING_BACKEND` / `EMBEDDING_MODEL` | Provider and model selected by the engine. |
+| `EMBEDDING_URL` / `EMBEDDING_API_KEY` | Endpoint and optional key for remote or Ollama providers. |
+| `SOURCE_SYNC_INTERVAL_HOURS` | First-install default for permanent-source polling; the UI can change it later. |
+| `AFTERWORD_SECRET_KEY` | Optional Fernet key; if omitted, Docker generates one in its data volume. |
+| `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
 
-Permanent sources are scanned automatically once per day (UTC) by the engine, even when the browser is closed. The Sources view can switch this cadence to manual-only, every 6 hours, daily, or weekly. A manual refresh still scans all enabled permanent sources immediately. One-time sources receive an initial background scan when added and are then excluded from scheduled and manual feed refreshes until they are toggled off and on again.
+The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 
-Digest delivery is off by default. Under Settings, choose the weekday, local time, IANA timezone, minimum match score, maximum number of books, and whether a recommendation may appear only once. Discord webhooks are restricted to Discord's HTTPS webhook hosts. Email uses the standard-library SMTP client with no credentials sent to the browser; STARTTLS is the default, with SSL/TLS and no transport encryption available for private networks. Use the per-channel test buttons before enabling the schedule in production.
+## Testing and quality checks
 
-Cover art is enriched during source scans and on startup for older databases. Bookward first uses safe HTTPS artwork from the source, then looks up matching editions through Open Library and Google Books. If a title has not received a published cover yet, it receives a deterministic image placeholder instead of leaving an empty card; known Open Library ISBN no-cover URLs are automatically replaced. Open Library ISBN source links are rendered as durable title/author search links so provisional upcoming-book ISBNs do not lead to dead 404 pages.
+Run the same checks used by CI before opening a pull request:
 
-The Librarr and remote embedding keys are encrypted in the engine database and are never returned to the browser. Bookward includes optional HTTP Basic authentication and binds to localhost by default. Internet-facing deployments should additionally use HTTPS through an authenticated reverse proxy.
-
-## Independent architecture
-
-The installation has no Hermes dependency, no external scheduler, and no hard-coded host paths. The engine includes its own lightweight persisted source scheduler:
-
-- `afterword`: SvelteKit UI and same-origin form layer
-- `engine`: FastAPI ingestion, jobs, source scheduler, scoring, feedback, SQLite, and Librarr integration
-- optional `ollama`: local CPU/GPU embedding server selected through a Compose profile
-- `afterword-data`: the only required persistent volume
-
-Custom source fetching rejects private, loopback, link-local, and metadata addresses. Source responses, imports, and feed sizes are bounded. Goodreads credentials are never requested.
-
-## Verify
-
-```bash
+~~~
+# Frontend
 npm run check
-npm run test
+npm test
 npm run build
-uv sync --project engine --extra dev
+
+# Engine
+uv sync --project engine --extra dev --frozen
 uv run --project engine pytest -q engine/tests
-uv run --project engine python -m compileall engine/afterword_engine
+uv run --project engine python -m compileall -q engine/afterword_engine
+
+# Container smoke build
 docker compose build
-```
+~~~
 
-Docker is optional for development. `uv.lock` pins Python transitive dependencies, `package-lock.json` does the same for Node, and production base images are pinned to multi-platform manifest digests.
+The frontend suite covers Svelte/type checks and unit tests. The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
 
-## Project automation
+## Contributing
 
-Every push and pull request runs the frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker image builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly; incompatible TypeScript 7 majors are held back until the Svelte checker supports them. Pushing a `v*.*.*` tag publishes the Bookward and engine images to GitHub Container Registry as both the version tag and `latest`.
+Bookward is easier to improve when changes are small, understandable, and easy to try. A good contribution can be a bug fix, a clearer explanation, an accessible UI improvement, a new source adapter, or a better developer workflow.
+
+1. Open an issue for a larger behavior change, or start with a focused branch from `main`:
+
+   ~~~
+   git switch -c feat/describe-your-change
+   ~~~
+
+2. Make the smallest change that solves the problem. Keep product copy friendly and direct.
+3. Run the relevant checks from [Testing and quality checks](#testing-and-quality-checks).
+4. For UI changes, include before/after screenshots in the pull request and check the layout at narrow and wide widths.
+5. Keep controls keyboard reachable, provide labels for new inputs, preserve visible focus, and respect `prefers-reduced-motion`.
+6. Open a pull request against `main` with a short summary, testing notes, and any setup or migration detail a reviewer needs.
+
+Please do not commit `.env` files, database files, API keys, webhook URLs, SMTP credentials, or generated secret keys. Use the sanitized demo catalog or redacted fixtures when adding examples. See [SECURITY.md](SECURITY.md) for vulnerability reports.
+
+## Project map
+
+~~~
+src/                         SvelteKit UI, form actions, and browser theme handling
+engine/                      FastAPI ingestion, jobs, scoring, SQLite, and integrations
+engine/tests/                Python engine tests
+src/**/*.spec.ts             Frontend and server unit tests
+static/                      Favicon, manifest, and static web assets
+docs/screenshots/            README screenshots from the sanitized demo
+compose.yaml                 Local Docker stack
+compose.gpu.yaml             Optional NVIDIA/Ollama override
+.github/workflows/            CI, CodeQL, dependency review, and image publishing
+~~~
+
+## Troubleshooting
+
+### The web app shows a 503 page
+
+The UI intentionally shows a retryable 503 page when the engine is unavailable. Start the engine first and confirm that `ENGINE_URL` points to the same host and port as uvicorn.
+
+### The first run looks too quiet
+
+The default local embedder is intentionally small and predictable. FastEmbed, Ollama, and remote providers may download a model or take longer during their first indexing pass. Check **Settings** and the engine terminal for progress.
+
+### Goodreads import is incomplete
+
+Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
+
+### Librarr works in Docker but not locally (or vice versa)
+
+The URL must be reachable from the engine process, not just from your browser. Use `http://librarr:5050` between containers and `http://127.0.0.1:5050` when both services run on the host.
+
+## Automation and releases
+
+Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly.
+
+Pushing a tag matching `v*.*.*` publishes the Bookward and engine images to GitHub Container Registry as the version tag and `latest`.
