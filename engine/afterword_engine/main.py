@@ -345,7 +345,7 @@ def api_token_list(connection=None):
     )
 
 
-def overview_payload(*, include_api_tokens: bool = True):
+def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None):
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
@@ -353,7 +353,9 @@ def overview_payload(*, include_api_tokens: bool = True):
         }
         return {
             "counts": counts,
-            "recommendations": recommendation_list(connection),
+            "recommendations": recommendation_list(
+                connection, recommended_limit=recommendation_limit
+            ),
             "sources": [
                 dict(item)
                 for item in connection.execute(
@@ -388,16 +390,65 @@ async def health():
 
 
 @app.get("/api/overview")
-def overview():
-    return overview_payload()
+def overview(recommendation_limit: int | None = Query(default=None, ge=1, le=100)):
+    return overview_payload(recommendation_limit=recommendation_limit)
 
-def recommendation_list(connection=None):
-    query = "SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100"
-    result = (
-        [dict(item) for item in connection.execute(query).fetchall()]
-        if connection is not None
-        else rows(query)
+def _recommendation_rows(
+    connection=None,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+):
+    clauses = [
+        "c.status!='rejected'",
+        "(c.status IN ('saved','imported') OR s.enabled=1)",
+    ]
+    params: list[object] = []
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"c.status IN ({placeholders})")
+        params.extend(statuses)
+    query = (
+        "SELECT c.*,s.name source_name FROM candidates c "
+        "LEFT JOIN sources s ON s.id=c.source_id WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 "
+        "WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ? OFFSET ?"
     )
+    params.extend((-1 if limit is None else limit, offset))
+    result = (
+        [dict(item) for item in connection.execute(query, params).fetchall()]
+        if connection is not None
+        else rows(query, params)
+    )
+    return result
+
+
+def recommendation_list(
+    connection=None,
+    *,
+    status: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    recommended_limit: int | None = None,
+):
+    if recommended_limit is not None and status is None and offset == 0:
+        result = _recommendation_rows(
+            connection, statuses=("recommended",), limit=recommended_limit
+        )
+        result.extend(
+            _recommendation_rows(
+                connection,
+                statuses=("saved", "imported", "new"),
+                limit=None,
+            )
+        )
+    else:
+        statuses = None if not status or status == "all" else (status,)
+        result = _recommendation_rows(
+            connection, statuses=statuses, limit=limit, offset=offset
+        )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
@@ -405,7 +456,12 @@ def recommendation_list(connection=None):
     return result
 
 @app.get("/api/recommendations")
-def recommendations(): return recommendation_list()
+def recommendations(
+    status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+):
+    return recommendation_list(status=status, limit=limit, offset=offset)
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
 def feedback(candidate_id: int, payload: FeedbackIn):
@@ -916,11 +972,9 @@ def api_settings():
 def api_recommendations(
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    recommendations = recommendation_list()
-    if status and status != "all":
-        recommendations = [item for item in recommendations if item["status"] == status]
-    return recommendations[:limit]
+    return recommendation_list(status=status, limit=limit, offset=offset)
 
 
 @api_v1.post("/recommendations/bulk-feedback")

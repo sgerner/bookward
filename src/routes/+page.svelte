@@ -48,6 +48,7 @@
   type LibrarrResult = Record<string, unknown>;
 
   let { data, form } = $props();
+  type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let filter = $state("");
   let searchOpen = $state(false);
@@ -56,6 +57,11 @@
   const DISCOVER_PAGE_SIZE = 8;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
+  let additionalDiscoverBooks = $state<PageBook[]>([]);
+  let discoverHasMore = $state(true);
+  let discoverLoading = $state(false);
+  let discoverLoadError = $state("");
+  let previousDataBooks = $state<PageBook[] | null>(null);
   let pendingAction = $state<string | null>(null);
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -97,7 +103,7 @@
       icon: Settings2,
     },
   ];
-  function matchesBookFilter(book: (typeof data.books)[number]) {
+  function matchesBookFilter(book: PageBook) {
     const query = filter.trim().toLowerCase();
     return (
       !query ||
@@ -106,13 +112,14 @@
         .includes(query)
     );
   }
+  const allBooks = $derived([...data.books, ...additionalDiscoverBooks]);
   const discoverBooks = $derived(
-    data.books.filter(
+    allBooks.filter(
       (book) => book.status === "recommended" && matchesBookFilter(book),
     ),
   );
   const savedBooks = $derived(
-    data.books.filter(
+    allBooks.filter(
       (book) =>
         ["saved", "imported"].includes(book.status) && matchesBookFilter(book),
     ),
@@ -144,10 +151,11 @@
       (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
   );
   const hasMoreDiscoverBooks = $derived(
-    activeView === "discover" && visibleBooks.length < filteredBooks.length,
+    activeView === "discover" &&
+      (visibleBooks.length < filteredBooks.length || discoverHasMore),
   );
   const savedCount = $derived(
-    data.books.filter((book) => ["saved", "imported"].includes(book.status))
+    allBooks.filter((book) => ["saved", "imported"].includes(book.status))
       .length,
   );
   const activeSourceCount = $derived(
@@ -279,12 +287,47 @@
     return `${date < today ? "Published" : "Publishes"} ${label}`;
   }
 
-  function loadMoreDiscover() {
-    if (!hasMoreDiscoverBooks) return;
-    discoverVisibleCount = Math.min(
-      discoverVisibleCount + DISCOVER_PAGE_SIZE,
-      filteredBooks.length,
-    );
+  async function loadMoreDiscover() {
+    if (discoverLoading) return;
+    if (discoverVisibleCount < filteredBooks.length) {
+      discoverVisibleCount = Math.min(
+        discoverVisibleCount + DISCOVER_PAGE_SIZE,
+        filteredBooks.length,
+      );
+      return;
+    }
+    if (!discoverHasMore) return;
+
+    discoverLoading = true;
+    discoverLoadError = "";
+    const offset = allBooks.filter((book) => book.status === "recommended").length;
+    try {
+      const params = new URLSearchParams({
+        status: "recommended",
+        limit: String(DISCOVER_PAGE_SIZE),
+        offset: String(offset),
+      });
+      const response = await fetch(`/api/recommendations?${params.toString()}`);
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Recommendations could not be loaded.");
+      }
+      const existing = new Set(allBooks.map((book) => book.id));
+      additionalDiscoverBooks = [
+        ...additionalDiscoverBooks,
+        ...payload.items.filter((book) => !existing.has(book.id)),
+      ];
+      discoverHasMore = payload.has_more === true;
+      discoverVisibleCount += DISCOVER_PAGE_SIZE;
+    } catch (error) {
+      discoverLoadError = error instanceof Error ? error.message : "Recommendations could not be loaded.";
+    } finally {
+      discoverLoading = false;
+    }
   }
 
   function toggleSearch() {
@@ -416,6 +459,15 @@
   function closeLibrarrSearch() {
     librarrSearchOpen = false;
   }
+
+  $effect(() => {
+    const nextBooks = data.books;
+    if (previousDataBooks === nextBooks) return;
+    previousDataBooks = nextBooks;
+    additionalDiscoverBooks = [];
+    discoverHasMore = true;
+    discoverLoadError = "";
+  });
 
   $effect(() => {
     activeView;
@@ -556,7 +608,7 @@
               const id = Number((input as { id?: unknown })?.id);
               if (
                 !Number.isInteger(id) ||
-                !data.books.some(
+                !allBooks.some(
                   (book) => book.id === id && book.status === "recommended",
                 )
               )
@@ -729,7 +781,7 @@
 
         {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : savedBooks}
         {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
-        {@const viewHasMoreDiscoverBooks = view === "discover" && viewVisibleBooks.length < viewBooks.length}
+        {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-10 px-1 sm:px-0">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
@@ -866,7 +918,7 @@
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
             </div>{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex justify-center pt-1">
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover}>Load more <ArrowRight size={14} /></button>
+              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
         </section>
       {/snippet}
