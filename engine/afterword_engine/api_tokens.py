@@ -40,7 +40,8 @@ def legacy_hash_api_token(token: str) -> str:
     ``hash_api_token`` immediately.
     """
 
-    # lgtm[py/weak-sensitive-data-hashing]
+    # This compatibility digest is only used to recognize pre-PBKDF2 records;
+    # successful authentication upgrades the stored value immediately.
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
