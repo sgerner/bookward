@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import initialize, row, rows, transaction
+from .database import connect, initialize, row, rows, transaction
 from .api_tokens import (
     TOKEN_MAX_LENGTH,
     TOKEN_PREFIX,
@@ -481,9 +481,17 @@ def tracked_recommendations(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    connection=None,
+    recommended_limit: int | None = None,
     session_id: str = "",
 ):
-    recommendations = recommendation_list(status=status, limit=limit, offset=offset)
+    recommendations = recommendation_list(
+        connection,
+        status=status,
+        limit=limit,
+        offset=offset,
+        recommended_limit=recommended_limit,
+    )
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -503,24 +511,32 @@ def tracked_recommendations(
 
 
 def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None, session_id: str = ""):
-    counts = {
-        name: row(f"SELECT COUNT(*) count FROM {name}")["count"]
-        for name in ("reads", "candidates", "sources")
-    }
-    recommendations, run_id = tracked_recommendations(
-        limit=recommendation_limit or 100,
-        session_id=session_id,
-    )
-    return {
-        "counts": counts,
-        "recommendations": recommendations,
-        "recommendation_run_id": run_id,
-        "sources": rows("SELECT * FROM sources ORDER BY is_default DESC,name"),
-        "history": rows(
-            "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
-        ),
-        "settings": safe_settings(include_api_tokens=include_api_tokens),
-    }
+    with connect() as connection:
+        counts = {
+            name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
+            for name in ("reads", "candidates", "sources")
+        }
+        recommendations, run_id = tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            session_id=session_id,
+        )
+        return {
+            "counts": counts,
+            "recommendations": recommendations,
+            "recommendation_run_id": run_id,
+            "sources": [dict(item) for item in connection.execute(
+                "SELECT * FROM sources ORDER BY is_default DESC,name"
+            ).fetchall()],
+            "history": [dict(item) for item in connection.execute(
+                "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+            ).fetchall()],
+            "settings": safe_settings(
+                include_api_tokens=include_api_tokens,
+                connection=connection,
+            ),
+        }
 
 
 @app.get("/api/health")
@@ -1085,15 +1101,16 @@ def association_runs(limit: int = Query(default=20, ge=1, le=100)):
         )[0]["count"],
     }
 
-def private_settings():
+def private_settings(connection=None):
+    items = connection.execute("SELECT key,value,secret FROM settings").fetchall() if connection is not None else rows("SELECT key,value,secret FROM settings")
     return {
         item["key"]: unseal(item["value"]) if item["secret"] else item["value"]
-        for item in rows("SELECT key,value,secret FROM settings")
+        for item in items
     }
 
 
-def safe_association_settings():
-    private = private_settings()
+def safe_association_settings(connection=None):
+    private = private_settings(connection)
     return {
         "openlibrary_enabled": private.get("association_openlibrary_enabled", "0") == "1",
         "openlibrary_contact": private.get(
@@ -1105,13 +1122,13 @@ def safe_association_settings():
     }
 
 
-def safe_settings(*, include_api_tokens: bool = True):
-    private = private_settings()
+def safe_settings(*, include_api_tokens: bool = True, connection=None):
+    private = private_settings(connection)
     try:
         media_type = normalize_media_type(private.get("librarr_media_type"))
     except ValueError:
         media_type = "audiobook"
-    digest = safe_digest_settings(private)
+    digest = safe_digest_settings(private, connection)
     result = {
         "embedding_backend": private.get("embedding_backend", settings.embedding_backend),
         "embedding_model": private.get("embedding_model", settings.embedding_model),
@@ -1124,7 +1141,7 @@ def safe_settings(*, include_api_tokens: bool = True):
         "digest": digest,
         "llm_connections": safe_connections(),
         "llm_policies": safe_policies(),
-        "associations": safe_association_settings(),
+        "associations": safe_association_settings(connection),
     }
     if include_api_tokens:
         result["api_tokens"] = api_token_list()

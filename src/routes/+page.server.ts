@@ -235,7 +235,6 @@ const message = (error: unknown) =>
     : "The engine could not complete that request.";
 const status = (error: unknown) =>
   error instanceof EngineError && error.status < 500 ? error.status : 502;
-<<<<<<< HEAD
 const publicUrl = (value: string) => {
   try {
     const parsed = new URL(value);
@@ -286,8 +285,6 @@ const llmModelSchema = z.string().trim().min(1).max(300);
 const llmNameSchema = z.string().trim().min(1).max(100);
 const llmEndpointSchema = z.string().trim().max(500);
 
-=======
->>>>>>> e542ef0 (perf: paginate recommendation loading (#38))
 export const actions: Actions = {
   loadLlmCatalog: async ({ request }) => {
     const refresh = (await request.formData()).get("refresh") === "on";

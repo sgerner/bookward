@@ -77,7 +77,6 @@ MIGRATIONS = [
     (
         5,
         """
-<<<<<<< HEAD
         CREATE TABLE IF NOT EXISTS recommendation_runs (
             id TEXT PRIMARY KEY,
             policy TEXT NOT NULL,
