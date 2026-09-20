@@ -77,6 +77,64 @@ MIGRATIONS = [
     (
         5,
         """
+        CREATE TABLE IF NOT EXISTS recommendation_runs (
+            id TEXT PRIMARY KEY,
+            policy TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            candidate_count INTEGER NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_impressions (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            rank INTEGER NOT NULL CHECK(rank > 0),
+            score REAL NOT NULL,
+            propensity REAL NOT NULL CHECK(propensity > 0 AND propensity <= 1),
+            presented_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            visible_at TEXT,
+            UNIQUE(run_id, candidate_id)
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_events (
+            id INTEGER PRIMARY KEY,
+            event_key TEXT NOT NULL UNIQUE,
+            run_id TEXT REFERENCES recommendation_runs(id) ON DELETE SET NULL,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            value REAL,
+            source TEXT NOT NULL,
+            occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+            id INTEGER PRIMARY KEY,
+            impression_id INTEGER NOT NULL REFERENCES recommendation_impressions(id) ON DELETE CASCADE,
+            event_id INTEGER NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
+            read_id INTEGER REFERENCES reads(id) ON DELETE SET NULL,
+            label REAL NOT NULL,
+            label_kind TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            attributed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(impression_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_candidate_time
+            ON recommendation_impressions(candidate_id, presented_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_run_rank
+            ON recommendation_impressions(run_id, rank);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_events_candidate_time
+            ON recommendation_events(candidate_id, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_events_type_time
+            ON recommendation_events(event_type, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_read
+            ON recommendation_outcomes(read_id, attributed_at DESC);
+        """,
+    ),
+    (
+        6,
+        """
         CREATE TABLE IF NOT EXISTS llm_connections (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,

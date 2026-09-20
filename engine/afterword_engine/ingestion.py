@@ -259,6 +259,12 @@ def import_goodreads_csv(content: bytes):
             if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): raise ValueError("Ratings must be between 0 and 5")
             con.execute("INSERT INTO reads(title,author,rating,read_at,isbn,source) VALUES(?,?,?,?,?,'goodreads_csv') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=excluded.read_at,isbn=excluded.isbn", (title, author, rating, row.get("Date Read") or None, (row.get("ISBN13") or row.get("ISBN") or "").strip('="') or None))
             count += 1
+    # Importing a history is also the point at which naturally supplied
+    # ratings can become outcomes for recommendations shown earlier. Import
+    # lazily to keep the ingestion module independent of the telemetry module
+    # during application startup.
+    from .learning import attribute_read_outcomes
+    attribute_read_outcomes()
     return count
 
 async def fetch_bytes(url: str, allow_goodreads_http=False):
@@ -299,6 +305,8 @@ async def import_goodreads_rss(url: str):
             if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): rating = None
             con.execute("INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,'goodreads_rss') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=excluded.read_at", (title, author, rating, entry.get("user_read_at")))
             count += 1
+    from .learning import attribute_read_outcomes
+    attribute_read_outcomes()
     return count
 
 def parse_book_items(content: bytes, content_type: str, source_url: str):
