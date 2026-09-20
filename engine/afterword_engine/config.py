@@ -16,5 +16,8 @@ class Settings(BaseSettings):
     # the internal engine URL so Docker installs can link to the web service.
     public_url: str = "http://localhost:5173"
     librarr_allowed_hosts: str = "librarr"
+    models_catalog_url: str = "https://models.dev/api.json?type=all"
+    models_catalog_cache: str = "/data/models-dev.json"
+    models_catalog_ttl_hours: int = 24
 
 settings = Settings()
