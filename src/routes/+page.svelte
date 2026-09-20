@@ -33,6 +33,7 @@
     X,
   } from "@lucide/svelte";
   import ThemePicker from "$lib/components/ThemePicker.svelte";
+  import LlmSettings from "$lib/components/LlmSettings.svelte";
   import { copyApiTokenText } from "$lib/api-token-clipboard";
   import { tokenForView } from "$lib/api-token-ui";
   import { createTelemetryClient } from "$lib/telemetry";
@@ -45,7 +46,14 @@
     icon: typeof Compass;
     shortLabel: string;
   };
-  type FormState = { message?: string; error?: boolean; token?: string } | null | undefined;
+  type FormState = {
+    message?: string;
+    error?: boolean;
+    token?: string;
+    llmCatalog?: any;
+    deviceLogin?: any;
+    llmRuns?: any[];
+  } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
   type LibrarrResult = Record<string, unknown>;
@@ -1792,6 +1800,12 @@
                   </div>
                 {/if}
               </section>
+              <LlmSettings
+                llm={data.llm}
+                formState={formState}
+                {setPending}
+                {isPending}
+              />
               <section
                 in:fly={{
                   y: 12,
