@@ -97,6 +97,25 @@ describe("public API proxy", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects dot-segment paths before they can escape the versioned API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const request = new Request(
+      "http://bookward.test/api/v1/%2e%2e/settings/api-tokens",
+      { headers: { origin: "https://client.example" } },
+    );
+
+    const response = await proxyApi({
+      request,
+      url: new URL(request.url),
+      params: { path: "../settings/api-tokens" },
+    } as never);
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ detail: "Invalid API path" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("preserves the engine auth challenge for API clients", async () => {
     vi.stubGlobal(
       "fetch",
