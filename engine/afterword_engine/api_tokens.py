@@ -40,9 +40,8 @@ def legacy_hash_api_token(token: str) -> str:
     ``hash_api_token`` immediately.
     """
 
-    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(
-        token.encode("utf-8")
+        token.encode("utf-8")  # lgtm[py/weak-sensitive-data-hashing]
     ).hexdigest()
 
 
