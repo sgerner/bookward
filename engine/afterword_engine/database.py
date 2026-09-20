@@ -199,6 +199,62 @@ MIGRATIONS = [
             ON llm_scores(candidate_id, run_id);
         """,
     ),
+    (
+        7,
+        """
+        CREATE TABLE IF NOT EXISTS association_runs (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            status TEXT NOT NULL,
+            seed_count INTEGER NOT NULL DEFAULT 0,
+            edge_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_association_runs_provider_started
+            ON association_runs(provider, started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS association_requests (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            request_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_association_requests_provider_time
+            ON association_requests(provider, requested_at DESC);
+
+        CREATE TABLE IF NOT EXISTS association_cache (
+            provider TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY(provider, cache_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_association_cache_expiry
+            ON association_cache(provider, expires_at);
+
+        CREATE TABLE IF NOT EXISTS association_evidence (
+            provider TEXT NOT NULL,
+            seed_read_id INTEGER NOT NULL REFERENCES reads(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            provider_rank INTEGER,
+            source_url TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            run_id TEXT REFERENCES association_runs(id) ON DELETE SET NULL,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT,
+            PRIMARY KEY(provider, seed_read_id, external_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_association_evidence_candidate
+            ON association_evidence(candidate_id, provider);
+        CREATE INDEX IF NOT EXISTS idx_association_evidence_seed
+            ON association_evidence(seed_read_id, provider);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

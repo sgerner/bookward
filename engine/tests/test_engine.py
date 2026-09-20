@@ -533,7 +533,7 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 6
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
     assert row(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
@@ -561,12 +561,12 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
         )
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 6
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
     assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 6
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 7
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
 
 
