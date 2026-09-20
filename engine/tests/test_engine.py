@@ -21,7 +21,7 @@ from afterword_engine.covers import (
     safe_cover_url,
 )
 from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
-from afterword_engine.scoring import score_all, cached_vectors
+from afterword_engine.scoring import cached_vectors, rebuild_all_embeddings, score_all
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import validate_public_url, validate_service_url
@@ -186,6 +186,35 @@ def test_failed_embedding_rebuild_keeps_previous_provider_cache(database, monkey
     with pytest.raises(RuntimeError, match="provider unavailable"):
         asyncio.run(handle_job("rebuild_embeddings"))
     assert row("SELECT COUNT(*) count FROM embeddings WHERE backend='legacy'")["count"] == 1
+
+
+def test_failed_embedding_rebuild_keeps_active_provider_cache(database, monkeypatch):
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    before = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+
+    class BrokenEmbedder:
+        name = "local"
+        model = "hashing-768"
+
+        async def embed(self, _texts):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(
+        "afterword_engine.scoring.get_embedder",
+        lambda *_args, **_kwargs: BrokenEmbedder(),
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(rebuild_all_embeddings("local", "hashing-768"))
+
+    after = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+    assert after == before
+
 
 def test_private_source_addresses_are_rejected(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
