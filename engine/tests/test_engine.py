@@ -22,7 +22,7 @@ from afterword_engine.covers import (
     safe_cover_url,
 )
 from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
-from afterword_engine.scoring import score_all, cached_vectors
+from afterword_engine.scoring import cached_vectors, rebuild_all_embeddings, score_all
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import validate_public_url, validate_service_url
@@ -117,6 +117,28 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     candidate = row("SELECT * FROM candidates WHERE title='A New World'")
     assert json.loads(candidate["genres"]) == ["Science fiction"]
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
+
+
+def test_empty_source_scan_preserves_existing_candidates(database, monkeypatch):
+    async def empty_fetch(_url):
+        return b"<html><body>temporarily unavailable</body></html>", "text/html"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", empty_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.parse_book_items", lambda *_args: [])
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?)",
+            ("Empty source", "https://example.com/empty"),
+        )
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
+            ("Keep this book", "A Writer", cursor.lastrowid, "recommended", "keep this book a writer"),
+        )
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 0
+    assert row("SELECT status FROM candidates WHERE title='Keep this book'")["status"] == "recommended"
+    assert row("SELECT last_status FROM sources WHERE id=?", (cursor.lastrowid,))["last_status"] == "empty:0"
 
 
 @respx.mock
@@ -224,6 +246,35 @@ def test_failed_embedding_rebuild_keeps_previous_provider_cache(database, monkey
         asyncio.run(handle_job("rebuild_embeddings"))
     assert row("SELECT COUNT(*) count FROM embeddings WHERE backend='legacy'")["count"] == 1
 
+
+def test_failed_embedding_rebuild_keeps_active_provider_cache(database, monkeypatch):
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    before = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+
+    class BrokenEmbedder:
+        name = "local"
+        model = "hashing-768"
+
+        async def embed(self, _texts):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(
+        "afterword_engine.scoring.get_embedder",
+        lambda *_args, **_kwargs: BrokenEmbedder(),
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(rebuild_all_embeddings("local", "hashing-768"))
+
+    after = rows(
+        "SELECT entity_type,entity_id,backend,model,vector,content_hash "
+        "FROM embeddings ORDER BY entity_type,entity_id"
+    )
+    assert after == before
+
+
 def test_private_source_addresses_are_rejected(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))])
     with pytest.raises(ValueError, match="Private"):
@@ -313,6 +364,45 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
             "/api/v1/recommendations",
             headers={"Authorization": f"Bearer {token}"},
         ).status_code == 401
+
+
+def test_api_recommendation_status_filter_applies_before_limit(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='recommended', source_id=?, score=100",
+            (source_id,),
+        )
+        for index in range(101):
+            con.execute(
+                "INSERT INTO candidates(title,author,status,score,normalized_key,source_id) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    f"Recommended {index}",
+                    "Author",
+                    "recommended",
+                    100 - index,
+                    f"recommended {index} author",
+                    source_id,
+                ),
+            )
+        con.execute(
+            "UPDATE candidates SET status='saved' WHERE title='Recommended 100'"
+        )
+
+    with TestClient(app) as client:
+        token = client.post(
+            "/api/settings/api-tokens", json={"name": "Filter test"}
+        ).json()["token"]
+        response = client.get(
+            "/api/v1/recommendations?status=saved&limit=100",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        assert [item["title"] for item in response.json()] == ["Recommended 100"]
+
 
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
