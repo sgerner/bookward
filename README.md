@@ -48,6 +48,7 @@ Bring in your reading history, choose an embedding provider, connect Librarr if 
 
 - Start with a zero-download local hashing embedder that works on CPU-only machines.
 - Switch to FastEmbed, Ollama, or an OpenAI-compatible remote embedding endpoint when you want to experiment.
+- Run optional LLM policies in shadow mode using API-key providers from Models.dev, a ChatGPT Plus/Pro account through Codex device-code login, or a Claude subscription through a Claude Code OAuth token. Shadow scores never replace the visible ranking until the evaluation gate passes.
 - Add permanent feeds or one-time imports from public, HTTPS-accessible pages.
 - Set source refresh cadence to manual-only, every 6 hours, daily, or weekly.
 - Send weekly digests to Discord, SMTP email, or both, with minimum-score and “only new books” controls.

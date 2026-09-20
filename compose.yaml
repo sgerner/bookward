@@ -27,6 +27,10 @@ services:
       AFTERWORD_PUBLIC_URL: ${AFTERWORD_PUBLIC_URL:-http://127.0.0.1:3000}
       AFTERWORD_SECRET_KEY: ${AFTERWORD_SECRET_KEY:-}
       AFTERWORD_LIBRARR_ALLOWED_HOSTS: ${LIBRARR_ALLOWED_HOSTS:-librarr}
+      AFTERWORD_LLM_CODEX_COMMAND: ${LLM_CODEX_COMMAND:-codex}
+      AFTERWORD_LLM_CODEX_HOME: /data/codex-home
+      AFTERWORD_LLM_CLAUDE_COMMAND: ${LLM_CLAUDE_COMMAND:-claude}
+      AFTERWORD_LLM_SUBSCRIPTION_TIMEOUT_SECONDS: ${LLM_SUBSCRIPTION_TIMEOUT_SECONDS:-90}
     volumes: ["afterword-data:/data"]
     expose: ["8000"]
     extra_hosts: ["host.docker.internal:host-gateway"]
