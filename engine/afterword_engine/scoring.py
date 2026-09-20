@@ -36,7 +36,7 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating IS NOT NULL")
-    candidates = rows("SELECT c.*, s.name source_name, s.weight source_weight FROM candidates c JOIN sources s ON s.id=c.source_id WHERE c.status IN ('new','recommended') AND s.enabled=1")
+    candidates = rows("SELECT c.*, s.name source_name, s.weight source_weight FROM candidates c JOIN sources s ON s.id=c.source_id WHERE c.status IN ('new','recommended') AND s.enabled=1 AND book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads)")
     if not candidates: return 0
     positives = [r for r in reads if (r.get("rating") or 0) >= 4]
     negatives = [r for r in reads if 0 < (r.get("rating") or 0) <= 2]
