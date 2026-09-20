@@ -366,8 +366,22 @@ async def health():
 def overview():
     return overview_payload()
 
-def recommendation_list():
-    result = rows("SELECT c.*,s.name source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.status!='rejected' AND (c.status IN ('saved','imported') OR s.enabled=1) ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT 100")
+def recommendation_list(status: str | None = None, limit: int = 100):
+    clauses = [
+        "c.status!='rejected'",
+        "(c.status IN ('saved','imported') OR s.enabled=1)",
+    ]
+    params: list[Any] = []
+    if status and status != "all":
+        clauses.append("c.status=?")
+        params.append(status)
+    result = rows(
+        "SELECT c.*,s.name source_name FROM candidates c "
+        "LEFT JOIN sources s ON s.id=c.source_id WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ?",
+        (*params, limit),
+    )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
@@ -864,10 +878,7 @@ def api_recommendations(
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
 ):
-    recommendations = recommendation_list()
-    if status and status != "all":
-        recommendations = [item for item in recommendations if item["status"] == status]
-    return recommendations[:limit]
+    return recommendation_list(status=status, limit=limit)
 
 
 @api_v1.post("/recommendations/bulk-feedback")
