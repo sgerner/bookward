@@ -23,14 +23,22 @@ export function isPublicApiPath(pathname: string) {
   return pathname === '/api/v1' || pathname.startsWith('/api/v1/');
 }
 
+export function withSecurityHeaders(response: Response) {
+  response.headers.set('x-content-type-options', 'nosniff');
+  response.headers.set('x-frame-options', 'DENY');
+  response.headers.set('referrer-policy', 'strict-origin-when-cross-origin');
+  response.headers.set('permissions-policy', 'camera=(), geolocation=(), microphone=()');
+  return response;
+}
+
 export const handle: Handle = async ({ event, resolve }) => {
   // The public API authenticates with a Bookward API token. Keep it separate
   // from the optional browser Basic-auth prompt so integrations do not need
   // to know deployment credentials.
-  if (isPublicApiPath(event.url.pathname)) return resolve(event);
+  if (isPublicApiPath(event.url.pathname)) return withSecurityHeaders(await resolve(event));
   const password=env.AFTERWORD_AUTH_PASSWORD;
-  if(!password) return resolve(event);
+  if(!password) return withSecurityHeaders(await resolve(event));
   const username=env.AFTERWORD_AUTH_USERNAME || 'bookward';
-  if(!authorized(event.request,username,password)) return new Response('Authentication required',{status:401,headers:{'www-authenticate':'Basic realm="Bookward", charset="UTF-8"','cache-control':'no-store'}});
-  return resolve(event);
+  if(!authorized(event.request,username,password)) return withSecurityHeaders(new Response('Authentication required',{status:401,headers:{'www-authenticate':'Basic realm="Bookward", charset="UTF-8"','cache-control':'no-store'}}));
+  return withSecurityHeaders(await resolve(event));
 };

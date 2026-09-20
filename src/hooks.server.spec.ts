@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { authorized, isPublicApiPath } from './hooks.server';
+import { authorized, isPublicApiPath, withSecurityHeaders } from './hooks.server';
 
 describe('authentication boundary', () => {
   it('requires configured basic authentication and accepts colons in passwords', async () => {
@@ -13,5 +13,14 @@ describe('authentication boundary', () => {
     expect(isPublicApiPath('/api/v1/recommendations')).toBe(true);
     expect(isPublicApiPath('/api/v10/recommendations')).toBe(false);
     expect(isPublicApiPath('/settings')).toBe(false);
+  });
+
+  it('adds baseline browser security headers to every response', () => {
+    const response = withSecurityHeaders(new Response('ok'));
+
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('x-frame-options')).toBe('DENY');
+    expect(response.headers.get('referrer-policy')).toBe('strict-origin-when-cross-origin');
+    expect(response.headers.get('permissions-policy')).toBe('camera=(), geolocation=(), microphone=()');
   });
 });

@@ -6,6 +6,7 @@
 		DEFAULT_MODE,
 		DEFAULT_THEME,
 		THEMES,
+		THEME_SWATCHES,
 		applyTheme,
 		getStoredPreferences,
 		loadTheme,
@@ -146,10 +147,10 @@
 							aria-label={`Use ${item.label} theme`}
 							onclick={() => chooseTheme(item.id)}
 						>
-							<span data-theme={item.id} class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-surface-300-700" aria-hidden="true">
-								<span class="size-3 bg-primary-500"></span>
-								<span class="size-3 bg-secondary-500"></span>
-								<span class="size-3 bg-tertiary-500"></span>
+							<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-surface-300-700" aria-hidden="true">
+								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].primary}`}></span>
+								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].secondary}`}></span>
+								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].tertiary}`}></span>
 							</span>
 							<span class="min-w-0 flex-1 truncate">{item.label}</span>
 							{#if theme === item.id}<span in:scale={{ duration: motionDuration(150) }} out:fade={{ duration: motionDuration(90) }} class="ms-auto shrink-0"><Check size={15} strokeWidth={2.2} aria-hidden="true" /></span>{/if}

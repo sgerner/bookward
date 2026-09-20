@@ -46,6 +46,44 @@ export type SkeletonThemeName = (typeof THEMES)[number]['id'];
 
 const THEME_NAMES = new Set<string>(THEMES.map((theme) => theme.id));
 
+export type ThemeSwatch = {
+	primary: string;
+	secondary: string;
+	tertiary: string;
+};
+
+/**
+ * Small preview tokens for the picker. These are intentionally separate from
+ * the deferred theme styles: the picker can show every palette without
+ * downloading all 24 full Skeleton stylesheets just to render three swatches.
+ */
+export const THEME_SWATCHES: Record<SkeletonThemeName, ThemeSwatch> = {
+	catppuccin: { primary: 'oklch(66.37% 0.18 273.14deg)', secondary: 'oklch(72.56% 0.17 338.45deg)', tertiary: 'oklch(60.23% 0.1 201.09deg)' },
+	cerberus: { primary: 'oklch(0.57 0.21 258.29)', secondary: 'oklch(0.49 0.23 300.45)', tertiary: 'oklch(0.65 0.26 2.47)' },
+	concord: { primary: 'oklch(57.74% 0.21 273.85deg)', secondary: 'oklch(65.34% 0.22 351.93deg)', tertiary: 'oklch(69.62% 0.15 247.99deg)' },
+	crimson: { primary: 'oklch(55.71% 0.21 19.55deg)', secondary: 'oklch(59.26% 0.09 239.95deg)', tertiary: 'oklch(78.4% 0.01 31.17deg)' },
+	dracula: { primary: 'oklch(74.03% 0.15 302.13deg)', secondary: 'oklch(75% 0.18 346.86deg)', tertiary: 'oklch(88.11% 0.09 212.62deg)' },
+	fennec: { primary: 'oklch(65.88% 0.21 38.25deg)', secondary: 'oklch(87.53% 0.1 74.15deg)', tertiary: 'oklch(57.22% 0.05 185.36deg)' },
+	hamlindigo: { primary: 'oklch(80.28% 0.08 266.51deg)', secondary: 'oklch(65.46% 0.07 87.04deg)', tertiary: 'oklch(64.32% 0.06 213.24deg)' },
+	legacy: { primary: 'oklch(69.84% 0.15 162.21deg)', secondary: 'oklch(51.06% 0.23 276.97deg)', tertiary: 'oklch(68.47% 0.15 237.31deg)' },
+	mint: { primary: 'oklch(83.57% 0.18 148.98deg)', secondary: 'oklch(59.27% 0.21 282.75deg)', tertiary: 'oklch(44.74% 0.03 322.1deg)' },
+	modern: { primary: 'oklch(65.59% 0.21 354.32deg)', secondary: 'oklch(71.48% 0.13 215.21deg)', tertiary: 'oklch(70.37% 0.12 182.49deg)' },
+	mona: { primary: 'oklch(56.31% 0.21 294.98deg)', secondary: 'oklch(63.43% 0.16 148.39deg)', tertiary: 'oklch(81.11% 0.1 190.5deg)' },
+	nosh: { primary: 'oklch(56.22% 0.23 24.62deg)', secondary: 'oklch(89.23% 0.04 17.93deg)', tertiary: 'oklch(42.89% 0.04 161.33deg)' },
+	nouveau: { primary: 'oklch(83.44% 0.16 97deg)', secondary: 'oklch(56.7% 0.19 256.45deg)', tertiary: 'oklch(62.5% 0.15 284.38deg)' },
+	pine: { primary: 'oklch(62.15% 0.08 79.85deg)', secondary: 'oklch(31.9% 0.11 347.8deg)', tertiary: 'oklch(61.68% 0.02 103.61deg)' },
+	reign: { primary: 'oklch(94.82% 0.17 110.7deg)', secondary: 'oklch(94.82% 0.17 110.7deg)', tertiary: 'oklch(94.82% 0.17 110.7deg)' },
+	rocket: { primary: 'oklch(71.48% 0.13 215.21deg)', secondary: 'oklch(62.31% 0.19 259.81deg)', tertiary: 'oklch(62.68% 0.23 303.91deg)' },
+	rose: { primary: 'oklch(69.89% 0.13 348.12deg)', secondary: 'oklch(46.75% 0.22 272.16deg)', tertiary: 'oklch(78.41% 0.08 291.85deg)' },
+	rosepine: { primary: 'oklch(53.06% 0.08 227.38deg)', secondary: 'oklch(78.02% 0.09 305.36deg)', tertiary: 'oklch(83.96% 0.05 21.29deg)' },
+	sahara: { primary: 'oklch(78.19% 0.15 76.87deg)', secondary: 'oklch(76.32% 0.12 183.49deg)', tertiary: 'oklch(85.72% 0.12 126.76deg)' },
+	seafoam: { primary: 'oklch(80.78% 0.07 190.34deg)', secondary: 'oklch(32.36% 0.07 262.2deg)', tertiary: 'oklch(65.36% 0.23 34.04deg)' },
+	terminus: { primary: 'oklch(48.65% 0.3 279.02deg)', secondary: 'oklch(89.36% 0.16 171.7deg)', tertiary: 'oklch(91.3% 0.21 117.7deg)' },
+	vintage: { primary: 'oklch(71.39% 0.16 59.66deg)', secondary: 'oklch(80.21% 0.08 152.14deg)', tertiary: 'oklch(71.48% 0.13 215.21deg)' },
+	vox: { primary: 'oklch(82.71% 0.1 51.5deg)', secondary: 'oklch(92.54% 0.17 123.36deg)', tertiary: 'oklch(80.24% 0.12 298.53deg)' },
+	wintry: { primary: 'oklch(62.31% 0.19 259.81deg)', secondary: 'oklch(68.47% 0.15 237.31deg)', tertiary: 'oklch(66.28% 0.18 280.87deg)' },
+};
+
 /**
  * Keep the default palette in the critical stylesheet. Alternate palettes are
  * loaded only when a user selects one, so the initial page does not download
