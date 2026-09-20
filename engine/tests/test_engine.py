@@ -182,14 +182,14 @@ def test_failed_one_time_source_remains_pending_for_retry(database, monkeypatch)
 
 def test_provider_error_messages_redact_query_and_webhook_credentials():
     message = safe_error_message(
-        "request failed for https://api.nytimes.com/v3/books?api-key=source-secret "
-        "and https://discord.com/api/webhooks/123/webhook-secret"
+        "request failed for https://source.example/v3/books?api-key=source-secret "
+        "and https://hooks.example/api/webhooks/123/webhook-secret"
     )
 
     assert "source-secret" not in message
     assert "webhook-secret" not in message
-    assert "api.nytimes.com" in message
-    assert "discord.com" in message
+    assert "source.example" in message
+    assert "hooks.example" in message
 
 
 @respx.mock
