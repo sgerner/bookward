@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     source_max_bytes: int = 2_000_000
     source_max_items: int = 250
     source_sync_interval_hours: int = 24
+    # Contact address included in identified Open Library requests.  The
+    # provider remains usable without one, but Open Library asks applications
+    # making regular requests to identify themselves.
+    openlibrary_contact: str = ""
     cors_origin: str = "http://localhost:3000"
     # Public origin used in digest links. It is deliberately separate from
     # the internal engine URL so Docker installs can link to the web service.
