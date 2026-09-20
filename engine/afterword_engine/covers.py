@@ -10,6 +10,7 @@ on the server, which keeps the cover enrichment path out of SSRF territory.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, datetime
 from urllib.parse import urlencode, urlparse
@@ -42,6 +43,15 @@ KNOWN_COVER_HOSTS = frozenset(
 )
 
 METADATA_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
+
+
+def metadata_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=min(settings.source_timeout_seconds, 6.0),
+        follow_redirects=False,
+        trust_env=False,
+        headers={"User-Agent": METADATA_USER_AGENT},
+    )
 
 
 def is_weak_cover_url(value: object) -> bool:
@@ -136,8 +146,10 @@ def _google_cover_url(image_links: object) -> str:
     return ""
 
 
-async def _lookup_open_library(title: str, author: str) -> str:
-    record = await _lookup_open_library_record(title, author)
+async def _lookup_open_library(
+    title: str, author: str, client: httpx.AsyncClient | None = None
+) -> str:
+    record = await _lookup_open_library_record(title, author, client=client)
     return str(record.get("cover_url", ""))
 
 
@@ -186,7 +198,11 @@ def _publication_date(value: object) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
-async def _lookup_open_library_record(title: str, author: str) -> dict[str, str]:
+async def _lookup_open_library_record(
+    title: str,
+    author: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, str]:
     params = {
         "title": title[:500],
         "author": author[:300],
@@ -194,15 +210,13 @@ async def _lookup_open_library_record(title: str, author: str) -> dict[str, str]
         "fields": "title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence",
     }
     try:
-        async with httpx.AsyncClient(
-            timeout=min(settings.source_timeout_seconds, 6.0),
-            follow_redirects=False,
-            trust_env=False,
-            headers={"User-Agent": METADATA_USER_AGENT},
-        ) as client:
+        if client is None:
+            async with metadata_client() as owned_client:
+                response = await owned_client.get(OPEN_LIBRARY_SEARCH, params=params)
+        else:
             response = await client.get(OPEN_LIBRARY_SEARCH, params=params)
-            response.raise_for_status()
-            payload = response.json()
+        response.raise_for_status()
+        payload = response.json()
     except Exception:
         return {}
     docs = payload.get("docs", []) if isinstance(payload, dict) else []
@@ -226,23 +240,27 @@ async def _lookup_open_library_record(title: str, author: str) -> dict[str, str]
     return {}
 
 
-async def _lookup_google_books(title: str, author: str) -> str:
-    record = await _lookup_google_books_record(title, author)
+async def _lookup_google_books(
+    title: str, author: str, client: httpx.AsyncClient | None = None
+) -> str:
+    record = await _lookup_google_books_record(title, author, client=client)
     return str(record.get("cover_url", ""))
 
 
-async def _lookup_google_books_record(title: str, author: str) -> dict[str, str]:
+async def _lookup_google_books_record(
+    title: str,
+    author: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, str]:
     params = {"q": f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": 5}
     try:
-        async with httpx.AsyncClient(
-            timeout=min(settings.source_timeout_seconds, 6.0),
-            follow_redirects=False,
-            trust_env=False,
-            headers={"User-Agent": METADATA_USER_AGENT},
-        ) as client:
+        if client is None:
+            async with metadata_client() as owned_client:
+                response = await owned_client.get(GOOGLE_BOOKS_SEARCH, params=params)
+        else:
             response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
-            response.raise_for_status()
-            payload = response.json()
+        response.raise_for_status()
+        payload = response.json()
     except Exception:
         return {}
     items = payload.get("items", []) if isinstance(payload, dict) else []
@@ -272,6 +290,8 @@ async def resolve_book_metadata(
     source_url: str = "",
     description: object = "",
     release_date: object = "",
+    client: httpx.AsyncClient | None = None,
+    lookup_cache: dict[tuple[str, str], asyncio.Task[dict[str, str]]] | None = None,
 ) -> dict[str, str]:
     """Resolve summary, publication date, and cover from public book catalogs.
 
@@ -292,7 +312,15 @@ async def resolve_book_metadata(
     needs_release_date = not result["release_date"]
     if needs_description or needs_release_date or not supplied_url:
         for lookup in (_lookup_open_library_record, _lookup_google_books_record):
-            record = await lookup(title, author)
+            if lookup_cache is None:
+                record = await lookup(title, author, client=client)
+            else:
+                cache_key = (lookup.__name__, f"{_normalized_title(title)}|{_normalized_title(author)}")
+                task = lookup_cache.get(cache_key)
+                if task is None:
+                    task = asyncio.create_task(lookup(title, author, client=client))
+                    lookup_cache[cache_key] = task
+                record = await task
             if not result["cover_url"] and record.get("cover_url"):
                 result["cover_url"] = record["cover_url"]
             if needs_description and record.get("description"):
@@ -308,7 +336,13 @@ async def resolve_book_metadata(
     return result
 
 
-async def resolve_cover_url(title: str, author: str, supplied: object = "", source_url: str = "") -> str:
+async def resolve_cover_url(
+    title: str,
+    author: str,
+    supplied: object = "",
+    source_url: str = "",
+    client: httpx.AsyncClient | None = None,
+) -> str:
     """Resolve a useful cover URL, always returning a non-empty value."""
 
     supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
@@ -316,10 +350,10 @@ async def resolve_cover_url(title: str, author: str, supplied: object = "", sour
         # Source-provided artwork is preferred.  We still normalize it to HTTPS
         # and never ask the engine to fetch it.
         return supplied_url
-    cover = await _lookup_open_library(title, author)
+    cover = await _lookup_open_library(title, author, client=client)
     if cover:
         return cover
-    cover = await _lookup_google_books(title, author)
+    cover = await _lookup_google_books(title, author, client=client)
     return cover or placeholder_cover_url(title, author)
 
 
