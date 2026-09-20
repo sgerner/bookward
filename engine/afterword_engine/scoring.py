@@ -1,8 +1,12 @@
 import json
 import math
+
+import numpy as np
+
 from .database import rows, transaction
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
+SCORING_BATCH_SIZE = 256
 
 def document(item):
     genres = item.get("genres", "[]")
@@ -57,6 +61,34 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
                 if not vector: raise ValueError("Embedding provider returned an empty vector")
                 vectors[index] = vector
     return vectors
+
+
+def _normalized_vectors(vectors):
+    if not vectors:
+        return np.empty((0, 0), dtype=np.float32)
+
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms != 0)
+
+
+def _max_cosine_similarities(vectors, references, default):
+    if not vectors:
+        return np.empty(0, dtype=np.float32)
+    if not references:
+        return np.full(len(vectors), default, dtype=np.float32)
+
+    normalized_vectors = _normalized_vectors(vectors)
+    normalized_references = _normalized_vectors(references)
+    best = np.empty(len(vectors), dtype=np.float32)
+    reference_transpose = normalized_references.T
+
+    for start in range(0, len(vectors), SCORING_BATCH_SIZE):
+        end = start + SCORING_BATCH_SIZE
+        similarities = normalized_vectors[start:end] @ reference_transpose
+        best[start:end] = similarities.max(axis=1)
+
+    return best
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
