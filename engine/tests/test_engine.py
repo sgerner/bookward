@@ -165,6 +165,27 @@ def test_local_cpu_scoring_runs_without_model_download(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 4
     assert row("SELECT COUNT(*) count FROM embeddings")["count"] == first_count
 
+
+def test_cached_vectors_batches_cache_reads(database, monkeypatch):
+    import afterword_engine.scoring as scoring_module
+
+    candidates = rows("SELECT * FROM candidates")
+    embedder = get_embedder("local", "hashing-768")
+    cache_queries = []
+    original_rows = scoring_module.rows
+
+    def capture_rows(query, params=()):
+        cache_queries.append(query)
+        return original_rows(query, params)
+
+    monkeypatch.setattr(scoring_module, "rows", capture_rows)
+    vectors = asyncio.run(cached_vectors(embedder, "candidate", candidates))
+
+    assert len(vectors) == len(candidates)
+    assert len(cache_queries) == 1
+    assert "entity_id IN" in cache_queries[0]
+
+
 def test_embedding_rebuild_replaces_every_stored_vector(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 4
     assert row("SELECT COUNT(*) count FROM embeddings")["count"] == 8
