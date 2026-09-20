@@ -22,7 +22,7 @@ from afterword_engine.covers import (
     safe_cover_url,
 )
 from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
-from afterword_engine.scoring import score_all, cached_vectors
+from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import safe_error_message, validate_public_url, validate_service_url
@@ -252,6 +252,17 @@ def test_cached_vectors_batches_cache_reads(database, monkeypatch):
     assert len(vectors) == len(candidates)
     assert len(cache_queries) == 1
     assert "entity_id IN" in cache_queries[0]
+
+
+def test_scoring_uses_chunked_cosine_maxima():
+    result = _max_cosine_similarities(
+        [[1, 0], [0, 1], [0, 0]],
+        [[1, 0], [1, 1]],
+        0.25,
+    )
+
+    assert result.tolist() == pytest.approx([1, 1 / 2**0.5, 0])
+    assert _max_cosine_similarities([[1, 0]], [], 0.25).tolist() == [0.25]
 
 
 def test_embedding_rebuild_replaces_every_stored_vector(database):
