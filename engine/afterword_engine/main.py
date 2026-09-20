@@ -33,6 +33,7 @@ from .digest import (
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
+SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 
@@ -63,7 +64,7 @@ def source_sync_is_due():
         return False
     now = datetime.now(timezone.utc)
     sources = rows(
-        "SELECT last_scanned_at FROM sources "
+        "SELECT last_scanned_at,last_status FROM sources "
         "WHERE enabled=1 AND kind!='builtin' AND lifecycle='permanent'"
     )
     for source in sources:
@@ -77,6 +78,10 @@ def source_sync_is_due():
             return True
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
+        if str(source["last_status"] or "").startswith("error:"):
+            if now - last >= timedelta(seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS):
+                return True
+            continue
         if now - last >= timedelta(hours=interval):
             return True
     return False
