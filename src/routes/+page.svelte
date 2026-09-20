@@ -33,6 +33,7 @@
     X,
   } from "@lucide/svelte";
   import ThemePicker from "$lib/components/ThemePicker.svelte";
+  import { copyApiTokenText } from "$lib/api-token-clipboard";
   import bookwardMark from "$lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "sources" | "settings";
@@ -80,6 +81,7 @@
   let digestOnlyNewOverride = $state<boolean | null>(null);
   let digestDiscordOverride = $state<boolean | null>(null);
   let digestEmailOverride = $state<boolean | null>(null);
+  let apiTokenCopyMessage = $state<string | null>(null);
 
   const navItems: NavItem[] = [
     {
@@ -415,6 +417,13 @@
   }
   function closeLibrarrSearch() {
     librarrSearchOpen = false;
+  }
+
+  async function copyApiToken() {
+    apiTokenCopyMessage = await copyApiTokenText(
+      formState?.token ?? "",
+      navigator.clipboard,
+    );
   }
 
   $effect(() => {
@@ -1537,9 +1546,12 @@
                         type="button"
                         title="Copy API token"
                         aria-label="Copy API token"
-                        onclick={() => void navigator.clipboard?.writeText(formState?.token ?? "")}
+                        onclick={() => void copyApiToken()}
                       ><Copy size={14} /> Copy</button>
                     </div>
+                    {#if apiTokenCopyMessage}
+                      <p class="mt-3 text-xs" role="status">{apiTokenCopyMessage}</p>
+                    {/if}
                   </div>
                 {/if}
 
