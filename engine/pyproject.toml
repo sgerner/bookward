@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-local-model = ["sentence-transformers==5.1.1"]
-dev = ["pytest==8.4.2", "respx==0.22.0"]
+local-model = ["sentence-transformers==6.0.1"]
+dev = ["pytest==9.1.1", "respx==0.23.1"]
 
 [build-system]
 requires = ["hatchling"]
