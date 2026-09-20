@@ -12,7 +12,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl
 from .config import settings
 from .database import initialize, row, rows, transaction
-from .api_tokens import generate_api_token, hash_api_token, token_prefix
+from .api_tokens import (
+    generate_api_token,
+    hash_api_token,
+    legacy_hash_api_token,
+    token_prefix,
+)
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import import_goodreads_csv, import_goodreads_rss, preview_source, refresh_missing_candidate_metadata, scan_source
@@ -821,10 +826,12 @@ def require_api_token(
             detail="A valid API token is required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    current_hash = hash_api_token(candidate)
+    legacy_hash = legacy_hash_api_token(candidate)
     found = row(
-        "SELECT id,name FROM api_tokens "
-        "WHERE token_hash=? AND revoked_at IS NULL",
-        (hash_api_token(candidate),),
+        "SELECT id,name,token_hash FROM api_tokens "
+        "WHERE token_hash IN (?,?) AND revoked_at IS NULL",
+        (current_hash, legacy_hash),
     )
     if not found:
         raise HTTPException(
@@ -833,6 +840,14 @@ def require_api_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     with transaction() as con:
+        if found["token_hash"] == legacy_hash:
+            # Tokens created before the PBKDF2 upgrade remain valid and are
+            # upgraded on their first successful use. The predicate makes
+            # concurrent requests harmless if another request wins the race.
+            con.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=? AND token_hash=?",
+                (current_hash, found["id"], legacy_hash),
+            )
         con.execute(
             "UPDATE api_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
             (found["id"],),

@@ -26,6 +26,7 @@ from afterword_engine.scoring import cached_vectors, rebuild_all_embeddings, sco
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import validate_public_url, validate_service_url
+from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
 from afterword_engine.main import (
     SOURCE_SYNC_ERROR_RETRY_SECONDS,
     app,
@@ -364,6 +365,25 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
             "/api/v1/recommendations",
             headers={"Authorization": f"Bearer {token}"},
         ).status_code == 401
+
+
+def test_legacy_api_token_hash_is_upgraded_on_first_use(database):
+    with TestClient(app) as client:
+        created = client.post("/api/settings/api-tokens", json={"name": "Legacy client"})
+        token = created.json()["token"]
+        token_id = created.json()["id"]
+        with transaction() as con:
+            con.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=?",
+                (legacy_hash_api_token(token), token_id),
+            )
+
+        authorized = client.get(
+            "/api/v1/health",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert authorized.status_code == 200
+        assert row("SELECT token_hash FROM api_tokens WHERE id=?", (token_id,))["token_hash"] == hash_api_token(token)
 
 
 def test_api_recommendation_status_filter_applies_before_limit(database):

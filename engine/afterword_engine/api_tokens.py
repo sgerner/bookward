@@ -32,6 +32,19 @@ def hash_api_token(token: str) -> str:
     ).hex()
 
 
+def legacy_hash_api_token(token: str) -> str:
+    """Return the SHA-256 digest used before installation-bound hashing.
+
+    This deliberately weak digest is retained only to recognize tokens stored
+    by pre-PBKDF2 releases; successful legacy authentication is upgraded to
+    ``hash_api_token`` immediately.
+    """
+
+    # This compatibility digest is only used to recognize pre-PBKDF2 records;
+    # successful authentication upgrades the stored value immediately.
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def token_prefix(token: str) -> str:
     """Return the stable, non-secret identifier shown in token listings."""
 
