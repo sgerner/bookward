@@ -77,6 +77,7 @@ MIGRATIONS = [
     (
         5,
         """
+<<<<<<< HEAD
         CREATE TABLE IF NOT EXISTS recommendation_runs (
             id TEXT PRIMARY KEY,
             policy TEXT NOT NULL,
@@ -253,6 +254,10 @@ MIGRATIONS = [
             ON association_evidence(candidate_id, provider);
         CREATE INDEX IF NOT EXISTS idx_association_evidence_seed
             ON association_evidence(seed_read_id, provider);
+        CREATE INDEX IF NOT EXISTS idx_reads_recent
+            ON reads(COALESCE(read_at, created_at) DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_queue
+            ON jobs(status, created_at);
         """,
     ),
 ]

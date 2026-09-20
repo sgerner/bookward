@@ -65,6 +65,29 @@ def test_database_files_are_owner_only(tmp_path):
         if path.exists():
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
+
+def test_database_indexes_cover_recent_history_and_job_queue(database):
+    indexes = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
+            ("idx_reads_recent", "idx_jobs_queue"),
+        )
+    }
+
+    assert indexes == {"idx_reads_recent", "idx_jobs_queue"}
+    history_plan = rows(
+        "EXPLAIN QUERY PLAN SELECT * FROM reads "
+        "ORDER BY COALESCE(read_at, created_at) DESC LIMIT 12"
+    )
+    queue_plan = rows(
+        "EXPLAIN QUERY PLAN SELECT * FROM jobs "
+        "WHERE status='queued' ORDER BY created_at LIMIT 1"
+    )
+    assert any("idx_reads_recent" in item["detail"] for item in history_plan)
+    assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
+
+
 def test_fresh_database_seeds_curated_sources(database):
     sources = rows("SELECT name,url,enabled FROM sources WHERE is_default=0")
     urls = {source["url"] for source in sources}
