@@ -73,6 +73,15 @@ MIGRATIONS = [
             ON api_tokens(revoked_at, created_at DESC);
         """,
     ),
+    (
+        5,
+        """
+        CREATE INDEX IF NOT EXISTS idx_reads_recent
+            ON reads(COALESCE(read_at, created_at) DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_queue
+            ON jobs(status, created_at);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

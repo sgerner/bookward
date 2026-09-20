@@ -57,6 +57,29 @@ def test_database_files_are_owner_only(tmp_path):
         if path.exists():
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
+
+def test_database_indexes_cover_recent_history_and_job_queue(database):
+    indexes = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
+            ("idx_reads_recent", "idx_jobs_queue"),
+        )
+    }
+
+    assert indexes == {"idx_reads_recent", "idx_jobs_queue"}
+    history_plan = rows(
+        "EXPLAIN QUERY PLAN SELECT * FROM reads "
+        "ORDER BY COALESCE(read_at, created_at) DESC LIMIT 12"
+    )
+    queue_plan = rows(
+        "EXPLAIN QUERY PLAN SELECT * FROM jobs "
+        "WHERE status='queued' ORDER BY created_at LIMIT 1"
+    )
+    assert any("idx_reads_recent" in item["detail"] for item in history_plan)
+    assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
+
+
 def test_fresh_database_seeds_curated_sources(database):
     sources = rows("SELECT name,url,enabled FROM sources WHERE is_default=0")
     urls = {source["url"] for source in sources}
@@ -592,7 +615,7 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 5
     assert row(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
