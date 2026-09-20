@@ -23,5 +23,7 @@ class Settings(BaseSettings):
     models_catalog_url: str = "https://models.dev/api.json?type=all"
     models_catalog_cache: str = "/data/models-dev.json"
     models_catalog_ttl_hours: int = 24
+    llm_timeout_seconds: float = 45.0
+    llm_shadow_max_reads: int = 300
 
 settings = Settings()

@@ -77,6 +77,131 @@ MIGRATIONS = [
     (
         5,
         """
+        CREATE TABLE IF NOT EXISTS recommendation_runs (
+            id TEXT PRIMARY KEY,
+            policy TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            candidate_count INTEGER NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_impressions (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            rank INTEGER NOT NULL CHECK(rank > 0),
+            score REAL NOT NULL,
+            propensity REAL NOT NULL CHECK(propensity > 0 AND propensity <= 1),
+            presented_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            visible_at TEXT,
+            UNIQUE(run_id, candidate_id)
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_events (
+            id INTEGER PRIMARY KEY,
+            event_key TEXT NOT NULL UNIQUE,
+            run_id TEXT REFERENCES recommendation_runs(id) ON DELETE SET NULL,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            value REAL,
+            source TEXT NOT NULL,
+            occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+            id INTEGER PRIMARY KEY,
+            impression_id INTEGER NOT NULL REFERENCES recommendation_impressions(id) ON DELETE CASCADE,
+            event_id INTEGER NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
+            read_id INTEGER REFERENCES reads(id) ON DELETE SET NULL,
+            label REAL NOT NULL,
+            label_kind TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            attributed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(impression_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_candidate_time
+            ON recommendation_impressions(candidate_id, presented_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_run_rank
+            ON recommendation_impressions(run_id, rank);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_events_candidate_time
+            ON recommendation_events(candidate_id, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_events_type_time
+            ON recommendation_events(event_type, occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_read
+            ON recommendation_outcomes(read_id, attributed_at DESC);
+        """,
+    ),
+    (
+        6,
+        """
+        CREATE TABLE IF NOT EXISTS llm_connections (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL DEFAULT '',
+            auth_type TEXT NOT NULL DEFAULT 'api_key',
+            secret TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_status TEXT,
+            last_error TEXT,
+            last_used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(auth_type IN ('api_key'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_connections_enabled
+            ON llm_connections(enabled, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_policies (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            top_k INTEGER NOT NULL DEFAULT 20,
+            prompt_version TEXT NOT NULL DEFAULT 'shadow-v1',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(top_k BETWEEN 1 AND 100)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_policies_enabled
+            ON llm_policies(enabled, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_runs (
+            id TEXT PRIMARY KEY,
+            policy_id INTEGER NOT NULL REFERENCES llm_policies(id),
+            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
+            request_hash TEXT NOT NULL,
+            candidate_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_runs_policy_created
+            ON llm_runs(policy_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_llm_runs_request
+            ON llm_runs(request_hash, created_at DESC);
+        CREATE TABLE IF NOT EXISTS llm_scores (
+            run_id TEXT NOT NULL REFERENCES llm_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+            rank INTEGER NOT NULL,
+            score REAL NOT NULL,
+            confidence REAL,
+            reason_codes TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY(run_id, candidate_id),
+            UNIQUE(run_id, rank)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_scores_candidate
+            ON llm_scores(candidate_id, run_id);
+        """,
+    ),
+    (
+        7,
+        """
         CREATE TABLE IF NOT EXISTS association_runs (
             id TEXT PRIMARY KEY,
             provider TEXT NOT NULL,
