@@ -21,7 +21,7 @@ from .api_tokens import (
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import import_goodreads_csv, import_goodreads_rss, preview_source, refresh_missing_candidate_metadata, scan_source
-from .security import validate_public_url, validate_service_url
+from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import rebuild_all_embeddings, score_all
 from .secrets import seal, unseal
@@ -262,7 +262,7 @@ async def handle_job(kind: str):
         try:
             collected = await scan_source(source)
         except Exception as exc:
-            message = str(exc)[:400]
+            message = safe_error_message(exc)
             with transaction() as con:
                 con.execute(
                     "UPDATE sources SET last_status=?, "
@@ -286,7 +286,7 @@ async def handle_job(kind: str):
             try:
                 total += await scan_source(source)
             except Exception as exc:
-                message = str(exc)[:400]
+                message = safe_error_message(exc)
                 with transaction() as con:
                     con.execute(
                         "UPDATE sources SET last_status=?, "
@@ -683,8 +683,9 @@ async def import_librarr(candidate_id: int):
             con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
         return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
     except (httpx.HTTPError, ValueError) as exc:
-        with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(str(exc)[:1000],key))
-        raise HTTPException(502, f"Librarr request failed: {exc}")
+        message = safe_error_message(exc, limit=1000)
+        with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(message,key))
+        raise HTTPException(502, f"Librarr request failed: {message}")
 
 
 @app.get("/api/librarr/search")
@@ -694,9 +695,9 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise HTTPException(400, safe_error_message(exc)) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {exc}") from exc
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 class LibrarrDownloadIn(BaseModel):
@@ -714,9 +715,9 @@ async def download_librarr(payload: LibrarrDownloadIn):
         result = await librarr_download(config, payload.result, media, key)
         return {"ok": True, "media_type": media, "result": result}
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise HTTPException(400, safe_error_message(exc)) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {exc}") from exc
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @app.post("/api/import/goodreads/csv")
 async def goodreads_csv(file: UploadFile = File(...)):
@@ -725,24 +726,24 @@ async def goodreads_csv(file: UploadFile = File(...)):
         content.extend(chunk)
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
     try: count = import_goodreads_csv(bytes(content))
-    except ValueError as exc: raise HTTPException(400,str(exc))
+    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
     return {"imported":count,"job_id":enqueue_job("score")}
 
 @app.post("/api/import/goodreads/rss")
 async def goodreads_rss(payload: UrlIn):
     try: count = await import_goodreads_rss(str(payload.url))
-    except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,str(exc))
+    except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
     return {"imported":count,"job_id":enqueue_job("score")}
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: UrlIn):
     try: return await preview_source(str(payload.url))
-    except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,str(exc))
+    except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
 
 @app.post("/api/sources")
 def add_source(payload: SourceIn):
     try: validate_public_url(str(payload.url))
-    except ValueError as exc: raise HTTPException(400,str(exc))
+    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
     with transaction() as con:
         try: cursor=con.execute("INSERT INTO sources(name,url,enabled,weight,lifecycle) VALUES(?,?,?,?,?)",(payload.name,str(payload.url),payload.enabled,payload.weight,payload.lifecycle))
         except Exception as exc: raise HTTPException(409,"Source already exists") from exc
@@ -783,7 +784,7 @@ def _save_digest_settings(updates: dict):
     try:
         validate_digest_config(merged)
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise HTTPException(400, safe_error_message(exc)) from exc
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -1356,13 +1357,13 @@ def revoke_api_token(token_id: int):
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
     try: payload.validate_values()
-    except ValueError as exc: raise HTTPException(400,str(exc))
+    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
     current = private_settings(); values = payload.model_dump()
     for key in ("embedding_api_key","librarr_api_key"):
         if not values[key]: values[key] = current.get(key,"")
     test = await asyncio.to_thread(get_embedder, values["embedding_backend"],values["embedding_model"],values["embedding_url"],values["embedding_api_key"])
     health = await test.health()
-    if not health.get("ok"): raise HTTPException(400, f"Embedding provider check failed: {health.get('error','unknown error')}")
+    if not health.get("ok"): raise HTTPException(400, f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}")
     values["embedding_model"] = test.model
     with transaction() as con:
         for key,value in values.items():

@@ -26,7 +26,7 @@ from afterword_engine.ingestion import import_goodreads_csv, parse_book_items, f
 from afterword_engine.scoring import cached_vectors, rebuild_all_embeddings, score_all
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
-from afterword_engine.security import validate_public_url, validate_service_url
+from afterword_engine.security import safe_error_message, validate_public_url, validate_service_url
 from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
 from afterword_engine.main import (
     SOURCE_SYNC_ERROR_RETRY_SECONDS,
@@ -200,13 +200,54 @@ def test_failed_one_time_source_remains_pending_for_retry(database, monkeypatch)
         )
 
     async def fail(_source):
-        raise RuntimeError("temporary source outage")
+        raise RuntimeError("temporary source outage at https://api.nytimes.com/v3/books?api-key=source-secret")
 
     monkeypatch.setattr("afterword_engine.main.scan_source", fail)
     result = asyncio.run(handle_job("sync"))
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:") and source["last_scanned_at"] is None
+    assert "source-secret" not in source["last_status"]
+
+
+def test_provider_error_messages_redact_query_and_webhook_credentials():
+    message = safe_error_message(
+        "request failed for https://source.example/v3/books?api-key=source-secret "
+        "and https://hooks.example/api/webhooks/123/webhook-secret"
+    )
+
+    assert "source-secret" not in message
+    assert "webhook-secret" not in message
+    assert "source.example" in message
+    assert "hooks.example" in message
+
+
+@respx.mock
+def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("162.159.135.42", 443))],
+    )
+    secret_url = "https://discord.com/api/webhooks/123/webhook-secret"
+    route = respx.post(secret_url).mock(return_value=httpx.Response(500))
+    config = {
+        "digest_enabled": "1",
+        "digest_channels": "discord",
+        "digest_minimum_score": "0",
+        "digest_maximum_books": "1",
+        "digest_app_url": "https://afterword.example",
+        "digest_discord_webhook_url": secret_url,
+    }
+
+    result = asyncio.run(send_digest(config))
+    delivery = row("SELECT error FROM notification_deliveries LIMIT 1")
+
+    assert route.called
+    assert result["status"] == "failed"
+    assert result["deliveries"][0]["error"] == "Discord webhook returned HTTP 500"
+    assert delivery["error"] == "Discord webhook returned HTTP 500"
+    assert "webhook-secret" not in json.dumps(result)
 
 
 def test_failed_permanent_source_retries_after_short_backoff(database, monkeypatch):
