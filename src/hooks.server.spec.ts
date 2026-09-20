@@ -11,6 +11,9 @@ describe('authentication boundary', () => {
   it('recognizes only the versioned API paths as token-authenticated routes', () => {
     expect(isPublicApiPath('/api/v1')).toBe(true);
     expect(isPublicApiPath('/api/v1/recommendations')).toBe(true);
+    expect(isPublicApiPath('/api/v1/%72ecommendations')).toBe(true);
+    expect(isPublicApiPath('/api/v1/%2e%2e/settings')).toBe(false);
+    expect(isPublicApiPath('/api/v1/%5c%2e%2e%5csettings')).toBe(false);
     expect(isPublicApiPath('/api/v10/recommendations')).toBe(false);
     expect(isPublicApiPath('/settings')).toBe(false);
   });
