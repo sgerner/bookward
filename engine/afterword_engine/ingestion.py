@@ -461,7 +461,9 @@ async def scan_source(source):
         if seen:
             placeholders = ",".join("?" for _ in seen)
             con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
-        else:
-            con.execute("DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended')", (source["id"],))
-        con.execute("UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP WHERE id=?", (f"ok:{len(items)}", source["id"]))
+        # An empty response can be a transient block page, parser mismatch,
+        # or upstream outage. It is not safe to interpret it as proof that a
+        # source no longer contains any books, so retain existing candidates.
+        status = f"ok:{len(items)}" if items else "empty:0"
+        con.execute("UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP WHERE id=?", (status, source["id"]))
     return len(items)

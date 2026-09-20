@@ -112,6 +112,28 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
 
 
+def test_empty_source_scan_preserves_existing_candidates(database, monkeypatch):
+    async def empty_fetch(_url):
+        return b"<html><body>temporarily unavailable</body></html>", "text/html"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", empty_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.parse_book_items", lambda *_args: [])
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?)",
+            ("Empty source", "https://example.com/empty"),
+        )
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
+            ("Keep this book", "A Writer", cursor.lastrowid, "recommended", "keep this book a writer"),
+        )
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 0
+    assert row("SELECT status FROM candidates WHERE title='Keep this book'")["status"] == "recommended"
+    assert row("SELECT last_status FROM sources WHERE id=?", (cursor.lastrowid,))["last_status"] == "empty:0"
+
+
 @respx.mock
 def test_one_time_source_is_imported_once_and_remains_visible(database, monkeypatch):
     url = "https://openlibrary.org/subjects/science_fiction.json?limit=1"
