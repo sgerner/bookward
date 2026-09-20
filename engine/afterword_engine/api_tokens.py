@@ -11,6 +11,7 @@ from .secrets import installation_key
 
 
 TOKEN_PREFIX = "bkw_"
+TOKEN_MAX_LENGTH = 128
 TOKEN_HASH_SALT = b"bookward-api-token-v1:"
 TOKEN_HASH_ITERATIONS = 600_000
 
@@ -30,6 +31,17 @@ def hash_api_token(token: str) -> str:
         TOKEN_HASH_SALT + installation_key(),
         TOKEN_HASH_ITERATIONS,
     ).hex()
+
+
+def legacy_hash_api_token(token: str) -> str:
+    """Return the digest used before installation-bound token hashing.
+
+    This compatibility path is only used to recognize tokens stored by older
+    releases; successful authentication upgrades the row to PBKDF2 below.
+    """
+
+    # codeql[py/weak-sensitive-data-hashing]
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def token_prefix(token: str) -> str:

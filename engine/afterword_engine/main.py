@@ -12,7 +12,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl
 from .config import settings
 from .database import connect, initialize, row, rows, transaction
-from .api_tokens import generate_api_token, hash_api_token, token_prefix
+from .api_tokens import (
+    TOKEN_MAX_LENGTH,
+    TOKEN_PREFIX,
+    generate_api_token,
+    hash_api_token,
+    legacy_hash_api_token,
+    token_prefix,
+)
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import import_goodreads_csv, import_goodreads_rss, preview_source, refresh_missing_candidate_metadata, scan_source
@@ -821,17 +828,31 @@ def require_api_token(
     candidate = credentials.credentials.strip() if credentials else ""
     if not candidate and x_api_key:
         candidate = x_api_key.strip()
-    if not candidate or any(character.isspace() for character in candidate):
+    if (
+        not candidate
+        or len(candidate) > TOKEN_MAX_LENGTH
+        or not candidate.startswith(TOKEN_PREFIX)
+        or any(character.isspace() for character in candidate)
+    ):
         raise HTTPException(
             status_code=401,
             detail="A valid API token is required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    current_hash = hash_api_token(candidate)
     found = row(
-        "SELECT id,name FROM api_tokens "
+        "SELECT id,name,token_hash FROM api_tokens "
         "WHERE token_hash=? AND revoked_at IS NULL",
-        (hash_api_token(candidate),),
+        (current_hash,),
     )
+    legacy_hash = None
+    if not found:
+        legacy_hash = legacy_hash_api_token(candidate)
+        found = row(
+            "SELECT id,name,token_hash FROM api_tokens "
+            "WHERE token_hash=? AND revoked_at IS NULL",
+            (legacy_hash,),
+        )
     if not found:
         raise HTTPException(
             status_code=401,
@@ -839,6 +860,12 @@ def require_api_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     with transaction() as con:
+        if legacy_hash and found["token_hash"] == legacy_hash:
+            # The predicate keeps concurrent first-use upgrades harmless.
+            con.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=? AND token_hash=?",
+                (current_hash, found["id"], legacy_hash),
+            )
         con.execute(
             "UPDATE api_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
             (found["id"],),
