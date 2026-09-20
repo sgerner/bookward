@@ -7,11 +7,11 @@ def document(item):
     genres = item.get("genres", "[]")
     return f"{item.get('title','')} {item.get('author','')} {genres} {item.get('description','')}"
 
-async def cached_vectors(embedder, entity_type, items):
+async def cached_vectors(embedder, entity_type, items, *, force=False, persist=True):
     vectors, missing = [None] * len(items), []
     for index, item in enumerate(items):
         text = document(item); digest = content_hash(text)
-        cached = row("SELECT vector FROM embeddings WHERE entity_type=? AND entity_id=? AND backend=? AND model=? AND content_hash=?", (entity_type,item["id"],embedder.name,embedder.model,digest))
+        cached = None if force else row("SELECT vector FROM embeddings WHERE entity_type=? AND entity_id=? AND backend=? AND model=? AND content_hash=?", (entity_type,item["id"],embedder.name,embedder.model,digest))
         if cached: vectors[index] = blob_vector(cached["vector"])
         else: missing.append((index,item,text,digest))
     if missing:
@@ -22,11 +22,16 @@ async def cached_vectors(embedder, entity_type, items):
         dimensions = len(generated[0]) if generated else 0
         if not dimensions or any(len(vector) != dimensions or not all(math.isfinite(float(value)) for value in vector) for vector in generated):
             raise ValueError("Embedding provider returned invalid or inconsistent vectors")
-        with transaction() as con:
-            for (index,item,_text,digest), vector in zip(missing,generated):
+        if persist:
+            with transaction() as con:
+                for (index,item,_text,digest), vector in zip(missing,generated):
+                    if not vector: raise ValueError("Embedding provider returned an empty vector")
+                    vectors[index] = vector
+                    con.execute("INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",(entity_type,item["id"],embedder.name,embedder.model,vector_blob(vector),len(vector),digest))
+        else:
+            for (index,_item,_text,_digest), vector in zip(missing,generated):
                 if not vector: raise ValueError("Embedding provider returned an empty vector")
                 vectors[index] = vector
-                con.execute("INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",(entity_type,item["id"],embedder.name,embedder.model,vector_blob(vector),len(vector),digest))
     return vectors
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
@@ -62,21 +67,38 @@ async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=Non
     Scoring intentionally embeds only rated reads and active candidates for
     speed. A provider/model change needs a stronger guarantee: every stored
     entity should be ready for the next scoring or discovery run. Existing
-    vectors for the selected provider are cleared first; vectors from another
-    provider remain available until the caller confirms the rebuild succeeded.
+    vectors for the selected provider are replaced only after the complete
+    replacement set has been generated successfully.
     """
     embedder = get_embedder(backend, model, url, api_key)
-    # Force regeneration for the selected provider/model, while leaving an
-    # older provider's vectors available until the new set is complete.
+    reads = rows("SELECT * FROM reads")
+    candidates = rows("SELECT * FROM candidates")
+    # Generate off to the side first. A provider failure must leave both the
+    # current provider cache and caches for other providers untouched.
+    read_vectors = await cached_vectors(embedder, "read", reads, force=True, persist=False)
+    candidate_vectors = await cached_vectors(embedder, "candidate", candidates, force=True, persist=False)
     with transaction() as con:
         con.execute(
             "DELETE FROM embeddings WHERE backend=? AND model=?",
             (embedder.name, embedder.model),
         )
-    reads = rows("SELECT * FROM reads")
-    candidates = rows("SELECT * FROM candidates")
-    await cached_vectors(embedder, "read", reads)
-    await cached_vectors(embedder, "candidate", candidates)
+        for entity_type, items, vectors in (
+            ("read", reads, read_vectors),
+            ("candidate", candidates, candidate_vectors),
+        ):
+            for item, vector in zip(items, vectors):
+                con.execute(
+                    "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        entity_type,
+                        item["id"],
+                        embedder.name,
+                        embedder.model,
+                        vector_blob(vector),
+                        len(vector),
+                        content_hash(document(item)),
+                    ),
+                )
     scored = await score_all(backend, model, url, api_key, embedder=embedder)
     return {
         "embeddings": len(reads) + len(candidates),
