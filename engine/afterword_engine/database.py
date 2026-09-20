@@ -300,13 +300,15 @@ DEFAULT_SOURCES = (
 )
 
 def connect():
-    Path(settings.db).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(settings.db, timeout=10, check_same_thread=False)
+    db_path = Path(settings.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.create_function("book_identity", 2, book_identity, deterministic=True)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=5000")
+    _restrict_database_files()
     return con
 
 
@@ -372,6 +374,15 @@ def _ensure_llm_auth_types(con):
         con.execute("PRAGMA legacy_alter_table=OFF")
         con.execute("PRAGMA foreign_keys=ON")
 
+def _restrict_database_files():
+    """Keep the database and SQLite sidecars private to the engine user."""
+
+    for path in (Path(settings.db), Path(f"{settings.db}-wal"), Path(f"{settings.db}-shm")):
+        try:
+            path.chmod(0o600)
+        except FileNotFoundError:
+            continue
+
 @contextmanager
 def transaction():
     con = connect()
@@ -384,6 +395,7 @@ def transaction():
         raise
     finally:
         con.close()
+        _restrict_database_files()
 
 def initialize():
     with connect() as con:
@@ -452,6 +464,7 @@ def initialize():
                     con.execute("UPDATE candidates SET source_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (source_value, current["id"]))
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
+    _restrict_database_files()
 
 def normalize_key(title: str, author: str):
     import re

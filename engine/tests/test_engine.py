@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 from datetime import datetime, timedelta, timezone
+import stat
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,20 @@ def test_fresh_database_seeds_independent_demo(database):
     covers = [item["cover_url"] for item in rows("SELECT cover_url FROM candidates")]
     assert len(covers) == 4 and all(covers) and not any(is_weak_cover_url(cover) for cover in covers)
     assert all("/isbn/" not in item["source_url"] for item in rows("SELECT source_url FROM candidates"))
+
+
+def test_database_files_are_owner_only(tmp_path):
+    settings.db = str(tmp_path / "private.db")
+    Path(settings.db).touch(mode=0o644)
+    Path(settings.db).chmod(0o644)
+
+    initialize()
+    with transaction() as con:
+        con.execute("INSERT INTO reads(title,author,source) VALUES(?,?,?)", ("Private", "Reader", "test"))
+
+    for path in (Path(settings.db), Path(f"{settings.db}-wal"), Path(f"{settings.db}-shm")):
+        if path.exists():
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 def test_fresh_database_seeds_curated_sources(database):
     sources = rows("SELECT name,url,enabled FROM sources WHERE is_default=0")
