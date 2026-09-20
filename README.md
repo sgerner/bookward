@@ -82,7 +82,7 @@ curl https://your-bookward-host.example/api/v1/recommendations \
 The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
 
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
-- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|all` and `limit`.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|all`, cap with `limit`, and page with `offset`.
 - `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, or `restore`.
 - `GET /api/v1/sources` — list configured sources.
 - `POST /api/v1/sync` — queue a source refresh and return a job ID.

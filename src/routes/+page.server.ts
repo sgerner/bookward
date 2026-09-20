@@ -1,24 +1,11 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { engine, EngineError } from "$lib/server/engine";
+import { toPageBook, type Recommendation } from "$lib/server/recommendations";
 import { z } from "zod";
 
 type Overview = {
-  recommendations: Array<{
-    id: number;
-    title: string;
-    author: string;
-    description: string;
-    cover_url: string;
-    source_url: string;
-    release_date: string | null;
-    date_kind: string;
-    genres: string[];
-    score: number;
-    explanation: string[];
-    status: string;
-    source_name: string | null;
-  }>;
+  recommendations: Recommendation[];
   history: Array<{
     id: number;
     title: string;
@@ -92,7 +79,7 @@ type DigestSettings = {
 export const load: PageServerLoad = async ({ url }) => {
   let overview: Overview;
   try {
-    overview = await engine<Overview>("/api/overview");
+    overview = await engine<Overview>("/api/overview?recommendation_limit=24");
   } catch (cause) {
     throw httpError(503, {
       message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
@@ -118,17 +105,7 @@ export const load: PageServerLoad = async ({ url }) => {
     }
   }
   return {
-    books: overview.recommendations.map((book) => ({
-      ...book,
-      cover_url: publicUrl(book.cover_url),
-      source_url: publicUrl(book.source_url),
-      published_on: book.release_date,
-      published_kind: book.date_kind,
-      synopsis: book.description,
-      reason: book.explanation.join(" · "),
-      source_type: "engine",
-      librar_id: book.status === "imported" ? "imported" : null,
-    })),
+    books: overview.recommendations.map(toPageBook),
     history: overview.history,
     digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
     sources: overview.sources
@@ -161,15 +138,6 @@ const message = (error: unknown) =>
     : "The engine could not complete that request.";
 const status = (error: unknown) =>
   error instanceof EngineError && error.status < 500 ? error.status : 502;
-const publicUrl = (value: string) => {
-  try {
-    const parsed = new URL(value);
-    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
-  } catch {
-    return "";
-  }
-};
-
 export const actions: Actions = {
   createApiToken: async ({ request }) => {
     const name = z.string().trim().min(1).max(100).safeParse(
