@@ -57,7 +57,49 @@ type Overview = {
       last_used_at: string | null;
       revoked_at: string | null;
     }>;
+    llm_connections?: LlmConnectionSummary[];
+    llm_policies?: LlmPolicySummary[];
   };
+};
+
+type LlmConnectionSummary = {
+  id: number;
+  name: string;
+  provider_id: string;
+  model_id: string;
+  endpoint: string;
+  auth_type: string;
+  enabled: number;
+  last_status: string | null;
+  last_error: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type LlmPolicySummary = {
+  id: number;
+  name: string;
+  connection_id: number;
+  enabled: number;
+  top_k: number;
+  prompt_version: string;
+  created_at: string;
+  updated_at: string;
+  connection_name: string;
+  provider_id: string;
+  model_id: string;
+};
+
+type LlmRunSummary = {
+  id: string;
+  policy_id: number;
+  connection_id: number;
+  status: string;
+  candidate_count: number;
+  latency_ms: number | null;
+  created_at: string;
+  finished_at: string | null;
 };
 
 type DigestSettings = {
@@ -115,6 +157,15 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
       message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
     });
   }
+  let llmRuns: LlmRunSummary[] = [];
+  try {
+    const runResult = await engine<{ runs?: Array<Record<string, unknown>> }>(
+      "/api/llm/runs?limit=12",
+    );
+    llmRuns = normalizeLlmRuns(runResult.runs ?? []);
+  } catch {
+    // Optional history should not make the main recommendation page unavailable.
+  }
   const builtIn = overview.sources.find((source) => source.is_default);
   let digestPeriod = url.searchParams.get("digest_period");
   let digestReviewIds: number[] = [];
@@ -166,6 +217,11 @@ export const load: PageServerLoad = async ({ url, cookies }) => {
         ? overview.settings.api_tokens
         : [],
     },
+    llm: {
+      connections: overview.settings.llm_connections ?? [],
+      policies: overview.settings.llm_policies ?? [],
+      runs: llmRuns,
+    },
   };
 };
 
@@ -188,7 +244,219 @@ const publicUrl = (value: string) => {
   }
 };
 
+const normalizeLlmRuns = (runs: Array<Record<string, unknown>>): LlmRunSummary[] =>
+  runs.flatMap((run) => {
+    if (
+      typeof run.id !== "string" ||
+      typeof run.policy_id !== "number" ||
+      typeof run.connection_id !== "number" ||
+      typeof run.status !== "string" ||
+      typeof run.candidate_count !== "number" ||
+      typeof run.created_at !== "string"
+    )
+      return [];
+    return [
+      {
+        id: run.id,
+        policy_id: run.policy_id,
+        connection_id: run.connection_id,
+        status: run.status,
+        candidate_count: run.candidate_count,
+        latency_ms: typeof run.latency_ms === "number" ? run.latency_ms : null,
+        created_at: run.created_at,
+        finished_at: typeof run.finished_at === "string" ? run.finished_at : null,
+      },
+    ];
+  });
+
+const formText = (data: FormData, key: string) => String(data.get(key) ?? "").trim();
+const optionalFormText = (data: FormData, key: string) => {
+  const value = formText(data, key);
+  return value || undefined;
+};
+const llmAuthSchema = z.enum(["api_key", "openai_codex", "claude_code"]);
+const llmProviderSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9._-]+$/);
+const llmModelSchema = z.string().trim().min(1).max(300);
+const llmNameSchema = z.string().trim().min(1).max(100);
+const llmEndpointSchema = z.string().trim().max(500);
+
 export const actions: Actions = {
+  loadLlmCatalog: async ({ request }) => {
+    const refresh = (await request.formData()).get("refresh") === "on";
+    try {
+      const llmCatalog = await engine<Record<string, unknown>>(
+        `/api/llm/catalog${refresh ? "?refresh=true" : ""}`,
+      );
+      return { llmCatalog, message: "Model catalog loaded." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  saveLlmConnection: async ({ request }) => {
+    const data = await request.formData();
+    const id = optionalFormText(data, "id");
+    const name = llmNameSchema.safeParse(data.get("name"));
+    const providerId = llmProviderSchema.safeParse(data.get("providerId"));
+    const modelId = llmModelSchema.safeParse(data.get("modelId"));
+    const endpoint = llmEndpointSchema.safeParse(data.get("endpoint") ?? "");
+    const authType = llmAuthSchema.safeParse(data.get("authType"));
+    if (!name.success || !providerId.success || !modelId.success || !endpoint.success || !authType.success)
+      return fail(400, { message: "Choose a provider, model, authentication method, and name." });
+    const payload: Record<string, unknown> = {
+      name: name.data,
+      provider_id: providerId.data,
+      model_id: modelId.data,
+      endpoint: endpoint.data,
+      auth_type: authType.data,
+      enabled: data.get("enabled") !== "off",
+    };
+    const apiKey = optionalFormText(data, "apiKey");
+    const oauthToken = optionalFormText(data, "oauthToken");
+    if (apiKey) payload.api_key = apiKey;
+    if (oauthToken) payload.oauth_token = oauthToken;
+    try {
+      await engine(
+        id ? `/api/llm/connections/${encodeURIComponent(id)}` : "/api/llm/connections",
+        { method: id ? "PUT" : "POST", body: JSON.stringify(payload) },
+      );
+      return { message: `${name.data} connection saved.` };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  disableLlmConnection: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid LLM connection." });
+    try {
+      await engine(`/api/llm/connections/${id.data}`, { method: "DELETE", body: "" });
+      return { message: "LLM connection disabled." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  openaiDeviceLoginStart: async () => {
+    try {
+      const deviceLogin = await engine<Record<string, unknown>>("/api/llm/openai/device/start", {
+        method: "POST",
+        body: "{}",
+      });
+      return { deviceLogin, message: "OpenAI device login started." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  openaiDeviceLoginStatus: async () => {
+    try {
+      const deviceLogin = await engine<Record<string, unknown>>("/api/llm/openai/device/status");
+      return { deviceLogin };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  openaiDeviceLoginCancel: async ({ request }) => {
+    const loginId = z.string().trim().min(1).max(200).safeParse(
+      (await request.formData()).get("loginId"),
+    );
+    if (!loginId.success) return fail(400, { message: "The device login has expired." });
+    try {
+      const deviceLogin = await engine<Record<string, unknown>>("/api/llm/openai/device/cancel", {
+        method: "POST",
+        body: JSON.stringify({ login_id: loginId.data }),
+      });
+      return { deviceLogin, message: "OpenAI device login cancelled." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  openaiDeviceLogout: async () => {
+    try {
+      const deviceLogin = await engine<Record<string, unknown>>("/api/llm/openai/device/logout", {
+        method: "POST",
+        body: "{}",
+      });
+      return { deviceLogin, message: "OpenAI subscription signed out." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  saveClaudeOAuth: async ({ request }) => {
+    const data = await request.formData();
+    const connectionId = idSchema.safeParse(data.get("connectionId"));
+    const token = z.string().trim().min(1).max(20_000).safeParse(data.get("oauthToken"));
+    if (!connectionId.success || !token.success)
+      return fail(400, { message: "Choose an Anthropic connection and enter its OAuth token." });
+    try {
+      await engine("/api/llm/claude/oauth", {
+        method: "POST",
+        body: JSON.stringify({ connection_id: connectionId.data, oauth_token: token.data }),
+      });
+      return { message: "Claude Code OAuth token saved." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  saveLlmPolicy: async ({ request }) => {
+    const data = await request.formData();
+    const id = optionalFormText(data, "id");
+    const name = llmNameSchema.safeParse(data.get("name"));
+    const connectionId = idSchema.safeParse(data.get("connectionId"));
+    const topK = z.coerce.number().int().min(1).max(100).safeParse(data.get("topK"));
+    const promptVersion = z.string().trim().min(1).max(100).safeParse(data.get("promptVersion") || "shadow-v1");
+    if (!name.success || !connectionId.success || !topK.success || !promptVersion.success)
+      return fail(400, { message: "Choose a policy name, connection, and candidate count." });
+    const payload = {
+      name: name.data,
+      connection_id: connectionId.data,
+      top_k: topK.data,
+      prompt_version: promptVersion.data,
+      enabled: data.get("enabled") !== "off",
+    };
+    try {
+      await engine(
+        id ? `/api/llm/policies/${encodeURIComponent(id)}` : "/api/llm/policies",
+        { method: id ? "PUT" : "POST", body: JSON.stringify(payload) },
+      );
+      return { message: `${name.data} policy saved.` };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  disableLlmPolicy: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid shadow policy." });
+    try {
+      await engine(`/api/llm/policies/${id.data}`, { method: "DELETE", body: "" });
+      return { message: "Shadow policy disabled." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  runLlmPolicy: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid shadow policy." });
+    try {
+      const result = await engine<{ job_id?: string }>(`/api/llm/policies/${id.data}/run`, {
+        method: "POST",
+        body: "{}",
+      });
+      return { message: `Shadow run queued${result.job_id ? ` (${result.job_id.slice(0, 8)})` : ""}.` };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  refreshLlmRuns: async () => {
+    try {
+      const result = await engine<{ runs?: Array<Record<string, unknown>> }>("/api/llm/runs?limit=12");
+      return { llmRuns: normalizeLlmRuns(result.runs ?? []), message: "Run history refreshed." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
   createApiToken: async ({ request }) => {
     const name = z.string().trim().min(1).max(100).safeParse(
       (await request.formData()).get("name"),
