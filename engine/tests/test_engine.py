@@ -10,7 +10,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from afterword_engine.config import settings
-from afterword_engine.database import initialize, row, rows, transaction
+from afterword_engine.database import MIGRATIONS, initialize, row, rows, transaction
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -538,6 +538,37 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
     assert row("SELECT source_id FROM candidates LIMIT 1")["source_id"] != 1
+
+
+def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
+    settings.db = str(tmp_path / "v3.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS[:3]:
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        source_id = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?) RETURNING id",
+            ("Existing source", "https://example.com/existing"),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            ("Existing book", "Existing author", source_id, "existing book existing author"),
+        )
+
+    initialize()
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 4
+    assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
+    assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
+
+    initialize()
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
+
 
 @respx.mock
 def test_openai_compatible_normalizes_v1_and_orders_vectors():
