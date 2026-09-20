@@ -22,8 +22,32 @@ function corsHeaders(request: Request) {
   return headers;
 }
 
+function encodedApiPath(path: string | undefined) {
+  if (!path) return '';
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path).replaceAll('\\', '/');
+  } catch {
+    return null;
+  }
+  const segments = decoded.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..')) return null;
+  return segments.map((segment) => encodeURIComponent(segment)).join('/');
+}
+
 export async function proxyApi(event: RequestEvent) {
-  const path = event.params.path ? `/${event.params.path}` : "";
+  const encodedPath = encodedApiPath(event.params.path);
+  if (encodedPath === null) {
+    return new Response(JSON.stringify({ detail: "Invalid API path" }), {
+      status: 404,
+      headers: new Headers({
+        ...Object.fromEntries(corsHeaders(event.request)),
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      }),
+    });
+  }
+  const path = encodedPath ? `/${encodedPath}` : "";
   const target = `${engineBase}/api/v1${path}${event.url.search}`;
 
   if (event.request.method === "OPTIONS") {
