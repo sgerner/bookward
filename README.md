@@ -91,3 +91,7 @@ docker compose build
 ```
 
 Docker is optional for development. `uv.lock` pins Python transitive dependencies, `package-lock.json` does the same for Node, and production base images are pinned to multi-platform manifest digests.
+
+## Project automation
+
+Every push and pull request runs the frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker image builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly; incompatible TypeScript 7 majors are held back until the Svelte checker supports them. Pushing a `v*.*.*` tag publishes the Bookward and engine images to GitHub Container Registry as both the version tag and `latest`.

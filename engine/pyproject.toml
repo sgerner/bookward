@@ -4,22 +4,22 @@ version = "0.1.0"
 description = "Independent ingestion and recommendation engine for Bookward"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi==0.118.0",
+  "fastapi==0.141.1",
   "uvicorn[standard]==0.37.0",
   "httpx==0.28.1",
   "feedparser==6.0.12",
   "fastembed==0.8.0",
   "beautifulsoup4==4.13.5",
-  "cryptography==46.0.5",
+  "cryptography==50.0.1",
   "numpy==2.3.3",
   "scikit-learn==1.7.2",
-  "python-multipart==0.0.20",
+  "python-multipart==0.0.32",
   "pydantic-settings==2.11.0"
 ]
 
 [project.optional-dependencies]
-local-model = ["sentence-transformers==5.1.1"]
-dev = ["pytest==8.4.2", "respx==0.22.0"]
+local-model = ["sentence-transformers==6.1.0"]
+dev = ["pytest==9.1.1", "respx==0.22.0"]
 
 [build-system]
 requires = ["hatchling"]
