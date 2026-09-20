@@ -1,6 +1,7 @@
 import asyncio
 import json
 import socket
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,13 @@ from afterword_engine.scoring import score_all, cached_vectors
 from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import validate_public_url, validate_service_url
-from afterword_engine.main import app, handle_job, recommendation_list, source_sync_is_due
+from afterword_engine.main import (
+    SOURCE_SYNC_ERROR_RETRY_SECONDS,
+    app,
+    handle_job,
+    recommendation_list,
+    source_sync_is_due,
+)
 from afterword_engine.digest import digest_is_due, digest_preview, send_digest, validate_digest_config
 
 @pytest.fixture()
@@ -150,6 +157,36 @@ def test_failed_one_time_source_remains_pending_for_retry(database, monkeypatch)
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:") and source["last_scanned_at"] is None
+
+
+def test_failed_permanent_source_retries_after_short_backoff(database, monkeypatch):
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=0")
+        cursor = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
+            ("Retry permanent", "https://example.com/retry-permanent"),
+        )
+
+    async def fail(_source):
+        raise RuntimeError("temporary source outage")
+
+    monkeypatch.setattr("afterword_engine.main.scan_source", fail)
+    result = asyncio.run(handle_job("sync"))
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert len(result["errors"]) == 1
+    assert source["last_status"].startswith("error:")
+    assert source_sync_is_due() is False
+
+    retry_at = datetime.now(timezone.utc) - timedelta(
+        seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS + 1
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET last_scanned_at=? WHERE id=?",
+            (retry_at.isoformat(), cursor.lastrowid),
+        )
+    assert source_sync_is_due() is True
+
 
 def test_goodreads_csv_import_is_idempotent(database):
     payload = b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n1,"A Book, With Comma",Writer,5,2026/01/02,"=\"9781234567890\""\n'
