@@ -562,13 +562,13 @@ async def goodreads_csv(file: UploadFile = File(...)):
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
     try: count = import_goodreads_csv(bytes(content))
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    return {"imported":count,"job_id":enqueue_job("score")}
+    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/import/goodreads/rss")
 async def goodreads_rss(payload: UrlIn):
     try: count = await import_goodreads_rss(str(payload.url))
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
-    return {"imported":count,"job_id":enqueue_job("score")}
+    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: UrlIn):
@@ -582,7 +582,7 @@ def add_source(payload: SourceIn):
     with transaction() as con:
         try: cursor=con.execute("INSERT INTO sources(name,url,enabled,weight,lifecycle) VALUES(?,?,?,?,?)",(payload.name,str(payload.url),payload.enabled,payload.weight,payload.lifecycle))
         except Exception as exc: raise HTTPException(409,"Source already exists") from exc
-    job_id = enqueue_job(f"source:{cursor.lastrowid}") if payload.enabled else None
+    job_id = enqueue_job(f"source:{cursor.lastrowid}", dedupe=True) if payload.enabled else None
     return {"id":cursor.lastrowid, "job_id":job_id}
 
 @app.put("/api/sources/{source_id}/toggle")
@@ -597,7 +597,7 @@ def toggle_source(source_id:int):
             "WHERE id=?",
             (source_id,),
         )
-    job_id = enqueue_job(f"source:{source_id}") if became_enabled and source["kind"] != "builtin" else None
+    job_id = enqueue_job(f"source:{source_id}", dedupe=True) if became_enabled and source["kind"] != "builtin" else None
     return {"id":source_id, "job_id":job_id}
 
 
@@ -722,31 +722,31 @@ def test_digest(payload: DigestTestIn = DigestTestIn()):
         channel = config["channels"][0]
     if channel not in config["channels"]:
         raise HTTPException(400, "That digest channel is not enabled")
-    return {"job_id": enqueue_job(f"digest:test:{channel}")}
+    return {"job_id": enqueue_job(f"digest:test:{channel}", dedupe=True)}
 
 
 @app.post("/api/digest/run")
 def run_digest():
-    return {"job_id": enqueue_job("digest:manual")}
+    return {"job_id": enqueue_job("digest:manual", dedupe=True)}
 
 
 @app.post("/api/digest/deliveries/{delivery_id}/retry")
 def retry_digest_delivery(delivery_id: str):
     if not row("SELECT id FROM notification_deliveries WHERE id=?", (delivery_id,)):
         raise HTTPException(404, "Delivery not found")
-    return {"job_id": enqueue_job(f"notification_retry:{delivery_id}")}
+    return {"job_id": enqueue_job(f"notification_retry:{delivery_id}", dedupe=True)}
 
 @app.post("/api/sync")
 async def sync():
-    return {"job_id":enqueue_job("sync")}
+    return {"job_id":enqueue_job("sync", dedupe=True)}
 
 @app.post("/api/score")
 async def score():
-    return {"job_id":enqueue_job("score")}
+    return {"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/embeddings/rebuild")
 async def rebuild_embeddings():
-    return {"job_id":enqueue_job("rebuild_embeddings")}
+    return {"job_id":enqueue_job("rebuild_embeddings", dedupe=True)}
 
 @app.get("/api/jobs/{job_id}")
 def job(job_id:str):

@@ -27,7 +27,7 @@ from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import safe_error_message, validate_public_url, validate_service_url
 from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
-from afterword_engine.main import app, handle_job, recommendation_list, source_sync_is_due
+from afterword_engine.main import app, handle_job, recommendation_list, score, source_sync_is_due, sync
 from afterword_engine.digest import digest_is_due, digest_preview, send_digest, validate_digest_config
 
 @pytest.fixture()
@@ -104,6 +104,18 @@ def test_source_scheduler_detects_due_permanent_feeds(database):
     with transaction() as con:
         con.execute("UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP WHERE name='Due feed'")
     assert source_sync_is_due() is False
+
+
+def test_expensive_job_requests_reuse_active_queue_entries(database):
+    first_sync = asyncio.run(sync())
+    second_sync = asyncio.run(sync())
+    first_score = asyncio.run(score())
+    second_score = asyncio.run(score())
+
+    assert first_sync == second_sync
+    assert first_score == second_score
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='sync'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 1
     with transaction() as con:
         con.execute("UPDATE settings SET value='0' WHERE key='source_sync_interval_hours'")
     assert source_sync_is_due() is False
