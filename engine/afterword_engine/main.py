@@ -29,6 +29,13 @@ from .librarr import download as librarr_download, normalize_media_type, search 
 from .llm_catalog import get_catalog
 from .llm import validate_endpoint
 from .llm_shadow import run_shadow_policy, safe_connections, safe_policies
+from .llm_subscriptions import (
+    AUTH_TYPE_API_KEY,
+    AUTH_TYPE_CLAUDE_CODE,
+    AUTH_TYPE_OPENAI_CODEX,
+    codex_login_manager,
+    normalize_auth_type,
+)
 from .exploration import epsilon_tail_explore
 from .digest import (
     digest_config,
@@ -405,8 +412,20 @@ class LLMConnectionIn(BaseModel):
     provider_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
     model_id: str = Field(min_length=1, max_length=300)
     endpoint: str = Field(default="", max_length=500)
+    auth_type: str = Field(default=AUTH_TYPE_API_KEY, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
     api_key: str | None = Field(default=None, max_length=20_000)
+    oauth_token: str | None = Field(default=None, max_length=20_000)
     enabled: bool = True
+
+
+class OpenAIDeviceLoginCancelIn(BaseModel):
+    login_id: str = Field(min_length=1, max_length=200)
+
+
+class ClaudeOAuthTokenIn(BaseModel):
+    connection_id: int = Field(gt=0)
+    oauth_token: str | None = Field(default=None, min_length=1, max_length=20_000)
+    token: str | None = Field(default=None, min_length=1, max_length=20_000)
 
 
 class LLMPolicyIn(BaseModel):
@@ -1109,6 +1128,67 @@ async def llm_catalog(refresh: bool = Query(default=False)):
         raise HTTPException(503, str(exc)) from exc
 
 
+@app.get("/api/llm/openai/device/status")
+@app.get("/api/llm/subscriptions/openai/device/status")
+@app.get("/api/llm/openai/device-code/status")
+@app.get("/api/llm/subscriptions/openai/device-code/status")
+def openai_device_login_status():
+    return codex_login_manager().status()
+
+
+@app.post("/api/llm/openai/device/start")
+@app.post("/api/llm/subscriptions/openai/device/start")
+@app.post("/api/llm/openai/device-code/start")
+@app.post("/api/llm/subscriptions/openai/device-code/start")
+def openai_device_login_start():
+    try:
+        return codex_login_manager().start()
+    except Exception as exc:
+        # Provider diagnostics can contain implementation details or command
+        # paths.  Keep the API error generic and token-free.
+        raise HTTPException(503, "OpenAI device login is unavailable") from exc
+
+
+@app.post("/api/llm/openai/device/cancel")
+@app.post("/api/llm/subscriptions/openai/device/cancel")
+@app.post("/api/llm/openai/device-code/cancel")
+@app.post("/api/llm/subscriptions/openai/device-code/cancel")
+def openai_device_login_cancel(payload: OpenAIDeviceLoginCancelIn):
+    try:
+        return codex_login_manager().cancel(payload.login_id)
+    except KeyError as exc:
+        raise HTTPException(404, "OpenAI device login was not found") from exc
+    except Exception as exc:
+        raise HTTPException(503, "OpenAI device login cancellation is unavailable") from exc
+
+
+@app.post("/api/llm/openai/device/logout")
+@app.post("/api/llm/subscriptions/openai/device/logout")
+@app.post("/api/llm/openai/device-code/logout")
+@app.post("/api/llm/subscriptions/openai/device-code/logout")
+def openai_device_logout():
+    return codex_login_manager().logout()
+
+
+@app.post("/api/llm/claude/oauth")
+@app.post("/api/llm/subscriptions/claude/oauth")
+def set_claude_oauth_token(payload: ClaudeOAuthTokenIn):
+    connection = row("SELECT * FROM llm_connections WHERE id=?", (payload.connection_id,))
+    if not connection:
+        raise HTTPException(404, "LLM connection not found")
+    if connection["provider_id"].strip().lower() != "anthropic":
+        raise HTTPException(400, "Claude OAuth requires the anthropic provider")
+    token = (payload.oauth_token or payload.token or "").strip()
+    if not token:
+        raise HTTPException(400, "A Claude OAuth token is required")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET auth_type=?,secret=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (AUTH_TYPE_CLAUDE_CODE, seal(token), payload.connection_id),
+        )
+    return {"id": payload.connection_id, "connection": next(item for item in safe_connections() if item["id"] == payload.connection_id)}
+
+
 def _llm_default_endpoint(provider_id: str) -> str:
     return {
         "openai": "https://api.openai.com/v1",
@@ -1116,13 +1196,27 @@ def _llm_default_endpoint(provider_id: str) -> str:
     }.get(provider_id.strip().lower(), "")
 
 
-def _llm_connection_values(payload: LLMConnectionIn, current_key: str = "") -> tuple[str, str]:
+def _llm_connection_values(payload: LLMConnectionIn, current_key: str = "") -> tuple[str, str, str]:
     provider_id = payload.provider_id.strip()
+    auth_type = normalize_auth_type(payload.auth_type)
     endpoint = validate_endpoint(payload.endpoint, default=_llm_default_endpoint(provider_id))
+    if auth_type == AUTH_TYPE_OPENAI_CODEX and provider_id.lower() != "openai":
+        raise HTTPException(400, "OpenAI Codex auth requires the openai provider")
+    if auth_type == AUTH_TYPE_CLAUDE_CODE and provider_id.lower() != "anthropic":
+        raise HTTPException(400, "Claude Code auth requires the anthropic provider")
+    if auth_type == AUTH_TYPE_OPENAI_CODEX:
+        return endpoint, "", auth_type
+    if auth_type == AUTH_TYPE_CLAUDE_CODE:
+        key = payload.oauth_token.strip() if payload.oauth_token is not None else (
+            payload.api_key.strip() if payload.api_key is not None else current_key
+        )
+        if not key:
+            raise HTTPException(400, "A Claude OAuth token is required for this connection")
+        return endpoint, key, auth_type
     key = payload.api_key.strip() if payload.api_key is not None else current_key
     if not key:
         raise HTTPException(400, "An API key is required for this connection")
-    return endpoint, key
+    return endpoint, key, auth_type
 
 
 @app.get("/api/llm/connections")
@@ -1133,13 +1227,13 @@ def llm_connections():
 @app.post("/api/llm/connections")
 def create_llm_connection(payload: LLMConnectionIn):
     try:
-        endpoint, key = _llm_connection_values(payload)
+        endpoint, key, auth_type = _llm_connection_values(payload)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     with transaction() as con:
         cursor = con.execute(
             "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,auth_type,secret,enabled) VALUES(?,?,?,?,?,?,?)",
-            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, "api_key", seal(key), int(payload.enabled)),
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled)),
         )
     return {"id": cursor.lastrowid, "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid)}
 
@@ -1150,13 +1244,13 @@ def update_llm_connection(connection_id: int, payload: LLMConnectionIn):
     if not current:
         raise HTTPException(404, "LLM connection not found")
     try:
-        endpoint, key = _llm_connection_values(payload, unseal(current["secret"]) if current["secret"] else "")
+        endpoint, key, auth_type = _llm_connection_values(payload, unseal(current["secret"]) if current["secret"] else "")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     with transaction() as con:
         con.execute(
-            "UPDATE llm_connections SET name=?,provider_id=?,model_id=?,endpoint=?,auth_type='api_key',secret=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, seal(key), int(payload.enabled), connection_id),
+            "UPDATE llm_connections SET name=?,provider_id=?,model_id=?,endpoint=?,auth_type=?,secret=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled), connection_id),
         )
     return {"id": connection_id, "connection": next(item for item in safe_connections() if item["id"] == connection_id)}
 

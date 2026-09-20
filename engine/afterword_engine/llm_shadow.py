@@ -103,7 +103,13 @@ async def run_shadow_policy(policy_id: int) -> dict[str, Any]:
     started = time.perf_counter()
     try:
         secret = unseal(policy["secret"]) if policy["secret"] else ""
-        client = build_client(policy["provider_id"], policy["model_id"], policy["endpoint"], secret)
+        client = build_client(
+            policy["provider_id"],
+            policy["model_id"],
+            policy["endpoint"],
+            secret,
+            auth_type=policy["auth_type"],
+        )
         result = await client.rank(prompt, {int(item["id"]) for item in candidates})
         latency_ms = round((time.perf_counter() - started) * 1000)
         with transaction() as con:
@@ -131,4 +137,3 @@ async def run_shadow_policy(policy_id: int) -> dict[str, Any]:
                 (message, policy["connection_id"]),
             )
         return {"status": "failed", "policy_id": policy_id, "run_id": run_id, "error": message, "latency_ms": latency_ms}
-

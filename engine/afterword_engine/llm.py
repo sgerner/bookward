@@ -295,12 +295,31 @@ def build_client(
     endpoint: str,
     api_key: str,
     *,
+    auth_type: str = "api_key",
     timeout: float | None = None,
 ) -> BaseLLMClient:
     provider = provider_id.strip().lower()
     model = model_id.strip()
     if not provider or not model:
         raise ValueError("LLM provider and model are required")
+    # Import lazily to keep the subscription runner's dependency on this
+    # module acyclic.  Subscription clients own their subprocess protocol and
+    # do not use the HTTP endpoint or API-key argument.
+    from .llm_subscriptions import (
+        ClaudeCodeSubscriptionClient,
+        CodexSubscriptionClient,
+        is_claude_code_auth,
+        is_openai_codex_auth,
+    )
+
+    if is_openai_codex_auth(auth_type):
+        if provider != "openai":
+            raise ValueError("OpenAI Codex auth requires the openai provider")
+        return CodexSubscriptionClient(model, timeout=timeout)
+    if is_claude_code_auth(auth_type):
+        if provider != "anthropic":
+            raise ValueError("Claude Code auth requires the anthropic provider")
+        return ClaudeCodeSubscriptionClient(model, api_key, timeout=timeout)
     if provider == "openai":
         url = validate_endpoint(endpoint, default="https://api.openai.com/v1")
         return OpenAIResponsesClient(url, model, api_key, timeout=timeout)
@@ -345,4 +364,3 @@ def build_prompt(reads: list[Mapping[str, Any]], candidates: list[Mapping[str, A
         "candidates": [candidate_item(item) for item in candidates],
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
