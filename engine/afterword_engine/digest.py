@@ -521,12 +521,14 @@ async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
         return {"id": delivery_id, "status": "failed", "error": str(exc)[:400]}
 
 
-def safe_digest_settings(values: dict | None = None) -> dict:
+def safe_digest_settings(values: dict | None = None, connection=None) -> dict:
     config = digest_config(values)
-    latest = row(
+    query = (
         "SELECT id,period_key,channel,status,error,created_at,updated_at,sent_at "
         "FROM notification_deliveries ORDER BY created_at DESC LIMIT 1"
     )
+    latest_row = connection.execute(query).fetchone() if connection is not None else row(query)
+    latest = dict(latest_row) if latest_row else None
     return {
         "enabled": config["enabled"],
         "channels": config["channels"],
