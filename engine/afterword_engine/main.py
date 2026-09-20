@@ -480,9 +480,10 @@ def tracked_recommendations(
     *,
     status: str | None = None,
     limit: int = 100,
+    offset: int = 0,
     session_id: str = "",
 ):
-    recommendations = recommendation_list(status=status, limit=limit)
+    recommendations = recommendation_list(status=status, limit=limit, offset=offset)
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -501,12 +502,15 @@ def tracked_recommendations(
     return recommendations, run_id
 
 
-def overview_payload(*, include_api_tokens: bool = True, session_id: str = ""):
+def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None, session_id: str = ""):
     counts = {
         name: row(f"SELECT COUNT(*) count FROM {name}")["count"]
         for name in ("reads", "candidates", "sources")
     }
-    recommendations, run_id = tracked_recommendations(session_id=session_id)
+    recommendations, run_id = tracked_recommendations(
+        limit=recommendation_limit or 100,
+        session_id=session_id,
+    )
     return {
         "counts": counts,
         "recommendations": recommendations,
@@ -535,27 +539,68 @@ async def health():
 
 @app.get("/api/overview")
 def overview(
+    recommendation_limit: int | None = Query(default=None, ge=1, le=100),
     x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
 ):
-    return overview_payload(session_id=x_bookward_session or "")
+    return overview_payload(recommendation_limit=recommendation_limit, session_id=x_bookward_session or "")
 
-def recommendation_list(status: str | None = None, limit: int = 100):
+def _recommendation_rows(
+    connection=None,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+):
     clauses = [
         "c.status!='rejected'",
         "(c.status IN ('saved','imported') OR s.enabled=1)",
         "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
     ]
-    params: list[Any] = []
-    if status and status != "all":
-        clauses.append("c.status=?")
-        params.append(status)
-    result = rows(
+    params: list[object] = []
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"c.status IN ({placeholders})")
+        params.extend(statuses)
+    query = (
         "SELECT c.*,s.name source_name FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ?",
-        (*params, limit),
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 "
+        "WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ? OFFSET ?"
     )
+    params.extend((-1 if limit is None else limit, offset))
+    result = (
+        [dict(item) for item in connection.execute(query, params).fetchall()]
+        if connection is not None
+        else rows(query, params)
+    )
+    return result
+
+
+def recommendation_list(
+    connection=None,
+    *,
+    status: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    recommended_limit: int | None = None,
+):
+    if recommended_limit is not None and status is None and offset == 0:
+        result = _recommendation_rows(
+            connection, statuses=("recommended",), limit=recommended_limit
+        )
+        result.extend(
+            _recommendation_rows(
+                connection,
+                statuses=("saved", "imported", "new"),
+                limit=None,
+            )
+        )
+    else:
+        statuses = None if not status or status == "all" else (status,)
+        result = _recommendation_rows(
+            connection, statuses=statuses, limit=limit, offset=offset
+        )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
@@ -565,9 +610,17 @@ def recommendation_list(status: str | None = None, limit: int = 100):
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
+    status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
     x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
 ):
-    values, run_id = tracked_recommendations(session_id=x_bookward_session or "")
+    values, run_id = tracked_recommendations(
+        status=status,
+        limit=limit,
+        offset=offset,
+        session_id=x_bookward_session or "",
+    )
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
@@ -1483,8 +1536,9 @@ def api_recommendations(
     response: Response,
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    values, run_id = tracked_recommendations(status=status, limit=limit)
+    values, run_id = tracked_recommendations(status=status, limit=limit, offset=offset)
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 

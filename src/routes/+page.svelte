@@ -540,6 +540,15 @@
   });
 
   $effect(() => {
+    const nextBooks = data.books;
+    if (previousDataBooks === nextBooks) return;
+    previousDataBooks = nextBooks;
+    additionalDiscoverBooks = [];
+    discoverHasMore = true;
+    discoverLoadError = "";
+  });
+
+  $effect(() => {
     activeView;
     filter;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;

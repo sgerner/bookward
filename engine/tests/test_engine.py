@@ -400,6 +400,27 @@ def test_api_boots_and_serves_recommendations(database):
         assert rebuild.status_code == 200 and rebuild.json()["job_id"]
 
 
+def test_recommendations_filter_and_paginate_in_sql(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='recommended', score=id")
+        con.execute("UPDATE candidates SET status='saved' WHERE id=1")
+
+    with TestClient(app) as client:
+        page = client.get("/api/recommendations?status=recommended&limit=2&offset=1")
+        assert page.status_code == 200
+        assert len(page.json()) == 2
+        assert all(item["status"] == "recommended" for item in page.json())
+
+        saved = client.get("/api/recommendations?status=saved&limit=1")
+        assert [item["id"] for item in saved.json()] == [1]
+
+        overview = client.get("/api/overview?recommendation_limit=1")
+        assert [item["status"] for item in overview.json()["recommendations"]] == [
+            "recommended",
+            "saved",
+        ]
+
+
 def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
     import afterword_engine.main as main_module
 
