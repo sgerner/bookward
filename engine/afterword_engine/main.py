@@ -6,10 +6,10 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
 from .database import initialize, row, rows, transaction
 from .api_tokens import (
@@ -35,6 +35,12 @@ from .digest import (
     safe_digest_settings,
     send_digest,
     validate_digest_config,
+)
+from .learning import (
+    EVENT_TYPES,
+    create_recommendation_run,
+    record_event_in_connection,
+    record_events,
 )
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -302,12 +308,45 @@ class DigestTestIn(BaseModel):
     channel: Literal["discord", "email"] | None = None
 
 class UrlIn(BaseModel): url: HttpUrl
-class FeedbackIn(BaseModel): action: str
+
+
+class FeedbackIn(BaseModel):
+    action: str
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class TelemetryEventIn(BaseModel):
+    event_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+    candidate_id: int = Field(gt=0)
+    event_type: str
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+    value: float | None = None
+    source: str = Field(default="ui", min_length=1, max_length=32)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("event_type")
+    @classmethod
+    def valid_event_type(cls, value: str) -> str:
+        if value not in EVENT_TYPES - {"save", "reject", "restore", "read"}:
+            raise ValueError("Unsupported recommendation event type")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def valid_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 32:
+            raise ValueError("Event metadata must have at most 32 fields")
+        return value
+
+
+class TelemetryBatchIn(BaseModel):
+    events: list[TelemetryEventIn] = Field(min_length=1, max_length=100)
 
 
 class BulkFeedbackIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["save", "reject", "restore"]
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class ApiTokenCreateIn(BaseModel):
@@ -343,14 +382,32 @@ def api_token_list():
     )
 
 
-def overview_payload(*, include_api_tokens: bool = True):
+def tracked_recommendations(
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    session_id: str = "",
+):
+    recommendations = recommendation_list(status=status, limit=limit)
+    run_id = create_recommendation_run(
+        recommendations,
+        session_id=session_id,
+        status=status,
+        limit=limit,
+    )
+    return recommendations, run_id
+
+
+def overview_payload(*, include_api_tokens: bool = True, session_id: str = ""):
     counts = {
         name: row(f"SELECT COUNT(*) count FROM {name}")["count"]
         for name in ("reads", "candidates", "sources")
     }
+    recommendations, run_id = tracked_recommendations(session_id=session_id)
     return {
         "counts": counts,
-        "recommendations": recommendation_list(),
+        "recommendations": recommendations,
+        "recommendation_run_id": run_id,
         "sources": rows("SELECT * FROM sources ORDER BY is_default DESC,name"),
         "history": rows(
             "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
@@ -374,8 +431,10 @@ async def health():
 
 
 @app.get("/api/overview")
-def overview():
-    return overview_payload()
+def overview(
+    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
+):
+    return overview_payload(session_id=x_bookward_session or "")
 
 def recommendation_list(status: str | None = None, limit: int = 100):
     clauses = [
@@ -401,7 +460,13 @@ def recommendation_list(status: str | None = None, limit: int = 100):
     return result
 
 @app.get("/api/recommendations")
-def recommendations(): return recommendation_list()
+def recommendations(
+    response: Response,
+    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
+):
+    values, run_id = tracked_recommendations(session_id=x_bookward_session or "")
+    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    return values
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
 def feedback(candidate_id: int, payload: FeedbackIn):
@@ -410,7 +475,25 @@ def feedback(candidate_id: int, payload: FeedbackIn):
     with transaction() as con:
         if not con.execute("SELECT 1 FROM candidates WHERE id=?", (candidate_id,)).fetchone(): raise HTTPException(404, "Recommendation not found")
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
-        con.execute("INSERT INTO feedback(candidate_id,action) VALUES(?,?)", (candidate_id,payload.action))
+        feedback_id = con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            (candidate_id, payload.action),
+        ).lastrowid
+        label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
+        try:
+            record_event_in_connection(
+                con,
+                event_key=f"feedback:{feedback_id}",
+                candidate_id=candidate_id,
+                event_type=payload.action,
+                run_id=payload.run_id,
+                source="ui",
+                label=label,
+                label_kind="explicit_feedback" if label is not None else None,
+                confidence=0.8 if payload.run_id and label is not None else 0.5,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"id":candidate_id,"status":status}
 
 
@@ -426,8 +509,49 @@ def bulk_feedback(payload: BulkFeedbackIn):
         }
         for candidate_id in found:
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
-            con.execute("INSERT INTO feedback(candidate_id,action) VALUES(?,?)", (candidate_id, payload.action))
+            feedback_id = con.execute(
+                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                (candidate_id, payload.action),
+            ).lastrowid
+            label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
+            try:
+                record_event_in_connection(
+                    con,
+                    event_key=f"feedback:{feedback_id}",
+                    candidate_id=candidate_id,
+                    event_type=payload.action,
+                    run_id=payload.run_id,
+                    source="ui",
+                    label=label,
+                    label_kind="explicit_feedback" if label is not None else None,
+                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
     return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
+
+
+def telemetry_events(payload: TelemetryBatchIn):
+    try:
+        return record_events(
+            {
+                "event_key": event.event_key,
+                "candidate_id": event.candidate_id,
+                "event_type": event.event_type,
+                "run_id": event.run_id,
+                "value": event.value,
+                "source": event.source,
+                "metadata": event.metadata,
+            }
+            for event in payload.events
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/telemetry/events")
+def post_telemetry_events(payload: TelemetryBatchIn):
+    return telemetry_events(payload)
 
 @app.post("/api/recommendations/{candidate_id}/import")
 async def import_librarr(candidate_id: int):
@@ -905,10 +1029,13 @@ def api_settings():
 
 @api_v1.get("/recommendations")
 def api_recommendations(
+    response: Response,
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
 ):
-    return recommendation_list(status=status, limit=limit)
+    values, run_id = tracked_recommendations(status=status, limit=limit)
+    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    return values
 
 
 @api_v1.post("/recommendations/bulk-feedback")
@@ -919,6 +1046,11 @@ def api_bulk_feedback(payload: BulkFeedbackIn):
 @api_v1.post("/recommendations/{candidate_id}/feedback")
 def api_feedback(candidate_id: int, payload: FeedbackIn):
     return feedback(candidate_id, payload)
+
+
+@api_v1.post("/telemetry/events")
+def api_telemetry_events(payload: TelemetryBatchIn):
+    return telemetry_events(payload)
 
 
 @api_v1.post("/recommendations/{candidate_id}/import")
