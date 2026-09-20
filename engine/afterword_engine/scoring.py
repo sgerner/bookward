@@ -1,6 +1,6 @@
 import json
 import math
-from .database import rows, row, transaction
+from .database import rows, transaction
 from .embeddings import get_embedder, cosine, content_hash, vector_blob, blob_vector
 
 def document(item):
@@ -9,10 +9,33 @@ def document(item):
 
 async def cached_vectors(embedder, entity_type, items):
     vectors, missing = [None] * len(items), []
+
+    cached_by_id = {}
+    entity_ids = [item["id"] for item in items]
+    # Keep the lookup bounded for large Goodreads imports while replacing the
+    # per-item connection/query loop with a small number of batch reads.
+    for start in range(0, len(entity_ids), 500):
+        batch_ids = entity_ids[start:start + 500]
+        if not batch_ids:
+            continue
+        placeholders = ",".join("?" for _ in batch_ids)
+        cached_by_id.update(
+            {
+                int(cached["entity_id"]): cached
+                for cached in rows(
+                    f"SELECT entity_id,vector,content_hash FROM embeddings "
+                    f"WHERE entity_type=? AND backend=? AND model=? "
+                    f"AND entity_id IN ({placeholders})",
+                    (entity_type, embedder.name, embedder.model, *batch_ids),
+                )
+            }
+        )
+
     for index, item in enumerate(items):
         text = document(item); digest = content_hash(text)
-        cached = row("SELECT vector FROM embeddings WHERE entity_type=? AND entity_id=? AND backend=? AND model=? AND content_hash=?", (entity_type,item["id"],embedder.name,embedder.model,digest))
-        if cached: vectors[index] = blob_vector(cached["vector"])
+        cached = cached_by_id.get(item["id"])
+        if cached and cached["content_hash"] == digest:
+            vectors[index] = blob_vector(cached["vector"])
         else: missing.append((index,item,text,digest))
     if missing:
         generated = []
