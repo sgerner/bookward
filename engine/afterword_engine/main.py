@@ -598,7 +598,8 @@ def _recommendation_rows(
         "c.status!='rejected'",
         "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
         "(c.status IN ('saved','imported') OR s.enabled=1)",
-        "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
+        "(c.status IN ('saved','imported') OR NOT EXISTS (SELECT 1 FROM reads r WHERE book_identity_matches(c.title,c.author,r.title,r.author)))",
+        "(c.status IN ('saved','imported') OR NOT EXISTS (SELECT 1 FROM candidates prior WHERE prior.id!=c.id AND prior.status IN ('saved','imported') AND book_identity_matches(c.title,c.author,prior.title,prior.author)))",
     ]
     params: list[object] = []
     if statuses:

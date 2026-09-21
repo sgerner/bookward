@@ -97,8 +97,8 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
-        "AND s.enabled=1 AND book_identity(c.title,c.author) NOT IN "
-        "(SELECT book_identity(title,author) FROM reads)"
+        "AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM reads r "
+        "WHERE book_identity_matches(c.title,c.author,r.title,r.author))"
     )
     if not candidates: return 0
     embedder = embedder or get_embedder(backend, model, url, api_key)
