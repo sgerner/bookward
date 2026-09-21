@@ -16,7 +16,8 @@ from afterword_engine.llm import (
     LLMError,
     validate_rankings,
 )
-from afterword_engine.llm_shadow import run_shadow_policy
+from afterword_engine.llm_shadow import run_shadow_policy, safe_policies
+from afterword_engine import main as main_module
 from afterword_engine.main import app, recommendation_list
 
 
@@ -120,3 +121,55 @@ def test_connection_api_encrypts_key_and_never_returns_it(database):
         stored = row("SELECT secret FROM llm_connections WHERE id=?", (connection_id,))["secret"]
         assert stored.startswith("fernet:") and "super-secret" not in stored
         assert client.post("/api/llm/policies", json={"name": "Shadow", "connection_id": connection_id, "top_k": 5}).status_code == 200
+
+
+def test_connection_api_provisions_default_shadow_policy(database):
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm/connections",
+            json={
+                "name": "OpenAI",
+                "provider_id": "openai",
+                "model_id": "gpt-test",
+                "api_key": "super-secret",
+            },
+        )
+        assert response.status_code == 200
+        connection_id = response.json()["id"]
+        policy = response.json()["policy"]
+        assert policy["connection_id"] == connection_id
+        assert policy["enabled"] == 1
+        assert policy["top_k"] == 20
+        assert client.get("/api/llm/policies").json()["policies"]
+
+
+def test_policy_listing_backfills_connections_created_before_auto_provisioning(database):
+    with transaction() as con:
+        connection_id = con.execute(
+            "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,secret) VALUES(?,?,?,?,?)",
+            ("Legacy", "openai", "gpt-test", "https://api.openai.com/v1", ""),
+        ).lastrowid
+    policies = safe_policies()
+    assert any(policy["connection_id"] == connection_id for policy in policies)
+
+
+def test_authenticated_device_status_provisions_connection_and_policy(database, monkeypatch):
+    class AuthenticatedManager:
+        def status(self):
+            return {
+                "status": "authenticated",
+                "authenticated": True,
+                "account": {"email": "reader@example.com"},
+            }
+
+    monkeypatch.setattr(main_module, "codex_login_manager", lambda: AuthenticatedManager())
+    with TestClient(app) as client:
+        first = client.get("/api/llm/openai/device/status")
+        second = client.get("/api/llm/openai/device/status")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["connection"]["auth_type"] == "openai_codex"
+    assert first.json()["policy"]["connection_id"] == first.json()["connection"]["id"]
+    assert second.json()["connection"]["id"] == first.json()["connection"]["id"]
+    assert row("SELECT COUNT(*) count FROM llm_connections WHERE auth_type='openai_codex'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM llm_policies")["count"] == 1
