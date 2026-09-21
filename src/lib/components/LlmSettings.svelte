@@ -20,6 +20,7 @@
   let deviceLogin = $state<DeviceLogin | null>(null);
   let runs = $state<Run[]>([]);
   let catalogQuery = $state("");
+  let providerSearchOpen = $state(false);
   let selectedProviderId = $state("");
   let selectedModelId = $state("");
   let modelChoice = $state("");
@@ -70,7 +71,7 @@
       return !query || `${provider.name} ${provider.id} ${model.name} ${model.id}`.toLowerCase().includes(query);
     }),
   })).filter((provider) => provider.models.length));
-  const modelOptions = $derived(filteredProviders.flatMap((provider) => provider.models.map((model) => ({ value: `${provider.id}::${model.id}`, label: `${provider.name} · ${model.name}` }))));
+  const matchingModels = $derived(filteredProviders.flatMap((provider) => provider.models.map((model) => ({ provider, model }))));
   const selectedProvider = $derived(catalog?.providers?.find((provider) => provider.id === selectedProviderId) ?? null);
 
   function selectModel(value: string) {
@@ -81,10 +82,12 @@
       selectedModelId = value.slice(separator + 2);
     }
   }
-  function selectProvider(provider: Provider) {
+  function selectCatalogModel(provider: Provider, model: ProviderModel) {
     selectedProviderId = provider.id;
-    selectedModelId = provider.models[0]?.id ?? "";
+    selectedModelId = model.id;
     modelChoice = `${selectedProviderId}::${selectedModelId}`;
+    catalogQuery = provider.name;
+    providerSearchOpen = false;
   }
   function formatDate(value: string | null | undefined) {
     if (!value) return "—";
@@ -126,14 +129,29 @@
       <form class="mt-5 space-y-4" method="POST" action="?/saveLlmConnection" use:enhance={setPending("llm-connection")}>
         <input type="hidden" name="authType" value={connectionMethod === "claude" ? "claude_code" : "api_key"} />
         <div class="grid gap-4 sm:grid-cols-2"><label class="block text-sm font-medium text-surface-800-200">Connection name<input class="input mt-2" name="name" placeholder={connectionMethod === "claude" ? "Claude ranking" : "Primary ranking model"} required /></label><label class="block text-sm font-medium text-surface-800-200">Endpoint<span class="mt-1 block text-xs font-normal text-surface-700-300">Leave blank for provider defaults.</span><input class="input mt-2" name="endpoint" value={selectedProvider?.api ?? ""} placeholder="https://api.example.com/v1" /></label></div>
-        <div class="grid gap-4 sm:grid-cols-2"><label class="block text-sm font-medium text-surface-800-200">Search Models.dev models<input class="input mt-2" value={catalogQuery} oninput={(event) => { catalogQuery = event.currentTarget.value; }} placeholder={catalog ? "Search by provider or model" : "Load the catalog first"} /><span class="mt-1 block text-xs font-normal text-surface-700-300">Type to filter the provider and model suggestions below.</span></label><label class="block text-sm font-medium text-surface-800-200">Selected model<input class="input mt-2" value={modelChoice} oninput={(event) => selectModel(event.currentTarget.value)} placeholder="provider::model-id" list="llm-model-options" required /><datalist id="llm-model-options">{#each modelOptions as option (option.value)}<option value={option.value} label={option.label}></option>{/each}</datalist><span class="mt-1 block text-xs font-normal text-surface-700-300">Searchable suggestions use provider::model-id.</span></label></div>
+        <div class="grid gap-4 sm:grid-cols-2">
+          <div class="relative">
+            <label class="block text-sm font-medium text-surface-800-200" for="llm-provider-search">Search for provider</label>
+            <input id="llm-provider-search" class="input mt-2" value={catalogQuery} onfocus={() => providerSearchOpen = true} oninput={(event) => { catalogQuery = event.currentTarget.value; providerSearchOpen = true; }} onkeydown={(event) => { if (event.key === "Escape") providerSearchOpen = false; }} placeholder={catalog ? "Search providers or models" : "Loading catalog…"} autocomplete="off" />
+            {#if providerSearchOpen && catalog}
+              <div class="absolute z-30 mt-2 max-h-80 w-full overflow-y-auto border border-surface-300-700 bg-surface-50-950 p-1 shadow-xl" role="listbox" aria-label="Matching providers and models">
+                {#each matchingModels.slice(0, 40) as result (`${result.provider.id}::${result.model.id}`)}
+                  <button type="button" class="flex w-full items-start gap-3 p-3 text-left hover:preset-tonal-primary" role="option" aria-selected={selectedProviderId === result.provider.id && selectedModelId === result.model.id} onclick={() => selectCatalogModel(result.provider, result.model)}>
+                    <span class="min-w-0 flex-1"><strong class="block truncate text-sm text-surface-950-50">{result.provider.name}</strong><span class="mt-0.5 block truncate text-xs text-surface-700-300">{result.model.name}</span></span><span class="max-w-[45%] truncate text-right text-xs text-surface-600-400">{result.model.id}</span>
+                  </button>
+                {:else}<p class="p-3 text-sm text-surface-700-300">No providers or models match that search.</p>{/each}
+                {#if matchingModels.length > 40}<p class="border-t border-surface-300-700/50 p-2 text-xs text-surface-600-400">Showing the first 40 matches. Refine your search for more.</p>{/if}
+              </div>
+            {/if}
+            <span class="mt-1 block text-xs font-normal text-surface-700-300">Choose a matching provider/model from the popup.</span>
+          </div>
+          <label class="block text-sm font-medium text-surface-800-200">Selected model<input class="input mt-2" value={modelChoice} oninput={(event) => selectModel(event.currentTarget.value)} placeholder="provider::model-id" required /><span class="mt-1 block text-xs font-normal text-surface-700-300">Selected provider and model are saved together.</span></label>
+        </div>
         <input type="hidden" name="providerId" value={selectedProviderId} /><input type="hidden" name="modelId" value={selectedModelId} />
         {#if connectionMethod === "api"}<label class="block text-sm font-medium text-surface-800-200">API key<input class="input mt-2" name="apiKey" type="password" autocomplete="new-password" placeholder="Stored securely by Bookward" required /></label>{:else}<label class="block text-sm font-medium text-surface-800-200">Claude Code OAuth token<input class="input mt-2" name="oauthToken" type="password" autocomplete="new-password" placeholder="Paste the token from Claude Code" required /></label>{/if}
         <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("llm-connection")} aria-busy={isPending("llm-connection")}>{#if isPending("llm-connection")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save connection and create shadow policy</button>
       </form>
     {/if}
-
-    <div class="mt-6 border-t border-surface-300-700/50 pt-5"><div class="flex flex-wrap items-center justify-between gap-3"><div><h4 class="text-sm font-semibold text-surface-950-50">Models.dev catalog</h4><p class="mt-1 text-xs text-surface-700-300">{catalog ? `${modelOptions.length} matching text models · ${catalog.stale ? "cached catalog" : `fetched ${formatDate(catalog.fetched_at)}`}` : "Load the catalog to search providers and models."}</p></div><label class="sr-only" for="llm-catalog-filter">Filter catalog</label><input id="llm-catalog-filter" class="input max-w-xs" bind:value={catalogQuery} placeholder="Filter catalog" /></div>{#if catalog}<div class="mt-4 grid max-h-56 gap-2 overflow-y-auto pr-1 sm:grid-cols-2">{#each filteredProviders as provider (provider.id)}<div class="border border-surface-300-700/50 p-3"><button type="button" class="flex w-full items-center justify-between gap-3 text-left" onclick={() => selectProvider(provider)}><span class="min-w-0"><strong class="block truncate text-sm text-surface-950-50">{provider.name}</strong><small class="block truncate text-xs text-surface-700-300">{provider.id} · {provider.models.length} models</small></span><span class="text-xs text-primary-600-400">Use first</span></button><div class="mt-2 flex flex-wrap gap-1.5">{#each provider.models.slice(0, 4) as model (model.id)}<button type="button" class={`badge max-w-full truncate ${selectedModelId === model.id && selectedProviderId === provider.id ? "preset-filled-primary-500" : "preset-tonal-surface"}`} title={model.name} onclick={() => selectModel(`${provider.id}::${model.id}`)}>{model.name}</button>{/each}{#if provider.models.length > 4}<span class="badge preset-tonal-surface">+{provider.models.length - 4}</span>{/if}</div></div>{:else}<p class="py-4 text-sm text-surface-700-300">No catalog models match that search.</p>{/each}</div>{/if}</div>
 
     <div class="mt-6 border-t border-surface-300-700/50 pt-5"><div class="mb-3 flex items-center gap-2"><ShieldCheck size={17} class="text-tertiary-600-400" /><h4 class="text-sm font-semibold text-surface-950-50">Saved connections</h4></div><div class="space-y-3">{#each llm.connections as connection (connection.id)}<div class="border border-surface-300-700/50 p-3"><div class="flex items-start gap-3"><div class="min-w-0 flex-1"><strong class="block truncate text-sm text-surface-950-50">{connection.name}</strong><span class="mt-1 block truncate text-xs text-surface-700-300">{connection.provider_id} · {connection.model_id}</span></div><span class={`badge shrink-0 ${connection.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>{connection.enabled ? "Enabled" : "Disabled"}</span></div><div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-surface-700-300"><span>{authLabel(connection.auth_type)} · {connection.last_status ?? "Not used"}</span>{#if connection.enabled}<form method="POST" action="?/disableLlmConnection" use:enhance={setPending(`llm-disable-${connection.id}`)}><input type="hidden" name="id" value={connection.id} /><button class="btn btn-sm min-h-8 preset-tonal-error" type="submit" disabled={isPending(`llm-disable-${connection.id}`)} aria-label={`Disable ${connection.name}`}><X size={14} /> Disable</button></form>{/if}</div></div>{:else}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">No model connections yet.</p>{/each}</div></div>
   </section>
