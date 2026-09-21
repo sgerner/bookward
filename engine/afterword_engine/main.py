@@ -30,7 +30,12 @@ from .secrets import seal, unseal
 from .librarr import download as librarr_download, normalize_media_type, search as librarr_search
 from .llm_catalog import get_catalog
 from .llm import validate_endpoint
-from .llm_shadow import run_shadow_policy, safe_connections, safe_policies
+from .llm_shadow import (
+    ensure_default_shadow_policy,
+    run_shadow_policy,
+    safe_connections,
+    safe_policies,
+)
 from .llm_subscriptions import (
     AUTH_TYPE_API_KEY,
     AUTH_TYPE_CLAUDE_CODE,
@@ -1235,12 +1240,62 @@ async def llm_catalog(refresh: bool = Query(default=False)):
         raise HTTPException(503, str(exc)) from exc
 
 
+def _ensure_openai_subscription_connection() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Provision the ChatGPT subscription connection after device auth.
+
+    Device login is account-level, while the shadow runner still needs a
+    normal connection row.  Provisioning a dedicated connection avoids
+    replacing an existing API-key connection and is safe to repeat for every
+    status poll.
+    """
+
+    connection = row(
+        "SELECT * FROM llm_connections WHERE provider_id='openai' "
+        "AND auth_type=? ORDER BY id LIMIT 1",
+        (AUTH_TYPE_OPENAI_CODEX,),
+    )
+    if connection:
+        if not connection["enabled"]:
+            with transaction() as con:
+                con.execute(
+                    "UPDATE llm_connections SET enabled=1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (connection["id"],),
+                )
+            connection = row("SELECT * FROM llm_connections WHERE id=?", (connection["id"],))
+    else:
+        with transaction() as con:
+            cursor = con.execute(
+                "INSERT INTO llm_connections "
+                "(name,provider_id,model_id,endpoint,auth_type,secret,enabled) "
+                "VALUES(?,?,?,?,?,?,1)",
+                (
+                    "ChatGPT subscription",
+                    "openai",
+                    "gpt-5",
+                    "https://api.openai.com/v1",
+                    AUTH_TYPE_OPENAI_CODEX,
+                    "",
+                ),
+            )
+            connection_id = cursor.lastrowid
+        connection = row("SELECT * FROM llm_connections WHERE id=?", (connection_id,))
+    policy = ensure_default_shadow_policy(int(connection["id"]))
+    safe_connection = next(item for item in safe_connections() if item["id"] == connection["id"])
+    safe_policy = next(item for item in safe_policies() if item["id"] == policy["id"])
+    return safe_connection, safe_policy
+
+
 @app.get("/api/llm/openai/device/status")
 @app.get("/api/llm/subscriptions/openai/device/status")
 @app.get("/api/llm/openai/device-code/status")
 @app.get("/api/llm/subscriptions/openai/device-code/status")
 def openai_device_login_status():
-    return codex_login_manager().status()
+    status = codex_login_manager().status()
+    if status.get("authenticated"):
+        connection, policy = _ensure_openai_subscription_connection()
+        status["connection"] = connection
+        status["policy"] = policy
+    return status
 
 
 @app.post("/api/llm/openai/device/start")
@@ -1249,7 +1304,14 @@ def openai_device_login_status():
 @app.post("/api/llm/subscriptions/openai/device-code/start")
 def openai_device_login_start():
     try:
-        return codex_login_manager().start()
+        manager = codex_login_manager()
+        current = manager.status()
+        if current.get("authenticated"):
+            connection, policy = _ensure_openai_subscription_connection()
+            current["connection"] = connection
+            current["policy"] = policy
+            return current
+        return manager.start()
     except Exception as exc:
         # Provider diagnostics can contain implementation details or command
         # paths.  Keep the API error generic and token-free.
@@ -1293,7 +1355,12 @@ def set_claude_oauth_token(payload: ClaudeOAuthTokenIn):
             "UPDATE llm_connections SET auth_type=?,secret=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (AUTH_TYPE_CLAUDE_CODE, seal(token), payload.connection_id),
         )
-    return {"id": payload.connection_id, "connection": next(item for item in safe_connections() if item["id"] == payload.connection_id)}
+    policy = ensure_default_shadow_policy(payload.connection_id)
+    return {
+        "id": payload.connection_id,
+        "connection": next(item for item in safe_connections() if item["id"] == payload.connection_id),
+        "policy": next(item for item in safe_policies() if item["id"] == policy["id"]),
+    }
 
 
 def _llm_default_endpoint(provider_id: str) -> str:
@@ -1342,7 +1409,12 @@ def create_llm_connection(payload: LLMConnectionIn):
             "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,auth_type,secret,enabled) VALUES(?,?,?,?,?,?,?)",
             (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled)),
         )
-    return {"id": cursor.lastrowid, "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid)}
+    policy = ensure_default_shadow_policy(int(cursor.lastrowid))
+    return {
+        "id": cursor.lastrowid,
+        "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid),
+        "policy": next(item for item in safe_policies() if item["id"] == policy["id"]),
+    }
 
 
 @app.put("/api/llm/connections/{connection_id}")
@@ -1359,7 +1431,12 @@ def update_llm_connection(connection_id: int, payload: LLMConnectionIn):
             "UPDATE llm_connections SET name=?,provider_id=?,model_id=?,endpoint=?,auth_type=?,secret=?,enabled=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled), connection_id),
         )
-    return {"id": connection_id, "connection": next(item for item in safe_connections() if item["id"] == connection_id)}
+    policy = ensure_default_shadow_policy(connection_id)
+    return {
+        "id": connection_id,
+        "connection": next(item for item in safe_connections() if item["id"] == connection_id),
+        "policy": next(item for item in safe_policies() if item["id"] == policy["id"]),
+    }
 
 
 @app.delete("/api/llm/connections/{connection_id}")

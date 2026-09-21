@@ -19,6 +19,10 @@ from .llm import build_client, build_prompt
 from .secrets import unseal
 
 
+DEFAULT_SHADOW_TOP_K = 20
+DEFAULT_SHADOW_PROMPT_VERSION = "shadow-v1"
+
+
 def safe_connections() -> list[dict[str, Any]]:
     return rows(
         "SELECT id,name,provider_id,model_id,endpoint,auth_type,enabled,"
@@ -27,12 +31,56 @@ def safe_connections() -> list[dict[str, Any]]:
     )
 
 
+def _backfill_default_shadow_policies() -> None:
+    """Repair connections created before automatic policy provisioning."""
+
+    for connection in rows(
+        "SELECT c.id FROM llm_connections c "
+        "WHERE NOT EXISTS (SELECT 1 FROM llm_policies p WHERE p.connection_id=c.id)"
+    ):
+        ensure_default_shadow_policy(int(connection["id"]))
+
+
 def safe_policies() -> list[dict[str, Any]]:
+    _backfill_default_shadow_policies()
     return rows(
         "SELECT p.id,p.name,p.connection_id,p.enabled,p.top_k,p.prompt_version,"
         "p.created_at,p.updated_at,c.name connection_name,c.provider_id,c.model_id "
         "FROM llm_policies p JOIN llm_connections c ON c.id=p.connection_id "
         "ORDER BY p.updated_at DESC,p.id DESC"
+    )
+
+
+def ensure_default_shadow_policy(connection_id: int, *, name: str | None = None) -> dict[str, Any]:
+    """Ensure a connection has one enabled default shadow policy.
+
+    Connections are usable as soon as they are saved.  Keeping this operation
+    idempotent makes it safe to call after a normal connection save and after
+    subscription authentication completes (including repeated device-login
+    status polls).
+    """
+
+    connection = row("SELECT id,name FROM llm_connections WHERE id=?", (connection_id,))
+    if not connection:
+        raise ValueError("LLM connection not found")
+    policy_name = (name or f"{connection['name']} shadow ranking").strip()[:100]
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT id,name,connection_id,enabled,top_k,prompt_version,created_at,updated_at "
+            "FROM llm_policies WHERE connection_id=? ORDER BY id LIMIT 1",
+            (connection_id,),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        cursor = con.execute(
+            "INSERT INTO llm_policies(name,connection_id,enabled,top_k,prompt_version) VALUES(?,?,?,?,?)",
+            (policy_name, connection_id, 1, DEFAULT_SHADOW_TOP_K, DEFAULT_SHADOW_PROMPT_VERSION),
+        )
+        policy_id = cursor.lastrowid
+    return row(
+        "SELECT id,name,connection_id,enabled,top_k,prompt_version,created_at,updated_at "
+        "FROM llm_policies WHERE id=?",
+        (policy_id,),
     )
 
 
