@@ -206,6 +206,15 @@ def _source_matches(source_url, host, path_prefix=None):
     return path_prefix is None or parsed.path.startswith(path_prefix)
 
 
+def _is_apple_source(source_url):
+    """Recognize both legacy iTunes and current Apple RSS endpoints."""
+
+    return any(
+        _source_matches(source_url, host)
+        for host in ("itunes.apple.com", "rss.marketingtools.apple.com")
+    )
+
+
 def _parse_goodreads_genre(content, source_url):
     soup = BeautifulSoup(content, "html.parser")
     covers = {}
@@ -325,7 +334,7 @@ async def import_goodreads_rss(url: str):
 def parse_book_items(content: bytes, content_type: str, source_url: str):
     if "xml" in content_type or "rss" in content_type or content.lstrip().startswith(b"<?xml"):
         feed = feedparser.parse(content)
-        if _source_matches(source_url, "itunes.apple.com"):
+        if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
         return [{"title": str(e.get("title", ""))[:500], "author": str(e.get("author", "Unknown author"))[:300], "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000], "source_url": metadata_url(e.get("link"), source_url)} for e in feed.entries[:settings.source_max_items] if e.get("title")]
     items = []
@@ -334,7 +343,7 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         try: payloads = [json.loads(content)]
         except (json.JSONDecodeError, UnicodeDecodeError): return []
         payload = payloads[0]
-        if _source_matches(source_url, "itunes.apple.com") and isinstance(payload, dict):
+        if _is_apple_source(source_url) and isinstance(payload, dict):
             return _parse_apple_entries(payload.get("feed", {}).get("entry", []), source_url)
         if _source_matches(source_url, "openlibrary.org", "/subjects/") and isinstance(payload, dict):
             return _parse_open_library(payload, source_url)
