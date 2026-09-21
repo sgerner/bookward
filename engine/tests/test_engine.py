@@ -146,6 +146,12 @@ def test_source_parsers_handle_apple_open_library_and_goodreads_formats():
     assert apple_items[0]["title"] == "Glass House"
     assert apple_items[0]["author"] == "Jane Reader"
     assert apple_items[0]["release_date"] == "2027-01-02"
+    marketing_apple_items = parse_book_items(
+        apple,
+        "application/rss+xml",
+        "https://rss.marketingtools.apple.com/api/v2/us/audio-books/top/1/audio-books.rss",
+    )
+    assert marketing_apple_items[0]["author"] == "Jane Reader"
     open_library = json.dumps({"works": [{"title": "A New World", "authors": [{"name": "A Writer"}], "cover_id": 42, "key": "/works/OL1W", "subject": ["Science fiction"]}]}).encode()
     open_library_items = parse_book_items(open_library, "application/json", "https://openlibrary.org/subjects/science_fiction.json?limit=1")
     assert open_library_items[0]["author"] == "A Writer"
