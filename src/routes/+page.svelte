@@ -72,7 +72,9 @@
   let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
-  let previousDataBooks = $state<PageBook[] | null>(null);
+  // This is only an identity sentinel. Keeping it outside `$state` avoids
+  // proxying `data.books` and retriggering the synchronization effect forever.
+  let previousDataBooks: PageBook[] | null = null;
   let pendingAction = $state<string | null>(null);
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -528,15 +530,6 @@
   $effect(() => {
     if (formState?.token) revealedApiToken = formState.token;
     else if (formState) revealedApiToken = null;
-  });
-
-  $effect(() => {
-    const nextBooks = data.books;
-    if (previousDataBooks === nextBooks) return;
-    previousDataBooks = nextBooks;
-    additionalDiscoverBooks = [];
-    discoverHasMore = true;
-    discoverLoadError = "";
   });
 
   $effect(() => {
