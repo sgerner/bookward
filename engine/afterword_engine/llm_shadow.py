@@ -91,8 +91,8 @@ def _candidate_rows(top_k: int) -> list[dict[str, Any]]:
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status='recommended' AND q.quality_status='accepted' "
         "AND (s.id IS NULL OR s.enabled=1) "
-        "AND book_identity(c.title,c.author) NOT IN "
-        "(SELECT book_identity(title,author) FROM reads) "
+        "AND NOT EXISTS (SELECT 1 FROM reads r "
+        "WHERE book_identity_matches(c.title,c.author,r.title,r.author)) "
         "ORDER BY c.score DESC,c.id ASC LIMIT ?",
         (top_k,),
     )
