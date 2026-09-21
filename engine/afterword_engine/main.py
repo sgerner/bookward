@@ -324,6 +324,14 @@ async def lifespan(app):
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     enqueue_job("metadata", dedupe=True)
+    # A migration-created legacy quality ledger is an explicit signal that the
+    # existing corpus still needs its one-time catalog audit.  Fresh installs
+    # only contain curated demo rows and therefore skip this expensive job.
+    if row(
+        "SELECT 1 FROM candidate_quality WHERE audit_version='legacy-pending-audit-v1' "
+        "OR quality_status='pending' LIMIT 1"
+    ):
+        enqueue_job("candidate_quality", dedupe=True)
     yield
     stop.set(); await scheduler; await digest_scheduler; await worker
 
