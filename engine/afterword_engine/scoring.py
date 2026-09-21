@@ -92,7 +92,14 @@ def _max_cosine_similarities(vectors, references, default):
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
-    candidates = rows("SELECT c.*, s.name source_name, s.weight source_weight FROM candidates c JOIN sources s ON s.id=c.source_id WHERE c.status IN ('new','recommended') AND s.enabled=1 AND book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads)")
+    candidates = rows(
+        "SELECT c.*, s.name source_name, s.weight source_weight "
+        "FROM candidates c JOIN sources s ON s.id=c.source_id "
+        "JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
+        "AND s.enabled=1 AND book_identity(c.title,c.author) NOT IN "
+        "(SELECT book_identity(title,author) FROM reads)"
+    )
     if not candidates: return 0
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)

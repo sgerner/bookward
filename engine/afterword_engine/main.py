@@ -58,6 +58,7 @@ from .associations import run_association_provider
 from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
+from .quality import audit_candidates, quality_summary
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
@@ -225,6 +226,7 @@ async def handle_job(kind: str):
             result = await run_association_provider(provider, reads, persist=False)
         else:
             raise ValueError("Unknown association provider")
+        quality = await audit_candidates(only_pending=True)
         return {
             "run_id": result.id,
             "provider": result.provider,
@@ -232,6 +234,7 @@ async def handle_job(kind: str):
             "seeds": result.seeds,
             "edges": result.edges,
             "persisted": result.persisted,
+            "quality": quality,
         }
     if kind == "rebuild_embeddings":
         # Embedding vectors are model-specific. Rebuild the selected provider's
@@ -249,6 +252,15 @@ async def handle_job(kind: str):
         return {"scored": scored, "digest_job_id": queue_digest_if_due()}
     if kind == "metadata":
         return {"metadata": await refresh_missing_candidate_metadata()}
+    if kind == "candidate_quality":
+        quality = await audit_candidates(only_pending=False)
+        scored = await score_all(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        return {**quality, "scored": scored}
     if kind.startswith("source:"):
         try:
             source_id = int(kind.partition(":")[2])
@@ -274,9 +286,10 @@ async def handle_job(kind: str):
                 )
             raise
         metadata = await refresh_missing_candidate_metadata()
+        quality = await audit_candidates(only_pending=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
-        return {"collected":collected,"metadata":metadata,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
+        return {"collected":collected,"metadata":metadata,"quality":quality,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
     if kind == "sync":
         total = 0
         errors = []
@@ -298,9 +311,10 @@ async def handle_job(kind: str):
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
         metadata = await refresh_missing_candidate_metadata()
+        quality = await audit_candidates(only_pending=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
-        return {"collected":total,"metadata":metadata,"scored":scored,"errors":errors,"digest_job_id":digest_job_id}
+        return {"collected":total,"metadata":metadata,"quality":quality,"scored":scored,"errors":errors,"digest_job_id":digest_job_id}
     raise ValueError(f"Unsupported job kind: {kind}")
 
 @asynccontextmanager
@@ -569,6 +583,7 @@ def _recommendation_rows(
 ):
     clauses = [
         "c.status!='rejected'",
+        "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
         "(c.status IN ('saved','imported') OR s.enabled=1)",
         "(c.status IN ('saved','imported') OR book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads))",
     ]
@@ -579,7 +594,8 @@ def _recommendation_rows(
         params.extend(statuses)
     query = (
         "SELECT c.*,s.name source_name FROM candidates c "
-        "LEFT JOIN sources s ON s.id=c.source_id WHERE "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id WHERE "
         + " AND ".join(clauses)
         + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 "
         "WHEN 'saved' THEN 1 ELSE 2 END, c.score DESC LIMIT ? OFFSET ?"
@@ -979,6 +995,16 @@ async def sync():
 @app.post("/api/score")
 async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
+
+@app.post("/api/candidates/audit")
+async def candidate_audit():
+    """Queue a full catalog identity and quality audit."""
+
+    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+
+@app.get("/api/candidates/quality")
+def candidate_quality():
+    return quality_summary()
 
 @app.post("/api/embeddings/rebuild")
 async def rebuild_embeddings():
