@@ -259,6 +259,45 @@ MIGRATIONS = [
             ON jobs(status, created_at);
         """,
     ),
+    (
+        8,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_quality (
+            candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id) ON DELETE CASCADE,
+            quality_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(quality_status IN ('pending','accepted','quarantine','rejected')),
+            quality_score REAL NOT NULL DEFAULT 0
+                CHECK(quality_score >= 0 AND quality_score <= 1),
+            flags_json TEXT NOT NULL DEFAULT '[]',
+            provider TEXT NOT NULL DEFAULT '',
+            provider_id TEXT NOT NULL DEFAULT '',
+            work_id TEXT NOT NULL DEFAULT '',
+            isbn13 TEXT NOT NULL DEFAULT '',
+            isbn10 TEXT NOT NULL DEFAULT '',
+            title_match REAL NOT NULL DEFAULT 0,
+            author_match REAL NOT NULL DEFAULT 0,
+            audit_version TEXT NOT NULL DEFAULT 'candidate-quality-v1',
+            audited_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_quality_status
+            ON candidate_quality(quality_status, quality_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_candidate_quality_isbn13
+            ON candidate_quality(isbn13);
+        CREATE TRIGGER IF NOT EXISTS candidate_quality_after_insert
+        AFTER INSERT ON candidates
+        BEGIN
+            INSERT OR IGNORE INTO candidate_quality(candidate_id, quality_status)
+            SELECT NEW.id,
+                CASE WHEN EXISTS(
+                    SELECT 1 FROM sources WHERE id=NEW.source_id AND kind='builtin'
+                ) THEN 'accepted' ELSE 'pending' END;
+        END;
+        INSERT OR IGNORE INTO candidate_quality(candidate_id, quality_status, audit_version)
+            SELECT id, 'accepted', 'legacy-pending-audit-v1' FROM candidates;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -455,6 +494,16 @@ def initialize():
                 VALUES(?,?,?,?,?,?,?, ?,?,?,?,'recommended',?)""", (item["title"], item["author"], item["description"], fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), canonical_book_source_url(item["title"], item["author"], item.get("source_url", "")), builtin_id, release_date, "demo", json.dumps(item["genres"]), item["score"], json.dumps(item["explanation"]), normalize_key(item["title"], item["author"])))
             for title, author, rating in [("Sea of Tranquility","Emily St. John Mandel",5),("The Fifth Season","N. K. Jemisin",5),("Piranesi","Susanna Clarke",4.5),("The Only Good Indians","Stephen Graham Jones",4)]:
                 con.execute("INSERT OR IGNORE INTO reads(title,author,rating,source) VALUES(?,?,?,'demo')", (title,author,rating))
+        # Built-in demo rows are curated and do not need an external catalog
+        # round-trip before the first recommendation is visible.  All rows
+        # discovered from a source remain pending until the quality worker
+        # audits them.
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='builtin-curated-v1',updated_at=CURRENT_TIMESTAMP "
+            "WHERE candidate_id IN (SELECT id FROM candidates WHERE source_id=? AND status IN ('new','recommended')) "
+            "AND audit_version='candidate-quality-v1'",
+            (builtin_id,),
+        )
         # Keep an existing self-hosted installation from displaying the old
         # Open Library ISBN URLs that render as 1x1 transparent GIFs.  This is
         # deliberately network-free; the next refresh can enrich placeholders

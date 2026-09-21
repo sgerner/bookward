@@ -222,7 +222,9 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     query = (
         "SELECT c.*, s.name AS source_name FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
-        "WHERE c.status='recommended' AND c.score>=? AND COALESCE(s.enabled, 1)=1 "
+        "JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.status='recommended' AND q.quality_status='accepted' "
+        "AND c.score>=? AND COALESCE(s.enabled, 1)=1 "
         "AND book_identity(c.title,c.author) NOT IN (SELECT book_identity(title,author) FROM reads)"
     )
     if not include_seen and config["only_new"]:
@@ -400,7 +402,7 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
                 if existing_ids:
                     placeholders = ",".join("?" for _ in existing_ids)
                     items = rows(
-                        f"SELECT c.*, s.name AS source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id WHERE c.id IN ({placeholders}) ORDER BY c.score DESC, c.id DESC",
+                        f"SELECT c.*, s.name AS source_name FROM candidates c LEFT JOIN sources s ON s.id=c.source_id JOIN candidate_quality q ON q.candidate_id=c.id WHERE c.id IN ({placeholders}) ORDER BY c.score DESC, c.id DESC",
                         existing_ids,
                     )
                     for item in items:
