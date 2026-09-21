@@ -1957,7 +1957,7 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="relative m-0 card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         onclick={(event) => event.stopPropagation()}
         onkeydown={(event) => event.stopPropagation()}
@@ -1988,7 +1988,7 @@
         </div>
         <div class="max-h-[calc(100vh-11rem)] overflow-y-auto p-5 sm:p-6">
           <form
-            class="flex flex-col gap-3 sm:flex-row"
+            class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
               event.preventDefault();
               void searchLibrarr();
@@ -1998,7 +1998,7 @@
               class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
               aria-label="Search Librarr"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-w-0"
+                class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
                 bind:value={librarrQuery}
                 placeholder="Search title or author"
               /></label
@@ -2006,7 +2006,7 @@
             <label class="sr-only" for="librarr-media-type">Format</label
             ><select
               id="librarr-media-type"
-              class="select min-h-12 sm:w-40"
+              class="select min-h-12 sm:mx-1 sm:w-40"
               bind:value={librarrMediaType}
               ><option value="audiobook">Audiobook</option><option value="ebook"
                 >Ebook</option
