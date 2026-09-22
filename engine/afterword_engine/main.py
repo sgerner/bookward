@@ -446,6 +446,7 @@ class LLMConnectionIn(BaseModel):
     auth_type: str = Field(default=AUTH_TYPE_API_KEY, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
     api_key: str | None = Field(default=None, max_length=20_000)
     oauth_token: str | None = Field(default=None, max_length=20_000)
+    reasoning_effort: str | None = Field(default=None, max_length=30, pattern=r"^[A-Za-z0-9_-]+$")
     enabled: bool = True
 
 
@@ -1476,6 +1477,34 @@ def _llm_connection_values(payload: LLMConnectionIn, current_key: str = "") -> t
     return endpoint, key, auth_type
 
 
+def _apply_llm_policy_settings(policy_id: int, model_id: str, reasoning_effort: str) -> dict[str, Any]:
+    """Apply subscription model settings from either the picker or API endpoint."""
+
+    policy = row(
+        "SELECT p.id,p.connection_id,c.auth_type "
+        "FROM llm_policies p JOIN llm_connections c ON c.id=p.connection_id WHERE p.id=?",
+        (policy_id,),
+    )
+    if not policy:
+        raise HTTPException(404, "LLM policy not found")
+    auth_type = normalize_auth_type(policy["auth_type"])
+    if auth_type not in {AUTH_TYPE_OPENAI_CODEX, AUTH_TYPE_CLAUDE_CODE}:
+        raise HTTPException(400, "Model and reasoning settings are only available for subscription connections")
+    effort = reasoning_effort.strip().lower()
+    if effort not in SUBSCRIPTION_REASONING_LEVELS:
+        raise HTTPException(400, "Choose a supported reasoning level")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET model_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (model_id.strip(), policy["connection_id"]),
+        )
+        con.execute(
+            "UPDATE llm_policies SET reasoning_effort=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (effort, policy_id),
+        )
+    return next(item for item in safe_policies() if item["id"] == policy_id)
+
+
 @app.get("/api/llm/connections")
 def llm_connections():
     return {"connections": safe_connections()}
@@ -1493,6 +1522,8 @@ def create_llm_connection(payload: LLMConnectionIn):
             (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled)),
         )
     policy = ensure_default_shadow_policy(int(cursor.lastrowid))
+    if auth_type == AUTH_TYPE_CLAUDE_CODE and payload.reasoning_effort:
+        policy = _apply_llm_policy_settings(int(policy["id"]), payload.model_id, payload.reasoning_effort)
     return {
         "id": cursor.lastrowid,
         "connection": next(item for item in safe_connections() if item["id"] == cursor.lastrowid),
@@ -1515,6 +1546,8 @@ def update_llm_connection(connection_id: int, payload: LLMConnectionIn):
             (payload.name.strip(), payload.provider_id.strip(), payload.model_id.strip(), endpoint, auth_type, seal(key) if key else "", int(payload.enabled), connection_id),
         )
     policy = ensure_default_shadow_policy(connection_id)
+    if auth_type == AUTH_TYPE_CLAUDE_CODE and payload.reasoning_effort:
+        policy = _apply_llm_policy_settings(int(policy["id"]), payload.model_id, payload.reasoning_effort)
     return {
         "id": connection_id,
         "connection": next(item for item in safe_connections() if item["id"] == connection_id),
@@ -1567,29 +1600,7 @@ def update_llm_policy(policy_id: int, payload: LLMPolicyIn):
 
 @app.put("/api/llm/policies/{policy_id}/settings")
 def update_llm_policy_settings(policy_id: int, payload: LLMPolicySettingsIn):
-    policy = row(
-        "SELECT p.id,p.connection_id,c.auth_type,c.provider_id "
-        "FROM llm_policies p JOIN llm_connections c ON c.id=p.connection_id WHERE p.id=?",
-        (policy_id,),
-    )
-    if not policy:
-        raise HTTPException(404, "LLM policy not found")
-    auth_type = normalize_auth_type(policy["auth_type"])
-    if auth_type not in {AUTH_TYPE_OPENAI_CODEX, AUTH_TYPE_CLAUDE_CODE}:
-        raise HTTPException(400, "Model and reasoning settings are only available for subscription connections")
-    effort = payload.reasoning_effort.strip().lower()
-    if effort not in SUBSCRIPTION_REASONING_LEVELS:
-        raise HTTPException(400, "Choose a supported reasoning level")
-    with transaction() as con:
-        con.execute(
-            "UPDATE llm_connections SET model_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (payload.model_id.strip(), policy["connection_id"]),
-        )
-        con.execute(
-            "UPDATE llm_policies SET reasoning_effort=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (effort, policy_id),
-        )
-    return {"id": policy_id, "policy": next(item for item in safe_policies() if item["id"] == policy_id)}
+    return {"id": policy_id, "policy": _apply_llm_policy_settings(policy_id, payload.model_id, payload.reasoning_effort)}
 
 
 @app.delete("/api/llm/policies/{policy_id}")

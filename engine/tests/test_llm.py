@@ -143,6 +143,46 @@ def test_connection_api_provisions_default_shadow_policy(database):
         assert client.get("/api/llm/policies").json()["policies"]
 
 
+def test_claude_connection_picker_applies_reasoning_to_default_policy(database):
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/llm/connections",
+            json={
+                "name": "Claude subscription",
+                "provider_id": "anthropic",
+                "model_id": "claude-sonnet-4-5",
+                "auth_type": "claude_code",
+                "oauth_token": "oauth-secret",
+                "reasoning_effort": "xhigh",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["connection"]["model_id"] == "claude-sonnet-4-5"
+        assert response.json()["policy"]["reasoning_effort"] == "xhigh"
+        policy = row("SELECT reasoning_effort FROM llm_policies WHERE connection_id=?", (response.json()["id"],))
+        assert policy["reasoning_effort"] == "xhigh"
+
+
+def test_subscription_policy_settings_updates_model_and_reasoning(database):
+    with transaction() as con:
+        connection_id = con.execute(
+            "INSERT INTO llm_connections(name,provider_id,model_id,endpoint,auth_type,secret) VALUES(?,?,?,?,?,?)",
+            ("ChatGPT", "openai", "gpt-5.6-terra", "https://api.openai.com/v1", "openai_codex", ""),
+        ).lastrowid
+        policy_id = con.execute(
+            "INSERT INTO llm_policies(name,connection_id,reasoning_effort) VALUES(?,?,?)",
+            ("ChatGPT shadow", connection_id, "medium"),
+        ).lastrowid
+    with TestClient(app) as client:
+        response = client.put(
+            f"/api/llm/policies/{policy_id}/settings",
+            json={"model_id": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+        )
+    assert response.status_code == 200
+    assert response.json()["policy"]["model_id"] == "gpt-5.6-luna"
+    assert response.json()["policy"]["reasoning_effort"] == "xhigh"
+
+
 def test_policy_listing_backfills_connections_created_before_auto_provisioning(database):
     with transaction() as con:
         connection_id = con.execute(
