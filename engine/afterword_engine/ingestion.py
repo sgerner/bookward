@@ -6,7 +6,7 @@ import json
 import re
 import math
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
@@ -23,11 +23,25 @@ GOODREADS_TITLE_RE = re.compile(r'class=\\"readable bookTitle\\"[^>]*>(.*?)<\\/a
 GOODREADS_AUTHOR_RE = re.compile(r'class=\\"authorName\\"[^>]*>(.*?)<\\/a>', re.S)
 GOODREADS_LINK_RE = re.compile(r'href=\\"(https://www\.goodreads\.com/book/show/[^"?]+)', re.S)
 GOODREADS_YEAR_RE = re.compile(r'(?:published|release date:)\s+(\d{4})', re.I)
+GOODREADS_BOOK_ID_RE = re.compile(r"/book/show/(\d+)", re.I)
+GOODREADS_TOOLTIPS_URL = "https://www.goodreads.com/tooltips"
+GOODREADS_BLOG_HOSTS = frozenset({"goodreads.com", "www.goodreads.com"})
+EDITORIAL_SOURCE_HOSTS = frozenset(
+    {"andrewliptak.com", "www.andrewliptak.com", "transfer-orbit.ghost.io"}
+)
+SOURCE_MAX_REDIRECTS = 4
 
 
 def _clean_text(value, limit=4000):
     text = BeautifulSoup(html.unescape(str(value or "")), "html.parser").get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _clean_editorial_title(value):
+    # Ghost sometimes splits an italicized word across an inline text node
+    # (for example ``T`` + ``he Tower``), which BeautifulSoup renders as
+    # ``T he Tower``. Rejoin only a single letter followed by lowercase text.
+    return re.sub(r"\b([A-Za-z])\s+([a-z])", r"\1\2", _clean_text(value, 500))
 
 
 def _date_value(value):
@@ -206,6 +220,13 @@ def _source_matches(source_url, host, path_prefix=None):
     return path_prefix is None or parsed.path.startswith(path_prefix)
 
 
+def _source_host(source_url):
+    try:
+        return (urlparse(source_url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+
+
 def _is_apple_source(source_url):
     """Recognize both legacy iTunes and current Apple RSS endpoints."""
 
@@ -213,6 +234,16 @@ def _is_apple_source(source_url):
         _source_matches(source_url, host)
         for host in ("itunes.apple.com", "rss.marketingtools.apple.com")
     )
+
+
+def _is_goodreads_blog_source(source_url):
+    return _source_host(source_url) in GOODREADS_BLOG_HOSTS and urlparse(source_url).path.startswith(
+        "/blog/show/"
+    )
+
+
+def _is_editorial_source(source_url):
+    return _source_host(source_url) in EDITORIAL_SOURCE_HOSTS
 
 
 def _parse_goodreads_genre(content, source_url):
@@ -258,6 +289,146 @@ def _parse_goodreads_genre(content, source_url):
                 return items
     return items
 
+
+def _parse_goodreads_blog(content, source_url):
+    """Parse Goodreads editorial pages without relying on legacy genre markup.
+
+    Blog pages render each recommendation as a tooltip trigger.  The card has
+    a stable Goodreads book id and cover, while the author and description are
+    supplied by the batched ``/tooltips`` endpoint and filled in by the async
+    enrichment step below.
+    """
+
+    soup = BeautifulSoup(content, "html.parser")
+    items = []
+    seen = set()
+    for card in soup.select(".tooltipTrigger.book[data-resource-id]"):
+        resource_id = str(card.get("data-resource-id") or "").strip()
+        if not resource_id or resource_id in seen:
+            continue
+        seen.add(resource_id)
+        image = card.select_one("img[src]")
+        title = _clean_text(image.get("alt") if image else "", 500)
+        link = card.select_one("a[href*='/book/show/']")
+        href = urljoin("https://www.goodreads.com", link.get("href", "")) if link else ""
+        if not title and link:
+            title = _clean_text(link.get_text(" ", strip=True), 500)
+        if not title or not href:
+            continue
+        items.append(
+            {
+                "title": title,
+                "author": "Unknown author",
+                "description": "",
+                "cover_url": safe_cover_url(image.get("src") if image else "", source_url),
+                "source_url": metadata_url(href, source_url),
+                "release_date": None,
+                "genres": [],
+            }
+        )
+        if len(items) >= settings.source_max_items:
+            break
+    return items
+
+
+def _editorial_book_link(href):
+    try:
+        parsed = urlparse(href)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    return parsed.scheme in {"http", "https"} and host not in EDITORIAL_SOURCE_HOSTS
+
+
+def _editorial_date(value, source_url):
+    match = re.search(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+        str(value or ""),
+        re.I,
+    )
+    if not match:
+        return None
+    year_match = re.search(r"\b(20\d{2})\b", source_url)
+    year = int(year_match.group(1)) if year_match else datetime.now().year
+    try:
+        return datetime.strptime(
+            f"{match.group(1)} {int(match.group(2))} {year}", "%B %d %Y"
+        ).date().isoformat()
+    except ValueError:
+        return None
+
+
+def _text_before(node, child):
+    parts = []
+    for part in node.contents:
+        if part is child:
+            break
+        parts.append(part.get_text(" ", strip=True) if hasattr(part, "get_text") else str(part))
+    return _clean_text(" ".join(parts), 500)
+
+
+def _parse_editorial_html(content, source_url):
+    """Parse Transfer Orbit/Andrew Liptak Ghost book-list headings."""
+
+    soup = BeautifulSoup(content, "html.parser")
+    items = []
+    seen = set()
+    for heading in soup.select("h2, h3, h4"):
+        raw_links = [
+            link
+            for link in heading.select("a[href]")
+            if _editorial_book_link(link.get("href", ""))
+        ]
+        if not raw_links:
+            continue
+        heading_text = _clean_text(heading.get_text(" ", strip=True), 1200)
+        marker = re.search(r"\s+(?:edited\s+by|by)\s+", heading_text, re.I)
+        if not marker:
+            continue
+        attribution_text = heading_text[marker.end() :]
+        date_match = re.search(r"\s+\((?P<date>[^()]*)\)\s*$", attribution_text)
+        author_text = attribution_text[: date_match.start()] if date_match else attribution_text
+        author = _clean_text(author_text, 300)
+        # Keep the primary author usable for metadata lookup while retaining
+        # ordinary multi-author and editor attributions.
+        author = re.split(r"(?:,|\s+and)\s+translated\s+by\s+", author, maxsplit=1, flags=re.I)[0].strip()
+        date_value = _editorial_date(date_match.group("date") if date_match else "", source_url)
+        grouped_links = []
+        for link in raw_links:
+            href = link.get("href", "")
+            title_text = link.get_text(" ", strip=True)
+            if grouped_links and grouped_links[-1][0] == href:
+                grouped_links[-1][1] = f"{grouped_links[-1][1]} {title_text}"
+            else:
+                grouped_links.append([href, title_text])
+        prefix = _text_before(heading, raw_links[0]) if len(grouped_links) > 1 else ""
+        for href, title_text in grouped_links:
+            title = _clean_editorial_title(title_text)
+            if prefix:
+                title = _clean_editorial_title(f"{prefix} {title}")
+            if not title or not author:
+                continue
+            key = normalize_key(title, author)
+            if key in seen:
+                continue
+            seen.add(key)
+            book_url = metadata_url(urljoin(source_url, href), source_url)
+            items.append(
+                {
+                    "title": title,
+                    "author": author,
+                    "description": "",
+                    "cover_url": "",
+                    "source_url": book_url,
+                    "release_date": date_value,
+                    "genres": [],
+                }
+            )
+            if len(items) >= settings.source_max_items:
+                return items
+    return items
+
 def metadata_url(value, fallback=""):
     try:
         parsed = httpx.URL(str(value))
@@ -289,24 +460,173 @@ def import_goodreads_csv(content: bytes):
     attribute_read_outcomes()
     return count
 
-async def fetch_bytes(url: str, allow_goodreads_http=False):
-    _, address, hostname = resolve_public_target(url, allow_http=allow_goodreads_http)
+def _source_client():
+    return httpx.AsyncClient(
+        timeout=settings.source_timeout_seconds,
+        follow_redirects=False,
+        trust_env=False,
+        headers={
+            "User-Agent": "Bookward/0.1 (+self-hosted book recommender)",
+            "Accept-Encoding": "identity",
+        },
+    )
+
+
+async def _request_pinned(client, method, url, *, params=None, allow_http=False):
+    _, address, hostname = resolve_public_target(url, allow_http=allow_http)
     original = httpx.URL(url)
     pinned = original.copy_with(host=address)
     default_port = 443 if original.scheme == "https" else 80
     host_header = hostname if original.port in (None, default_port) else f"{hostname}:{original.port}"
-    async with httpx.AsyncClient(timeout=settings.source_timeout_seconds, follow_redirects=False, trust_env=False, headers={"User-Agent":"Bookward/0.1 (+self-hosted book recommender)","Accept-Encoding":"identity"}) as client:
-        async with client.stream("GET", pinned, headers={"Host":host_header}, extensions={"sni_hostname":hostname}) as response:
-            if response.is_redirect: raise ValueError("Redirects are disabled; use the final HTTPS URL")
+    return await client.request(
+        method,
+        pinned,
+        params=params,
+        headers={"Host": host_header},
+        extensions={"sni_hostname": hostname},
+    )
+
+
+async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
+    current_url = str(url)
+    for _ in range(SOURCE_MAX_REDIRECTS + 1):
+        response = await _request_pinned(
+            client,
+            "GET",
+            current_url,
+            allow_http=allow_goodreads_http,
+        )
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("Source returned an invalid redirect")
+            current_url = str(httpx.URL(current_url).join(location))
+            continue
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if not any(
+            kind in content_type
+            for kind in ("html", "xml", "rss", "atom", "json", "javascript", "text/plain")
+        ):
+            raise ValueError("Source returned an unsupported content type")
+        chunks, size = [], 0
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > settings.source_max_bytes:
+                raise ValueError("Source response is too large")
+            chunks.append(chunk)
+        return b"".join(chunks), content_type
+    raise ValueError("Source returned too many redirects")
+
+
+async def fetch_bytes(url: str, allow_goodreads_http=False, client=None):
+    if client is not None:
+        return await _fetch_bytes_with_client(client, url, allow_goodreads_http)
+    async with _source_client() as owned_client:
+        return await _fetch_bytes_with_client(owned_client, url, allow_goodreads_http)
+
+
+def _goodreads_tooltip_params(resource_ids):
+    params = []
+    for resource_id in resource_ids:
+        key = f"Book.{resource_id}"
+        params.extend(
+            [
+                (f"resources[{key}][type]", "Book"),
+                (f"resources[{key}][id]", resource_id),
+            ]
+        )
+    return params
+
+
+async def _goodreads_tooltips(client, resource_ids):
+    if not resource_ids:
+        return {}
+
+    async def request_batches():
+        collected = {}
+        for start in range(0, len(resource_ids), 50):
+            response = await _request_pinned(
+                client,
+                "GET",
+                GOODREADS_TOOLTIPS_URL,
+                params=_goodreads_tooltip_params(resource_ids[start : start + 50]),
+            )
             response.raise_for_status()
-            content_type = response.headers.get("content-type", "").lower()
-            if not any(kind in content_type for kind in ("html","xml","rss","atom","json","javascript","text/plain")): raise ValueError("Source returned an unsupported content type")
-            chunks, size = [], 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > settings.source_max_bytes: raise ValueError("Source response is too large")
-                chunks.append(chunk)
-            return b"".join(chunks), content_type
+            payload = response.json()
+            batch = payload.get("tooltips", {}) if isinstance(payload, dict) else {}
+            if isinstance(batch, dict):
+                collected.update(batch)
+        return collected
+
+    try:
+        return await request_batches()
+    except httpx.HTTPError:
+        # Goodreads normally accepts the session established by the source
+        # page. If an edge node requires a fresh session, seed it once and
+        # retry the same bounded batches; the fixed public host is pinned and
+        # revalidated on every request.
+        home = await _request_pinned(client, "GET", "https://www.goodreads.com/")
+        home.raise_for_status()
+        return await request_batches()
+
+
+async def enrich_goodreads_blog_items(items, client):
+    resource_ids = []
+    for item in items:
+        match = GOODREADS_BOOK_ID_RE.search(item.get("source_url", ""))
+        if match and match.group(1) not in resource_ids:
+            resource_ids.append(match.group(1))
+    try:
+        tooltips = await _goodreads_tooltips(client, resource_ids)
+    except Exception:
+        # The page itself remains a valid source if Goodreads temporarily
+        # blocks or changes the tooltip endpoint; retain card-level metadata.
+        return items
+    enriched = []
+    for item in items:
+        match = GOODREADS_BOOK_ID_RE.search(item.get("source_url", ""))
+        tooltip_html = tooltips.get(f"Book.{match.group(1)}") if match else ""
+        if not tooltip_html:
+            enriched.append(item)
+            continue
+        soup = BeautifulSoup(tooltip_html, "html.parser")
+        title_node = soup.select_one("h2 a, a.readable")
+        authors = [
+            _clean_text(author.get_text(" ", strip=True), 300)
+            for author in soup.select("a.authorName")
+            if author.get_text(strip=True)
+        ]
+        description_node = soup.select_one("span[id^='freeTextContainer']")
+        published = soup.select_one(".bookRatingAndPublishing")
+        published_text = published.get_text(" ", strip=True) if published else ""
+        year_match = GOODREADS_YEAR_RE.search(published_text)
+        book_link = title_node.get("href") if title_node else ""
+        updated = {
+            **item,
+            "title": _clean_text(title_node.get_text(" ", strip=True), 500)
+            if title_node
+            else item["title"],
+            "author": ", ".join(authors)[:300] if authors else item["author"],
+            "description": _clean_text(description_node or ""),
+            "source_url": metadata_url(
+                urljoin("https://www.goodreads.com", book_link), item.get("source_url", "")
+            ),
+            "release_date": f"{year_match.group(1)}-01-01" if year_match else None,
+            "date_kind": "year" if year_match else item.get("date_kind", "source"),
+        }
+        enriched.append(updated)
+    return enriched
+
+
+async def _fetch_and_parse_source(url):
+    if _is_goodreads_blog_source(url):
+        async with _source_client() as client:
+            content, content_type = await fetch_bytes(url, client=client)
+            items = parse_book_items(content, content_type, url)
+            return content_type, await enrich_goodreads_blog_items(items, client)
+    content, content_type = await fetch_bytes(url)
+    return content_type, parse_book_items(content, content_type, url)
 
 async def import_goodreads_rss(url: str):
     parsed = httpx.URL(url); host = parsed.host or ""
@@ -350,6 +670,10 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         if _source_matches(source_url, "api.nytimes.com") and isinstance(payload, dict):
             return _parse_nytimes(payload, source_url)
     else:
+        if _is_goodreads_blog_source(source_url):
+            return _parse_goodreads_blog(content, source_url)
+        if _is_editorial_source(source_url):
+            return _parse_editorial_html(content, source_url)
         if _source_matches(source_url, "goodreads.com", "/genres/") or _source_matches(source_url, "www.goodreads.com", "/genres/"):
             return _parse_goodreads_genre(content, source_url)
         soup = BeautifulSoup(content, "html.parser")
@@ -479,13 +803,11 @@ async def refresh_missing_candidate_covers():
     return await refresh_missing_candidate_metadata()
 
 async def preview_source(url):
-    content, content_type = await fetch_bytes(url)
-    items = parse_book_items(content, content_type, url)
+    content_type, items = await _fetch_and_parse_source(url)
     return {"url": url, "content_type": content_type, "count": len(items), "sample": items[:5]}
 
 async def scan_source(source):
-    content, content_type = await fetch_bytes(source["url"])
-    items = parse_book_items(content, content_type, source["url"])
+    _, items = await _fetch_and_parse_source(source["url"])
     items = await enrich_book_metadata(items)
     with transaction() as con:
         seen = []
