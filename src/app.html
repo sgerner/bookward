@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="cerberus" data-mode="system" data-color-scheme="light">
+<html lang="en" data-theme="cerberus" data-mode="dark" data-color-scheme="dark">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -23,7 +23,7 @@
 					const legacyMode = window.localStorage.getItem('afterword-color-mode');
 					const mode = storedMode === 'light' || storedMode === 'dark' || storedMode === 'system' ? storedMode : legacyMode;
 					const selectedTheme = themes.includes(theme ?? '') ? theme : 'cerberus';
-					const selectedMode = mode === 'light' || mode === 'dark' || mode === 'system' ? mode : 'system';
+					const selectedMode = mode === 'light' || mode === 'dark' || mode === 'system' ? mode : 'dark';
 					const resolvedMode = selectedMode === 'system' ? (systemDark() ? 'dark' : 'light') : selectedMode;
 					root.dataset.theme = selectedTheme;
 					root.dataset.mode = selectedMode;
@@ -31,10 +31,10 @@
 					root.classList.toggle('dark', resolvedMode === 'dark');
 					root.style.colorScheme = resolvedMode;
 				} catch {
-					root.dataset.mode = 'system';
-					root.dataset.colorScheme = systemDark() ? 'dark' : 'light';
-					root.classList.toggle('dark', root.dataset.colorScheme === 'dark');
-					root.style.colorScheme = root.dataset.colorScheme;
+					root.dataset.mode = 'dark';
+					root.dataset.colorScheme = 'dark';
+					root.classList.toggle('dark', true);
+					root.style.colorScheme = 'dark';
 				}
 			})();
 		</script>
