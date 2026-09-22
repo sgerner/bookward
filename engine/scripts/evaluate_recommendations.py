@@ -2,10 +2,9 @@
 """Print a read-only JSON report for logged recommendation outcomes.
 
 The input may be a SQLite database or an export containing
-``recommendation_runs``, ``recommendation_impressions``,
-``recommendation_outcomes``, ``llm_runs``, and ``llm_scores`` arrays.  The
-script never mutates a database and never turns an unobserved impression into
-a negative outcome.
+``recommendation_runs``, ``recommendation_impressions``, and
+``recommendation_outcomes`` arrays. The script never mutates a database and
+never turns an unobserved impression into a negative outcome.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from afterword_engine.evaluation import DEFAULT_BOOTSTRAP_ITERATIONS, build_repo
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="SQLite snapshot or JSON export")
-    parser.add_argument("--llm-run-id", help="Evaluate this shadow run explicitly")
     parser.add_argument("--bootstrap-iterations", type=int, default=DEFAULT_BOOTSTRAP_ITERATIONS)
     parser.add_argument("--bootstrap-seed", type=int, default=20260920)
     parser.add_argument("--minimum-runs", type=int, default=20)
@@ -39,7 +37,7 @@ def main() -> None:
         args.minimum_negative_impressions,
     )):
         parser.error("minimum sample gates must be non-negative")
-    rows = load_rows(args.source, llm_run_id=args.llm_run_id)
+    rows = load_rows(args.source)
     report = build_report(
         rows,
         bootstrap_iterations=args.bootstrap_iterations,
