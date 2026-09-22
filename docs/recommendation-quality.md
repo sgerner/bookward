@@ -1,5 +1,11 @@
 # Recommendation quality study
 
+> **Follow-up (2026-09-22):** The [production study](recommendation-production-study.md)
+> found that the historical evaluator excluded most Goodreads slash-formatted
+> read dates. On a later production snapshot, the corrected evaluator produced
+> different ranking results. The figures below describe the earlier snapshot;
+> do not use them as a current or population-wide quality claim.
+
 ## Production snapshot
 
 Read-only snapshot reviewed on 2026-09-20: 1,834 read entries, 2,283

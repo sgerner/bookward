@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 spec = importlib.util.spec_from_file_location(
     "evaluate_ranking", Path(__file__).parents[1] / "scripts" / "evaluate_ranking.py"
 )
@@ -65,3 +66,31 @@ def test_feedback_uses_latest_explicit_event_and_only_prior_unrelated_reads(monk
     result = evaluation.feedback_check(data, records, ("test", "fixed"))
     assert result["usable_candidates"] == 1
     assert result["saved"] == 1  # workflow status is not a negative label
+
+
+@pytest.mark.parametrize("value", ["2026/08/05", "2026/8/5"])
+def test_read_dates_accept_goodreads_csv_slash_dates(value):
+    assert evaluation.read_time(value) == evaluation.read_time("2026-08-05")
+
+
+@pytest.mark.parametrize("value", [None, "", "2026/02/30", "2026/13/01", "not a date"])
+def test_invalid_read_dates_remain_unusable(value):
+    assert evaluation.read_time(value) is None
+
+
+def test_prepare_keeps_dated_goodreads_csv_history():
+    reads = [
+        {"id": i, "title": f"CSV work {i}", "author": "Writer", "rating": 4,
+         "read_at": f"2020/01/{i % 28 + 1:02d}"}
+        for i in range(100)
+    ]
+    embeddings = [
+        {"entity_type": "read", "entity_id": item["id"], "backend": "test", "model": "fixed",
+         "content_hash": evaluation.content_hash(evaluation.document(item)), "dimensions": 2,
+         "vector": np.array([1, 0], dtype=np.float32).tobytes()}
+        for item in reads
+    ]
+    records, _, excluded = evaluation.prepare({"reads": reads, "embeddings": embeddings}, None, None)
+    assert len(records) == 100
+    assert excluded["undated"] == 0
+    assert records == sorted(records, key=lambda record: (record[0], record[1]["id"]))

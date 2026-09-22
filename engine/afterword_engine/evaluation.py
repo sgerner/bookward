@@ -2,9 +2,10 @@
 
 All metrics in this module are read-only calculations over exported rows.  A
 missing outcome is censored and is excluded from the metric; it is never
-silently converted to a negative label.  Inverse propensity weights are
-``confidence / propensity`` and every bootstrap resample is made at the
-recommendation-run level to preserve within-run dependence.
+silently converted to a negative label.  The legacy ``ips_*`` names are kept
+for API compatibility, but the outputs are descriptive logged-policy metrics:
+``confidence / propensity`` is a diagnostic weight, not a universal causal
+correction.  Ranking metrics are computed within each recommendation run.
 """
 
 from __future__ import annotations
@@ -65,6 +66,100 @@ def _row_label(row: Mapping[str, Any]) -> float | None:
     return label if label is not None and 0 <= label <= 1 else None
 
 
+def _positive_rank(value: Any) -> int | None:
+    """Return a strictly positive integer logged rank, or ``None``."""
+
+    if isinstance(value, bool):
+        return None
+    number = _as_float(value)
+    if number is None or number <= 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _run_key(row: Mapping[str, Any]) -> str:
+    value = row.get("run_id")
+    return str(value) if value is not None else "__missing_run__"
+
+
+def _row_tie_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """Make equal logged ranks deterministic without relying on input order."""
+
+    return tuple(
+        str(row.get(field, ""))
+        for field in ("candidate_id", "impression_id", "event_id", "score")
+    )
+
+
+def _ranked_runs(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[tuple[Mapping[str, Any], int]]]:
+    """Group rows by run and sort valid logged slots deterministically."""
+
+    groups: dict[str, list[tuple[Mapping[str, Any], int]]] = defaultdict(list)
+    seen: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = defaultdict(dict)
+    seen_ranks: dict[str, dict[int, Mapping[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        rank = _positive_rank(row.get("rank"))
+        if rank is not None:
+            run_key = _run_key(row)
+            candidate_id = row.get("candidate_id")
+            impression_id = row.get("impression_id")
+            duplicate_keys = []
+            if impression_id is not None:
+                duplicate_keys.append(("impression", str(impression_id)))
+            if candidate_id is not None:
+                duplicate_keys.append(("candidate", str(candidate_id)))
+            if not duplicate_keys:
+                duplicate_keys.append(("row", "|".join(_row_tie_key(row))))
+            previous = next(
+                (seen[run_key].get(key) for key in duplicate_keys if seen[run_key].get(key) is not None),
+                None,
+            )
+            if previous is not None:
+                fingerprint = tuple(
+                    str(previous.get(field, ""))
+                    for field in ("rank", "score", "propensity", "confidence", "label", "label_kind")
+                )
+                current_fingerprint = tuple(
+                    str(row.get(field, ""))
+                    for field in ("rank", "score", "propensity", "confidence", "label", "label_kind")
+                )
+                if fingerprint != current_fingerprint:
+                    raise ValueError("Conflicting duplicate impression in recommendation run")
+                continue
+            previous_rank = seen_ranks[run_key].get(rank)
+            if previous_rank is not None:
+                raise ValueError("Duplicate logged rank in recommendation run")
+            seen_ranks[run_key][rank] = row
+            for key in duplicate_keys:
+                seen[run_key][key] = row
+            groups[run_key].append((row, rank))
+    for values in groups.values():
+        values.sort(key=lambda item: (item[1], _row_tie_key(item[0])))
+    return groups
+
+
+def _weighted_item(
+    row: Mapping[str, Any],
+    *,
+    score_key: str,
+) -> tuple[float, float, float] | None:
+    label = _row_label(row)
+    score = _as_float(row.get(score_key))
+    propensity = _as_float(row.get("propensity"), default=1.0)
+    confidence = _as_float(row.get("confidence"), default=1.0)
+    if (
+        label is None
+        or score is None
+        or propensity is None
+        or confidence is None
+        or propensity <= 0
+        or propensity > 1
+        or confidence < 0
+    ):
+        return None
+    return score, label, confidence / propensity
+
+
 def _weighted_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -74,21 +169,10 @@ def _weighted_rows(
 
     result = []
     for row in rows:
-        label = _row_label(row)
-        score = _as_float(row.get(score_key))
-        propensity = _as_float(row.get("propensity"), default=1.0)
-        confidence = _as_float(row.get("confidence"), default=1.0)
-        if (
-            label is None
-            or score is None
-            or propensity is None
-            or confidence is None
-            or propensity <= 0
-            or propensity > 1
-            or confidence < 0
-        ):
-            continue
-        result.append((row, score, label, confidence / propensity))
+        item = _weighted_item(row, score_key=score_key)
+        if item is not None:
+            score, label, weight = item
+            result.append((row, score, label, weight))
     return result
 
 
@@ -124,22 +208,29 @@ def ips_precision_at_k(
     score_key: str = "score",
     positive_threshold: float = 0.5,
 ) -> float | None:
-    """Estimate top-k precision using IPS weights.
+    """Estimate logged top-k precision as a macro-average over runs.
 
-    The logged rank is used for the slate position.  Rows without outcomes are
-    censored, so the denominator is the total IPS weight of observed labels in
-    the top-k rather than an invented full-slate negative count.
+    The logged rank is used for the slate position.  Top-k selection happens
+    before censoring unlabeled rows, and only runs with an observed label in
+    their top-k contribute to the descriptive average.  The legacy ``ips``
+    name does not make this a counterfactual policy estimate.
     """
 
     if k <= 0:
         raise ValueError("k must be positive")
-    usable = _weighted_rows(rows, score_key=score_key)
-    ranked = sorted(usable, key=lambda item: (_as_float(item[0].get("rank"), default=10**9), -item[1]))[:k]
-    denominator = sum(weight for _, _, _, weight in ranked)
-    if denominator <= 0:
-        return None
-    numerator = sum(weight for _, _, label, weight in ranked if label > positive_threshold)
-    return numerator / denominator
+    per_run: list[float] = []
+    for values in _ranked_runs(rows).values():
+        topk = [(row, rank) for row, rank in values if rank <= k]
+        usable = []
+        for row, _rank in topk:
+            item = _weighted_item(row, score_key=score_key)
+            if item is not None:
+                usable.append(item)
+        denominator = sum(weight for _, _, weight in usable)
+        if denominator > 0:
+            numerator = sum(weight for _, label, weight in usable if label > positive_threshold)
+            per_run.append(numerator / denominator)
+    return sum(per_run) / len(per_run) if per_run else None
 
 
 def ips_ndcg_at_k(
@@ -148,21 +239,42 @@ def ips_ndcg_at_k(
     *,
     score_key: str = "score",
 ) -> float | None:
-    """Estimate normalized DCG@k using inverse-propensity gains."""
+    """Estimate logged NDCG@k as a macro-average over runs.
+
+    Logged integer ranks determine both the cutoff and the discount.  Missing
+    outcomes therefore leave their slots in place instead of moving a later
+    observed label upward.  The legacy ``ips`` name denotes diagnostic
+    confidence/propensity weighting, not a universal causal correction.
+    """
 
     if k <= 0:
         raise ValueError("k must be positive")
-    usable = _weighted_rows(rows, score_key=score_key)
-    ranked = sorted(usable, key=lambda item: (_as_float(item[0].get("rank"), default=10**9), -item[1]))[:k]
-    if not ranked:
-        return None
-    discounts = [1.0 / math.log2(position + 2) for position in range(k)]
-    dcg = sum(label * weight * discounts[position] for position, (_, _, label, weight) in enumerate(ranked))
-    # The ideal list uses the observed gains and weights, sorted independently
-    # of rank.  This keeps the normalization bounded while preserving IPS.
-    ideal = sorted((label * weight for _, _, label, weight in usable), reverse=True)[:k]
-    idcg = sum(gain * discounts[position] for position, gain in enumerate(ideal))
-    return dcg / idcg if idcg > 0 else None
+    per_run: list[float] = []
+    for values in _ranked_runs(rows).values():
+        topk = [(row, rank) for row, rank in values if rank <= k]
+        gains: list[tuple[int, float, float]] = []
+        for row, rank in topk:
+            item = _weighted_item(row, score_key=score_key)
+            if item is not None:
+                _score, label, weight = item
+                gains.append((rank, label, weight))
+        if not gains:
+            continue
+        dcg = sum(
+            label * weight / math.log2(rank + 1)
+            for rank, label, weight in gains
+        )
+        all_gains = []
+        for row, _rank in values:
+            item = _weighted_item(row, score_key=score_key)
+            if item is not None:
+                _score, label, weight = item
+                all_gains.append(label * weight)
+        all_gains.sort(reverse=True)
+        idcg = sum(gain / math.log2(position + 2) for position, gain in enumerate(all_gains[:k]))
+        if idcg > 0:
+            per_run.append(dcg / idcg)
+    return sum(per_run) / len(per_run) if per_run else None
 
 
 # Short aliases make the metric layer convenient for callers and scripts.
@@ -182,7 +294,7 @@ def _metric_bundle(rows: Sequence[Mapping[str, Any]], *, score_key: str, k: int)
         "labeled_impressions": len(usable),
         "positive_impressions": sum(label > 0.5 for label in labels),
         "negative_impressions": sum(label < 0.5 for label in labels),
-        "runs": len({str(row.get("run_id")) for row in rows if row.get("run_id") is not None}),
+        "runs": len({_run_key(row) for row in rows}),
     }
 
 
@@ -212,7 +324,7 @@ def cluster_bootstrap(
     values = list(rows)
     clusters: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in values:
-        clusters[str(row.get("run_id", "__missing_run__"))].append(row)
+        clusters[_run_key(row)].append(row)
     metric_fn = {
         "auc": lambda sample: ips_auc(sample, score_key=score_key),
         "precision_at_20": lambda sample: ips_precision_at_k(sample, k, score_key=score_key),
@@ -228,7 +340,16 @@ def cluster_bootstrap(
     samples: list[float] = []
     for _ in range(int(iterations)):
         sampled = [cluster_values[generator.randrange(len(cluster_values))] for _ in cluster_values]
-        metric_value = metric_fn([row for cluster in sampled for row in cluster])
+        # Each draw is a separate run.  Without remapping IDs, repeated draws
+        # of one run collapse back into one group inside per-run metrics.
+        sampled_rows: list[Mapping[str, Any]] = []
+        for replica_index, cluster in enumerate(sampled):
+            replica_id = f"__bootstrap_run_{replica_index}"
+            for row in cluster:
+                copy = dict(row)
+                copy["run_id"] = replica_id
+                sampled_rows.append(copy)
+        metric_value = metric_fn(sampled_rows)
         if metric_value is not None and math.isfinite(metric_value):
             samples.append(metric_value)
     if not samples:
@@ -270,7 +391,7 @@ def temporal_split(
     values = list(rows)
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in values:
-        grouped[str(row.get("run_id", "__missing_run__"))].append(row)
+        grouped[_run_key(row)].append(row)
 
     def run_time(group: list[Mapping[str, Any]]) -> tuple[datetime, str]:
         dates = [_time(row.get("run_created_at") or row.get("created_at") or row.get("presented_at")) for row in group]
@@ -387,7 +508,7 @@ def build_report(
     values = list(rows)
     splits = temporal_split(values)
     report: dict[str, Any] = {
-        "protocol": "temporal run split 60/20/20; IPS confidence/propensity weighting; cluster bootstrap by run",
+        "protocol": "temporal run split 60/20/20; descriptive confidence/propensity weighting; run-macro top-k metrics; cluster bootstrap by run",
         "sample": _metric_bundle(values, score_key="score", k=k),
         "splits": {},
         "signal_diagnostics": signal_diagnostics(values, score_key="score", k=k),
