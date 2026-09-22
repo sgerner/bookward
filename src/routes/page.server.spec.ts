@@ -194,6 +194,38 @@ describe("page actions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("saves normalized source genre filters", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ saved: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "7");
+    body.set("includeGenres", " Science fiction, fantasy, science fiction ");
+    body.set("excludeGenres", " romance ");
+    const result = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Source filters updated; a fresh scan is queued.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/sources/7",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          filters: {
+            include_genres: ["Science fiction", "fantasy"],
+            exclude_genres: ["romance"],
+          },
+        }),
+      }),
+    );
+  });
+
   it("saves the permanent-source refresh cadence", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ saved: true, interval_hours: 24 }), {

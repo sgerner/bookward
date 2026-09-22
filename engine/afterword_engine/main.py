@@ -22,7 +22,14 @@ from .api_tokens import (
 )
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
-from .ingestion import import_goodreads_csv, import_goodreads_rss, preview_source, refresh_missing_candidate_metadata, scan_source
+from .ingestion import (
+    import_goodreads_csv,
+    import_goodreads_rss,
+    normalize_source_filters,
+    preview_source,
+    refresh_missing_candidate_metadata,
+    scan_source,
+)
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import rebuild_all_embeddings, score_all
@@ -376,12 +383,27 @@ app.add_middleware(
     allow_credentials=False,
 )
 
+class SourceFilters(BaseModel):
+    include_genres: list[str] = Field(default_factory=list, max_length=12)
+    exclude_genres: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("include_genres", "exclude_genres", mode="before")
+    @classmethod
+    def normalize_genres(cls, value):
+        return normalize_source_filters({"include_genres": value})["include_genres"]
+
+
 class SourceIn(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     url: HttpUrl
     enabled: bool = True
     weight: float = Field(default=1, ge=.25, le=2)
     lifecycle: Literal["permanent", "one_time"] = "permanent"
+    filters: SourceFilters = Field(default_factory=SourceFilters)
+
+
+class SourceUpdateIn(BaseModel):
+    filters: SourceFilters = Field(default_factory=SourceFilters)
 
 
 class SourceScheduleIn(BaseModel):
@@ -414,6 +436,10 @@ class DigestTestIn(BaseModel):
     channel: Literal["discord", "email"] | None = None
 
 class UrlIn(BaseModel): url: HttpUrl
+
+
+class SourcePreviewIn(UrlIn):
+    filters: SourceFilters = Field(default_factory=SourceFilters)
 
 
 class FeedbackIn(BaseModel):
@@ -567,6 +593,11 @@ def tracked_recommendations(
 
 
 def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None, session_id: str = ""):
+    def source_payload(source):
+        item = dict(source)
+        item["filters"] = normalize_source_filters(item.get("filters"))
+        return item
+
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
@@ -582,7 +613,7 @@ def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: i
             "counts": counts,
             "recommendations": recommendations,
             "recommendation_run_id": run_id,
-            "sources": [dict(item) for item in connection.execute(
+            "sources": [source_payload(item) for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()],
             "history": [dict(item) for item in connection.execute(
@@ -911,8 +942,8 @@ async def goodreads_rss(payload: UrlIn):
     return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/sources/preview")
-async def source_preview(payload: UrlIn):
-    try: return await preview_source(str(payload.url))
+async def source_preview(payload: SourcePreviewIn):
+    try: return await preview_source(str(payload.url), payload.filters.model_dump())
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
 
 @app.post("/api/sources")
@@ -920,10 +951,11 @@ def add_source(payload: SourceIn):
     try: validate_public_url(str(payload.url))
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
     with transaction() as con:
-        try: cursor=con.execute("INSERT INTO sources(name,url,enabled,weight,lifecycle) VALUES(?,?,?,?,?)",(payload.name,str(payload.url),payload.enabled,payload.weight,payload.lifecycle))
+        try: cursor=con.execute("INSERT INTO sources(name,url,enabled,weight,lifecycle,filters) VALUES(?,?,?,?,?,?)",(payload.name,str(payload.url),payload.enabled,payload.weight,payload.lifecycle,json.dumps(payload.filters.model_dump())))
         except Exception as exc: raise HTTPException(409,"Source already exists") from exc
     job_id = enqueue_job(f"source:{cursor.lastrowid}", dedupe=True) if payload.enabled else None
-    return {"id":cursor.lastrowid, "job_id":job_id}
+    return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
+
 
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
@@ -950,6 +982,18 @@ def update_source_schedule(payload: SourceScheduleIn):
             ("source_sync_interval_hours", str(payload.interval_hours)),
         )
     return {"saved": True, "interval_hours": payload.interval_hours}
+
+
+@app.put("/api/sources/{source_id}")
+def update_source(source_id: int, payload: SourceUpdateIn):
+    filters = payload.filters.model_dump()
+    with transaction() as con:
+        source = con.execute("SELECT enabled,kind FROM sources WHERE id=?", (source_id,)).fetchone()
+        if not source: raise HTTPException(404, "Source not found")
+        if source["kind"] == "builtin": raise HTTPException(400, "The built-in source cannot be filtered")
+        con.execute("UPDATE sources SET filters=? WHERE id=?", (json.dumps(filters), source_id))
+    job_id = enqueue_job(f"source:{source_id}", dedupe=True) if source["enabled"] else None
+    return {"id": source_id, "filters": filters, "job_id": job_id}
 
 
 def _save_digest_settings(updates: dict):
@@ -1837,11 +1881,14 @@ async def api_import_librarr(candidate_id: int):
 
 @api_v1.get("/sources")
 def api_sources():
-    return rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    return [
+        {**source, "filters": normalize_source_filters(source.get("filters"))}
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    ]
 
 
 @api_v1.post("/sources/preview")
-async def api_source_preview(payload: UrlIn):
+async def api_source_preview(payload: SourcePreviewIn):
     return await source_preview(payload)
 
 
@@ -1858,6 +1905,11 @@ def api_toggle_source(source_id: int):
 @api_v1.put("/sources/schedule")
 def api_update_source_schedule(payload: SourceScheduleIn):
     return update_source_schedule(payload)
+
+
+@api_v1.put("/sources/{source_id}")
+def api_update_source(source_id: int, payload: SourceUpdateIn):
+    return update_source(source_id, payload)
 
 
 @api_v1.post("/import/goodreads/rss")
