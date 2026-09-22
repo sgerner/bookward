@@ -27,7 +27,7 @@ function executeBootstrap(options: {
 
 	const classes = new Set<string>();
 	const root: BootstrapRoot = {
-		dataset: { theme: 'cerberus', mode: 'system', colorScheme: 'light' },
+		dataset: { theme: 'cerberus', mode: 'dark', colorScheme: 'dark' },
 		style: { colorScheme: '' },
 		classes,
 		classList: {
@@ -80,35 +80,35 @@ describe('no-flash appearance bootstrap', () => {
 		expect(root.classes.has('dark')).toBe(hasDarkClass);
 	});
 
-	it('falls back to the default theme and system mode for invalid saved values', () => {
+	it('falls back to the default theme and dark mode for invalid saved values', () => {
 		const root = executeBootstrap({
 			systemDark: false,
 			readStorage: () => 'not-a-real-preference',
 		});
 
 		expect(root.dataset.theme).toBe('cerberus');
-		expect(root.dataset.mode).toBe('system');
-		expect(root.dataset.colorScheme).toBe('light');
-		expect(root.classes.has('dark')).toBe(false);
+		expect(root.dataset.mode).toBe('dark');
+		expect(root.dataset.colorScheme).toBe('dark');
+		expect(root.classes.has('dark')).toBe(true);
 	});
 
-	it('still chooses the operating-system mode when localStorage is denied', () => {
-		const root = executeBootstrap({ denyStorage: true, systemDark: true });
+	it('falls back to dark mode when localStorage is denied', () => {
+		const root = executeBootstrap({ denyStorage: true, systemDark: false });
 
 		expect(root.dataset.theme).toBe('cerberus');
-		expect(root.dataset.mode).toBe('system');
+		expect(root.dataset.mode).toBe('dark');
 		expect(root.dataset.colorScheme).toBe('dark');
 		expect(root.style.colorScheme).toBe('dark');
 		expect(root.classes.has('dark')).toBe(true);
 	});
 
-	it('keeps a safe light fallback when matchMedia is unavailable', () => {
+	it('keeps a dark fallback when matchMedia is unavailable', () => {
 		const root = executeBootstrap({ denyStorage: true, withoutMatchMedia: true, systemDark: true });
 
 		expect(root.dataset.theme).toBe('cerberus');
-		expect(root.dataset.mode).toBe('system');
-		expect(root.dataset.colorScheme).toBe('light');
-		expect(root.style.colorScheme).toBe('light');
-		expect(root.classes.has('dark')).toBe(false);
+		expect(root.dataset.mode).toBe('dark');
+		expect(root.dataset.colorScheme).toBe('dark');
+		expect(root.style.colorScheme).toBe('dark');
+		expect(root.classes.has('dark')).toBe(true);
 	});
 });

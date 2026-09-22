@@ -10,7 +10,7 @@ const LEGACY_THEME_STORAGE_KEY = 'afterword-theme';
 const LEGACY_MODE_STORAGE_KEY = 'afterword-color-mode';
 
 export const DEFAULT_THEME = 'cerberus' as const;
-export const DEFAULT_MODE = 'system' as const;
+export const DEFAULT_MODE = 'dark' as const;
 const SYSTEM_MEDIA_QUERY = '(prefers-color-scheme: dark)';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
