@@ -15,9 +15,11 @@
   type LlmData = { connections: Connection[]; policies: Policy[]; runs: Run[] };
   type FormState = { llmCatalog?: Catalog; deviceLogin?: DeviceLogin; llmRuns?: Run[] } | null | undefined;
   type ConnectionMethod = "api" | "chatgpt" | "claude";
+  type OptimisticChange = { commit?: () => void; rollback?: () => void };
+  type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
   const reasoningLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 
-  let { llm, formState, setPending, isPending }: { llm: LlmData; formState: FormState; setPending: (key: string) => SubmitFunction; isPending: (key: string) => boolean } = $props();
+  let { llm, formState, setPending, isPending }: { llm: LlmData; formState: FormState; setPending: (key: string, optimistic?: OptimisticFactory) => SubmitFunction; isPending: (key: string) => boolean } = $props();
   let catalog = $state<Catalog | null>(null);
   let deviceLogin = $state<DeviceLogin | null>(null);
   let runs = $state<Run[]>([]);
@@ -30,6 +32,8 @@
   let chatgptReasoningEffort = $state("medium");
   let chatgptServerModelId = $state("");
   let chatgptServerReasoningEffort = $state("");
+  let connectionEnabledOverrides = $state<Record<number, number>>({});
+  let policyOverrides = $state<Record<number, Partial<Policy>>>({});
   let connectionMethod = $state<ConnectionMethod>("api");
   let deviceStatusForm = $state<HTMLFormElement>();
   let deviceStatusRequested = $state(false);
@@ -93,7 +97,15 @@
   const selectedProvider = $derived(catalog?.providers?.find((provider) => provider.id === selectedProviderId) ?? null);
   const selectedChatgptModel = $derived((deviceLogin?.models ?? []).find((model) => model.id === chatgptModelId));
   const chatgptReasoningLevels = $derived(selectedChatgptModel?.supportedReasoningEfforts?.map((item) => item.reasoningEffort.toLowerCase()).filter((level) => reasoningLevels.includes(level as (typeof reasoningLevels)[number])) ?? [...reasoningLevels]);
-  const claudePolicy = $derived(llm.policies.find((policy) => policy.auth_type === "claude_code") ?? null);
+  const visibleConnections = $derived(llm.connections.map((connection) => ({
+    ...connection,
+    enabled: connectionEnabledOverrides[connection.id] ?? connection.enabled,
+  })));
+  const visiblePolicies = $derived(llm.policies.map((policy) => ({
+    ...policy,
+    ...(policyOverrides[policy.id] ?? {}),
+  })));
+  const claudePolicy = $derived(visiblePolicies.find((policy) => policy.auth_type === "claude_code") ?? null);
   const anthropicModels = $derived(catalog?.providers?.find((provider) => provider.id === "anthropic")?.models ?? []);
 
   function selectModel(value: string) {
@@ -125,6 +137,73 @@
   function authLabel(value: string) {
     return value === "openai_codex" ? "ChatGPT subscription" : value === "claude_code" ? "Claude Code OAuth" : "API key";
   }
+
+  function optimisticDisableConnection(formData: FormData) {
+    const id = Number(formData.get("id"));
+    const connection = llm.connections.find((item) => item.id === id);
+    if (!connection) return;
+    const previous = connectionEnabledOverrides[id];
+    connectionEnabledOverrides = { ...connectionEnabledOverrides, [id]: 0 };
+    return {
+      commit: () => {
+        const next = { ...connectionEnabledOverrides };
+        delete next[id];
+        connectionEnabledOverrides = next;
+      },
+      rollback: () => {
+        const next = { ...connectionEnabledOverrides };
+        if (previous === undefined) delete next[id];
+        else next[id] = previous;
+        connectionEnabledOverrides = next;
+      },
+    };
+  }
+
+  function optimisticPolicySettings(formData: FormData) {
+    const id = Number(formData.get("policyId"));
+    const modelId = String(formData.get("modelId") ?? "");
+    const reasoningEffort = String(formData.get("reasoningEffort") ?? "");
+    if (!Number.isInteger(id) || !modelId || !reasoningEffort) return;
+    const previous = policyOverrides[id];
+    policyOverrides = {
+      ...policyOverrides,
+      [id]: { ...(previous ?? {}), model_id: modelId, reasoning_effort: reasoningEffort },
+    };
+    return {
+      commit: () => {
+        const next = { ...policyOverrides };
+        delete next[id];
+        policyOverrides = next;
+      },
+      rollback: () => {
+        const next = { ...policyOverrides };
+        if (previous === undefined) delete next[id];
+        else next[id] = previous;
+        policyOverrides = next;
+      },
+    };
+  }
+
+  function optimisticDisablePolicy(formData: FormData) {
+    const id = Number(formData.get("id"));
+    const policy = llm.policies.find((item) => item.id === id);
+    if (!policy) return;
+    const previous = policyOverrides[id];
+    policyOverrides = { ...policyOverrides, [id]: { ...(previous ?? {}), enabled: 0 } };
+    return {
+      commit: () => {
+        const next = { ...policyOverrides };
+        delete next[id];
+        policyOverrides = next;
+      },
+      rollback: () => {
+        const next = { ...policyOverrides };
+        if (previous === undefined) delete next[id];
+        else next[id] = previous;
+        policyOverrides = next;
+      },
+    };
+  }
 </script>
 
 <section class="mt-6 space-y-5 lg:col-span-2" aria-label="LLM settings">
@@ -147,7 +226,7 @@
         {#if deviceLogin?.status === "pending"}<p class="font-semibold text-surface-950-50">Waiting for authorization</p><p class="mt-1 text-surface-700-300">Code: <strong class="text-surface-950-50">{deviceLogin.user_code || "—"}</strong></p>{#if deviceLogin.verification_url}<a class="mt-3 inline-flex items-center gap-2 text-primary-600-400 underline" href={deviceLogin.verification_url} target="_blank" rel="noreferrer">Open verification page <ExternalLink size={14} /></a>{/if}<p class="mt-3 text-xs text-surface-700-300">Bookward checks automatically every few seconds.</p>{:else if deviceLogin?.authenticated}<p class="font-semibold text-success-600-400">Signed in{deviceLogin.account?.email ? ` as ${deviceLogin.account.email}` : ""}.</p>{#if deviceLogin.connection?.model_id}<p class="mt-1 text-xs text-surface-700-300">Connection ready with {deviceLogin.connection.model_id}; its shadow policy was created automatically.</p>{/if}{:else if deviceLogin?.status === "failed"}<p class="font-semibold text-error-600-400">Device login failed.</p><p class="mt-1 text-xs text-error-600-400">{deviceLogin.error ?? "Try starting the device login again."}</p>{:else if deviceLogin?.status === "cancelled"}<p class="text-surface-700-300">Device login cancelled.</p>{:else}<p class="text-surface-700-300">No ChatGPT subscription is connected.</p>{/if}
       </div>
       {#if deviceLogin?.authenticated && deviceLogin.policy?.id && (deviceLogin.models ?? []).length}
-        <form class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end" method="POST" action="?/saveLlmPolicySettings" use:enhance={setPending("llm-chatgpt-settings")}>
+        <form class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end" method="POST" action="?/saveLlmPolicySettings" use:enhance={setPending("llm-chatgpt-settings", optimisticPolicySettings)}>
           <input type="hidden" name="policyId" value={deviceLogin.policy.id} />
           <label class="block text-sm font-medium text-surface-800-200">Shadow model<select class="input mt-2" name="modelId" value={chatgptModelId} oninput={(event) => selectChatgptModel(event.currentTarget.value)}>{#each (deviceLogin.models ?? []) as model (model.id)}<option value={model.id}>{model.displayName ?? model.id}</option>{/each}</select></label>
           <label class="block text-sm font-medium text-surface-800-200">Reasoning<select class="input mt-2" name="reasoningEffort" value={chatgptReasoningEffort} oninput={(event) => chatgptReasoningEffort = event.currentTarget.value}>{#each chatgptReasoningLevels as effort}<option value={effort}>{effort}</option>{/each}</select></label>
@@ -157,7 +236,7 @@
       <div class="mt-4 flex flex-wrap gap-2">{#if deviceLogin?.status === "pending"}<form method="POST" action="?/openaiDeviceLoginCancel" use:enhance={setPending("openai-cancel")}><input type="hidden" name="loginId" value={deviceLogin.login_id ?? ""} /><button class="btn btn-sm min-h-10 preset-tonal-error" type="submit" disabled={isPending("openai-cancel")}><X size={15} /> Cancel</button></form>{:else}<form method="POST" action="?/openaiDeviceLoginStart" use:enhance={setPending("openai-start")}><button class="btn btn-sm min-h-10 preset-filled-primary-500" type="submit" disabled={isPending("openai-start")} aria-busy={isPending("openai-start")}>{#if isPending("openai-start")}<RefreshCw size={15} class="animate-spin" />{:else}<KeyRound size={15} />{/if} Start device login</button></form>{/if}<form method="POST" action="?/openaiDeviceLogout" use:enhance={setPending("openai-logout")}><button class="btn btn-sm min-h-10 preset-tonal-surface" type="submit" disabled={isPending("openai-logout")}><LogOut size={15} /> Sign out</button></form></div>
     {:else}
       {#if connectionMethod === "claude" && claudePolicy}
-        <form class="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end" method="POST" action="?/saveLlmPolicySettings" use:enhance={setPending("llm-claude-settings")}>
+        <form class="mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end" method="POST" action="?/saveLlmPolicySettings" use:enhance={setPending("llm-claude-settings", optimisticPolicySettings)}>
           <input type="hidden" name="policyId" value={claudePolicy.id} />
           <label class="block text-sm font-medium text-surface-800-200">Shadow model<select class="input mt-2" name="modelId" value={claudePolicy.model_id}>{#each anthropicModels as model (model.id)}<option value={model.id}>{model.name}</option>{/each}{#if !anthropicModels.length}<option value={claudePolicy.model_id}>{claudePolicy.model_id}</option>{/if}</select></label>
           <label class="block text-sm font-medium text-surface-800-200">Reasoning<select class="input mt-2" name="reasoningEffort" value={claudePolicy.reasoning_effort || "medium"}>{#each reasoningLevels as effort}<option value={effort}>{effort}</option>{/each}</select></label>
@@ -192,10 +271,10 @@
       </form>
     {/if}
 
-    <div class="mt-6 border-t border-surface-300-700/50 pt-5"><div class="mb-3 flex items-center gap-2"><ShieldCheck size={17} class="text-tertiary-600-400" /><h4 class="text-sm font-semibold text-surface-950-50">Saved connections</h4></div><div class="space-y-3">{#each llm.connections as connection (connection.id)}<div class="border border-surface-300-700/50 p-3"><div class="flex items-start gap-3"><div class="min-w-0 flex-1"><strong class="block truncate text-sm text-surface-950-50">{connection.name}</strong><span class="mt-1 block truncate text-xs text-surface-700-300">{connection.provider_id} · {connection.model_id}</span></div><span class={`badge shrink-0 ${connection.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>{connection.enabled ? "Enabled" : "Disabled"}</span></div><div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-surface-700-300"><span>{authLabel(connection.auth_type)} · {connection.last_status ?? "Not used"}</span>{#if connection.enabled}<form method="POST" action="?/disableLlmConnection" use:enhance={setPending(`llm-disable-${connection.id}`)}><input type="hidden" name="id" value={connection.id} /><button class="btn btn-sm min-h-8 preset-tonal-error" type="submit" disabled={isPending(`llm-disable-${connection.id}`)} aria-label={`Disable ${connection.name}`}><X size={14} /> Disable</button></form>{/if}</div></div>{:else}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">No model connections yet.</p>{/each}</div></div>
+    <div class="mt-6 border-t border-surface-300-700/50 pt-5"><div class="mb-3 flex items-center gap-2"><ShieldCheck size={17} class="text-tertiary-600-400" /><h4 class="text-sm font-semibold text-surface-950-50">Saved connections</h4></div><div class="space-y-3">{#each visibleConnections as connection (connection.id)}<div class="border border-surface-300-700/50 p-3"><div class="flex items-start gap-3"><div class="min-w-0 flex-1"><strong class="block truncate text-sm text-surface-950-50">{connection.name}</strong><span class="mt-1 block truncate text-xs text-surface-700-300">{connection.provider_id} · {connection.model_id}</span></div><span class={`badge shrink-0 ${connection.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>{connection.enabled ? "Enabled" : "Disabled"}</span></div><div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-surface-700-300"><span>{authLabel(connection.auth_type)} · {connection.last_status ?? "Not used"}</span>{#if connection.enabled}<form method="POST" action="?/disableLlmConnection" use:enhance={setPending(`llm-disable-${connection.id}`, optimisticDisableConnection)}><input type="hidden" name="id" value={connection.id} /><button class="btn btn-sm min-h-8 preset-tonal-error" type="submit" disabled={isPending(`llm-disable-${connection.id}`)} aria-label={`Disable ${connection.name}`}><X size={14} /> Disable</button></form>{/if}</div></div>{:else}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">No model connections yet.</p>{/each}</div></div>
   </section>
 
-  <section class="card preset-tonal-surface p-5 sm:p-6" aria-labelledby="shadow-policy-heading"><div class="mb-5 flex items-start gap-3"><span class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"><ShieldCheck size={19} /></span><div><h3 id="shadow-policy-heading" class="text-lg font-semibold text-surface-950-50">Shadow policies</h3><p class="mt-1 max-w-2xl text-sm leading-6 text-surface-700-300">Each saved model gets one enabled shadow policy automatically. Shadow runs never change the books you see.</p></div></div>{#if llm.connections.length === 0}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">Connect a LLM above to create its shadow policy automatically.</p>{:else}<div class="space-y-3">{#each llm.policies as policy (policy.id)}<div class="border border-surface-300-700/50 p-4"><div class="flex flex-wrap items-center gap-3"><strong class="text-sm text-surface-950-50">{policy.name}</strong><span class={`badge ${policy.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>{policy.enabled ? "Enabled" : "Disabled"}</span><span class="text-xs text-surface-700-300">{policy.connection_name} · top {policy.top_k}</span></div>{#if policy.auth_type === "openai_codex" || policy.auth_type === "claude_code"}<p class="mt-2 text-xs text-surface-700-300">Model and reasoning are configured in the connection picker above: {policy.model_id} · {policy.reasoning_effort || "medium"}.</p>{/if}<div class="mt-3 flex flex-wrap gap-2"><form method="POST" action="?/runLlmPolicy" use:enhance={setPending(`llm-run-${policy.id}`)}><input type="hidden" name="id" value={policy.id} /><button class="btn btn-sm min-h-9 preset-filled-tertiary-500" type="submit" disabled={!policy.enabled || isPending(`llm-run-${policy.id}`)} aria-busy={isPending(`llm-run-${policy.id}`)}><Play size={14} /> Run now</button></form>{#if policy.enabled}<form method="POST" action="?/disableLlmPolicy" use:enhance={setPending(`llm-policy-disable-${policy.id}`)}><input type="hidden" name="id" value={policy.id} /><button class="btn btn-sm min-h-9 preset-tonal-error" type="submit" disabled={isPending(`llm-policy-disable-${policy.id}`)}><X size={14} /> Disable</button></form>{/if}</div></div>{:else}<p class="mt-4 text-sm text-surface-700-300">No policies have been created yet.</p>{/each}</div>{/if}</section>
+  <section class="card preset-tonal-surface p-5 sm:p-6" aria-labelledby="shadow-policy-heading"><div class="mb-5 flex items-start gap-3"><span class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"><ShieldCheck size={19} /></span><div><h3 id="shadow-policy-heading" class="text-lg font-semibold text-surface-950-50">Shadow policies</h3><p class="mt-1 max-w-2xl text-sm leading-6 text-surface-700-300">Each saved model gets one enabled shadow policy automatically. Shadow runs never change the books you see.</p></div></div>{#if visibleConnections.length === 0}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">Connect a LLM above to create its shadow policy automatically.</p>{:else}<div class="space-y-3">{#each visiblePolicies as policy (policy.id)}<div class="border border-surface-300-700/50 p-4"><div class="flex flex-wrap items-center gap-3"><strong class="text-sm text-surface-950-50">{policy.name}</strong><span class={`badge ${policy.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>{policy.enabled ? "Enabled" : "Disabled"}</span><span class="text-xs text-surface-700-300">{policy.connection_name} · top {policy.top_k}</span></div>{#if policy.auth_type === "openai_codex" || policy.auth_type === "claude_code"}<p class="mt-2 text-xs text-surface-700-300">Model and reasoning are configured in the connection picker above: {policy.model_id} · {policy.reasoning_effort || "medium"}.</p>{/if}<div class="mt-3 flex flex-wrap gap-2"><form method="POST" action="?/runLlmPolicy" use:enhance={setPending(`llm-run-${policy.id}`)}><input type="hidden" name="id" value={policy.id} /><button class="btn btn-sm min-h-9 preset-filled-tertiary-500" type="submit" disabled={!policy.enabled || isPending(`llm-run-${policy.id}`)} aria-busy={isPending(`llm-run-${policy.id}`)}><Play size={14} /> Run now</button></form>{#if policy.enabled}<form method="POST" action="?/disableLlmPolicy" use:enhance={setPending(`llm-policy-disable-${policy.id}`, optimisticDisablePolicy)}><input type="hidden" name="id" value={policy.id} /><button class="btn btn-sm min-h-9 preset-tonal-error" type="submit" disabled={isPending(`llm-policy-disable-${policy.id}`)}><X size={14} /> Disable</button></form>{/if}</div></div>{:else}<p class="mt-4 text-sm text-surface-700-300">No policies have been created yet.</p>{/each}</div>{/if}</section>
 
   <section class="card preset-tonal-surface p-5 sm:p-6" aria-labelledby="shadow-runs-heading"><div class="mb-5 flex flex-wrap items-start justify-between gap-4"><div class="flex items-start gap-3"><span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"><RefreshCw size={19} /></span><div><h3 id="shadow-runs-heading" class="text-lg font-semibold text-surface-950-50">Recent shadow runs</h3><p class="mt-1 text-sm text-surface-700-300">Status and timing only; model prompts and credentials are never shown.</p></div></div><form method="POST" action="?/refreshLlmRuns" use:enhance={setPending("llm-runs")}><button class="btn btn-sm min-h-10 preset-tonal-surface" type="submit" disabled={isPending("llm-runs")}><RefreshCw size={15} class={isPending("llm-runs") ? "animate-spin" : ""} /> Refresh</button></form></div>{#if runs.length}<div class="overflow-x-auto"><table class="table w-full text-left text-sm"><thead><tr class="border-b border-surface-300-700/50 text-xs uppercase tracking-wide text-surface-600-400"><th class="px-2 py-2">Status</th><th class="px-2 py-2">Created</th><th class="px-2 py-2">Candidates</th><th class="px-2 py-2">Latency</th></tr></thead><tbody>{#each runs as run (run.id)}<tr class="border-b border-surface-300-700/30"><td class="px-2 py-3"><span class={`badge ${run.status === "complete" ? "preset-tonal-success" : run.status === "failed" ? "preset-tonal-error" : "preset-tonal-secondary"}`}>{run.status}</span></td><td class="px-2 py-3 text-surface-700-300">{formatDate(run.created_at)}</td><td class="px-2 py-3 text-surface-700-300">{run.candidate_count}</td><td class="px-2 py-3 text-surface-700-300">{run.latency_ms == null ? "—" : `${run.latency_ms} ms`}</td></tr>{/each}</tbody></table></div>{:else}<p class="border border-dashed border-surface-300-700/50 p-4 text-sm text-surface-700-300">No shadow runs yet. Your first run will appear here.</p>{/if}</section>
 </section>
