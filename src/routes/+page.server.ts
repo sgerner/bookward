@@ -89,6 +89,8 @@ type LlmPolicySummary = {
   connection_name: string;
   provider_id: string;
   model_id: string;
+  auth_type: string;
+  reasoning_effort: string;
 };
 
 type LlmRunSummary = {
@@ -422,6 +424,23 @@ export const actions: Actions = {
         { method: id ? "PUT" : "POST", body: JSON.stringify(payload) },
       );
       return { message: `${name.data} policy saved.` };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  saveLlmPolicySettings: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("policyId"));
+    const modelId = llmModelSchema.safeParse(data.get("modelId"));
+    const reasoningEffort = z.enum(["low", "medium", "high", "xhigh", "max"]).safeParse(data.get("reasoningEffort"));
+    if (!id.success || !modelId.success || !reasoningEffort.success)
+      return fail(400, { message: "Choose a subscription model and reasoning level." });
+    try {
+      await engine(`/api/llm/policies/${id.data}/settings`, {
+        method: "PUT",
+        body: JSON.stringify({ model_id: modelId.data, reasoning_effort: reasoningEffort.data }),
+      });
+      return { message: "Subscription shadow settings saved." };
     } catch (error) {
       return fail(status(error), { message: message(error) });
     }

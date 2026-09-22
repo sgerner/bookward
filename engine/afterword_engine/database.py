@@ -298,6 +298,19 @@ MIGRATIONS = [
             SELECT id, 'accepted', 'legacy-pending-audit-v1' FROM candidates;
         """,
     ),
+    (
+        9,
+        """
+        ALTER TABLE llm_policies ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium';
+        -- gpt-5 is an API model and cannot be selected by a ChatGPT account
+        -- through Codex app-server.  Existing device-login connections used
+        -- this early placeholder, so move them to a subscription model that
+        -- the current app-server catalog advertises.
+        UPDATE llm_connections
+        SET model_id='gpt-5.6-terra', updated_at=CURRENT_TIMESTAMP
+        WHERE auth_type='openai_codex' AND model_id='gpt-5';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

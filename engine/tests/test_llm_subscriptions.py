@@ -95,3 +95,43 @@ print(json.dumps({'structured_output': %r}))
     result = asyncio.run(client.rank("rank these", {1, 2}))
     assert result.rankings[0]["candidate_id"] == 1
     assert token_file.read_text() == "oauth-secret"
+
+
+def test_subscription_reasoning_effort_is_forwarded_to_both_runners(tmp_path):
+    codex_executable = _executable(
+        tmp_path,
+        """
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get('method') == 'initialize':
+        print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+    elif message.get('method') == 'thread/start':
+        print(json.dumps({'id': message['id'], 'result': {'thread': {'id': 'thr_fake'}}}), flush=True)
+    elif message.get('method') == 'turn/start':
+        assert message['params']['effort'] == 'high'
+        print(json.dumps({'id': message['id'], 'result': {'turn': {'status': 'inProgress'}}}), flush=True)
+        print(json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}), flush=True)
+""",
+    )
+    codex = CodexSubscriptionClient("gpt-subscription", reasoning_effort="high", command=codex_executable, codex_home=str(tmp_path / "codex"), timeout=3)
+    # The fake does not return output; this assertion only verifies the
+    # protocol field before the expected output validation failure.
+    try:
+        asyncio.run(codex.rank("rank these", {1, 2}))
+    except Exception as exc:
+        assert "no ranking output" in str(exc)
+
+    claude_executable = _executable(
+        tmp_path,
+        """
+import sys
+assert sys.argv[sys.argv.index('--effort') + 1] == 'high'
+print('{\"structured_output\": {\"rankings\": []}}')
+""",
+    )
+    claude = ClaudeCodeSubscriptionClient("claude-subscription", "oauth-secret", reasoning_effort="high", command=claude_executable, config_dir=str(tmp_path / "claude"), timeout=3)
+    try:
+        asyncio.run(claude.rank("rank these", {1, 2}))
+    except Exception as exc:
+        assert "rank" in str(exc)

@@ -67,6 +67,7 @@ CLAUDE_CODE_AUTH_TYPES = frozenset(
 
 MAX_PROTOCOL_LINE_BYTES = 2_000_000
 MAX_CLAUDE_OUTPUT_BYTES = 4_000_000
+SUBSCRIPTION_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 class SubscriptionRunnerError(LLMError):
@@ -157,6 +158,45 @@ def _safe_account(value: Any) -> dict[str, Any] | None:
         if isinstance(item, (str, type(None))):
             result[key] = item
     return result or None
+
+
+def _safe_models(value: Any) -> list[dict[str, Any]]:
+    """Return the small, public model projection advertised by app-server."""
+
+    if not isinstance(value, list):
+        return []
+    models: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        model_id = raw.get("id") or raw.get("model")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        item: dict[str, Any] = {"id": model_id.strip()}
+        for key in ("displayName", "name", "defaultReasoningEffort"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                item[key] = value.strip()
+        efforts = raw.get("supportedReasoningEfforts")
+        if isinstance(efforts, list):
+            safe_efforts: list[dict[str, str]] = []
+            for effort in efforts:
+                if not isinstance(effort, Mapping):
+                    continue
+                name = effort.get("reasoningEffort")
+                if not isinstance(name, str) or name not in SUBSCRIPTION_REASONING_LEVELS:
+                    continue
+                entry = {"reasoningEffort": name}
+                description = effort.get("description")
+                if isinstance(description, str) and description.strip():
+                    entry["description"] = description.strip()
+                safe_efforts.append(entry)
+            if safe_efforts:
+                item["supportedReasoningEfforts"] = safe_efforts
+        if raw.get("isDefault") is True:
+            item["isDefault"] = True
+        models.append(item)
+    return models
 
 
 class _JSONLProcess:
@@ -324,13 +364,31 @@ def _reject_server_request(rpc: _JSONLProcess, message: Mapping[str, Any]) -> No
         )
 
 
+def _normalize_reasoning_effort(value: str | None) -> str:
+    effort = (value or "medium").strip().lower()
+    return effort if effort in SUBSCRIPTION_REASONING_LEVELS else "medium"
+
+
+def _codex_failure_detail(value: Mapping[str, Any]) -> str:
+    """Extract a bounded provider diagnostic without persisting credentials."""
+
+    raw: Any = value.get("error")
+    if isinstance(raw, Mapping):
+        raw = raw.get("message") or raw.get("code")
+    if raw is None:
+        raw = value.get("message") or value.get("status")
+    detail = str(raw or "unknown provider error").replace("\n", " ").strip()
+    return detail[:800]
+
+
 class CodexSubscriptionClient(BaseLLMClient):
     """Run one ephemeral JSON-only turn through ``codex app-server``."""
 
-    def __init__(self, model: str, *, timeout: float | None = None, command: str | None = None, codex_home: str | None = None):
+    def __init__(self, model: str, *, reasoning_effort: str | None = None, timeout: float | None = None, command: str | None = None, codex_home: str | None = None):
         home = _private_dir(codex_home or settings.llm_codex_home)
         self.codex_home = home
         self.command = _command(command or settings.llm_codex_command, "codex")
+        self.reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
         super().__init__("", model, "", timeout=timeout or settings.llm_subscription_timeout_seconds)
 
     def _argv(self) -> list[str]:
@@ -366,6 +424,7 @@ class CodexSubscriptionClient(BaseLLMClient):
                         "input": [{"type": "text", "text": prompt}],
                         "outputSchema": RANKING_SCHEMA,
                         "approvalPolicy": "never",
+                        "effort": self.reasoning_effort,
                     },
                 }
             )
@@ -375,6 +434,10 @@ class CodexSubscriptionClient(BaseLLMClient):
             while True:
                 message = rpc.read()
                 method = message.get("method")
+                if method == "error":
+                    params = message.get("params")
+                    detail = _codex_failure_detail(params.get("error") if isinstance(params, Mapping) and isinstance(params.get("error"), Mapping) else (params if isinstance(params, Mapping) else {}))
+                    raise SubscriptionRunnerError(f"Codex app-server turn failed: {detail}")
                 if method in {"item/tool/call", "item/commandExecution/request", "item/mcpToolCall"}:
                     _reject_server_request(rpc, message)
                     raise SubscriptionRunnerError("Codex app-server attempted to use a tool")
@@ -392,12 +455,15 @@ class CodexSubscriptionClient(BaseLLMClient):
                     turn_response = message
                     turn = message.get("result", {}).get("turn") if isinstance(message.get("result"), Mapping) else None
                     if isinstance(turn, Mapping) and turn.get("status") in {"completed", "failed", "interrupted"}:
+                        if turn.get("status") != "completed":
+                            raise SubscriptionRunnerError(f"Codex app-server turn failed: {_codex_failure_detail(turn)}")
                         break
                 elif method == "turn/completed":
                     params = message.get("params")
                     turn = params.get("turn") if isinstance(params, Mapping) else None
                     if isinstance(turn, Mapping) and turn.get("status") not in {None, "completed"}:
-                        raise SubscriptionRunnerError("Codex app-server did not complete the turn")
+                        detail = _codex_failure_detail(turn)
+                        raise SubscriptionRunnerError(f"Codex app-server turn failed: {detail}")
                     break
             if turn_response and turn_response.get("error") is not None:
                 raise SubscriptionRunnerError("Codex app-server rejected the turn")
@@ -414,11 +480,12 @@ class CodexSubscriptionClient(BaseLLMClient):
 class ClaudeCodeSubscriptionClient(BaseLLMClient):
     """Run Claude Code in headless JSON mode with OAuth supplied in env."""
 
-    def __init__(self, model: str, oauth_token: str, *, timeout: float | None = None, command: str | None = None, config_dir: str | None = None):
+    def __init__(self, model: str, oauth_token: str, *, reasoning_effort: str | None = None, timeout: float | None = None, command: str | None = None, config_dir: str | None = None):
         if not oauth_token or "\x00" in oauth_token:
             raise ValueError("Claude Code OAuth token is required")
         self.oauth_token = oauth_token
         self.command = _command(command or settings.llm_claude_command, "claude")
+        self.reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
         # Keep the CLI's private config separate from a developer's interactive
         # Claude profile; only this runner's OAuth env token is used.
         self.config_dir = _private_dir(config_dir or str(Path(settings.db).with_name("claude-config")))
@@ -436,6 +503,8 @@ class ClaudeCodeSubscriptionClient(BaseLLMClient):
             "",
             "--model",
             self.model,
+            "--effort",
+            self.reasoning_effort,
             "--json-schema",
             json.dumps(RANKING_SCHEMA, ensure_ascii=False, separators=(",", ":")),
             "--",
@@ -628,6 +697,21 @@ class CodexDeviceLoginManager:
             "account": account,
             "requires_openai_auth": requires_auth,
         }
+
+    def models(self) -> list[dict[str, Any]]:
+        """Read the models and reasoning levels available to this account."""
+
+        with self._spawn() as rpc:
+            _codex_initialize(rpc)
+            rpc.send(
+                {
+                    "method": "model/list",
+                    "id": 2,
+                    "params": {"includeHidden": False, "limit": 100},
+                }
+            )
+            result = _check_response(rpc.response(2), 2)
+            return _safe_models(result.get("data"))
 
     def cancel(self, login_id: str) -> dict[str, Any]:
         if not login_id or len(login_id) > 200:
