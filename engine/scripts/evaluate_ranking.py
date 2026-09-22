@@ -25,9 +25,12 @@ def read_time(value):
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         try:
-            result = parsedate_to_datetime(value)
-        except (ValueError, TypeError, AttributeError):
-            return None
+            result = datetime.strptime(value, "%Y/%m/%d")
+        except (ValueError, TypeError):
+            try:
+                result = parsedate_to_datetime(value)
+            except (ValueError, TypeError, AttributeError):
+                return None
     return result.replace(tzinfo=result.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 

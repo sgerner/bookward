@@ -1,4 +1,9 @@
 import json
+import math
+
+import pytest
+
+from afterword_engine import evaluation
 import random
 import subprocess
 import sys
@@ -129,3 +134,61 @@ def test_report_loads_json_join_and_cli_emits_json(tmp_path: Path):
         cwd=Path(__file__).parents[2],
     )
     assert json.loads(result.stdout)["protocol"].startswith("temporal run split")
+
+
+def row(run, rank, label, *, candidate_id=None, impression_id=None):
+    return {
+        "run_id": run,
+        "rank": rank,
+        "candidate_id": candidate_id if candidate_id is not None else f"{run}-{rank}",
+        "impression_id": impression_id if impression_id is not None else f"{run}-{rank}",
+        "score": float(100 - rank),
+        "propensity": 1.0,
+        "confidence": 1.0,
+        "label": label,
+    }
+
+
+def test_top_k_metrics_are_macro_by_run_and_keep_logged_slots():
+    rows = [row("a", 1, 1), row("b", 1, 0)]
+    assert evaluation.ips_precision_at_k(rows, 1) == pytest.approx(0.5)
+
+    rows = [row("one", 1, None), row("one", 2, 1)]
+    expected = 1 / math.log2(3)
+    assert evaluation.ips_precision_at_k(rows, 2) == 1
+    assert evaluation.ips_ndcg_at_k(rows, 2) == pytest.approx(expected)
+
+
+def test_rank_cutoff_uses_actual_positive_integer_rank():
+    assert evaluation.ips_precision_at_k([row("late", 25, 1)], 20) is None
+    assert evaluation.ips_ndcg_at_k([row("late", 20, 1)], 20) == pytest.approx(1 / math.log2(21))
+    assert evaluation.ips_ndcg_at_k([row("late", 25, 1)], 20) is None
+    assert evaluation.ips_precision_at_k([row("bad", 1.5, 1)], 20) is None
+    assert evaluation.ips_precision_at_k([row("bad", 0, 1)], 20) is None
+    assert evaluation.ips_precision_at_k([row("bad", True, 1)], 20) is None
+
+
+def test_input_order_does_not_change_metrics_and_duplicates_do_not_add_evidence():
+    values = [row("a", 1, 1), row("a", 2, 0), row("b", 1, 0), row("b", 2, 1)]
+    assert evaluation.ips_ndcg_at_k(values, 2) == evaluation.ips_ndcg_at_k(list(reversed(values)), 2)
+    duplicate = values + [dict(values[0])]
+    assert evaluation.ips_precision_at_k(duplicate, 2) == evaluation.ips_precision_at_k(values, 2)
+
+
+def test_conflicting_duplicate_and_duplicate_rank_exports_are_rejected():
+    conflicting = [row("a", 1, 1, candidate_id="c", impression_id="i"), row("a", 1, 0, candidate_id="c", impression_id="i")]
+    with pytest.raises(ValueError, match="Conflicting duplicate"):
+        evaluation.ips_precision_at_k(conflicting, 1)
+    same_impression = [row("a", 1, 1, candidate_id="c1", impression_id="i"), row("a", 1, 1, candidate_id="c2", impression_id="i")]
+    assert evaluation.ips_precision_at_k(same_impression, 1) == 1
+    duplicate_rank = [row("a", 1, 1, candidate_id="c1", impression_id="i1"), row("a", 1, 1, candidate_id="c2", impression_id="i2")]
+    with pytest.raises(ValueError, match="Duplicate logged rank"):
+        evaluation.ips_ndcg_at_k(duplicate_rank, 2)
+
+
+def test_bootstrap_remaps_repeated_run_draws():
+    values = [row("positive", 1, 1), row("negative", 1, 0)]
+    result = evaluation.cluster_bootstrap(values, metric="precision_at_20", iterations=200, seed=7)
+    assert result["estimate"] == pytest.approx(0.5)
+    assert result["lower"] == 0
+    assert result["upper"] == 1
