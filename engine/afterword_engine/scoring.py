@@ -6,6 +6,7 @@ import numpy as np
 from .database import rows, transaction
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
+from .identity import book_identity_match_index, book_identity_match_keys
 SCORING_BATCH_SIZE = 256
 
 def document(item):
@@ -92,14 +93,18 @@ def _max_cosine_similarities(vectors, references, default):
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    all_read_keys = book_identity_match_index(rows("SELECT title,author FROM reads"))
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight "
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
-        "AND s.enabled=1 AND NOT EXISTS (SELECT 1 FROM reads r "
-        "WHERE book_identity_matches(c.title,c.author,r.title,r.author))"
+        "AND s.enabled=1"
     )
+    candidates = [
+        item for item in candidates
+        if not book_identity_match_keys(item["title"], item["author"]) & all_read_keys
+    ]
     if not candidates: return 0
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)

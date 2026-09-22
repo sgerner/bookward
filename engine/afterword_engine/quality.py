@@ -29,7 +29,7 @@ from .covers import (
     safe_cover_url,
 )
 from .database import rows, transaction
-from .identity import book_identity
+from .identity import book_identity, book_identity_match_index, book_identity_match_keys
 
 
 QUALITY_VERSION = "candidate-quality-v1"
@@ -407,38 +407,44 @@ def _dedupe_and_hide(con) -> int:
     """Reject read overlaps and active duplicates of saved/imported books."""
 
     changed = 0
-    overlap = con.execute(
-        """SELECT c.id FROM candidates c
+    active = con.execute(
+        """SELECT c.id,c.title,c.author FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
-        WHERE c.status IN ('new','recommended')
-          AND EXISTS (
-              SELECT 1 FROM reads r
-              WHERE book_identity_matches(c.title,c.author,r.title,r.author)
-          )"""
+        WHERE c.status IN ('new','recommended')"""
     ).fetchall()
+    read_keys = book_identity_match_index(
+        con.execute("SELECT title,author FROM reads").fetchall()
+    )
+    overlap = [
+        item for item in active
+        if book_identity_match_keys(item["title"], item["author"]) & read_keys
+    ]
     for item in overlap:
-        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (item[0],))
+        candidate_id = item["id"]
+        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
         con.execute(
             "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-            (json.dumps(["read_overlap"]), item[0]),
+            (json.dumps(["read_overlap"]), candidate_id),
         )
         changed += 1
+    overlap_ids = {item["id"] for item in overlap}
 
-    shortlisted_overlap = con.execute(
-        """SELECT c.id FROM candidates c
-        JOIN candidate_quality q ON q.candidate_id=c.id
-        WHERE c.status IN ('new','recommended')
-          AND EXISTS (
-              SELECT 1 FROM candidates prior
-              WHERE prior.id!=c.id AND prior.status IN ('saved','imported')
-                AND book_identity_matches(c.title,c.author,prior.title,prior.author)
-          )"""
-    ).fetchall()
+    shortlisted_keys = book_identity_match_index(
+        con.execute(
+            "SELECT title,author FROM candidates WHERE status IN ('saved','imported')"
+        ).fetchall()
+    )
+    shortlisted_overlap = [
+        item for item in active
+        if item["id"] not in overlap_ids
+        and book_identity_match_keys(item["title"], item["author"]) & shortlisted_keys
+    ]
     for item in shortlisted_overlap:
-        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (item[0],))
+        candidate_id = item["id"]
+        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
         con.execute(
             "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-            (json.dumps(["shortlisted_overlap"]), item[0]),
+            (json.dumps(["shortlisted_overlap"]), candidate_id),
         )
         changed += 1
 

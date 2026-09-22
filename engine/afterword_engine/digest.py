@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .database import row, rows, transaction
+from .identity import book_identity_match_index, book_identity_match_keys
 from .security import safe_error_message, validate_public_url
 
 
@@ -225,14 +226,16 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status='recommended' AND q.quality_status='accepted' "
         "AND c.score>=? AND COALESCE(s.enabled, 1)=1 "
-        "AND NOT EXISTS (SELECT 1 FROM reads r "
-        "WHERE book_identity_matches(c.title,c.author,r.title,r.author))"
     )
     if not include_seen and config["only_new"]:
         query += " AND NOT EXISTS (SELECT 1 FROM digest_items d WHERE d.candidate_id=c.id)"
-    query += " ORDER BY c.score DESC, c.updated_at DESC, c.id DESC LIMIT ?"
-    params.append(config["maximum_books"])
+    query += " ORDER BY c.score DESC, c.updated_at DESC, c.id DESC"
     result = rows(query, params)
+    read_keys = book_identity_match_index(rows("SELECT title,author FROM reads"))
+    result = [
+        item for item in result
+        if not book_identity_match_keys(item["title"], item["author"]) & read_keys
+    ][: config["maximum_books"]]
     for item in result:
         try:
             item["genres"] = json.loads(item.get("genres") or "[]")

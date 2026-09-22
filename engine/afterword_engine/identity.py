@@ -70,6 +70,22 @@ def _title_match_keys(value: object) -> set[str]:
     return keys
 
 
+def book_identity_match_keys(title: object, author: object) -> set[tuple[str, str]]:
+    """Return indexed keys used by the conservative same-work matcher."""
+
+    author_key = _author_match_key(author)
+    return {(author_key, title_key) for title_key in _title_match_keys(title)}
+
+
+def book_identity_match_index(items) -> set[tuple[str, str]]:
+    """Build a lookup index for a collection of title/author rows."""
+
+    index: set[tuple[str, str]] = set()
+    for item in items:
+        index.update(book_identity_match_keys(item["title"], item["author"]))
+    return index
+
+
 def book_identity(title: object, author: object) -> str:
     """Return a conservative, deterministic title/author identity."""
 

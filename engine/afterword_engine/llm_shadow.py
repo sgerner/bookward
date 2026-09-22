@@ -17,6 +17,7 @@ from .config import settings
 from .database import row, rows, transaction
 from .llm import build_client, build_prompt
 from .secrets import unseal
+from .identity import book_identity_match_index, book_identity_match_keys
 
 
 DEFAULT_SHADOW_TOP_K = 20
@@ -85,17 +86,19 @@ def ensure_default_shadow_policy(connection_id: int, *, name: str | None = None)
 
 
 def _candidate_rows(top_k: int) -> list[dict[str, Any]]:
-    return rows(
+    result = rows(
         "SELECT c.*,s.name source_name FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status='recommended' AND q.quality_status='accepted' "
         "AND (s.id IS NULL OR s.enabled=1) "
-        "AND NOT EXISTS (SELECT 1 FROM reads r "
-        "WHERE book_identity_matches(c.title,c.author,r.title,r.author)) "
-        "ORDER BY c.score DESC,c.id ASC LIMIT ?",
-        (top_k,),
+        "ORDER BY c.score DESC,c.id ASC",
     )
+    read_keys = book_identity_match_index(rows("SELECT title,author FROM reads"))
+    return [
+        item for item in result
+        if not book_identity_match_keys(item["title"], item["author"]) & read_keys
+    ][:top_k]
 
 
 def _read_rows() -> list[dict[str, Any]]:
