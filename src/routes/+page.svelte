@@ -449,6 +449,17 @@
       librarrMediaType,
     );
   }
+  function resultScore(result: LibrarrResult) {
+    const value = result.score;
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.max(0, Math.min(100, value))
+      : null;
+  }
+  const highConfidenceLibrarrResults = $derived(
+    librarrResults
+      .map((result, index) => ({ result, index, score: resultScore(result) }))
+      .filter((item): item is { result: LibrarrResult; index: number; score: number } => item.score !== null && item.score >= 90),
+  );
   function resultKey(result: LibrarrResult, index: number) {
     return `${resultText(
       result,
@@ -611,7 +622,7 @@
         error instanceof Error ? error.message : "Librarr search failed.";
     }
   }
-  async function addLibrarrResult(result: LibrarrResult, index: number) {
+  async function addLibrarrResult(result: LibrarrResult, index: number, closeAfter = true) {
     if (librarrAdded.has(index)) return;
     librarrAddingIndex = index;
     librarrSearchError = "";
@@ -620,7 +631,7 @@
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ media_type: librarrMediaType, result }),
+        body: JSON.stringify({ media_type: librarrMediaType, candidate_id: librarrSearchBook?.id, result }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
@@ -630,13 +641,35 @@
       librarrAdded = new Set([...librarrAdded, index]);
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
+      if (closeAfter) {
+        closeLibrarrSearch();
+        await invalidateAll();
+      }
+      return true;
     } catch (error) {
       librarrSearchError =
         error instanceof Error
           ? error.message
           : "Librarr could not add that book.";
+      return false;
     } finally {
       librarrAddingIndex = null;
+    }
+  }
+  async function addHighConfidenceLibrarrResults() {
+    if (!highConfidenceLibrarrResults.length || librarrAddingIndex !== null) return;
+    librarrAddingIndex = -1;
+    librarrSearchError = "";
+    librarrSearchMessage = "";
+    let added = 0;
+    for (const item of highConfidenceLibrarrResults) {
+      const success = await addLibrarrResult(item.result, item.index, false);
+      if (success) added += 1;
+    }
+    librarrAddingIndex = null;
+    if (added) {
+      closeLibrarrSearch();
+      await invalidateAll();
     }
   }
 
@@ -2059,6 +2092,7 @@
               </div>
             </div>
           {:else if librarrResults.length}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingIndex !== null} aria-busy={librarrAddingIndex === -1}>{#if librarrAddingIndex === -1}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -2104,7 +2138,7 @@
                   <button
                     type="button"
                     class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
-                    disabled={librarrAddingIndex === index ||
+                    disabled={librarrAddingIndex !== null ||
                       librarrAdded.has(index)}
                     aria-busy={librarrAddingIndex === index}
                     onclick={() => void addLibrarrResult(result, index)}

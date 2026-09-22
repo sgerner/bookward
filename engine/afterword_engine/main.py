@@ -827,17 +827,46 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
 class LibrarrDownloadIn(BaseModel):
     media_type: str = "audiobook"
     result: dict[str, Any]
+    candidate_id: int | None = Field(default=None, gt=0)
 
 
 @app.post("/api/librarr/download")
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
+        candidate = row("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)) if payload.candidate_id else None
+        if payload.candidate_id and not candidate:
+            raise HTTPException(404, "Recommendation not found")
         encoded = json.dumps(payload.result, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{media}:{encoded}".encode()).hexdigest()
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         result = await librarr_download(config, payload.result, media, key)
-        return {"ok": True, "media_type": media, "result": result}
+        response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
+        if candidate:
+            status = candidate["status"]
+            if status not in {"saved", "imported"}:
+                with transaction() as con:
+                    con.execute(
+                        "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (candidate["id"],),
+                    )
+                    feedback_id = con.execute(
+                        "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                        (candidate["id"], "save"),
+                    ).lastrowid
+                    record_event_in_connection(
+                        con,
+                        event_key=f"feedback:{feedback_id}",
+                        candidate_id=int(candidate["id"]),
+                        event_type="save",
+                        source="librarr",
+                        label=1.0,
+                        label_kind="explicit_feedback",
+                        confidence=0.9,
+                    )
+                status = "saved"
+            response["candidate"] = {"id": candidate["id"], "status": status}
+        return response
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
     except httpx.HTTPError as exc:
