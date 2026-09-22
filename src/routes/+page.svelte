@@ -57,6 +57,11 @@
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
   type LibrarrResult = Record<string, unknown>;
+  type OptimisticChange = {
+    commit?: () => void;
+    rollback?: () => void;
+  };
+  type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
@@ -76,7 +81,7 @@
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
-  let pendingAction = $state<string | null>(null);
+  let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
   let librarrSearchBook = $state<{
@@ -103,6 +108,24 @@
   let apiTokenCopyMessage = $state<string | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
+  let optimisticNotification = $state<{
+    message: string;
+    error: boolean;
+    id: number;
+  } | null>(null);
+  let optimisticNotificationId = 0;
+  let optimisticNotificationTimer: ReturnType<typeof setTimeout> | null = null;
+  let defaultSourceEnabledOverride = $state<boolean | null>(null);
+  let sourceEnabledOverrides = $state<Record<number, boolean>>({});
+  let sourceScheduleOverride = $state<number | null>(null);
+  let librarrUrlOverride = $state<string | null>(null);
+  let librarrConnectedOverride = $state<boolean | null>(null);
+  let librarrMediaTypeOverride = $state<MediaType | null>(null);
+  let embeddingBackendOverride = $state<string | null>(null);
+  let embeddingModelOverride = $state<string | null>(null);
+  let embeddingUrlOverride = $state<string | null>(null);
+  let revokedApiTokenIds = $state(new Set<number>());
+  let bookStatusOverrides = $state<Record<number, string>>({});
   const telemetry = createTelemetryClient();
 
   const navItems: NavItem[] = [
@@ -130,7 +153,15 @@
         .includes(query)
     );
   }
-  const allBooks = $derived([...data.books, ...additionalDiscoverBooks]);
+  function sourceEnabled(source: { id: number; enabled: number }) {
+    return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
+  }
+  const allBooks = $derived(
+    [...data.books, ...additionalDiscoverBooks].map((book) => {
+      const status = bookStatusOverrides[book.id];
+      return status === undefined ? book : { ...book, status };
+    }),
+  );
   const discoverBooks = $derived(
     allBooks.filter(
       (book) => book.status === "recommended" && matchesBookFilter(book),
@@ -152,6 +183,31 @@
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
   const digestSettings = $derived(data.profile.digest);
+  const defaultSourceEnabled = $derived(
+    defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
+  );
+  const sourceSyncIntervalHours = $derived(
+    sourceScheduleOverride ?? data.profile.source_sync_interval_hours,
+  );
+  const librarrUrl = $derived(librarrUrlOverride ?? data.profile.librar_url);
+  const librarrConnected = $derived(
+    librarrConnectedOverride ?? Boolean(data.profile.librar_connected),
+  );
+  const configuredLibrarrMediaType = $derived(
+    librarrMediaTypeOverride ?? data.profile.librarr_media_type,
+  );
+  const embeddingBackend = $derived(
+    embeddingBackendOverride ?? data.profile.embedding_backend,
+  );
+  const embeddingModel = $derived(
+    embeddingModelOverride ?? data.profile.embedding_model,
+  );
+  const embeddingUrl = $derived(
+    embeddingUrlOverride ?? data.profile.embedding_url,
+  );
+  const apiTokens = $derived(
+    data.profile.api_tokens.filter((token) => !revokedApiTokenIds.has(token.id)),
+  );
   const digestEnabled = $derived(
     digestEnabledOverride ?? digestSettings.enabled,
   );
@@ -177,8 +233,7 @@
       .length,
   );
   const activeSourceCount = $derived(
-    data.sources.filter((source) => source.enabled).length +
-      (data.profile.default_source_enabled ? 1 : 0),
+    data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
   );
   const permanentSources = $derived(
     data.sources.filter((source) => source.lifecycle !== "one_time"),
@@ -187,10 +242,10 @@
     data.sources.filter((source) => source.lifecycle === "one_time"),
   );
   const activePermanentSourceCount = $derived(
-    permanentSources.filter((source) => source.enabled).length,
+    permanentSources.filter(sourceEnabled).length,
   );
   const activeOneTimeSourceCount = $derived(
-    oneTimeSources.filter((source) => source.enabled).length,
+    oneTimeSources.filter(sourceEnabled).length,
   );
   const sourceGroups = $derived([
     {
@@ -231,7 +286,11 @@
     },
   ]);
   const formState = $derived((form ?? null) as FormState);
-  const formIsError = $derived(Boolean(formState?.error));
+  const visibleNotification = $derived(
+    optimisticNotification ??
+      (formState?.message && !formNotificationDismissed ? formState : null),
+  );
+  const formIsError = $derived(Boolean(visibleNotification?.error));
 
   $effect(() => {
     // Read the prop itself so identical messages from separate submissions
@@ -267,33 +326,284 @@
       pushState(url, {});
     }
   }
-  function setPending(key: string): SubmitFunction {
-    return () => {
-      pendingAction = key;
-      return async ({ update }) => {
+  function announceActionError(message: string) {
+    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+    const id = ++optimisticNotificationId;
+    formNotificationDismissed = true;
+    optimisticNotification = { message, error: true, id };
+    optimisticNotificationTimer = setTimeout(() => {
+      if (optimisticNotification?.id !== id) return;
+      optimisticNotification = null;
+      formNotificationDismissed = true;
+      optimisticNotificationTimer = null;
+    }, FORM_NOTIFICATION_DISMISS_MS + 1500);
+  }
+
+  function actionResultMessage(result: {
+    type: string;
+    data?: unknown;
+    error?: unknown;
+  }) {
+    if (result.data && typeof result.data === "object" && "message" in result.data) {
+      const message = (result.data as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    if (result.error && typeof result.error === "object" && "message" in result.error) {
+      const message = (result.error as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    return "The request could not be completed. Your change was reverted.";
+  }
+
+  function withPending(key: string, add: boolean) {
+    const next = new Set(pendingActions);
+    if (add) next.add(key);
+    else next.delete(key);
+    pendingActions = next;
+  }
+
+  function setPending(
+    key: string,
+    optimistic?: OptimisticFactory,
+  ): SubmitFunction {
+    return ({ formData }) => {
+      withPending(key, true);
+      let change: OptimisticChange | void;
+      try {
+        change = optimistic?.(formData);
+      } catch {
+        change = undefined;
+      }
+      return async ({ update, result, formElement }) => {
+        const succeeded = result.type === "success" || result.type === "redirect";
+        const rollback = () => {
+          try {
+            change?.rollback?.();
+          } catch {
+            // A rollback must never obscure the action result.
+          }
+        };
         try {
+          if (!succeeded) {
+            rollback();
+            formElement.reset();
+          }
+          if (result.type === "error") {
+            announceActionError(actionResultMessage(result));
+            return;
+          }
           await update();
+          if (succeeded) change?.commit?.();
+        } catch (error) {
+          rollback();
+          formElement.reset();
+          announceActionError(
+            error instanceof Error
+              ? error.message
+              : "The request could not be completed. Your change was reverted.",
+          );
         } finally {
-          pendingAction = null;
+          withPending(key, false);
         }
       };
     };
   }
+
   function setPendingDigestBulk(): SubmitFunction {
-    return () => {
-      pendingAction = "shortlist-bulk";
-      return async ({ update }) => {
-        try {
-          await update();
-          clearDigestSelection();
-        } finally {
-          pendingAction = null;
-        }
-      };
+    return setPending("shortlist-bulk", optimisticShortlistBulk);
+  }
+
+  function isPending(key: string) {
+    return pendingActions.has(key);
+  }
+
+  function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
+    const book = [...data.books, ...additionalDiscoverBooks].find((item) => item.id === id);
+    if (!book) return;
+    const previous = bookStatusOverrides[id];
+    bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
+    return {
+      commit: () => {
+        if (bookStatusOverrides[id] !== status) return;
+        const next = { ...bookStatusOverrides };
+        delete next[id];
+        bookStatusOverrides = next;
+      },
+      rollback: () => {
+        if (bookStatusOverrides[id] !== status) return;
+        const next = { ...bookStatusOverrides };
+        if (previous === undefined) delete next[id];
+        else next[id] = previous;
+        bookStatusOverrides = next;
+      },
     };
   }
-  function isPending(key: string) {
-    return pendingAction === key;
+
+  function optimisticDecision(formData: FormData) {
+    const id = Number(formData.get("id"));
+    const status = String(formData.get("status") ?? "");
+    return Number.isInteger(id) && ["saved", "rejected", "recommended"].includes(status)
+      ? optimisticBookStatus(id, status)
+      : undefined;
+  }
+
+  function optimisticImport(formData: FormData) {
+    const id = Number(formData.get("id"));
+    return Number.isInteger(id) ? optimisticBookStatus(id, "imported") : undefined;
+  }
+
+  function optimisticShortlistBulk(formData: FormData) {
+    const ids = [...new Set(
+      formData
+        .getAll("ids")
+        .map((value) => Number(value))
+        .filter((id) => Number.isInteger(id)),
+    )];
+    const changes = ids.map((id) => optimisticBookStatus(id, "saved")).filter(Boolean) as OptimisticChange[];
+    return {
+      commit: () => {
+        changes.forEach((change) => change.commit?.());
+        clearDigestSelection();
+      },
+      rollback: () => changes.forEach((change) => change.rollback?.()),
+    };
+  }
+
+  function optimisticSourceToggle(formData: FormData) {
+    const id = Number(formData.get("id"));
+    const source = data.sources.find((item) => item.id === id);
+    if (!source) return;
+    const previous = sourceEnabledOverrides[id];
+    const nextValue = !(previous ?? Boolean(source.enabled));
+    sourceEnabledOverrides = { ...sourceEnabledOverrides, [id]: nextValue };
+    return {
+      commit: () => {
+        if (sourceEnabledOverrides[id] !== nextValue) return;
+        const next = { ...sourceEnabledOverrides };
+        delete next[id];
+        sourceEnabledOverrides = next;
+      },
+      rollback: () => {
+        if (sourceEnabledOverrides[id] !== nextValue) return;
+        const next = { ...sourceEnabledOverrides };
+        if (previous === undefined) delete next[id];
+        else next[id] = previous;
+        sourceEnabledOverrides = next;
+      },
+    };
+  }
+
+  function optimisticDefaultToggle() {
+    const previous = defaultSourceEnabledOverride;
+    const nextValue = !defaultSourceEnabled;
+    defaultSourceEnabledOverride = nextValue;
+    return {
+      commit: () => {
+        if (defaultSourceEnabledOverride === nextValue) defaultSourceEnabledOverride = null;
+      },
+      rollback: () => {
+        if (defaultSourceEnabledOverride === nextValue) defaultSourceEnabledOverride = previous;
+      },
+    };
+  }
+
+  function optimisticSourceSchedule(formData: FormData) {
+    const nextValue = Number(formData.get("intervalHours"));
+    if (!Number.isInteger(nextValue)) return;
+    sourceScheduleOverride = nextValue;
+    return {
+      commit: () => {
+        if (sourceScheduleOverride === nextValue) sourceScheduleOverride = null;
+      },
+      rollback: () => {
+        if (sourceScheduleOverride === nextValue) sourceScheduleOverride = null;
+      },
+    };
+  }
+
+  function optimisticLibrarr(formData: FormData) {
+    const nextUrl = String(formData.get("url") ?? "").trim();
+    const nextMediaType = String(formData.get("mediaType")) as MediaType;
+    librarrUrlOverride = nextUrl;
+    librarrMediaTypeOverride = nextMediaType;
+    librarrConnectedOverride = Boolean(String(formData.get("apiKey") ?? "").trim()) || librarrConnected;
+    return {
+      commit: () => {
+        if (librarrUrlOverride === nextUrl) librarrUrlOverride = null;
+        if (librarrMediaTypeOverride === nextMediaType) librarrMediaTypeOverride = null;
+        librarrConnectedOverride = null;
+      },
+      rollback: () => {
+        librarrUrlOverride = null;
+        librarrConnectedOverride = null;
+        librarrMediaTypeOverride = null;
+      },
+    };
+  }
+
+  function optimisticEmbeddings(formData: FormData) {
+    const nextBackend = String(formData.get("backend") ?? "");
+    const nextModel = String(formData.get("model") ?? "");
+    const nextUrl = String(formData.get("url") ?? "");
+    embeddingBackendOverride = nextBackend;
+    embeddingModelOverride = nextModel;
+    embeddingUrlOverride = nextUrl;
+    return {
+      commit: () => {
+        embeddingBackendOverride = null;
+        embeddingModelOverride = null;
+        embeddingUrlOverride = null;
+      },
+      rollback: () => {
+        embeddingBackendOverride = null;
+        embeddingModelOverride = null;
+        embeddingUrlOverride = null;
+      },
+    };
+  }
+
+  function optimisticRevokeToken(formData: FormData) {
+    const id = Number(formData.get("id"));
+    if (!Number.isInteger(id)) return;
+    const previous = revokedApiTokenIds.has(id);
+    revokedApiTokenIds = new Set([...revokedApiTokenIds, id]);
+    return {
+      commit: () => {
+        const next = new Set(revokedApiTokenIds);
+        next.delete(id);
+        revokedApiTokenIds = next;
+      },
+      rollback: () => {
+        if (previous) return;
+        const next = new Set(revokedApiTokenIds);
+        next.delete(id);
+        revokedApiTokenIds = next;
+      },
+    };
+  }
+
+  function optimisticDigestSettings(formData: FormData) {
+    const nextEnabled = formData.get("enabled") === "on";
+    const nextOnlyNew = formData.get("onlyNew") === "on";
+    const channels = formData.getAll("channels");
+    const nextDiscord = channels.includes("discord");
+    const nextEmail = channels.includes("email");
+    digestEnabledOverride = nextEnabled;
+    digestOnlyNewOverride = nextOnlyNew;
+    digestDiscordOverride = nextDiscord;
+    digestEmailOverride = nextEmail;
+    const clear = () => {
+      digestEnabledOverride = null;
+      digestOnlyNewOverride = null;
+      digestDiscordOverride = null;
+      digestEmailOverride = null;
+    };
+    return {
+      commit: clear,
+      rollback: () => {
+        clear();
+      },
+    };
   }
   function motionDuration(duration: number) {
     if (
@@ -493,11 +803,10 @@
     title: string;
     author: string;
   }) {
-    if (!data.profile.librar_connected) return;
+    if (!librarrConnected) return;
     librarrSearchBook = book;
     librarrQuery = `${book.title} ${book.author}`.trim().slice(0, 200);
-    librarrMediaType =
-      data.profile.librarr_media_type === "ebook" ? "ebook" : "audiobook";
+    librarrMediaType = librarrMediaTypeOverride === "ebook" ? "ebook" : "audiobook";
     librarrResults = [];
     librarrSearchError = "";
     librarrSearchMessage = "";
@@ -646,6 +955,7 @@
   async function addLibrarrResult(result: LibrarrResult, index: number, closeAfter = true) {
     if (librarrAdded.has(index)) return;
     librarrAddingIndex = index;
+    librarrAdded = new Set([...librarrAdded, index]);
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
@@ -659,7 +969,6 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      librarrAdded = new Set([...librarrAdded, index]);
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
@@ -668,6 +977,9 @@
       }
       return true;
     } catch (error) {
+      const nextAdded = new Set(librarrAdded);
+      nextAdded.delete(index);
+      librarrAdded = nextAdded;
       librarrSearchError =
         error instanceof Error
           ? error.message
@@ -753,21 +1065,30 @@
                 status: "saved",
                 run_id: String(data.recommendation_run_id || ""),
               });
-              const response = await fetch("?/decide", {
-                method: "POST",
-                headers: {
-                  accept: "application/json",
-                  "content-type": "application/x-www-form-urlencoded",
-                  "x-sveltekit-action": "true",
-                },
-                body,
-              });
-              if (!response.ok)
-                throw new Error("Could not shortlist that book.");
-              await applyAction(deserialize(await response.text()));
-              await invalidateAll();
-              go("saved");
-              return { id, status: "saved" };
+              const change = optimisticBookStatus(id, "saved");
+              try {
+                const response = await fetch("?/decide", {
+                  method: "POST",
+                  headers: {
+                    accept: "application/json",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "x-sveltekit-action": "true",
+                  },
+                  body,
+                });
+                if (!response.ok) throw new Error("Could not shortlist that book.");
+                await applyAction(deserialize(await response.text()));
+                await invalidateAll();
+                change?.commit?.();
+                go("saved");
+                return { id, status: "saved" };
+              } catch (error) {
+                change?.rollback?.();
+                announceActionError(
+                  error instanceof Error ? error.message : "Could not shortlist that book.",
+                );
+                throw error;
+              }
             },
           },
           { signal: lifecycle.signal },
@@ -901,7 +1222,7 @@
     class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
     <div id="main-content" role="main" class="min-w-0 flex-1">
-      {#if formState?.message && !formNotificationDismissed}{#key formState.message}<div
+      {#if visibleNotification}{#key visibleNotification.message}<div
             in:fly={{ y: -12, duration: motionDuration(240) }}
             out:fade={{ duration: motionDuration(140) }}
             class={`mb-6 flex items-start gap-3 border p-4 text-sm ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
@@ -911,7 +1232,7 @@
                 size={18}
                 class="mt-0.5 shrink-0"
               />{:else}<Check size={18} class="mt-0.5 shrink-0" />{/if}<span
-              >{formState.message}</span
+              >{visibleNotification.message}</span
             >
           </div>{/key}{/if}
 
@@ -1035,19 +1356,19 @@
                 </details>
                 <div class="mt-auto flex flex-wrap gap-2 pt-1">
                   {#if book.status === "recommended"}
-                    {#if data.profile.librar_connected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`)}>
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
                     </form>
                   {:else if book.status === "saved"}
-                    {#if data.profile.librar_connected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`)}>
-                      <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" disabled={!data.profile.librar_connected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {data.profile.librar_connected ? `Add ${data.profile.librarr_media_type === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                      <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                     </form>
                   {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-11 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
@@ -1168,17 +1489,18 @@
                       <form
                         method="POST"
                         action="?/toggleDefault"
-                        use:enhance={setPending("toggle-default")}
+                        use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
                       >
                         <button
                           type="submit"
-                          class={`relative h-7 w-12 rounded-full p-1 transition ${data.profile.default_source_enabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
+                          class={`relative h-7 w-12 rounded-full p-1 transition ${defaultSourceEnabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
                           role="switch"
                           aria-label="Toggle Bookward demo books"
-                          aria-checked={!!data.profile.default_source_enabled}
+                          aria-checked={defaultSourceEnabled}
+                          disabled={isPending("toggle-default")}
                           aria-busy={isPending("toggle-default")}
                           ><span
-                            class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${data.profile.default_source_enabled ? "translate-x-5" : ""}`}
+                            class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${defaultSourceEnabled ? "translate-x-5" : ""}`}
                           ></span></button
                         >
                       </form>
@@ -1230,7 +1552,7 @@
                           <form
                             method="POST"
                             action="?/toggleSource"
-                            use:enhance={setPending(`toggle-source-${source.id}`)}
+                            use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
                           >
                             <input
                               type="hidden"
@@ -1238,13 +1560,14 @@
                               value={source.id}
                             /><button
                               type="submit"
-                              class={`relative h-7 w-12 rounded-full p-1 transition ${source.enabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
+                              class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
                               role="switch"
                               aria-label={`Toggle ${source.label}`}
-                              aria-checked={!!source.enabled}
+                              aria-checked={sourceEnabled(source)}
+                              disabled={isPending(`toggle-source-${source.id}`)}
                               aria-busy={isPending(`toggle-source-${source.id}`)}
                               ><span
-                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${source.enabled ? "translate-x-5" : ""}`}
+                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
                               ></span></button
                             >
                           </form>
@@ -1270,7 +1593,7 @@
                   class="card preset-tonal-surface p-5 sm:p-6"
                   method="POST"
                   action="?/configureSourceSchedule"
-                  use:enhance={setPending("source-schedule")}
+                  use:enhance={setPending("source-schedule", optimisticSourceSchedule)}
                 >
                   <div class="mb-4 flex items-center gap-3">
                     <span
@@ -1291,10 +1614,10 @@
                       class="select mt-2"
                       name="intervalHours"
                     >
-                      <option value="0" selected={data.profile.source_sync_interval_hours === 0}>Manual only</option>
-                      <option value="6" selected={data.profile.source_sync_interval_hours === 6}>Every 6 hours</option>
-                      <option value="24" selected={data.profile.source_sync_interval_hours === 24}>Daily (UTC)</option>
-                      <option value="168" selected={data.profile.source_sync_interval_hours === 168}>Weekly</option>
+                      <option value="0" selected={sourceSyncIntervalHours === 0}>Manual only</option>
+                      <option value="6" selected={sourceSyncIntervalHours === 6}>Every 6 hours</option>
+                      <option value="24" selected={sourceSyncIntervalHours === 24}>Daily (UTC)</option>
+                      <option value="168" selected={sourceSyncIntervalHours === 168}>Weekly</option>
                     </select></label
                   >
                   <p class="mt-3 text-sm leading-6 text-surface-700-300">
@@ -1496,7 +1819,7 @@
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
-                use:enhance={setPending("librarr")}
+                use:enhance={setPending("librarr", optimisticLibrarr)}
               >
                 <div class="mb-5 flex items-center justify-between gap-4">
                   <div class="flex min-w-0 items-center gap-3">
@@ -1511,8 +1834,8 @@
                     </h2>
                   </div>
                   <span
-                    class={`badge shrink-0 ${data.profile.librar_connected ? "preset-tonal-success" : "preset-tonal-surface"}`}
-                    >{data.profile.librar_connected
+                    class={`badge shrink-0 ${librarrConnected ? "preset-tonal-success" : "preset-tonal-surface"}`}
+                    >{librarrConnected
                       ? "Connected"
                       : "Not connected"}</span
                   >
@@ -1527,7 +1850,7 @@
                     class="input mt-2"
                     name="url"
                     type="url"
-                    value={data.profile.librar_url}
+                    value={librarrUrl}
                     placeholder="http://librarr:5050"
                     required
                   /></label
@@ -1537,7 +1860,7 @@
                     class="input mt-2"
                     name="apiKey"
                     type="password"
-                    placeholder={data.profile.librar_connected
+                    placeholder={librarrConnected
                       ? "Leave blank to keep current key"
                       : "Your Librarr API key"}
                   /></label
@@ -1548,11 +1871,11 @@
                     name="mediaType"
                     ><option
                       value="audiobook"
-                      selected={data.profile.librarr_media_type === "audiobook"}
+                      selected={configuredLibrarrMediaType === "audiobook"}
                       >Audiobook</option
                     ><option
                       value="ebook"
-                      selected={data.profile.librarr_media_type === "ebook"}
+                      selected={configuredLibrarrMediaType === "ebook"}
                       >Ebook</option
                     ></select
                   ></label
@@ -1588,7 +1911,7 @@
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
-                    >{data.profile.embedding_backend}</span
+                    >{embeddingBackend}</span
                   >
                 </div>
                 <form
@@ -1596,25 +1919,25 @@
                   class="space-y-4"
                   method="POST"
                   action="?/configureEmbeddings"
-                  use:enhance={setPending("embeddings")}
+                  use:enhance={setPending("embeddings", optimisticEmbeddings)}
                 >
                   <label class="block text-sm font-medium text-surface-800-200"
                     >Provider<select class="select mt-2" name="backend"
                       ><option
                         value="local"
-                        selected={data.profile.embedding_backend === "local"}
+                        selected={embeddingBackend === "local"}
                         >Local CPU · zero download</option
                       ><option
                         value="fastembed"
-                        selected={data.profile.embedding_backend ===
+                        selected={embeddingBackend ===
                           "fastembed"}>Local BGE · FastEmbed</option
                       ><option
                         value="ollama"
-                        selected={data.profile.embedding_backend === "ollama"}
+                        selected={embeddingBackend === "ollama"}
                         >Ollama / Qwen</option
                       ><option
                         value="openai-compatible"
-                        selected={data.profile.embedding_backend ===
+                        selected={embeddingBackend ===
                           "openai-compatible"}>OpenAI-compatible API</option
                       ></select
                     ></label
@@ -1622,7 +1945,7 @@
                     >Model<input
                       class="input mt-2"
                       name="model"
-                      value={data.profile.embedding_model}
+                      value={embeddingModel}
                       placeholder="qwen3-embedding:0.6b"
                       required
                     /></label
@@ -1631,7 +1954,7 @@
                       class="input mt-2"
                       name="url"
                       type="url"
-                      value={data.profile.embedding_url}
+                      value={embeddingUrl}
                       placeholder="http://ollama:11434"
                     /></label
                   ><label class="block text-sm font-medium text-surface-800-200"
@@ -1753,11 +2076,11 @@
                   </button>
                 </form>
 
-                {#if data.profile.api_tokens.length}
+                {#if apiTokens.length}
                   <div class="mt-6 border-t border-surface-300-700/40 pt-5">
                     <h3 class="text-sm font-semibold text-surface-950-50">Existing tokens</h3>
                     <ul class="mt-3 divide-y divide-surface-300-700/40 border border-surface-300-700/40">
-                      {#each data.profile.api_tokens as token (token.id)}
+                      {#each apiTokens as token (token.id)}
                         <li class="flex flex-wrap items-center gap-3 p-3">
                           <div class="min-w-0 flex-1">
                             <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
@@ -1767,7 +2090,7 @@
                           {#if token.revoked_at}
                             <span class="badge preset-tonal-error">Revoked</span>
                           {:else}
-                            <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`)}>
+                            <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)}>
                               <input type="hidden" name="id" value={token.id} />
                               <button class="btn btn-sm min-h-9 preset-tonal-error" type="submit" disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>
                                 {#if isPending(`revoke-api-token-${token.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Trash2 size={14} />{/if} Revoke
@@ -1788,7 +2111,7 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
-                <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings")}>
+                <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <div class="flex flex-wrap items-center gap-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-4 focus-within:ring-offset-surface-950">
                     <input id="digest-enabled" class="sr-only" type="checkbox" name="enabled" checked={digestEnabled} role="switch" aria-label="Enable weekly digest" onchange={(event) => (digestEnabledOverride = (event.currentTarget as HTMLInputElement).checked)} />
                     <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
@@ -1894,14 +2217,14 @@
                 </form>
                 <div class="mt-5 flex flex-wrap items-center gap-2 border-t border-surface-300-700/40 pt-5">
                   {#each ["discord", "email"] as channel}
-                    {@const configured = digestSettings.channels.includes(channel as "discord" | "email")}
+                    {@const configured = channel === "discord" ? digestDiscord : digestEmail}
                     {#if configured}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
                       <input type="hidden" name="channel" value={channel} />
                       <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
                     </form>{/if}
                   {/each}
                   <form method="POST" action="?/runDigest" use:enhance={setPending("digest-run")} class="ml-auto">
-                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!digestSettings.enabled || digestSettings.channels.length === 0 || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
+                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!digestEnabled || (!digestDiscord && !digestEmail) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
                 {#if digestSettings.last_delivery}
