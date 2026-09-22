@@ -307,7 +307,8 @@ export const actions: Actions = {
     const modelId = llmModelSchema.safeParse(data.get("modelId"));
     const endpoint = llmEndpointSchema.safeParse(data.get("endpoint") ?? "");
     const authType = llmAuthSchema.safeParse(data.get("authType"));
-    if (!name.success || !providerId.success || !modelId.success || !endpoint.success || !authType.success)
+    const reasoningEffort = z.enum(["low", "medium", "high", "xhigh", "max"]).optional().safeParse(data.get("reasoningEffort") || undefined);
+    if (!name.success || !providerId.success || !modelId.success || !endpoint.success || !authType.success || !reasoningEffort.success)
       return fail(400, { message: "Choose a provider, model, authentication method, and name." });
     const payload: Record<string, unknown> = {
       name: name.data,
@@ -321,6 +322,7 @@ export const actions: Actions = {
     const oauthToken = optionalFormText(data, "oauthToken");
     if (apiKey) payload.api_key = apiKey;
     if (oauthToken) payload.oauth_token = oauthToken;
+    if (authType.data === "claude_code" && reasoningEffort.data) payload.reasoning_effort = reasoningEffort.data;
     try {
       await engine(
         id ? `/api/llm/connections/${encodeURIComponent(id)}` : "/api/llm/connections",
