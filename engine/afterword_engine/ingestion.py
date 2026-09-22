@@ -5,7 +5,7 @@ import io
 import json
 import re
 import math
-from datetime import datetime
+from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
 import feedparser
 import httpx
@@ -48,6 +48,26 @@ def _date_value(value):
     raw = str(value or "").strip()
     if not raw:
         return None
+    if re.fullmatch(r"\d{4}", raw):
+        try:
+            return date(int(raw), 1, 1).isoformat()
+        except ValueError:
+            return None
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        try:
+            year, month = (int(part) for part in raw.split("-"))
+            return date(year, month, 1).isoformat()
+        except ValueError:
+            return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            return date.fromisoformat(raw).isoformat()
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        pass
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%B %d, %Y", "%b %d, %Y"):
         try:
             return datetime.strptime(raw, fmt).date().isoformat()
@@ -430,10 +450,14 @@ def _parse_editorial_html(content, source_url):
     return items
 
 def metadata_url(value, fallback=""):
-    try:
-        parsed = httpx.URL(str(value))
-        return str(parsed) if parsed.scheme in ("http","https") and parsed.host else fallback
-    except Exception: return fallback
+    for candidate in (value, fallback):
+        try:
+            parsed = httpx.URL(str(candidate))
+        except Exception:
+            continue
+        if parsed.scheme in ("http", "https") and parsed.host and not parsed.username and not parsed.password:
+            return str(parsed)
+    return ""
 
 def import_goodreads_csv(content: bytes):
     if len(content) > 10_000_000: raise ValueError("CSV is larger than 10 MB")
@@ -651,14 +675,387 @@ async def import_goodreads_rss(url: str):
     attribute_read_outcomes()
     return count
 
+
+def _schema_type_matches(value, *wanted):
+    raw_types = value.get("@type", []) if isinstance(value, dict) else []
+    types = [raw_types] if isinstance(raw_types, str) else raw_types
+    if not isinstance(types, (list, tuple)):
+        return False
+    wanted_types = set(wanted)
+    return any(str(raw).rsplit("/", 1)[-1].rsplit("#", 1)[-1] in wanted_types for raw in types)
+
+
+def _iter_jsonld_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                yield from _iter_jsonld_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_jsonld_nodes(child)
+
+
+def _schema_text(value, limit=4000):
+    if isinstance(value, str):
+        return _clean_text(value, limit)
+    if isinstance(value, (int, float)):
+        return str(value)[:limit]
+    if isinstance(value, dict):
+        for key in ("name", "@value", "value", "text"):
+            if value.get(key) not in (None, ""):
+                return _schema_text(value[key], limit)
+        return ""
+    if isinstance(value, (list, tuple)):
+        values = []
+        for child in value:
+            text = _schema_text(child, limit)
+            if text and text not in values:
+                values.append(text)
+        return ", ".join(values)[:limit]
+    return ""
+
+
+def _schema_url(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("url", "contentUrl", "@id"):
+            if value.get(key):
+                return _schema_url(value[key])
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            url = _schema_url(child)
+            if url:
+                return url
+    return ""
+
+
+def _schema_author(value):
+    return _schema_text(value, 300) or "Unknown author"
+
+
+def _schema_image(value):
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = [value]
+    for child in values:
+        image = _schema_url(child)
+        if image and not image.startswith("data:"):
+            return image
+    return ""
+
+
+def _schema_genres(value):
+    raw_genres = value.get("genre", []) if isinstance(value, dict) else []
+    values = raw_genres if isinstance(raw_genres, (list, tuple)) else [raw_genres]
+    genres = []
+    for raw in values:
+        genre = _schema_text(raw, 80)
+        if genre and genre not in genres:
+            genres.append(genre)
+    return genres[:8]
+
+
+def _date_kind(raw_value):
+    raw = str(raw_value or "").strip()
+    if not raw or not _date_value(raw):
+        return ""
+    if re.fullmatch(r"\d{4}", raw):
+        return "year"
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        return "month"
+    return "day"
+
+
+def _schema_release(value):
+    raw = _schema_text(value, 100)
+    release_date = _date_value(raw)
+    return release_date, _date_kind(raw) if release_date else ""
+
+
+def _book_metadata_url(value, source_url):
+    fallback = metadata_url(source_url)
+    candidate = _schema_url(value)
+    if not candidate:
+        return fallback
+    resolved = metadata_url(urljoin(source_url, candidate), fallback)
+    if resolved:
+        parsed = urlparse(resolved)
+        resolved = parsed._replace(fragment="").geturl()
+    return resolved or fallback
+
+
+def _merge_book_item(items, item, source_url):
+    title = _clean_text(item.get("title"), 500)
+    if not title:
+        return
+    normalized = {
+        "title": title,
+        "author": _clean_text(item.get("author") or "Unknown author", 300),
+        "description": _clean_text(item.get("description"), 4000),
+        "cover_url": item.get("cover_url", "") or "",
+        "source_url": metadata_url(item.get("source_url"), source_url),
+        "release_date": item.get("release_date"),
+        "date_kind": item.get("date_kind", "") or "",
+        "genres": list(item.get("genres") or [])[:8],
+    }
+    title_key = normalize_key(title, "")
+    author_key = normalize_key(normalized["author"], "")
+    unknown_authors = {"", normalize_key("Unknown author", "")}
+    for existing in items:
+        if normalize_key(existing.get("title", ""), "") != title_key:
+            continue
+        existing_author_key = normalize_key(existing.get("author", ""), "")
+        authors_unknown = existing_author_key in unknown_authors or author_key in unknown_authors
+        if authors_unknown:
+            existing_source = existing.get("source_url", "")
+            same_specific_source = (
+                existing_source
+                and normalized["source_url"]
+                and existing_source != source_url
+                and normalized["source_url"] != source_url
+                and existing_source == normalized["source_url"]
+            )
+            if not same_specific_source:
+                continue
+        elif existing_author_key != author_key:
+            continue
+        existing_precision = {"year": 1, "month": 2, "day": 3}.get(existing.get("date_kind", ""), 0)
+        incoming_precision = {"year": 1, "month": 2, "day": 3}.get(normalized.get("date_kind", ""), 0)
+        for field in ("description", "cover_url"):
+            if not existing.get(field) and normalized.get(field):
+                existing[field] = normalized[field]
+        if normalized.get("release_date") and (
+            not existing.get("release_date") or incoming_precision > existing_precision
+        ):
+            existing["release_date"] = normalized["release_date"]
+            existing["date_kind"] = normalized.get("date_kind", "")
+        elif not existing.get("date_kind") and normalized.get("date_kind"):
+            existing["date_kind"] = normalized["date_kind"]
+        if normalized.get("genres"):
+            existing["genres"] = list(dict.fromkeys((existing.get("genres") or []) + normalized["genres"]))[:8]
+        if existing_author_key in unknown_authors and author_key not in unknown_authors:
+            existing["author"] = normalized["author"]
+        if existing.get("source_url") in ("", source_url) and normalized.get("source_url") != source_url:
+            existing["source_url"] = normalized["source_url"]
+        return
+    items.append(normalized)
+
+
+def _parse_jsonld_books(payloads, source_url):
+    items = []
+    for payload in payloads:
+        for value in _iter_jsonld_nodes(payload):
+            if not _schema_type_matches(value, "Book", "Audiobook"):
+                continue
+            release_date, date_kind = _schema_release(value.get("datePublished"))
+            image = _schema_image(value.get("image"))
+            _merge_book_item(
+                items,
+                {
+                    "title": _schema_text(value.get("name"), 500),
+                    "author": _schema_author(value.get("author")),
+                    "description": _schema_text(value.get("description"), 4000),
+                    "cover_url": safe_cover_url(urljoin(source_url, image), source_url) if image else "",
+                    "source_url": _book_metadata_url(value.get("url") or value.get("sameAs") or value.get("@id"), source_url),
+                    "release_date": release_date,
+                    "date_kind": date_kind,
+                    "genres": _schema_genres(value),
+                },
+                source_url,
+            )
+            if len(items) >= settings.source_max_items:
+                return items
+    return items
+
+
+def _html_node_value(node):
+    if not node:
+        return ""
+    return node.get("content") or node.get("datetime") or node.get_text(" ", strip=True)
+
+
+def _generic_card_container(heading):
+    for ancestor in heading.parents:
+        if not ancestor or ancestor.name in ("body", "html"):
+            break
+        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
+        itemtype = str(ancestor.get("itemtype") or "").casefold()
+        if ancestor.name in ("article", "li") or "book" in itemtype or classes.intersection(
+            {"book", "book-card", "book-item", "book-listing", "book-blurb", "card", "listing"}
+        ):
+            return ancestor
+    if heading.parent and heading.parent.select_one(".author-name, [itemprop='author']"):
+        return heading.parent
+    return None
+
+
+def _has_generic_book_semantics(heading):
+    for ancestor in [heading, *heading.parents]:
+        if not ancestor or ancestor.name in ("body", "html"):
+            break
+        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
+        itemtype = str(ancestor.get("itemtype") or "").casefold()
+        if "book" in itemtype or classes.intersection(
+            {"book", "book-card", "book-item", "book-listing", "book-blurb"}
+        ):
+            return True
+    return False
+
+
+def _parse_generic_book_cards(soup, source_url):
+    items = []
+    for heading in soup.select(
+        "h1.book-title, h2.book-title, h3.book-title, h4.book-title, "
+        "h1[itemprop='name'], h2[itemprop='name'], h3[itemprop='name'], h4[itemprop='name']"
+    ):
+        title = _clean_text(heading.get_text(" ", strip=True), 500)
+        container = _generic_card_container(heading)
+        author_node = container.select_one(".author-name, [itemprop='author']") if container else None
+        author = _clean_text(_html_node_value(author_node), 300)
+        author = re.sub(r"^\s*(?:by|author)\s*:?[\s]+", "", author, flags=re.I)
+        if not title or not author:
+            continue
+        link = heading.find_parent("a", href=True) or heading.find("a", href=True)
+        if not link and container:
+            link = container.select_one("a[itemprop='url'][href], a[href]")
+        href = link.get("href", "") if link else ""
+        description_node = container.select_one(".blurb-content, .description, [itemprop='description']") if container else None
+        paragraphs = description_node.select("p") if description_node else []
+        paragraph_text = []
+        for paragraph in paragraphs:
+            text = _clean_text(paragraph, 4000)
+            if text:
+                paragraph_text.append(text)
+        description = " ".join(paragraph_text)
+        if not description and description_node:
+            description = _clean_text(description_node, 4000)
+        genres = [
+            _clean_text(node, 80)
+            for node in (container.select(".genre-tag, [itemprop='genre']") if container else [])
+            if _clean_text(node, 80)
+        ]
+        image = ""
+        for node in (container.select("img, [itemprop='image']") if container else []):
+            image = (
+                node.get("data-lazy-src")
+                or node.get("data-src")
+                or node.get("data-original")
+                or node.get("src")
+                or _html_node_value(node)
+                or ""
+            )
+            if image and not image.startswith("data:"):
+                break
+        date_node = container.select_one("[itemprop='datePublished'], time") if container else None
+        raw_date = _html_node_value(date_node)
+        _merge_book_item(
+            items,
+            {
+                "title": title,
+                "author": author,
+                "description": description,
+                "cover_url": safe_cover_url(urljoin(source_url, image), source_url) if image else "",
+                "source_url": metadata_url(urljoin(source_url, href), source_url),
+                "release_date": _date_value(raw_date),
+                "date_kind": _date_kind(raw_date),
+                "genres": list(dict.fromkeys(genres))[:8],
+            },
+            source_url,
+        )
+        if len(items) >= settings.source_max_items:
+            break
+    return items
+
+
+def _generic_author_from_line(value):
+    text = _clean_text(value, 600)
+    if not text:
+        return ""
+    leading_by = bool(re.match(r"^(?:by|written\s+by|author)\s+", text, re.I))
+    text = re.sub(r"^(?:by|written\s+by|author)\s*:?[\s]+", "", text, flags=re.I).strip()
+    isbn_match = re.search(r"\bISBN(?:-\d+)?\s*[:#]?\s*[0-9Xx][0-9Xx -]{8,17}", text, re.I)
+    if isbn_match:
+        text = text[: isbn_match.start()].strip(" .,-")
+        price_match = re.search(r"\s[$€£]\s*[\d,.]+", text)
+        if price_match:
+            text = text[: price_match.start()].strip(" .,-")
+        parts = re.split(r"\.\s+", text, maxsplit=1)
+        return _clean_text(parts[0], 300) if parts else ""
+    parenthesized = re.fullmatch(r"(.+?)\s+\([^()]+\)", text)
+    if parenthesized:
+        return _clean_text(parenthesized.group(1), 300)
+    if leading_by and text:
+        return _clean_text(text, 300)
+    return ""
+
+
+def _parse_generic_heading_pairs(soup, source_url):
+    items = []
+    for heading in soup.select("h2, h3, h4"):
+        heading_classes = {str(value).casefold() for value in (heading.get("class") or [])}
+        if heading_classes.intersection({"book-title", "author", "authors", "contributor", "contributors", "isbn-related"}):
+            continue
+        title = _clean_text(heading.get_text(" ", strip=True), 500)
+        link = heading.find("a", href=True)
+        metadata = heading.find_next_sibling()
+        book_container = _generic_card_container(heading)
+        is_semantic_book = heading.get("itemprop") == "name" or _has_generic_book_semantics(heading)
+        bounded_heading_pair = (
+            book_container is not None
+            and book_container.name in ("article", "li")
+            and metadata is not None
+            and metadata.name in ("h3", "h4")
+        )
+        if not link and not is_semantic_book and not bounded_heading_pair:
+            continue
+        if link and re.match(r"^by\s+", title, re.I) and "author" in link.get("href", "").casefold():
+            continue
+        if metadata and metadata.name == heading.name and heading.name in ("h1", "h2", "h3"):
+            continue
+        author = _generic_author_from_line(metadata.get_text(" ", strip=True) if metadata else "")
+        if not title or not author:
+            continue
+        href = link.get("href", "") if link else ""
+        description_node = metadata.find_next_sibling() if metadata else None
+        description = _clean_text(description_node, 4000) if description_node and description_node.name == "p" else ""
+        _merge_book_item(
+            items,
+            {
+                "title": title,
+                "author": author,
+                "description": description,
+                "cover_url": "",
+                "source_url": metadata_url(urljoin(source_url, href), source_url),
+                "release_date": None,
+                "date_kind": "",
+                "genres": [],
+            },
+            source_url,
+        )
+        if len(items) >= settings.source_max_items:
+            break
+    return items
+
+
+def _parse_generic_html(soup, source_url):
+    items = _parse_generic_book_cards(soup, source_url)
+    for item in _parse_generic_heading_pairs(soup, source_url):
+        _merge_book_item(items, item, source_url)
+        if len(items) >= settings.source_max_items:
+            break
+    return items[: settings.source_max_items]
+
 def parse_book_items(content: bytes, content_type: str, source_url: str):
     if "xml" in content_type or "rss" in content_type or content.lstrip().startswith(b"<?xml"):
         feed = feedparser.parse(content)
         if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
         return [{"title": str(e.get("title", ""))[:500], "author": str(e.get("author", "Unknown author"))[:300], "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000], "source_url": metadata_url(e.get("link"), source_url)} for e in feed.entries[:settings.source_max_items] if e.get("title")]
-    items = []
     payloads = []
+    soup = None
     if "json" in content_type or "javascript" in content_type:
         try: payloads = [json.loads(content)]
         except (json.JSONDecodeError, UnicodeDecodeError): return []
@@ -678,25 +1075,15 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
             return _parse_goodreads_genre(content, source_url)
         soup = BeautifulSoup(content, "html.parser")
         for node in soup.select('script[type="application/ld+json"]'):
-            try: payloads.append(json.loads(node.string or "null"))
+            try: payloads.append(json.loads(node.string or node.get_text() or "null"))
             except json.JSONDecodeError: continue
-    for payload in payloads:
-        values = payload if isinstance(payload, list) else [payload]
-        values = [child for value in values for child in (value.get("@graph", []) if isinstance(value, dict) and isinstance(value.get("@graph"), list) else [value])]
-        for value in values:
-            kinds = value.get("@type", []) if isinstance(value, dict) else []
-            kinds = [kinds] if isinstance(kinds, str) else kinds
-            if isinstance(value, dict) and any(kind in ("Book", "Audiobook") for kind in kinds):
-                author = value.get("author", "Unknown author")
-                if isinstance(author, list): author = author[0] if author else "Unknown author"
-                if isinstance(author, dict): author = author.get("name", "Unknown author")
-                image = value.get("image", "")
-                if isinstance(image, dict): image = image.get("url", "")
-                if isinstance(image, list): image = image[0] if image else ""
-                raw_date = str(value.get("datePublished") or "")[:10]
-                release_date = raw_date if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date) else None
-                items.append({"title": str(value.get("name", ""))[:500], "author": str(author)[:300], "description": BeautifulSoup(str(value.get("description", "")), "html.parser").get_text(" ")[:4000], "cover_url": safe_cover_url(image, source_url), "source_url": source_url, "release_date": release_date})
-    return [item for item in items[:settings.source_max_items] if item["title"]]
+    items = _parse_jsonld_books(payloads, source_url)
+    if soup is not None:
+        for item in _parse_generic_html(soup, source_url):
+            _merge_book_item(items, item, source_url)
+            if len(items) >= settings.source_max_items:
+                break
+    return items[: settings.source_max_items]
 
 
 async def enrich_cover_urls(items):
