@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from .config import settings
 from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, resolve_cover_url, safe_cover_url
 from .database import normalize_key, rows, transaction
+from .isbn import isbn_parts_from_source
 from .security import resolve_public_target
 
 GOODREADS_TIP_RE = re.compile(
@@ -118,6 +119,20 @@ def _apple_cover(entry, summary, source_url):
     return safe_cover_url(images[0] if images else "", source_url)
 
 
+def _with_source_isbn(item, values=()):
+    """Attach only checksum-valid source ISBNs to a parsed item."""
+
+    isbn13, isbn10 = isbn_parts_from_source(values, item.get("source_url", ""))
+    if not isbn13 and not isbn10:
+        return item
+    enriched = dict(item)
+    if isbn13:
+        enriched["isbn13"] = isbn13
+    if isbn10:
+        enriched["isbn10"] = isbn10
+    return enriched
+
+
 def _parse_apple_entries(entries, source_url):
     items = []
     for entry in entries[: settings.source_max_items]:
@@ -152,15 +167,22 @@ def _parse_apple_entries(entries, source_url):
             if genre_match:
                 genres = [genre_match.group(1).strip()]
         if title and author:
-            items.append({
-                "title": title[:500],
-                "author": author[:300],
-                "description": _clean_text(summary),
-                "cover_url": _apple_cover(entry, summary, source_url),
-                "source_url": link,
-                "release_date": _date_value(release),
-                "genres": genres[:8],
-            })
+            items.append(
+                _with_source_isbn(
+                    {
+                        "title": title[:500],
+                        "author": author[:300],
+                        "description": _clean_text(summary),
+                        "cover_url": _apple_cover(entry, summary, source_url),
+                        "source_url": link,
+                        "release_date": _date_value(release),
+                        "genres": genres[:8],
+                    },
+                    [entry.get(key) for key in ("isbn13", "isbn10", "isbn")]
+                    if isinstance(entry, dict)
+                    else (),
+                )
+            )
     return items
 
 
@@ -187,15 +209,20 @@ def _parse_open_library(payload, source_url):
         cover_id = work.get("cover_id") or work.get("cover_i")
         work_key = str(work.get("key", ""))
         source = metadata_url(f"https://openlibrary.org{work_key}" if work_key.startswith("/") else work_key, source_url)
-        items.append({
-            "title": title[:500],
-            "author": author[:300],
-            "description": _clean_text(description),
-            "cover_url": safe_cover_url(f"https://covers.openlibrary.org/b/id/{int(cover_id)}-L.jpg", source_url) if str(cover_id).isdigit() else "",
-            "source_url": source,
-            "release_date": None,
-            "genres": [str(subject)[:80] for subject in (work.get("subject") or [])[:8] if subject],
-        })
+        items.append(
+            _with_source_isbn(
+                {
+                    "title": title[:500],
+                    "author": author[:300],
+                    "description": _clean_text(description),
+                    "cover_url": safe_cover_url(f"https://covers.openlibrary.org/b/id/{int(cover_id)}-L.jpg", source_url) if str(cover_id).isdigit() else "",
+                    "source_url": source,
+                    "release_date": None,
+                    "genres": [str(subject)[:80] for subject in (work.get("subject") or [])[:8] if subject],
+                },
+                [work.get(key) for key in ("isbn13", "isbn10", "isbn")],
+            )
+        )
     return items
 
 
@@ -211,15 +238,27 @@ def _parse_nytimes(payload, source_url):
         author = str(book.get("author", "Unknown author")).strip()
         if not title:
             continue
-        items.append({
-            "title": title[:500],
-            "author": author[:300],
-            "description": _clean_text(book.get("description", "")),
-            "cover_url": safe_cover_url(book.get("book_image", ""), source_url),
-            "source_url": metadata_url(book.get("amazon_product_url"), source_url),
-            "release_date": _date_value(book.get("published_date")),
-            "genres": [str(book.get("list_name", "")).strip()] if book.get("list_name") else [],
-        })
+        source = metadata_url(book.get("amazon_product_url"), source_url)
+        items.append(
+            _with_source_isbn(
+                {
+                    "title": title[:500],
+                    "author": author[:300],
+                    "description": _clean_text(book.get("description", "")),
+                    "cover_url": safe_cover_url(book.get("book_image", ""), source_url),
+                    "source_url": source,
+                    "release_date": _date_value(book.get("published_date")),
+                    "genres": [str(book.get("list_name", "")).strip()] if book.get("list_name") else [],
+                },
+                [
+                    book.get("primary_isbn13"),
+                    book.get("primary_isbn10"),
+                    book.get("isbn13"),
+                    book.get("isbn10"),
+                    book.get("isbn"),
+                ],
+            )
+        )
     return items
 
 
@@ -791,16 +830,25 @@ def _merge_book_item(items, item, source_url):
     title = _clean_text(item.get("title"), 500)
     if not title:
         return
+    item_source_url = metadata_url(item.get("source_url"), source_url)
+    isbn13, isbn10 = isbn_parts_from_source(
+        [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+        item_source_url,
+    )
     normalized = {
         "title": title,
         "author": _clean_text(item.get("author") or "Unknown author", 300),
         "description": _clean_text(item.get("description"), 4000),
         "cover_url": item.get("cover_url", "") or "",
-        "source_url": metadata_url(item.get("source_url"), source_url),
+        "source_url": item_source_url,
         "release_date": item.get("release_date"),
         "date_kind": item.get("date_kind", "") or "",
         "genres": list(item.get("genres") or [])[:8],
     }
+    if isbn13:
+        normalized["isbn13"] = isbn13
+    if isbn10:
+        normalized["isbn10"] = isbn10
     title_key = normalize_key(title, "")
     author_key = normalize_key(normalized["author"], "")
     unknown_authors = {"", normalize_key("Unknown author", "")}
@@ -824,7 +872,7 @@ def _merge_book_item(items, item, source_url):
             continue
         existing_precision = {"year": 1, "month": 2, "day": 3}.get(existing.get("date_kind", ""), 0)
         incoming_precision = {"year": 1, "month": 2, "day": 3}.get(normalized.get("date_kind", ""), 0)
-        for field in ("description", "cover_url"):
+        for field in ("description", "cover_url", "isbn13", "isbn10"):
             if not existing.get(field) and normalized.get(field):
                 existing[field] = normalized[field]
         if normalized.get("release_date") and (
@@ -860,6 +908,9 @@ def _parse_jsonld_books(payloads, source_url):
                     "description": _schema_text(value.get("description"), 4000),
                     "cover_url": safe_cover_url(urljoin(source_url, image), source_url) if image else "",
                     "source_url": _book_metadata_url(value.get("url") or value.get("sameAs") or value.get("@id"), source_url),
+                    "isbn13": value.get("isbn13"),
+                    "isbn10": value.get("isbn10"),
+                    "isbn": value.get("isbn"),
                     "release_date": release_date,
                     "date_kind": date_kind,
                     "genres": _schema_genres(value),
@@ -1053,7 +1104,19 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         feed = feedparser.parse(content)
         if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
-        return [{"title": str(e.get("title", ""))[:500], "author": str(e.get("author", "Unknown author"))[:300], "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000], "source_url": metadata_url(e.get("link"), source_url)} for e in feed.entries[:settings.source_max_items] if e.get("title")]
+        return [
+            _with_source_isbn(
+                {
+                    "title": str(e.get("title", ""))[:500],
+                    "author": str(e.get("author", "Unknown author"))[:300],
+                    "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000],
+                    "source_url": metadata_url(e.get("link"), source_url),
+                },
+                [e.get(key) for key in ("isbn13", "isbn10", "isbn")],
+            )
+            for e in feed.entries[:settings.source_max_items]
+            if e.get("title")
+        ]
     payloads = []
     soup = None
     if "json" in content_type or "javascript" in content_type:
@@ -1201,15 +1264,52 @@ async def scan_source(source):
         for item in items:
             key = normalize_key(item["title"], item.get("author", "Unknown author"))
             seen.append(key)
-            con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,normalized_key)
-            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
+            isbn13, isbn10 = isbn_parts_from_source(
+                [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+                item.get("source_url", source["url"]),
+            )
+            existing = con.execute(
+                "SELECT id,isbn13,isbn10 FROM candidates WHERE normalized_key=?",
+                (key,),
+            ).fetchone()
+            con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
             description=CASE WHEN length(excluded.description)>length(description) THEN excluded.description ELSE description END,
             cover_url=CASE WHEN length(excluded.cover_url)>0 THEN excluded.cover_url ELSE cover_url END,
             source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
             release_date=COALESCE(excluded.release_date, release_date),
             date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
             genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), json.dumps(item.get("genres", [])), key))
+            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
+            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
+            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), json.dumps(item.get("genres", [])), isbn13, isbn10, key))
+            candidate = con.execute(
+                "SELECT id,isbn13,isbn10 FROM candidates WHERE normalized_key=?",
+                (key,),
+            ).fetchone()
+            if candidate and (isbn13 or isbn10):
+                con.execute(
+                    """UPDATE candidate_quality SET
+                        isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
+                        isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE candidate_id=?""",
+                    (isbn13, isbn10, candidate["id"]),
+                )
+            isbn_added = bool(
+                (isbn13 and not (existing["isbn13"] if existing else ""))
+                or (isbn10 and not (existing["isbn10"] if existing else ""))
+            )
+            if existing and isbn_added:
+                # A newly discovered ISBN is evidence for a retry, not proof
+                # of identity. Requeue only quarantined rows; accepted rows
+                # remain untouched and therefore cannot change ranking here.
+                con.execute(
+                    """UPDATE candidate_quality SET quality_status='pending',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE candidate_id=? AND quality_status='quarantine'""",
+                    (candidate["id"],),
+                )
         if seen:
             placeholders = ",".join("?" for _ in seen)
             con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
