@@ -4,6 +4,11 @@ import { engine, EngineError } from "$lib/server/engine";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 
+type SourceFilters = {
+  include_genres: string[];
+  exclude_genres: string[];
+};
+
 type Overview = {
   recommendation_run_id?: string;
   recommendations: Array<{
@@ -36,6 +41,7 @@ type Overview = {
     kind: string;
     is_default: number;
     lifecycle: "permanent" | "one_time";
+    filters: SourceFilters;
     last_status: string | null;
     last_scanned_at: string | null;
   }>;
@@ -272,6 +278,23 @@ const normalizeLlmRuns = (runs: Array<Record<string, unknown>>): LlmRunSummary[]
   });
 
 const formText = (data: FormData, key: string) => String(data.get(key) ?? "").trim();
+const sourceGenreList = (value: FormDataEntryValue | null) => {
+  const seen = new Set<string>();
+  return String(value ?? "")
+    .split(",")
+    .map((item) => item.trim().replace(/\s+/g, " ").slice(0, 80))
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (!item || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 12);
+};
+const sourceFiltersFromForm = (data: FormData): SourceFilters => ({
+  include_genres: sourceGenreList(data.get("includeGenres")),
+  exclude_genres: sourceGenreList(data.get("excludeGenres")),
+});
 const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
@@ -557,16 +580,19 @@ export const actions: Actions = {
       .enum(["permanent", "one_time"])
       .catch("permanent")
       .parse(data.get("lifecycle"));
+    const filters = sourceFiltersFromForm(data);
     if (!url.success || !label.success)
       return fail(400, { message: "Add a valid name and public URL." });
     try {
       const preview = await engine<{ count: number }>("/api/sources/preview", {
         method: "POST",
-        body: JSON.stringify({ url: url.data }),
+        body: JSON.stringify({ url: url.data, filters }),
       });
       if (preview.count === 0)
         return fail(400, {
-          message: "No recognizable books were found at that URL.",
+          message: filters.include_genres.length || filters.exclude_genres.length
+            ? "No books matched these filters."
+            : "No recognizable books were found at that URL.",
         });
       await engine("/api/sources", {
         method: "POST",
@@ -574,11 +600,27 @@ export const actions: Actions = {
           name: label.data,
           url: url.data,
           lifecycle,
+          filters,
         }),
       });
       return {
         message: `${lifecycle === "one_time" ? "One-time import" : "Permanent source"} added; its first scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`,
       };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  configureSourceFilters: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    const filters = sourceFiltersFromForm(data);
+    try {
+      await engine(`/api/sources/${id.data}`, {
+        method: "PUT",
+        body: JSON.stringify({ filters }),
+      });
+      return { message: "Source filters updated; a fresh scan is queued." };
     } catch (error) {
       return fail(status(error), { message: message(error) });
     }

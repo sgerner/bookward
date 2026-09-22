@@ -31,6 +31,82 @@ EDITORIAL_SOURCE_HOSTS = frozenset(
     {"andrewliptak.com", "www.andrewliptak.com", "transfer-orbit.ghost.io"}
 )
 SOURCE_MAX_REDIRECTS = 4
+SOURCE_FILTER_MAX_GENRES = 12
+SOURCE_FILTER_GENRE_MAX_LENGTH = 80
+
+
+def _filter_genre_values(value):
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        return []
+    values = []
+    seen = set()
+    for raw in value:
+        genre = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not genre:
+            continue
+        genre = genre[:SOURCE_FILTER_GENRE_MAX_LENGTH]
+        key = genre.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(genre)
+        if len(values) >= SOURCE_FILTER_MAX_GENRES:
+            break
+    return values
+
+
+def normalize_source_filters(value):
+    """Return the small, forward-compatible filter shape stored per source."""
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = {}
+    if not isinstance(value, dict):
+        value = {}
+    return {
+        "include_genres": _filter_genre_values(value.get("include_genres")),
+        "exclude_genres": _filter_genre_values(value.get("exclude_genres")),
+    }
+
+
+def _genre_matches(wanted, available):
+    wanted = re.sub(r"\s+", " ", str(wanted or "")).strip().casefold()
+    available = re.sub(r"\s+", " ", str(available or "")).strip().casefold()
+    return bool(wanted and available and (wanted == available or wanted in available or available in wanted))
+
+
+def filter_source_items(items, filters):
+    """Apply optional genre filters without losing untagged source records.
+
+    Generic pages often omit genre metadata. Those records remain eligible so
+    enabling a filter cannot make an otherwise valid source silently disappear.
+    """
+
+    configured = normalize_source_filters(filters)
+    include = configured["include_genres"]
+    exclude = configured["exclude_genres"]
+    if not include and not exclude:
+        return list(items)
+    filtered = []
+    for item in items:
+        genres = item.get("genres") or []
+        if isinstance(genres, str):
+            try:
+                genres = json.loads(genres)
+            except (TypeError, ValueError):
+                genres = [genres]
+        genres = [str(genre) for genre in genres if str(genre).strip()]
+        if genres:
+            if include and not any(_genre_matches(wanted, genre) for wanted in include for genre in genres):
+                continue
+            if exclude and any(_genre_matches(blocked, genre) for blocked in exclude for genre in genres):
+                continue
+        filtered.append(item)
+    return filtered
 
 
 def _clean_text(value, limit=4000):
@@ -1252,12 +1328,21 @@ async def refresh_missing_candidate_covers():
 
     return await refresh_missing_candidate_metadata()
 
-async def preview_source(url):
+async def preview_source(url, filters=None):
     content_type, items = await _fetch_and_parse_source(url)
-    return {"url": url, "content_type": content_type, "count": len(items), "sample": items[:5]}
+    filtered = filter_source_items(items, filters)
+    return {
+        "url": url,
+        "content_type": content_type,
+        "count": len(filtered),
+        "raw_count": len(items),
+        "sample": filtered[:5],
+    }
 
 async def scan_source(source):
     _, items = await _fetch_and_parse_source(source["url"])
+    raw_count = len(items)
+    items = filter_source_items(items, source.get("filters"))
     items = await enrich_book_metadata(items)
     with transaction() as con:
         seen = []
@@ -1313,6 +1398,11 @@ async def scan_source(source):
         if seen:
             placeholders = ",".join("?" for _ in seen)
             con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
+        elif raw_count:
+            con.execute(
+                "DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended')",
+                (source["id"],),
+            )
         # An empty response can be a transient block page, parser mismatch,
         # or upstream outage. It is not safe to interpret it as proof that a
         # source no longer contains any books, so retain existing candidates.

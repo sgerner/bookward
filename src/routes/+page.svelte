@@ -1548,6 +1548,48 @@
                             <span class="mt-1 block text-xs text-surface-600-400"
                               >{source.lifecycle === "one_time" ? "One-time import" : "Permanent feed"} · {formatSourceScan(source.last_scanned_at, source.last_status)}</span
                             >
+                            <details class="mt-3 max-w-xl">
+                              <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
+                                  ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
+                                  : ""}
+                              </summary>
+                              <form
+                                class="mt-3 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                method="POST"
+                                action="?/configureSourceFilters"
+                                use:enhance={setPending(`source-filters-${source.id}`)}
+                              >
+                                <input type="hidden" name="id" value={source.id} />
+                                <label class="block text-xs font-medium text-surface-800-200">
+                                  Include genres
+                                  <input
+                                    class="input mt-1 text-sm"
+                                    name="includeGenres"
+                                    value={source.filters.include_genres.join(", ")}
+                                    placeholder="science fiction, fantasy"
+                                  />
+                                </label>
+                                <label class="block text-xs font-medium text-surface-800-200">
+                                  Exclude genres
+                                  <input
+                                    class="input mt-1 text-sm"
+                                    name="excludeGenres"
+                                    value={source.filters.exclude_genres.join(", ")}
+                                    placeholder="romance, cookbook"
+                                  />
+                                </label>
+                                <p class="text-xs leading-5 text-surface-600-400">
+                                  Separate genres with commas. Untagged books remain eligible.
+                                </p>
+                                <button
+                                  class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                  type="submit"
+                                  disabled={isPending(`source-filters-${source.id}`)}
+                                  aria-busy={isPending(`source-filters-${source.id}`)}
+                                >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                              </form>
+                            </details>
                           </div>
                           <form
                             method="POST"
@@ -1680,6 +1722,32 @@
                       <option value="permanent">Permanent feed · keep it fresh</option>
                       <option value="one_time">One-time import · scan once</option>
                     </select></label
+                  ><details class="mt-4 border-l-2 border-tertiary-500/30 pl-3">
+                    <summary class="cursor-pointer text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
+                      Optional filters
+                    </summary>
+                    <div class="mt-3 space-y-3">
+                      <label class="block text-xs font-medium text-surface-800-200">
+                        Include genres
+                        <input
+                          class="input mt-1 text-sm"
+                          name="includeGenres"
+                          placeholder="science fiction, fantasy"
+                        />
+                      </label>
+                      <label class="block text-xs font-medium text-surface-800-200">
+                        Exclude genres
+                        <input
+                          class="input mt-1 text-sm"
+                          name="excludeGenres"
+                          placeholder="romance, cookbook"
+                        />
+                      </label>
+                      <p class="text-xs leading-5 text-surface-600-400">
+                        Comma-separated. Books without genre tags remain eligible.
+                      </p>
+                    </div>
+                  </details
                   ><button
                     class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                     type="submit"

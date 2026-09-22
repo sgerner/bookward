@@ -321,6 +321,12 @@ MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS idx_candidates_isbn10 ON candidates(isbn10);
         """,
     ),
+    (
+        11,
+        """
+        ALTER TABLE sources ADD COLUMN filters TEXT NOT NULL DEFAULT '{}';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

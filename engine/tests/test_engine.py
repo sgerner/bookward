@@ -27,7 +27,9 @@ from afterword_engine.ingestion import (
     enrich_book_metadata,
     enrich_goodreads_blog_items,
     fetch_bytes,
+    filter_source_items,
     import_goodreads_csv,
+    normalize_source_filters,
     parse_book_items,
     scan_source,
 )
@@ -489,6 +491,57 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
 
 
+def test_source_filters_match_genres_and_keep_untagged_books():
+    items = [
+        {"title": "Fantasy book", "genres": ["Fantasy"]},
+        {"title": "Romance book", "genres": ["Romance"]},
+        {"title": "Untagged book", "genres": []},
+    ]
+    filters = normalize_source_filters(
+        {"include_genres": ["fantasy"], "exclude_genres": ["romance"]}
+    )
+    assert filters == {"include_genres": ["fantasy"], "exclude_genres": ["romance"]}
+    assert [item["title"] for item in filter_source_items(items, filters)] == [
+        "Fantasy book",
+        "Untagged book",
+    ]
+
+
+def test_scan_source_applies_filters_and_removes_stale_unmatched_candidates(database, monkeypatch):
+    async def fake_fetch(_url):
+        return "application/json", [
+            {"title": "Keep fantasy", "author": "A Writer", "genres": ["Fantasy"]},
+            {"title": "Drop romance", "author": "A Writer", "genres": ["Romance"]},
+            {"title": "Keep untagged", "author": "A Writer", "genres": []},
+        ]
+
+    async def no_enrichment(items):
+        return items
+
+    monkeypatch.setattr("afterword_engine.ingestion._fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.enrich_book_metadata", no_enrichment)
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO sources(name,url,filters) VALUES(?,?,?)",
+            (
+                "Filtered source",
+                "https://example.com/filtered",
+                json.dumps({"include_genres": ["fantasy"]}),
+            ),
+        )
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
+            ("Stale book", "A Writer", cursor.lastrowid, "new", "stale book a writer"),
+        )
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 2
+    assert row("SELECT id FROM candidates WHERE title='Keep fantasy'")
+    assert row("SELECT id FROM candidates WHERE title='Keep untagged'")
+    assert row("SELECT id FROM candidates WHERE title='Drop romance'") is None
+    assert row("SELECT id FROM candidates WHERE title='Stale book'") is None
+
+
 def test_scan_source_persists_source_isbn_and_quality_evidence(database, monkeypatch):
     async def fake_fetch(_url):
         return "application/json", [
@@ -763,6 +816,41 @@ def test_api_boots_and_serves_recommendations(database):
         saved = client.post("/api/recommendations/1/feedback", json={"action":"save"})
         assert saved.json()["status"] == "saved"
         assert client.put("/api/sources/99999/toggle").status_code == 404
+        with transaction() as con:
+            cursor = con.execute(
+                "INSERT INTO sources(name,url,enabled) VALUES(?,?,0)",
+                ("Filter API", "https://example.com/filter-api"),
+            )
+            source_id = cursor.lastrowid
+        updated = client.put(
+            f"/api/sources/{source_id}",
+            json={
+                "filters": {
+                    "include_genres": ["Fantasy", "fantasy"],
+                    "exclude_genres": ["Romance"],
+                }
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["filters"] == {
+            "include_genres": ["Fantasy"],
+            "exclude_genres": ["Romance"],
+        }
+        source = next(
+            item for item in client.get("/api/overview").json()["sources"]
+            if item["id"] == source_id
+        )
+        assert source["filters"] == updated.json()["filters"]
+        token = client.post(
+            "/api/settings/api-tokens", json={"name": "Source filter test"}
+        ).json()["token"]
+        assert next(
+            item
+            for item in client.get(
+                "/api/v1/sources", headers={"Authorization": f"Bearer {token}"}
+            ).json()
+            if item["id"] == source_id
+        )["filters"] == updated.json()["filters"]
         invalid = client.put("/api/settings", json={"embedding_backend":"not-real","embedding_model":"x"})
         assert invalid.status_code == 400
         schedule = client.put("/api/sources/schedule", json={"interval_hours": 168})
@@ -1089,7 +1177,7 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 11
     assert row(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
@@ -1117,12 +1205,12 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
         )
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 11
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
     assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 11
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
 
 
