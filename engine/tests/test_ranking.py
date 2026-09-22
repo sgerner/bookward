@@ -62,3 +62,16 @@ def test_formula_parity_no_negative_neighbors_and_zero_vectors_stay_finite():
     zero = rank_candidates([], np.empty((0, 2)), [book(3, "Zero", "New")], np.asarray([[0.0, 0.0]]))[0]
     assert zero["score"] == 54.0
     assert np.isfinite(zero["score"])
+
+
+def test_kernel_rating_ramps_in_for_short_history():
+    reads = [book(1, "Loved", "A", 5), book(2, "Disliked", "B", 1)]
+    candidates = [book(3, "Near loved", "C"), book(4, "Near disliked", "D")]
+    ranked = rank_candidates(reads, [[1, 0], [0, 1]], candidates, [[1, 0], [0, 1]])
+    assert [item["score"] for item in ranked] == [97.4, 10.6]
+
+
+def test_kernel_does_not_infer_a_rating_without_positive_similarity():
+    reads = [book(i, f"Read {i}", "Writer", 5 if i < 41 else 1) for i in range(1, 42)]
+    result = rank_candidates(reads, [[1, 0]] * len(reads), [book(50, "Orthogonal", "New")], [[0, 1]])
+    assert result[0]["score"] == 42.0
