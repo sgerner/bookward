@@ -296,6 +296,7 @@ def build_client(
     api_key: str,
     *,
     auth_type: str = "api_key",
+    reasoning_effort: str | None = None,
     timeout: float | None = None,
 ) -> BaseLLMClient:
     provider = provider_id.strip().lower()
@@ -315,11 +316,11 @@ def build_client(
     if is_openai_codex_auth(auth_type):
         if provider != "openai":
             raise ValueError("OpenAI Codex auth requires the openai provider")
-        return CodexSubscriptionClient(model, timeout=timeout)
+        return CodexSubscriptionClient(model, reasoning_effort=reasoning_effort, timeout=timeout)
     if is_claude_code_auth(auth_type):
         if provider != "anthropic":
             raise ValueError("Claude Code auth requires the anthropic provider")
-        return ClaudeCodeSubscriptionClient(model, api_key, timeout=timeout)
+        return ClaudeCodeSubscriptionClient(model, api_key, reasoning_effort=reasoning_effort, timeout=timeout)
     if provider == "openai":
         url = validate_endpoint(endpoint, default="https://api.openai.com/v1")
         return OpenAIResponsesClient(url, model, api_key, timeout=timeout)

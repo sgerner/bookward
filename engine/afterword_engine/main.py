@@ -40,6 +40,7 @@ from .llm_subscriptions import (
     AUTH_TYPE_API_KEY,
     AUTH_TYPE_CLAUDE_CODE,
     AUTH_TYPE_OPENAI_CODEX,
+    SUBSCRIPTION_REASONING_LEVELS,
     codex_login_manager,
     normalize_auth_type,
 )
@@ -464,6 +465,11 @@ class LLMPolicyIn(BaseModel):
     top_k: int = Field(default=20, ge=1, le=100)
     prompt_version: str = Field(default="shadow-v1", min_length=1, max_length=100)
     enabled: bool = True
+
+
+class LLMPolicySettingsIn(BaseModel):
+    model_id: str = Field(min_length=1, max_length=300)
+    reasoning_effort: str = Field(default="medium", min_length=1, max_length=30, pattern=r"^[A-Za-z0-9_-]+$")
 
 class EngineSettings(BaseModel):
     embedding_backend: str = "local"
@@ -1258,7 +1264,7 @@ async def llm_catalog(refresh: bool = Query(default=False)):
         raise HTTPException(503, str(exc)) from exc
 
 
-def _ensure_openai_subscription_connection() -> tuple[dict[str, Any], dict[str, Any]]:
+def _ensure_openai_subscription_connection(default_model: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Provision the ChatGPT subscription connection after device auth.
 
     Device login is account-level, while the shadow runner still needs a
@@ -1273,12 +1279,19 @@ def _ensure_openai_subscription_connection() -> tuple[dict[str, Any], dict[str, 
         (AUTH_TYPE_OPENAI_CODEX,),
     )
     if connection:
+        updates: list[str] = []
+        values: list[Any] = []
         if not connection["enabled"]:
+            updates.append("enabled=1")
+        # The original device-login implementation used the API-only gpt-5
+        # placeholder.  Repair that value once a live account model catalog is
+        # available, while preserving an explicit user selection thereafter.
+        if default_model and connection["model_id"] == "gpt-5":
+            updates.append("model_id=?")
+            values.append(default_model)
+        if updates:
             with transaction() as con:
-                con.execute(
-                    "UPDATE llm_connections SET enabled=1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (connection["id"],),
-                )
+                con.execute(f"UPDATE llm_connections SET {', '.join(updates)},updated_at=CURRENT_TIMESTAMP WHERE id=?", (*values, connection["id"]))
             connection = row("SELECT * FROM llm_connections WHERE id=?", (connection["id"],))
     else:
         with transaction() as con:
@@ -1289,7 +1302,7 @@ def _ensure_openai_subscription_connection() -> tuple[dict[str, Any], dict[str, 
                 (
                     "ChatGPT subscription",
                     "openai",
-                    "gpt-5",
+                    default_model or "gpt-5.6-terra",
                     "https://api.openai.com/v1",
                     AUTH_TYPE_OPENAI_CODEX,
                     "",
@@ -1303,17 +1316,37 @@ def _ensure_openai_subscription_connection() -> tuple[dict[str, Any], dict[str, 
     return safe_connection, safe_policy
 
 
+def _openai_subscription_models(manager) -> list[dict[str, Any]]:
+    try:
+        return manager.models()
+    except Exception:
+        return []
+
+
 @app.get("/api/llm/openai/device/status")
 @app.get("/api/llm/subscriptions/openai/device/status")
 @app.get("/api/llm/openai/device-code/status")
 @app.get("/api/llm/subscriptions/openai/device-code/status")
 def openai_device_login_status():
-    status = codex_login_manager().status()
+    manager = codex_login_manager()
+    status = manager.status()
     if status.get("authenticated"):
-        connection, policy = _ensure_openai_subscription_connection()
+        models = _openai_subscription_models(manager)
+        status["models"] = models
+        default_model = next((item["id"] for item in models if item.get("isDefault") is True), None)
+        connection, policy = _ensure_openai_subscription_connection(default_model)
         status["connection"] = connection
         status["policy"] = policy
     return status
+
+
+@app.get("/api/llm/openai/models")
+@app.get("/api/llm/subscriptions/openai/models")
+def openai_subscription_models():
+    try:
+        return {"models": codex_login_manager().models()}
+    except Exception as exc:
+        raise HTTPException(503, "OpenAI subscription models are unavailable") from exc
 
 
 @app.post("/api/llm/openai/device/start")
@@ -1325,7 +1358,10 @@ def openai_device_login_start():
         manager = codex_login_manager()
         current = manager.status()
         if current.get("authenticated"):
-            connection, policy = _ensure_openai_subscription_connection()
+            models = _openai_subscription_models(manager)
+            current["models"] = models
+            default_model = next((item["id"] for item in models if item.get("isDefault") is True), None)
+            connection, policy = _ensure_openai_subscription_connection(default_model)
             current["connection"] = connection
             current["policy"] = policy
             return current
@@ -1496,6 +1532,33 @@ def update_llm_policy(policy_id: int, payload: LLMPolicyIn):
         con.execute(
             "UPDATE llm_policies SET name=?,connection_id=?,enabled=?,top_k=?,prompt_version=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (payload.name.strip(), payload.connection_id, int(payload.enabled), payload.top_k, payload.prompt_version.strip(), policy_id),
+        )
+    return {"id": policy_id, "policy": next(item for item in safe_policies() if item["id"] == policy_id)}
+
+
+@app.put("/api/llm/policies/{policy_id}/settings")
+def update_llm_policy_settings(policy_id: int, payload: LLMPolicySettingsIn):
+    policy = row(
+        "SELECT p.id,p.connection_id,c.auth_type,c.provider_id "
+        "FROM llm_policies p JOIN llm_connections c ON c.id=p.connection_id WHERE p.id=?",
+        (policy_id,),
+    )
+    if not policy:
+        raise HTTPException(404, "LLM policy not found")
+    auth_type = normalize_auth_type(policy["auth_type"])
+    if auth_type not in {AUTH_TYPE_OPENAI_CODEX, AUTH_TYPE_CLAUDE_CODE}:
+        raise HTTPException(400, "Model and reasoning settings are only available for subscription connections")
+    effort = payload.reasoning_effort.strip().lower()
+    if effort not in SUBSCRIPTION_REASONING_LEVELS:
+        raise HTTPException(400, "Choose a supported reasoning level")
+    with transaction() as con:
+        con.execute(
+            "UPDATE llm_connections SET model_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.model_id.strip(), policy["connection_id"]),
+        )
+        con.execute(
+            "UPDATE llm_policies SET reasoning_effort=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (effort, policy_id),
         )
     return {"id": policy_id, "policy": next(item for item in safe_policies() if item["id"] == policy_id)}
 

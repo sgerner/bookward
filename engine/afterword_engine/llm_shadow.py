@@ -45,8 +45,8 @@ def _backfill_default_shadow_policies() -> None:
 def safe_policies() -> list[dict[str, Any]]:
     _backfill_default_shadow_policies()
     return rows(
-        "SELECT p.id,p.name,p.connection_id,p.enabled,p.top_k,p.prompt_version,"
-        "p.created_at,p.updated_at,c.name connection_name,c.provider_id,c.model_id "
+        "SELECT p.id,p.name,p.connection_id,p.enabled,p.top_k,p.prompt_version,p.reasoning_effort,"
+        "p.created_at,p.updated_at,c.name connection_name,c.provider_id,c.model_id,c.auth_type "
         "FROM llm_policies p JOIN llm_connections c ON c.id=p.connection_id "
         "ORDER BY p.updated_at DESC,p.id DESC"
     )
@@ -67,19 +67,19 @@ def ensure_default_shadow_policy(connection_id: int, *, name: str | None = None)
     policy_name = (name or f"{connection['name']} shadow ranking").strip()[:100]
     with transaction() as con:
         existing = con.execute(
-            "SELECT id,name,connection_id,enabled,top_k,prompt_version,created_at,updated_at "
+            "SELECT id,name,connection_id,enabled,top_k,prompt_version,reasoning_effort,created_at,updated_at "
             "FROM llm_policies WHERE connection_id=? ORDER BY id LIMIT 1",
             (connection_id,),
         ).fetchone()
         if existing:
             return dict(existing)
         cursor = con.execute(
-            "INSERT INTO llm_policies(name,connection_id,enabled,top_k,prompt_version) VALUES(?,?,?,?,?)",
-            (policy_name, connection_id, 1, DEFAULT_SHADOW_TOP_K, DEFAULT_SHADOW_PROMPT_VERSION),
+            "INSERT INTO llm_policies(name,connection_id,enabled,top_k,prompt_version,reasoning_effort) VALUES(?,?,?,?,?,?)",
+            (policy_name, connection_id, 1, DEFAULT_SHADOW_TOP_K, DEFAULT_SHADOW_PROMPT_VERSION, "medium"),
         )
         policy_id = cursor.lastrowid
     return row(
-        "SELECT id,name,connection_id,enabled,top_k,prompt_version,created_at,updated_at "
+        "SELECT id,name,connection_id,enabled,top_k,prompt_version,reasoning_effort,created_at,updated_at "
         "FROM llm_policies WHERE id=?",
         (policy_id,),
     )
@@ -139,7 +139,7 @@ async def run_shadow_policy(policy_id: int) -> dict[str, Any]:
     reads = _read_rows()
     prompt = build_prompt(reads, candidates)
     candidate_hash = _hash_payload([{"id": item["id"], "score": item["score"], "title": item["title"], "author": item["author"], "description": item["description"], "genres": item["genres"]} for item in candidates])
-    request_hash = _hash_payload({"policy": policy["id"], "prompt_version": policy["prompt_version"], "provider": policy["provider_id"], "model": policy["model_id"], "prompt": prompt})
+    request_hash = _hash_payload({"policy": policy["id"], "prompt_version": policy["prompt_version"], "provider": policy["provider_id"], "model": policy["model_id"], "reasoning_effort": policy["reasoning_effort"], "prompt": prompt})
     cached = row(
         "SELECT id FROM llm_runs WHERE request_hash=? AND status='complete' ORDER BY created_at DESC LIMIT 1",
         (request_hash,),
@@ -162,6 +162,7 @@ async def run_shadow_policy(policy_id: int) -> dict[str, Any]:
             policy["endpoint"],
             secret,
             auth_type=policy["auth_type"],
+            reasoning_effort=policy["reasoning_effort"],
         )
         result = await client.rank(prompt, {int(item["id"]) for item in candidates})
         latency_ms = round((time.perf_counter() - started) * 1000)
