@@ -66,6 +66,7 @@
   let searchInput = $state<HTMLInputElement | null>(null);
   let detailsId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
+  const FORM_NOTIFICATION_DISMISS_MS = 5000;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
@@ -101,6 +102,7 @@
   let digestEmailOverride = $state<boolean | null>(null);
   let apiTokenCopyMessage = $state<string | null>(null);
   let revealedApiToken = $state<string | null>(null);
+  let formNotificationDismissed = $state(false);
   const telemetry = createTelemetryClient();
 
   const navItems: NavItem[] = [
@@ -230,6 +232,25 @@
   ]);
   const formState = $derived((form ?? null) as FormState);
   const formIsError = $derived(Boolean(formState?.error));
+
+  $effect(() => {
+    // Read the prop itself so identical messages from separate submissions
+    // still restart the notification timer.
+    const currentForm = form as FormState;
+    const message = currentForm?.message;
+    formNotificationDismissed = false;
+    if (!message) return;
+
+    const dismissTimer = setTimeout(
+      () => {
+        formNotificationDismissed = true;
+      },
+      currentForm?.error
+        ? FORM_NOTIFICATION_DISMISS_MS + 1500
+        : FORM_NOTIFICATION_DISMISS_MS,
+    );
+    return () => clearTimeout(dismissTimer);
+  });
 
   function readView(value: string | null): View {
     return value && ["discover", "saved", "sources", "settings"].includes(value)
@@ -880,7 +901,7 @@
     class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
     <div id="main-content" role="main" class="min-w-0 flex-1">
-      {#if formState?.message}{#key formState.message}<div
+      {#if formState?.message && !formNotificationDismissed}{#key formState.message}<div
             in:fly={{ y: -12, duration: motionDuration(240) }}
             out:fade={{ duration: motionDuration(140) }}
             class={`mb-6 flex items-start gap-3 border p-4 text-sm ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
