@@ -8,6 +8,10 @@ from .identity import book_identity
 
 
 _BATCH_SIZE = 64
+_KERNEL_NEIGHBORS = 40
+_KERNEL_POWER = 8
+_KERNEL_SCORE_PER_STAR = 10
+_KERNEL_FULL_HISTORY = 100
 
 
 def _matrix(vectors: Sequence[Sequence[float]], dimensions: int | None = None) -> np.ndarray:
@@ -67,6 +71,7 @@ def rank_candidates(
     positives = [(item, vector) for item, vector in history if float(item.get("rating") or 0) >= 4]
     negatives = [(item, vector) for item, vector in history if 0 < float(item.get("rating") or 0) <= 2]
     all_ratings = history
+    rating_values = np.asarray([float(item.get("rating") or 0) for item, _ in all_ratings], dtype=np.float64)
     pos_matrix = np.stack([v for _, v in positives]) if positives else np.empty((0, dimensions), dtype=np.float32)
     neg_matrix = np.stack([v for _, v in negatives]) if negatives else np.empty((0, dimensions), dtype=np.float32)
     all_matrix = np.stack([v for _, v in all_ratings]) if all_ratings else np.empty((0, dimensions), dtype=np.float32)
@@ -94,13 +99,21 @@ def rank_candidates(
             else:
                 author_delta = 0.0
             if all_sim.shape[1] and np.any(all_sim[offset] > 0):
-                count = min(5, all_sim.shape[1])
-                indices = np.argsort(-all_sim[offset], kind="stable")[:count]
-                weights = np.maximum(all_sim[offset, indices], 0) + 1e-4
-                local_rating = float(np.dot(weights, [float(all_ratings[i][0].get("rating") or 0) for i in indices]) / weights.sum())
+                neighbors = np.argsort(-all_sim[offset], kind="stable")[:min(_KERNEL_NEIGHBORS, all_sim.shape[1])]
+                similarities = np.maximum(all_sim[offset, neighbors].astype(np.float64), 0)
+                kernel_weights = (similarities + 1e-8) ** _KERNEL_POWER
+                kernel_rating = float(np.dot(kernel_weights, rating_values[neighbors]) / kernel_weights.sum())
+                local = neighbors[:min(5, len(neighbors))]
+                weights = np.maximum(all_sim[offset, local], 0) + 1e-4
+                local_rating = float(np.dot(weights, rating_values[local]) / weights.sum())
             else:
                 local_rating = 3.0
+                kernel_rating = global_mean
             score = 42 + 48 * float(positive_top[offset]) - 24 * float(negative_max[offset]) + 3.5 * (local_rating - 3) + 3.5 * author_delta
+            # The historical comparison begins at 100 reads. Ramp in the new
+            # term for smaller libraries, where one neighbor is weak evidence.
+            kernel_strength = _KERNEL_SCORE_PER_STAR * min(1.0, len(all_ratings) / _KERNEL_FULL_HISTORY)
+            score += kernel_strength * (kernel_rating - global_mean)
             score += (float(candidate.get("source_weight") or 1) - 1) * 5
             score = max(0.0, min(100.0, score))
             explanation: list[str] = []
