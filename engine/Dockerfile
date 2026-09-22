@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 COPY afterword_engine ./afterword_engine
 RUN pip install --no-cache-dir .
 RUN useradd --create-home --uid 10001 afterword \
+    && mkdir -p /data \
     && chown -R afterword:afterword /app /data
 USER afterword
 VOLUME ["/data"]
