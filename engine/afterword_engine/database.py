@@ -134,73 +134,6 @@ MIGRATIONS = [
         """,
     ),
     (
-        6,
-        """
-        CREATE TABLE IF NOT EXISTS llm_connections (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            provider_id TEXT NOT NULL,
-            model_id TEXT NOT NULL,
-            endpoint TEXT NOT NULL DEFAULT '',
-            auth_type TEXT NOT NULL DEFAULT 'api_key',
-            secret TEXT NOT NULL DEFAULT '',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_status TEXT,
-            last_error TEXT,
-            last_used_at TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CHECK(auth_type IN ('api_key','openai_codex','claude_code'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_llm_connections_enabled
-            ON llm_connections(enabled, updated_at DESC);
-        CREATE TABLE IF NOT EXISTS llm_policies (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
-            enabled INTEGER NOT NULL DEFAULT 1,
-            top_k INTEGER NOT NULL DEFAULT 20,
-            prompt_version TEXT NOT NULL DEFAULT 'shadow-v1',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CHECK(top_k BETWEEN 1 AND 100)
-        );
-        CREATE INDEX IF NOT EXISTS idx_llm_policies_enabled
-            ON llm_policies(enabled, updated_at DESC);
-        CREATE TABLE IF NOT EXISTS llm_runs (
-            id TEXT PRIMARY KEY,
-            policy_id INTEGER NOT NULL REFERENCES llm_policies(id),
-            connection_id INTEGER NOT NULL REFERENCES llm_connections(id),
-            request_hash TEXT NOT NULL,
-            candidate_hash TEXT NOT NULL,
-            status TEXT NOT NULL,
-            candidate_count INTEGER NOT NULL DEFAULT 0,
-            latency_ms INTEGER,
-            input_tokens INTEGER,
-            output_tokens INTEGER,
-            error TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            finished_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_llm_runs_policy_created
-            ON llm_runs(policy_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_llm_runs_request
-            ON llm_runs(request_hash, created_at DESC);
-        CREATE TABLE IF NOT EXISTS llm_scores (
-            run_id TEXT NOT NULL REFERENCES llm_runs(id) ON DELETE CASCADE,
-            candidate_id INTEGER NOT NULL REFERENCES candidates(id),
-            rank INTEGER NOT NULL,
-            score REAL NOT NULL,
-            confidence REAL,
-            reason_codes TEXT NOT NULL DEFAULT '[]',
-            PRIMARY KEY(run_id, candidate_id),
-            UNIQUE(run_id, rank)
-        );
-        CREATE INDEX IF NOT EXISTS idx_llm_scores_candidate
-            ON llm_scores(candidate_id, run_id);
-        """,
-    ),
-    (
         7,
         """
         CREATE TABLE IF NOT EXISTS association_runs (
@@ -300,19 +233,6 @@ MIGRATIONS = [
         """,
     ),
     (
-        9,
-        """
-        ALTER TABLE llm_policies ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium';
-        -- gpt-5 is an API model and cannot be selected by a ChatGPT account
-        -- through Codex app-server.  Existing device-login connections used
-        -- this early placeholder, so move them to a subscription model that
-        -- the current app-server catalog advertises.
-        UPDATE llm_connections
-        SET model_id='gpt-5.6-terra', updated_at=CURRENT_TIMESTAMP
-        WHERE auth_type='openai_codex' AND model_id='gpt-5';
-        """,
-    ),
-    (
         10,
         """
         ALTER TABLE candidates ADD COLUMN isbn13 TEXT NOT NULL DEFAULT '';
@@ -325,6 +245,18 @@ MIGRATIONS = [
         11,
         """
         ALTER TABLE sources ADD COLUMN filters TEXT NOT NULL DEFAULT '{}';
+        """,
+    ),
+    (
+        12,
+        """
+        -- Remove the retired provider connections, policies, and run history
+        -- so stored credentials do not survive the feature removal.
+        DROP TABLE IF EXISTS llm_scores;
+        DROP TABLE IF EXISTS llm_runs;
+        DROP TABLE IF EXISTS llm_policies;
+        DROP TABLE IF EXISTS llm_connections;
+        DELETE FROM settings WHERE key LIKE 'llm_%' OR key LIKE 'models_catalog%';
         """,
     ),
 ]
@@ -387,68 +319,6 @@ def connect():
     return con
 
 
-def _ensure_llm_auth_types(con):
-    """Upgrade the v6 connection table without changing migration numbering.
-
-    v6 shipped with an API-key-only CHECK constraint.  Existing installs may
-    already have that migration recorded, so the constraint needs an in-place
-    SQLite table rebuild before subscription auth types can be stored.  Keep
-    the migration ledger stable for older clients that use it as a health
-    check.
-    """
-
-    table = con.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='llm_connections'"
-    ).fetchone()
-    definition = (table[0] if table else "") or ""
-    if "openai_codex" in definition and "claude_code" in definition:
-        return
-
-    con.execute("PRAGMA foreign_keys=OFF")
-    con.execute("PRAGMA legacy_alter_table=ON")
-    try:
-        con.execute("ALTER TABLE llm_connections RENAME TO llm_connections_legacy")
-        con.execute(
-            """
-            CREATE TABLE llm_connections (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                endpoint TEXT NOT NULL DEFAULT '',
-                auth_type TEXT NOT NULL DEFAULT 'api_key',
-                secret TEXT NOT NULL DEFAULT '',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                last_status TEXT,
-                last_error TEXT,
-                last_used_at TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CHECK(auth_type IN ('api_key','openai_codex','claude_code'))
-            )
-            """
-        )
-        con.execute(
-            """
-            INSERT INTO llm_connections
-                (id,name,provider_id,model_id,endpoint,auth_type,secret,enabled,
-                 last_status,last_error,last_used_at,created_at,updated_at)
-            SELECT id,name,provider_id,model_id,endpoint,auth_type,secret,enabled,
-                   last_status,last_error,last_used_at,created_at,updated_at
-            FROM llm_connections_legacy
-            """
-        )
-        con.execute("DROP TABLE llm_connections_legacy")
-        con.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_llm_connections_enabled
-                ON llm_connections(enabled, updated_at DESC)
-            """
-        )
-    finally:
-        con.execute("PRAGMA legacy_alter_table=OFF")
-        con.execute("PRAGMA foreign_keys=ON")
-
 def _restrict_database_files():
     """Keep the database and SQLite sidecars private to the engine user."""
 
@@ -510,7 +380,6 @@ def initialize():
             if version not in applied:
                 con.executescript(script)
                 con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
-        _ensure_llm_auth_types(con)
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),

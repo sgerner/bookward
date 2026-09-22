@@ -114,15 +114,13 @@ def test_report_loads_json_join_and_cli_emits_json(tmp_path: Path):
             {"impression_id": 1, "label": 1, "confidence": 1, "label_kind": "save", "attributed_at": "2026-01-02T00:00:00Z"},
             {"impression_id": 2, "label": 0, "confidence": 1, "label_kind": "reject", "attributed_at": "2026-01-02T00:00:00Z"},
         ],
-        "llm_runs": [{"id": "llm-1", "status": "complete", "created_at": "2025-12-01T00:00:00Z"}],
-        "llm_scores": [{"run_id": "llm-1", "candidate_id": 1, "score": 0.8}, {"run_id": "llm-1", "candidate_id": 2, "score": 0.1}],
     }
     path = tmp_path / "export.json"
     path.write_text(json.dumps(corpus))
     rows = load_rows(path)
-    assert rows[0]["shadow_score"] == 0.8
     report = build_report(rows, bootstrap_iterations=3, minimums={"runs": 0, "labeled_impressions": 0, "positive_impressions": 0, "negative_impressions": 0})
     assert report["protocol"].startswith("temporal run split")
+    assert set(report["splits"]["test"]) == {"champion"}
     result = subprocess.run(
         [sys.executable, "engine/scripts/evaluate_recommendations.py", str(path), "--bootstrap-iterations", "1", "--minimum-runs", "0", "--minimum-labeled-impressions", "0", "--minimum-positive-impressions", "0", "--minimum-negative-impressions", "0"],
         check=True,

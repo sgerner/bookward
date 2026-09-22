@@ -1,4 +1,4 @@
-"""Offline evaluation for recommendation impressions and shadow rankings.
+"""Offline evaluation for recommendation impressions and ranking quality.
 
 All metrics in this module are read-only calculations over exported rows.  A
 missing outcome is censored and is excluded from the metric; it is never
@@ -312,7 +312,7 @@ def promotion_gate(
     min_precision_delta: float = 0.0,
     min_ndcg_delta: float = 0.01,
 ) -> dict[str, Any]:
-    """Apply minimum sample and metric-improvement gates to a shadow model."""
+    """Apply minimum sample and metric-improvement gates to a candidate ranker."""
 
     counts = dict(sample or candidate)
     limits = {**DEFAULT_MINIMUMS, **(minimums or {})}
@@ -343,12 +343,11 @@ def _read_json_or_sqlite(path: Path) -> dict[str, Any]:
             return [dict(row) for row in con.execute(f"SELECT * FROM {table}")] if table in tables else []
         return {table: fetch(table) for table in (
             "recommendation_runs", "recommendation_impressions", "recommendation_outcomes",
-            "llm_runs", "llm_scores",
         )}
 
 
-def load_rows(source: str | Path | Mapping[str, Any], *, llm_run_id: str | None = None) -> list[dict[str, Any]]:
-    """Load joined impression/outcome rows and optional as-of shadow scores."""
+def load_rows(source: str | Path | Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Load joined recommendation impressions and observed outcomes."""
 
     data = dict(source) if isinstance(source, Mapping) else _read_json_or_sqlite(Path(source))
     runs = {str(row["id"]): row for row in data.get("recommendation_runs", [])}
@@ -356,67 +355,34 @@ def load_rows(source: str | Path | Mapping[str, Any], *, llm_run_id: str | None 
     outcomes_by_impression: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
     for outcome in data.get("recommendation_outcomes", []):
         outcomes_by_impression[outcome.get("impression_id")].append(outcome)
-    llm_runs = [row for row in data.get("llm_runs", []) if row.get("status") in (None, "complete")]
-    llm_scores = data.get("llm_scores", [])
-    explicit_scores: dict[Any, dict[Any, Mapping[str, Any]]] = defaultdict(dict)
-    for score in llm_scores:
-        explicit_scores[score.get("run_id")][score.get("candidate_id")] = score
-    rows: list[dict[str, Any]] = []
+    values: list[dict[str, Any]] = []
     for impression in impressions:
         run = runs.get(str(impression.get("run_id")), {})
         candidates = outcomes_by_impression.get(impression.get("id"), [])
-        # Multiple signals can be attached to an impression.  Choose the most
-        # confident/latest signal for the primary ranking metric; diagnostics
-        # still expose signal-specific metrics from those same records below.
         outcome = None
         if candidates:
             outcome = sorted(candidates, key=lambda item: (_as_float(item.get("confidence"), default=0), str(item.get("attributed_at") or "")), reverse=True)[0]
-        value = {
-            "run_id": impression.get("run_id"),
-            "run_created_at": run.get("created_at"),
-            "created_at": run.get("created_at"),
-            "presented_at": impression.get("presented_at"),
-            "impression_id": impression.get("id"),
-            "candidate_id": impression.get("candidate_id"),
-            "rank": impression.get("rank"),
-            "score": impression.get("score"),
+        values.append({
+            "run_id": impression.get("run_id"), "run_created_at": run.get("created_at"),
+            "created_at": run.get("created_at"), "presented_at": impression.get("presented_at"),
+            "impression_id": impression.get("id"), "candidate_id": impression.get("candidate_id"),
+            "rank": impression.get("rank"), "score": impression.get("score"),
             "propensity": impression.get("propensity", 1.0),
             "label": outcome.get("label") if outcome else None,
             "confidence": outcome.get("confidence", 1.0) if outcome else None,
             "label_kind": outcome.get("label_kind") if outcome else None,
-        }
-        if llm_run_id:
-            score = explicit_scores.get(llm_run_id, {}).get(impression.get("candidate_id"))
-            value["shadow_score"] = score.get("score") if score else None
-            value["shadow_run_id"] = llm_run_id if score else None
-        else:
-            # As-of selection prevents a later shadow run from leaking into an
-            # earlier impression.  If timestamps are absent, leave it missing.
-            exposure_time = _time(impression.get("presented_at"))
-            eligible = [run for run in llm_runs if _time(run.get("created_at")) and exposure_time and _time(run.get("created_at")) <= exposure_time]
-            eligible.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id"))), reverse=True)
-            score = None
-            selected = None
-            for selected in eligible:
-                score = explicit_scores.get(selected.get("id"), {}).get(impression.get("candidate_id"))
-                if score:
-                    break
-            value["shadow_score"] = score.get("score") if score else None
-            value["shadow_run_id"] = selected.get("id") if score and selected else None
-        rows.append(value)
-    return rows
-
+        })
+    return values
 
 def build_report(
     rows: Iterable[Mapping[str, Any]],
     *,
-    llm_score_key: str = "shadow_score",
     k: int = DEFAULT_K,
     bootstrap_iterations: int = DEFAULT_BOOTSTRAP_ITERATIONS,
     bootstrap_seed: int = 20260920,
     minimums: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Build a JSON-serializable champion/shadow report."""
+    """Build a JSON-serializable ranking-quality report."""
 
     values = list(rows)
     splits = temporal_split(values)
@@ -425,25 +391,10 @@ def build_report(
         "sample": _metric_bundle(values, score_key="score", k=k),
         "splits": {},
         "signal_diagnostics": signal_diagnostics(values, score_key="score", k=k),
-        "shadow_signal_diagnostics": signal_diagnostics(
-            [row for row in values if _as_float(row.get(llm_score_key)) is not None],
-            score_key=llm_score_key,
-            k=k,
-        ),
+        "minimums": {**DEFAULT_MINIMUMS, **(minimums or {})},
     }
     for split_name, split_rows in splits.items():
         champion = evaluate_metrics(split_rows, score_key="score", k=k)
         champion["auc_bootstrap"] = cluster_bootstrap(split_rows, score_key="score", metric="auc", k=k, iterations=bootstrap_iterations, seed=bootstrap_seed)
-        shadow_rows = [row for row in split_rows if _as_float(row.get(llm_score_key)) is not None]
-        shadow = evaluate_metrics(shadow_rows, score_key=llm_score_key, k=k)
-        shadow["auc_bootstrap"] = cluster_bootstrap(shadow_rows, score_key=llm_score_key, metric="auc", k=k, iterations=bootstrap_iterations, seed=bootstrap_seed)
-        shadow["available_impressions"] = len(shadow_rows)
-        report["splits"][split_name] = {"champion": champion, "shadow_llm": shadow}
-    test = report["splits"]["test"]
-    report["promotion_gate"] = promotion_gate(
-        test["shadow_llm"],
-        test["champion"],
-        sample=test["shadow_llm"],
-        minimums=minimums,
-    )
+        report["splits"][split_name] = {"champion": champion}
     return report

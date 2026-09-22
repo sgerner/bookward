@@ -20,19 +20,6 @@ class Settings(BaseSettings):
     # the internal engine URL so Docker installs can link to the web service.
     public_url: str = "http://localhost:5173"
     librarr_allowed_hosts: str = "librarr"
-    models_catalog_url: str = "https://models.dev/api.json?type=all"
-    models_catalog_cache: str = "/data/models-dev.json"
-    models_catalog_ttl_hours: int = 24
-    llm_timeout_seconds: float = 45.0
-    llm_shadow_max_reads: int = 300
-    # Subscription-backed providers run in isolated subprocesses.  Keep the
-    # Codex home stable across invocations so device-code auth survives an
-    # engine restart, while each ranking request still uses an ephemeral
-    # conversation.
-    llm_codex_command: str = "codex"
-    llm_codex_home: str = "/data/codex-home"
-    llm_claude_command: str = "claude"
-    llm_subscription_timeout_seconds: float = 90.0
     # Exploration is deliberately opt-in.  The ranking path and response
     # order remain deterministic until an operator enables this flag.
     exploration_enabled: bool = False

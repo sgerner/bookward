@@ -58,11 +58,10 @@ status is rewritten.
 3. Evaluate explicit feedback only after deduplicating events and separating
    save intent from an actual high reading rating. Sixty-six labeled
    candidates are too few to justify a large learned model on their own.
-4. Trial an optional LLM reranker over a bounded shortlist with verified
-   summaries and retrieved positive/negative examples. Keep an offline
-   fallback, cache results by input hash, and compare blinded judgments,
-   held-out ranking, latency, and cost. Ship it only if it beats the cheaper
-   scorer; generated explanations alone are not evidence of better ranking.
+4. Trial alternate rankers only as bounded offline studies over verified
+   summaries and retrieved positive/negative examples. Keep the existing
+   scorer as the fallback, and compare held-out ranking, latency, and
+   reproducibility before shipping a change.
 
 Scores are ranking heuristics, not calibrated probabilities of liking a
 book. Do not raise scores simply to clear a digest threshold.
