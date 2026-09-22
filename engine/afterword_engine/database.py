@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from .config import settings
 from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover_url
 from .identity import book_identity, book_identity_matches
+from .isbn import isbn_parts_from_amazon_url
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -311,6 +312,15 @@ MIGRATIONS = [
         WHERE auth_type='openai_codex' AND model_id='gpt-5';
         """,
     ),
+    (
+        10,
+        """
+        ALTER TABLE candidates ADD COLUMN isbn13 TEXT NOT NULL DEFAULT '';
+        ALTER TABLE candidates ADD COLUMN isbn10 TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_candidates_isbn13 ON candidates(isbn13);
+        CREATE INDEX IF NOT EXISTS idx_candidates_isbn10 ON candidates(isbn10);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -440,6 +450,36 @@ def _restrict_database_files():
         except FileNotFoundError:
             continue
 
+
+def _backfill_source_isbns(con):
+    """Recover source ISBNs from legacy Amazon links without accepting rows."""
+
+    candidates = con.execute(
+        "SELECT id,isbn13,isbn10,source_url FROM candidates "
+        "WHERE source_url!='' AND (isbn13='' OR isbn10='')"
+    ).fetchall()
+    for candidate in candidates:
+        isbn13, isbn10 = isbn_parts_from_amazon_url(candidate["source_url"])
+        if not isbn13 and not isbn10:
+            continue
+        next_isbn13 = candidate["isbn13"] or isbn13
+        next_isbn10 = candidate["isbn10"] or isbn10
+        con.execute(
+            "UPDATE candidates SET isbn13=?,isbn10=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (next_isbn13, next_isbn10, candidate["id"]),
+        )
+        # Do not overwrite a provider identifier that was already recorded for
+        # an accepted or ambiguous match. Blank ledger fields are safe to fill
+        # for pending/quarantined rows and let the next audit use source proof.
+        con.execute(
+            """UPDATE candidate_quality SET
+                isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
+                isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE candidate_id=? AND quality_status IN ('pending','quarantine')""",
+            (next_isbn13, next_isbn10, candidate["id"]),
+        )
+
 @contextmanager
 def transaction():
     con = connect()
@@ -531,6 +571,7 @@ def initialize():
                     con.execute("UPDATE candidates SET source_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (source_value, current["id"]))
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
+        _backfill_source_isbns(con)
     _restrict_database_files()
 
 def normalize_key(title: str, author: str):

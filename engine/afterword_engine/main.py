@@ -64,7 +64,7 @@ from .associations import run_association_provider
 from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
-from .quality import audit_candidates, quality_summary
+from .quality import QUALITY_VERSION, audit_candidates, quality_summary
 from .identity import book_identity_match_index, book_identity_match_keys
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -202,6 +202,8 @@ async def handle_job(kind: str):
         delivery_id = kind.partition(":")[2]
         return await retry_delivery(delivery_id, config)
     if kind.startswith("llm_shadow:"):
+        if not settings.llm_shadow_enabled:
+            return {"status": "disabled", "reason": "llm_shadow_retired"}
         try:
             policy_id = int(kind.partition(":")[2])
         except ValueError as exc:
@@ -261,6 +263,15 @@ async def handle_job(kind: str):
         return {"metadata": await refresh_missing_candidate_metadata()}
     if kind == "candidate_quality":
         quality = await audit_candidates(only_pending=False)
+        scored = await score_all(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        return {**quality, "scored": scored}
+    if kind == "candidate_quality_recovery":
+        quality = await audit_candidates(only_pending=True)
         scored = await score_all(
             config.get("embedding_backend"),
             config.get("embedding_model"),
@@ -334,11 +345,21 @@ async def lifespan(app):
     # A migration-created legacy quality ledger is an explicit signal that the
     # existing corpus still needs its one-time catalog audit.  Fresh installs
     # only contain curated demo rows and therefore skip this expensive job.
-    if row(
+    needs_full_quality_audit = row(
         "SELECT 1 FROM candidate_quality WHERE audit_version='legacy-pending-audit-v1' "
         "OR quality_status='pending' LIMIT 1"
-    ):
+    )
+    if needs_full_quality_audit:
         enqueue_job("candidate_quality", dedupe=True)
+    elif row(
+        "SELECT 1 FROM candidate_quality WHERE quality_status='quarantine' "
+        "AND audit_version!=? AND candidate_id IN ("
+        "SELECT id FROM candidates WHERE isbn13!='' OR isbn10!='') LIMIT 1",
+        (QUALITY_VERSION,),
+    ):
+        # Migration backfills only recover source evidence.  The targeted job
+        # retries those rows without re-auditing accepted candidates.
+        enqueue_job("candidate_quality_recovery", dedupe=True)
     yield
     stop.set(); await scheduler; await digest_scheduler; await worker
 
@@ -1619,6 +1640,8 @@ def disable_llm_policy(policy_id: int):
 def run_llm_policy(policy_id: int):
     if not row("SELECT id FROM llm_policies WHERE id=?", (policy_id,)):
         raise HTTPException(404, "LLM policy not found")
+    if not settings.llm_shadow_enabled:
+        return {"status": "disabled", "reason": "llm_shadow_retired"}
     return {"job_id": enqueue_job(f"llm_shadow:{policy_id}", dedupe=True)}
 
 

@@ -18,8 +18,6 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import urlparse
-
 import httpx
 
 from .covers import (
@@ -30,9 +28,10 @@ from .covers import (
 )
 from .database import rows, transaction
 from .identity import book_identity, book_identity_match_index, book_identity_match_keys
+from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
-QUALITY_VERSION = "candidate-quality-v1"
+QUALITY_VERSION = "candidate-quality-v2"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 UNKNOWN_AUTHOR_RE = re.compile(
@@ -100,36 +99,8 @@ def _author_similarity(left: object, right: object) -> float:
     return max(overlap, surname_score)
 
 
-def canonical_isbn(value: object) -> str:
-    """Return a checksum-valid ISBN-10/13, or an empty string."""
-
-    raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
-    if len(raw) == 13 and raw.isdigit():
-        total = sum((1 if index % 2 == 0 else 3) * int(char) for index, char in enumerate(raw))
-        return raw if total % 10 == 0 else ""
-    if len(raw) == 10 and re.fullmatch(r"[0-9]{9}[0-9Xx]", raw):
-        total = sum((10 - index) * (10 if char.upper() == "X" else int(char)) for index, char in enumerate(raw))
-        if total % 11 != 0:
-            return ""
-        prefix = "978" + raw[:9]
-        check = (10 - sum((1 if index % 2 == 0 else 3) * int(char) for index, char in enumerate(prefix)) % 10) % 10
-        return prefix + str(check)
-    return ""
-
-
 def _first_isbn(values: object) -> tuple[str, str]:
-    if not isinstance(values, (list, tuple, set)):
-        values = [values]
-    isbn13 = ""
-    isbn10 = ""
-    for value in values:
-        raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
-        if len(raw) == 10 and not isbn10 and canonical_isbn(raw):
-            isbn10 = raw.upper()
-            isbn13 = canonical_isbn(raw)
-        elif len(raw) == 13 and not isbn13 and canonical_isbn(raw):
-            isbn13 = raw
-    return isbn13, isbn10
+    return isbn_parts(values)
 
 
 def local_flags(candidate: dict[str, Any]) -> list[str]:
@@ -195,10 +166,16 @@ def _provider_match(
     }
 
 
-async def _open_library_match(title: str, author: str, client: httpx.AsyncClient) -> dict[str, Any] | None:
+async def _open_library_match(
+    title: str,
+    author: str,
+    client: httpx.AsyncClient,
+    *,
+    isbn: str = "",
+) -> dict[str, Any] | None:
     params = {
-        "title": title[:500],
-        "author": author[:300],
+        ("isbn" if isbn else "title"): isbn or title[:500],
+        **({} if isbn else {"author": author[:300]}),
         "limit": CATALOG_LIMIT,
         "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,isbn,isbn13,edition_key",
     }
@@ -240,8 +217,17 @@ async def _open_library_match(title: str, author: str, client: httpx.AsyncClient
     return best
 
 
-async def _google_books_match(title: str, author: str, client: httpx.AsyncClient) -> dict[str, Any] | None:
-    params = {"q": f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": CATALOG_LIMIT}
+async def _google_books_match(
+    title: str,
+    author: str,
+    client: httpx.AsyncClient,
+    *,
+    isbn: str = "",
+) -> dict[str, Any] | None:
+    params = {
+        "q": f"isbn:{isbn}" if isbn else f"intitle:{title[:300]} inauthor:{author[:200]}",
+        "maxResults": CATALOG_LIMIT,
+    }
     try:
         response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
         response.raise_for_status()
@@ -292,16 +278,55 @@ async def resolve_catalog_match(
     author: str,
     *,
     client: httpx.AsyncClient,
-    cache: dict[tuple[str, str], asyncio.Task[dict[str, Any] | None]],
+    cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]],
+    isbn13: str = "",
+    isbn10: str = "",
+    isbn: str = "",
 ) -> dict[str, Any] | None:
-    """Find the strongest title/author match in public catalogs."""
+    """Find a catalog match, trying source ISBN evidence before text search."""
 
-    key = (_catalog_text(title), _catalog_text(author))
+    source_isbn13, source_isbn10 = isbn_parts(isbn13, isbn10, isbn)
+    key = (
+        _catalog_text(title),
+        _catalog_text(author),
+        source_isbn13,
+        source_isbn10,
+    )
     existing = cache.get(key)
     if existing is not None:
         return await existing
 
+    def accepted(match: dict[str, Any] | None) -> bool:
+        return bool(
+            match
+            and match.get("quality_score", 0) >= 0.82
+            and match.get("title_match", 0) >= 0.82
+            and match.get("author_match", 0) >= 0.65
+        )
+
     async def lookup():
+        isbn_matches: list[dict[str, Any]] = []
+        for candidate_isbn in dict.fromkeys(
+            value for value in (source_isbn13, source_isbn10) if value
+        ):
+            # ISBN queries are exact edition lookups. Return immediately only
+            # after the same title/author gates used by the normal audit pass;
+            # a mismatched ISBN must not turn into a visible recommendation.
+            open_library_isbn = await _open_library_match(
+                title, author, client, isbn=candidate_isbn
+            )
+            if open_library_isbn:
+                isbn_matches.append(open_library_isbn)
+                if accepted(open_library_isbn):
+                    return open_library_isbn
+            google_isbn = await _google_books_match(
+                title, author, client, isbn=candidate_isbn
+            )
+            if google_isbn:
+                isbn_matches.append(google_isbn)
+                if accepted(google_isbn):
+                    return google_isbn
+
         # Open Library is the primary public catalog.  Only fall through to
         # Google Books when it cannot produce a strong match; this halves the
         # normal request volume and makes a full audit kinder to both services.
@@ -309,7 +334,11 @@ async def resolve_catalog_match(
         if open_library and open_library["quality_score"] >= 0.82:
             return open_library
         google = await _google_books_match(title, author, client)
-        return max((item for item in (open_library, google) if item), key=lambda item: item["quality_score"], default=None)
+        return max(
+            (item for item in (*isbn_matches, open_library, google) if item),
+            key=lambda item: item["quality_score"],
+            default=None,
+        )
 
     task = asyncio.create_task(lookup())
     cache[key] = task
@@ -318,20 +347,34 @@ async def resolve_catalog_match(
 
 async def _audit_one(candidate: dict[str, Any], client: httpx.AsyncClient, cache):
     flags = local_flags(candidate)
+    source_isbn13, source_isbn10 = isbn_parts_from_source(
+        [candidate.get("isbn13"), candidate.get("isbn10"), candidate.get("isbn")],
+        candidate.get("source_url", ""),
+    )
+    source_identifiers = {"isbn13": source_isbn13, "isbn10": source_isbn10}
     if any(flag in flags for flag in ("missing_title", "noise_title", "missing_author", "unknown_author", "title_equals_author", "title_contains_url")):
         return {
             "candidate_id": int(candidate["id"]),
             "quality_status": "rejected",
             "quality_score": 0.0,
             "flags": flags,
+            **source_identifiers,
         }
-    match = await resolve_catalog_match(candidate["title"], candidate["author"], client=client, cache=cache)
+    match = await resolve_catalog_match(
+        candidate["title"],
+        candidate["author"],
+        client=client,
+        cache=cache,
+        isbn13=source_isbn13,
+        isbn10=source_isbn10,
+    )
     if not match:
         return {
             "candidate_id": int(candidate["id"]),
             "quality_status": "quarantine",
             "quality_score": 0.0,
             "flags": sorted(set(flags + ["catalog_unmatched"])),
+            **source_identifiers,
         }
     accepted = match["quality_score"] >= 0.82 and match["title_match"] >= 0.82 and match["author_match"] >= 0.65
     return {
@@ -340,6 +383,8 @@ async def _audit_one(candidate: dict[str, Any], client: httpx.AsyncClient, cache
         "quality_score": match["quality_score"],
         "flags": sorted(set(flags + ([] if accepted else ["catalog_match_ambiguous"]))),
         **match,
+        "isbn13": source_isbn13 or match.get("isbn13", ""),
+        "isbn10": source_isbn10 or match.get("isbn10", ""),
     }
 
 
@@ -479,18 +524,26 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
     """Audit and enrich candidates, returning a deterministic quality report."""
 
     where = "c.status!='rejected'"
+    params: tuple[object, ...] = ()
     if only_pending:
-        where += " AND COALESCE(q.quality_status,'pending')='pending'"
+        # A source ISBN is a safe reason to retry a quarantined row once after
+        # the ISBN-first resolver is deployed.  Keep accepted rows out of this
+        # recovery path so a provider outage cannot change visible ranking.
+        where += (
+            " AND (COALESCE(q.quality_status,'pending')='pending' "
+            "OR (q.quality_status='quarantine' AND q.audit_version!=? "
+            "AND (c.isbn13!='' OR c.isbn10!='')))"
+        )
+        params = (QUALITY_VERSION,)
     query = (
         "SELECT c.*,s.url AS source_root FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         f"WHERE {where} ORDER BY c.id"
     )
-    params = ()
     if limit is not None:
         query += " LIMIT ?"
-        params = (max(1, int(limit)),)
+        params = (*params, max(1, int(limit)))
     candidates = rows(query, params)
     if not candidates:
         with transaction() as con:
@@ -498,7 +551,7 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
         return {"audited": 0, "accepted": 0, "quarantine": 0, "rejected": 0, "deduped": deduped, "enriched": 0}
 
     semaphore = asyncio.Semaphore(CATALOG_CONCURRENCY)
-    cache: dict[tuple[str, str], asyncio.Task[dict[str, Any] | None]] = {}
+    cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]] = {}
     async with metadata_client() as client:
         async def run(candidate):
             async with semaphore:

@@ -174,6 +174,41 @@ def test_source_parsers_handle_apple_open_library_and_goodreads_formats():
     assert nyt_items[0]["title"] == "NYT Pick" and nyt_items[0]["release_date"] == "2027-02-03"
 
 
+def test_nyt_parser_preserves_valid_payload_and_amazon_isbns():
+    nyt = json.dumps(
+        {
+            "results": {
+                "books": [
+                    {
+                        "title": "Payload ISBN",
+                        "author": "A Writer",
+                        "primary_isbn13": "9780307474278",
+                        "primary_isbn10": "0307474275",
+                        "amazon_product_url": "https://www.amazon.com/dp/0307474275",
+                    },
+                    {
+                        "title": "URL ISBN",
+                        "author": "Another Writer",
+                        "primary_isbn13": "not-an-isbn",
+                        "amazon_product_url": "https://www.amazon.com/URL-ISBN/dp/0061120081?tag=bookward",
+                    },
+                ]
+            }
+        }
+    ).encode()
+
+    items = parse_book_items(
+        nyt,
+        "application/json",
+        "https://api.nytimes.com/svc/books/v3/lists/overview.json",
+    )
+
+    assert items[0]["isbn13"] == "9780307474278"
+    assert items[0]["isbn10"] == "0307474275"
+    assert items[1]["isbn13"] == "9780061120084"
+    assert items[1]["isbn10"] == "0061120081"
+
+
 def test_source_parser_provider_dispatch_requires_matching_host_and_path():
     payload = json.dumps({"works": [{"title": "A New World", "authors": [{"name": "A Writer"}]}]}).encode()
 
@@ -450,6 +485,37 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     candidate = row("SELECT * FROM candidates WHERE title='A New World'")
     assert json.loads(candidate["genres"]) == ["Science fiction"]
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
+
+
+def test_scan_source_persists_source_isbn_and_quality_evidence(database, monkeypatch):
+    async def fake_fetch(_url):
+        return "application/json", [
+            {
+                "title": "Recovered Book",
+                "author": "A Writer",
+                "source_url": "https://www.amazon.com/dp/0061120081",
+            }
+        ]
+
+    async def no_enrichment(items):
+        return items
+
+    monkeypatch.setattr("afterword_engine.ingestion._fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.enrich_book_metadata", no_enrichment)
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?)",
+            ("Amazon-backed source", "https://example.com/upcoming"),
+        )
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 1
+    candidate = row("SELECT * FROM candidates WHERE title='Recovered Book'")
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate["id"],))
+    assert candidate["isbn13"] == "9780061120084"
+    assert candidate["isbn10"] == "0061120081"
+    assert quality["isbn13"] == "9780061120084"
+    assert quality["isbn10"] == "0061120081"
 
 
 def test_empty_source_scan_preserves_existing_candidates(database, monkeypatch):
@@ -1021,7 +1087,7 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         con.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, kind TEXT NOT NULL DEFAULT 'web', enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, weight REAL NOT NULL DEFAULT 1, last_status TEXT, last_scanned_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("INSERT INTO sources(id,name,url) VALUES(7,'Existing','https://example.com')")
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 9
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
     assert row(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
@@ -1049,12 +1115,12 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
         )
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 9
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
     assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
 
     initialize()
-    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 9
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == 10
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
 
 
