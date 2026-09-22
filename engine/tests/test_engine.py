@@ -22,7 +22,15 @@ from afterword_engine.covers import (
     resolve_cover_url,
     safe_cover_url,
 )
-from afterword_engine.ingestion import enrich_book_metadata, import_goodreads_csv, parse_book_items, fetch_bytes, scan_source
+from afterword_engine.ingestion import (
+    _source_client,
+    enrich_book_metadata,
+    enrich_goodreads_blog_items,
+    fetch_bytes,
+    import_goodreads_csv,
+    parse_book_items,
+    scan_source,
+)
 from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
 from afterword_engine.scoring import rebuild_all_embeddings
 from afterword_engine.embeddings import get_embedder
@@ -176,6 +184,113 @@ def test_source_parser_provider_dispatch_requires_matching_host_and_path():
     )
 
     assert items == []
+
+
+def test_source_parsers_handle_editorial_and_goodreads_blog_formats():
+    editorial = b'''<section class="gh-content">
+      <h3><em>Stranger Things: The Complete Scripts</em>
+        <a href="https://bookshop.org/season-3">Season 3</a> and
+        <a href="https://bookshop.org/season-4">Season 4</a>
+        by The Duffer Brothers (December 9th)</h3>
+      <h3><a href="https://store.gollancz.co.uk/loss-protocol">Loss Protocol</a>
+        by Paul McAuley (February 12th)</h3>
+    </section>'''
+    editorial_items = parse_book_items(
+        editorial,
+        "text/html",
+        "https://www.andrewliptak.com/sci-fi-fantasy-horror-books-february-2026-ashton-okorafor-mcauley/",
+    )
+    assert [(item["title"], item["author"]) for item in editorial_items] == [
+        ("Stranger Things: The Complete Scripts Season 3", "The Duffer Brothers"),
+        ("Stranger Things: The Complete Scripts Season 4", "The Duffer Brothers"),
+        ("Loss Protocol", "Paul McAuley"),
+    ]
+
+    blog = b'''<div class="tooltipTrigger book" data-resource-id="42">
+      <a href="/book/show/42-example"><img alt="Example Book (Series, #1)" src="https://i.gr-assets.com/example.jpg"></a>
+    </div>
+    <div class="tooltipTrigger book" data-resource-id="42">
+      <a href="/book/show/42-example"><img alt="Example Book (Series, #1)" src="https://i.gr-assets.com/example.jpg"></a>
+    </div>'''
+    blog_items = parse_book_items(blog, "text/html", "https://www.goodreads.com/blog/show/3127")
+    assert len(blog_items) == 1
+    assert blog_items[0]["title"] == "Example Book (Series, #1)"
+    assert blog_items[0]["author"] == "Unknown author"
+
+
+@respx.mock
+def test_goodreads_blog_tooltips_fill_author_and_metadata(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    respx.get("https://93.184.216.34/").mock(
+        return_value=httpx.Response(200, text="home", headers={"content-type": "text/html"})
+    )
+    respx.get("https://93.184.216.34/tooltips").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "tooltips": {
+                    "Book.42": """<section class='tooltip'>
+                      <h2><a class='readable' href='/book/show/42-example'>Example Book</a></h2>
+                      by <a class='authorName'>A Writer</a>
+                      <div class='bookRatingAndPublishing'>published 2026</div>
+                      <div class='addBookTipDescription'><span id='freeTextContainer42'>A description.</span></div>
+                    </section>"""
+                }
+            },
+        )
+    )
+
+    async def run():
+        async with _source_client() as client:
+            return await enrich_goodreads_blog_items(
+                [
+                    {
+                        "title": "Example Book (Series, #1)",
+                        "author": "Unknown author",
+                        "description": "",
+                        "cover_url": "",
+                        "source_url": "https://www.goodreads.com/book/show/42-example",
+                        "release_date": None,
+                        "genres": [],
+                    }
+                ],
+                client,
+            )
+
+    item = asyncio.run(run())[0]
+    assert item["title"] == "Example Book"
+    assert item["author"] == "A Writer"
+    assert item["description"] == "A description."
+    assert item["release_date"] == "2026-01-01"
+
+
+@respx.mock
+def test_source_fetch_follows_and_repins_public_redirects(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    respx.get("https://93.184.216.34/list").mock(
+        return_value=httpx.Response(
+            302,
+            headers={"location": "https://redirect.example.test/final"},
+        )
+    )
+    final = respx.get("https://93.184.216.34/final").mock(
+        return_value=httpx.Response(200, text="books", headers={"content-type": "text/plain"})
+    )
+    content, content_type = asyncio.run(fetch_bytes("https://books.example.test/list"))
+    assert content == b"books" and content_type == "text/plain"
+    assert final.calls[0].request.headers["host"] == "redirect.example.test"
 
 @respx.mock
 def test_scan_source_persists_provider_metadata(database, monkeypatch):
