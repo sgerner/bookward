@@ -662,12 +662,17 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     let added = 0;
+    let failed = 0;
     for (const item of highConfidenceLibrarrResults) {
       const success = await addLibrarrResult(item.result, item.index, false);
       if (success) added += 1;
+      else failed += 1;
     }
     librarrAddingIndex = null;
-    if (added) {
+    if (failed) {
+      librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
+      librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
+    } else if (added) {
       closeLibrarrSearch();
       await invalidateAll();
     }
@@ -2134,6 +2139,7 @@
                       class="mt-1 block text-xs capitalize text-surface-600-400"
                       >{resultFormat(result)}</span
                     >
+                    {#if resultScore(result) !== null}<span class="mt-1 block text-xs text-primary-600-400">Librarr match {resultScore(result)}/100</span>{/if}
                   </div>
                   <button
                     type="button"
