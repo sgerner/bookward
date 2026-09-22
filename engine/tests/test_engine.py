@@ -105,6 +105,8 @@ def test_fresh_database_seeds_curated_sources(database):
     assert "https://itunes.apple.com/us/rss/topaudiobooks/limit=50/xml" in urls
     assert "https://openlibrary.org/subjects/science_fiction.json?limit=50" in urls
     assert "https://www.goodreads.com/genres/science-fiction" in urls
+    assert "https://www.publishersweekly.com/pw/reviews/starred.html" in urls
+    assert "https://www.penguinrandomhouse.com/books/new-releases/" in urls
     assert "https://api.nytimes.com/svc/books/v3/lists/overview.json" in urls
     assert sum(source["enabled"] for source in sources) >= 8
     assert row("SELECT value FROM settings WHERE key='source_sync_interval_hours'")["value"] == "24"

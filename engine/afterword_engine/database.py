@@ -360,6 +360,8 @@ DEFAULT_SOURCES = (
     ("Goodreads · Speculative fiction", "https://www.goodreads.com/genres/speculative-fiction", 1),
     ("Goodreads · Mystery thriller", "https://www.goodreads.com/genres/mystery-thriller", 1),
     ("Goodreads · Literary fiction", "https://www.goodreads.com/genres/literary-fiction", 1),
+    ("Publishers Weekly · Starred reviews this week", "https://www.publishersweekly.com/pw/reviews/starred.html", 1),
+    ("Penguin Random House · New releases", "https://www.penguinrandomhouse.com/books/new-releases/", 1),
     ("Open Library · Mystery & detective", "https://openlibrary.org/subjects/mystery_and_detective_stories.json?limit=50", 0),
     ("Open Library · Literary fiction", "https://openlibrary.org/subjects/literary_fiction.json?limit=50", 0),
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
