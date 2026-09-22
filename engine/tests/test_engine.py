@@ -186,6 +186,152 @@ def test_source_parser_provider_dispatch_requires_matching_host_and_path():
     assert items == []
 
 
+def test_generic_source_parser_walks_nested_jsonld_and_normalizes_dates():
+    payload = {
+        "@context": "https://schema.org",
+        "@type": "WebPage",
+        "mainEntity": {
+            "@type": "Book",
+            "name": "Nested Book",
+            "author": [{"@type": "Person", "name": "A Writer"}],
+            "description": "<p>A nested description.</p>",
+            "image": {"@type": "ImageObject", "url": "/covers/nested.jpg"},
+            "url": "/books/nested-book",
+            "datePublished": "2025-03",
+            "genre": ["Science fiction", "Adventure"],
+        },
+    }
+    items = parse_book_items(
+        json.dumps(payload).encode(),
+        "application/ld+json",
+        "https://publisher.example/books/nested-book",
+    )
+
+    assert items == [
+        {
+            "title": "Nested Book",
+            "author": "A Writer",
+            "description": "A nested description.",
+            "cover_url": "https://publisher.example/covers/nested.jpg",
+            "source_url": "https://publisher.example/books/nested-book",
+            "release_date": "2025-03-01",
+            "date_kind": "month",
+            "genres": ["Science fiction", "Adventure"],
+        }
+    ]
+
+
+def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pairs():
+    cards = b'''<article class="book-blurb"><div class="blurb-details">
+      <a href="/books/guardian"><h2 class="book-title">A Guardian and a Thief</h2></a>
+      <span class="author-name">by Megha Majumdar</span>
+      <div class="genres"><span class="genre-tag">Fiction</span></div>
+      <div class="blurb-content"><p>A story about loyalty and theft.</p><span class="byline">- A Reviewer</span></div>
+      <img data-lazy-src="/covers/guardian.jpg" src="data:image/svg+xml;base64,placeholder">
+    </div></article>'''
+    card_items = parse_book_items(cards, "text/html", "https://bookriot.example/best-books-of-2025/")
+    assert card_items == [
+        {
+            "title": "A Guardian and a Thief",
+            "author": "Megha Majumdar",
+            "description": "A story about loyalty and theft.",
+            "cover_url": "https://bookriot.example/covers/guardian.jpg",
+            "source_url": "https://bookriot.example/books/guardian",
+            "release_date": None,
+            "date_kind": "",
+            "genres": ["Fiction"],
+        }
+    ]
+
+    missing_author = b'''<article class="book-blurb"><h2 class="book-title">Missing Author</h2></article>''' + cards
+    bounded_items = parse_book_items(missing_author, "text/html", "https://bookriot.example/best-books-of-2025/")
+    assert len(bounded_items) == 1 and bounded_items[0]["title"] == "A Guardian and a Thief"
+
+    microdata = b'''<div itemscope itemtype="https://schema.org/Book">
+      <h2 itemprop="name">A Microdata Book</h2>
+      <span itemprop="author">A Microdata Writer</span>
+      <a itemprop="url" href="/books/microdata"></a>
+      <meta itemprop="image" content="/covers/microdata.jpg">
+      <time itemprop="datePublished" datetime="2027">2027</time>
+    </div>'''
+    microdata_items = parse_book_items(microdata, "text/html", "https://publisher.example/list")
+    assert microdata_items == [
+        {
+            "title": "A Microdata Book",
+            "author": "A Microdata Writer",
+            "description": "",
+            "cover_url": "https://publisher.example/covers/microdata.jpg",
+            "source_url": "https://publisher.example/books/microdata",
+            "release_date": "2027-01-01",
+            "date_kind": "year",
+            "genres": [],
+        }
+    ]
+
+    publisher = b'''<section>
+      <h3><a href="/books/call-and-response">Call and Response: Stories of the Fantastic</a></h3>
+      <h4>Christopher Caldwell. Neon Hemlock, $28 (188p) ISBN 978-1-966503-14-9</h4>
+      <p>A collection of fantastic stories.</p>
+    </section>'''
+    publisher_items = parse_book_items(publisher, "text/html", "https://publisher.example/books")
+    assert publisher_items == [
+        {
+            "title": "Call and Response: Stories of the Fantastic",
+            "author": "Christopher Caldwell",
+            "description": "A collection of fantastic stories.",
+            "cover_url": "",
+            "source_url": "https://publisher.example/books/call-and-response",
+            "release_date": None,
+            "date_kind": "",
+            "genres": [],
+        }
+    ]
+
+    contributor_markup = b'''<div class="contrib-wrap">
+      <h2 class="contributors isbn-related 9780000000000 show">By <a href="/authors/writer">A Writer</a></h2>
+      <h2 class="contributors isbn-related 9780000000001">By <a href="/authors/writer">A Writer</a></h2>
+    </div>'''
+    assert parse_book_items(contributor_markup, "text/html", "https://publisher.example/books/example") == []
+    assert parse_book_items(b"<h2>About the author</h2><p>By A Writer</p>", "text/html", "https://publisher.example/about") == []
+
+
+def test_generic_source_parser_keeps_distinct_unknown_author_books_and_prefers_precise_dates():
+    payload = json.dumps([
+        {
+            "@type": "Book",
+            "name": "Same Title",
+            "url": "/books/one",
+            "datePublished": "2027",
+        },
+        {
+            "@type": "Book",
+            "name": "Same Title",
+            "url": "/books/two",
+            "datePublished": "2027-03-04",
+        },
+    ]).encode()
+    items = parse_book_items(payload, "application/json", "https://publisher.example/list")
+    assert len(items) == 2
+    assert [item["source_url"] for item in items] == [
+        "https://publisher.example/books/one",
+        "https://publisher.example/books/two",
+    ]
+    assert [item["release_date"] for item in items] == ["2027-01-01", "2027-03-04"]
+
+    duplicate_payload = json.dumps([
+        {"@type": "Book", "name": "One Book", "author": "A Writer", "url": "/books/one", "datePublished": "2027"},
+        {"@type": "Book", "name": "One Book", "author": "A Writer", "url": "/books/one", "datePublished": "2027-03-04"},
+    ]).encode()
+    duplicate_items = parse_book_items(duplicate_payload, "application/json", "https://publisher.example/list")
+    assert len(duplicate_items) == 1 and duplicate_items[0]["release_date"] == "2027-03-04"
+
+    invalid_date = json.dumps(
+        {"@type": "Book", "name": "Invalid Date", "author": "A Writer", "datePublished": "2027-02-30"}
+    ).encode()
+    invalid_items = parse_book_items(invalid_date, "application/json", "https://publisher.example/list")
+    assert invalid_items[0]["release_date"] is None and invalid_items[0]["date_kind"] == ""
+
+
 def test_source_parsers_handle_editorial_and_goodreads_blog_formats():
     editorial = b'''<section class="gh-content">
       <h3><em>Stranger Things: The Complete Scripts</em>
@@ -753,9 +899,9 @@ def test_disabled_source_is_removed_from_discovery_and_scoring(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 0
 
 def test_json_ld_graph_and_urls_are_normalized():
-    payload = b'''<script type="application/ld+json">{"@graph":[{"@type":["Thing","Book"],"name":"Safe","author":[{"name":"Writer"}],"image":"javascript:alert(1)","datePublished":"2027-03-04T00:00:00Z"}]}</script>'''
+    payload = b'''<script type="application/ld+json">{"@graph":[{"@type":["Thing","Book"],"name":"Safe","author":[{"name":"Writer"}],"image":"javascript:alert(1)","url":"https://user:pass@books.example/safe","datePublished":"2027-03-04T00:00:00Z"}]}</script>'''
     items = parse_book_items(payload, "text/html", "https://books.example/list")
-    assert items == [{"title":"Safe","author":"Writer","description":"","cover_url":"","source_url":"https://books.example/list","release_date":"2027-03-04"}]
+    assert items == [{"title":"Safe","author":"Writer","description":"","cover_url":"","source_url":"https://books.example/list","release_date":"2027-03-04","date_kind":"day","genres":[]}]
 
 def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("javascript:alert(1)") == ""
