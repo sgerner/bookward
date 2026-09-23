@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from afterword_engine.ranking import rank_candidates
+from afterword_engine.ranking import _read_day, rank_candidates
 
 
 def book(book_id, title, author, rating=None):
@@ -75,3 +75,20 @@ def test_kernel_does_not_infer_a_rating_without_positive_similarity():
     reads = [book(i, f"Read {i}", "Writer", 5 if i < 41 else 1) for i in range(1, 42)]
     result = rank_candidates(reads, [[1, 0]] * len(reads), [book(50, "Orthogonal", "New")], [[0, 1]])
     assert result[0]["score"] == 42.0
+
+
+def test_recent_ratings_receive_more_weight_without_changing_undated_history():
+    reads = [book(1, "Loved", "A", 5), book(2, "Disliked", "B", 1)]
+    candidate = book(3, "Candidate", "C")
+    undated = rank_candidates(reads, [[1, 0], [1, 0]], [candidate], [[1, 0]])[0]["score"]
+    reads[0]["read_at"], reads[1]["read_at"] = "2010/01/01", "2025/01/01"
+    recent_dislike = rank_candidates(reads, [[1, 0], [1, 0]], [candidate], [[1, 0]])[0]["score"]
+    reads[0]["read_at"], reads[1]["read_at"] = reads[1]["read_at"], reads[0]["read_at"]
+    recent_like = rank_candidates(reads, [[1, 0], [1, 0]], [candidate], [[1, 0]])[0]["score"]
+    assert recent_dislike < undated < recent_like
+
+
+def test_supported_read_dates_normalize_to_utc_and_invalid_dates_are_unknown():
+    assert _read_day("2026/09/22") == _read_day("2026-09-22")
+    assert _read_day("Mon, 21 Sep 2026 17:00:00 -0700") == _read_day("2026-09-22")
+    assert _read_day("not a date") is None
