@@ -1,5 +1,7 @@
 """Pure, bounded recommendation ranking from read and candidate embeddings."""
 
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Sequence
 
 import numpy as np
@@ -12,6 +14,30 @@ _KERNEL_NEIGHBORS = 40
 _KERNEL_POWER = 8
 _KERNEL_SCORE_PER_STAR = 10
 _KERNEL_FULL_HISTORY = 100
+_RECENCY_TIMESCALE_YEARS = 8
+_RECENCY_SCORE_PER_STAR = 20
+
+
+def _read_day(value: object) -> date | None:
+    """Parse supported read dates as UTC days; leave unknown dates neutral."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        return value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.strptime(value, "%Y/%m/%d")
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(value)
+                except (TypeError, ValueError, IndexError):
+                    return None
+    else:
+        return None
+    return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc).date()
 
 
 def _matrix(vectors: Sequence[Sequence[float]], dimensions: int | None = None) -> np.ndarray:
@@ -72,6 +98,8 @@ def rank_candidates(
     negatives = [(item, vector) for item, vector in history if 0 < float(item.get("rating") or 0) <= 2]
     all_ratings = history
     rating_values = np.asarray([float(item.get("rating") or 0) for item, _ in all_ratings], dtype=np.float64)
+    read_ordinals = np.asarray([day.toordinal() if (day := _read_day(item.get("read_at"))) else np.nan
+                                for item, _ in all_ratings], dtype=np.float64)
     pos_matrix = np.stack([v for _, v in positives]) if positives else np.empty((0, dimensions), dtype=np.float32)
     neg_matrix = np.stack([v for _, v in negatives]) if negatives else np.empty((0, dimensions), dtype=np.float32)
     all_matrix = np.stack([v for _, v in all_ratings]) if all_ratings else np.empty((0, dimensions), dtype=np.float32)
@@ -103,17 +131,31 @@ def rank_candidates(
                 similarities = np.maximum(all_sim[offset, neighbors].astype(np.float64), 0)
                 kernel_weights = (similarities + 1e-8) ** _KERNEL_POWER
                 kernel_rating = float(np.dot(kernel_weights, rating_values[neighbors]) / kernel_weights.sum())
+                neighbor_days = read_ordinals[neighbors]
+                known = np.isfinite(neighbor_days)
+                if known.any():
+                    # The query-date factor cancels after normalization; only
+                    # relative ages among these neighbors affect the rating.
+                    ages = np.maximum(0, (neighbor_days[known].max() - neighbor_days) / 365.25)
+                    ages[~known] = np.median(ages[known])
+                    recent_weights = kernel_weights * np.exp(-ages / _RECENCY_TIMESCALE_YEARS)
+                    recent_rating = float(np.dot(recent_weights, rating_values[neighbors]) / recent_weights.sum())
+                else:
+                    recent_rating = kernel_rating
                 local = neighbors[:min(5, len(neighbors))]
                 weights = np.maximum(all_sim[offset, local], 0) + 1e-4
                 local_rating = float(np.dot(weights, rating_values[local]) / weights.sum())
             else:
                 local_rating = 3.0
                 kernel_rating = global_mean
+                recent_rating = global_mean
             score = 42 + 48 * float(positive_top[offset]) - 24 * float(negative_max[offset]) + 3.5 * (local_rating - 3) + 3.5 * author_delta
             # The historical comparison begins at 100 reads. Ramp in the new
             # term for smaller libraries, where one neighbor is weak evidence.
             kernel_strength = _KERNEL_SCORE_PER_STAR * min(1.0, len(all_ratings) / _KERNEL_FULL_HISTORY)
             score += kernel_strength * (kernel_rating - global_mean)
+            recency_strength = _RECENCY_SCORE_PER_STAR * min(1.0, len(all_ratings) / _KERNEL_FULL_HISTORY)
+            score += recency_strength * (recent_rating - kernel_rating)
             score += (float(candidate.get("source_weight") or 1) - 1) * 5
             score = max(0.0, min(100.0, score))
             explanation: list[str] = []
