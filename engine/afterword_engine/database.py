@@ -7,6 +7,7 @@ from .config import settings
 from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover_url
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
+from .secrets import unseal
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -269,6 +270,13 @@ MIGRATIONS = [
             ON candidate_quality(quality_status, metadata_checked_at);
         """,
     ),
+    (
+        14,
+        """
+        ALTER TABLE candidate_quality ADD COLUMN metadata_confidence REAL NOT NULL DEFAULT 0.5
+            CHECK(metadata_confidence >= 0 AND metadata_confidence <= 1);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -296,9 +304,8 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_last_period": "",
 }
 
-# These feeds are intentionally public and require no per-user credentials.
-# Keep the NYT API visible but disabled because its overview endpoint returns
-# 401 without a user API key; users can add their keyed URL when they want it.
+# Most default feeds are public. Keep NYT disabled until a key is configured;
+# the key is stored encrypted and added only to outgoing Books API requests.
 DEFAULT_SOURCES = (
     ("Apple Books · Top audiobooks", "https://itunes.apple.com/us/rss/topaudiobooks/limit=50/xml", 1),
     ("Apple Books · Top paid ebooks", "https://itunes.apple.com/us/rss/toppaidebooks/limit=50/xml", 1),
@@ -407,6 +414,9 @@ def initialize():
                 "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,?)",
                 (key, value, secret),
             )
+        con.execute(
+            "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
+        )
         # Upgrade an older install's placeholder link when the deployment now
         # advertises a different public origin, without overwriting a URL the
         # user explicitly chose in Settings.
@@ -468,6 +478,15 @@ def normalize_key(title: str, author: str):
 def rows(query: str, params=()):
     with connect() as con:
         return [dict(row) for row in con.execute(query, params).fetchall()]
+
+
+def private_setting(key: str, default: str = "") -> str:
+    """Read one setting, decrypting it when the database marks it secret."""
+
+    found = row("SELECT value,secret FROM settings WHERE key=?", (key,))
+    if not found:
+        return default
+    return unseal(found["value"]) if found["secret"] else found["value"]
 
 def row(query: str, params=()):
     with connect() as con:

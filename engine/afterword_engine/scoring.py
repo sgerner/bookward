@@ -7,11 +7,30 @@ from .database import rows, transaction
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
 from .identity import book_identity_match_index, book_identity_match_keys
+from .subjects import normalize_subjects
 SCORING_BATCH_SIZE = 256
 
 def document(item):
-    genres = item.get("genres", "[]")
-    return f"{item.get('title','')} {item.get('author','')} {genres} {item.get('description','')}"
+    # Read embeddings already exist in production with this exact representation.
+    # Keep it stable so adding cleaner candidate subjects does not invalidate the
+    # cache for every historical read.
+    if "rating" in item:
+        return (
+            f"{item.get('title', '')} {item.get('author', '')} "
+            f"{item.get('genres') or '[]'} {item.get('description', '')}"
+        )
+    genres = normalize_subjects(item.get("genres", "[]"), limit=8)
+    subjects = "; ".join(genres)
+    return " ".join(
+        str(value).strip()
+        for value in (
+            item.get("title", ""),
+            item.get("author", ""),
+            item.get("description", ""),
+            f"Subjects: {subjects}" if subjects else "",
+        )
+        if str(value or "").strip()
+    )
 
 async def cached_vectors(embedder, entity_type, items, *, force=False, persist=True):
     vectors, missing = [None] * len(items), []
@@ -95,7 +114,9 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
     all_read_keys = book_identity_match_index(rows("SELECT title,author FROM reads"))
     candidates = rows(
-        "SELECT c.*, s.name source_name, s.weight source_weight "
+        "SELECT c.*, s.name source_name, s.weight source_weight, "
+        "CASE WHEN q.quality_score>0 THEN q.quality_score "
+        "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
@@ -113,6 +134,10 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     with transaction() as con:
         for candidate in ranked:
             con.execute("UPDATE candidates SET score=?, explanation=?, status=CASE WHEN status='new' THEN 'recommended' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate["score"], json.dumps(candidate["explanation"]), candidate["id"]))
+            con.execute(
+                "UPDATE candidate_quality SET metadata_confidence=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
+                (candidate["metadata_confidence"], candidate["id"]),
+            )
     return len(candidates)
 
 

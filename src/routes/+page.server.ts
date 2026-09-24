@@ -22,6 +22,7 @@ type Overview = {
     date_kind: string;
     genres: string[];
     score: number;
+    metadata_confidence: number;
     explanation: string[];
     status: string;
     source_name: string | null;
@@ -52,6 +53,7 @@ type Overview = {
     embedding_api_key_set: boolean;
     librarr_url: string;
     librarr_api_key_set: boolean;
+    nyt_api_key_set?: boolean;
     librarr_media_type: "ebook" | "audiobook";
     source_sync_interval_hours: number;
     digest: DigestSettings;

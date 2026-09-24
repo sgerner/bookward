@@ -21,6 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
+from .subjects import normalize_subjects
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
 GOOGLE_BOOKS_SEARCH = "https://www.googleapis.com/books/v1/volumes"
@@ -216,26 +217,8 @@ def _author_matches(wanted: str, candidates: object) -> bool:
 
 
 def _catalog_genres(value: object, limit: int = 8) -> list[str]:
-    if isinstance(value, str):
-        values = [value]
-    elif isinstance(value, (list, tuple)):
-        values = list(value)
-    else:
-        return []
-    genres = []
-    seen = set()
-    for raw in values:
-        if isinstance(raw, dict):
-            raw = raw.get("name") or raw.get("value") or raw.get("text") or ""
-        genre = _clean_metadata_text(raw, 80)
-        key = genre.casefold()
-        if not genre or key in seen:
-            continue
-        seen.add(key)
-        genres.append(genre)
-        if len(genres) >= limit:
-            break
-    return genres
+    values = normalize_subjects(value, limit=limit)
+    return [_clean_metadata_text(genre, 80) for genre in values]
 
 
 def _author_display(value: object) -> str:

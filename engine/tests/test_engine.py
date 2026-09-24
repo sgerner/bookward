@@ -4,6 +4,7 @@ import socket
 from datetime import datetime, timedelta, timezone
 import stat
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import respx
@@ -23,6 +24,7 @@ from afterword_engine.covers import (
     safe_cover_url,
 )
 from afterword_engine.ingestion import (
+    _nyt_request_url,
     _source_client,
     enrich_book_metadata,
     enrich_goodreads_blog_items,
@@ -30,6 +32,7 @@ from afterword_engine.ingestion import (
     filter_source_items,
     import_goodreads_csv,
     normalize_source_filters,
+    normalize_stored_candidate_subjects,
     parse_book_items,
     refresh_missing_candidate_metadata,
     scan_source,
@@ -128,6 +131,23 @@ def test_source_scheduler_detects_due_permanent_feeds(database):
     with transaction() as con:
         con.execute("UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP WHERE name='Due feed'")
     assert source_sync_is_due() is False
+
+
+def test_source_scheduler_ignores_association_provider_records(database):
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=0")
+        cursor = con.execute(
+            "INSERT INTO sources(name,url,kind,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES(?,?,'association',1,'permanent','error:Sources must use HTTPS',?)",
+            ("Association · Open Library", "association://openlibrary_lists", stale),
+        )
+
+    assert source_sync_is_due() is False
+    assert asyncio.run(handle_job(f"source:{cursor.lastrowid}")) == {
+        "skipped": "managed_by_association_provider",
+        "source_id": cursor.lastrowid,
+    }
 
 
 def test_expensive_job_requests_reuse_active_queue_entries(database):
@@ -861,6 +881,16 @@ def test_private_source_addresses_are_rejected(monkeypatch):
     with pytest.raises(ValueError, match="Private"):
         validate_public_url("https://books.example.test/list")
 
+def test_nyt_source_endpoints_reject_inline_credentials():
+    url = "https://api.nytimes.com/svc/books/v3/lists/overview.json?api-key=never-store-this"
+    with TestClient(app) as client:
+        preview = client.post("/api/sources/preview", json={"url": url})
+        assert preview.status_code == 400
+        assert "encrypted NYT API settings" in preview.json()["detail"]
+        created = client.post("/api/sources", json={"name": "NYT", "url": url})
+        assert created.status_code == 400
+        assert "never-store-this" not in created.text
+
 def test_api_boots_and_serves_recommendations(database):
     with TestClient(app) as client:
         assert client.get("/api/health").json()["ok"] is True
@@ -963,6 +993,86 @@ def test_settings_encrypt_and_preserve_api_keys(database):
     stored = row("SELECT value,secret FROM settings WHERE key='librarr_api_key'")
     assert stored["secret"] == 1 and stored["value"].startswith("fernet:") and "librarr-secret" not in stored["value"]
     assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
+
+
+def test_nyt_books_key_is_encrypted_and_only_added_to_outgoing_requests(database):
+    with TestClient(app) as client:
+        assert client.get("/api/settings/nyt").json() == {"api_key_set": False}
+        saved = client.put("/api/settings/nyt", json={"api_key": "nyt-test-key"})
+        assert saved.json() == {"saved": True, "api_key_set": True}
+        assert client.get("/api/settings/nyt").json() == {"api_key_set": True}
+
+    stored = row("SELECT value,secret FROM settings WHERE key='nyt_api_key'")
+    assert stored["secret"] == 1
+    assert stored["value"].startswith("fernet:")
+    assert "nyt-test-key" not in stored["value"]
+    outbound = _nyt_request_url(
+        "https://api.nytimes.com/svc/books/v3/lists/overview.json?offset=0&api-key=stale"
+    )
+    assert parse_qs(urlparse(outbound).query) == {
+        "offset": ["0"],
+        "api-key": ["nyt-test-key"],
+    }
+
+
+def test_nyt_import_uses_key_but_keeps_source_metadata_credential_free(database, monkeypatch):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('nyt_api_key',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+            (seal("nyt-import-test-key"),),
+        )
+    requested = []
+
+    async def fake_fetch(url):
+        requested.append(url)
+        payload = {
+            "results": {
+                "lists": [
+                    {
+                        "books": [
+                            {
+                                "title": "A Book",
+                                "author": "A Writer",
+                                "description": "A publisher description.",
+                                "list_name": "Hardcover Fiction",
+                                "amazon_product_url": "https://books.example/a-book",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        return json.dumps(payload).encode(), "application/json"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", fake_fetch)
+    url = "https://api.nytimes.com/svc/books/v3/lists/overview.json"
+    _, items = asyncio.run(ingestion._fetch_and_parse_source(url))
+
+    assert parse_qs(urlparse(requested[0]).query) == {
+        "api-key": ["nyt-import-test-key"]
+    }
+    assert items[0]["source_url"] == "https://books.example/a-book"
+    assert "nyt-import-test-key" not in json.dumps(items)
+
+
+def test_existing_subject_cleanup_updates_catalog_artifacts(database):
+    with transaction() as con:
+        cursor = con.execute(
+            "INSERT INTO candidates(title,author,genres,normalized_key) VALUES(?,?,?,?)",
+            (
+                "Tagged Book",
+                "A Writer",
+                '["Fiction","nyt:paperback_advice=2007-07-28","89.70 Politics"]',
+                "tagged book a writer",
+            ),
+        )
+
+    assert normalize_stored_candidate_subjects() >= 1
+    assert json.loads(row("SELECT genres FROM candidates WHERE id=?", (cursor.lastrowid,))["genres"]) == [
+        "Fiction",
+        "Politics",
+    ]
 
 
 def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):

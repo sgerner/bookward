@@ -7,15 +7,16 @@ import re
 import math
 import unicodedata
 from datetime import date, datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from .config import settings
 from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, resolve_cover_url, safe_cover_url
-from .database import normalize_key, rows, transaction
+from .database import normalize_key, private_setting, rows, transaction
 from .isbn import isbn_parts_from_source
 from .security import resolve_public_target
+from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
     r'''new\s+Tip\(\$\('(?P<id>bookCover[^']+)'\),\s*"(?P<body>(?:\\.|[^"\\])*)"\s*,''',
@@ -64,14 +65,7 @@ def _filter_genre_values(value):
 
 
 def _stored_genre_values(value):
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError):
-            return []
-        if not isinstance(value, (list, tuple)):
-            return []
-    return _filter_genre_values(value)[:8]
+    return normalize_subjects(value, limit=8)
 
 
 def normalize_source_filters(value):
@@ -787,14 +781,40 @@ async def enrich_goodreads_blog_items(items, client):
     return enriched
 
 
+def _nyt_request_url(url: str) -> str:
+    """Attach the encrypted Books API key only to the outgoing NYT request."""
+
+    parsed = urlparse(url)
+    if (parsed.hostname or "").casefold().rstrip(".") != "api.nytimes.com":
+        return url
+    api_key = private_setting("nyt_api_key").strip()
+    if not api_key:
+        return url
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+             if key.casefold() != "api-key"]
+    query.append(("api-key", api_key))
+    return parsed._replace(query=urlencode(query)).geturl()
+
+
+def _clean_parsed_subjects(items):
+    return [
+        {**item, "genres": normalize_subjects(item.get("genres"), limit=8)}
+        for item in items
+    ]
+
+
 async def _fetch_and_parse_source(url):
+    request_url = _nyt_request_url(url)
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
             content, content_type = await fetch_bytes(url, client=client)
             items = parse_book_items(content, content_type, url)
-            return content_type, await enrich_goodreads_blog_items(items, client)
-    content, content_type = await fetch_bytes(url)
-    return content_type, parse_book_items(content, content_type, url)
+            items = await enrich_goodreads_blog_items(items, client)
+            return content_type, _clean_parsed_subjects(items)
+    content, content_type = await fetch_bytes(request_url)
+    return content_type, _clean_parsed_subjects(
+        parse_book_items(content, content_type, url)
+    )
 
 async def import_goodreads_rss(url: str):
     parsed = httpx.URL(url); host = parsed.host or ""
@@ -893,13 +913,7 @@ def _schema_image(value):
 
 def _schema_genres(value):
     raw_genres = value.get("genre", []) if isinstance(value, dict) else []
-    values = raw_genres if isinstance(raw_genres, (list, tuple)) else [raw_genres]
-    genres = []
-    for raw in values:
-        genre = _schema_text(raw, 80)
-        if genre and genre not in genres:
-            genres.append(genre)
-    return genres[:8]
+    return normalize_subjects(raw_genres, limit=8)
 
 
 def _date_kind(raw_value):
@@ -948,7 +962,7 @@ def _merge_book_item(items, item, source_url):
         "source_url": item_source_url,
         "release_date": item.get("release_date"),
         "date_kind": item.get("date_kind", "") or "",
-        "genres": list(item.get("genres") or [])[:8],
+        "genres": normalize_subjects(item.get("genres"), limit=8),
     }
     if isbn13:
         normalized["isbn13"] = isbn13
@@ -988,7 +1002,9 @@ def _merge_book_item(items, item, source_url):
         elif not existing.get("date_kind") and normalized.get("date_kind"):
             existing["date_kind"] = normalized["date_kind"]
         if normalized.get("genres"):
-            existing["genres"] = list(dict.fromkeys((existing.get("genres") or []) + normalized["genres"]))[:8]
+            existing["genres"] = normalize_subjects(
+                (existing.get("genres") or []) + normalized["genres"], limit=8
+            )
         if existing_author_key in unknown_authors and author_key not in unknown_authors:
             existing["author"] = normalized["author"]
         if existing.get("source_url") in ("", source_url) and normalized.get("source_url") != source_url:
@@ -1313,15 +1329,11 @@ async def enrich_book_metadata(items):
                     enriched["date_kind"] = metadata.get("date_kind") or "day"
                 elif enriched.get("release_date") and not enriched.get("date_kind"):
                     enriched["date_kind"] = "source"
-                existing_genres = _filter_genre_values(enriched.get("genres", []))
-                genre_keys = {genre.casefold() for genre in existing_genres}
-                for genre in _filter_genre_values(metadata.get("genres", [])):
-                    if genre.casefold() not in genre_keys:
-                        existing_genres.append(genre)
-                        genre_keys.add(genre.casefold())
-                    if len(existing_genres) >= 8:
-                        break
-                enriched["genres"] = existing_genres
+                enriched["genres"] = normalize_subjects(
+                    normalize_subjects(enriched.get("genres", []))
+                    + normalize_subjects(metadata.get("genres", [])),
+                    limit=8,
+                )
                 enriched["_metadata_provider"] = metadata.get("provider", "")
                 enriched["_metadata_provider_id"] = metadata.get("provider_id", "")
                 enriched["_metadata_work_id"] = metadata.get("work_id", "")
@@ -1332,8 +1344,32 @@ async def enrich_book_metadata(items):
         return await asyncio.gather(*(enrich(item) for item in items))
 
 
+def normalize_stored_candidate_subjects() -> int:
+    """Clean legacy source tags and keep stored subjects normalized."""
+
+    candidates = rows("SELECT id,genres FROM candidates")
+    updates = []
+    for candidate in candidates:
+        normalized = json.dumps(
+            normalize_subjects(candidate.get("genres"), limit=8),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if normalized != (candidate.get("genres") or "[]"):
+            updates.append((normalized, candidate["id"]))
+    if updates:
+        with transaction() as con:
+            con.executemany(
+                "UPDATE candidates SET genres=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                updates,
+            )
+    return len(updates)
+
+
 async def refresh_missing_candidate_metadata():
     """Backfill sparse metadata for catalog-accepted candidates only."""
+
+    normalize_stored_candidate_subjects()
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
@@ -1358,15 +1394,8 @@ async def refresh_missing_candidate_metadata():
             release_date = item.get("release_date") or None
             date_kind = item.get("date_kind") or previous.get("date_kind") or "unknown"
             previous_genres = _stored_genre_values(previous.get("genres", []))
-            item_genres = _filter_genre_values(item.get("genres", []))
-            genres = list(previous_genres)
-            genre_keys = {genre.casefold() for genre in genres}
-            for genre in item_genres:
-                if genre.casefold() not in genre_keys:
-                    genres.append(genre)
-                    genre_keys.add(genre.casefold())
-                if len(genres) >= 8:
-                    break
+            item_genres = normalize_subjects(item.get("genres", []), limit=8)
+            genres = normalize_subjects(previous_genres + item_genres, limit=8)
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             metadata_provider = str(item.get("_metadata_provider", "") or "")
             metadata_provider_id = str(item.get("_metadata_provider_id", "") or "")
@@ -1436,7 +1465,8 @@ async def scan_source(source):
     _, items = await _fetch_and_parse_source(source["url"])
     raw_count = len(items)
     items = filter_source_items(items, source.get("filters"))
-    items = await enrich_book_metadata(items)
+    items = await enrich_book_metadata(_clean_parsed_subjects(items))
+    items = _clean_parsed_subjects(items)
     with transaction() as con:
         seen = []
         for item in items:
@@ -1450,14 +1480,11 @@ async def scan_source(source):
                 "SELECT id,isbn13,isbn10,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
-            genres = _stored_genre_values(existing["genres"] if existing else [])
-            genre_keys = {genre.casefold() for genre in genres}
-            for genre in _filter_genre_values(item.get("genres", [])):
-                if genre.casefold() not in genre_keys:
-                    genres.append(genre)
-                    genre_keys.add(genre.casefold())
-                if len(genres) >= 8:
-                    break
+            genres = normalize_subjects(
+                _stored_genre_values(existing["genres"] if existing else [])
+                + normalize_subjects(item.get("genres", []), limit=8),
+                limit=8,
+            )
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
