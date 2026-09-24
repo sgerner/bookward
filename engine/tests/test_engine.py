@@ -48,6 +48,7 @@ from afterword_engine.main import (
     SOURCE_SYNC_ERROR_RETRY_SECONDS,
     app,
     handle_job,
+    _needs_candidate_quality_audit,
     recommendation_list,
     score,
     source_sync_is_due,
@@ -103,6 +104,24 @@ def test_database_indexes_cover_recent_history_and_job_queue(database):
     )
     assert any("idx_reads_recent" in item["detail"] for item in history_plan)
     assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
+
+
+def test_startup_quality_audit_ignores_rejected_legacy_candidates(database):
+    candidate_id = row("SELECT id FROM candidates ORDER BY id LIMIT 1")["id"]
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected' WHERE id=?", (candidate_id,))
+        con.execute(
+            "UPDATE candidate_quality SET audit_version='legacy-pending-audit-v1' "
+            "WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    assert _needs_candidate_quality_audit() is False
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='new' WHERE id=?", (candidate_id,))
+
+    assert _needs_candidate_quality_audit() is True
 
 
 def test_fresh_database_seeds_curated_sources(database):

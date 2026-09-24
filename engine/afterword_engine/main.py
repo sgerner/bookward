@@ -122,6 +122,21 @@ def active_job(kind: str):
     )
 
 
+def _needs_candidate_quality_audit():
+    """Backfill confidence only for candidate rows that remain eligible."""
+
+    return bool(
+        row(
+            """SELECT 1 FROM candidate_quality q
+            JOIN candidates c ON c.id=q.candidate_id
+            WHERE c.status!='rejected'
+              AND (q.audit_version='legacy-pending-audit-v1'
+                   OR q.quality_status='pending')
+            LIMIT 1"""
+        )
+    )
+
+
 def queue_digest_if_due():
     """Schedule a digest immediately after scoring, when its window is open."""
 
@@ -332,10 +347,7 @@ async def lifespan(app):
     # A migration-created legacy quality ledger is an explicit signal that the
     # existing corpus still needs its one-time catalog audit.  Fresh installs
     # only contain curated demo rows and therefore skip this expensive job.
-    needs_full_quality_audit = row(
-        "SELECT 1 FROM candidate_quality WHERE audit_version='legacy-pending-audit-v1' "
-        "OR quality_status='pending' LIMIT 1"
-    )
+    needs_full_quality_audit = _needs_candidate_quality_audit()
     if needs_full_quality_audit:
         enqueue_job("candidate_quality", dedupe=True)
     elif row(
