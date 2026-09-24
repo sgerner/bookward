@@ -23,6 +23,8 @@ import httpx
 from .covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
+    _catalog_genres,
+    _clean_metadata_text,
     metadata_client,
     safe_cover_url,
 )
@@ -143,6 +145,7 @@ def _provider_match(
     description: str = "",
     release_date: str = "",
     cover_url: str = "",
+    genres: list[str] | None = None,
 ) -> dict[str, Any]:
     title_match = _title_similarity(title, catalog_title)
     author_match = _author_similarity(author, catalog_author)
@@ -160,9 +163,10 @@ def _provider_match(
         "quality_score": round(confidence, 4),
         "catalog_title": _text(catalog_title, 500),
         "catalog_author": _text(catalog_author, 300),
-        "description": _text(description, 4000),
+        "description": _clean_metadata_text(description, 4000),
         "release_date": _text(release_date, 32),
         "cover_url": cover_url,
+        "genres": _catalog_genres(genres),
     }
 
 
@@ -177,7 +181,7 @@ async def _open_library_match(
         ("isbn" if isbn else "title"): isbn or title[:500],
         **({} if isbn else {"author": author[:300]}),
         "limit": CATALOG_LIMIT,
-        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,isbn,isbn13,edition_key",
+        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,edition_key",
     }
     try:
         response = await client.get(OPEN_LIBRARY_SEARCH, params=params)
@@ -208,9 +212,10 @@ async def _open_library_match(
             catalog_author=catalog_author,
             isbn13=isbn13,
             isbn10=isbn10,
-            description=str(doc.get("first_sentence") or doc.get("description") or ""),
+            description=doc.get("first_sentence") or doc.get("description") or "",
             release_date=str(doc.get("first_publish_date") or doc.get("first_publish_year") or ""),
             cover_url=safe_cover_url(cover),
+            genres=_catalog_genres(doc.get("subject")),
         )
         if best is None or match["quality_score"] > best["quality_score"]:
             best = match
@@ -267,6 +272,7 @@ async def _google_books_match(
             description=str(info.get("description") or ""),
             release_date=str(info.get("publishedDate") or ""),
             cover_url=image,
+            genres=_catalog_genres(info.get("categories")),
         )
         if best is None or match["quality_score"] > best["quality_score"]:
             best = match
@@ -331,7 +337,7 @@ async def resolve_catalog_match(
         # Google Books when it cannot produce a strong match; this halves the
         # normal request volume and makes a full audit kinder to both services.
         open_library = await _open_library_match(title, author, client)
-        if open_library and open_library["quality_score"] >= 0.82:
+        if accepted(open_library):
             return open_library
         google = await _google_books_match(title, author, client)
         return max(
@@ -394,8 +400,9 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
-            work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
+            metadata_provider_id,audited_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -408,6 +415,8 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             title_match=excluded.title_match,
             author_match=excluded.author_match,
             audit_version=excluded.audit_version,
+            metadata_provider=CASE WHEN excluded.metadata_provider!='' THEN excluded.metadata_provider ELSE metadata_provider END,
+            metadata_provider_id=CASE WHEN excluded.metadata_provider_id!='' THEN excluded.metadata_provider_id ELSE metadata_provider_id END,
             audited_at=excluded.audited_at,
             updated_at=CURRENT_TIMESTAMP""",
         (
@@ -423,6 +432,14 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             float(result.get("title_match", 0) or 0),
             float(result.get("author_match", 0) or 0),
             QUALITY_VERSION,
+            str(result.get("provider", ""))
+            if result.get("quality_status") == "accepted"
+            and (result.get("description") or result.get("genres") or result.get("cover_url") or result.get("release_date"))
+            else "",
+            str(result.get("provider_id", ""))
+            if result.get("quality_status") == "accepted"
+            and (result.get("description") or result.get("genres") or result.get("cover_url") or result.get("release_date"))
+            else "",
         ),
     )
     if result.get("quality_status") == "rejected" and candidate.get("status") in {"new", "recommended"}:
@@ -430,22 +447,41 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             "UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (candidate_id,),
         )
-    # Catalog fields are additive.  A source's richer description/cover/date
-    # remains authoritative, while empty or placeholder fields are replaced.
+    # Catalog metadata is only used after the same title/author gate that
+    # accepts the identity. Existing source descriptions and genres remain
+    # authoritative; verified catalog values only fill gaps.
+    if result.get("quality_status") != "accepted":
+        return False
     description = _text(result.get("description"), 4000)
     cover_url = str(result.get("cover_url") or "")
     release_date = _text(result.get("release_date"), 32)
-    if description or cover_url or release_date:
+    existing_genres = candidate.get("genres", "[]")
+    if isinstance(existing_genres, str):
+        try:
+            existing_genres = json.loads(existing_genres)
+        except (TypeError, ValueError):
+            existing_genres = [existing_genres] if existing_genres.strip() else []
+    merged_genres = _catalog_genres(existing_genres)
+    genre_keys = {genre.casefold() for genre in merged_genres}
+    for genre in _catalog_genres(result.get("genres", [])):
+        if genre.casefold() not in genre_keys:
+            merged_genres.append(genre)
+            genre_keys.add(genre.casefold())
+        if len(merged_genres) >= 8:
+            break
+    genres_json = json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":"))
+    if description or cover_url or release_date or len(merged_genres) > len(_catalog_genres(existing_genres)):
         con.execute(
             """UPDATE candidates SET
                 description=CASE WHEN description='' AND ?!='' THEN ? ELSE description END,
                 cover_url=CASE WHEN (cover_url='' OR cover_url LIKE '%/b/isbn/%') AND ?!='' THEN ? ELSE cover_url END,
                 release_date=CASE WHEN release_date IS NULL AND ?!='' THEN ? ELSE release_date END,
                 date_kind=CASE WHEN release_date IS NULL AND ?!='' THEN 'catalog' ELSE date_kind END,
+                genres=CASE WHEN ?!='[]' THEN ? ELSE genres END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-            (description, description, cover_url, cover_url, release_date, release_date, release_date, candidate_id),
+            (description, description, cover_url, cover_url, release_date, release_date, release_date, genres_json, genres_json, candidate_id),
         )
-    return bool(description or cover_url or release_date)
+    return bool(description or cover_url or release_date or len(merged_genres) > len(_catalog_genres(existing_genres)))
 
 
 def _dedupe_and_hide(con) -> int:

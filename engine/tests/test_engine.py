@@ -11,7 +11,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from afterword_engine.config import settings
-from afterword_engine.database import MIGRATIONS, initialize, row, rows, transaction
+from afterword_engine.database import MIGRATIONS, initialize, normalize_key, row, rows, transaction
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -31,8 +31,10 @@ from afterword_engine.ingestion import (
     import_goodreads_csv,
     normalize_source_filters,
     parse_book_items,
+    refresh_missing_candidate_metadata,
     scan_source,
 )
+from afterword_engine import ingestion
 from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
 from afterword_engine.scoring import rebuild_all_embeddings
 from afterword_engine.embeddings import get_embedder
@@ -491,6 +493,49 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
 
 
+def test_scan_source_preserves_existing_description_and_merges_genres(database, monkeypatch):
+    async def fake_fetch(_url):
+        return "application/json", [
+            {
+                "title": "Curated Work",
+                "author": "A Writer",
+                "description": "A longer catalog description that must not replace the curated copy.",
+                "genres": ["Literary fiction", "Family life"],
+            }
+        ]
+
+    async def no_enrichment(items):
+        return items
+
+    monkeypatch.setattr("afterword_engine.ingestion._fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr("afterword_engine.ingestion.enrich_book_metadata", no_enrichment)
+    with transaction() as con:
+        builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        source_id = con.execute(
+            "INSERT INTO sources(name,url) VALUES(?,?)",
+            ("Metadata merge source", "https://example.com/metadata-merge"),
+        ).lastrowid
+        candidate_id = con.execute(
+            """INSERT INTO candidates(title,author,description,source_url,source_id,genres,normalized_key)
+            VALUES(?,?,?,?,?,?,?)""",
+            (
+                "Curated Work",
+                "A Writer",
+                "Curated publisher description.",
+                "https://example.com/curated",
+                builtin_id,
+                '["Curated genre"]',
+                normalize_key("Curated Work", "A Writer"),
+            ),
+        ).lastrowid
+
+    source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    assert asyncio.run(scan_source(source)) == 1
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    assert candidate["description"] == "Curated publisher description."
+    assert json.loads(candidate["genres"]) == ["Curated genre", "Literary fiction", "Family life"]
+
+
 def test_source_filters_match_genres_and_keep_untagged_books():
     items = [
         {"title": "Fantasy book", "genres": ["Fantasy"]},
@@ -501,10 +546,19 @@ def test_source_filters_match_genres_and_keep_untagged_books():
         {"include_genres": ["fantasy"], "exclude_genres": ["romance"]}
     )
     assert filters == {"include_genres": ["fantasy"], "exclude_genres": ["romance"]}
-    assert [item["title"] for item in filter_source_items(items, filters)] == [
+    assert [item["title"] for item in filter_source_items(items, filters)] == ["Fantasy book"]
+    assert [item["title"] for item in filter_source_items(items, {"exclude_genres": ["romance"]})] == [
         "Fantasy book",
         "Untagged book",
     ]
+    assert filter_source_items(
+        [{"title": "Cartography", "genres": ["Cartography"]}],
+        {"include_genres": ["art"]},
+    ) == []
+    assert filter_source_items(
+        [{"title": "Generic fiction", "genres": ["Fiction"]}],
+        {"include_genres": ["Science fiction"]},
+    ) == []
 
 
 def test_scan_source_applies_filters_and_removes_stale_unmatched_candidates(database, monkeypatch):
@@ -535,9 +589,9 @@ def test_scan_source_applies_filters_and_removes_stale_unmatched_candidates(data
         )
 
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
-    assert asyncio.run(scan_source(source)) == 2
+    assert asyncio.run(scan_source(source)) == 1
     assert row("SELECT id FROM candidates WHERE title='Keep fantasy'")
-    assert row("SELECT id FROM candidates WHERE title='Keep untagged'")
+    assert row("SELECT id FROM candidates WHERE title='Keep untagged'") is None
     assert row("SELECT id FROM candidates WHERE title='Drop romance'") is None
     assert row("SELECT id FROM candidates WHERE title='Stale book'") is None
 
@@ -1070,7 +1124,7 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
 @respx.mock
 def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
     route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(200, json={"docs": [{"title": "A Book", "cover_i": 12345}]})
+        return_value=httpx.Response(200, json={"docs": [{"title": "A Book", "author_name": ["An Author"], "cover_i": 12345}]})
     )
     cover = asyncio.run(resolve_cover_url("A Book", "An Author", "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg"))
     assert cover == "https://covers.openlibrary.org/b/id/12345-L.jpg"
@@ -1080,7 +1134,7 @@ def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
 def test_cover_lookup_falls_back_to_google_books_then_placeholder():
     respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
     google = respx.get(GOOGLE_BOOKS_SEARCH).mock(
-        return_value=httpx.Response(200, json={"items": [{"volumeInfo": {"title": "A Book", "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=x"}}}]})
+        return_value=httpx.Response(200, json={"items": [{"volumeInfo": {"title": "A Book", "authors": ["An Author"], "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=x"}}}]})
     )
     cover = asyncio.run(resolve_cover_url("A Book", "An Author"))
     assert cover == "https://books.google.com/books/content?id=x"
@@ -1099,9 +1153,11 @@ def test_book_metadata_lookup_supplies_summary_and_year():
                 "docs": [
                     {
                         "title": "A Book",
+                        "author_name": ["An Author"],
                         "cover_i": 12345,
                         "first_publish_year": 1998,
                         "first_sentence": ["A quiet story about becoming brave."],
+                        "subject": ["Literary fiction", "Coming of age"],
                     }
                 ]
             },
@@ -1124,6 +1180,7 @@ def test_metadata_enrichment_reuses_duplicate_provider_lookups():
                 "docs": [
                     {
                         "title": "A Book",
+                        "author_name": ["An Author"],
                         "cover_i": 12345,
                         "first_publish_year": 1998,
                         "first_sentence": ["A quiet story about becoming brave."],
@@ -1142,6 +1199,186 @@ def test_metadata_enrichment_reuses_duplicate_provider_lookups():
     assert route.call_count == 1
     assert len(enriched) == 2
     assert all(item["release_date"] == "1998-01-01" for item in enriched)
+
+
+@respx.mock
+def test_metadata_rejects_wrong_author_and_falls_back_to_verified_google_record():
+    open_library = respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={"docs": [
+                {"key": "/works/OLWRONG", "title": "A Book", "author_name": ["B Writer"], "first_sentence": ["Wrong book."]},
+                {"key": "/works/OLNOAUTHOR", "title": "A Book", "first_sentence": ["No author evidence."]},
+            ]},
+        )
+    )
+    google = respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "volume-1",
+                        "volumeInfo": {
+                            "title": "A Book",
+                            "authors": ["An Author"],
+                            "description": "A verified description.",
+                            "categories": ["Literary fiction", "Mystery"],
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    metadata = asyncio.run(resolve_book_metadata("A Book", "An Author"))
+
+    assert open_library.called and google.called
+    assert metadata["description"] == "A verified description."
+    assert metadata["genres"] == ["Literary fiction", "Mystery"]
+    assert metadata["provider"] == "google_books"
+    assert metadata["provider_id"] == "volume-1"
+
+
+@respx.mock
+def test_metadata_does_not_use_an_exact_provider_id_with_wrong_author():
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={"docs": [{"key": "/works/OL1W", "title": "A Book", "author_name": ["B Writer"], "first_sentence": ["Wrong book."], "subject": ["Wrong genre"]}]},
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={"items": [{"id": "volume-1", "volumeInfo": {"title": "A Book", "authors": ["An Author"], "description": "Also not the recorded provider."}}]},
+        )
+    )
+
+    metadata = asyncio.run(
+        resolve_book_metadata(
+            "A Book",
+            "An Author",
+            description="Curated description.",
+            genres=["Curated genre"],
+            expected_provider="openlibrary",
+            expected_provider_id="/works/OL1W",
+        )
+    )
+
+    assert metadata["description"] == "Curated description."
+    assert metadata["genres"] == []
+    assert metadata["provider"] == ""
+
+
+@respx.mock
+def test_refresh_metadata_preserves_curated_description_and_serializes_genres(database):
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        candidate_id = con.execute(
+            """INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,genres,normalized_key)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                "A Curated Book",
+                "An Author",
+                "Carefully edited publisher copy.",
+                "https://placehold.co/640x960",
+                "https://example.com/book",
+                source_id,
+                '[]',
+                "curated-metadata-backfill",
+            ),
+        ).lastrowid
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLCURATED",
+                        "title": "A Curated Book",
+                        "author_name": ["An Author"],
+                        "cover_i": 42,
+                        "first_publish_year": 2001,
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "volume-fallback",
+                        "volumeInfo": {
+                            "title": "A Curated Book",
+                            "authors": ["An Author"],
+                            "description": "A provider summary.",
+                            "categories": ["Literary fiction", "Family life"],
+                        },
+                    }
+                ]
+            },
+        )
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET provider='openlibrary',provider_id='/works/OLCURATED',work_id='/works/OLCURATED' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    changed = asyncio.run(refresh_missing_candidate_metadata())
+
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert changed == 1
+    assert candidate["description"] == "Carefully edited publisher copy."
+    assert json.loads(candidate["genres"]) == ["Literary fiction", "Family life"]
+    assert candidate["cover_url"] == "https://covers.openlibrary.org/b/id/42-L.jpg"
+    assert quality["provider"] == "openlibrary"
+    assert quality["provider_id"] == "/works/OLCURATED"
+    assert quality["work_id"] == "/works/OLCURATED"
+    assert quality["metadata_provider"] == "google_books"
+    assert quality["metadata_provider_id"] == "volume-fallback"
+    assert quality["metadata_checked_at"]
+
+
+def test_metadata_refresh_rotates_through_sparse_candidates(database, monkeypatch):
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        candidate_ids = []
+        for score in range(51):
+            candidate_ids.append(
+                con.execute(
+                    """INSERT INTO candidates(title,author,source_url,source_id,score,normalized_key)
+                    VALUES(?,?,?,?,?,?)""",
+                    (f"Sparse book {score}", "A Writer", "https://example.com/book", source_id, score, f"sparse-{score}"),
+                ).lastrowid
+            )
+
+    batches = []
+
+    async def no_match(items):
+        batches.append([item["id"] for item in items])
+        return items
+
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", no_match)
+    assert asyncio.run(refresh_missing_candidate_metadata()) == 0
+    assert len(batches[0]) == 50
+    remaining = set(candidate_ids) - set(batches[0])
+    assert len(remaining) == 1
+
+    assert asyncio.run(refresh_missing_candidate_metadata()) == 0
+    assert remaining.issubset(set(batches[1]))
+
+    metadata_checked = rows(
+        "SELECT metadata_checked_at FROM candidate_quality WHERE candidate_id IN (%s)" % ",".join("?" for _ in candidate_ids),
+        tuple(candidate_ids),
+    )
+    assert len(metadata_checked) == 51
+    assert all(item["metadata_checked_at"] for item in metadata_checked)
 
 def test_existing_seed_isbn_cover_urls_are_migrated(database):
     with transaction() as con:

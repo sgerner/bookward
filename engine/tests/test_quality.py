@@ -61,6 +61,8 @@ def test_audit_accepts_catalog_match_and_persists_identifier(database):
                         "author_name": ["A Writer"],
                         "isbn": ["0307474275"],
                         "first_publish_year": 2010,
+                        "first_sentence": ["A checked catalog summary."],
+                        "subject": ["Literary fiction", "Family life"],
                     }
                 ]
             },
@@ -75,6 +77,9 @@ def test_audit_accepts_catalog_match_and_persists_identifier(database):
     assert quality["isbn13"] == "9780307474278"
     assert quality["work_id"] == "/works/OL1W"
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "new"
+    candidate = row("SELECT description,genres FROM candidates WHERE id=?", (candidate_id,))
+    assert candidate["description"] == "A checked catalog summary."
+    assert json.loads(candidate["genres"]) == ["Literary fiction", "Family life"]
 
 
 @respx.mock

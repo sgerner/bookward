@@ -5,7 +5,8 @@ import io
 import json
 import re
 import math
-from datetime import date, datetime
+import unicodedata
+from datetime import date, datetime, timezone
 from urllib.parse import urljoin, urlparse
 import feedparser
 import httpx
@@ -37,7 +38,12 @@ SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 
 def _filter_genre_values(value):
     if isinstance(value, str):
-        value = value.split(",")
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            value = value.split(",")
+        else:
+            value = decoded if isinstance(decoded, (list, tuple)) else [value]
     if not isinstance(value, (list, tuple)):
         return []
     values = []
@@ -57,6 +63,17 @@ def _filter_genre_values(value):
     return values
 
 
+def _stored_genre_values(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(value, (list, tuple)):
+            return []
+    return _filter_genre_values(value)[:8]
+
+
 def normalize_source_filters(value):
     """Return the small, forward-compatible filter shape stored per source."""
 
@@ -74,16 +91,26 @@ def normalize_source_filters(value):
 
 
 def _genre_matches(wanted, available):
-    wanted = re.sub(r"\s+", " ", str(wanted or "")).strip().casefold()
-    available = re.sub(r"\s+", " ", str(available or "")).strip().casefold()
-    return bool(wanted and available and (wanted == available or wanted in available or available in wanted))
+    def words(value):
+        value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return re.findall(r"[\w]+", value)
+
+    wanted_words, available_words = words(wanted), words(available)
+    if not wanted_words or not available_words:
+        return False
+
+    def contains_phrase(phrase, text):
+        return any(text[index:index + len(phrase)] == phrase for index in range(len(text) - len(phrase) + 1))
+
+    return contains_phrase(wanted_words, available_words)
 
 
 def filter_source_items(items, filters):
     """Apply optional genre filters without losing untagged source records.
 
-    Generic pages often omit genre metadata. Those records remain eligible so
-    enabling a filter cannot make an otherwise valid source silently disappear.
+    An explicit include filter requires a matching genre. Exclude-only filters
+    keep untagged records because there is no evidence that they match an
+    excluded genre.
     """
 
     configured = normalize_source_filters(filters)
@@ -100,6 +127,8 @@ def filter_source_items(items, filters):
             except (TypeError, ValueError):
                 genres = [genres]
         genres = [str(genre) for genre in genres if str(genre).strip()]
+        if include and not genres:
+            continue
         if genres:
             if include and not any(_genre_matches(wanted, genre) for wanted in include for genre in genres):
                 continue
@@ -1270,8 +1299,11 @@ async def enrich_book_metadata(items):
                     item.get("source_url", ""),
                     item.get("description", ""),
                     item.get("release_date", ""),
+                    item.get("genres", []),
                     client=client,
                     lookup_cache=lookup_cache,
+                    expected_provider=item.get("_expected_provider", ""),
+                    expected_provider_id=item.get("_expected_provider_id", ""),
                 )
                 enriched = {**item, "cover_url": metadata["cover_url"]}
                 if not enriched.get("description") and metadata["description"]:
@@ -1281,23 +1313,43 @@ async def enrich_book_metadata(items):
                     enriched["date_kind"] = metadata.get("date_kind") or "day"
                 elif enriched.get("release_date") and not enriched.get("date_kind"):
                     enriched["date_kind"] = "source"
+                existing_genres = _filter_genre_values(enriched.get("genres", []))
+                genre_keys = {genre.casefold() for genre in existing_genres}
+                for genre in _filter_genre_values(metadata.get("genres", [])):
+                    if genre.casefold() not in genre_keys:
+                        existing_genres.append(genre)
+                        genre_keys.add(genre.casefold())
+                    if len(existing_genres) >= 8:
+                        break
+                enriched["genres"] = existing_genres
+                enriched["_metadata_provider"] = metadata.get("provider", "")
+                enriched["_metadata_provider_id"] = metadata.get("provider_id", "")
+                enriched["_metadata_work_id"] = metadata.get("work_id", "")
+                enriched["_metadata_title_match"] = metadata.get("title_match", 0.0)
+                enriched["_metadata_author_match"] = metadata.get("author_match", 0.0)
                 return enriched
 
         return await asyncio.gather(*(enrich(item) for item in items))
 
 
 async def refresh_missing_candidate_metadata():
-    """Backfill artwork, summaries, and dates for older candidates."""
+    """Backfill sparse metadata for catalog-accepted candidates only."""
 
     candidates = rows(
-        "SELECT id,title,author,description,cover_url,source_url,release_date,date_kind "
-        "FROM candidates WHERE status!='rejected' AND ("
-        "cover_url='' OR cover_url LIKE '%/b/isbn/%' OR description='' OR release_date IS NULL) "
-        "ORDER BY id LIMIT 50"
+        "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
+        "q.provider AS _expected_provider,q.provider_id AS _expected_provider_id "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.status!='rejected' AND q.quality_status='accepted' AND ("
+        "cover_url='' OR cover_url LIKE '%/b/isbn/%' OR cover_url LIKE 'https://placehold.co/%' "
+        "OR description='' OR release_date IS NULL "
+        "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
+        "ORDER BY q.metadata_checked_at ASC,c.score DESC,c.id LIMIT 50"
     )
     if not candidates:
         return 0
-    enriched = await enrich_book_metadata(candidates)
+    enriched = await enrich_book_metadata(
+        [{**candidate, "genres": _stored_genre_values(candidate.get("genres"))} for candidate in candidates]
+    )
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
@@ -1305,20 +1357,61 @@ async def refresh_missing_candidate_metadata():
             cover_url = item.get("cover_url", "")
             release_date = item.get("release_date") or None
             date_kind = item.get("date_kind") or previous.get("date_kind") or "unknown"
+            previous_genres = _stored_genre_values(previous.get("genres", []))
+            item_genres = _filter_genre_values(item.get("genres", []))
+            genres = list(previous_genres)
+            genre_keys = {genre.casefold() for genre in genres}
+            for genre in item_genres:
+                if genre.casefold() not in genre_keys:
+                    genres.append(genre)
+                    genre_keys.add(genre.casefold())
+                if len(genres) >= 8:
+                    break
+            genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
+            metadata_provider = str(item.get("_metadata_provider", "") or "")
+            metadata_provider_id = str(item.get("_metadata_provider_id", "") or "")
+            metadata_work_id = str(item.get("_metadata_work_id", "") or "")
             if (
-                (description and len(description) > len(previous.get("description", "")))
+                (description and not previous.get("description"))
                 or (cover_url and (not previous.get("cover_url") or is_weak_cover_url(previous.get("cover_url"))))
                 or (release_date and not previous.get("release_date"))
+                or (len(genres) > len(previous_genres))
             ):
                 changed += 1
             con.execute(
                 """UPDATE candidates SET
-                description=CASE WHEN length(?) > length(description) THEN ? ELSE description END,
-                cover_url=CASE WHEN (cover_url='' OR cover_url LIKE '%/b/isbn/%') AND ?!='' THEN ? ELSE cover_url END,
+                description=CASE WHEN description='' AND ?!='' THEN ? ELSE description END,
+                cover_url=CASE WHEN (cover_url='' OR cover_url LIKE '%/b/isbn/%' OR cover_url LIKE 'https://placehold.co/%') AND ?!='' THEN ? ELSE cover_url END,
                 release_date=COALESCE(release_date, ?),
                 date_kind=CASE WHEN release_date IS NULL AND ? IS NOT NULL THEN ? ELSE date_kind END,
+                genres=CASE WHEN ?!='[]' THEN ? ELSE genres END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (description, description, cover_url, cover_url, release_date, release_date, date_kind, item["id"]),
+                (description, description, cover_url, cover_url, release_date, release_date, date_kind, genres_json, genres_json, item["id"]),
+            )
+            con.execute(
+                """UPDATE candidate_quality SET metadata_checked_at=?,
+                    metadata_provider=CASE WHEN ?!='' THEN ? ELSE metadata_provider END,
+                    metadata_provider_id=CASE WHEN ?!='' THEN ? ELSE metadata_provider_id END,
+                    provider=CASE WHEN provider='' THEN ? ELSE provider END,
+                    provider_id=CASE WHEN provider='' THEN ? ELSE provider_id END,
+                    work_id=CASE WHEN provider='' THEN ? ELSE work_id END,
+                    title_match=CASE WHEN provider='' THEN ? ELSE title_match END,
+                    author_match=CASE WHEN provider='' THEN ? ELSE author_match END,
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE candidate_id=? AND quality_status='accepted'""",
+                (
+                    datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    metadata_provider,
+                    metadata_provider,
+                    metadata_provider_id,
+                    metadata_provider_id,
+                    metadata_provider,
+                    metadata_provider_id,
+                    metadata_work_id,
+                    float(item.get("_metadata_title_match", 0) or 0),
+                    float(item.get("_metadata_author_match", 0) or 0),
+                    item["id"],
+                )
             )
     return changed
 
@@ -1354,12 +1447,21 @@ async def scan_source(source):
                 item.get("source_url", source["url"]),
             )
             existing = con.execute(
-                "SELECT id,isbn13,isbn10 FROM candidates WHERE normalized_key=?",
+                "SELECT id,isbn13,isbn10,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
+            genres = _stored_genre_values(existing["genres"] if existing else [])
+            genre_keys = {genre.casefold() for genre in genres}
+            for genre in _filter_genre_values(item.get("genres", [])):
+                if genre.casefold() not in genre_keys:
+                    genres.append(genre)
+                    genre_keys.add(genre.casefold())
+                if len(genres) >= 8:
+                    break
+            genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
-            description=CASE WHEN length(excluded.description)>length(description) THEN excluded.description ELSE description END,
+            description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
             cover_url=CASE WHEN length(excluded.cover_url)>0 THEN excluded.cover_url ELSE cover_url END,
             source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
             release_date=COALESCE(excluded.release_date, release_date),
@@ -1367,7 +1469,7 @@ async def scan_source(source):
             genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
             isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
             isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), json.dumps(item.get("genres", [])), isbn13, isbn10, key))
+            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
             candidate = con.execute(
                 "SELECT id,isbn13,isbn10 FROM candidates WHERE normalized_key=?",
                 (key,),
