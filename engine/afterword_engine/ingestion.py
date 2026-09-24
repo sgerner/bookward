@@ -296,7 +296,21 @@ def _parse_open_library(payload, source_url):
             continue
         title = str(work.get("title", "")).strip()
         authors = work.get("authors") or []
-        names = [str(author.get("name", "")).strip() for author in authors if isinstance(author, dict) and author.get("name")]
+        if isinstance(authors, (str, dict)):
+            authors = [authors]
+        names = [
+            str(author.get("name", "")).strip()
+            if isinstance(author, dict)
+            else str(author).strip()
+            for author in authors
+            if (author.get("name") if isinstance(author, dict) else author)
+        ]
+        if not names:
+            author_names = work.get("author_name") or work.get("author_names") or []
+            if isinstance(author_names, str):
+                author_names = [author_names]
+            if isinstance(author_names, list):
+                names = [str(author).strip() for author in author_names if author]
         author = names[0] if names else "Unknown author"
         key = normalize_key(title, author)
         if not title or key in seen:
@@ -308,6 +322,10 @@ def _parse_open_library(payload, source_url):
         cover_id = work.get("cover_id") or work.get("cover_i")
         work_key = str(work.get("key", ""))
         source = metadata_url(f"https://openlibrary.org{work_key}" if work_key.startswith("/") else work_key, source_url)
+        raw_release_date = work.get("first_publish_date") or work.get("first_publish_year")
+        subjects = work.get("subject") or work.get("subjects") or []
+        if isinstance(subjects, str):
+            subjects = [subjects]
         items.append(
             _with_source_isbn(
                 {
@@ -316,8 +334,9 @@ def _parse_open_library(payload, source_url):
                     "description": _clean_text(description),
                     "cover_url": safe_cover_url(f"https://covers.openlibrary.org/b/id/{int(cover_id)}-L.jpg", source_url) if str(cover_id).isdigit() else "",
                     "source_url": source,
-                    "release_date": None,
-                    "genres": [str(subject)[:80] for subject in (work.get("subject") or [])[:8] if subject],
+                    "release_date": _date_value(raw_release_date),
+                    "date_kind": _date_kind(raw_release_date),
+                    "genres": [str(subject)[:80] for subject in subjects[:8] if subject],
                 },
                 [work.get(key) for key in ("isbn13", "isbn10", "isbn")],
             )
@@ -1246,7 +1265,11 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         payload = payloads[0]
         if _is_apple_source(source_url) and isinstance(payload, dict):
             return _parse_apple_entries(payload.get("feed", {}).get("entry", []), source_url)
-        if _source_matches(source_url, "openlibrary.org", "/subjects/") and isinstance(payload, dict):
+        if (
+            _source_matches(source_url, "openlibrary.org")
+            and isinstance(payload, dict)
+            and isinstance(payload.get("works"), list)
+        ):
             return _parse_open_library(payload, source_url)
         if _source_matches(source_url, "api.nytimes.com") and isinstance(payload, dict):
             return _parse_nytimes(payload, source_url)
