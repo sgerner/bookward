@@ -5,7 +5,12 @@ import pytest
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, transaction
 from afterword_engine.digest import _candidate_rows
-from afterword_engine.identity import book_identity, book_identity_matches
+from afterword_engine.identity import (
+    book_identity,
+    book_identity_match_index,
+    book_identity_matches,
+    book_row_identity_match_keys,
+)
 from afterword_engine.main import recommendation_list
 from afterword_engine.scoring import score_all
 
@@ -53,7 +58,80 @@ def test_identity_matching_handles_catalog_author_suffixes_and_subtitles():
         "The Rise and Fall of the Third Reich: A History of Nazi Germany",
         "William L. Shirer",
     )
+    assert book_identity_matches(
+        "The Dispossessed",
+        "Ursula K. Le Guin",
+        "The Dispossessed: An Ambiguous Utopia",
+        "Ursula K. Le Guin",
+    )
+    assert book_identity_matches(
+        "Biological War",
+        "Annie Jacobsen",
+        "Biological War: A Scenario",
+        "Annie Jacobsen",
+    )
     assert not book_identity_matches("Dune", "Frank Herbert", "Dune: Messiah", "Frank Herbert")
+    assert not book_identity_matches(
+        "The Hunger Games",
+        "Suzanne Collins",
+        "The Hunger Games: Catching Fire",
+        "Suzanne Collins",
+    )
+    assert not book_identity_matches(
+        "The Lord of the Rings",
+        "J. R. R. Tolkien",
+        "The Lord of the Rings: The Two Towers",
+        "J. R. R. Tolkien",
+    )
+
+
+def test_identity_index_matches_isbn_editions_and_provider_scoped_work_ids():
+    reads = [
+        {
+            "title": "Unreasonable Hospitality",
+            "author": "Will Guidara",
+            "isbn": "0593418573",
+        },
+        {
+            "title": "The Lost City",
+            "author": "A. Reader",
+            "work_id": "/works/OL123456W",
+            "work_id_provider": "openlibrary",
+        },
+    ]
+    read_keys = book_identity_match_index(reads)
+
+    assert book_row_identity_match_keys(
+        {
+            "title": "Hospitality: A New Approach",
+            "author": "Different Catalog Author",
+            "isbn13": "9780593418574",
+        }
+    ) & read_keys
+    assert book_row_identity_match_keys(
+        {
+            "title": "The Lost City: A Novel",
+            "author": "Someone Else",
+            "quality_work_id": "OL123456W",
+            "quality_provider": "openlibrary",
+        }
+    ) & read_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "The Lost City: A Novel",
+            "author": "Someone Else",
+            "quality_work_id": "OL123456W",
+            "quality_provider": "google_books",
+        }
+    ) & read_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "An unrelated candidate",
+            "author": "Another Author",
+            "isbn13": "9780593418573",
+            "work_id": "OL123456W",
+        }
+    ) & read_keys
 
 
 def test_recommendation_and_digest_hide_unrated_reads_but_keep_saved(database):
@@ -92,6 +170,66 @@ def test_recommendations_hide_recommended_duplicate_of_imported_work(database):
 
     assert recommended_id not in {item["id"] for item in visible}
     assert imported_id in {item["id"] for item in visible}
+
+
+def test_discovery_never_returns_the_three_read_book_identity_variants(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+
+    unreasonable_id = add_candidate(
+        "Unreasonable Hospitality: The Remarkable Power of Giving People More Than They Expect",
+        "Unknown author",
+        score=100,
+    )
+    dispossessed_id = add_candidate(
+        "The Dispossessed",
+        "Ursula K. Le Guin",
+        score=99,
+    )
+    biological_war_id = add_candidate(
+        "Biological War",
+        "Annie Jacobsen",
+        score=98,
+    )
+    fresh_id = add_candidate("A Different Book", "Another Writer", score=90)
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET isbn13=? WHERE id=?",
+            ("9780593418574", unreasonable_id),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,isbn,source) VALUES(?,?,?,?)",
+            (
+                "Unreasonable Hospitality",
+                "Will Guidara",
+                "0593418573",
+                "goodreads_csv",
+            ),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            (
+                "The Dispossessed: An Ambiguous Utopia",
+                "Ursula K. Le Guin",
+                "goodreads_csv",
+            ),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            (
+                "Biological War: A Scenario",
+                "Annie Jacobsen",
+                "goodreads_csv",
+            ),
+        )
+
+    visible = recommendation_list(status="recommended", limit=None)
+    visible_ids = {item["id"] for item in visible}
+
+    assert unreasonable_id not in visible_ids
+    assert dispossessed_id not in visible_ids
+    assert biological_war_id not in visible_ids
+    assert fresh_id in visible_ids
 
 
 def test_scoring_excludes_unrated_reads(database):

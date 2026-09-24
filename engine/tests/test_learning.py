@@ -32,7 +32,7 @@ def test_recommendation_responses_create_ranked_run_and_impressions(database):
         (run_id,),
     )
     assert run["policy"] == "rating-neighborhood"
-    assert run["policy_version"] == "rating-neighborhood-v1"
+    assert run["policy_version"] == "rating-kernel-recency-v1"
     assert run["candidate_count"] == len(recommendations)
     assert impressions["count"] == len(recommendations)
     assert row(

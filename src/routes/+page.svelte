@@ -1576,7 +1576,7 @@
                                   />
                                 </label>
                                 <p class="text-xs leading-5 text-surface-600-400">
-                                  Separate genres with commas. Untagged books remain eligible.
+                                  Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                                 </p>
                                 <button
                                   class="btn btn-sm min-h-9 preset-tonal-secondary"
@@ -1740,7 +1740,7 @@
                         />
                       </label>
                       <p class="text-xs leading-5 text-surface-600-400">
-                        Comma-separated. Books without genre tags remain eligible.
+                        Comma-separated. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                       </p>
                     </div>
                   </details

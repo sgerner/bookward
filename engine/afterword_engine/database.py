@@ -259,6 +259,16 @@ MIGRATIONS = [
         DELETE FROM settings WHERE key LIKE 'llm_%' OR key LIKE 'models_catalog%';
         """,
     ),
+    (
+        13,
+        """
+        ALTER TABLE candidate_quality ADD COLUMN metadata_checked_at TEXT;
+        ALTER TABLE candidate_quality ADD COLUMN metadata_provider TEXT NOT NULL DEFAULT '';
+        ALTER TABLE candidate_quality ADD COLUMN metadata_provider_id TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_candidate_quality_metadata_checked
+            ON candidate_quality(quality_status, metadata_checked_at);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

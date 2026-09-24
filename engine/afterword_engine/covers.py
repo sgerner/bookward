@@ -11,7 +11,9 @@ on the server, which keeps the cover enrichment path out of SSRF territory.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import unicodedata
 from datetime import date, datetime
 from urllib.parse import urlencode, urlparse
 
@@ -55,13 +57,16 @@ def metadata_client() -> httpx.AsyncClient:
 
 
 def is_weak_cover_url(value: object) -> bool:
-    """Identify Open Library ISBN URLs, which may be a 1x1 no-cover GIF."""
+    """Identify known placeholder cover URLs that should be retried."""
 
     try:
         parsed = httpx.URL(str(value))
     except Exception:
         return False
-    return parsed.host == "covers.openlibrary.org" and parsed.path.casefold().startswith("/b/isbn/")
+    return (
+        parsed.host == "covers.openlibrary.org"
+        and parsed.path.casefold().startswith("/b/isbn/")
+    ) or parsed.host == "placehold.co"
 
 
 def safe_cover_url(value: object, source_url: str = "") -> str:
@@ -153,20 +158,104 @@ async def _lookup_open_library(
     return str(record.get("cover_url", ""))
 
 
+def _identity_text(value: object) -> str:
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(
+        "".join(char if char.isalnum() else " " for char in value).split()
+    )
+
+
 def _normalized_title(value: object) -> str:
-    return " ".join(str(value or "").casefold().split())
+    return _identity_text(value)
 
 
 def _title_matches(wanted: str, candidate: object) -> bool:
+    """Require a normalized full-title match before using catalog metadata."""
+
     normalized = _normalized_title(candidate)
-    return bool(wanted and normalized and (wanted in normalized or normalized in wanted))
+    return bool(wanted and normalized and wanted == normalized)
+
+
+def _author_matches(wanted: str, candidates: object) -> bool:
+    """Match a full author name or its first initial and surname.
+
+    Catalogs vary in whether they include middle names and initials. A shared
+    surname alone is too weak to attach descriptions or subjects to a work.
+    """
+
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    if not isinstance(candidates, (list, tuple)):
+        return False
+    wanted_parts = [part.strip() for part in re.split(r"\s*(?:,|;|&|\band\b)\s*", wanted, flags=re.I) if part.strip()]
+    for wanted_author in wanted_parts:
+        wanted_normalized = _identity_text(wanted_author)
+        wanted_tokens = wanted_normalized.split()
+        if not wanted_tokens:
+            continue
+        for candidate in candidates:
+            candidate_normalized = _identity_text(candidate)
+            candidate_tokens = candidate_normalized.split()
+            if not candidate_tokens:
+                continue
+            if wanted_normalized == candidate_normalized:
+                return True
+            if (
+                len(wanted_tokens) >= 2
+                and len(candidate_tokens) >= 2
+                and wanted_tokens[-1] == candidate_tokens[-1]
+                and wanted_tokens[0][0] == candidate_tokens[0][0]
+                and (
+                    wanted_tokens[0] == candidate_tokens[0]
+                    or len(wanted_tokens[0]) == 1
+                    or len(candidate_tokens[0]) == 1
+                )
+            ):
+                return True
+    return False
+
+
+def _catalog_genres(value: object, limit: int = 8) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        return []
+    genres = []
+    seen = set()
+    for raw in values:
+        if isinstance(raw, dict):
+            raw = raw.get("name") or raw.get("value") or raw.get("text") or ""
+        genre = _clean_metadata_text(raw, 80)
+        key = genre.casefold()
+        if not genre or key in seen:
+            continue
+        seen.add(key)
+        genres.append(genre)
+        if len(genres) >= limit:
+            break
+    return genres
+
+
+def _author_display(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(author) for author in value if author)
+    return ""
 
 
 def _clean_metadata_text(value: object, limit: int = 4000) -> str:
     if isinstance(value, dict):
         value = value.get("value") or value.get("text") or ""
     if isinstance(value, list):
-        value = " ".join(str(item) for item in value)
+        value = " ".join(
+            str(item.get("value") or item.get("text") or "")
+            if isinstance(item, dict)
+            else str(item)
+            for item in value
+        )
     text = BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
@@ -202,12 +291,12 @@ async def _lookup_open_library_record(
     title: str,
     author: str,
     client: httpx.AsyncClient | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     params = {
         "title": title[:500],
         "author": author[:300],
         "limit": 5,
-        "fields": "title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence",
+        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject",
     }
     try:
         if client is None:
@@ -224,7 +313,11 @@ async def _lookup_open_library_record(
         return {}
     wanted = _normalized_title(title)
     for doc in docs:
-        if not isinstance(doc, dict) or not _title_matches(wanted, doc.get("title")):
+        if (
+            not isinstance(doc, dict)
+            or not _title_matches(wanted, doc.get("title"))
+            or not _author_matches(author, doc.get("author_name"))
+        ):
             continue
         release_date, date_kind = _publication_date(
             doc.get("first_publish_date") or doc.get("first_publish_year")
@@ -236,6 +329,13 @@ async def _lookup_open_library_record(
             ),
             "release_date": release_date or "",
             "date_kind": date_kind or "",
+            "genres": _catalog_genres(doc.get("subject")),
+            "provider": "openlibrary",
+            "provider_id": str(doc.get("key") or ""),
+            "catalog_title": str(doc.get("title") or ""),
+            "catalog_author": _author_display(doc.get("author_name")),
+            "title_match": 1.0,
+            "author_match": 1.0,
         }
     return {}
 
@@ -251,7 +351,7 @@ async def _lookup_google_books_record(
     title: str,
     author: str,
     client: httpx.AsyncClient | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     params = {"q": f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": 5}
     try:
         if client is None:
@@ -271,7 +371,10 @@ async def _lookup_google_books_record(
         info = item.get("volumeInfo", {}) if isinstance(item, dict) else {}
         if not isinstance(info, dict):
             continue
-        if not _title_matches(wanted, info.get("title")):
+        if (
+            not _title_matches(wanted, info.get("title"))
+            or not _author_matches(author, info.get("authors"))
+        ):
             continue
         release_date, date_kind = _publication_date(info.get("publishedDate"))
         return {
@@ -279,6 +382,13 @@ async def _lookup_google_books_record(
             "description": _clean_metadata_text(info.get("description")),
             "release_date": release_date or "",
             "date_kind": date_kind or "",
+            "genres": _catalog_genres(info.get("categories")),
+            "provider": "google_books",
+            "provider_id": str(item.get("id") or ""),
+            "catalog_title": str(info.get("title") or ""),
+            "catalog_author": _author_display(info.get("authors")),
+            "title_match": 1.0,
+            "author_match": 1.0,
         }
     return {}
 
@@ -290,9 +400,12 @@ async def resolve_book_metadata(
     source_url: str = "",
     description: object = "",
     release_date: object = "",
+    genres: object = (),
     client: httpx.AsyncClient | None = None,
     lookup_cache: dict[tuple[str, str], asyncio.Task[dict[str, str]]] | None = None,
-) -> dict[str, str]:
+    expected_provider: str = "",
+    expected_provider_id: str = "",
+) -> dict[str, object]:
     """Resolve summary, publication date, and cover from public book catalogs.
 
     Source pages frequently expose covers but omit descriptions or dates.  This
@@ -307,10 +420,25 @@ async def resolve_book_metadata(
         "description": _clean_metadata_text(description),
         "release_date": str(release_date or ""),
         "date_kind": "",
+        "genres": [],
+        "provider": "",
+        "provider_id": "",
+        "work_id": "",
+        "catalog_title": "",
+        "catalog_author": "",
+        "title_match": 0.0,
+        "author_match": 0.0,
     }
     needs_description = not result["description"]
     needs_release_date = not result["release_date"]
-    if needs_description or needs_release_date or not supplied_url:
+    if isinstance(genres, str):
+        try:
+            genres = json.loads(genres)
+        except (TypeError, ValueError):
+            genres = [genres] if genres.strip() else []
+    needs_genres = not _catalog_genres(genres)
+    description_source = ""
+    if (needs_description or needs_release_date or needs_genres or not supplied_url) and title and author:
         for lookup in (_lookup_open_library_record, _lookup_google_books_record):
             if lookup_cache is None:
                 record = await lookup(title, author, client=client)
@@ -321,16 +449,50 @@ async def resolve_book_metadata(
                     task = asyncio.create_task(lookup(title, author, client=client))
                     lookup_cache[cache_key] = task
                 record = await task
+            if (
+                expected_provider
+                and record.get("provider") == expected_provider
+                and expected_provider_id
+                and record.get("provider_id") != expected_provider_id
+            ):
+                continue
+            contributed_primary_metadata = False
+            contributed_description = False
+            contributed_genres = False
             if not result["cover_url"] and record.get("cover_url"):
                 result["cover_url"] = record["cover_url"]
+                contributed_primary_metadata = True
             if needs_description and record.get("description"):
                 result["description"] = record["description"]
                 needs_description = False
+                contributed_primary_metadata = True
+                contributed_description = True
+                description_source = str(record.get("provider") or "")
             if needs_release_date and record.get("release_date"):
                 result["release_date"] = record["release_date"]
                 result["date_kind"] = record.get("date_kind", "")
                 needs_release_date = False
-            if not needs_description and not needs_release_date and result["cover_url"]:
+                contributed_primary_metadata = True
+            if needs_genres and record.get("genres"):
+                result["genres"] = record["genres"]
+                needs_genres = False
+                contributed_primary_metadata = True
+                contributed_genres = True
+            # Attribute the metadata record to its description source when
+            # possible. A later provider that only supplies genres must not
+            # replace the provenance of a description already selected.
+            if contributed_primary_metadata and (
+                contributed_description
+                or (contributed_genres and not description_source)
+                or not result["provider"]
+            ):
+                for field in (
+                    "provider", "provider_id", "catalog_title", "catalog_author",
+                    "title_match", "author_match",
+                ):
+                    result[field] = record.get(field, result[field])
+                result["work_id"] = result["provider_id"] if result["provider"] == "openlibrary" else ""
+            if not needs_description and not needs_release_date and not needs_genres and result["cover_url"]:
                 break
     result["cover_url"] = result["cover_url"] or placeholder_cover_url(title, author)
     return result

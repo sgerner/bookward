@@ -56,7 +56,7 @@ from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import QUALITY_VERSION, audit_candidates, quality_summary
-from .identity import book_identity_match_index, book_identity_match_keys
+from .identity import book_identity_match_index, book_row_identity_match_keys
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
@@ -607,7 +607,9 @@ def _recommendation_rows(
         clauses.append(f"c.status IN ({placeholders})")
         params.extend(statuses)
     query = (
-        "SELECT c.*,s.name source_name FROM candidates c "
+        "SELECT c.*,s.name source_name,q.work_id quality_work_id,"
+        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.isbn10 quality_isbn10 FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id WHERE "
         + " AND ".join(clauses)
@@ -624,16 +626,21 @@ def _recommendation_rows(
         if connection is not None
         else rows(sql, values)
     )
-    read_keys = book_identity_match_index(fetch("SELECT title,author FROM reads"))
+    read_keys = book_identity_match_index(fetch("SELECT * FROM reads"))
     shortlisted_keys = book_identity_match_index(
-        fetch("SELECT title,author FROM candidates WHERE status IN ('saved','imported')")
+        fetch(
+            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.status IN ('saved','imported')"
+        )
     )
     visible = []
     for item in result:
         if item["status"] in {"saved", "imported"}:
             visible.append(item)
             continue
-        keys = book_identity_match_keys(item["title"], item["author"])
+        keys = book_row_identity_match_keys(item)
         if keys & read_keys or keys & shortlisted_keys:
             continue
         visible.append(item)

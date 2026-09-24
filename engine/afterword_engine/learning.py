@@ -20,7 +20,7 @@ from .identity import book_identity
 
 
 POLICY = "rating-neighborhood"
-POLICY_VERSION = "rating-neighborhood-v1"
+POLICY_VERSION = "rating-kernel-recency-v1"
 EVENT_TYPES = {
     "visible",
     "detail_open",
