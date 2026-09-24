@@ -7,6 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .identity import book_identity
+from .subjects import normalize_subjects
 
 
 _BATCH_SIZE = 64
@@ -62,6 +63,30 @@ def _top_weighted(values: np.ndarray, default: float = 0.0) -> np.ndarray:
     top = np.partition(values, -count, axis=1)[:, -count:]
     weights = np.maximum(top, 0) + 1e-4
     return (top * weights).sum(axis=1) / weights.sum(axis=1)
+
+
+def _metadata_confidence(candidate: dict[str, Any]) -> float:
+    """Estimate how much catalog evidence supports the candidate text."""
+
+    identity = candidate.get("catalog_confidence", candidate.get("quality_score"))
+    if identity is None:
+        # Keep the pure ranker useful for callers without the catalog ledger.
+        return 1.0
+    try:
+        identity_confidence = min(1.0, max(0.0, float(identity)))
+    except (TypeError, ValueError):
+        identity_confidence = 0.0
+    description = " ".join(str(candidate.get("description") or "").split())
+    description_confidence = min(1.0, len(description) / 400.0)
+    subject_confidence = min(
+        1.0, len(normalize_subjects(candidate.get("genres"), limit=8)) / 4.0
+    )
+    return round(
+        0.45 * identity_confidence
+        + 0.40 * description_confidence
+        + 0.15 * subject_confidence,
+        4,
+    )
 
 
 def rank_candidates(
@@ -157,6 +182,11 @@ def rank_candidates(
             recency_strength = _RECENCY_SCORE_PER_STAR * min(1.0, len(all_ratings) / _KERNEL_FULL_HISTORY)
             score += recency_strength * (recent_rating - kernel_rating)
             score += (float(candidate.get("source_weight") or 1) - 1) * 5
+            metadata_confidence = _metadata_confidence(candidate)
+            # Sparse catalog records produce weak text vectors. Shrink their
+            # ranking signal toward a neutral score instead of letting a
+            # title-only match dominate the top of discovery.
+            score = 50 + metadata_confidence * (score - 50)
             score = max(0.0, min(100.0, score))
             explanation: list[str] = []
             if author in positive_authors:
@@ -172,5 +202,16 @@ def rank_candidates(
                 explanation.append(f"Reduced for similarity to {negatives[nearest][0].get('title', 'a low-rated book')}")
             if candidate.get("source_name"):
                 explanation.append(f"From {candidate['source_name']}")
-            results.append({**candidate, "score": round(score, 1), "explanation": explanation})
+            if metadata_confidence < 0.65:
+                explanation.append(
+                    "Ranking confidence reduced because catalog details are sparse"
+                )
+            results.append(
+                {
+                    **candidate,
+                    "score": round(score, 1),
+                    "metadata_confidence": metadata_confidence,
+                    "explanation": explanation,
+                }
+            )
     return results

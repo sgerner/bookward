@@ -92,3 +92,26 @@ def test_supported_read_dates_normalize_to_utc_and_invalid_dates_are_unknown():
     assert _read_day("2026/09/22") == _read_day("2026-09-22")
     assert _read_day("Mon, 21 Sep 2026 17:00:00 -0700") == _read_day("2026-09-22")
     assert _read_day("not a date") is None
+
+
+def test_sparse_catalog_metadata_shrinks_ranking_toward_neutral_and_explains_it():
+    reads = [book(1, "Loved", "Writer", 5)]
+    sparse = {
+        **book(10, "Sparse", "New"),
+        "catalog_confidence": 1.0,
+        "description": "",
+        "genres": "[]",
+    }
+    rich = {
+        **book(11, "Detailed", "New"),
+        "catalog_confidence": 1.0,
+        "description": "A detailed description. " * 24,
+        "genres": '["Fiction", "Mystery", "Historical fiction", "Family"]',
+    }
+    result = rank_candidates(reads, [[1, 0]], [sparse, rich], [[1, 0], [1, 0]])
+
+    ranked = {item["id"]: item for item in result}
+    assert ranked[11]["metadata_confidence"] == 1.0
+    assert ranked[10]["metadata_confidence"] == 0.45
+    assert ranked[10]["score"] < ranked[11]["score"]
+    assert any("catalog details are sparse" in text for text in ranked[10]["explanation"])

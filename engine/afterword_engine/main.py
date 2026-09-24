@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
@@ -92,7 +92,8 @@ def source_sync_is_due():
     now = datetime.now(timezone.utc)
     sources = rows(
         "SELECT last_scanned_at,last_status FROM sources "
-        "WHERE enabled=1 AND kind!='builtin' AND lifecycle='permanent'"
+        "WHERE enabled=1 AND kind NOT IN ('builtin','association') "
+        "AND lifecycle='permanent'"
     )
     for source in sources:
         if not source["last_scanned_at"]:
@@ -270,6 +271,8 @@ async def handle_job(kind: str):
         source = row("SELECT * FROM sources WHERE id=?", (source_id,))
         if not source or source["kind"] == "builtin":
             raise ValueError("Source not found")
+        if source["kind"] == "association":
+            return {"skipped": "managed_by_association_provider", "source_id": source_id}
         if not source["enabled"]:
             return {"skipped": "disabled", "source_id": source_id}
         if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
@@ -295,7 +298,8 @@ async def handle_job(kind: str):
         total = 0
         errors = []
         sources = rows(
-            "SELECT * FROM sources WHERE enabled=1 AND kind!='builtin' "
+            "SELECT * FROM sources WHERE enabled=1 "
+            "AND kind NOT IN ('builtin','association') "
             "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
         )
         for source in sources:
@@ -483,6 +487,10 @@ class EngineSettings(BaseModel):
             validate_service_url(self.librarr_url, allowed)
 
 
+class NYTApiKeyIn(BaseModel):
+    api_key: str | None = Field(default=None, max_length=500)
+
+
 class AssociationSettingsIn(BaseModel):
     openlibrary_enabled: bool = False
     openlibrary_contact: str = Field(default="", max_length=200)
@@ -607,7 +615,8 @@ def _recommendation_rows(
         clauses.append(f"c.status IN ({placeholders})")
         params.extend(statuses)
     query = (
-        "SELECT c.*,s.name source_name,q.work_id quality_work_id,"
+        "SELECT c.*,s.name source_name,q.metadata_confidence,"
+        "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
         "q.isbn10 quality_isbn10 FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -892,11 +901,23 @@ async def goodreads_rss(payload: UrlIn):
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: SourcePreviewIn):
+    _reject_inline_nyt_key(str(payload.url))
     try: return await preview_source(str(payload.url), payload.filters.model_dump())
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
 
+def _reject_inline_nyt_key(url: str):
+    parsed = urlparse(url)
+    if (parsed.hostname or "").casefold() == "api.nytimes.com" and any(
+        key.casefold() == "api-key" for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    ):
+        raise HTTPException(
+            400,
+            "Store NYT credentials in encrypted NYT API settings instead of the source URL.",
+        )
+
 @app.post("/api/sources")
 def add_source(payload: SourceIn):
+    _reject_inline_nyt_key(str(payload.url))
     try: validate_public_url(str(payload.url))
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
     with transaction() as con:
@@ -918,7 +939,11 @@ def toggle_source(source_id:int):
             "WHERE id=?",
             (source_id,),
         )
-    job_id = enqueue_job(f"source:{source_id}", dedupe=True) if became_enabled and source["kind"] != "builtin" else None
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if became_enabled and source["kind"] not in {"builtin", "association"}
+        else None
+    )
     return {"id":source_id, "job_id":job_id}
 
 
@@ -933,6 +958,26 @@ def update_source_schedule(payload: SourceScheduleIn):
     return {"saved": True, "interval_hours": payload.interval_hours}
 
 
+@app.get("/api/settings/nyt")
+def nyt_settings():
+    return {"api_key_set": bool(private_settings().get("nyt_api_key"))}
+
+
+@app.put("/api/settings/nyt")
+def update_nyt_settings(payload: NYTApiKeyIn):
+    current = private_settings().get("nyt_api_key", "")
+    api_key = current if payload.api_key is None else payload.api_key.strip()
+    stored = seal(api_key) if api_key else ""
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('nyt_api_key',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,"
+            "updated_at=CURRENT_TIMESTAMP",
+            (stored,),
+        )
+    return {"saved": True, "api_key_set": bool(api_key)}
+
+
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
     filters = payload.filters.model_dump()
@@ -941,7 +986,11 @@ def update_source(source_id: int, payload: SourceUpdateIn):
         if not source: raise HTTPException(404, "Source not found")
         if source["kind"] == "builtin": raise HTTPException(400, "The built-in source cannot be filtered")
         con.execute("UPDATE sources SET filters=? WHERE id=?", (json.dumps(filters), source_id))
-    job_id = enqueue_job(f"source:{source_id}", dedupe=True) if source["enabled"] else None
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if source["enabled"] and source["kind"] != "association"
+        else None
+    )
     return {"id": source_id, "filters": filters, "job_id": job_id}
 
 
@@ -1244,6 +1293,7 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "librarr_url": private.get("librarr_url", ""),
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
         "librarr_media_type": media_type,
+        "nyt_api_key_set": bool(private.get("nyt_api_key")),
         "source_sync_interval_hours": source_sync_interval_hours(),
         "digest": digest,
         "associations": safe_association_settings(connection),

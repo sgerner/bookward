@@ -7,6 +7,7 @@ from .config import settings
 from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover_url
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
+from .secrets import unseal
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -269,6 +270,66 @@ MIGRATIONS = [
             ON candidate_quality(quality_status, metadata_checked_at);
         """,
     ),
+    (
+        14,
+        """
+        DROP TRIGGER IF EXISTS candidate_quality_after_insert;
+        DROP INDEX IF EXISTS idx_candidate_quality_status;
+        DROP INDEX IF EXISTS idx_candidate_quality_isbn13;
+        DROP INDEX IF EXISTS idx_candidate_quality_metadata_checked;
+        ALTER TABLE candidate_quality RENAME TO candidate_quality_before_metadata_confidence;
+        CREATE TABLE candidate_quality (
+            candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id) ON DELETE CASCADE,
+            quality_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(quality_status IN ('pending','accepted','quarantine','rejected')),
+            quality_score REAL NOT NULL DEFAULT 0
+                CHECK(quality_score >= 0 AND quality_score <= 1),
+            flags_json TEXT NOT NULL DEFAULT '[]',
+            provider TEXT NOT NULL DEFAULT '',
+            provider_id TEXT NOT NULL DEFAULT '',
+            work_id TEXT NOT NULL DEFAULT '',
+            isbn13 TEXT NOT NULL DEFAULT '',
+            isbn10 TEXT NOT NULL DEFAULT '',
+            title_match REAL NOT NULL DEFAULT 0,
+            author_match REAL NOT NULL DEFAULT 0,
+            audit_version TEXT NOT NULL DEFAULT 'candidate-quality-v1',
+            audited_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            metadata_checked_at TEXT,
+            metadata_provider TEXT NOT NULL DEFAULT '',
+            metadata_provider_id TEXT NOT NULL DEFAULT '',
+            metadata_confidence REAL NOT NULL DEFAULT 0.5
+                CHECK(metadata_confidence >= 0 AND metadata_confidence <= 1)
+        );
+        INSERT INTO candidate_quality(
+            candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
+            work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,
+            created_at,updated_at,metadata_checked_at,metadata_provider,
+            metadata_provider_id,metadata_confidence
+        )
+        SELECT candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
+            work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,
+            created_at,updated_at,metadata_checked_at,metadata_provider,
+            metadata_provider_id,0.5
+        FROM candidate_quality_before_metadata_confidence;
+        DROP TABLE candidate_quality_before_metadata_confidence;
+        CREATE INDEX idx_candidate_quality_status
+            ON candidate_quality(quality_status, quality_score DESC);
+        CREATE INDEX idx_candidate_quality_isbn13 ON candidate_quality(isbn13);
+        CREATE INDEX idx_candidate_quality_metadata_checked
+            ON candidate_quality(quality_status, metadata_checked_at);
+        CREATE TRIGGER candidate_quality_after_insert
+        AFTER INSERT ON candidates
+        BEGIN
+            INSERT OR IGNORE INTO candidate_quality(candidate_id, quality_status)
+            SELECT NEW.id,
+                CASE WHEN EXISTS(
+                    SELECT 1 FROM sources WHERE id=NEW.source_id AND kind='builtin'
+                ) THEN 'accepted' ELSE 'pending' END;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -296,9 +357,8 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_last_period": "",
 }
 
-# These feeds are intentionally public and require no per-user credentials.
-# Keep the NYT API visible but disabled because its overview endpoint returns
-# 401 without a user API key; users can add their keyed URL when they want it.
+# Most default feeds are public. Keep NYT disabled until a key is configured;
+# the key is stored encrypted and added only to outgoing Books API requests.
 DEFAULT_SOURCES = (
     ("Apple Books · Top audiobooks", "https://itunes.apple.com/us/rss/topaudiobooks/limit=50/xml", 1),
     ("Apple Books · Top paid ebooks", "https://itunes.apple.com/us/rss/toppaidebooks/limit=50/xml", 1),
@@ -388,7 +448,12 @@ def initialize():
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
         for version, script in MIGRATIONS:
             if version not in applied:
-                con.executescript(script)
+                try:
+                    con.executescript(script)
+                except sqlite3.Error as exc:
+                    raise sqlite3.DatabaseError(
+                        f"Schema migration {version} failed: {exc}"
+                    ) from exc
                 con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
@@ -407,6 +472,9 @@ def initialize():
                 "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,?)",
                 (key, value, secret),
             )
+        con.execute(
+            "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
+        )
         # Upgrade an older install's placeholder link when the deployment now
         # advertises a different public origin, without overwriting a URL the
         # user explicitly chose in Settings.
@@ -468,6 +536,15 @@ def normalize_key(title: str, author: str):
 def rows(query: str, params=()):
     with connect() as con:
         return [dict(row) for row in con.execute(query, params).fetchall()]
+
+
+def private_setting(key: str, default: str = "") -> str:
+    """Read one setting, decrypting it when the database marks it secret."""
+
+    found = row("SELECT value,secret FROM settings WHERE key=?", (key,))
+    if not found:
+        return default
+    return unseal(found["value"]) if found["secret"] else found["value"]
 
 def row(query: str, params=()):
     with connect() as con:

@@ -1310,12 +1310,13 @@
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500">{book.score}% match</span>
+                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
               </button>
               <div class="flex min-w-0 flex-col gap-2.5 p-4 sm:p-5">
                 <div class="flex flex-wrap items-center gap-2 text-sm font-medium text-surface-600-400">
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
+                  {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
                       class="btn btn-icon btn-xs preset-tonal-surface ml-auto shrink-0"
