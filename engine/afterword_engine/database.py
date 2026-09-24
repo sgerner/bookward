@@ -273,8 +273,61 @@ MIGRATIONS = [
     (
         14,
         """
-        ALTER TABLE candidate_quality ADD COLUMN metadata_confidence REAL NOT NULL DEFAULT 0.5
-            CHECK(metadata_confidence >= 0 AND metadata_confidence <= 1);
+        DROP TRIGGER IF EXISTS candidate_quality_after_insert;
+        DROP INDEX IF EXISTS idx_candidate_quality_status;
+        DROP INDEX IF EXISTS idx_candidate_quality_isbn13;
+        DROP INDEX IF EXISTS idx_candidate_quality_metadata_checked;
+        ALTER TABLE candidate_quality RENAME TO candidate_quality_before_metadata_confidence;
+        CREATE TABLE candidate_quality (
+            candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id) ON DELETE CASCADE,
+            quality_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(quality_status IN ('pending','accepted','quarantine','rejected')),
+            quality_score REAL NOT NULL DEFAULT 0
+                CHECK(quality_score >= 0 AND quality_score <= 1),
+            flags_json TEXT NOT NULL DEFAULT '[]',
+            provider TEXT NOT NULL DEFAULT '',
+            provider_id TEXT NOT NULL DEFAULT '',
+            work_id TEXT NOT NULL DEFAULT '',
+            isbn13 TEXT NOT NULL DEFAULT '',
+            isbn10 TEXT NOT NULL DEFAULT '',
+            title_match REAL NOT NULL DEFAULT 0,
+            author_match REAL NOT NULL DEFAULT 0,
+            audit_version TEXT NOT NULL DEFAULT 'candidate-quality-v1',
+            audited_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            metadata_checked_at TEXT,
+            metadata_provider TEXT NOT NULL DEFAULT '',
+            metadata_provider_id TEXT NOT NULL DEFAULT '',
+            metadata_confidence REAL NOT NULL DEFAULT 0.5
+                CHECK(metadata_confidence >= 0 AND metadata_confidence <= 1)
+        );
+        INSERT INTO candidate_quality(
+            candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
+            work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,
+            created_at,updated_at,metadata_checked_at,metadata_provider,
+            metadata_provider_id,metadata_confidence
+        )
+        SELECT candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
+            work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,
+            created_at,updated_at,metadata_checked_at,metadata_provider,
+            metadata_provider_id,0.5
+        FROM candidate_quality_before_metadata_confidence;
+        DROP TABLE candidate_quality_before_metadata_confidence;
+        CREATE INDEX idx_candidate_quality_status
+            ON candidate_quality(quality_status, quality_score DESC);
+        CREATE INDEX idx_candidate_quality_isbn13 ON candidate_quality(isbn13);
+        CREATE INDEX idx_candidate_quality_metadata_checked
+            ON candidate_quality(quality_status, metadata_checked_at);
+        CREATE TRIGGER candidate_quality_after_insert
+        AFTER INSERT ON candidates
+        BEGIN
+            INSERT OR IGNORE INTO candidate_quality(candidate_id, quality_status)
+            SELECT NEW.id,
+                CASE WHEN EXISTS(
+                    SELECT 1 FROM sources WHERE id=NEW.source_id AND kind='builtin'
+                ) THEN 'accepted' ELSE 'pending' END;
+        END;
         """,
     ),
 ]

@@ -1555,6 +1555,24 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
     assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
+    existing_quality = row(
+        "SELECT metadata_confidence FROM candidate_quality "
+        "WHERE candidate_id=(SELECT id FROM candidates WHERE normalized_key=?)",
+        ("existing book existing author",),
+    )
+    assert existing_quality["metadata_confidence"] == 0.5
+
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            ("New book", "New author", source_id, "new book new author"),
+        )
+    new_quality = row(
+        "SELECT quality_status,metadata_confidence FROM candidate_quality "
+        "WHERE candidate_id=(SELECT id FROM candidates WHERE normalized_key=?)",
+        ("new book new author",),
+    )
+    assert new_quality == {"quality_status": "pending", "metadata_confidence": 0.5}
 
     initialize()
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
