@@ -395,7 +395,12 @@ def initialize():
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
         for version, script in MIGRATIONS:
             if version not in applied:
-                con.executescript(script)
+                try:
+                    con.executescript(script)
+                except sqlite3.Error as exc:
+                    raise sqlite3.DatabaseError(
+                        f"Schema migration {version} failed: {exc}"
+                    ) from exc
                 con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
