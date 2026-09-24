@@ -190,6 +190,29 @@ def test_source_parsers_handle_apple_open_library_and_goodreads_formats():
     open_library_items = parse_book_items(open_library, "application/json", "https://openlibrary.org/subjects/science_fiction.json?limit=1")
     assert open_library_items[0]["author"] == "A Writer"
     assert open_library_items[0]["source_url"] == "https://openlibrary.org/works/OL1W"
+    trending = json.dumps(
+        {
+            "query": "/trending/weekly",
+            "works": [
+                {
+                    "key": "/works/OL17930368W",
+                    "title": "Atomic Habits",
+                    "author_name": ["James Clear"],
+                    "cover_i": 12539702,
+                    "first_publish_year": 2018,
+                    "subject": ["Self-Help"],
+                }
+            ],
+        }
+    ).encode()
+    trending_items = parse_book_items(
+        trending, "application/json", "https://openlibrary.org/trending/weekly"
+    )
+    assert trending_items[0]["author"] == "James Clear"
+    assert trending_items[0]["release_date"] == "2018-01-01"
+    assert trending_items[0]["date_kind"] == "year"
+    assert trending_items[0]["source_url"] == "https://openlibrary.org/works/OL17930368W"
+    assert trending_items[0]["genres"] == ["Self-Help"]
     goodreads = b'''<div class="coverWrapper" id="bookCover1"><img class="bookImage" src="https://i.gr-assets.com/cover.jpg" /></div>
     <script>new Tip($('bookCover1'), "<h2><a class=\\"readable bookTitle\\" href=\\"https://www.goodreads.com/book/show/1-glass-house?x=1\\">Glass House<\\/a></h2><div>by <a class=\\"authorName\\" href=\\"/author/show/1\\">Jane Reader<\\/a></div><div class=\\"addBookTipDescription\\"><span id=\\"freeTextContainer1\\">A mystery.</span></div>", {});</script>'''
     goodreads_items = parse_book_items(goodreads, "text/html", "https://www.goodreads.com/genres/mystery-thriller")
@@ -511,6 +534,40 @@ def test_scan_source_persists_provider_metadata(database, monkeypatch):
     candidate = row("SELECT * FROM candidates WHERE title='A New World'")
     assert json.loads(candidate["genres"]) == ["Science fiction"]
     assert candidate["source_url"] == "https://openlibrary.org/works/OL1W"
+
+
+def test_open_library_trending_source_imports_author_names_and_sets_ok_status(database, monkeypatch):
+    url = "https://openlibrary.org/trending/weekly"
+    payload = json.dumps(
+        {
+            "works": [
+                {
+                    "key": "/works/OL17930368W",
+                    "title": "Atomic Habits",
+                    "author_name": ["James Clear"],
+                    "cover_i": 12539702,
+                    "first_publish_year": 2018,
+                }
+            ]
+        }
+    ).encode()
+
+    async def fake_fetch(_url):
+        return payload, "application/json"
+
+    async def fake_enrich(items):
+        return items
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", fake_enrich)
+    with transaction() as con:
+        cursor = con.execute("INSERT INTO sources(name,url) VALUES(?,?)", ("Open Library trending", url))
+
+    source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
+    assert asyncio.run(scan_source(source)) == 1
+    candidate = row("SELECT * FROM candidates WHERE normalized_key=?", (normalize_key("Atomic Habits", "James Clear"),))
+    assert candidate["source_url"] == "https://openlibrary.org/works/OL17930368W"
+    assert row("SELECT last_status FROM sources WHERE id=?", (cursor.lastrowid,))["last_status"] == "ok:1"
 
 
 def test_scan_source_preserves_existing_description_and_merges_genres(database, monkeypatch):
