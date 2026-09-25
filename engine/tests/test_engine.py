@@ -1779,6 +1779,61 @@ def test_librarr_search_and_direct_download_forward_selected_media(database):
     assert added_audio.status_code == 200 and added_audio.json()["result"]["id"] == "audio-download-1"
     assert json.loads(audio_download_route.calls[0].request.content)["id"] == "audio-1"
 
+
+@respx.mock
+def test_librarr_stream_search_forwards_sse_and_preserves_event_frames(database):
+    with transaction() as con:
+        con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_url','http://librarr:5050',0)")
+        con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_api_key',?,1)", (seal("test-key"),))
+    body = (
+        'event: started\ndata: {"search_id":"search-1"}\n\n'
+        'event: results\ndata: {"results":[{"id":"book-1","title":"A Book"}]}\n\n'
+        'event: complete\ndata: {"status":"complete"}\n\n'
+    )
+    ebook_route = respx.get("http://librarr:5050/api/search/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text=body,
+            headers={"content-type": "text/event-stream; charset=utf-8"},
+        )
+    )
+    audiobook_route = respx.get("http://librarr:5050/api/search/audiobooks/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    with TestClient(app) as client:
+        ebook = client.get("/api/librarr/search/stream", params={"q": "A Book", "media_type": "ebook"})
+        audiobook = client.get("/api/librarr/search/stream", params={"q": "Audio Book", "media_type": "audiobook"})
+
+    assert ebook.status_code == 200
+    assert ebook.headers["content-type"].startswith("text/event-stream")
+    assert ebook.headers["cache-control"] == "no-cache, no-transform"
+    assert ebook.headers["x-accel-buffering"] == "no"
+    assert ebook.text == body
+    assert ebook_route.calls[0].request.url.params["q"] == "A Book"
+    assert ebook_route.calls[0].request.headers["x-api-key"] == "test-key"
+    assert ebook_route.calls[0].request.headers["accept"] == "text/event-stream"
+    assert audiobook.status_code == 200 and audiobook.text == body
+    assert audiobook_route.calls[0].request.url.params["q"] == "Audio Book"
+
+
+@respx.mock
+def test_librarr_stream_search_signals_unsupported_legacy_service(database):
+    with transaction() as con:
+        con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_url','http://librarr:5050',0)")
+        con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_api_key',?,1)", (seal("test-key"),))
+    respx.get("http://librarr:5050/api/search/stream").mock(
+        return_value=httpx.Response(404, json={"detail": "Not found"})
+    )
+    with TestClient(app) as client:
+        response = client.get("/api/librarr/search/stream", params={"q": "A Book", "media_type": "ebook"})
+    assert response.status_code == 501
+    assert "does not support streaming" in response.json()["detail"]
+
 def test_librarr_media_type_is_validated(database):
     with TestClient(app) as client:
         response = client.put("/api/settings", json={"embedding_backend":"local","embedding_model":"hashing-768","librarr_media_type":"vinyl"})
