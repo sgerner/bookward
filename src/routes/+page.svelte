@@ -1433,7 +1433,7 @@
       {/snippet}
 
       <!-- Layer each view in the same grid cell so fade intros/outros overlap instead of leaving a blank frame. -->
-      <div class="grid min-h-[20rem]">
+      <div class="grid min-h-[20rem] min-w-0">
 
         {#if activeView === "discover"}
           <div
@@ -1456,11 +1456,11 @@
         {:else if activeView === "sources"}
           <div
             data-view="sources"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
-            <section class="mb-6 max-w-2xl">
+            <section class="mb-6 min-w-0 max-w-2xl">
               <h1
                 class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
@@ -1468,7 +1468,7 @@
               </h1>
             </section>
             <section
-              class="grid gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(18rem,1fr)]"
+              class="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(18rem,1fr)]"
             >
               <div
                 in:fly={{
@@ -1476,9 +1476,9 @@
                   duration: motionDuration(300),
                   delay: motionDelay(0),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-4 sm:p-6"
               >
-                <div class="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div class="mb-4 flex min-w-0 flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <h2 class="font-semibold text-surface-950-50">
                       Available sources
@@ -1490,7 +1490,7 @@
                     </p>
                   </div>
                   <div
-                    class="flex w-full items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
+                    class="flex min-w-0 w-full items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
                     role="tablist"
                     aria-label="Filter sources by lifecycle"
                   >
@@ -1499,7 +1499,7 @@
                         type="button"
                         role="tab"
                         aria-selected={sourceFilter === option.value}
-                        class={`min-h-9 flex-1 px-3 text-xs font-medium transition sm:flex-none ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
+                        class={`min-h-9 min-w-0 flex-1 break-words px-2 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
                         onclick={() => (sourceFilter = option.value)}
                       >
                         {option.label}
@@ -1508,7 +1508,7 @@
                     {/each}
                   </div>
                 </div>
-                <div class="divide-y divide-surface-200-800">
+                <div class="min-w-0 divide-y divide-surface-200-800">
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -1553,17 +1553,17 @@
                     <div in:fade={{ duration: motionDuration(160) }} out:fade={{ duration: motionDuration(100) }}>
                   {#each visibleSourceGroups as group}
                     <div
-                      class="flex items-end justify-between gap-4 border-b border-surface-200-800 px-1 py-4"
+                      class="flex min-w-0 items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
                     >
-                      <div>
+                      <div class="min-w-0 flex-1">
                         <h3 class="font-semibold text-surface-950-50">
                           {group.label}
                         </h3>
-                        <p class="mt-1 text-sm text-surface-700-300">
+                        <p class="mt-1 break-words text-sm text-surface-700-300">
                           {group.description}
                         </p>
                       </div>
-                      <span class="badge shrink-0 preset-tonal-surface"
+                      <span class="badge max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
                         >{group.active} active · {group.sources.length} total</span
                       >
                     </div>
@@ -1575,7 +1575,7 @@
                             delay: motionDelay(source.id % 5, 24),
                           }}
                           out:fade={{ duration: motionDuration(120) }}
-                          class="flex min-h-24 items-center gap-4 border-b border-surface-200-800 py-4 last:border-b-0"
+                          class="flex min-h-24 min-w-0 items-center gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:gap-4"
                         >
                           <span
                             class={`grid size-10 shrink-0 place-items-center ${source.lifecycle === "one_time" ? "preset-tonal-tertiary" : "preset-tonal-secondary"}`}
@@ -1591,14 +1591,14 @@
                             <span class="mt-1 block text-xs text-surface-600-400"
                               >{source.lifecycle === "one_time" ? "One-time import" : "Permanent feed"} · {formatSourceScan(source.last_scanned_at, source.last_status)}</span
                             >
-                            <details class="mt-3 max-w-xl">
+                            <details class="mt-3 w-full max-w-full">
                               <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                 Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
                                   ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                   : ""}
                               </summary>
                               <form
-                                class="mt-3 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
                                 method="POST"
                                 action="?/configureSourceFilters"
                                 use:enhance={setPending(`source-filters-${source.id}`)}
@@ -1607,7 +1607,7 @@
                                 <label class="block text-xs font-medium text-surface-800-200">
                                   Include genres
                                   <input
-                                    class="input mt-1 text-sm"
+                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="includeGenres"
                                     value={source.filters.include_genres.join(", ")}
                                     placeholder="science fiction, fantasy"
@@ -1616,7 +1616,7 @@
                                 <label class="block text-xs font-medium text-surface-800-200">
                                   Exclude genres
                                   <input
-                                    class="input mt-1 text-sm"
+                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="excludeGenres"
                                     value={source.filters.exclude_genres.join(", ")}
                                     placeholder="romance, cookbook"
@@ -1635,6 +1635,7 @@
                             </details>
                           </div>
                           <form
+                            class="shrink-0"
                             method="POST"
                             action="?/toggleSource"
                             use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
@@ -1668,14 +1669,14 @@
                   {/key}
                 </div>
               </div>
-              <div class="space-y-5">
+              <div class="min-w-0 space-y-5">
                 <form
                   in:fly={{
                     y: 12,
                     duration: motionDuration(300),
                     delay: motionDelay(1),
                   }}
-                  class="card preset-tonal-surface p-5 sm:p-6"
+                  class="card min-w-0 preset-tonal-surface p-4 sm:p-6"
                   method="POST"
                   action="?/configureSourceSchedule"
                   use:enhance={setPending("source-schedule", optimisticSourceSchedule)}
@@ -1696,7 +1697,7 @@
                   </div>
                   <label class="block text-sm font-medium text-surface-800-200"
                     >Scan permanent sources<select
-                      class="select mt-2"
+                      class="select mt-2 w-full min-w-0 max-w-full"
                       name="intervalHours"
                     >
                       <option value="0" selected={sourceSyncIntervalHours === 0}>Manual only</option>
@@ -1726,7 +1727,7 @@
                     duration: motionDuration(300),
                     delay: motionDelay(2),
                   }}
-                  class="card h-fit preset-tonal-surface p-5 sm:p-6"
+                  class="card h-fit min-w-0 preset-tonal-surface p-4 sm:p-6"
                   method="POST"
                   action="?/source"
                   use:enhance={setPending("source")}
@@ -1745,7 +1746,7 @@
                   <label
                     class="mt-5 block text-sm font-medium text-surface-800-200"
                     >Name<input
-                      class="input mt-2"
+                      class="input mt-2 w-full min-w-0 max-w-full"
                       name="label"
                       placeholder="e.g. Reactor new releases"
                       required
@@ -1753,7 +1754,7 @@
                   ><label
                     class="mt-4 block text-sm font-medium text-surface-800-200"
                     >Public URL<input
-                      class="input mt-2"
+                      class="input mt-2 w-full min-w-0 max-w-full"
                       name="url"
                       type="url"
                       placeholder="https://…"
@@ -1761,7 +1762,7 @@
                     /></label
                   ><label
                     class="mt-4 block text-sm font-medium text-surface-800-200"
-                    >Source type<select class="select mt-2" name="lifecycle">
+                    >Source type<select class="select mt-2 w-full min-w-0 max-w-full" name="lifecycle">
                       <option value="permanent">Permanent feed · keep it fresh</option>
                       <option value="one_time">One-time import · scan once</option>
                     </select></label
@@ -1773,7 +1774,7 @@
                       <label class="block text-xs font-medium text-surface-800-200">
                         Include genres
                         <input
-                          class="input mt-1 text-sm"
+                          class="input mt-1 w-full min-w-0 max-w-full text-sm"
                           name="includeGenres"
                           placeholder="science fiction, fantasy"
                         />
@@ -1781,7 +1782,7 @@
                       <label class="block text-xs font-medium text-surface-800-200">
                         Exclude genres
                         <input
-                          class="input mt-1 text-sm"
+                          class="input mt-1 w-full min-w-0 max-w-full text-sm"
                           name="excludeGenres"
                           placeholder="romance, cookbook"
                         />
