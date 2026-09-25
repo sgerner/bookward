@@ -30,6 +30,7 @@ from .ingestion import (
     import_goodreads_rss,
     normalize_source_filters,
     preview_source,
+    refresh_read_work_identities,
     refresh_missing_candidate_metadata,
     scan_source,
 )
@@ -70,7 +71,11 @@ from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import QUALITY_VERSION, audit_candidates, quality_summary
-from .identity import book_identity_match_index, book_row_identity_match_keys
+from .identity import (
+    book_identity_match_index,
+    book_openlibrary_work_id,
+    book_row_identity_match_keys,
+)
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
@@ -211,6 +216,11 @@ async def digest_scheduler_loop(stop):
 
 async def handle_job(kind: str):
     config = private_settings()
+    if kind == "read_work_identities":
+        result = await refresh_read_work_identities()
+        if result["remaining"]:
+            enqueue_job("read_work_identities", dedupe=False)
+        return result
     if kind == "digest":
         return await send_digest(config)
     if kind in {"digest:manual", "digest:force"}:
@@ -250,6 +260,7 @@ async def handle_job(kind: str):
         else:
             raise ValueError("Unknown association provider")
         quality = await audit_candidates(only_pending=True)
+        enqueue_job("read_work_identities", dedupe=True)
         return {
             "run_id": result.id,
             "provider": result.provider,
@@ -277,6 +288,7 @@ async def handle_job(kind: str):
         return {"metadata": await refresh_missing_candidate_metadata()}
     if kind == "candidate_quality":
         quality = await audit_candidates(only_pending=False)
+        enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
             config.get("embedding_model"),
@@ -286,6 +298,7 @@ async def handle_job(kind: str):
         return {**quality, "scored": scored}
     if kind == "candidate_quality_recovery":
         quality = await audit_candidates(only_pending=True)
+        enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
             config.get("embedding_model"),
@@ -321,6 +334,7 @@ async def handle_job(kind: str):
             raise
         metadata = await refresh_missing_candidate_metadata()
         quality = await audit_candidates(only_pending=True)
+        enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
         return {"collected":collected,"metadata":metadata,"quality":quality,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
@@ -347,6 +361,7 @@ async def handle_job(kind: str):
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
         metadata = await refresh_missing_candidate_metadata()
         quality = await audit_candidates(only_pending=True)
+        enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
         return {"collected":total,"metadata":metadata,"quality":quality,"scored":scored,"errors":errors,"digest_job_id":digest_job_id}
@@ -374,6 +389,7 @@ async def lifespan(app):
         # Migration backfills only recover source evidence.  The targeted job
         # retries those rows without re-auditing accepted candidates.
         enqueue_job("candidate_quality_recovery", dedupe=True)
+    enqueue_job("read_work_identities", dedupe=True)
     yield
     stop.set(); await scheduler; await digest_scheduler; await worker
 
@@ -849,7 +865,11 @@ def feedback(candidate_id: int, payload: FeedbackIn):
 def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
     with transaction() as con:
         candidate = con.execute(
-            "SELECT id,title,author FROM candidates WHERE id=?", (candidate_id,)
+            "SELECT c.id,c.title,c.author,c.source_url,"
+            "q.work_id quality_work_id,q.provider quality_provider "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.id=?",
+            (candidate_id,),
         ).fetchone()
         if not candidate:
             raise HTTPException(404, "Recommendation not found")
@@ -862,12 +882,26 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
             if payload.rating is not None
             else existing["rating"] if existing else None
         )
+        openlibrary_work_id = book_openlibrary_work_id(candidate)
         con.execute(
-            "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-            "VALUES(?,?,?,NULL,NULL,'manual') "
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
+            "openlibrary_work_id,openlibrary_lookup_attempted_at) "
+            "VALUES(?,?,?,NULL,NULL,'manual',?,"
+            "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
             "ON CONFLICT(title,author) DO UPDATE SET "
-            "rating=COALESCE(excluded.rating,reads.rating)",
-            (candidate["title"], candidate["author"], rating),
+            "rating=COALESCE(excluded.rating,reads.rating),"
+            "openlibrary_work_id=CASE WHEN reads.openlibrary_work_id='' "
+            "THEN excluded.openlibrary_work_id ELSE reads.openlibrary_work_id END,"
+            "openlibrary_lookup_attempted_at=CASE "
+            "WHEN reads.openlibrary_work_id='' AND excluded.openlibrary_work_id!='' "
+            "THEN CURRENT_TIMESTAMP ELSE reads.openlibrary_lookup_attempted_at END",
+            (
+                candidate["title"],
+                candidate["author"],
+                rating,
+                openlibrary_work_id,
+                openlibrary_work_id,
+            ),
         )
         read = con.execute(
             "SELECT id FROM reads WHERE title=? AND author=?",
@@ -1094,6 +1128,7 @@ async def goodreads_csv(file: UploadFile = File(...)):
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
     try: count = import_goodreads_csv(bytes(content))
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
+    enqueue_job("read_work_identities", dedupe=True)
     return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/import/goodreads/rss")

@@ -6,7 +6,7 @@ import json
 import re
 import math
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import feedparser
 import httpx
@@ -14,7 +14,12 @@ from bs4 import BeautifulSoup
 from .config import settings
 from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, resolve_cover_url, safe_cover_url
 from .database import normalize_key, private_setting, rows, transaction
-from .isbn import isbn_parts_from_source
+from .identity import (
+    book_author_identity_key,
+    book_openlibrary_work_id,
+    book_row_identity_match_keys,
+)
+from .isbn import isbn_parts, isbn_parts_from_source
 from .security import resolve_public_target
 from .subjects import normalize_subjects
 
@@ -35,6 +40,9 @@ EDITORIAL_SOURCE_HOSTS = frozenset(
 SOURCE_MAX_REDIRECTS = 4
 SOURCE_FILTER_MAX_GENRES = 12
 SOURCE_FILTER_GENRE_MAX_LENGTH = 80
+READ_WORK_IDENTITY_BATCH_SIZE = 25
+READ_WORK_IDENTITY_RETRY_DAYS = 30
+READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS = 1.0
 
 
 def _filter_genre_values(value):
@@ -631,7 +639,25 @@ def import_goodreads_csv(content: bytes):
             if row.get("Exclusive Shelf") and row.get("Exclusive Shelf", "").strip().lower() != "read": continue
             rating = float(row.get("My Rating") or 0) or None
             if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): raise ValueError("Ratings must be between 0 and 5")
-            con.execute("INSERT INTO reads(title,author,rating,read_at,isbn,source) VALUES(?,?,?,?,?,'goodreads_csv') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=excluded.read_at,isbn=excluded.isbn", (title, author, rating, row.get("Date Read") or None, (row.get("ISBN13") or row.get("ISBN") or "").strip('="') or None))
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+                "VALUES(?,?,?,?,?,'goodreads_csv') "
+                "ON CONFLICT(title,author) DO UPDATE SET "
+                "rating=excluded.rating,read_at=excluded.read_at,"
+                "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
+                "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
+                "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
+                "AND excluded.isbn IS NOT reads.isbn THEN NULL "
+                "ELSE reads.openlibrary_lookup_attempted_at END,"
+                "isbn=COALESCE(excluded.isbn,reads.isbn)",
+                (
+                    title,
+                    author,
+                    rating,
+                    row.get("Date Read") or None,
+                    (row.get("ISBN13") or row.get("ISBN") or "").strip('="') or None,
+                ),
+            )
             count += 1
     # Importing a history is also the point at which naturally supplied
     # ratings can become outcomes for recommendations shown earlier. Import
@@ -666,6 +692,166 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
         headers={"Host": host_header},
         extensions={"sni_hostname": hostname},
     )
+
+
+def _openlibrary_work_from_edition(payload, requested_isbn13: str) -> str:
+    """Return a single verified Open Library work key for an ISBN edition."""
+
+    if not isinstance(payload, dict):
+        return ""
+    edition_isbns = set()
+    for field in ("isbn_13", "isbn_10"):
+        values = payload.get(field) or []
+        if isinstance(values, (str, int)):
+            values = [values]
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        for value in values:
+            isbn13, _isbn10 = isbn_parts(value)
+            if isbn13:
+                edition_isbns.add(isbn13)
+    if not requested_isbn13 or requested_isbn13 not in edition_isbns:
+        return ""
+
+    works = payload.get("works") or []
+    if not isinstance(works, list):
+        return ""
+    work_ids = set()
+    for work in works:
+        if not isinstance(work, dict):
+            continue
+        work_id = book_openlibrary_work_id(
+            {"openlibrary_work_id": work.get("key", "")}
+        )
+        if work_id:
+            work_ids.add(work_id)
+    # An edition linked to several works is ambiguous for automatic exclusion.
+    return next(iter(work_ids)) if len(work_ids) == 1 else ""
+
+
+async def refresh_read_work_identities(
+    limit: int = READ_WORK_IDENTITY_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache verified Open Library work IDs for reads that could collide.
+
+    ISBN lookups are limited to reads by an author with an active, accepted
+    Open Library candidate whose title/edition identity does not already match.
+    This keeps requests focused and lets the exact work key, rather than fuzzy
+    title translation, decide whether two rows describe one work.
+    """
+
+    reads = rows("SELECT * FROM reads ORDER BY id")
+    candidates = rows(
+        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "JOIN sources s ON s.id=c.source_id "
+        "WHERE c.status IN ('new','recommended') "
+        "AND q.quality_status='accepted' AND s.enabled=1"
+    )
+
+    candidates_by_author: dict[str, list[tuple[dict, set]]] = {}
+    for candidate in candidates:
+        if not book_openlibrary_work_id(candidate):
+            continue
+        author_key = book_author_identity_key(candidate.get("author"))
+        if not author_key:
+            continue
+        candidates_by_author.setdefault(author_key, []).append(
+            (candidate, book_row_identity_match_keys(candidate))
+        )
+
+    now = datetime.now(timezone.utc)
+    retry_before = now - timedelta(days=READ_WORK_IDENTITY_RETRY_DAYS)
+    targets: dict[int, tuple[float, dict]] = {}
+    for read in reads:
+        if not read.get("isbn") or read.get("openlibrary_work_id"):
+            continue
+        attempted_at = read.get("openlibrary_lookup_attempted_at")
+        if attempted_at:
+            try:
+                attempted = datetime.fromisoformat(
+                    str(attempted_at).replace("Z", "+00:00")
+                )
+            except ValueError:
+                attempted = retry_before - timedelta(seconds=1)
+            if attempted.tzinfo is None:
+                attempted = attempted.replace(tzinfo=timezone.utc)
+            if attempted > retry_before:
+                continue
+
+        author_key = book_author_identity_key(read.get("author"))
+        author_candidates = candidates_by_author.get(author_key, [])
+        if not author_candidates:
+            continue
+        read_keys = book_row_identity_match_keys(read)
+        unmatched = [
+            candidate
+            for candidate, candidate_keys in author_candidates
+            if not (read_keys & candidate_keys)
+        ]
+        if not unmatched:
+            continue
+        isbn13, _isbn10 = isbn_parts(read.get("isbn"))
+        if not isbn13:
+            continue
+        priority = max(float(candidate.get("score") or 0) for candidate in unmatched)
+        previous = targets.get(int(read["id"]))
+        if previous is None or priority > previous[0]:
+            targets[int(read["id"])] = (priority, read)
+
+    batch_size = max(1, min(int(limit), READ_WORK_IDENTITY_BATCH_SIZE))
+    batch = sorted(
+        targets.values(),
+        key=lambda item: (-item[0], int(item[1]["id"])),
+    )[:batch_size]
+    if not batch:
+        return {"checked": 0, "matched": 0, "lookup_failures": 0, "remaining": 0}
+
+    updates = []
+    matched = 0
+    lookup_failures = 0
+    async with metadata_client() as client:
+        for _priority, read in batch:
+            await asyncio.sleep(READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS)
+            isbn13, _isbn10 = isbn_parts(read.get("isbn"))
+            work_id = ""
+            try:
+                response = await _request_pinned(
+                    client,
+                    "GET",
+                    f"https://openlibrary.org/isbn/{isbn13}.json",
+                )
+                if response.status_code != 404:
+                    response.raise_for_status()
+                    work_id = _openlibrary_work_from_edition(
+                        response.json(), isbn13
+                    )
+            except Exception:
+                # A failed optional lookup must not block recommendation
+                # serving. Its attempt timestamp also prevents a tight retry.
+                lookup_failures += 1
+            updates.append(
+                (
+                    work_id,
+                    datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    int(read["id"]),
+                )
+            )
+            matched += bool(work_id)
+
+    with transaction() as con:
+        con.executemany(
+            "UPDATE reads SET openlibrary_work_id=?,"
+            "openlibrary_lookup_attempted_at=? WHERE id=?",
+            updates,
+        )
+    return {
+        "checked": len(batch),
+        "matched": int(matched),
+        "lookup_failures": lookup_failures,
+        "remaining": max(0, len(targets) - len(batch)),
+    }
 
 
 async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
