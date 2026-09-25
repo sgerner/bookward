@@ -71,7 +71,7 @@ async def search(config: dict[str, Any], query: str, media_type: str) -> dict[st
         raise ValueError("Search must be between 2 and 200 characters")
     base_url, headers = _service(config)
     endpoint = "/api/search/audiobooks" if media == "audiobook" else "/api/search"
-    async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
         response = await client.get(f"{base_url}{endpoint}", params={"q": clean_query}, headers=headers)
         response.raise_for_status()
         try:
