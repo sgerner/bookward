@@ -67,6 +67,7 @@
   let searchOpen = $state(false);
   let searchInput = $state<HTMLInputElement | null>(null);
   let detailsId = $state<number | null>(null);
+  let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const FORM_NOTIFICATION_DISMISS_MS = 5000;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
@@ -1285,10 +1286,10 @@
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
-              class={`relative isolate card group grid min-w-0 grid-cols-1 overflow-hidden bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 preset-tonal-surface shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
+              class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 preset-tonal-surface shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
               {#if book.cover_url}
-                <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden sm:hidden" aria-hidden="true">
+                <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden rounded-[inherit] sm:hidden" aria-hidden="true">
                   <img
                     class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px]"
                     src={book.cover_url}
@@ -1346,32 +1347,6 @@
                       onclick={() => recordBookEvent(book.id, "source_open")}
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
-                  {#if view === "discover" && book.status === "recommended"}
-                    <details class="relative z-40 ml-auto shrink-0">
-                      <summary
-                        class="btn btn-icon btn-xs min-h-8 min-w-8 list-none preset-tonal-surface [&::-webkit-details-marker]:hidden"
-                        aria-label={`More options for ${book.title}`}
-                        title="More options"
-                      ><EllipsisVertical size={15} /></summary>
-                      <div class="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl">
-                        <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
-                        <p class="mt-1 text-xs leading-5 text-surface-700-300">Add it to your read list so it leaves Discover without marking it as a pass.</p>
-                        <form class="mt-3 flex flex-col gap-2" method="POST" action="?/markRead" use:enhance={setPending(`read-${book.id}`, optimisticRead)}>
-                          <input type="hidden" name="id" value={book.id} />
-                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`read-rating-${book.id}`}>
-                            Your rating <span class="sr-only">for {book.title}</span>
-                            <select id={`read-rating-${book.id}`} name="rating" class="select select-sm min-h-10 w-full preset-tonal-surface">
-                              <option value="">No rating</option>
-                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
-                            </select>
-                          </label>
-                          <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`read-${book.id}`)} aria-busy={isPending(`read-${book.id}`)}>
-                            {#if isPending(`read-${book.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<BookOpen size={14} />{/if} Mark as read
-                          </button>
-                        </form>
-                      </div>
-                    </details>
-                  {/if}
                 </div>
                 <div>
                   <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
@@ -1397,7 +1372,7 @@
                         </div>{/if}
                     </div>{/if}
                 </details>
-                <div class="mt-auto flex flex-wrap gap-2 pt-0.5">
+                <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
@@ -1406,6 +1381,36 @@
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
                     </form>
+                    <details
+                      class="relative z-50 ml-auto shrink-0"
+                      ontoggle={(event) => {
+                        const menu = event.currentTarget as HTMLDetailsElement;
+                        if (menu.open) openReadMenuId = book.id;
+                        else if (openReadMenuId === book.id) openReadMenuId = null;
+                      }}
+                    >
+                      <summary
+                        class="btn btn-icon btn-xs min-h-8 min-w-8 list-none preset-tonal-surface [&::-webkit-details-marker]:hidden"
+                        aria-label={`More options for ${book.title}`}
+                        title="More options"
+                      ><EllipsisVertical size={15} /></summary>
+                      <div class="absolute bottom-full right-0 z-50 mb-2 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl">
+                        <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
+                        <form class="mt-3 flex flex-col gap-2" method="POST" action="?/markRead" use:enhance={setPending(`read-${book.id}`, optimisticRead)}>
+                          <input type="hidden" name="id" value={book.id} />
+                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`read-rating-${book.id}`}>
+                            Your rating <span class="sr-only">for {book.title}</span>
+                            <select id={`read-rating-${book.id}`} name="rating" class="select select-sm min-h-10 w-full preset-tonal-surface">
+                              <option value="">No rating</option>
+                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
+                            </select>
+                          </label>
+                          <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`read-${book.id}`)} aria-busy={isPending(`read-${book.id}`)}>
+                            {#if isPending(`read-${book.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<BookOpen size={14} />{/if} Mark as read
+                          </button>
+                        </form>
+                      </div>
+                    </details>
                   {:else if book.status === "saved"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
