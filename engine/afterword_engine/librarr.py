@@ -17,6 +17,10 @@ from .security import validate_service_url
 MEDIA_TYPES = frozenset({"ebook", "audiobook"})
 
 
+class StreamingUnsupportedError(ValueError):
+    """Raised when the configured Librarr version has no SSE search route."""
+
+
 def normalize_media_type(value: str | None) -> str:
     media_type = str(value or "audiobook").strip().lower()
     if media_type not in MEDIA_TYPES:
@@ -79,6 +83,58 @@ async def search(config: dict[str, Any], query: str, media_type: str) -> dict[st
         except ValueError as exc:
             raise ValueError("Librarr returned an invalid search response") from exc
     return {"results": _results(payload), "media_type": media}
+
+
+async def open_search_stream(
+    config: dict[str, Any], query: str, media_type: str
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    """Open Librarr's SSE search and return its live response for proxying.
+
+    The client and response stay open until the downstream consumer closes the
+    stream. Callers must close both, including when the browser disconnects.
+    """
+
+    media = normalize_media_type(media_type)
+    clean_query = str(query).strip()
+    if len(clean_query) < 2 or len(clean_query) > 200:
+        raise ValueError("Search must be between 2 and 200 characters")
+    base_url, headers = _service(config)
+    endpoint = (
+        "/api/search/audiobooks/stream"
+        if media == "audiobook"
+        else "/api/search/stream"
+    )
+    headers = {**headers, "Accept": "text/event-stream"}
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(55.0, connect=5.0),
+        follow_redirects=False,
+        trust_env=False,
+    )
+    response: httpx.Response | None = None
+    try:
+        request = client.build_request(
+            "GET",
+            f"{base_url}{endpoint}",
+            params={"q": clean_query},
+            headers=headers,
+        )
+        response = await client.send(request, stream=True)
+        if response.status_code in {404, 405}:
+            raise StreamingUnsupportedError(
+                "The connected Librarr version does not support streaming search"
+            )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if not content_type.startswith("text/event-stream"):
+            raise StreamingUnsupportedError(
+                "The connected Librarr version does not support streaming search"
+            )
+        return client, response
+    except BaseException:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        raise
 
 
 async def download(config: dict[str, Any], result: dict[str, Any], media_type: str, idempotency_key: str) -> dict[str, Any]:

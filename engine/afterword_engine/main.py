@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlparse
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -36,7 +37,13 @@ from .security import safe_error_message, validate_public_url, validate_service_
 from .jobs import enqueue_job, worker_loop
 from .scoring import rebuild_all_embeddings, score_all
 from .secrets import seal, unseal
-from .librarr import download as librarr_download, normalize_media_type, search as librarr_search
+from .librarr import (
+    StreamingUnsupportedError,
+    download as librarr_download,
+    normalize_media_type,
+    open_search_stream as librarr_open_search_stream,
+    search as librarr_search,
+)
 from .exploration import epsilon_tail_explore
 from .digest import (
     digest_config,
@@ -992,6 +999,45 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
+@app.get("/api/librarr/search/stream")
+async def stream_librarr_search(
+    q: str = Query(min_length=2, max_length=200),
+    media_type: str = Query(default="audiobook"),
+):
+    client: httpx.AsyncClient | None = None
+    upstream: httpx.Response | None = None
+    try:
+        media = normalize_media_type(media_type)
+        config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
+        client, upstream = await librarr_open_search_stream(config, q, media)
+    except StreamingUnsupportedError as exc:
+        raise HTTPException(501, safe_error_message(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
+
+    assert client is not None and upstream is not None
+
+    async def stream_bytes():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_bytes(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 class LibrarrDownloadIn(BaseModel):
     media_type: str = "audiobook"
     result: dict[str, Any]
@@ -1755,6 +1801,14 @@ async def api_librarr_search(
     media_type: str = Query(default="audiobook"),
 ):
     return await search_librarr(q=q, media_type=media_type)
+
+
+@api_v1.get("/librarr/search/stream")
+async def api_librarr_search_stream(
+    q: str = Query(min_length=2, max_length=200),
+    media_type: str = Query(default="audiobook"),
+):
+    return await stream_librarr_search(q=q, media_type=media_type)
 
 
 @api_v1.post("/librarr/download")

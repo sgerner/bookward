@@ -37,6 +37,7 @@
   import { copyApiTokenText } from "$lib/api-token-clipboard";
   import { tokenForView } from "$lib/api-token-ui";
   import { createTelemetryClient } from "$lib/telemetry";
+  import { readLibrarrSearchStream } from "$lib/librarr-stream";
   import bookwardMark from "$lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "sources" | "settings";
@@ -95,8 +96,10 @@
   );
   let librarrSearchError = $state("");
   let librarrSearchMessage = $state("");
-  let librarrAddingIndex = $state<number | null>(null);
-  let librarrAdded = $state<Set<number>>(new Set());
+  let librarrAddingKey = $state<string | null>(null);
+  let librarrBulkAdding = $state(false);
+  let librarrAdded = $state<Set<string>>(new Set());
+  let librarrSearchAbortController: AbortController | null = null;
   let digestMode = $state(page.url.searchParams.get("digest") === "1");
   let selectedDigestIds = $state<Set<number>>(new Set());
   let digestEnabledOverride = $state<boolean | null>(null);
@@ -795,11 +798,14 @@
       .filter((item): item is { result: LibrarrResult; index: number; score: number } => item.score !== null && item.score >= 90),
   );
   function resultKey(result: LibrarrResult, index: number) {
-    return `${resultText(
+    return `${resultIdentity(result)}-${index}`;
+  }
+  function resultIdentity(result: LibrarrResult) {
+    return resultText(
       result,
       ["id", "guid", "isbn", "asin"],
-      resultTitle(result),
-    )}-${index}`;
+      `${resultTitle(result)}-${resultAuthor(result)}-${resultFormat(result)}`,
+    ).trim().toLocaleLowerCase();
   }
   function openLibrarrSearch(book: {
     id: number;
@@ -818,6 +824,8 @@
     void searchLibrarr();
   }
   function closeLibrarrSearch() {
+    librarrSearchAbortController?.abort();
+    librarrSearchAbortController = null;
     librarrSearchOpen = false;
   }
 
@@ -922,11 +930,17 @@
   });
   async function searchLibrarr() {
     const query = librarrQuery.trim();
+    librarrSearchAbortController?.abort();
+    librarrSearchAbortController = null;
     if (query.length < 2) {
       librarrSearchState = "error";
       librarrSearchError = "Enter at least two characters.";
       return;
     }
+    const controller = new AbortController();
+    librarrSearchAbortController = controller;
+    librarrResults = [];
+    librarrAdded = new Set();
     librarrSearchState = "searching";
     librarrSearchError = "";
     librarrSearchMessage = "";
@@ -936,29 +950,69 @@
         media_type: librarrMediaType,
       });
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
-      const response = await fetch(`/api/librarr/search?${params.toString()}`);
-      const payload = (await response.json().catch(() => ({}))) as {
-        results?: unknown[];
-        message?: string;
-      };
-      if (!response.ok)
-        throw new Error(payload.message || "Librarr search failed.");
-      librarrResults = Array.isArray(payload.results)
-        ? payload.results.filter((item): item is LibrarrResult =>
-            Boolean(item && typeof item === "object" && !Array.isArray(item)),
-          )
-        : [];
-      librarrSearchState = "ready";
+      let response = await fetch(`/api/librarr/search/stream?${params.toString()}`, {
+        headers: { accept: "text/event-stream" },
+        signal: controller.signal,
+      });
+      if (librarrSearchAbortController !== controller) return;
+      const isEventStream = response.headers
+        .get("content-type")
+        ?.toLowerCase()
+        .startsWith("text/event-stream");
+      const streamUnsupported = [404, 405, 501].includes(response.status) ||
+        (response.ok && !isEventStream);
+      if (streamUnsupported) {
+        await response.body?.cancel().catch(() => {});
+        response = await fetch(`/api/librarr/search?${params.toString()}`, {
+          signal: controller.signal,
+        });
+        if (librarrSearchAbortController !== controller) return;
+        const payload = (await response.json().catch(() => ({}))) as {
+          results?: unknown[];
+          message?: string;
+        };
+        if (!response.ok)
+          throw new Error(payload.message || "Librarr search failed.");
+        librarrResults = Array.isArray(payload.results)
+          ? payload.results.filter((item): item is LibrarrResult =>
+              Boolean(item && typeof item === "object" && !Array.isArray(item)),
+            )
+          : [];
+      } else {
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => ({}))) as {
+            message?: string;
+          };
+          throw new Error(payload.message || "Librarr search failed.");
+        }
+        if (!isEventStream) throw new Error("Librarr did not return a search stream.");
+        const progress = await readLibrarrSearchStream(response, (results) => {
+          if (librarrSearchAbortController === controller) librarrResults = results;
+        });
+        if (librarrSearchAbortController !== controller) return;
+        if (!progress.completed) {
+          librarrSearchError = "Librarr ended the stream before search finished. Showing any results received.";
+        }
+      }
+      if (librarrSearchAbortController === controller) {
+        librarrSearchState = "ready";
+      }
     } catch (error) {
+      if (controller.signal.aborted || librarrSearchAbortController !== controller) return;
       librarrSearchState = "error";
       librarrSearchError =
         error instanceof Error ? error.message : "Librarr search failed.";
+    } finally {
+      if (librarrSearchAbortController === controller) {
+        librarrSearchAbortController = null;
+      }
     }
   }
   async function addLibrarrResult(result: LibrarrResult, index: number, closeAfter = true) {
-    if (librarrAdded.has(index)) return;
-    librarrAddingIndex = index;
-    librarrAdded = new Set([...librarrAdded, index]);
+    const identity = resultIdentity(result);
+    if (librarrAdded.has(identity)) return;
+    librarrAddingKey = identity;
+    librarrAdded = new Set([...librarrAdded, identity]);
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
@@ -981,7 +1035,7 @@
       return true;
     } catch (error) {
       const nextAdded = new Set(librarrAdded);
-      nextAdded.delete(index);
+      nextAdded.delete(identity);
       librarrAdded = nextAdded;
       librarrSearchError =
         error instanceof Error
@@ -989,12 +1043,12 @@
           : "Librarr could not add that book.";
       return false;
     } finally {
-      librarrAddingIndex = null;
+      if (librarrAddingKey === identity) librarrAddingKey = null;
     }
   }
   async function addHighConfidenceLibrarrResults() {
-    if (!highConfidenceLibrarrResults.length || librarrAddingIndex !== null) return;
-    librarrAddingIndex = -1;
+    if (!highConfidenceLibrarrResults.length || librarrAddingKey !== null || librarrBulkAdding) return;
+    librarrBulkAdding = true;
     librarrSearchError = "";
     librarrSearchMessage = "";
     let added = 0;
@@ -1004,7 +1058,7 @@
       if (success) added += 1;
       else failed += 1;
     }
-    librarrAddingIndex = null;
+    librarrBulkAdding = false;
     if (failed) {
       librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
@@ -2508,7 +2562,6 @@
             <button
               type="submit"
               class="btn min-h-12 preset-filled-primary-500"
-              disabled={librarrSearchState === "searching"}
               aria-busy={librarrSearchState === "searching"}
               >{#if librarrSearchState === "searching"}<RefreshCw
                   size={16}
@@ -2532,7 +2585,7 @@
               <CircleHelp size={16} class="mt-0.5 shrink-0" />
               <span>{librarrSearchError}</span>
             </div>{/if}
-          {#if librarrSearchState === "searching"}
+          {#if librarrSearchState === "searching" && librarrResults.length === 0}
             <div
               in:fade={{ duration: motionDuration(160) }}
               class="grid min-h-48 place-items-center text-sm text-surface-700-300"
@@ -2540,7 +2593,17 @@
               <RefreshCw size={22} class="animate-spin text-primary-500" /> Searching
               Librarr…
             </div>
-          {:else if librarrSearchState === "ready" && librarrResults.length === 0}
+          {:else if librarrSearchState === "searching"}
+            <div
+              class="mt-4 flex items-center gap-2 text-sm text-surface-700-300"
+              role="status"
+              aria-live="polite"
+            >
+              <RefreshCw size={15} class="animate-spin text-primary-500" />
+              Searching Librarr… {librarrResults.length} matches so far
+            </div>
+          {/if}
+          {#if librarrSearchState === "ready" && librarrResults.length === 0}
             <div
               in:fade={{ duration: motionDuration(160) }}
               class="grid min-h-48 place-items-center text-center text-sm text-surface-700-300"
@@ -2551,8 +2614,9 @@
                 <p class="mt-1">Try a title, author, or a shorter search.</p>
               </div>
             </div>
-          {:else if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingIndex !== null} aria-busy={librarrAddingIndex === -1}>{#if librarrAddingIndex === -1}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+          {/if}
+          {#if librarrResults.length}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -2599,18 +2663,18 @@
                   <button
                     type="button"
                     class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
-                    disabled={librarrAddingIndex !== null ||
-                      librarrAdded.has(index)}
-                    aria-busy={librarrAddingIndex === index}
+                    disabled={librarrAddingKey !== null || librarrBulkAdding ||
+                      librarrAdded.has(resultIdentity(result))}
+                    aria-busy={librarrAddingKey === resultIdentity(result)}
                     onclick={() => void addLibrarrResult(result, index)}
-                    >{#if librarrAddingIndex === index}<RefreshCw
+                    >{#if librarrAddingKey === resultIdentity(result)}<RefreshCw
                         size={15}
                         class="animate-spin"
-                      />{:else if librarrAdded.has(index)}<Check
+                      />{:else if librarrAdded.has(resultIdentity(result))}<Check
                         size={15}
                       />{:else}<Library size={15} />{/if}<span
                       class="hidden sm:inline"
-                      >{librarrAdded.has(index) ? "Added" : "Add"}</span
+                      >{librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"}</span
                     ></button
                   >
                 </article>
