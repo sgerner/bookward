@@ -20,7 +20,7 @@ from .identity import book_identity
 
 
 POLICY = "rating-neighborhood"
-POLICY_VERSION = "rating-kernel-recency-v1"
+POLICY_VERSION = "rating-kernel-recency-interaction-v1"
 EVENT_TYPES = {
     "visible",
     "detail_open",
@@ -96,6 +96,7 @@ def create_recommendation_run(
     session_id: str = "",
     status: str | None = None,
     limit: int | None = None,
+    ranking_metadata: dict[str, Any] | None = None,
 ) -> str:
     """Persist a ranked response and return its opaque run identifier.
 
@@ -110,6 +111,8 @@ def create_recommendation_run(
     metadata = {"status": status or "all"}
     if limit is not None:
         metadata["limit"] = int(limit)
+    if ranking_metadata:
+        metadata["interaction_learning"] = ranking_metadata
     now = utc_now()
     with transaction() as con:
         con.execute(
