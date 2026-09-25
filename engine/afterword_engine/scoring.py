@@ -127,9 +127,33 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         if not book_identity_match_keys(item["title"], item["author"]) & all_read_keys
     ]
     if not candidates: return 0
+    interaction_candidates = rows(
+        """SELECT DISTINCT c.* FROM candidates c WHERE c.id IN (
+            SELECT candidate_id FROM (
+                SELECT candidate_id,occurred_at FROM recommendation_events
+                WHERE event_type IN ('save','reject','restore','read','librarr_import')
+                UNION ALL
+                SELECT f.candidate_id,f.created_at FROM feedback f
+                WHERE f.action IN ('save','reject','restore')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM recommendation_events e
+                    WHERE e.event_key='feedback:' || f.id
+                  )
+            ) ORDER BY datetime(occurred_at) DESC LIMIT 5000
+        ) ORDER BY c.id"""
+    )
+    candidate_items_by_id = {int(item["id"]): item for item in candidates}
+    for item in interaction_candidates:
+        candidate_items_by_id.setdefault(int(item["id"]), item)
+    candidate_items = list(candidate_items_by_id.values())
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)
-    candidate_vectors = await cached_vectors(embedder,"candidate",candidates)
+    all_candidate_vectors = await cached_vectors(embedder,"candidate",candidate_items)
+    vectors_by_id = {
+        int(item["id"]): vector
+        for item, vector in zip(candidate_items, all_candidate_vectors)
+    }
+    candidate_vectors = [vectors_by_id[int(item["id"])] for item in candidates]
     ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
     with transaction() as con:
         for candidate in ranked:

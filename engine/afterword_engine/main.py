@@ -1,6 +1,7 @@
 import hashlib
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -51,6 +52,11 @@ from .learning import (
     record_event_in_connection,
     record_events,
 )
+from .interaction_personalization import (
+    load_interaction_events,
+    load_cached_candidate_vectors,
+    personalize_recommendations,
+)
 from .associations import run_association_provider
 from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
@@ -63,6 +69,7 @@ SOURCE_SYNC_MAX_HOURS = 720
 SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
+LOGGER = logging.getLogger(__name__)
 
 
 def source_sync_interval_hours():
@@ -529,13 +536,87 @@ def tracked_recommendations(
     recommended_limit: int | None = None,
     session_id: str = "",
 ):
-    recommendations = recommendation_list(
-        connection,
-        status=status,
-        limit=limit,
-        offset=offset,
-        recommended_limit=recommended_limit,
-    )
+    learning_metadata = {
+        "mode": "confidence_gated_live",
+        "scope": "session" if session_id else "installation",
+        "applied": False,
+        "observed_books": 0,
+        "qualified_features": 0,
+        "semantic_evidence_books": 0,
+        "semantic_adjusted_candidates": 0,
+        "adjusted_candidates": 0,
+        "max_score_adjustment": 0.0,
+    }
+    can_personalize = status in (None, "", "all", "recommended")
+    if can_personalize:
+        try:
+            # Score the full eligible recommendation pool before pagination so
+            # a learned preference can promote a strong match from below the
+            # unpersonalized page boundary.
+            ranked = recommendation_list(
+                connection, status=status, limit=None, offset=0
+            )
+            interaction_events = load_interaction_events(
+                connection, session_id=session_id or None
+            )
+            cached_vectors = load_cached_candidate_vectors(
+                [*ranked, *interaction_events], connection
+            )
+            interaction_vectors = {
+                int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
+                for event in interaction_events
+                if int(event["candidate_id"]) in cached_vectors
+            }
+            ranked, diagnostics = personalize_recommendations(
+                ranked,
+                interaction_events,
+                interaction_vectors=interaction_vectors,
+                candidate_vectors=cached_vectors,
+            )
+            learning_metadata.update(diagnostics)
+            if recommended_limit is not None and status is None and offset == 0:
+                recommended = [item for item in ranked if item.get("status") == "recommended"]
+                remaining = [
+                    item for item in ranked
+                    if item.get("status") in {"saved", "imported", "new"}
+                ]
+                recommendations = recommended[:max(0, int(recommended_limit))] + remaining
+            else:
+                start = max(0, int(offset))
+                end = None if limit is None else start + max(0, int(limit))
+                recommendations = ranked[start:end]
+        except Exception:
+            # Personalization must never take the recommendation service down.
+            # On malformed legacy evidence, return the existing champion order.
+            LOGGER.exception(
+                "Interaction personalization failed; serving the base ranking"
+            )
+            recommendations = recommendation_list(
+                connection,
+                status=status,
+                limit=limit,
+                offset=offset,
+                recommended_limit=recommended_limit,
+            )
+            learning_metadata = {
+                "mode": "base_ranker_fallback",
+                "scope": "session" if session_id else "installation",
+                "applied": False,
+                "observed_books": 0,
+                "qualified_features": 0,
+                "semantic_evidence_books": 0,
+                "semantic_adjusted_candidates": 0,
+                "adjusted_candidates": 0,
+                "max_score_adjustment": 0.0,
+            }
+    else:
+        recommendations = recommendation_list(
+            connection,
+            status=status,
+            limit=limit,
+            offset=offset,
+            recommended_limit=recommended_limit,
+        )
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -550,6 +631,7 @@ def tracked_recommendations(
         session_id=session_id,
         status=status,
         limit=limit,
+        ranking_metadata=learning_metadata,
     )
     return recommendations, run_id
 

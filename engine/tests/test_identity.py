@@ -250,3 +250,28 @@ def test_scoring_excludes_unrated_reads(database):
         statuses = dict(con.execute("SELECT title,status FROM candidates WHERE title IN ('Already Read','New Book')"))
     assert statuses["Already Read"] == "recommended"
     assert statuses["New Book"] == "recommended"
+
+
+def test_scoring_refreshes_vectors_for_interacted_books(database):
+    add_candidate("Previously Saved", "Writer", status="saved")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO feedback(candidate_id,action) "
+            "SELECT id,'save' FROM candidates WHERE title='Previously Saved'"
+        )
+    add_candidate("Fresh Recommendation", "Writer")
+
+    class FakeEmbedder:
+        name, model = "test", "interaction-refresh"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+
+    assert asyncio.run(score_all(embedder=embedder)) > 0
+    assert any("Previously Saved" in text for text in embedder.texts)
