@@ -2,6 +2,7 @@ import hashlib
 import json
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -446,6 +447,16 @@ class FeedbackIn(BaseModel):
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
+class MarkReadIn(BaseModel):
+    rating: int | None = Field(default=None, ge=1, le=5)
+    session_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+    )
+
+
 class TelemetryEventIn(BaseModel):
     event_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
     candidate_id: int = Field(gt=0)
@@ -825,6 +836,58 @@ def feedback(candidate_id: int, payload: FeedbackIn):
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     return {"id":candidate_id,"status":status}
+
+
+@app.post("/api/recommendations/{candidate_id}/read")
+def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
+    with transaction() as con:
+        candidate = con.execute(
+            "SELECT id,title,author FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Recommendation not found")
+        existing = con.execute(
+            "SELECT id,rating FROM reads WHERE title=? AND author=?",
+            (candidate["title"], candidate["author"]),
+        ).fetchone()
+        rating = (
+            payload.rating
+            if payload.rating is not None
+            else existing["rating"] if existing else None
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+            "VALUES(?,?,?,NULL,NULL,'manual') "
+            "ON CONFLICT(title,author) DO UPDATE SET "
+            "rating=COALESCE(excluded.rating,reads.rating)",
+            (candidate["title"], candidate["author"], rating),
+        )
+        read = con.execute(
+            "SELECT id FROM reads WHERE title=? AND author=?",
+            (candidate["title"], candidate["author"]),
+        ).fetchone()
+        try:
+            record_event_in_connection(
+                con,
+                event_key=f"manual-read:{uuid.uuid4()}",
+                candidate_id=candidate_id,
+                event_type="read",
+                value=rating,
+                source="manual_read",
+                metadata={"session_id": payload.session_id} if payload.session_id else {},
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    job_id = enqueue_job("score", dedupe=True)
+    return {
+        "id": candidate_id,
+        "read_id": int(read["id"]),
+        "status": "read",
+        "rating": rating,
+        "job_id": job_id,
+        "already_present": existing is not None,
+    }
 
 
 @app.post("/api/recommendations/bulk-feedback")

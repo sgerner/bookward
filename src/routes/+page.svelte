@@ -16,6 +16,7 @@
     CircleHelp,
     Compass,
     Copy,
+    EllipsisVertical,
     ExternalLink,
     KeyRound,
     Library,
@@ -441,6 +442,11 @@
     return Number.isInteger(id) && ["saved", "rejected", "recommended"].includes(status)
       ? optimisticBookStatus(id, status)
       : undefined;
+  }
+
+  function optimisticRead(formData: FormData) {
+    const id = Number(formData.get("id"));
+    return Number.isInteger(id) ? optimisticBookStatus(id, "read") : undefined;
   }
 
   function optimisticImport(formData: FormData) {
@@ -1319,13 +1325,39 @@
                   {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
-                      class="btn btn-icon btn-xs preset-tonal-surface ml-auto shrink-0"
+                      class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
                       href={book.source_url}
                       target="_blank"
                       rel="noreferrer"
                       onclick={() => recordBookEvent(book.id, "source_open")}
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
+                  {#if view === "discover" && book.status === "recommended"}
+                    <details class="relative z-40 ml-auto shrink-0">
+                      <summary
+                        class="btn btn-icon btn-xs min-h-8 min-w-8 list-none preset-tonal-surface [&::-webkit-details-marker]:hidden"
+                        aria-label={`More options for ${book.title}`}
+                        title="More options"
+                      ><EllipsisVertical size={15} /></summary>
+                      <div class="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl">
+                        <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
+                        <p class="mt-1 text-xs leading-5 text-surface-700-300">Add it to your read list so it leaves Discover without marking it as a pass.</p>
+                        <form class="mt-3 flex flex-col gap-2" method="POST" action="?/markRead" use:enhance={setPending(`read-${book.id}`, optimisticRead)}>
+                          <input type="hidden" name="id" value={book.id} />
+                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`read-rating-${book.id}`}>
+                            Your rating <span class="sr-only">for {book.title}</span>
+                            <select id={`read-rating-${book.id}`} name="rating" class="select select-sm min-h-10 w-full preset-tonal-surface">
+                              <option value="">No rating</option>
+                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
+                            </select>
+                          </label>
+                          <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`read-${book.id}`)} aria-busy={isPending(`read-${book.id}`)}>
+                            {#if isPending(`read-${book.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<BookOpen size={14} />{/if} Mark as read
+                          </button>
+                        </form>
+                      </div>
+                    </details>
+                  {/if}
                 </div>
                 <div>
                   <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
