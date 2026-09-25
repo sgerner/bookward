@@ -1277,7 +1277,7 @@
             </div>
           </section>
         {/if}
-        <section class="grid gap-5 lg:grid-cols-2" aria-live="polite">
+        <section class="grid gap-3 sm:gap-4 lg:grid-cols-2" aria-live="polite">
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             <article
@@ -1285,8 +1285,21 @@
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
-              class={`relative card group grid grid-cols-[7rem_minmax(0,1fr)] overflow-hidden bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 preset-tonal-surface shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
+              class={`relative isolate card group grid min-w-0 grid-cols-1 overflow-hidden bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 preset-tonal-surface shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
+              {#if book.cover_url}
+                <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden sm:hidden" aria-hidden="true">
+                  <img
+                    class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px]"
+                    src={book.cover_url}
+                    alt=""
+                    loading={index > 2 ? "lazy" : "eager"}
+                    onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
+                  />
+                  <div class="absolute inset-0 preset-filled-surface-50-950 opacity-[0.82]"></div>
+                  <div class="absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15"></div>
+                </div>
+              {/if}
               {#if view === "discover" && digestVisible && book.status === "recommended"}
                 <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
                   <input
@@ -1300,7 +1313,7 @@
               {/if}
               <button
                 type="button"
-                class={`relative aspect-[2/3] h-fit w-full self-start overflow-hidden preset-tonal-surface text-left before:pointer-events-none before:absolute before:inset-0 before:z-10 before:bg-gradient-to-t before:from-primary-950/30 before:via-transparent before:to-secondary-500/10 before:content-[''] sm:aspect-auto sm:h-full sm:self-stretch ${index === 0 && view === "discover" ? "lg:aspect-auto lg:h-full lg:self-stretch" : ""}`}
+                class={`relative hidden h-full w-full self-stretch overflow-hidden preset-tonal-surface text-left before:pointer-events-none before:absolute before:inset-0 before:z-10 before:bg-gradient-to-t before:from-primary-950/30 before:via-transparent before:to-secondary-500/10 before:content-[''] sm:block`}
                 onclick={() => (detailsId = detailsId === book.id ? null : book.id)}
                 aria-label={`View details for ${book.title}`}
                 aria-expanded={detailsId === book.id}
@@ -1318,8 +1331,9 @@
                   />{/if}
                 <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
               </button>
-              <div class="flex min-w-0 flex-col gap-2.5 p-4 sm:p-5">
-                <div class="flex flex-wrap items-center gap-2 text-sm font-medium text-surface-600-400">
+              <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
+                <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
+                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
                   {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
@@ -1372,7 +1386,7 @@
                     detailsId = open ? book.id : null;
                   }}
                 >
-                  <summary class="flex min-h-11 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
+                  <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
                     <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
                   {#if detailsId === book.id}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
@@ -1383,24 +1397,24 @@
                         </div>{/if}
                     </div>{/if}
                 </details>
-                <div class="mt-auto flex flex-wrap gap-2 pt-1">
+                <div class="mt-auto flex flex-wrap gap-2 pt-0.5">
                   {#if book.status === "recommended"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
                     </form>
                   {:else if book.status === "saved"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-11 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                      <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-11 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
+                      <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-11 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                     </form>
-                  {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-11 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
+                  {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
                 </div>
               </div>
             </article>
