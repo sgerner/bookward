@@ -71,18 +71,25 @@ def load_interaction_events(
     values: tuple[Any, ...] = (max(1, min(MAX_INTERACTION_EVENTS, int(limit))),)
     if session_id:
         event_scope = """
-            AND EXISTS (
-                SELECT 1 FROM recommendation_runs r
-                WHERE r.id=e.run_id AND r.session_id=?
+            AND (
+                EXISTS (
+                    SELECT 1 FROM recommendation_runs r
+                    WHERE r.id=e.run_id AND r.session_id=?
+                )
+                OR CASE
+                    WHEN json_valid(e.metadata)
+                    THEN json_extract(e.metadata,'$.session_id')=?
+                    ELSE 0
+                END
             )
         """
         legacy_feedback_scope = "AND 0"
-        values = (session_id, *values)
+        values = (session_id, session_id, *values)
     query = f"""
-        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description
+        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,metadata
         FROM (
             SELECT e.id,e.candidate_id,e.event_type,e.value,e.occurred_at,
-                   c.title,c.author,c.genres,c.description
+                   c.title,c.author,c.genres,c.description,e.metadata
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
             WHERE e.event_type IN ('save','reject','restore','read','librarr_import')
@@ -90,7 +97,7 @@ def load_interaction_events(
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
-                   c.title,c.author,c.genres,c.description
+                   c.title,c.author,c.genres,c.description,NULL AS metadata
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
             WHERE f.action IN ('save','reject','restore')

@@ -77,6 +77,49 @@ describe("page actions", () => {
     );
   });
 
+  it("marks a recommended book as read with an optional rating and its browser session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "read", rating: 5 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "42");
+    body.set("rating", "5");
+    const result = await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+      cookies: { get: vi.fn().mockReturnValue("session-read-123") },
+    } as never);
+
+    expect(result).toEqual({
+      message: "Added to your read list with a 5-star rating.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/recommendations/42/read"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ rating: 5, session_id: "session-read-123" }),
+      }),
+    );
+  });
+
+  it("rejects an invalid manual read rating without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "42");
+    body.set("rating", "6");
+    const result = await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+      cookies: { get: vi.fn() },
+    } as never);
+
+    expect(result).toMatchObject({ status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("creates and revokes API tokens through the engine actions", async () => {
     const fetchMock = vi
       .fn()

@@ -16,7 +16,7 @@ from afterword_engine.learning import (
     record_event_in_connection,
 )
 from afterword_engine.interaction_personalization import load_interaction_events
-from afterword_engine.main import app, tracked_recommendations
+from afterword_engine.main import app, recommendation_list, tracked_recommendations
 
 
 @pytest.fixture()
@@ -211,6 +211,96 @@ def test_session_scoped_learning_keeps_browser_preferences_separate(database):
 
     assert [event["candidate_id"] for event in reader_a_events] == [reader_a_id]
     assert [event["candidate_id"] for event in reader_b_events] == [reader_b_id]
+
+
+def test_manual_read_marks_candidate_read_and_scopes_optional_rating(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,20,'recommended',?,?)",
+            ("Already Read", "A Reader", source_id, "already read a reader"),
+        ).lastrowid
+        unrated_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,19,'recommended',?,?)",
+            ("Unrated Read", "Another Reader", source_id, "unrated read another reader"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id IN (?,?)",
+            (candidate_id, unrated_id),
+        )
+
+    assert candidate_id in {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/recommendations/{candidate_id}/read",
+            json={"rating": 4, "session_id": "session-manual-read"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "read"
+    assert response.json()["rating"] == 4
+    read = row(
+        "SELECT title,author,rating,read_at,source FROM reads WHERE title=? AND author=?",
+        ("Already Read", "A Reader"),
+    )
+    assert read == {
+        "title": "Already Read",
+        "author": "A Reader",
+        "rating": 4.0,
+        "read_at": None,
+        "source": "manual",
+    }
+    assert candidate_id not in {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
+    event = row(
+        "SELECT event_type,value,source,metadata FROM recommendation_events "
+        "WHERE candidate_id=? AND source='manual_read'",
+        (candidate_id,),
+    )
+    assert event["event_type"] == "read"
+    assert event["value"] == 4
+    assert json.loads(event["metadata"]) == {"session_id": "session-manual-read"}
+    assert [event["candidate_id"] for event in load_interaction_events(
+        session_id="session-manual-read"
+    )] == [candidate_id]
+    assert load_interaction_events(session_id="another-session") == []
+
+    with TestClient(app) as client:
+        no_rating = client.post(
+            f"/api/recommendations/{candidate_id}/read",
+            json={"session_id": "session-manual-read"},
+        )
+        unrated = client.post(
+            f"/api/recommendations/{unrated_id}/read",
+            json={"session_id": "session-manual-read"},
+        )
+        invalid = client.post(
+            f"/api/recommendations/{candidate_id}/read",
+            json={"rating": 6},
+        )
+    assert no_rating.status_code == 200
+    assert no_rating.json()["rating"] == 4
+    assert unrated.status_code == 200
+    assert unrated.json()["rating"] is None
+    assert invalid.status_code == 422
+    assert row(
+        "SELECT COUNT(*) count FROM reads WHERE title=? AND author=?",
+        ("Already Read", "A Reader"),
+    )["count"] == 1
+    assert row(
+        "SELECT rating FROM reads WHERE title=? AND author=?",
+        ("Unrated Read", "Another Reader"),
+    )["rating"] is None
+    assert unrated_id not in {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
 
 
 def test_telemetry_batch_is_strict_and_idempotent(database):

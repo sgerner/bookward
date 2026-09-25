@@ -285,6 +285,35 @@ export const actions: Actions = {
       return fail(502, { message: message(error) });
     }
   },
+  markRead: async ({ request, cookies }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const rawRating = formText(data, "rating");
+    const rating = rawRating ? Number(rawRating) : undefined;
+    if (
+      !id.success ||
+      (rating !== undefined && (!Number.isInteger(rating) || rating < 1 || rating > 5))
+    ) {
+      return fail(400, { message: "Choose a valid book and an optional rating from 1 to 5." });
+    }
+    const sessionId = cookies?.get(SESSION_COOKIE);
+    try {
+      await engine(`/api/recommendations/${id.data}/read`, {
+        method: "POST",
+        body: JSON.stringify({
+          ...(rating === undefined ? {} : { rating }),
+          ...(sessionId ? { session_id: sessionId } : {}),
+        }),
+      });
+      return {
+        message: rating === undefined
+          ? "Added to your read list and removed from Discover."
+          : `Added to your read list with a ${rating}-star rating.`,
+      };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
   source: async ({ request }) => {
     const data = await request.formData();
     const url = urlSchema.safeParse(data.get("url"));
