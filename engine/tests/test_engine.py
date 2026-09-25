@@ -68,6 +68,23 @@ def test_fresh_database_seeds_independent_demo(database):
     covers = [item["cover_url"] for item in rows("SELECT cover_url FROM candidates")]
     assert len(covers) == 4 and all(covers) and not any(is_weak_cover_url(cover) for cover in covers)
     assert all("/isbn/" not in item["source_url"] for item in rows("SELECT source_url FROM candidates"))
+    _assert_retired_llm_removed()
+    assert [item["version"] for item in rows("SELECT version FROM schema_migrations ORDER BY version")] == [
+        version for version, _ in MIGRATIONS
+    ]
+
+
+def _assert_retired_llm_removed():
+    tables = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'llm_*'"
+        )
+    }
+    assert not tables
+    assert row(
+        "SELECT key FROM settings WHERE key GLOB 'llm_*' OR key GLOB 'models_catalog*' LIMIT 1"
+    ) is None
 
 
 def test_database_files_are_owner_only(tmp_path):
@@ -1629,6 +1646,8 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
 
     initialize()
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+    _assert_retired_llm_removed()
+    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {6, 9, 12}
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'")["name"] == "api_tokens"
     assert row("SELECT title FROM candidates WHERE normalized_key=?", ("existing book existing author",))["title"] == "Existing book"
     existing_quality = row(
@@ -1655,23 +1674,60 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
 
 
-def test_initialize_removes_retired_model_tables(tmp_path):
+def test_initialize_removes_retired_llm_data_from_v11_database(tmp_path):
     settings.db = str(tmp_path / "retired-model.db")
-    initialize()
-    with transaction() as con:
-        con.executescript(
-            """
-            CREATE TABLE llm_connections (id INTEGER PRIMARY KEY, secret TEXT NOT NULL DEFAULT '');
-            CREATE TABLE llm_policies (id INTEGER PRIMARY KEY, connection_id INTEGER);
-            CREATE TABLE llm_runs (id TEXT PRIMARY KEY, policy_id INTEGER);
-            CREATE TABLE llm_scores (run_id TEXT, candidate_id INTEGER);
-            INSERT INTO llm_connections(secret) VALUES('retired');
-            DELETE FROM schema_migrations WHERE version=12;
-            """
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
+        for version, script in MIGRATIONS:
+            if version > 11:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 12))
+        assert con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='llm_connections'"
+        ).fetchone()
+        connection_id = con.execute(
+            "INSERT INTO llm_connections(name,provider_id,model_id,secret) VALUES(?,?,?,?) RETURNING id",
+            ("Retired provider", "openai", "legacy-model", "sealed legacy credential"),
+        ).fetchone()[0]
+        policy_id = con.execute(
+            "INSERT INTO llm_policies(name,connection_id) VALUES(?,?) RETURNING id",
+            ("Retired shadow policy", connection_id),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO llm_runs(id,policy_id,connection_id,request_hash,candidate_hash,status) VALUES(?,?,?,?,?,?)",
+            ("legacy-run", policy_id, connection_id, "request", "candidates", "complete"),
+        )
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,normalized_key) VALUES(?,?,?) RETURNING id",
+            ("Legacy candidate", "Legacy author", "legacy candidate legacy author"),
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO llm_scores(run_id,candidate_id,rank,score) VALUES(?,?,?,?)",
+            ("legacy-run", candidate_id, 1, 0.9),
+        )
+        con.executemany(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,?)",
+            [
+                ("llm_shadow_enabled", "1", 0),
+                ("llm_provider_key", "sealed legacy credential", 1),
+                ("models_catalog_etag", "legacy-catalog", 0),
+                ("librarr_url", "http://librarr:5050", 0),
+            ],
+        )
+
     initialize()
-    for table in ("llm_scores", "llm_runs", "llm_policies", "llm_connections"):
-        assert row("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)) is None
+    _assert_retired_llm_removed()
+    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} == {
+        version for version, _ in MIGRATIONS
+    }
+    assert row("SELECT value FROM settings WHERE key='librarr_url'")["value"] == "http://librarr:5050"
 
 
 @respx.mock
