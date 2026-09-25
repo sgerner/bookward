@@ -71,6 +71,12 @@ def _author_match_key(value: object) -> str:
     return " ".join(tokens)
 
 
+def book_author_identity_key(value: object) -> str:
+    """Return a normalized author key for bounded catalog lookups."""
+
+    return _author_match_key(value)
+
+
 def _title_match_keys(value: object) -> set[str]:
     """Return the full title and a safe subtitle-free comparison key.
 
@@ -174,6 +180,15 @@ def book_row_identity_match_keys(item) -> set[tuple[str, ...]]:
     keys.update(_isbn_match_keys(item))
     keys.update(_work_match_keys(item))
     return keys
+
+
+def book_openlibrary_work_id(item) -> str:
+    """Return a normalized Open Library work URL when the row has one."""
+
+    for kind, provider, identifier in _work_match_keys(item):
+        if kind == "work" and provider == "openlibrary":
+            return f"/works/{identifier}"
+    return ""
 
 
 def book_identity_match_keys(title: object, author: object) -> set[tuple[str, str]]:

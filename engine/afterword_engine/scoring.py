@@ -6,7 +6,7 @@ import numpy as np
 from .database import rows, transaction
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
-from .identity import book_identity_match_index, book_identity_match_keys
+from .identity import book_identity_match_index, book_row_identity_match_keys
 from .subjects import normalize_subjects
 SCORING_BATCH_SIZE = 256
 
@@ -112,9 +112,11 @@ def _max_cosine_similarities(vectors, references, default):
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
-    all_read_keys = book_identity_match_index(rows("SELECT title,author FROM reads"))
+    all_read_keys = book_identity_match_index(rows("SELECT * FROM reads"))
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
+        "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
         "CASE WHEN q.quality_score>0 THEN q.quality_score "
         "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
@@ -124,7 +126,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     )
     candidates = [
         item for item in candidates
-        if not book_identity_match_keys(item["title"], item["author"]) & all_read_keys
+        if not book_row_identity_match_keys(item) & all_read_keys
     ]
     if not candidates: return 0
     interaction_candidates = rows(

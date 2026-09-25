@@ -410,6 +410,15 @@ MIGRATIONS = [
         END;
         """,
     ),
+    (
+        15,
+        """
+        ALTER TABLE reads ADD COLUMN openlibrary_work_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE reads ADD COLUMN openlibrary_lookup_attempted_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_reads_openlibrary_work_id
+            ON reads(openlibrary_work_id);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
