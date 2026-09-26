@@ -1037,6 +1037,102 @@ def test_api_boots_and_serves_recommendations(database):
         assert rebuild.status_code == 200 and rebuild.json()["job_id"]
 
 
+def test_reading_list_tracks_up_next_reading_and_finished_states(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='saved' WHERE id IN (1,2)")
+
+    with TestClient(app) as client:
+        initial = client.get("/api/reading-list")
+        assert initial.status_code == 200
+        first = next(item for item in initial.json() if item["id"] == 1)
+        assert first["reading_status"] == "saved"
+        assert first["up_next"] == 0
+
+        pinned = client.put("/api/reading-list/1", json={"up_next": True})
+        assert pinned.status_code == 200
+        assert pinned.json()["up_next"] is True
+        assert pinned.json()["status"] == "saved"
+
+        reading = client.put("/api/reading-list/1", json={"status": "reading"})
+        assert reading.status_code == 200
+        assert reading.json()["status"] == "reading"
+        assert reading.json()["up_next"] is False
+        assert reading.json()["started_at"]
+        assert client.put("/api/reading-list/1", json={"up_next": True}).status_code == 409
+
+        invalid_rating = client.put(
+            "/api/reading-list/1", json={"status": "finished", "rating": 6}
+        )
+        assert invalid_rating.status_code == 422
+        finished = client.put(
+            "/api/reading-list/1", json={"status": "finished", "rating": 4}
+        )
+        assert finished.status_code == 200
+        assert finished.json()["status"] == "finished"
+        assert finished.json()["rating"] == 4
+        assert finished.json()["finished_at"]
+
+        item = next(
+            item for item in client.get("/api/reading-list").json() if item["id"] == 1
+        )
+        assert item["reading_status"] == "finished"
+        assert item["reading_rating"] == 4
+        assert row(
+            "SELECT rating,source FROM reads WHERE title=? AND author=?",
+            (item["title"], item["author"]),
+        ) == {"rating": 4.0, "source": "manual"}
+
+        token = client.post(
+            "/api/settings/api-tokens", json={"name": "Reading list client"}
+        ).json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        assert client.get("/api/v1/reading-list").status_code == 401
+        public_list = client.get("/api/v1/reading-list", headers=headers)
+        assert public_list.status_code == 200
+        assert next(item for item in public_list.json() if item["id"] == 1)["reading_rating"] == 4
+        returned = client.put(
+            "/api/v1/reading-list/1", json={"status": "reading"}, headers=headers
+        )
+        assert returned.status_code == 200
+        assert returned.json()["status"] == "reading"
+        unrated = client.put("/api/reading-list/2", json={"status": "finished"})
+        assert unrated.status_code == 200
+        assert unrated.json()["rating"] is None
+
+    assert row("SELECT status,rating,finished_at FROM reading_progress WHERE candidate_id=1") == {
+        "status": "reading",
+        "rating": None,
+        "finished_at": None,
+    }
+
+
+def test_reading_progress_migration_backfills_existing_shortlist(tmp_path):
+    import sqlite3
+
+    settings.db = str(tmp_path / "reading-progress-upgrade.db")
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS[:-1]:
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        for index, status in enumerate(("saved", "imported", "recommended"), start=1):
+            con.execute(
+                "INSERT INTO candidates(title,author,status,normalized_key) VALUES(?,?,?,?)",
+                (f"Legacy {status}", "Reader", status, f"legacy {status} reader"),
+            )
+
+    initialize()
+    assert row(
+        "SELECT COUNT(*) count FROM reading_progress WHERE status='saved' AND up_next=0"
+    )["count"] == 2
+    assert row(
+        "SELECT COUNT(*) count FROM reading_progress WHERE candidate_id=("
+        "SELECT id FROM candidates WHERE status='recommended' AND title='Legacy recommended')"
+    )["count"] == 0
+
+
 def test_recommendations_filter_and_paginate_in_sql(database):
     with transaction() as con:
         con.execute("UPDATE candidates SET status='recommended', score=id")
