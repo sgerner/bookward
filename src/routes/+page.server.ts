@@ -8,6 +8,16 @@ type SourceFilters = {
   exclude_genres: string[];
 };
 
+type BackupStatus = {
+  enabled: boolean;
+  interval_hours: number;
+  retention_count: number;
+  last_success_at: string | null;
+  last_error: string | null;
+  next_backup_at: string | null;
+  backups: Array<{ id: string; created_at: string; size_bytes: number }>;
+};
+
 type Overview = {
   recommendation_run_id?: string;
   recommendations: Array<{
@@ -113,6 +123,21 @@ export const load: PageServerLoad = async ({ url }) => {
       message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
     });
   }
+  const fallbackBackupStatus: BackupStatus = {
+    enabled: false,
+    interval_hours: 0,
+    retention_count: 0,
+    last_success_at: null,
+    last_error: null,
+    next_backup_at: null,
+    backups: [],
+  };
+  let backupStatus = fallbackBackupStatus;
+  try {
+    backupStatus = await engine<BackupStatus>("/api/backups");
+  } catch {
+    // The main Bookward view remains usable while the engine upgrades.
+  }
   const builtIn = overview.sources.find((source) => source.is_default);
   let digestPeriod = url.searchParams.get("digest_period");
   let digestReviewIds: number[] = [];
@@ -151,6 +176,7 @@ export const load: PageServerLoad = async ({ url }) => {
       reading_rating: book.reading_rating ?? null,
     })),
     history: overview.history,
+    backupStatus,
     digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
     sources: overview.sources
       .filter((source) => !source.is_default)
@@ -214,6 +240,34 @@ const optionalFormText = (data: FormData, key: string) => {
   return value || undefined;
 };
 export const actions: Actions = {
+  createBackup: async () => {
+    try {
+      const result = await engine<{ backup: { created_at: string } }>(
+        "/api/backups/create",
+        { method: "POST", body: "{}" },
+        10 * 60_000,
+      );
+      return { message: `Backup created at ${result.backup.created_at}.` };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
+  restoreBackup: async ({ request }) => {
+    const data = await request.formData();
+    const id = z.string().regex(/^bookward-\d{8}T\d{6}Z-[0-9a-f]{8}$/).safeParse(data.get("backupId"));
+    if (!id.success) return fail(400, { message: "Choose a valid backup." });
+    if (formText(data, "confirm") !== "RESTORE")
+      return fail(400, { message: 'Type RESTORE to confirm replacing the current database.' });
+    try {
+      await engine(`/api/backups/${encodeURIComponent(id.data)}/restore`, {
+        method: "POST",
+        body: "{}",
+      }, 10 * 60_000);
+      return { message: "Database restored. A safety backup of the previous database was created first." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
   createApiToken: async ({ request }) => {
     const name = z.string().trim().min(1).max(100).safeParse(
       (await request.formData()).get("name"),

@@ -15,6 +15,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
 from .database import connect, initialize, row, rows, transaction
+from .backups import (
+    BackupError,
+    backup_scheduler_loop,
+    backup_status,
+    create_backup,
+    recover_interrupted_restore,
+    restore_backup,
+)
 from .api_tokens import (
     TOKEN_MAX_LENGTH,
     TOKEN_PREFIX,
@@ -369,8 +377,9 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    recover_interrupted_restore()
     initialize()
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop))
+    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     enqueue_job("metadata", dedupe=True)
@@ -391,7 +400,7 @@ async def lifespan(app):
         enqueue_job("candidate_quality_recovery", dedupe=True)
     enqueue_job("read_work_identities", dedupe=True)
     yield
-    stop.set(); await scheduler; await digest_scheduler; await worker
+    stop.set(); await scheduler; await digest_scheduler; await backup_scheduler; await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
@@ -405,6 +414,28 @@ app.add_middleware(
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key"],
     allow_credentials=False,
 )
+
+
+@app.get("/api/backups")
+def get_backup_status():
+    return backup_status()
+
+
+@app.post("/api/backups/create")
+def make_backup():
+    try:
+        created = create_backup()
+    except BackupError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {"backup": created, "status": backup_status()}
+
+
+@app.post("/api/backups/{backup_id}/restore")
+def restore_database_backup(backup_id: str):
+    try:
+        return restore_backup(backup_id)
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 class SourceFilters(BaseModel):
     include_genres: list[str] = Field(default_factory=list, max_length=12)

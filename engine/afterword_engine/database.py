@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import date, timedelta
@@ -485,18 +486,61 @@ DEFAULT_SOURCES = (
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
 )
 
+DATABASE_LOCK = threading.RLock()
+
+
+class _LockedConnection(sqlite3.Connection):
+    """Hold the process database lock for the lifetime of each connection.
+
+    Backups and restores use this same lock to wait for active requests and
+    keep new ones out while the live database file is being replaced.
+    """
+
+    def __init__(self, *args, **kwargs):
+        DATABASE_LOCK.acquire()
+        self._database_lock_held = True
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            self._database_lock_held = False
+            DATABASE_LOCK.release()
+            raise
+
+    def close(self):
+        held = getattr(self, "_database_lock_held", False)
+        if held:
+            self._database_lock_held = False
+        try:
+            super().close()
+        finally:
+            if held:
+                DATABASE_LOCK.release()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect():
     db_path = Path(settings.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.create_function("book_identity", 2, book_identity, deterministic=True)
-    con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA busy_timeout=5000")
-    _restrict_database_files()
-    return con
+    con = sqlite3.connect(
+        db_path, timeout=10, check_same_thread=False, factory=_LockedConnection
+    )
+    try:
+        con.row_factory = sqlite3.Row
+        con.create_function("book_identity", 2, book_identity, deterministic=True)
+        con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA busy_timeout=5000")
+        _restrict_database_files()
+        return con
+    except Exception:
+        con.close()
+        raise
 
 
 def _restrict_database_files():

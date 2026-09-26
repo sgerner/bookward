@@ -3,6 +3,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AFTERWORD_", extra="ignore")
     db: str = "/data/afterword.db"
+    backup_dir: str = ""
+    backup_interval_hours: int = 24
+    backup_retention_count: int = 7
     embedding_backend: str = "local"
     embedding_model: str = "hashing-768"
     embedding_url: str = "http://ollama:11434"

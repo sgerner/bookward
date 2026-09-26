@@ -70,6 +70,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 - SvelteKit frontend and FastAPI engine run independently, with no external scheduler required.
 - SQLite stores the catalog, feedback, jobs, settings, and delivery history in one persistent volume.
+- Scheduled, WAL-safe database snapshots, manual backups, and an in-app restore flow help recover a self-hosted installation.
 - Integration keys are encrypted in the engine database and are never returned to the browser.
 - Public source fetching rejects private, loopback, link-local, and metadata addresses.
 - Docker images are built in CI and published to GitHub Container Registry from version tags.
@@ -230,6 +231,10 @@ Open <http://127.0.0.1:3000>. Bookward stores SQLite data and the generated encr
 docker compose down
 ~~~
 
+Bookward creates a SQLite online backup every 24 hours and keeps the latest 7 snapshots in the separate `afterword-backups` Docker volume. Each snapshot has a matching generated-key recovery file beside it; both files are owner-only in a private directory. Settings shows the last successful backup, lets you create a snapshot, and can restore a selected snapshot after you type `RESTORE`. Restore makes an extra safety snapshot first. Configure `BACKUP_INTERVAL_HOURS=0` to disable scheduled snapshots; `BACKUP_RETENTION_COUNT` changes how many scheduled or manual snapshots are kept. Set `BACKUP_DIR` only to a directory mounted persistently into the engine container. For disaster recovery, preserve the `afterword-backups` volume separately from `afterword-data`; `docker compose down -v` removes both.
+
+Snapshots include every application table, including encrypted integration credentials. When Bookward generated the Fernet key, the private backup volume keeps a matching `secret.key` recovery file for each snapshot; restoring a snapshot restores its generated key too. If you set `AFTERWORD_SECRET_KEY` yourself, that value is not copied into backups and must be restored from your deployment's secret store. Snapshot and key files never appear in browser responses. Keep both Docker volumes or copy the private backup directory to secure storage outside the host. Keep the engine port private and protect the web app with authentication when exposing it beyond localhost.
+
 The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. To try Ollama locally:
 
 ~~~
@@ -261,6 +266,9 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `EMBEDDING_URL` / `EMBEDDING_API_KEY` | Endpoint and optional key for remote or Ollama providers. |
 | `SOURCE_SYNC_INTERVAL_HOURS` | First-install default for permanent-source polling; the UI can change it later. |
 | `AFTERWORD_SECRET_KEY` | Optional Fernet key; if omitted, Docker generates one in its data volume. |
+| `BACKUP_INTERVAL_HOURS` | Scheduled SQLite snapshot cadence; set `0` to disable. Defaults to 24 hours. |
+| `BACKUP_RETENTION_COUNT` | Number of newest automatic and manual snapshots to retain. Defaults to 7. |
+| `BACKUP_DIR` | Optional backup path inside the engine container; mount it persistently when set. Defaults to `/backups`, on its own `afterword-backups` Docker volume. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.

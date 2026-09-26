@@ -16,6 +16,7 @@
     CircleHelp,
     Compass,
     Copy,
+    Database,
     EllipsisVertical,
     ExternalLink,
     KeyRound,
@@ -662,6 +663,17 @@
           : { month: "short", day: "numeric", year: "numeric" },
     );
     return `${date < today ? "Published" : "Publishes"} ${label}`;
+  }
+
+  function formatBackupTime(value: string | null) {
+    if (!value) return "No successful backup yet";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? "Unknown" : date.toLocaleString();
+  }
+
+  function formatBackupSize(bytes: number) {
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   async function loadMoreDiscover() {
@@ -1961,6 +1973,73 @@
               </h1>
             </section>
             <section class="grid gap-5 lg:grid-cols-2">
+              <section class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2">
+                <div class="mb-5 flex items-start gap-3">
+                  <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"><Database size={19} /></span>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-3">
+                      <h2 class="text-lg font-semibold text-surface-950-50">Backup &amp; recovery</h2>
+                      <span class={`badge ${data.backupStatus.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                        {data.backupStatus.enabled ? `Every ${data.backupStatus.interval_hours} hours` : "Scheduled backups off"}
+                      </span>
+                    </div>
+                    <p class="mt-1 text-sm leading-6 text-surface-700-300">
+                      Last successful backup: <strong class="font-medium text-surface-950-50">{formatBackupTime(data.backupStatus.last_success_at)}</strong>.
+                      {#if data.backupStatus.enabled} Bookward keeps the latest {data.backupStatus.retention_count} snapshots in its private backup volume.{/if}
+                    </p>
+                  </div>
+                </div>
+
+                {#if data.backupStatus.last_error}
+                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
+                {/if}
+
+                <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
+                  Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
+                </p>
+
+                <div class="grid gap-5 lg:grid-cols-2">
+                  <div>
+                    <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
+                      <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
+                        {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
+                      </button>
+                    </form>
+                    <p class="mt-3 text-xs leading-5 text-surface-600-400">The snapshots and key recovery files are stored on the server and can be restored here.</p>
+                    <div class="mt-4 space-y-2">
+                      {#if data.backupStatus.backups.length}
+                        {#each data.backupStatus.backups as backup (backup.id)}
+                          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-surface-200-800 py-2 text-sm last:border-0">
+                            <span class="min-w-0 text-surface-800-200">{formatBackupTime(backup.created_at)} <span class="text-surface-600-400">· {formatBackupSize(backup.size_bytes)}</span></span>
+                          </div>
+                        {/each}
+                      {:else}
+                        <p class="py-2 text-sm text-surface-600-400">No backup files are available yet.</p>
+                      {/if}
+                    </div>
+                  </div>
+
+                  <div class="border border-surface-300-700/50 p-4">
+                    <h3 class="font-semibold text-surface-950-50">Restore a backup</h3>
+                    <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
+                    {#if data.backupStatus.backups.length}
+                      <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
+                        <label class="block text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
+                          {#each data.backupStatus.backups as backup (backup.id)}
+                            <option value={backup.id}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
+                          {/each}
+                        </select></label>
+                        <label class="block text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
+                        <button class="btn min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
+                          {#if isPending("restore-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<RefreshCw size={16} />{/if} Restore selected backup
+                        </button>
+                      </form>
+                    {:else}
+                      <p class="mt-4 text-sm text-surface-600-400">Create a backup before using restore.</p>
+                    {/if}
+                  </div>
+                </div>
+              </section>
               <form
                 in:fly={{
                   y: 12,
