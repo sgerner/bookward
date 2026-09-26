@@ -419,6 +419,27 @@ MIGRATIONS = [
             ON reads(openlibrary_work_id);
         """,
     ),
+    (
+        16,
+        """
+        CREATE TABLE IF NOT EXISTS reading_progress (
+            candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'saved'
+                CHECK(status IN ('saved','reading','finished')),
+            up_next INTEGER NOT NULL DEFAULT 0 CHECK(up_next IN (0,1)),
+            rating INTEGER CHECK(rating IS NULL OR rating BETWEEN 1 AND 5),
+            started_at TEXT,
+            finished_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK(up_next=0 OR status='saved')
+        );
+        CREATE INDEX IF NOT EXISTS idx_reading_progress_shelf
+            ON reading_progress(status,up_next,updated_at DESC);
+        INSERT OR IGNORE INTO reading_progress(candidate_id,status)
+            SELECT id,'saved' FROM candidates WHERE status IN ('saved','imported');
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
