@@ -10,19 +10,32 @@ It is for readers who want recommendations that feel personal without handing th
 
 ## See it in action
 
-These screenshots use Bookward's sanitized offline demo data. A fresh install gets the same small sample so you can explore the product before connecting your own library.
+These screenshots use Bookward's bundled, sanitized demo catalog and default connection settings. A fresh install includes a small sample so you can explore before connecting your own library. The captures use dark mode with the Sahara theme. Desktop images are 1600 × 1000; mobile images use a 390 × 844 CSS pixel viewport and are saved at 2× resolution.
 
-![Bookward's Discover screen showing explainable recommendations with match scores, covers, and Shortlist or Pass actions.](docs/screenshots/discover.png)
+### Desktop
 
-The Discover screen keeps the important question close to every book: *why might this be for me?* Expand a card to see its explanation, source, genres, and release date.
+![Bookward's Discover screen in dark Sahara mode, with ranked books, covers, metadata, an expanded recommendation explanation, and shortlist or pass actions.](docs/screenshots/discover.png)
 
-![Bookward's Sources screen showing built-in feeds, permanent source controls, refresh cadence, and the Add a source form.](docs/screenshots/sources.png)
+![Bookward's Sources screen in dark Sahara mode, showing the bundled demo list, public feeds, refresh cadence, source controls, and add-source form.](docs/screenshots/sources.png)
 
-Choose which feeds shape your recommendations. Keep a source fresh on a schedule, or import a one-time list and leave it in your discovery pool without polling it again.
+![Bookward's Settings screen in dark Sahara mode, showing Goodreads import, Librarr, and the local embedding provider.](docs/screenshots/settings.png)
 
-![Bookward's Settings screen showing Goodreads import, Librarr connection, and the local embedding provider.](docs/screenshots/settings.png)
+### Mobile
 
-Bring in your reading history, choose an embedding provider, connect Librarr if you use it, and optionally turn on a weekly digest.
+<table>
+  <thead>
+    <tr><th scope="col">Discover</th><th scope="col">Sources</th><th scope="col">Settings</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="docs/screenshots/discover-mobile.png"><img src="docs/screenshots/discover-mobile.png" alt="Bookward's Discover page on a mobile viewport, showing ranked book cards and the bottom navigation." width="220"></a></td>
+      <td><a href="docs/screenshots/sources-mobile.png"><img src="docs/screenshots/sources-mobile.png" alt="Bookward's Sources page on a mobile viewport, showing the source list and filters." width="220"></a></td>
+      <td><a href="docs/screenshots/settings-mobile.png"><img src="docs/screenshots/settings-mobile.png" alt="Bookward's Settings page on a mobile viewport, showing Goodreads import and connection settings." width="220"></a></td>
+    </tr>
+  </tbody>
+</table>
+
+Choose the feeds that shape your recommendations. A permanent source can refresh on a schedule; a one-time import stays in your discovery pool without being polled again. Settings is where you import reading history, choose an embedding provider, connect Librarr, and optionally configure a weekly digest.
 
 ## Why Bookward?
 
@@ -39,7 +52,7 @@ Bring in your reading history, choose an embedding provider, connect Librarr if 
 
 - Import a complete Goodreads CSV export, including ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
-- Combine reading history with author, genre, and semantic similarity signals.
+- Combine reading history with author, subject, and text-similarity signals.
 - Review recommendations in Discover, then shortlist, pass, or restore them.
 - Search Librarr from a recommendation and add a matching ebook or audiobook directly.
 - Choose the visual theme and appearance mode that work best for you.
@@ -92,7 +105,30 @@ The engine also publishes the complete interactive OpenAPI schema at `/openapi.j
 
 Keep the engine port private; the versioned web proxy is the intended external API boundary. API tokens currently grant the full v1 API and do not expire, so revoke them promptly if they are compromised.
 
-## How it works
+## How recommendations work
+
+Bookward ranks books that it can find through your enabled sources; it does not invent titles or search every book in print. The ranking process is:
+
+1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads CSV and RSS imports describe what you have read and how you rated it.
+2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
+3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. These representations are cached and refreshed when the source text changes.
+4. **Rank likely matches.** Books that resemble highly rated reads move up; close matches to low-rated books move down. Ratings for the same author, reading dates, and the weight of a source also contribute. The engine gives less weight to a candidate when its catalog details are sparse.
+5. **Learn from clear choices.** Shortlisting or passing on a book, and some reads linked back to a recommendation, can refine later rankings when there is enough consistent evidence. Simply seeing a book or opening its details is not counted as a dislike.
+6. **Show the strongest reasons.** Each card can point to a similar rated book, an author pattern, its source, or missing catalog details. These notes summarize useful evidence; they are not a line-by-line account of every scoring factor.
+
+The displayed score is a 0–100 ranking signal, not a percentage chance that you will enjoy the book. It helps order the current candidate pool.
+
+### Limitations
+
+- **The source list sets the boundaries.** A book outside your enabled feeds and imports is not available to rank. Incomplete or quiet sources can make the pool small or repetitive.
+- **Book details can be sparse or wrong.** Public catalogs do not always have reliable summaries, subjects, dates, or edition matches. Sparse details reduce the influence of text similarity, but the engine cannot fill in information that is missing.
+- **Reading history only tells part of the story.** Ratings and titles do not explain why you liked a book, what mood you were in, or what you want to read next. The default local text matcher is simple; richer embedding models still depend on accurate book text.
+- **Personalization needs feedback.** A small number of ratings or shortlist/pass actions may not reveal a stable preference. An unseen or unrated book is not treated as a negative signal.
+- **The score is a heuristic.** Scores are designed to rank the available books, not to promise enjoyment or make an objective quality judgment. Explanations can also be brief when there is little evidence.
+
+The default hashing provider runs on the Bookward engine host. If you choose a remote embedding endpoint, the book text used to create embeddings is sent to that endpoint for processing.
+
+## How the app fits together
 
 ~~~
 Goodreads CSV / RSS + trusted public lists
