@@ -42,6 +42,7 @@ type Overview = {
     finished_at?: string | null;
     reading_updated_at?: string | null;
   }>;
+  decisions?: Overview["recommendations"];
   history: Array<{
     id: number;
     title: string;
@@ -174,6 +175,23 @@ export const load: PageServerLoad = async ({ url }) => {
         (["saved", "imported"].includes(book.status) ? "saved" : null),
       up_next: book.up_next ?? 0,
       reading_rating: book.reading_rating ?? null,
+    })),
+    decisions: (overview.decisions ?? []).map((book) => ({
+      ...book,
+      cover_url: publicUrl(book.cover_url),
+      source_url: publicUrl(book.source_url),
+      published_on: book.release_date,
+      published_kind: book.date_kind,
+      synopsis: book.description,
+      reason: book.explanation.join(" · "),
+      source_type: "engine",
+      librar_id: book.status === "imported" ? "imported" : null,
+      reading_status: book.reading_status ?? null,
+      up_next: book.up_next ?? 0,
+      reading_rating: book.reading_rating ?? null,
+      started_at: book.started_at ?? null,
+      finished_at: book.finished_at ?? null,
+      reading_updated_at: book.reading_updated_at ?? null,
     })),
     history: overview.history,
     backupStatus,
@@ -310,28 +328,61 @@ export const actions: Actions = {
       .catch("")
       .parse(data.get("run_id"));
     const status = z
-      .enum(["saved", "rejected", "recommended"])
+      .enum(["saved", "rejected", "maybe_later", "recommended"])
       .safeParse(data.get("status"));
     if (!id.success || !status.success)
       return fail(400, { message: "Invalid recommendation." });
     const action = {
       saved: "save",
       rejected: "reject",
+      maybe_later: "maybe_later",
       recommended: "restore",
     }[status.data];
     try {
-      await engine(`/api/recommendations/${id.data}/feedback`, {
+      const result = await engine<{ decision_id?: number }>(
+        `/api/recommendations/${id.data}/feedback`, {
         method: "POST",
         body: JSON.stringify({ action, ...(runId ? { run_id: runId } : {}) }),
       });
+      const messages = {
+        saved: "Saved to your shortlist.",
+        rejected: "Passed on this recommendation.",
+        maybe_later: "Set aside for later.",
+        recommended: "Returned to Discover.",
+      };
       return {
-        message:
-          status.data === "saved"
-            ? "Saved to your shortlist."
-            : "Recommendation updated.",
+        message: messages[status.data],
+        ...(result.decision_id
+          ? {
+              undo_id: result.decision_id,
+              id: id.data,
+              undo_label: {
+                saved: "shortlisting this book",
+                rejected: "passing on this book",
+                maybe_later: "setting this book aside",
+                recommended: "restoring this book",
+              }[status.data],
+            }
+          : {}),
       };
     } catch (error) {
       return fail(502, { message: message(error) });
+    }
+  },
+  undoDecision: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const decisionId = idSchema.safeParse(data.get("decision_id"));
+    if (!id.success || !decisionId.success)
+      return fail(400, { message: "This decision can no longer be undone." });
+    try {
+      await engine(`/api/recommendations/${id.data}/undo`, {
+        method: "POST",
+        body: JSON.stringify({ decision_id: decisionId.data }),
+      });
+      return { message: "Decision undone." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
     }
   },
   markRead: async ({ request }) => {

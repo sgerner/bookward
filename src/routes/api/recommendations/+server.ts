@@ -5,7 +5,15 @@ import { toPageBook, type Recommendation } from "$lib/server/recommendations";
 import { z } from "zod";
 
 const querySchema = z.object({
-  status: z.enum(["recommended", "saved", "imported", "all"]).default("recommended"),
+  status: z.enum([
+    "recommended",
+    "saved",
+    "imported",
+    "all",
+    "decisions",
+    "rejected",
+    "maybe_later",
+  ]).default("recommended"),
   limit: z.coerce.number().int().min(1).max(24).default(8),
   offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
 });

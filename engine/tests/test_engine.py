@@ -1114,7 +1114,10 @@ def test_reading_progress_migration_backfills_existing_shortlist(tmp_path):
         con.execute(
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
-        for version, script in MIGRATIONS[:-1]:
+        # Leave both the reading-progress backfill and the next migration
+        # pending so legacy shortlist rows exist before reading_progress is
+        # created and populated.
+        for version, script in MIGRATIONS[:-2]:
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
         for index, status in enumerate(("saved", "imported", "recommended"), start=1):

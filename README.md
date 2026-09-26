@@ -53,7 +53,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 - Import a complete Goodreads CSV export, including ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
-- Review recommendations in Discover, then shortlist, pass, or restore them. Move saved books through Saved, Reading, and Finished, with an optional rating when you finish.
+- Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Move saved books through Saved, Reading, and Finished, with an optional rating when you finish.
 - Pin a saved book as Up next to keep it at the front of your shortlist.
 - Search Librarr from a recommendation and add a matching ebook or audiobook directly.
 - Choose the visual theme and appearance mode that work best for you.
@@ -97,8 +97,9 @@ curl https://your-bookward-host.example/api/v1/recommendations \
 The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
 
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
-- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|all`, cap with `limit`, and page with `offset`.
-- `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, or `restore`.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
+- `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, `maybe_later`, or `restore`. Only `reject` is a negative learning signal; `maybe_later` is neutral.
+- `POST /api/v1/recommendations/{id}/undo` — send `{"decision_id":123}` from a recent feedback response to undo the latest choice.
 - `GET /api/v1/reading-list` — list shortlisted books with their `reading_status`, `up_next`, rating, and timestamps.
 - `PUT /api/v1/reading-list/{id}` — set `{"status":"reading"}`, `{"status":"finished","rating":5}`, `{"status":"saved"}`, or `{"up_next":true}`.
 - `GET /api/v1/sources` — list configured sources.
@@ -117,7 +118,7 @@ Bookward ranks books that it can find through your enabled sources; it does not 
 2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
 3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. These representations are cached and refreshed when the source text changes.
 4. **Rank likely matches.** Books that resemble highly rated reads move up; close matches to low-rated books move down. Ratings for the same author, reading dates, and the weight of a source also contribute. The engine gives less weight to a candidate when its catalog details are sparse.
-5. **Learn from clear choices.** Shortlisting or passing on a book, and some reads linked back to a recommendation, can refine later rankings when there is enough consistent evidence. Simply seeing a book or opening its details is not counted as a dislike.
+5. **Learn from clear choices.** Shortlisting or explicitly passing on a book, and some reads linked back to a recommendation, can refine later rankings when there is enough consistent evidence. Maybe later is neutral and does not count as a rejection. Simply seeing a book or opening its details is not counted as a dislike.
 6. **Show the strongest reasons.** Each card can point to a similar rated book, an author pattern, its source, or missing catalog details. These notes summarize useful evidence; they are not a line-by-line account of every scoring factor.
 
 The displayed score is a 0–100 ranking signal, not a percentage chance that you will enjoy the book. It helps order the current candidate pool.

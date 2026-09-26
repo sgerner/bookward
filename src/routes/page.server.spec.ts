@@ -39,6 +39,24 @@ describe("page actions", () => {
         JSON.stringify({
           recommendation_run_id: "run-1234",
           recommendations: [],
+          decisions: [
+            {
+              id: 9,
+              title: "Deferred book",
+              author: "A Writer",
+              description: "A description",
+              cover_url: "https://covers.example/deferred.jpg",
+              source_url: "https://books.example/deferred",
+              release_date: null,
+              date_kind: "unknown",
+              genres: ["Fantasy"],
+              score: 81,
+              metadata_confidence: 0.8,
+              explanation: ["A good match"],
+              status: "maybe_later",
+              source_name: "A source",
+            },
+          ],
           history: [],
           sources: [],
           settings: {
@@ -58,8 +76,18 @@ describe("page actions", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = (await load({
       url: new URL("http://afterword.test/"),
-    } as never)) as { recommendation_run_id: string };
+    } as never)) as {
+      recommendation_run_id: string;
+      decisions: Array<{ id: number; status: string; reason: string }>;
+    };
     expect(result.recommendation_run_id).toBe("run-1234");
+    expect(result.decisions).toEqual([
+      expect.objectContaining({
+        id: 9,
+        status: "maybe_later",
+        reason: "A good match",
+      }),
+    ]);
     expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
   });
@@ -253,6 +281,57 @@ describe("page actions", () => {
       action: "save",
       run_id: "run-1234",
     });
+  });
+
+  it("sends Maybe later as a neutral decision and exposes its undo token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, status: "maybe_later", decision_id: 55 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "maybe_later");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Set aside for later.",
+      undo_id: 55,
+      id: 9,
+      undo_label: "setting this book aside",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "maybe_later",
+    });
+  });
+
+  it("forwards an Undo request with the server-issued decision ID", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, status: "recommended" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("decision_id", "55");
+    const result = await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Decision undone." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/9/undo",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ decision_id: 55 }),
+      }),
+    );
   });
 
   it("does not save a custom source when preview finds no books", async () => {

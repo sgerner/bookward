@@ -29,6 +29,7 @@ EVENT_TYPES = {
     "librarr_import",
     "save",
     "reject",
+    "maybe_later",
     "restore",
     "read",
 }
