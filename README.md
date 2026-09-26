@@ -42,7 +42,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 - **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads credentials. The default Docker binding is localhost.
 - **Recommendations are explainable.** Each book includes a match score, source, and plain-language reasons instead of an unexplained ranking.
 - **You control the inputs.** Import your Goodreads history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
-- **Discovery can become action.** Shortlist the books you want to remember, pass on the rest, and optionally add a title to a Librarr ebook or audiobook waitlist.
+- **Discovery can become a reading habit.** Shortlist books, pin a few as Up next, track what you are Reading, and mark books Finished with an optional rating. You can also add a title to a Librarr ebook or audiobook waitlist.
 - **Automation is optional and gentle.** Scheduled source refreshes and weekly Discord or email digests are off until you choose them. Delivery is recorded and retryable.
 - **It is comfortable to use.** The responsive interface includes keyboard-friendly controls, a skip-to-content link, accessible labels, light/dark/system modes, and reduced-motion support.
 
@@ -53,7 +53,8 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 - Import a complete Goodreads CSV export, including ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
-- Review recommendations in Discover, then shortlist, pass, or restore them.
+- Review recommendations in Discover, then shortlist, pass, or restore them. Move saved books through Saved, Reading, and Finished, with an optional rating when you finish.
+- Pin a saved book as Up next to keep it at the front of your shortlist.
 - Search Librarr from a recommendation and add a matching ebook or audiobook directly.
 - Choose the visual theme and appearance mode that work best for you.
 
@@ -77,7 +78,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 Bookward exposes a versioned API for automations and other applications. Open Settings → API access, name a token, and select **Generate token**. The full token is displayed only once; store it in the calling application and revoke it from the same screen if it is no longer needed.
 
-When upgrading an existing install, restart the engine once so the token-table migration is applied before generating a token.
+When upgrading an existing install, restart the engine once so pending SQLite migrations are applied. Existing saved and Librarr-imported books remain on your shortlist and start in the Saved shelf.
 
 The public base URL is:
 
@@ -97,6 +98,8 @@ The v1 API supports recommendations and feedback, source listing and management,
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
 - `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|all`, cap with `limit`, and page with `offset`.
 - `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, or `restore`.
+- `GET /api/v1/reading-list` — list shortlisted books with their `reading_status`, `up_next`, rating, and timestamps.
+- `PUT /api/v1/reading-list/{id}` — set `{"status":"reading"}`, `{"status":"finished","rating":5}`, `{"status":"saved"}`, or `{"up_next":true}`.
 - `GET /api/v1/sources` — list configured sources.
 - `POST /api/v1/sync` — queue a source refresh and return a job ID.
 - `GET /api/v1/jobs/{id}` — check a background job.
@@ -147,7 +150,7 @@ Goodreads CSV / RSS + trusted public lists
      (optional)           weekly digest
 ~~~
 
-Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, and digest scheduling.
+Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, digest scheduling, and the SQLite reading list. See [the reading workflow guide](docs/reading-workflow.md) for state transitions and API examples.
 
 ## Quick start for development
 

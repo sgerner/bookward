@@ -54,6 +54,7 @@
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
+  type ShelfFilter = "all" | "up_next" | "saved" | "reading" | "finished";
   type LibrarrResult = Record<string, unknown>;
   type OptimisticChange = {
     commit?: () => void;
@@ -82,6 +83,7 @@
   let previousDataBooks: PageBook[] | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
+  let shelfFilter = $state<ShelfFilter>("all");
   let librarrSearchOpen = $state(false);
   let librarrSearchBook = $state<{
     id: number;
@@ -174,8 +176,17 @@
         ["saved", "imported"].includes(book.status) && matchesBookFilter(book),
     ),
   );
+  const shortlistBooks = $derived(
+    savedBooks.filter((book) => {
+      const state = book.reading_status ?? "saved";
+      if (shelfFilter === "all") return true;
+      if (shelfFilter === "up_next") return state === "saved" && Boolean(book.up_next);
+      if (shelfFilter === "saved") return state === "saved" && !book.up_next;
+      return state === shelfFilter;
+    }),
+  );
   const filteredBooks = $derived(
-    activeView === "saved" ? savedBooks : discoverBooks,
+    activeView === "saved" ? shortlistBooks : discoverBooks,
   );
   const visibleBooks = $derived(
     activeView === "discover"
@@ -232,6 +243,18 @@
   const savedCount = $derived(
     allBooks.filter((book) => ["saved", "imported"].includes(book.status))
       .length,
+  );
+  const upNextCount = $derived(
+    savedBooks.filter((book) => Boolean(book.up_next) && book.reading_status !== "reading" && book.reading_status !== "finished").length,
+  );
+  const savedShelfCount = $derived(
+    savedBooks.filter((book) => (book.reading_status ?? "saved") === "saved" && !book.up_next).length,
+  );
+  const readingCount = $derived(
+    savedBooks.filter((book) => book.reading_status === "reading").length,
+  );
+  const finishedCount = $derived(
+    savedBooks.filter((book) => book.reading_status === "finished").length,
   );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
@@ -1295,7 +1318,7 @@
 
       {#snippet recommendationView(view: "discover" | "saved")}
 
-        {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : savedBooks}
+        {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : shortlistBooks}
         {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-10 px-1 sm:px-0">
@@ -1303,6 +1326,17 @@
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : "Your shortlist."}</h1>
         </section>
+        {#if view === "saved"}
+          <section class="mb-6" aria-label="Shortlist shelves">
+            <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
+              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "all"} onclick={() => (shelfFilter = "all")}>All <span class="badge badge-sm preset-tonal-surface">{savedBooks.length}</span></button>
+              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "up_next" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "up_next"} onclick={() => (shelfFilter = "up_next")}>Up next <span class="badge badge-sm preset-tonal-surface">{upNextCount}</span></button>
+              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "saved" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "saved"} onclick={() => (shelfFilter = "saved")}>Saved <span class="badge badge-sm preset-tonal-surface">{savedShelfCount}</span></button>
+              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "reading" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "reading"} onclick={() => (shelfFilter = "reading")}>Reading <span class="badge badge-sm preset-tonal-surface">{readingCount}</span></button>
+              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "finished" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "finished"} onclick={() => (shelfFilter = "finished")}>Finished <span class="badge badge-sm preset-tonal-surface">{finishedCount}</span></button>
+            </div>
+          </section>
+        {/if}
         {#if view === "discover" && digestVisible}
           <section
             in:fade={{ duration: motionDuration(260) }}
@@ -1335,6 +1369,7 @@
         <section class="grid gap-3 sm:gap-4 lg:grid-cols-2" aria-live="polite">
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
+            {@const shelfStatus = book.reading_status ?? "saved"}
             <article
               use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
@@ -1390,6 +1425,10 @@
                 <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
+                  {#if view === "saved"}
+                    <span class="badge badge-sm preset-tonal-primary">{shelfStatus === "reading" ? "Reading" : shelfStatus === "finished" ? "Finished" : book.up_next ? "Up next" : "Saved"}</span>
+                    {#if shelfStatus === "finished" && book.reading_rating}<span class="badge badge-sm preset-tonal-secondary" aria-label={`Your rating: ${book.reading_rating} ${book.reading_rating === 1 ? "star" : "stars"}`}>{book.reading_rating} ★</span>{/if}
+                  {/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
                   {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
@@ -1465,14 +1504,56 @@
                         </form>
                       </div>
                     </details>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                      <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
-                    </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                    </form>
+                    {#if book.status === "saved"}
+                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
+                      </form>
+                    {:else}
+                      <span class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>
+                    {/if}
+                    {#if shelfStatus === "saved"}
+                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-up-next`)}>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="up_next" value={book.up_next ? "false" : "true"} />
+                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-secondary" disabled={isPending(`progress-${book.id}-up-next`)} aria-busy={isPending(`progress-${book.id}-up-next`)}>{#if isPending(`progress-${book.id}-up-next`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} {book.up_next ? "Remove Up next" : "Up next"}</button>
+                      </form>
+                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-reading`)}>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="reading" />
+                        <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`progress-${book.id}-reading`)} aria-busy={isPending(`progress-${book.id}-reading`)}>{#if isPending(`progress-${book.id}-reading`)}<RefreshCw size={15} class="animate-spin" />{:else}<BookOpen size={15} />{/if} Start reading</button>
+                      </form>
+                    {:else if shelfStatus === "reading"}
+                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-saved`)}>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" />
+                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" disabled={isPending(`progress-${book.id}-saved`)} aria-busy={isPending(`progress-${book.id}-saved`)}>{#if isPending(`progress-${book.id}-saved`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Move to Saved</button>
+                      </form>
+                    {:else}
+                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-reading`)}>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="reading" />
+                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-secondary" disabled={isPending(`progress-${book.id}-reading`)} aria-busy={isPending(`progress-${book.id}-reading`)}>{#if isPending(`progress-${book.id}-reading`)}<RefreshCw size={15} class="animate-spin" />{:else}<BookOpen size={15} />{/if} Move to Reading</button>
+                      </form>
+                    {/if}
+                    {#if shelfStatus !== "finished"}
+                      <details class="min-w-0">
+                        <summary class="btn btn-sm min-h-10 list-none preset-tonal-primary [&::-webkit-details-marker]:hidden"><Check size={15} /> Finish book</summary>
+                        <form class="mt-2 flex flex-wrap items-end gap-2" method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-finished`)}>
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="finished" />
+                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`finish-rating-${book.id}`}>
+                            Rating <span class="sr-only">for {book.title}, optional</span>
+                            <select id={`finish-rating-${book.id}`} name="rating" class="select select-sm min-h-10 preset-tonal-surface">
+                              <option value="" selected={!book.reading_rating}>No rating</option>
+                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating} selected={book.reading_rating === rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
+                            </select>
+                          </label>
+                          <button type="submit" class="btn btn-sm min-h-10 preset-tonal-primary" disabled={isPending(`progress-${book.id}-finished`)} aria-busy={isPending(`progress-${book.id}-finished`)}>{#if isPending(`progress-${book.id}-finished`)}<RefreshCw size={15} class="animate-spin" />{:else}<Check size={15} />{/if} Mark Finished</button>
+                        </form>
+                      </details>
+                    {/if}
+                    {#if book.status === "saved"}
+                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                      </form>
+                    {/if}
                   {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
                 </div>
               </div>

@@ -106,6 +106,59 @@ describe("page actions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("saves shortlist reading transitions and optional completion ratings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "finished" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const finished = new FormData();
+    finished.set("id", "42");
+    finished.set("status", "finished");
+    finished.set("rating", "5");
+    await actions.readingProgress!({
+      request: new Request("http://afterword.test", { method: "POST", body: finished }),
+    } as never);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:8000/api/reading-list/42",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ status: "finished", rating: 5 }),
+      }),
+    );
+
+    const pinned = new FormData();
+    pinned.set("id", "42");
+    pinned.set("up_next", "true");
+    await actions.readingProgress!({
+      request: new Request("http://afterword.test", { method: "POST", body: pinned }),
+    } as never);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:8000/api/reading-list/42",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ up_next: true }),
+      }),
+    );
+  });
+
+  it("rejects invalid shortlist transitions locally", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "42");
+    body.set("status", "finished");
+    body.set("rating", "6");
+    const result = await actions.readingProgress!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toMatchObject({ status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("creates and revokes API tokens through the engine actions", async () => {
     const fetchMock = vi
       .fn()
