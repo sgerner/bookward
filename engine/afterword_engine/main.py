@@ -74,6 +74,10 @@ from .interaction_personalization import (
     load_cached_candidate_vectors,
     personalize_recommendations,
 )
+from .discovery_slate import (
+    diversify_discovery_slate,
+    empty_diagnostics as empty_discovery_slate_diagnostics,
+)
 from .associations import run_association_provider
 from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
@@ -612,6 +616,7 @@ def tracked_recommendations(
     connection=None,
     recommended_limit: int | None = None,
 ):
+    discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata = {
         "mode": "confidence_gated_live",
         "scope": "installation",
@@ -648,6 +653,20 @@ def tracked_recommendations(
                 candidate_vectors=cached_vectors,
             )
             learning_metadata.update(diagnostics)
+            recommended = [
+                item for item in ranked if item.get("status") == "recommended"
+            ]
+            if recommended:
+                diversified, discovery_metadata = diversify_discovery_slate(
+                    recommended, cached_vectors
+                )
+                ranked = diversified + [
+                    item for item in ranked if item.get("status") != "recommended"
+                ]
+            else:
+                discovery_metadata = empty_discovery_slate_diagnostics(
+                    "no_recommended_candidates"
+                )
             if recommended_limit is not None and status is None and offset == 0:
                 recommended = [item for item in ranked if item.get("status") == "recommended"]
                 remaining = [
@@ -683,6 +702,9 @@ def tracked_recommendations(
                 "adjusted_candidates": 0,
                 "max_score_adjustment": 0.0,
             }
+            discovery_metadata = empty_discovery_slate_diagnostics(
+                "base_ranker_fallback"
+            )
     else:
         recommendations = recommendation_list(
             connection,
@@ -705,6 +727,7 @@ def tracked_recommendations(
         status=status,
         limit=limit,
         ranking_metadata=learning_metadata,
+        discovery_slate_metadata=discovery_metadata,
     )
     return recommendations, run_id
 

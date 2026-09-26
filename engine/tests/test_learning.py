@@ -37,7 +37,7 @@ def test_recommendation_responses_create_ranked_run_and_impressions(database):
         (run_id,),
     )
     assert run["policy"] == "rating-neighborhood"
-    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-v2"
+    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-slate-v1"
     assert run["candidate_count"] == len(recommendations)
     assert impressions["count"] == len(recommendations)
     assert row(
@@ -136,7 +136,7 @@ def test_confident_existing_actions_reorder_live_results_before_page_limit(datab
     assert recommendations[0]["score"] > recommendations[1]["score"]
     run = row("SELECT policy_version,metadata FROM recommendation_runs WHERE id=?", (run_id,))
     metadata = json.loads(run["metadata"])["interaction_learning"]
-    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-v2"
+    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-slate-v1"
     assert metadata["mode"] == "confidence_gated_live"
     assert metadata["applied"] is True
     assert metadata["observed_books"] == 12
