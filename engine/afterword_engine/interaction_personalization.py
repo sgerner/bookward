@@ -56,36 +56,16 @@ _NONINFORMATIVE_SUBJECTS = {
 def load_interaction_events(
     connection=None,
     *,
-    session_id: str | None = None,
     limit: int = MAX_INTERACTION_EVENTS,
 ):
-    """Load recent actions, scoped to the browser session when one is known.
+    """Load recent actions and feedback across the whole installation.
 
-    Older feedback rows without a recommendation run cannot be assigned to a
-    particular reader. They remain usable for legacy, installation-wide API
-    requests, but are excluded from a session-scoped profile.
+    Recommendation runs retain their historical session identifiers for
+    telemetry, but a self-hosted Bookward installation has one shared learner
+    profile across browsers and devices.
     """
-
-    event_scope = ""
-    legacy_feedback_scope = ""
     values: tuple[Any, ...] = (max(1, min(MAX_INTERACTION_EVENTS, int(limit))),)
-    if session_id:
-        event_scope = """
-            AND (
-                EXISTS (
-                    SELECT 1 FROM recommendation_runs r
-                    WHERE r.id=e.run_id AND r.session_id=?
-                )
-                OR CASE
-                    WHEN json_valid(e.metadata)
-                    THEN json_extract(e.metadata,'$.session_id')=?
-                    ELSE 0
-                END
-            )
-        """
-        legacy_feedback_scope = "AND 0"
-        values = (session_id, session_id, *values)
-    query = f"""
+    query = """
         SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,metadata
         FROM (
             SELECT e.id,e.candidate_id,e.event_type,e.value,e.occurred_at,
@@ -93,7 +73,6 @@ def load_interaction_events(
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
             WHERE e.event_type IN ('save','reject','restore','read','librarr_import')
-              {event_scope}
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
@@ -101,7 +80,6 @@ def load_interaction_events(
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
             WHERE f.action IN ('save','reject','restore')
-              {legacy_feedback_scope}
               AND NOT EXISTS (
                   SELECT 1 FROM recommendation_events e
                   WHERE e.event_key='feedback:' || f.id

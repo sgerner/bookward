@@ -14,7 +14,7 @@ import { GET } from "./recommendations/+server";
 afterEach(() => vi.clearAllMocks());
 
 describe("recommendations endpoint", () => {
-  it("forwards the requested page and maps the response for the browser", async () => {
+  it("loads the requested page without a device cookie and maps the response for the browser", async () => {
     engineMock.mockResolvedValue([
       {
         id: 7,
@@ -37,13 +37,11 @@ describe("recommendations endpoint", () => {
       url: new URL(
         "http://bookward.test/api/recommendations?status=recommended&limit=2&offset=4",
       ),
-      cookies: { get: vi.fn().mockReturnValue("session-1234") },
     } as never);
 
     expect(response.status).toBe(200);
     expect(engineMock).toHaveBeenCalledWith(
       "/api/recommendations?status=recommended&limit=2&offset=4",
-      { headers: { "x-bookward-session": "session-1234" } },
     );
     expect(await response.json()).toEqual({
       items: [
@@ -62,7 +60,6 @@ describe("recommendations endpoint", () => {
   it("rejects oversized browser pages before contacting the engine", async () => {
     const response = await GET({
       url: new URL("http://bookward.test/api/recommendations?limit=25"),
-      cookies: { get: vi.fn() },
     } as never);
 
     expect(response.status).toBe(400);

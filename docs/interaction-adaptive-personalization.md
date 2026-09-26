@@ -9,12 +9,12 @@ When evidence is uncertain, the existing neighborhood ranker is served as-is.
 When the confidence gate passes, a bounded adjustment is applied to that same
 ranker before pagination.
 
-The web app already creates a persistent, opaque browser session cookie. Runs
-and their actions use that session to keep one browser's learned profile separate
-from another's. Requests without a session retain the legacy installation-wide
-behavior because they cannot identify an individual reader. Legacy feedback
-rows that lack a recommendation run cannot safely be assigned to a browser, so
-they are used only by those installation-wide requests.
+Bookward is designed for one reader per self-hosted installation, so every
+browser and device shares the same learned profile. The engine aggregates all
+eligible actions in its local database, including actions attached to older
+browser sessions and legacy feedback rows. Recommendation requests do not need
+a device cookie or session header for personalization. Historical run session
+identifiers remain telemetry only; they do not split the learning data.
 
 ## Existing interaction signals
 
@@ -43,10 +43,11 @@ uses a two-year half-life.
 
 ## Learning and serving rules
 
-The engine combines two kinds of evidence:
+The engine combines two kinds of evidence across the installation's action
+history:
 
 1. **Explicit metadata preferences.** It compares save/positive-rating rates
-   for an author's books or normalized subjects against the reader's other
+   for an author's books or normalized subjects against the installation's other
    interacted books. Both sides need at least six effective distinct books and
    4.5 total reliability/recency weight. The feature is used only when the two
    95% Wilson intervals do not overlap.
@@ -102,8 +103,10 @@ without degrading low-rating outcomes.
 
 Automated checks cover exact and semantic preference effects, low/high rating
 signals, evidence thresholds, neutral corrections, recency decay, metadata
-confidence, session isolation, pre-pagination reordering, legacy feedback
-deduplication, and refreshing vectors for interacted candidates.
+confidence, aggregation across historical browser sessions, pre-pagination
+reordering, legacy feedback deduplication, and refreshing vectors for
+interacted candidates. Web checks also confirm that recommendation and read
+requests work without creating or forwarding a device cookie.
 
 A read-only snapshot of the production event history found 75 distinct labeled
 actions and no exact author/subject effect above the confidence gate. The
