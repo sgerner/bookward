@@ -1,6 +1,7 @@
 node_modules
 .env
 data/*.db*
+data/backups/
 *.db-shm
 *.db-wal
 **/__pycache__/

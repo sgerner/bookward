@@ -26,8 +26,11 @@ services:
       AFTERWORD_SOURCE_SYNC_INTERVAL_HOURS: ${SOURCE_SYNC_INTERVAL_HOURS:-24}
       AFTERWORD_PUBLIC_URL: ${AFTERWORD_PUBLIC_URL:-http://127.0.0.1:3000}
       AFTERWORD_SECRET_KEY: ${AFTERWORD_SECRET_KEY:-}
+      AFTERWORD_BACKUP_DIR: ${BACKUP_DIR:-/backups}
+      AFTERWORD_BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      AFTERWORD_BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT:-7}
       AFTERWORD_LIBRARR_ALLOWED_HOSTS: ${LIBRARR_ALLOWED_HOSTS:-librarr}
-    volumes: ["afterword-data:/data"]
+    volumes: ["afterword-data:/data", "afterword-backups:/backups"]
     expose: ["8000"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: ["books"]
@@ -42,6 +45,7 @@ services:
 
 volumes:
   afterword-data:
+  afterword-backups:
   ollama-models:
 
 networks:
