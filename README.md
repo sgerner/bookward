@@ -154,6 +154,8 @@ Goodreads CSV / RSS + trusted public lists
 
 Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, digest scheduling, and the SQLite reading list. See [the reading workflow guide](docs/reading-workflow.md) for state transitions and API examples.
 
+The first eight discovery recommendations use a bounded anti-redundancy pass to reduce third-author repeats and near-duplicate books; see [the discovery slate policy](docs/discovery-slate-diversity.md) for its limits and telemetry.
+
 ## Quick start for development
 
 ### Prerequisites
