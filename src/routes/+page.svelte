@@ -13,6 +13,7 @@
     Bookmark,
     Check,
     ChevronDown,
+    Clock,
     CircleHelp,
     Compass,
     Copy,
@@ -30,6 +31,7 @@
     Send,
     Settings2,
     Sparkles,
+    ThumbsDown,
     TriangleAlert,
     Trash2,
     Upload,
@@ -1547,25 +1549,25 @@
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<History size={15} />{/if} Maybe later</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
-                    <details
-                      class="relative z-50 ml-auto shrink-0"
-                      ontoggle={(event) => {
-                        const menu = event.currentTarget as HTMLDetailsElement;
-                        if (menu.open) openReadMenuId = book.id;
-                        else if (openReadMenuId === book.id) openReadMenuId = null;
-                      }}
-                    >
-                      <summary
-                        class="btn btn-icon btn-xs min-h-8 min-w-8 list-none preset-tonal-surface [&::-webkit-details-marker]:hidden"
+                    <div class="relative z-50 ml-auto shrink-0">
+                      <button
+                        type="button"
+                        class="btn btn-icon btn-xs min-h-8 min-w-8 preset-tonal-surface"
                         aria-label={`More options for ${book.title}`}
+                        aria-expanded={openReadMenuId === book.id}
                         title="More options"
-                      ><EllipsisVertical size={15} /></summary>
-                      <div class="absolute bottom-full right-0 z-50 mb-2 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl">
+                        onclick={() => (openReadMenuId = openReadMenuId === book.id ? null : book.id)}
+                      ><EllipsisVertical size={15} /></button>
+                      {#if openReadMenuId === book.id}<div
+                        in:fly={{ y: 8, duration: motionDuration(180) }}
+                        out:fly={{ y: 8, duration: motionDuration(140) }}
+                        class="absolute bottom-full right-0 z-50 mb-2 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl"
+                      >
                         <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
                         <form class="mt-3 flex flex-col gap-2" method="POST" action="?/markRead" use:enhance={setPending(`read-${book.id}`, optimisticRead)}>
                           <input type="hidden" name="id" value={book.id} />
@@ -1580,8 +1582,8 @@
                             {#if isPending(`read-${book.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<BookOpen size={14} />{/if} Mark as read
                           </button>
                         </form>
-                      </div>
-                    </details>
+                      </div>{/if}
+                    </div>
                   {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     {#if book.status === "saved"}
