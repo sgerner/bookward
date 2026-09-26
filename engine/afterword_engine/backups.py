@@ -75,10 +75,24 @@ def _backup_path(backup_id: str) -> Path:
         raise BackupError("Choose a valid Bookward backup.")
     directory = backup_directory()
     _ensure_private_directory(directory)
-    path = directory / f"{backup_id}.sqlite3"
-    if path.is_symlink() or not path.is_file():
-        raise BackupError("That backup is no longer available.")
-    return path
+    try:
+        resolved_directory = directory.resolve(strict=True)
+        # Resolve requests against directory entries instead of turning the
+        # request value into a filesystem path. This keeps malformed or
+        # manipulated IDs from influencing path traversal, even if the ID
+        # validation above is changed in the future.
+        for candidate in directory.iterdir():
+            if candidate.name != f"{backup_id}.sqlite3":
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                break
+            resolved = candidate.resolve(strict=True)
+            if resolved.parent != resolved_directory:
+                break
+            return resolved
+    except OSError:
+        pass
+    raise BackupError("That backup is no longer available.")
 
 
 def _key_sidecar(backup_path: Path) -> Path:

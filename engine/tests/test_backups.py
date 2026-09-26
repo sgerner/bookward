@@ -128,6 +128,54 @@ def test_restore_rejects_a_non_bookward_file_without_changing_live_data(database
     assert row("SELECT 1 FROM reads WHERE title='Keep me'") is not None
 
 
+def test_backup_id_traversal_cannot_select_a_file_outside_backup_directory(database):
+    outside = database / "outside.sqlite3"
+    outside.write_bytes(b"do not open")
+
+    with pytest.raises(backups.BackupError, match="valid Bookward backup"):
+        backups._backup_path("../outside")
+
+    assert outside.read_bytes() == b"do not open"
+
+
+def test_restore_rejects_symlinked_snapshot_and_key_files(database):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Preserve live state", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("symlink_test_secret", seal("expected key")),
+        )
+    backup = backups.create_backup()
+    snapshot = database / "backups" / f"{backup['id']}.sqlite3"
+    key_sidecar = snapshot.with_name(f"{backup['id']}.secret.key")
+
+    outside_snapshot = database / "outside.sqlite3"
+    outside_snapshot.write_bytes(snapshot.read_bytes())
+    snapshot.unlink()
+    snapshot.symlink_to(outside_snapshot)
+    assert backup["id"] not in {item["id"] for item in backups.list_backups()}
+    with pytest.raises(backups.BackupError, match="no longer available"):
+        backups.restore_backup(backup["id"])
+
+    snapshot.unlink()
+    snapshot.write_bytes(outside_snapshot.read_bytes())
+    snapshot.chmod(0o600)
+    outside_key = database / "outside.key"
+    original_key = key_sidecar.read_bytes()
+    outside_key.write_bytes(original_key)
+    key_sidecar.unlink()
+    key_sidecar.symlink_to(outside_key)
+    with pytest.raises(backups.BackupError, match="no generated encryption key"):
+        backups.restore_backup(backup["id"])
+
+    assert outside_key.read_bytes() == original_key
+    assert row("SELECT 1 FROM reads WHERE title='Preserve live state'") is not None
+    assert private_setting("symlink_test_secret") == "expected key"
+
+
 def test_restore_rejects_a_mismatched_generated_key_before_replacement(database):
     with transaction() as con:
         con.execute(
