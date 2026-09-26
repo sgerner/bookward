@@ -72,14 +72,14 @@ def load_interaction_events(
                    c.title,c.author,c.genres,c.description,e.metadata
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
-            WHERE e.event_type IN ('save','reject','restore','read','librarr_import')
+            WHERE e.event_type IN ('save','reject','maybe_later','restore','read','librarr_import')
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
                    c.title,c.author,c.genres,c.description,NULL AS metadata
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
-            WHERE f.action IN ('save','reject','restore')
+            WHERE f.action IN ('save','reject','maybe_later','restore')
               AND NOT EXISTS (
                   SELECT 1 FROM recommendation_events e
                   WHERE e.event_key='feedback:' || f.id
@@ -181,6 +181,10 @@ def _event_label(event: dict[str, Any]) -> tuple[float | None, float]:
         return 1.0, 1.0
     if event_type == "reject":
         return 0.0, 1.0
+    if event_type == "maybe_later":
+        # This neutral event still replaces an earlier save or rejection for
+        # the same book so a deferral cannot keep training the learner.
+        return None, 0.0
     if event_type == "restore":
         # Restoring a rejected item is an explicit correction of that signal.
         return None, 0.0
@@ -247,7 +251,7 @@ def _latest_observations(
     ordered = sorted((dict(item) for item in events), key=_event_order)
     for event in ordered:
         event_type = str(event.get("event_type") or "").casefold()
-        if event_type not in {"save", "reject", "restore", "read", "librarr_import"}:
+        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
             continue
         identity = book_identity(event.get("title", ""), event.get("author", ""))
         if identity == "\x1f":

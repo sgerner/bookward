@@ -441,6 +441,15 @@ MIGRATIONS = [
             SELECT id,'saved' FROM candidates WHERE status IN ('saved','imported');
         """,
     ),
+    (
+        17,
+        """
+        ALTER TABLE feedback ADD COLUMN previous_status TEXT NOT NULL DEFAULT '';
+        ALTER TABLE feedback ADD COLUMN undone_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_feedback_candidate_latest
+            ON feedback(candidate_id, id DESC);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

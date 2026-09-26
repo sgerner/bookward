@@ -15,7 +15,10 @@ from afterword_engine.learning import (
     create_recommendation_run,
     record_event_in_connection,
 )
-from afterword_engine.interaction_personalization import load_interaction_events
+from afterword_engine.interaction_personalization import (
+    load_interaction_events,
+    personalize_recommendations,
+)
 from afterword_engine.main import app, recommendation_list, tracked_recommendations
 
 
@@ -409,6 +412,150 @@ def test_feedback_with_run_id_creates_explicit_outcome(database):
         )
     assert invalid.status_code == 400
     assert row("SELECT COUNT(*) count FROM feedback WHERE action='reject'")["count"] == 0
+
+
+def test_maybe_later_is_persisted_as_neutral_and_can_be_undone(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate_id = recommendations[0]["id"]
+
+    with TestClient(app) as client:
+        passed = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": "reject", "run_id": run_id},
+        )
+        deferred = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": "maybe_later", "run_id": run_id},
+        )
+        decision_id = deferred.json()["decision_id"]
+
+        assert passed.status_code == 200
+        assert deferred.status_code == 200
+        assert deferred.json()["status"] == "maybe_later"
+        assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "maybe_later"
+        assert row(
+            "SELECT action,previous_status FROM feedback WHERE id=?",
+            (decision_id,),
+        ) == {"action": "maybe_later", "previous_status": "rejected"}
+        event = row(
+            "SELECT event_type FROM recommendation_events WHERE event_key=?",
+            (f"feedback:{decision_id}",),
+        )
+        assert event["event_type"] == "maybe_later"
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id="
+            "(SELECT id FROM recommendation_events WHERE event_key=?)",
+            (f"feedback:{decision_id}",),
+        )["count"] == 0
+        events = [
+            item for item in load_interaction_events()
+            if item["candidate_id"] == candidate_id
+        ]
+        assert {item["event_type"] for item in events} == {"reject", "maybe_later"}
+        _, neutral_learning = personalize_recommendations([], events)
+        assert neutral_learning["observed_books"] == 0
+        assert candidate_id not in {item["id"] for item in recommendation_list()}
+        assert candidate_id in {
+            item["id"] for item in recommendation_list(status="decisions")
+        }
+
+        undone = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": decision_id},
+        )
+
+    assert undone.status_code == 200
+    assert undone.json()["status"] == "rejected"
+    assert row("SELECT undone_at FROM feedback WHERE id=?", (decision_id,))["undone_at"]
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "rejected"
+    assert row(
+        "SELECT event_type FROM recommendation_events WHERE event_key=?",
+        (f"undo-feedback:{decision_id}",),
+    )["event_type"] == "reject"
+    _, passed_learning = personalize_recommendations(
+        [],
+        [
+            item for item in load_interaction_events()
+            if item["candidate_id"] == candidate_id
+        ],
+    )
+    assert passed_learning["observed_books"] == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "expected_label"),
+    [("save", "saved", 1.0), ("reject", "rejected", 0.0)],
+)
+def test_undo_reverses_save_and_pass_state_without_relabeling_maybe_later(
+    database, action, status, expected_label
+):
+    recommendations, run_id = tracked_recommendations()
+    candidate_id = recommendations[0]["id"]
+    with TestClient(app) as client:
+        decision = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": action, "run_id": run_id},
+        ).json()
+        outcome = row(
+            "SELECT o.label FROM recommendation_outcomes o JOIN recommendation_events e "
+            "ON e.id=o.event_id WHERE e.event_key=?",
+            (f"feedback:{decision['decision_id']}",),
+        )
+        assert outcome["label"] == expected_label
+        assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == status
+
+        undone = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": decision["decision_id"]},
+        )
+        stale = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": decision["decision_id"]},
+        )
+
+    assert undone.status_code == 200
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == recommendations[0]["status"]
+    assert row(
+        "SELECT event_type FROM recommendation_events WHERE event_key=?",
+        (f"undo-feedback:{decision['decision_id']}",),
+    )["event_type"] == "restore"
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id="
+        "(SELECT id FROM recommendation_events WHERE event_key=?)",
+        (f"feedback:{decision['decision_id']}",),
+    )["count"] == 0
+    if action == "save" and recommendations[0]["status"] not in {"saved", "imported"}:
+        assert row(
+            "SELECT COUNT(*) count FROM reading_progress WHERE candidate_id=?",
+            (candidate_id,),
+        )["count"] == 0
+    assert stale.status_code == 409
+
+
+def test_only_the_latest_feedback_can_be_undone(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate_id = recommendations[0]["id"]
+    with TestClient(app) as client:
+        first = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": "save", "run_id": run_id},
+        ).json()
+        second = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": "reject", "run_id": run_id},
+        ).json()
+        stale = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": first["decision_id"]},
+        )
+        latest = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": second["decision_id"]},
+        )
+
+    assert stale.status_code == 409
+    assert latest.status_code == 200
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "saved"
 
 
 def test_read_attribution_requires_prior_exposure_and_updates_rating(database):

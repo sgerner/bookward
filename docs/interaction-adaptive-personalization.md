@@ -3,8 +3,8 @@
 ## Product behavior
 
 Bookward learns from actions people already take and applies a supported
-preference to the recommendations they receive next. It adds no prompt,
-preference screen, control, or second list, and it does not wait in shadow mode.
+preference to the recommendations they receive next. It adds no prompt or
+preference screen, and it does not wait in shadow mode.
 When evidence is uncertain, the existing neighborhood ranker is served as-is.
 When the confidence gate passes, a bounded adjustment is applied to that same
 ranker before pagination.
@@ -24,7 +24,8 @@ rows that are not duplicated by an event:
 | Action | Satisfaction label | Weight |
 | --- | --- | ---: |
 | Save | Positive | 1.00 |
-| Reject | Negative | 1.00 |
+| Pass (not interested) | Negative | 1.00 |
+| Maybe later | No label; workflow state only | 0 |
 | Restore | Neutral correction; clears the prior label for that work | 0 |
 | Attributed read rated 5 | Positive | 1.00 |
 | Attributed read rated 4 | Positive | 0.85 |
@@ -34,12 +35,16 @@ rows that are not duplicated by an event:
 | Librarr import | Positive intent, not confirmed enjoyment | 0.70 |
 | Card shown without action, detail/source open, or search | No label | 0 |
 
-Only reads already attributed to a recommendation impression are used. Merely
-being shown a book or opening its details is never interpreted as dislike. The
-latest meaningful action replaces older actions for a canonical title-author
-identity, preventing repeated clicks or duplicate imports from counting as
-independent books. At most 5,000 recent action events are read, and evidence
-uses a two-year half-life.
+Only explicit Pass actions create a negative feedback label. Maybe later is a
+separate persisted state, remains available from Past decisions, and never
+trains as a rejection. Recent shortlist, Pass, and Maybe later actions can be
+undone; the engine accepts an undo only while that decision is still the latest
+one for the book. Only reads already attributed to a recommendation impression
+are used. Merely being shown a book or opening its details is never interpreted
+as dislike. The latest decision or read replaces older actions for a canonical
+title-author identity, so a Maybe later decision clears an earlier save or pass
+and repeated clicks or duplicate imports do not count as independent books. At
+most 5,000 recent action events are read, and evidence uses a two-year half-life.
 
 ## Learning and serving rules
 

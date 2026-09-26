@@ -19,6 +19,7 @@
     Database,
     EllipsisVertical,
     ExternalLink,
+    History,
     KeyRound,
     Library,
     Link2,
@@ -41,7 +42,7 @@
   import { readLibrarrSearchStream } from "$lib/librarr-stream";
   import bookwardMark from "$lib/assets/bookward-mark.svg";
 
-  type View = "discover" | "saved" | "sources" | "settings";
+  type View = "discover" | "saved" | "decisions" | "sources" | "settings";
   type NavItem = {
     id: View;
     label: string;
@@ -52,6 +53,9 @@
     message?: string;
     error?: boolean;
     token?: string;
+    id?: number;
+    undo_id?: number;
+    undo_label?: string;
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
@@ -79,6 +83,7 @@
   let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
+  let decisionFilter = $state<"all" | "maybe_later" | "rejected">("all");
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
@@ -116,6 +121,8 @@
     message: string;
     error: boolean;
     id: number;
+    undo_id?: number;
+    undo_label?: string;
   } | null>(null);
   let optimisticNotificationId = 0;
   let optimisticNotificationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -140,6 +147,12 @@
       icon: Compass,
     },
     { id: "saved", label: "Shortlist", shortLabel: "Saved", icon: Bookmark },
+    {
+      id: "decisions",
+      label: "Past decisions",
+      shortLabel: "Review",
+      icon: History,
+    },
     { id: "sources", label: "Sources", shortLabel: "Sources", icon: Link2 },
     {
       id: "settings",
@@ -161,7 +174,7 @@
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
   const allBooks = $derived(
-    [...data.books, ...additionalDiscoverBooks].map((book) => {
+    [...data.books, ...data.decisions, ...additionalDiscoverBooks].map((book) => {
       const status = bookStatusOverrides[book.id];
       return status === undefined ? book : { ...book, status };
     }),
@@ -186,8 +199,20 @@
       return state === shelfFilter;
     }),
   );
+  const decisionBooks = $derived(
+    allBooks.filter(
+      (book) =>
+        ["rejected", "maybe_later"].includes(book.status) &&
+        (decisionFilter === "all" || book.status === decisionFilter) &&
+        matchesBookFilter(book),
+    ),
+  );
   const filteredBooks = $derived(
-    activeView === "saved" ? shortlistBooks : discoverBooks,
+    activeView === "saved"
+      ? shortlistBooks
+      : activeView === "decisions"
+        ? decisionBooks
+        : discoverBooks,
   );
   const visibleBooks = $derived(
     activeView === "discover"
@@ -257,6 +282,10 @@
   const finishedCount = $derived(
     savedBooks.filter((book) => book.reading_status === "finished").length,
   );
+  const decisionCount = $derived(
+    allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status))
+      .length,
+  );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
   );
@@ -323,7 +352,7 @@
     const currentForm = form as FormState;
     const message = currentForm?.message;
     formNotificationDismissed = false;
-    if (!message) return;
+    if (!message || currentForm?.undo_id) return;
 
     const dismissTimer = setTimeout(
       () => {
@@ -337,7 +366,7 @@
   });
 
   function readView(value: string | null): View {
-    return value && ["discover", "saved", "sources", "settings"].includes(value)
+    return value && ["discover", "saved", "decisions", "sources", "settings"].includes(value)
       ? (value as View)
       : "discover";
   }
@@ -443,7 +472,7 @@
   }
 
   function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...additionalDiscoverBooks].find((item) => item.id === id);
+    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks].find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
@@ -467,7 +496,7 @@
   function optimisticDecision(formData: FormData) {
     const id = Number(formData.get("id"));
     const status = String(formData.get("status") ?? "");
-    return Number.isInteger(id) && ["saved", "rejected", "recommended"].includes(status)
+    return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
       ? optimisticBookStatus(id, status)
       : undefined;
   }
@@ -1248,11 +1277,15 @@
                 in:scale={{ duration: motionDuration(160) }}
                 out:fade={{ duration: motionDuration(100) }}
                 class="badge badge-sm preset-tonal-surface">{savedCount}</span
+              >{/if}{#if item.id === "decisions" && decisionCount > 0}<span
+                in:scale={{ duration: motionDuration(160) }}
+                out:fade={{ duration: motionDuration(100) }}
+                class="badge badge-sm preset-tonal-surface">{decisionCount}</span
               >{/if}</button
       >{/each}
       </nav>
       <div class="ml-auto flex items-center gap-2">
-        {#if activeView === "discover" || activeView === "saved"}
+        {#if activeView === "discover" || activeView === "saved" || activeView === "decisions"}
           {#if searchOpen}
             <form
               class="flex items-center gap-1"
@@ -1325,19 +1358,39 @@
                 class="mt-0.5 shrink-0"
               />{:else}<Check size={18} class="mt-0.5 shrink-0" />{/if}<span
               >{visibleNotification.message}</span
-            >
-          </div>{/key}{/if}
+            >{#if visibleNotification.undo_id && visibleNotification.id}<form
+                method="POST"
+                action="?/undoDecision"
+                use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+              >
+                <input type="hidden" name="id" value={visibleNotification.id} />
+                <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                <button
+                  type="submit"
+                  class="btn btn-sm min-h-9 preset-tonal-surface"
+                  disabled={isPending(`undo-${visibleNotification.undo_id}`)}
+                  aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                  aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
+                >
+                  {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                  Undo
+                </button>
+              </form>{/if}
+            </div>{/key}{/if}
 
-      {#snippet recommendationView(view: "discover" | "saved")}
+      {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
 
-        {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : shortlistBooks}
+        {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : view === "saved" ? shortlistBooks : decisionBooks}
         {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-10 px-1 sm:px-0">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
-          >{view === "discover" ? "Find your next favorite." : "Your shortlist."}</h1>
+          >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : "Past decisions."}</h1>
         </section>
+        {#if view === "discover" && !digestVisible}
+          <p class="mb-6 max-w-2xl text-sm leading-6 text-surface-700-300">Pass means you are not interested. Maybe later sets a book aside to revisit without counting it as a rejection.</p>
+        {/if}
         {#if view === "saved"}
           <section class="mb-6" aria-label="Shortlist shelves">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
@@ -1346,6 +1399,16 @@
               <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "saved" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "saved"} onclick={() => (shelfFilter = "saved")}>Saved <span class="badge badge-sm preset-tonal-surface">{savedShelfCount}</span></button>
               <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "reading" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "reading"} onclick={() => (shelfFilter = "reading")}>Reading <span class="badge badge-sm preset-tonal-surface">{readingCount}</span></button>
               <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "finished" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "finished"} onclick={() => (shelfFilter = "finished")}>Finished <span class="badge badge-sm preset-tonal-surface">{finishedCount}</span></button>
+            </div>
+          </section>
+        {/if}
+        {#if view === "decisions"}
+          <section class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" aria-label="Past recommendation decisions">
+            <p class="max-w-2xl text-sm leading-6 text-surface-700-300">Passed and deferred books stay here. Return any one to Discover whenever you are ready.</p>
+            <div class="flex flex-wrap gap-2" role="group" aria-label="Filter past decisions">
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All ({allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length})</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later ({allBooks.filter((book) => book.status === "maybe_later").length})</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed ({allBooks.filter((book) => book.status === "rejected").length})</button>
             </div>
           </section>
         {/if}
@@ -1486,6 +1549,9 @@
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Pass</button>
                     </form>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<History size={15} />{/if} Maybe later</button>
+                    </form>
                     <details
                       class="relative z-50 ml-auto shrink-0"
                       ontoggle={(event) => {
@@ -1566,6 +1632,10 @@
                         <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                       </form>
                     {/if}
+                  {:else if book.status === "rejected" || book.status === "maybe_later"}
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                    </form>
                   {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
                 </div>
               </div>
@@ -1573,8 +1643,8 @@
           {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
               <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
               <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">{filter ? "No books match that search" : view === "saved" ? "Your shortlist is empty" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
-                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{filter ? "Try an author, title, or genre." : view === "saved" ? "Shortlist a recommendation when one catches your eye." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+                <h2 class="text-lg font-semibold text-surface-950-50">{filter ? "No books match that search" : view === "saved" ? "Your shortlist is empty" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
+                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{filter ? "Try an author, title, or genre." : view === "saved" ? "Shortlist a recommendation when one catches your eye." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
               </div>
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
             </div>{/each}
@@ -1604,6 +1674,15 @@
             out:fade={{ duration: motionDuration(420) }}
           >
             {@render recommendationView("saved")}
+          </div>
+        {:else if activeView === "decisions"}
+          <div
+            data-view="recommendations"
+            class="col-start-1 row-start-1"
+            in:fade={{ duration: motionDuration(420) }}
+            out:fade={{ duration: motionDuration(420) }}
+          >
+            {@render recommendationView("decisions")}
           </div>
         {:else if activeView === "sources"}
           <div
@@ -2649,6 +2728,11 @@
             out:fade={{ duration: motionDuration(100) }}
             class="absolute mb-7 ml-6 badge badge-xs preset-filled-primary-500"
             >{savedCount}</span
+          >{/if}{#if item.id === "decisions" && decisionCount > 0}<span
+            in:scale={{ duration: motionDuration(160) }}
+            out:fade={{ duration: motionDuration(100) }}
+            class="absolute mb-7 ml-8 badge badge-xs preset-filled-primary-500"
+            >{decisionCount}</span
           >{/if}</button
       >{/each}
   </nav>

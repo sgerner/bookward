@@ -497,8 +497,12 @@ class SourcePreviewIn(UrlIn):
 
 
 class FeedbackIn(BaseModel):
-    action: str
+    action: Literal["save", "reject", "maybe_later", "restore"]
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class UndoFeedbackIn(BaseModel):
+    decision_id: int = Field(gt=0)
 
 
 class MarkReadIn(BaseModel):
@@ -529,7 +533,9 @@ class TelemetryEventIn(BaseModel):
     @field_validator("event_type")
     @classmethod
     def valid_event_type(cls, value: str) -> str:
-        if value not in EVENT_TYPES - {"save", "reject", "restore", "read"}:
+        if value not in EVENT_TYPES - {
+            "save", "reject", "maybe_later", "restore", "read"
+        }:
             raise ValueError("Unsupported recommendation event type")
         return value
 
@@ -719,9 +725,13 @@ def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: i
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
         )
+        decisions = recommendation_list(
+            connection, status="decisions", limit=None
+        )
         return {
             "counts": counts,
             "recommendations": recommendations,
+            "decisions": decisions,
             "recommendation_run_id": run_id,
             "sources": [source_payload(item) for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
@@ -763,16 +773,32 @@ def _recommendation_rows(
     limit: int | None = 100,
     offset: int = 0,
 ):
-    clauses = [
-        "c.status!='rejected'",
-        "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
-        "(c.status IN ('saved','imported') OR s.enabled=1)",
-    ]
+    decision_statuses = {"rejected", "maybe_later"}
+    is_decision_archive = bool(statuses) and set(statuses).issubset(decision_statuses)
+    if is_decision_archive:
+        clauses = []
+    else:
+        clauses = [
+            "c.status NOT IN ('rejected','maybe_later')",
+            "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
+            "(c.status IN ('saved','imported') OR s.enabled=1)",
+        ]
     params: list[object] = []
     if statuses:
-        placeholders = ",".join("?" for _ in statuses)
-        clauses.append(f"c.status IN ({placeholders})")
-        params.extend(statuses)
+        if is_decision_archive:
+            archive_terms = []
+            if "rejected" in statuses:
+                archive_terms.append(
+                    "(c.status='rejected' AND EXISTS(SELECT 1 FROM feedback f "
+                    "WHERE f.candidate_id=c.id AND f.action='reject'))"
+                )
+            if "maybe_later" in statuses:
+                archive_terms.append("c.status='maybe_later'")
+            clauses.append("(" + " OR ".join(archive_terms) + ")")
+        else:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"c.status IN ({placeholders})")
+            params.extend(statuses)
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
@@ -844,7 +870,11 @@ def recommendation_list(
             )
         )
     else:
-        statuses = None if not status or status == "all" else (status,)
+        statuses = (
+            ("rejected", "maybe_later")
+            if status == "decisions"
+            else None if not status or status == "all" else (status,)
+        )
         result = _recommendation_rows(
             connection, statuses=statuses, limit=limit, offset=offset
         )
@@ -857,7 +887,7 @@ def recommendation_list(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -1024,18 +1054,27 @@ def update_reading_progress(candidate_id: int, payload: ReadingProgressIn):
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
 def feedback(candidate_id: int, payload: FeedbackIn):
-    status = {"save":"saved","reject":"rejected","restore":"recommended"}.get(payload.action)
-    if not status: raise HTTPException(400, "Unknown feedback action")
+    status = {
+        "save": "saved",
+        "reject": "rejected",
+        "maybe_later": "maybe_later",
+        "restore": "recommended",
+    }[payload.action]
     with transaction() as con:
-        if not con.execute("SELECT 1 FROM candidates WHERE id=?", (candidate_id,)).fetchone(): raise HTTPException(404, "Recommendation not found")
+        candidate = con.execute(
+            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Recommendation not found")
+        previous_status = str(candidate["status"])
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
         if payload.action == "save":
             _ensure_reading_progress(con, candidate_id)
         elif payload.action == "restore":
             con.execute("DELETE FROM reading_progress WHERE candidate_id=?", (candidate_id,))
         feedback_id = con.execute(
-            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-            (candidate_id, payload.action),
+            "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
+            (candidate_id, payload.action, previous_status),
         ).lastrowid
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
@@ -1052,7 +1091,88 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-    return {"id":candidate_id,"status":status}
+    result = {
+        "id": candidate_id,
+        "status": status,
+    }
+    if payload.action in {"save", "reject", "maybe_later"}:
+        result["decision_id"] = int(feedback_id)
+    return result
+
+
+@app.post("/api/recommendations/{candidate_id}/undo")
+def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
+    with transaction() as con:
+        decision = con.execute(
+            "SELECT id,action,previous_status,undone_at FROM feedback "
+            "WHERE id=? AND candidate_id=?",
+            (payload.decision_id, candidate_id),
+        ).fetchone()
+        if not decision or not decision["previous_status"]:
+            raise HTTPException(404, "Undo is no longer available")
+        if decision["undone_at"]:
+            raise HTTPException(409, "This decision has already been undone")
+        if decision["action"] not in {"save", "reject", "maybe_later"}:
+            raise HTTPException(404, "Undo is no longer available")
+        latest = con.execute(
+            "SELECT id FROM feedback WHERE candidate_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        if not latest or int(latest["id"]) != payload.decision_id:
+            raise HTTPException(409, "Only the latest decision can be undone")
+        current = con.execute(
+            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not current:
+            raise HTTPException(404, "Recommendation not found")
+        expected_status = {
+            "save": "saved",
+            "reject": "rejected",
+            "maybe_later": "maybe_later",
+            "restore": "recommended",
+        }[decision["action"]]
+        if current["status"] != expected_status:
+            raise HTTPException(409, "The recommendation changed after this decision")
+        previous_status = str(decision["previous_status"])
+        if decision["action"] == "save":
+            if previous_status in {"saved", "imported"}:
+                _ensure_reading_progress(con, candidate_id)
+            else:
+                con.execute(
+                    "DELETE FROM reading_progress WHERE candidate_id=?",
+                    (candidate_id,),
+                )
+        con.execute(
+            "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (previous_status, candidate_id),
+        )
+        con.execute(
+            "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload.decision_id,),
+        )
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE event_id=("
+            "SELECT id FROM recommendation_events WHERE event_key=?)",
+            (f"feedback:{payload.decision_id}",),
+        )
+        compensation = (
+            "save" if previous_status in {"saved", "imported"}
+            else "reject" if previous_status == "rejected"
+            else "maybe_later" if previous_status == "maybe_later"
+            else "restore"
+        )
+        try:
+            record_event_in_connection(
+                con,
+                event_key=f"undo-feedback:{payload.decision_id}",
+                candidate_id=candidate_id,
+                event_type=compensation,
+                source="ui_undo",
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return {"id": candidate_id, "status": previous_status}
 
 
 @app.post("/api/recommendations/{candidate_id}/read")
@@ -1864,6 +1984,7 @@ def api_root():
             "overview": "GET /api/v1/overview",
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
+            "undo": "POST /api/v1/recommendations/{id}/undo",
             "reading_list": "GET /api/v1/reading-list",
             "reading_progress": "PUT /api/v1/reading-list/{id}",
             "sources": "GET /api/v1/sources",
@@ -1890,7 +2011,7 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -1917,6 +2038,11 @@ def api_bulk_feedback(payload: BulkFeedbackIn):
 @api_v1.post("/recommendations/{candidate_id}/feedback")
 def api_feedback(candidate_id: int, payload: FeedbackIn):
     return feedback(candidate_id, payload)
+
+
+@api_v1.post("/recommendations/{candidate_id}/undo")
+def api_undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
+    return undo_feedback(candidate_id, payload)
 
 
 @api_v1.post("/telemetry/events")

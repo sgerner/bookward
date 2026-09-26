@@ -107,4 +107,18 @@ describe("recommendations endpoint", () => {
       started_at: "2026-09-24 10:00:00",
     });
   });
+
+  it("allows the browser to request the past decisions archive", async () => {
+    engineMock.mockResolvedValue([]);
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=decisions&limit=8&offset=0",
+      ),
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=decisions&limit=8&offset=0",
+    );
+  });
 });
