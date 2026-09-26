@@ -43,6 +43,7 @@ SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 READ_WORK_IDENTITY_BATCH_SIZE = 25
 READ_WORK_IDENTITY_RETRY_DAYS = 30
 READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS = 1.0
+READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
 
 def _filter_genre_values(value):
@@ -694,6 +695,37 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
     )
 
 
+async def _request_openlibrary_edition(client, isbn13: str):
+    """Follow Open Library's ISBN-to-edition redirect with every hop pinned.
+
+    The generic pinned request intentionally does not follow redirects because
+    doing so without validating each destination would bypass SSRF protections.
+    Open Library's ISBN endpoint redirects to ``/books/<edition>.json``; allow
+    only HTTPS redirects back to the same public catalog host.
+    """
+
+    url = f"https://openlibrary.org/isbn/{isbn13}.json"
+    for _ in range(READ_WORK_IDENTITY_MAX_REDIRECTS + 1):
+        response = await _request_pinned(client, "GET", url)
+        location = response.headers.get("location", "").strip()
+        if not response.is_redirect or not location:
+            return response
+
+        target = urljoin(url, location)
+        parsed = urlparse(target)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "openlibrary.org"
+            or parsed.port not in (None, 443)
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError("Open Library ISBN endpoint returned an unsafe redirect")
+        url = target
+
+    raise httpx.TooManyRedirects("Too many redirects from the Open Library ISBN endpoint")
+
+
 def _openlibrary_work_from_edition(payload, requested_isbn13: str) -> str:
     """Return a single verified Open Library work key for an ISBN edition."""
 
@@ -817,11 +849,7 @@ async def refresh_read_work_identities(
             isbn13, _isbn10 = isbn_parts(read.get("isbn"))
             work_id = ""
             try:
-                response = await _request_pinned(
-                    client,
-                    "GET",
-                    f"https://openlibrary.org/isbn/{isbn13}.json",
-                )
+                response = await _request_openlibrary_edition(client, isbn13)
                 if response.status_code != 404:
                     response.raise_for_status()
                     work_id = _openlibrary_work_from_edition(
