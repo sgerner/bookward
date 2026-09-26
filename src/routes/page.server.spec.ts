@@ -33,7 +33,7 @@ describe("page actions", () => {
     expect(result.profile.api_tokens).toEqual([]);
   });
 
-  it("persists an opaque session and forwards it with recommendation loads", async () => {
+  it("loads recommendations without creating or forwarding a device cookie", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -56,28 +56,15 @@ describe("page actions", () => {
       ),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const cookies = {
-      get: vi.fn().mockReturnValue(undefined),
-      set: vi.fn(),
-    };
     const result = (await load({
       url: new URL("http://afterword.test/"),
-      cookies,
     } as never)) as { recommendation_run_id: string };
     expect(result.recommendation_run_id).toBe("run-1234");
-    expect(cookies.set).toHaveBeenCalledWith(
-      "bookward_session",
-      expect.any(String),
-      expect.objectContaining({ httpOnly: true, sameSite: "lax", path: "/" }),
-    );
-    expect(fetchMock.mock.calls[0][1]).toEqual(
-      expect.objectContaining({
-        headers: expect.objectContaining({ "x-bookward-session": expect.any(String) }),
-      }),
-    );
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
+    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
   });
 
-  it("marks a recommended book as read with an optional rating and its browser session", async () => {
+  it("marks a recommended book as read with an optional rating and no device session", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ status: "read", rating: 5 }), {
         status: 200,
@@ -90,7 +77,6 @@ describe("page actions", () => {
     body.set("rating", "5");
     const result = await actions.markRead!({
       request: new Request("http://afterword.test", { method: "POST", body }),
-      cookies: { get: vi.fn().mockReturnValue("session-read-123") },
     } as never);
 
     expect(result).toEqual({
@@ -100,7 +86,7 @@ describe("page actions", () => {
       expect.stringContaining("/api/recommendations/42/read"),
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ rating: 5, session_id: "session-read-123" }),
+        body: JSON.stringify({ rating: 5 }),
       }),
     );
   });

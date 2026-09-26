@@ -34,20 +34,23 @@ def test_recommendation_responses_create_ranked_run_and_impressions(database):
         (run_id,),
     )
     assert run["policy"] == "rating-neighborhood"
-    assert run["policy_version"] == "rating-kernel-recency-interaction-v1"
+    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-v2"
     assert run["candidate_count"] == len(recommendations)
     assert impressions["count"] == len(recommendations)
     assert row(
         "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=? AND propensity=1",
         (run_id,),
     )["count"] == len(recommendations)
-    assert json.loads(run["metadata"])["interaction_learning"]["mode"] == "confidence_gated_live"
+    learning = json.loads(run["metadata"])["interaction_learning"]
+    assert learning["mode"] == "confidence_gated_live"
+    assert learning["scope"] == "installation"
 
     with TestClient(app) as client:
         response = client.get("/api/recommendations")
     assert response.status_code == 200
     header_run = response.headers["x-bookward-recommendation-run"]
-    assert row("SELECT id FROM recommendation_runs WHERE id=?", (header_run,))
+    api_run = row("SELECT metadata FROM recommendation_runs WHERE id=?", (header_run,))
+    assert json.loads(api_run["metadata"])["interaction_learning"]["scope"] == "installation"
 
 
 def test_confident_existing_actions_reorder_live_results_before_page_limit(database):
@@ -130,7 +133,7 @@ def test_confident_existing_actions_reorder_live_results_before_page_limit(datab
     assert recommendations[0]["score"] > recommendations[1]["score"]
     run = row("SELECT policy_version,metadata FROM recommendation_runs WHERE id=?", (run_id,))
     metadata = json.loads(run["metadata"])["interaction_learning"]
-    assert run["policy_version"] == "rating-kernel-recency-interaction-v1"
+    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-v2"
     assert metadata["mode"] == "confidence_gated_live"
     assert metadata["applied"] is True
     assert metadata["observed_books"] == 12
@@ -172,7 +175,7 @@ def test_legacy_feedback_is_used_without_double_counting_new_events(database):
     }
 
 
-def test_session_scoped_learning_keeps_browser_preferences_separate(database):
+def test_learning_aggregates_actions_across_legacy_browser_sessions(database):
     with transaction() as con:
         reader_a_id = con.execute(
             "INSERT INTO candidates(title,author,genres,normalized_key) VALUES(?,?,?,?)",
@@ -206,14 +209,24 @@ def test_session_scoped_learning_keeps_browser_preferences_separate(database):
             source="ui",
         )
 
-    reader_a_events = load_interaction_events(session_id="session-reader-a")
-    reader_b_events = load_interaction_events(session_id="session-reader-b")
+    events = load_interaction_events()
+    assert {
+        (event["candidate_id"], event["event_type"])
+        for event in events
+        if event["candidate_id"] in {reader_a_id, reader_b_id}
+    } == {
+        (reader_a_id, "save"),
+        (reader_b_id, "save"),
+    }
+    _, run_id = tracked_recommendations()
+    learning = json.loads(
+        row("SELECT metadata FROM recommendation_runs WHERE id=?", (run_id,))["metadata"]
+    )["interaction_learning"]
+    assert learning["scope"] == "installation"
+    assert learning["observed_books"] >= 2
 
-    assert [event["candidate_id"] for event in reader_a_events] == [reader_a_id]
-    assert [event["candidate_id"] for event in reader_b_events] == [reader_b_id]
 
-
-def test_manual_read_marks_candidate_read_and_scopes_optional_rating(database):
+def test_manual_read_marks_candidate_read_and_learns_without_a_session(database):
     with transaction() as con:
         source_id = con.execute(
             "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
@@ -239,7 +252,7 @@ def test_manual_read_marks_candidate_read_and_scopes_optional_rating(database):
     with TestClient(app) as client:
         response = client.post(
             f"/api/recommendations/{candidate_id}/read",
-            json={"rating": 4, "session_id": "session-manual-read"},
+            json={"rating": 4},
         )
 
     assert response.status_code == 200
@@ -266,20 +279,19 @@ def test_manual_read_marks_candidate_read_and_scopes_optional_rating(database):
     )
     assert event["event_type"] == "read"
     assert event["value"] == 4
-    assert json.loads(event["metadata"]) == {"session_id": "session-manual-read"}
-    assert [event["candidate_id"] for event in load_interaction_events(
-        session_id="session-manual-read"
-    )] == [candidate_id]
-    assert load_interaction_events(session_id="another-session") == []
+    assert json.loads(event["metadata"]) == {}
+    assert candidate_id in {
+        event["candidate_id"] for event in load_interaction_events()
+    }
 
     with TestClient(app) as client:
         no_rating = client.post(
             f"/api/recommendations/{candidate_id}/read",
-            json={"session_id": "session-manual-read"},
+            json={},
         )
         unrated = client.post(
             f"/api/recommendations/{unrated_id}/read",
-            json={"session_id": "session-manual-read"},
+            json={},
         )
         invalid = client.post(
             f"/api/recommendations/{candidate_id}/read",

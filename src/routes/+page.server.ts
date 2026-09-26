@@ -2,7 +2,6 @@ import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { engine, EngineError } from "$lib/server/engine";
 import { z } from "zod";
-import { randomUUID } from "node:crypto";
 
 type SourceFilters = {
   include_genres: string[];
@@ -99,25 +98,10 @@ type DigestSettings = {
   } | null;
 };
 
-const SESSION_COOKIE = "bookward_session";
-
-export const load: PageServerLoad = async ({ url, cookies }) => {
-  const existingSession = cookies?.get(SESSION_COOKIE);
-  const sessionId = existingSession || randomUUID();
-  if (cookies && !existingSession) {
-    cookies.set(SESSION_COOKIE, sessionId, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "lax",
-      secure: url.protocol === "https:",
-      maxAge: 60 * 60 * 24 * 365,
-    });
-  }
+export const load: PageServerLoad = async ({ url }) => {
   let overview: Overview;
   try {
-    overview = await engine<Overview>("/api/overview?recommendation_limit=24", {
-      headers: { "x-bookward-session": sessionId },
-    });
+    overview = await engine<Overview>("/api/overview?recommendation_limit=24");
   } catch (cause) {
     throw httpError(503, {
       message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
@@ -285,7 +269,7 @@ export const actions: Actions = {
       return fail(502, { message: message(error) });
     }
   },
-  markRead: async ({ request, cookies }) => {
+  markRead: async ({ request }) => {
     const data = await request.formData();
     const id = idSchema.safeParse(data.get("id"));
     const rawRating = formText(data, "rating");
@@ -296,13 +280,11 @@ export const actions: Actions = {
     ) {
       return fail(400, { message: "Choose a valid book and an optional rating from 1 to 5." });
     }
-    const sessionId = cookies?.get(SESSION_COOKIE);
     try {
       await engine(`/api/recommendations/${id.data}/read`, {
         method: "POST",
         body: JSON.stringify({
           ...(rating === undefined ? {} : { rating }),
-          ...(sessionId ? { session_id: sessionId } : {}),
         }),
       });
       return {

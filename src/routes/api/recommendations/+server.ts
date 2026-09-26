@@ -13,7 +13,7 @@ const querySchema = z.object({
 const engineStatus = (error: unknown) => error instanceof EngineError && error.status < 500 ? error.status : 502;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Recommendations could not be loaded.";
 
-export const GET: RequestHandler = async ({ url, cookies }) => {
+export const GET: RequestHandler = async ({ url }) => {
   const parsed = querySchema.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) return json({ message: "Choose a valid recommendation page." }, { status: 400 });
 
@@ -23,11 +23,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
     offset: String(parsed.data.offset),
   });
   try {
-    const sessionId = cookies.get("bookward_session");
-    const items = await engine<Recommendation[]>(
-      `/api/recommendations?${params.toString()}`,
-      sessionId ? { headers: { "x-bookward-session": sessionId } } : undefined,
-    );
+    const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
     return json({
       items: items.map(toPageBook),
       has_more: items.length === parsed.data.limit,

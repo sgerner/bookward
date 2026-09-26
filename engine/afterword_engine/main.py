@@ -568,11 +568,10 @@ def tracked_recommendations(
     offset: int = 0,
     connection=None,
     recommended_limit: int | None = None,
-    session_id: str = "",
 ):
     learning_metadata = {
         "mode": "confidence_gated_live",
-        "scope": "session" if session_id else "installation",
+        "scope": "installation",
         "applied": False,
         "observed_books": 0,
         "qualified_features": 0,
@@ -590,9 +589,7 @@ def tracked_recommendations(
             ranked = recommendation_list(
                 connection, status=status, limit=None, offset=0
             )
-            interaction_events = load_interaction_events(
-                connection, session_id=session_id or None
-            )
+            interaction_events = load_interaction_events(connection)
             cached_vectors = load_cached_candidate_vectors(
                 [*ranked, *interaction_events], connection
             )
@@ -634,7 +631,7 @@ def tracked_recommendations(
             )
             learning_metadata = {
                 "mode": "base_ranker_fallback",
-                "scope": "session" if session_id else "installation",
+                "scope": "installation",
                 "applied": False,
                 "observed_books": 0,
                 "qualified_features": 0,
@@ -662,7 +659,6 @@ def tracked_recommendations(
         )
     run_id = create_recommendation_run(
         recommendations,
-        session_id=session_id,
         status=status,
         limit=limit,
         ranking_metadata=learning_metadata,
@@ -670,7 +666,7 @@ def tracked_recommendations(
     return recommendations, run_id
 
 
-def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None, session_id: str = ""):
+def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None):
     def source_payload(source):
         item = dict(source)
         item["filters"] = normalize_source_filters(item.get("filters"))
@@ -685,7 +681,6 @@ def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: i
             connection=connection,
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
-            session_id=session_id,
         )
         return {
             "counts": counts,
@@ -721,9 +716,8 @@ async def health():
 @app.get("/api/overview")
 def overview(
     recommendation_limit: int | None = Query(default=None, ge=1, le=100),
-    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
 ):
-    return overview_payload(recommendation_limit=recommendation_limit, session_id=x_bookward_session or "")
+    return overview_payload(recommendation_limit=recommendation_limit)
 
 def _recommendation_rows(
     connection=None,
@@ -821,13 +815,11 @@ def recommendations(
     status: Literal["recommended", "saved", "imported", "all"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
-    x_bookward_session: str | None = Header(default=None, alias="X-Bookward-Session"),
 ):
     values, run_id = tracked_recommendations(
         status=status,
         limit=limit,
         offset=offset,
-        session_id=x_bookward_session or "",
     )
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
