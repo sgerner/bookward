@@ -8,5 +8,6 @@ export const POST: RequestHandler = async ({ cookies }) => {
 	} finally {
 		cookies.delete('bookward_session', { path: '/' });
 	}
-	throw redirect(303, '/login');
+	// Keep the local session ended even when automatic OIDC sign-in is enabled.
+	throw redirect(303, '/login?manual=1');
 };

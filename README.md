@@ -246,6 +246,8 @@ The first administrator can create accounts at **Manage accounts**. Each account
 
 Configure one OpenID Connect provider with `OIDC_ISSUER`, `OIDC_CLIENT_ID`, and `OIDC_CLIENT_SECRET`. `OIDC_REDIRECT_URI` is optional; when omitted, Bookward uses `{AFTERWORD_PUBLIC_URL}/auth/oidc/callback`. Set `OIDC_AUTO_PROVISION=true` only when every authenticated identity from the configured issuer should receive a profile automatically. The default is `false`, so SSO identities must first be linked to an existing account. SSO uses authorization code flow with PKCE and validates issuer, audience, signature, state, nonce, and redirect configuration.
 
+Set `OIDC_AUTO_LOGIN=true` to send unauthenticated visitors directly to the configured SSO provider instead of showing the Bookward login form first. After sign-out, Bookward shows the login form without immediately signing the same browser back in. Use `/login?manual=1` to open the local login form directly; `OIDC_AUTO_LOGIN` defaults to `false`.
+
 Candidate pools, reads, shortlists, sources, learning history, jobs, API tokens, and integration settings are stored in separate SQLite files per profile. Bookward currently keeps embeddings inside each profile database; this spends more disk and compute while preserving the same isolation boundary.
 
 The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. To try Ollama locally:
@@ -278,6 +280,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | Optional OpenID Connect provider configuration. |
 | `OIDC_REDIRECT_URI` | Optional exact callback URL registered with the provider. |
 | `OIDC_AUTO_PROVISION` | Allow any valid identity from the configured issuer to create a profile; defaults to `false`. |
+| `OIDC_AUTO_LOGIN` | Redirect unauthenticated visitors directly to the configured OIDC provider; defaults to `false`. |
 | `AFTERWORD_DB` | SQLite path for a local engine run. Docker uses `/data/afterword.db`. |
 | `EMBEDDING_BACKEND` / `EMBEDDING_MODEL` | Provider and model selected by the engine. |
 | `EMBEDDING_URL` / `EMBEDDING_API_KEY` | Endpoint and optional key for remote or Ollama providers. |

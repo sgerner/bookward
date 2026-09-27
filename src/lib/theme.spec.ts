@@ -175,8 +175,21 @@ describe('theme preferences', () => {
 		expect(resolveMode('system')).toBe('light');
 	});
 
-	it('re-applies system mode on OS changes and cleans up listeners', () => {
-		storage.values.set(THEME_STORAGE_KEY, 'mint');
+	it('loads the saved palette before applying it and re-applies system mode on OS changes', async () => {
+		const originalNoshLoader = THEME_LOADERS.nosh;
+		const originalRoseLoader = THEME_LOADERS.rose;
+		THEME_LOADERS.nosh = () => Promise.resolve({ default: '[data-theme="nosh"] {}' });
+		THEME_LOADERS.rose = () => Promise.resolve({ default: '[data-theme="rose"] {}' });
+		const appended: Array<{ dataset: Record<string, string>; textContent: string }> = [];
+		vi.stubGlobal('document', {
+			documentElement: root,
+			head: {
+				querySelector: vi.fn(() => null),
+				append: vi.fn((style: { dataset: Record<string, string>; textContent: string }) => appended.push(style)),
+			},
+			createElement: vi.fn(() => ({ dataset: {}, textContent: '' })),
+		});
+		storage.values.set(THEME_STORAGE_KEY, 'nosh');
 		storage.values.set(MODE_STORAGE_KEY, 'system');
 		let mediaChange: (() => void) | undefined;
 		const removeMediaListener = vi.fn();
@@ -199,19 +212,32 @@ describe('theme preferences', () => {
 		});
 
 		const cleanup = initAppearance();
-		expect(root.dataset.theme).toBe('mint');
-		expect(root.dataset.colorScheme).toBe('light');
+		try {
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(root.dataset.theme).toBe('nosh');
+			expect(root.dataset.colorScheme).toBe('light');
+			expect(appended).toHaveLength(1);
+			expect(appended[0].dataset.bookwardTheme).toBe('nosh');
 
-		systemDark = true;
-		mediaChange?.();
-		expect(root.dataset.colorScheme).toBe('dark');
-		expect(root.classes.has('dark')).toBe(true);
+			systemDark = true;
+			mediaChange?.();
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(root.dataset.colorScheme).toBe('dark');
+			expect(root.classes.has('dark')).toBe(true);
 
-		storage.values.set(THEME_STORAGE_KEY, 'rose');
-		storageListener();
-		expect(root.dataset.theme).toBe('rose');
+			storage.values.set(THEME_STORAGE_KEY, 'rose');
+			storageListener();
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(root.dataset.theme).toBe('rose');
+			expect(appended).toHaveLength(2);
 
-		cleanup();
+			expect(removeMediaListener).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+			THEME_LOADERS.nosh = originalNoshLoader;
+			THEME_LOADERS.rose = originalRoseLoader;
+		}
+
 		expect(removeMediaListener).toHaveBeenCalledWith('change', expect.any(Function));
 		expect(removeStorageListener).toHaveBeenCalledWith('storage', expect.any(Function));
 	});

@@ -226,9 +226,24 @@ export function setTheme(theme: SkeletonThemeName, mode: ThemeMode): Exclude<The
 export function initAppearance(): () => void {
 	if (typeof window === 'undefined') return () => undefined;
 
+	let generation = 0;
+	let active = true;
 	const sync = () => {
 		const preferences = getStoredPreferences();
-		applyTheme(preferences.theme, preferences.mode);
+		const request = ++generation;
+		void loadTheme(preferences.theme)
+			.then(() => true, async () => {
+				try {
+					await loadTheme(DEFAULT_THEME);
+				} catch {
+					// Keep the currently loaded palette if even the bundled default fails.
+				}
+				return false;
+			})
+			.then((loaded) => {
+				if (!active || request !== generation) return;
+				applyTheme(loaded ? preferences.theme : DEFAULT_THEME, preferences.mode);
+			});
 	};
 	const media = typeof window.matchMedia === 'function' ? window.matchMedia(SYSTEM_MEDIA_QUERY) : undefined;
 	const handleSystemChange = () => {
@@ -240,6 +255,8 @@ export function initAppearance(): () => void {
 	else if (media && typeof media.addListener === 'function') media.addListener(handleSystemChange);
 	window.addEventListener('storage', sync);
 	return () => {
+		active = false;
+		generation += 1;
 		if (media && typeof media.removeEventListener === 'function') media.removeEventListener('change', handleSystemChange);
 		else if (media && typeof media.removeListener === 'function') media.removeListener(handleSystemChange);
 		window.removeEventListener('storage', sync);
