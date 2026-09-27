@@ -1,19 +1,24 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '$lib/server/engine';
+import { safeNext } from '$lib/server/safe-next';
+import { env } from '$env/dynamic/private';
 
 type AuthConfig = { setup_required: boolean; local_login_enabled: boolean; oidc_enabled: boolean };
 type SessionResult = { session_token: string; max_age: number };
 
-function safeNext(value: FormDataEntryValue | null) {
-	const next = typeof value === 'string' ? value : '/';
-	return next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\') ? next : '/';
-}
-
 export const load: PageServerLoad = async ({ url }) => {
 	const config = await engine<AuthConfig>('/auth/config');
-	const error = url.searchParams.get('error');
-	return { ...config, next: safeNext(url.searchParams.get('next')), error: error === 'unlinked' ? 'This SSO identity is not linked yet. Sign in with your local account and link it from Account settings.' : error === 'sso' ? 'Single sign-on could not be completed. Try again or use your username and password.' : '' };
+	const next = safeNext(url.searchParams.get('next'));
+	const errorCode = url.searchParams.get('error');
+	const error = errorCode === 'unlinked' ? 'This SSO identity is not linked yet. Sign in with your local account and link it from Account settings.' : errorCode === 'sso' ? 'Single sign-on could not be completed. Try again or use your username and password.' : '';
+	const autoSso = env.OIDC_AUTO_LOGIN?.trim().toLowerCase() === 'true' && config.oidc_enabled;
+	const manualLogin = url.searchParams.get('manual') === '1';
+	const ssoFailed = errorCode === 'sso' || errorCode === 'unlinked';
+	if (autoSso && !config.setup_required && !manualLogin && !ssoFailed) {
+		throw redirect(303, `/auth/oidc/start?intent=login&next=${encodeURIComponent(next)}`);
+	}
+	return { ...config, next, auto_sso: autoSso, manual_login: manualLogin, error };
 };
 
 export const actions: Actions = {

@@ -11,7 +11,7 @@
 	function saveProfile(value: string) { try { localStorage.setItem('bookward-active-profile', value); } catch { /* Profile checks still run through the server session. */ } }
 
 	onMount(() => {
-		initAppearance();
+		const cleanupAppearance = initAppearance();
 		const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('bookward-profile') : null;
 		profileChannel = channel;
 		const profileId = () => data.user?.profile_id ?? null;
@@ -38,6 +38,7 @@
 			channel?.postMessage({ type: 'profile', profile_id: current });
 		}
 		return () => {
+			cleanupAppearance();
 			channel?.removeEventListener('message', onProfile);
 			channel?.close();
 			document.removeEventListener('submit', addProfileToForm, true);

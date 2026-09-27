@@ -12,9 +12,7 @@
 	<meta name="robots" content="noindex, nofollow" />
 </svelte:head>
 
-<main
-	class="relative isolate grid min-h-dvh overflow-hidden text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-40 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_18%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_14%,_transparent)_100%)] after:opacity-70 dark:before:opacity-75 dark:after:opacity-90"
->
+<main class="login-page relative isolate grid min-h-dvh overflow-hidden text-surface-900-100">
 	<div
 		class="mx-auto grid min-h-dvh w-full max-w-7xl items-center gap-8 px-5 py-8 sm:px-8 sm:py-12 lg:grid-cols-[minmax(0,1fr)_minmax(25rem,32rem)] lg:gap-16 lg:px-12 lg:py-14"
 	>
@@ -55,8 +53,8 @@
 		</section>
 
 		<section class="mx-auto w-full max-w-lg" aria-labelledby="login-title">
-			<div class="card relative overflow-hidden rounded-[2rem] border border-primary-500/15 bg-surface-50-950/90 p-6 shadow-2xl shadow-primary-500/10 backdrop-blur-xl sm:p-9">
-				<div class="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-primary-500 via-secondary-500 to-tertiary-500" aria-hidden="true"></div>
+			<div class="login-card card relative overflow-hidden rounded-[2rem] border bg-surface-50-950/90 p-6 backdrop-blur-xl sm:p-9">
+				<div class="login-accent-bar absolute inset-x-0 top-0 h-1" aria-hidden="true"></div>
 
 				<a href="/" class="mb-8 inline-flex items-center gap-3 text-surface-950-50 no-underline lg:hidden">
 					<img src={bookwardMark} alt="" class="size-11 rounded-2xl shadow-lg shadow-primary-500/20" />
@@ -91,7 +89,7 @@
 							<span id="password-help" class="text-sm font-normal leading-6 text-surface-700-300">Use at least 12 characters.</span>
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="btn group min-h-12 w-full justify-between preset-filled-primary-500" type="submit">
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit">
 							<span>Create administrator</span><ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />
 						</button>
 					</form>
@@ -113,7 +111,7 @@
 							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="current-password" required />
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="btn group min-h-12 w-full justify-between preset-filled-primary-500" type="submit">
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit">
 							<span>Sign in</span><ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />
 						</button>
 					</form>
@@ -121,7 +119,7 @@
 						<div class="my-6 flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.16em] text-surface-600-400">
 							<span class="h-px flex-1 bg-surface-300-700/50"></span><span>or</span><span class="h-px flex-1 bg-surface-300-700/50"></span>
 						</div>
-						<a class="btn min-h-12 w-full justify-between preset-tonal-surface" href="/auth/oidc/start?intent=login">
+						<a class="btn min-h-12 w-full justify-between preset-tonal-surface" href={`/auth/oidc/start?intent=login&next=${encodeURIComponent(data.next)}`}>
 							<span class="inline-flex items-center gap-2"><KeyRound size={16} /> Continue with single sign-on</span><ArrowRight size={16} />
 						</a>
 					{/if}
@@ -131,3 +129,47 @@
 		</section>
 	</div>
 </main>
+
+<style>
+	.login-page {
+		background:
+			radial-gradient(ellipse at 12% 4%, color-mix(in oklab, var(--color-primary-500) 30%, transparent), transparent 35%),
+			radial-gradient(ellipse at 88% 8%, color-mix(in oklab, var(--color-secondary-500) 26%, transparent), transparent 33%),
+			radial-gradient(ellipse at 52% 100%, color-mix(in oklab, var(--color-tertiary-500) 23%, transparent), transparent 43%),
+			var(--color-surface-50-950);
+	}
+
+	.login-card {
+		border-color: color-mix(in oklab, var(--color-primary-500) 32%, var(--color-surface-50-950));
+		box-shadow:
+			0 32px 100px -38px color-mix(in oklab, var(--color-primary-500) 36%, transparent),
+			inset 0 1px 0 color-mix(in oklab, var(--color-secondary-500) 18%, transparent);
+	}
+
+	.login-accent-bar {
+		background: linear-gradient(90deg, var(--color-primary-500), var(--color-secondary-500) 52%, var(--color-tertiary-500));
+	}
+
+	.login-submit {
+		border: 1px solid color-mix(in oklab, var(--color-primary-500) 70%, transparent);
+		background: linear-gradient(110deg, var(--color-primary-500), var(--color-secondary-500) 58%, var(--color-tertiary-500));
+		color: var(--color-primary-contrast-500);
+		box-shadow: 0 10px 28px color-mix(in oklab, var(--color-primary-500) 28%, transparent);
+		transition: filter 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+	}
+
+	.login-submit:hover {
+		filter: brightness(1.08);
+		box-shadow: 0 14px 34px color-mix(in oklab, var(--color-primary-500) 38%, transparent);
+	}
+
+	.login-submit:active {
+		transform: translateY(1px);
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.login-submit {
+			transition: none;
+		}
+	}
+</style>
