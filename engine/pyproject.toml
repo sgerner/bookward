@@ -8,7 +8,7 @@ dependencies = [
   "uvicorn[standard]==0.53.0",
   "httpx==0.28.1",
   "feedparser==6.0.14",
-  "fastembed==0.8.0",
+  "fastembed==0.8.1",
   "beautifulsoup4==4.15.0",
   "cryptography==50.0.1",
   "numpy==2.5.3",
