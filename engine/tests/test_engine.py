@@ -11,6 +11,8 @@ import respx
 import httpx
 from fastapi.testclient import TestClient
 
+from auth_helpers import authenticated_headers
+
 from afterword_engine.config import settings
 from afterword_engine.database import MIGRATIONS, initialize, normalize_key, row, rows, transaction
 from afterword_engine.covers import (
@@ -38,6 +40,7 @@ from afterword_engine.ingestion import (
     scan_source,
 )
 from afterword_engine import ingestion
+from afterword_engine import profiles
 from afterword_engine.scoring import score_all, cached_vectors, _max_cosine_similarities
 from afterword_engine.scoring import rebuild_all_embeddings
 from afterword_engine.embeddings import get_embedder
@@ -60,6 +63,7 @@ from afterword_engine.digest import digest_is_due, digest_preview, send_digest, 
 def database(tmp_path: Path):
     settings.db = str(tmp_path / "test.db")
     initialize()
+    profiles.initialize_auth()
     return settings.db
 
 def test_fresh_database_seeds_independent_demo(database):
@@ -976,7 +980,7 @@ def test_private_source_addresses_are_rejected(monkeypatch):
 
 def test_nyt_source_endpoints_reject_inline_credentials():
     url = "https://api.nytimes.com/svc/books/v3/lists/overview.json?api-key=never-store-this"
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         preview = client.post("/api/sources/preview", json={"url": url})
         assert preview.status_code == 400
         assert "encrypted NYT API settings" in preview.json()["detail"]
@@ -985,7 +989,7 @@ def test_nyt_source_endpoints_reject_inline_credentials():
         assert "never-store-this" not in created.text
 
 def test_api_boots_and_serves_recommendations(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         assert client.get("/api/health").json()["ok"] is True
         overview = client.get("/api/overview")
         assert overview.status_code == 200
@@ -1041,7 +1045,7 @@ def test_reading_list_tracks_up_next_reading_and_finished_states(database):
     with transaction() as con:
         con.execute("UPDATE candidates SET status='saved' WHERE id IN (1,2)")
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         initial = client.get("/api/reading-list")
         assert initial.status_code == 200
         first = next(item for item in initial.json() if item["id"] == 1)
@@ -1141,7 +1145,7 @@ def test_recommendations_filter_and_paginate_in_sql(database):
         con.execute("UPDATE candidates SET status='recommended', score=id")
         con.execute("UPDATE candidates SET status='saved' WHERE id=1")
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         page = client.get("/api/recommendations?status=recommended&limit=2&offset=1")
         assert page.status_code == 200
         assert len(page.json()) == 2
@@ -1178,7 +1182,7 @@ def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
 
 def test_settings_encrypt_and_preserve_api_keys(database):
     payload = {"embedding_backend":"local","embedding_model":"anything","embedding_url":"","embedding_api_key":"embedding-secret","librarr_url":"http://librarr:5050","librarr_api_key":"librarr-secret","librarr_media_type":"ebook"}
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         assert client.put("/api/settings", json=payload).status_code == 200
         payload["embedding_api_key"] = payload["librarr_api_key"] = ""
         assert client.put("/api/settings", json=payload).status_code == 200
@@ -1188,7 +1192,7 @@ def test_settings_encrypt_and_preserve_api_keys(database):
 
 
 def test_nyt_books_key_is_encrypted_and_only_added_to_outgoing_requests(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         assert client.get("/api/settings/nyt").json() == {"api_key_set": False}
         saved = client.put("/api/settings/nyt", json={"api_key": "nyt-test-key"})
         assert saved.json() == {"saved": True, "api_key_set": True}
@@ -1268,7 +1272,7 @@ def test_existing_subject_cleanup_updates_catalog_artifacts(database):
 
 
 def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         unauthorized = client.get("/api/v1/recommendations")
         assert unauthorized.status_code == 401
         assert unauthorized.headers["www-authenticate"] == "Bearer"
@@ -1297,7 +1301,8 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
         listed = client.get("/api/settings/api-tokens").json()["tokens"]
         assert listed[0]["name"] == "Home Assistant"
         assert "token" not in listed[0]
-        stored = row("SELECT token_hash FROM api_tokens WHERE id=?", (created.json()["id"],))
+        with profiles.auth_connect() as con:
+            stored = con.execute("SELECT token_hash FROM api_tokens WHERE id=?", (created.json()["id"],)).fetchone()
         assert stored["token_hash"] != token
 
         authorized = client.get(
@@ -1306,7 +1311,9 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
         )
         assert authorized.status_code == 200
         assert len(authorized.json()) == 4
-        assert row("SELECT last_used_at FROM api_tokens WHERE id=?", (created.json()["id"],))["last_used_at"]
+        with profiles.auth_connect() as con:
+            last_used = con.execute("SELECT last_used_at FROM api_tokens WHERE id=?", (created.json()["id"],)).fetchone()
+        assert last_used["last_used_at"]
         public_overview = client.get(
             "/api/v1/overview",
             headers={"Authorization": f"Bearer {token}"},
@@ -1326,11 +1333,11 @@ def test_api_tokens_authenticate_public_api_and_can_be_revoked(database):
 
 
 def test_legacy_api_token_hash_is_upgraded_on_first_use(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         created = client.post("/api/settings/api-tokens", json={"name": "Legacy client"})
         token = created.json()["token"]
         token_id = created.json()["id"]
-        with transaction() as con:
+        with profiles.auth_connect() as con:
             con.execute(
                 "UPDATE api_tokens SET token_hash=? WHERE id=?",
                 (legacy_hash_api_token(token), token_id),
@@ -1341,7 +1348,9 @@ def test_legacy_api_token_hash_is_upgraded_on_first_use(database):
             headers={"Authorization": f"Bearer {token}"},
         )
         assert authorized.status_code == 200
-        assert row("SELECT token_hash FROM api_tokens WHERE id=?", (token_id,))["token_hash"] == hash_api_token(token)
+        with profiles.auth_connect() as con:
+            stored = con.execute("SELECT token_hash FROM api_tokens WHERE id=?", (token_id,)).fetchone()
+        assert stored["token_hash"] == hash_api_token(token)
 
 
 def test_api_recommendation_status_filter_applies_before_limit(database):
@@ -1370,7 +1379,7 @@ def test_api_recommendation_status_filter_applies_before_limit(database):
             "UPDATE candidates SET status='saved' WHERE title='Recommended 100'"
         )
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         token = client.post(
             "/api/settings/api-tokens", json={"name": "Filter test"}
         ).json()["token"]
@@ -1382,7 +1391,7 @@ def test_api_recommendation_status_filter_applies_before_limit(database):
         assert [item["title"] for item in response.json()] == ["Recommended 100"]
 
 def test_api_token_rejects_unbounded_and_wrong_prefix_candidates(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         oversized = client.get(
             "/api/v1/health",
             headers={"Authorization": f"Bearer {'bkw_' + 'x' * 200}"},
@@ -1844,7 +1853,7 @@ def test_librarr_import_contract_and_idempotency(database):
         con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_url','http://librarr:5050',0)")
         con.execute("INSERT INTO settings(key,value,secret) VALUES('librarr_api_key',?,1)", (seal("test-key"),))
     route = respx.post("http://librarr:5050/api/wishlist").mock(return_value=httpx.Response(200, json={"id":"remote-1"}))
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         first = client.post("/api/recommendations/1/import")
         second = client.post("/api/recommendations/1/import")
     assert first.json()["remote_id"] == "remote-1"
@@ -1862,7 +1871,7 @@ def test_librarr_search_and_direct_download_forward_selected_media(database):
     audio_search_route = respx.get("http://librarr:5050/api/search/audiobooks").mock(return_value=httpx.Response(200, json={"items":[{"title":"An Audio Book","author":"A Writer","id":"audio-1"}]}))
     download_route = respx.post("http://librarr:5050/api/download").mock(return_value=httpx.Response(200, json={"id":"download-1"}))
     audio_download_route = respx.post("http://librarr:5050/api/download/audiobook").mock(return_value=httpx.Response(200, json={"id":"audio-download-1"}))
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         found = client.get("/api/librarr/search", params={"q":"A Book","media_type":"ebook"})
         found_audio = client.get("/api/librarr/search", params={"q":"An Audio Book","media_type":"audiobook"})
         added = client.post("/api/librarr/download", json={"media_type":"ebook","result":{"title":"A Book","author":"A Writer","id":"book-1"}})
@@ -1904,13 +1913,16 @@ def test_librarr_stream_search_forwards_sse_and_preserves_event_frames(database)
         )
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         ebook = client.get("/api/librarr/search/stream", params={"q": "A Book", "media_type": "ebook"})
         audiobook = client.get("/api/librarr/search/stream", params={"q": "Audio Book", "media_type": "audiobook"})
 
     assert ebook.status_code == 200
     assert ebook.headers["content-type"].startswith("text/event-stream")
-    assert ebook.headers["cache-control"] == "no-cache, no-transform"
+    assert "no-cache" in ebook.headers["cache-control"]
+    assert "no-transform" in ebook.headers["cache-control"]
+    assert "private" in ebook.headers["cache-control"]
+    assert "no-store" in ebook.headers["cache-control"]
     assert ebook.headers["x-accel-buffering"] == "no"
     assert ebook.text == body
     assert ebook_route.calls[0].request.url.params["q"] == "A Book"
@@ -1928,19 +1940,19 @@ def test_librarr_stream_search_signals_unsupported_legacy_service(database):
     respx.get("http://librarr:5050/api/search/stream").mock(
         return_value=httpx.Response(404, json={"detail": "Not found"})
     )
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.get("/api/librarr/search/stream", params={"q": "A Book", "media_type": "ebook"})
     assert response.status_code == 501
     assert "does not support streaming" in response.json()["detail"]
 
 def test_librarr_media_type_is_validated(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.put("/api/settings", json={"embedding_backend":"local","embedding_model":"hashing-768","librarr_media_type":"vinyl"})
     assert response.status_code == 400
 
 
 def test_digest_settings_are_safe_and_bulk_feedback_is_idempotent(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         saved = client.put(
             "/api/digest/settings",
             json={
@@ -2010,7 +2022,7 @@ def test_discord_digest_is_idempotent_and_records_delivery(database, monkeypatch
     assert first["status"] == "sent" and route.call_count == 1
     discord_body = json.loads(route.calls[0].request.content)
     assert "digest=1" in discord_body["content"]
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         review = client.get("/api/digest/review", params={"period": first["period"]})
         assert review.status_code == 200 and review.json()["found"] is True and len(review.json()["ids"]) == 2
     assert row("SELECT COUNT(*) count FROM notification_deliveries WHERE status='sent'")["count"] == 1
@@ -2022,7 +2034,7 @@ def test_discord_digest_is_idempotent_and_records_delivery(database, monkeypatch
 
 
 def test_digest_review_marks_unknown_period_as_stale(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.get("/api/digest/review", params={"period": "2026-W52"})
     assert response.status_code == 200
     assert response.json() == {"period": "2026-W52", "ids": [], "found": False}

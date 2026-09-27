@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from auth_helpers import authenticated_headers
+
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
 from afterword_engine.ingestion import import_goodreads_csv
@@ -48,7 +50,7 @@ def test_recommendation_responses_create_ranked_run_and_impressions(database):
     assert learning["mode"] == "confidence_gated_live"
     assert learning["scope"] == "installation"
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.get("/api/recommendations")
     assert response.status_code == 200
     header_run = response.headers["x-bookward-recommendation-run"]
@@ -252,7 +254,7 @@ def test_manual_read_marks_candidate_read_and_learns_without_a_session(database)
     assert candidate_id in {
         item["id"] for item in recommendation_list(status="recommended", limit=None)
     }
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.post(
             f"/api/recommendations/{candidate_id}/read",
             json={"rating": 4},
@@ -287,7 +289,7 @@ def test_manual_read_marks_candidate_read_and_learns_without_a_session(database)
         event["candidate_id"] for event in load_interaction_events()
     }
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         no_rating = client.post(
             f"/api/recommendations/{candidate_id}/read",
             json={},
@@ -332,7 +334,7 @@ def test_telemetry_batch_is_strict_and_idempotent(database):
             }
         ]
     }
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         first = client.post("/api/telemetry/events", json=payload)
         second = client.post("/api/telemetry/events", json=payload)
         conflict = client.post(
@@ -386,7 +388,7 @@ def test_telemetry_batch_is_strict_and_idempotent(database):
 def test_feedback_with_run_id_creates_explicit_outcome(database):
     recommendations, run_id = tracked_recommendations()
     candidate_id = recommendations[0]["id"]
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.post(
             f"/api/recommendations/{candidate_id}/feedback",
             json={"action": "save", "run_id": run_id},
@@ -405,7 +407,7 @@ def test_feedback_with_run_id_creates_explicit_outcome(database):
     assert outcome["label_kind"] == "explicit_feedback"
     assert outcome["confidence"] == 0.8
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         invalid = client.post(
             f"/api/recommendations/{candidate_id}/feedback",
             json={"action": "reject", "run_id": "missing-run-1"},
@@ -418,7 +420,7 @@ def test_maybe_later_is_persisted_as_neutral_and_can_be_undone(database):
     recommendations, run_id = tracked_recommendations()
     candidate_id = recommendations[0]["id"]
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         passed = client.post(
             f"/api/recommendations/{candidate_id}/feedback",
             json={"action": "reject", "run_id": run_id},
@@ -491,7 +493,7 @@ def test_undo_reverses_save_and_pass_state_without_relabeling_maybe_later(
 ):
     recommendations, run_id = tracked_recommendations()
     candidate_id = recommendations[0]["id"]
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         decision = client.post(
             f"/api/recommendations/{candidate_id}/feedback",
             json={"action": action, "run_id": run_id},
@@ -535,7 +537,7 @@ def test_undo_reverses_save_and_pass_state_without_relabeling_maybe_later(
 def test_only_the_latest_feedback_can_be_undone(database):
     recommendations, run_id = tracked_recommendations()
     candidate_id = recommendations[0]["id"]
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         first = client.post(
             f"/api/recommendations/{candidate_id}/feedback",
             json={"action": "save", "run_id": run_id},

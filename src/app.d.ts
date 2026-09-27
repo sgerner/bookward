@@ -6,9 +6,11 @@ declare module '*?raw' {
 }
 
 declare global {
-	namespace App {
+		namespace App {
 		// interface Error {}
-		// interface Locals {}
+		interface Locals {
+			user?: { id: string; profile_id: string; username: string; display_name: string; role: 'admin' | 'user'; must_change_password: boolean };
+		}
 		// interface PageData {}
 		// interface PageState {}
 		// interface Platform {}

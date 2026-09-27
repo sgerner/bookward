@@ -62,6 +62,7 @@ export async function proxyApi(event: RequestEvent) {
     const value = event.request.headers.get(name);
     if (value) headers.set(name, value);
   }
+  if (env.ENGINE_SERVICE_SECRET) headers.set("x-bookward-service", env.ENGINE_SERVICE_SECRET);
 
   let upstream: Response;
   try {

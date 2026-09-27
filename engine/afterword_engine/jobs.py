@@ -22,18 +22,29 @@ def enqueue_job(kind: str, dedupe: bool = False):
 async def worker_loop(handler, stop):
     import asyncio
     from .database import row
-    with transaction() as con: con.execute("UPDATE jobs SET status='queued',started_at=NULL WHERE status='running'")
+    from .profiles import profile_ids
+    from .tenancy import profile_scope
     while not stop.is_set():
-        job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
-        if not job:
+        worked = False
+        for profile_id in profile_ids():
+            if stop.is_set():
+                break
+            with profile_scope(profile_id):
+                with transaction() as con:
+                    con.execute("UPDATE jobs SET status='queued',started_at=NULL WHERE status='running'")
+                job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
+                if not job:
+                    continue
+                with transaction() as con:
+                    claimed = con.execute("UPDATE jobs SET status='running',started_at=? WHERE id=? AND status='queued'", (now(), job["id"])).rowcount
+                if not claimed:
+                    continue
+                worked = True
+                try:
+                    result = await handler(job["kind"])
+                    with transaction() as con: con.execute("UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=? WHERE id=?", (json.dumps(result), now(), job["id"]))
+                except Exception as exc:
+                    with transaction() as con: con.execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE id=?", (safe_error_message(exc, limit=2000), now(), job["id"]))
+        if not worked:
             try: await asyncio.wait_for(stop.wait(), timeout=.5)
             except TimeoutError: pass
-            continue
-        with transaction() as con:
-            claimed = con.execute("UPDATE jobs SET status='running',started_at=? WHERE id=? AND status='queued'", (now(), job["id"])).rowcount
-        if not claimed: continue
-        try:
-            result = await handler(job["kind"])
-            with transaction() as con: con.execute("UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=? WHERE id=?", (json.dumps(result), now(), job["id"]))
-        except Exception as exc:
-            with transaction() as con: con.execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE id=?", (safe_error_message(exc, limit=2000), now(), job["id"]))

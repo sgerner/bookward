@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import date, timedelta
@@ -9,6 +10,7 @@ from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
+from .tenancy import profile_database_path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -495,24 +497,116 @@ DEFAULT_SOURCES = (
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
 )
 
-DATABASE_LOCK = threading.RLock()
+class _ProfileDatabaseLock:
+    """Allow concurrent connections and let backup/restore take an exclusive lock."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._writer: int | None = None
+        self._write_depth = 0
+        self._waiting_writers = 0
+        self._connections = 0
+        self._connections_by_thread: dict[int, int] = {}
+
+    def acquire_connection(self) -> int:
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            while (
+                self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
+                self._condition.wait()
+            self._connections += 1
+            self._connections_by_thread[owner] = (
+                self._connections_by_thread.get(owner, 0) + 1
+            )
+        return owner
+
+    def release_connection(self, owner: int) -> None:
+        with self._condition:
+            count = self._connections_by_thread.get(owner, 0)
+            if not count:
+                return
+            self._connections -= 1
+            if count == 1:
+                del self._connections_by_thread[owner]
+            else:
+                self._connections_by_thread[owner] = count - 1
+            self._condition.notify_all()
+
+    def acquire(self) -> None:
+        owner = threading.get_ident()
+        with self._condition:
+            if self._writer == owner:
+                self._write_depth += 1
+                return
+            self._waiting_writers += 1
+            try:
+                while self._writer is not None or self._connections:
+                    self._condition.wait()
+                self._writer = owner
+                self._write_depth = 1
+            finally:
+                self._waiting_writers -= 1
+
+    def release(self) -> None:
+        owner = threading.get_ident()
+        with self._condition:
+            if self._writer != owner:
+                raise RuntimeError("Profile database lock released by a non-owner")
+            self._write_depth -= 1
+            if not self._write_depth:
+                self._writer = None
+                self._condition.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+
+_DATABASE_LOCKS: weakref.WeakValueDictionary[str, _ProfileDatabaseLock] = (
+    weakref.WeakValueDictionary()
+)
+_DATABASE_LOCKS_GUARD = threading.Lock()
+_DATABASE_SETUP_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
+    """Return the process lock for one profile database file."""
+
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _DATABASE_LOCKS_GUARD:
+        return _DATABASE_LOCKS.setdefault(key, _ProfileDatabaseLock())
+
+
+def _database_setup_lock(path: Path) -> threading.RLock:
+    key = str(path)
+    with _DATABASE_LOCKS_GUARD:
+        return _DATABASE_SETUP_LOCKS.setdefault(key, threading.RLock())
 
 
 class _LockedConnection(sqlite3.Connection):
-    """Hold the process database lock for the lifetime of each connection.
-
-    Backups and restores use this same lock to wait for active requests and
-    keep new ones out while the live database file is being replaced.
-    """
+    """Keep restores from replacing a profile database used by a live request."""
 
     def __init__(self, *args, **kwargs):
-        DATABASE_LOCK.acquire()
+        self._database_lock = database_lock(args[0] if args else None)
+        self._database_lock_owner = self._database_lock.acquire_connection()
         self._database_lock_held = True
         try:
             super().__init__(*args, **kwargs)
         except Exception:
             self._database_lock_held = False
-            DATABASE_LOCK.release()
+            self._database_lock.release_connection(self._database_lock_owner)
             raise
 
     def close(self):
@@ -523,7 +617,7 @@ class _LockedConnection(sqlite3.Connection):
             super().close()
         finally:
             if held:
-                DATABASE_LOCK.release()
+                self._database_lock.release_connection(self._database_lock_owner)
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -533,8 +627,13 @@ class _LockedConnection(sqlite3.Connection):
 
 
 def connect():
-    db_path = Path(settings.db)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = profile_database_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if db_path.parent.name == "profiles":
+        try:
+            db_path.parent.chmod(0o700)
+        except OSError:
+            pass
     con = sqlite3.connect(
         db_path, timeout=10, check_same_thread=False, factory=_LockedConnection
     )
@@ -542,10 +641,13 @@ def connect():
         con.row_factory = sqlite3.Row
         con.create_function("book_identity", 2, book_identity, deterministic=True)
         con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA foreign_keys=ON")
-        con.execute("PRAGMA busy_timeout=5000")
-        _restrict_database_files()
+        with _database_setup_lock(db_path):
+            mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA busy_timeout=5000")
+            _restrict_database_files()
         return con
     except Exception:
         con.close()
@@ -555,7 +657,8 @@ def connect():
 def _restrict_database_files():
     """Keep the database and SQLite sidecars private to the engine user."""
 
-    for path in (Path(settings.db), Path(f"{settings.db}-wal"), Path(f"{settings.db}-shm")):
+    db_path = profile_database_path()
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
         try:
             path.chmod(0o600)
         except FileNotFoundError:
@@ -605,7 +708,9 @@ def transaction():
         con.close()
         _restrict_database_files()
 
-def initialize():
+def initialize(*, seed_demo: bool = True):
+    db_path = profile_database_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
@@ -658,8 +763,8 @@ def initialize():
                 (name, url, "web", enabled),
             )
         seed = Path(__file__).with_name("seed.json")
-        seed_items = json.loads(seed.read_text())
-        if not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone():
+        seed_items = json.loads(seed.read_text()) if seed_demo else []
+        if seed_demo and not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone():
             for item in seed_items:
                 release_date = (date.today() + timedelta(days=int(item.get("release_offset_days", 30)))).isoformat()
                 con.execute("""INSERT OR IGNORE INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,score,explanation,status,normalized_key)

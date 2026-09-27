@@ -69,7 +69,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 ### For self-hosters
 
 - SvelteKit frontend and FastAPI engine run independently, with no external scheduler required.
-- SQLite stores the catalog, feedback, jobs, settings, and delivery history in one persistent volume.
+- SQLite stores a separate catalog, reading history, shortlist, settings, and jobs for each account in one persistent volume.
 - Scheduled, WAL-safe database snapshots, manual backups, and an in-app restore flow help recover a self-hosted installation.
 - Integration keys are encrypted in the engine database and are never returned to the browser.
 - Public source fetching rejects private, loopback, link-local, and metadata addresses.
@@ -206,6 +206,8 @@ ENGINE_URL=http://127.0.0.1:8000 \
 
 Open <http://127.0.0.1:5173>. The engine creates the SQLite database and a clearly labeled, sanitized demo catalog on a fresh install. Those books are sample data, not a live editorial feed; disable the demo source from **Sources** when you are ready to use your own inputs.
 
+The engine prints a one-use administrator setup token on first start when `AFTERWORD_AUTH_PASSWORD` is blank. Run `docker compose logs engine` and enter the token at `/login`. For a local development run, read it from the engine terminal. If that log is unavailable before setup, run `docker compose run --rm engine python -m afterword_engine.auth_admin setup-token` to issue another one. Existing installs with `AFTERWORD_AUTH_USERNAME` and `AFTERWORD_AUTH_PASSWORD` migrate those credentials to the first administrator account automatically. After that migration, account passwords live as Argon2id hashes in Bookward's identity registry; the environment password is no longer used.
+
 ### 4. Make it yours
 
 1. Open **Settings** and import a full Goodreads CSV export. RSS is useful for incremental refreshes, but a CSV export is the way to bring in your complete history.
@@ -222,21 +224,29 @@ Docker is the easiest way to run Bookward as a small self-hosted service.
 cp .env.example .env
 ~~~
 
-Before exposing Bookward beyond your own machine, set a strong `AFTERWORD_AUTH_PASSWORD` and set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. The default `BIND_ADDRESS=127.0.0.1` keeps the service local.
+Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade; for a new install, leave it blank and use the one-time setup token.
 
 ~~~
 docker compose up --build -d
 ~~~
 
-Open <http://127.0.0.1:3000>. Bookward stores SQLite data and the generated encryption key in the `afterword-data` volume. Stop the stack with:
+Open <http://127.0.0.1:3000>. Bookward stores the identity registry, each profile's SQLite database, and the generated encryption key in the `afterword-data` volume. Stop the stack with:
 
 ~~~
 docker compose down
 ~~~
 
-Bookward creates a SQLite online backup every 24 hours and keeps the latest 7 snapshots in the separate `afterword-backups` Docker volume. Each snapshot has a matching generated-key recovery file beside it; both files are owner-only in a private directory. Settings shows the last successful backup, lets you create a snapshot, and can restore a selected snapshot after you type `RESTORE`. Restore makes an extra safety snapshot first. Configure `BACKUP_INTERVAL_HOURS=0` to disable scheduled snapshots; `BACKUP_RETENTION_COUNT` changes how many scheduled or manual snapshots are kept. Set `BACKUP_DIR` only to a directory mounted persistently into the engine container. For disaster recovery, preserve the `afterword-backups` volume separately from `afterword-data`; `docker compose down -v` removes both.
+Bookward creates an online backup for each active profile every 24 hours and keeps the latest 7 profile snapshots in the separate `afterword-backups` Docker volume. It also backs up the account registry under `auth-registry/`. Each profile snapshot has a matching generated-key recovery file beside it; both files are owner-only in private directories. Settings shows the current profile's last successful backup, lets that profile create a snapshot, and restores only that profile after you type `RESTORE`. Restore makes an extra safety snapshot first. Configure `BACKUP_INTERVAL_HOURS=0` to disable scheduled snapshots; `BACKUP_RETENTION_COUNT` changes how many scheduled or manual snapshots are kept. Set `BACKUP_DIR` only to a directory mounted persistently into the engine container. For disaster recovery, preserve the `afterword-backups` volume separately from `afterword-data`; `docker compose down -v` removes both.
 
-Snapshots include every application table, including encrypted integration credentials. When Bookward generated the Fernet key, the private backup volume keeps a matching `secret.key` recovery file for each snapshot; restoring a snapshot restores its generated key too. If you set `AFTERWORD_SECRET_KEY` yourself, that value is not copied into backups and must be restored from your deployment's secret store. Snapshot and key files never appear in browser responses. Keep both Docker volumes or copy the private backup directory to secure storage outside the host. Keep the engine port private and protect the web app with authentication when exposing it beyond localhost.
+Profile snapshots include that profile's data and encrypted integration credentials. The shared identity registry has a separate operator recovery command. Stop the engine before restoring it: `docker compose run --rm engine python -m afterword_engine.auth_admin list`, then `docker compose run --rm engine python -m afterword_engine.auth_admin restore <snapshot-id> --confirm`. Restore revokes all restored sessions and API tokens; users sign in again and integrations need new tokens. When Bookward generated the Fernet key, the private backup volume keeps a matching `secret.key` recovery file for each profile snapshot; restoring a snapshot restores its generated key too. If you set `AFTERWORD_SECRET_KEY` yourself, that value is not copied into backups and must be restored from your deployment's secret store. Snapshot and key files never appear in browser responses. Keep both Docker volumes or copy the private backup directory to secure storage outside the host.
+
+### Accounts and single sign-on
+
+The first administrator can create accounts at **Manage accounts**. Each account opens its own profile automatically. New accounts receive a temporary password set by the administrator and must change it on first sign-in. Readers can link an OpenID Connect identity under **Account** after signing in; later SSO sign-ins go directly to the linked profile. Matching email addresses never link accounts automatically.
+
+Configure one OpenID Connect provider with `OIDC_ISSUER`, `OIDC_CLIENT_ID`, and `OIDC_CLIENT_SECRET`. `OIDC_REDIRECT_URI` is optional; when omitted, Bookward uses `{AFTERWORD_PUBLIC_URL}/auth/oidc/callback`. Set `OIDC_AUTO_PROVISION=true` only when every authenticated identity from the configured issuer should receive a profile automatically. The default is `false`, so SSO identities must first be linked to an existing account. SSO uses authorization code flow with PKCE and validates issuer, audience, signature, state, nonce, and redirect configuration.
+
+Candidate pools, reads, shortlists, sources, learning history, jobs, API tokens, and integration settings are stored in separate SQLite files per profile. Bookward currently keeps embeddings inside each profile database; this spends more disk and compute while preserving the same isolation boundary.
 
 The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. To try Ollama locally:
 
@@ -263,7 +273,11 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `ORIGIN` | Canonical browser origin used by the web server. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
-| `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional HTTP Basic authentication for the web app. |
+| `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional one-time bootstrap credentials for the first administrator, or compatibility migration from existing Basic authentication. |
+| `ENGINE_SERVICE_SECRET` | Private credential shared by the web and engine containers. |
+| `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | Optional OpenID Connect provider configuration. |
+| `OIDC_REDIRECT_URI` | Optional exact callback URL registered with the provider. |
+| `OIDC_AUTO_PROVISION` | Allow any valid identity from the configured issuer to create a profile; defaults to `false`. |
 | `AFTERWORD_DB` | SQLite path for a local engine run. Docker uses `/data/afterword.db`. |
 | `EMBEDDING_BACKEND` / `EMBEDDING_MODEL` | Provider and model selected by the engine. |
 | `EMBEDDING_URL` / `EMBEDDING_API_KEY` | Endpoint and optional key for remote or Ollama providers. |

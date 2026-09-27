@@ -1,5 +1,30 @@
-import { describe, expect, it } from 'vitest';
-import { authorized, isPublicApiPath, withSecurityHeaders } from './hooks.server';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { authorized, handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
+import { currentSessionToken } from '$lib/server/request-context';
+
+afterEach(() => vi.unstubAllGlobals());
+
+function eventFor(request: Request, session?: string) {
+	return {
+		url: new URL(request.url),
+		request,
+		locals: {},
+		cookies: {
+			get: (name: string) => name === 'bookward_session' ? session : undefined,
+			set: vi.fn(),
+			delete: vi.fn()
+		}
+	} as never;
+}
+
+function mockSessionLookup(profileId = 'alice-profile') {
+	const fetchMock = vi.fn().mockImplementation(() => new Response(JSON.stringify({
+		id: 'alice', profile_id: profileId, username: 'alice', display_name: 'Alice',
+		role: 'user', must_change_password: false
+	}), { status: 200, headers: { 'content-type': 'application/json' } }));
+	vi.stubGlobal('fetch', fetchMock);
+	return fetchMock;
+}
 
 describe('authentication boundary', () => {
   it('requires configured basic authentication and accepts colons in passwords', async () => {
@@ -26,4 +51,60 @@ describe('authentication boundary', () => {
     expect(response.headers.get('referrer-policy')).toBe('strict-origin-when-cross-origin');
     expect(response.headers.get('permissions-policy')).toBe('camera=(), geolocation=(), microphone=()');
   });
+
+	it('denies private API routes without a browser session', async () => {
+		const request = new Request('http://afterword.test/api/telemetry');
+		const response = await handle({
+			event: eventFor(request),
+			resolve: vi.fn()
+		} as never);
+
+		expect(response.status).toBe(401);
+	});
+
+	it('rejects cross-origin mutations before resolving the session', async () => {
+		const fetchMock = mockSessionLookup();
+		const request = new Request('http://afterword.test/api/telemetry', {
+			method: 'POST',
+			headers: { origin: 'https://attacker.test', 'content-type': 'application/json' },
+			body: JSON.stringify({ expected_profile_id: 'alice-profile', events: [] })
+		});
+		const response = await handle({
+			event: eventFor(request, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+
+		expect(response.status).toBe(403);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it('binds authenticated mutations to the current profile and request session', async () => {
+		mockSessionLookup();
+		const request = new Request('http://afterword.test/api/telemetry', {
+			method: 'POST',
+			headers: { origin: 'http://afterword.test', 'content-type': 'application/json' },
+			body: JSON.stringify({ expected_profile_id: 'other-profile', events: [] })
+		});
+		const mismatch = await handle({
+			event: eventFor(request, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(mismatch.status).toBe(409);
+
+		const validRequest = new Request('http://afterword.test/api/telemetry', {
+			method: 'POST',
+			headers: { origin: 'http://afterword.test', 'content-type': 'application/json' },
+			body: JSON.stringify({ expected_profile_id: 'alice-profile', events: [] })
+		});
+		let sessionInRoute: string | undefined;
+		const response = await handle({
+			event: eventFor(validRequest, 'valid-session'),
+			resolve: vi.fn(() => {
+				sessionInRoute = currentSessionToken();
+				return Promise.resolve(new Response('ok'));
+			})
+		} as never);
+		expect(response.status).toBe(200);
+		expect(sessionInRoute).toBe('valid-session');
+	});
 });

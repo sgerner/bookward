@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+from auth_helpers import authenticated_headers
 from cryptography.fernet import Fernet
 
 from afterword_engine import backups
@@ -265,7 +267,7 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
             ("api_recovery_secret", seal("api secret")),
         )
 
-    client = TestClient(app)
+    client = TestClient(app, headers=authenticated_headers())
     created = client.post("/api/backups/create", json={})
     assert created.status_code == 200
     backup = created.json()["backup"]

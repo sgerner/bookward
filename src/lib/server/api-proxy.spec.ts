@@ -24,6 +24,7 @@ describe("public API proxy", () => {
           authorization: "Bearer bkw_test",
           "content-type": "application/json",
           "idempotency-key": "request-1",
+          "x-bookward-service": "client-controlled-secret",
           "x-api-key": "bkw_test",
           origin: "https://client.example",
         },
@@ -48,6 +49,7 @@ describe("public API proxy", () => {
     expect(forwarded.get("authorization")).toBe("Bearer bkw_test");
     expect(forwarded.get("x-api-key")).toBe("bkw_test");
     expect(forwarded.get("idempotency-key")).toBe("request-1");
+    expect(forwarded.get("x-bookward-service")).not.toBe("client-controlled-secret");
     expect(await new Response(init.body).json()).toEqual({ action: "save" });
   });
 
