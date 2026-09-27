@@ -39,7 +39,7 @@ The difficult part is tracing ownership through the entire pipeline, not adding 
 
 ### Local accounts
 
-The first administrator uses the one-use setup token emitted by the engine, unless existing Basic-auth credentials bootstrap that account during upgrade. Administrators create additional accounts with a unique normalized username and a temporary password; the user must change that password at first sign-in. Public signup is disabled by default. Display name is optional and never used for identity matching.
+On a new install, the first person to complete setup at `/login` chooses the administrator username and password; creating that account closes setup atomically. Existing Basic-auth credentials still bootstrap the administrator during upgrade. Administrators create additional accounts with a unique normalized username and a temporary password; the user must change that password at first sign-in. Public signup is disabled by default. Display name is optional and never used for identity matching.
 
 Passwords are stored as salted Argon2id hashes through a maintained library. The implementation applies login throttling, bounded input sizes, generic login errors, and secret redaction. See [OWASP password storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
 
@@ -95,7 +95,7 @@ Each account owns exactly one opaque profile ID. Usernames, display names, passw
 
 Every existing personal table lives in the profile file: candidates, reads, sources and their filters, reading progress, feedback, candidate quality, recommendation runs/impressions/events/outcomes, association runs/evidence/cache, settings and encrypted integration credentials, jobs, digest records, Librarr import history, and embedding vectors. The profile file's SQLite integer IDs may overlap with other profiles safely. New profile setup creates the existing schema without copying reads, candidates, progress, history, tokens, or integration credentials. It receives its own default public-source rows. Demo books and ratings remain in the legacy profile only.
 
-The identity registry maps the special `legacy` profile ID to the already deployed database, so existing data files do not need a destructive table rewrite. Startup creates the registry once, hashes configured legacy credentials into the administrator account when available, and moves legacy API token records into the registry with their profile owner. If no password is configured, startup creates a random one-use setup token and logs it once. New accounts get independent database files. Every database runs its own normal schema migrations when initialized.
+The identity registry maps the special `legacy` profile ID to the already deployed database, so existing data files do not need a destructive table rewrite. Startup creates the registry once, hashes configured legacy credentials into the administrator account when available, and moves legacy API token records into the registry with their profile owner. If no password is configured, the first person to complete `/login` setup creates the administrator; a database write lock and a second account-count check ensure that only one request can succeed. New accounts get independent database files. Every database runs its own normal schema migrations when initialized.
 
 API token hashes and profile ownership live centrally because the profile must be known before the engine opens a profile database. Listing or revoking a token is restricted to the active profile. Disabled accounts revoke their sessions and tokens, disable the profile, and stop its scheduled work. Account management can provision, disable, re-enable, and reset passwords; it does not impersonate or merge profiles.
 
@@ -141,7 +141,7 @@ Show the current display name and sign-out action in the app header. The Account
 
 On first engine start after deployment, the engine creates the central identity registry beside the configured SQLite database and creates a `legacy` profile record that points at the existing database. Existing candidate/read/shortlist/settings/job IDs and rows remain in place. Existing schema migrations still run on the legacy database through the regular migration runner.
 
-If the existing Basic-auth username and password are supplied to the engine, startup hashes the password with Argon2id and creates the first administrator account for `legacy`. The username remains the login name. If the password is absent, startup stores only a digest of a random, one-use setup token and logs the token once; `/login` accepts it to create the administrator. If the log is unavailable, the operator can issue another token with `python -m afterword_engine.auth_admin setup-token` while no account exists. Once any administrator account exists, that setup command is unavailable.
+If the existing Basic-auth username and password are supplied to the engine, startup hashes the password with Argon2id and creates the first administrator account for `legacy`. The username remains the login name. If the password is absent, `/login` lets the first person to complete the username and password form create the administrator. Setup is available only while the registry has no accounts, and concurrent setup requests are serialized so a later request cannot replace the first account.
 
 Existing API token hashes and metadata are copied once into the central registry and assigned to `legacy`, preserving those integrations. Each new account receives a fresh empty database under `profiles/<opaque-profile-id>.sqlite3`; its first connection runs the existing schema migrations and initializes default public sources without demo reading history. The web service no longer checks Basic credentials. After verifying that legacy login works, operators should remove `AFTERWORD_AUTH_PASSWORD` from the deployment configuration.
 
@@ -157,7 +157,7 @@ Rollback of the entire feature requires stopping services and restoring the orig
 
 | Phase | Status | Delivered behavior |
 | --- | --- | --- |
-| Identity and migration | Implemented | Central registry, legacy profile mapping, password bootstrap/setup token, and existing API token ownership migration |
+| Identity and migration | Implemented | Central registry, legacy profile mapping, password bootstrap/first-visitor setup, and existing API token ownership migration |
 | Profile storage | Implemented | One SQLite data file per account; request-local engine routing; isolated settings, candidates, reads, shortlists, integrations, jobs, and learning state |
 | Browser authentication | Implemented | Argon2id credentials, opaque server-side sessions, rolling idle expiry, logout, password changes, forced first password change, and CSRF/profile binding |
 | SSO | Implemented | OIDC authorization code plus PKCE, issuer/audience/signature/nonce/state validation, explicit identity linking, and configurable just-in-time provisioning |

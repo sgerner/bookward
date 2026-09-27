@@ -29,10 +29,10 @@ def identity_store(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
     monkeypatch.setattr(settings, "backup_dir", "")
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
-    setup_token = profiles.initialize_auth()
-    if setup_token:
+    profiles.initialize_auth()
+    if profiles.account_count() == 0:
         admin = profiles.create_first_admin(
-            setup_token, "owner", "owner-password-with-enough-length"
+            "owner", "owner-password-with-enough-length"
         )
     else:
         with profiles.auth_connect() as con:
@@ -100,6 +100,103 @@ def test_private_api_selects_data_from_the_authenticated_profile(identity_store)
     assert [item["title"] for item in owner_shortlist] == ["Owner shortlist"]
     assert [item["title"] for item in alice_shortlist] == ["Alice shortlist"]
     assert profile_database_path("legacy") != profile_database_path(alice["profile_id"])
+
+
+def test_first_admin_setup_uses_only_credentials_and_is_available_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "first-admin.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_USERNAME", raising=False)
+    profiles.initialize_auth()
+
+    assert profiles.setup_required() is True
+    with profiles.auth_connect() as con:
+        con.execute(
+            "INSERT INTO auth_meta(key,value) VALUES('setup_token_hash','obsolete-digest')"
+        )
+    profiles.initialize_auth()
+    with profiles.auth_connect() as con:
+        assert con.execute(
+            "SELECT 1 FROM auth_meta WHERE key='setup_token_hash'"
+        ).fetchone() is None
+
+    account = profiles.create_first_admin(
+        "first-reader", "first-reader-password-long"
+    )
+
+    assert account["role"] == "admin"
+    assert account["profile_id"] == "legacy"
+    assert profiles.setup_required() is False
+    with pytest.raises(PermissionError, match="already completed"):
+        profiles.create_first_admin("second-reader", "second-reader-password-long")
+    assert profiles.account_count() == 1
+
+
+def test_concurrent_first_admin_setup_creates_exactly_one_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "concurrent-first-admin.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+    profiles.initialize_auth()
+
+    class FastPasswordHasher:
+        def hash(self, password):
+            return f"test-hash:{password}"
+
+    monkeypatch.setattr(profiles, "PASSWORD_HASHER", FastPasswordHasher())
+    validate_credentials = profiles.validate_credentials
+    both_prechecked = Barrier(2)
+
+    def validate_together(username, password):
+        result = validate_credentials(username, password)
+        both_prechecked.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(profiles, "validate_credentials", validate_together)
+
+    def attempt(username):
+        try:
+            account = profiles.create_first_admin(username, "first-admin-password-long")
+            return ("created", account["username"])
+        except PermissionError:
+            return ("closed", username)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(attempt, ("concurrent-one", "concurrent-two")))
+
+    assert [result[0] for result in results].count("created") == 1
+    assert [result[0] for result in results].count("closed") == 1
+    assert profiles.account_count() == 1
+
+
+def test_auth_setup_api_needs_no_token_and_closes_after_first_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "setup-api.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_USERNAME", raising=False)
+    profiles.initialize_auth()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/auth/setup",
+            json={
+                "username": "web-owner",
+                "password": "web-owner-password-long",
+            },
+        )
+        config = client.get("/auth/config")
+        repeated = client.post(
+            "/auth/setup",
+            json={
+                "username": "late-owner",
+                "password": "late-owner-password-long",
+            },
+        )
+
+    assert created.status_code == 200
+    assert created.json()["account"]["role"] == "admin"
+    assert config.json()["setup_required"] is False
+    assert config.json()["local_login_enabled"] is True
+    assert repeated.status_code == 403
 
 
 def test_admin_provisioned_local_login_opens_a_new_profile(identity_store):

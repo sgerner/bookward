@@ -206,7 +206,7 @@ ENGINE_URL=http://127.0.0.1:8000 \
 
 Open <http://127.0.0.1:5173>. The engine creates the SQLite database and a clearly labeled, sanitized demo catalog on a fresh install. Those books are sample data, not a live editorial feed; disable the demo source from **Sources** when you are ready to use your own inputs.
 
-The engine prints a one-use administrator setup token on first start when `AFTERWORD_AUTH_PASSWORD` is blank. Run `docker compose logs engine` and enter the token at `/login`. For a local development run, read it from the engine terminal. If that log is unavailable before setup, run `docker compose run --rm engine python -m afterword_engine.auth_admin setup-token` to issue another one. Existing installs with `AFTERWORD_AUTH_USERNAME` and `AFTERWORD_AUTH_PASSWORD` migrate those credentials to the first administrator account automatically. After that migration, account passwords live as Argon2id hashes in Bookward's identity registry; the environment password is no longer used.
+On a new install, open `/login` and choose a username and password for the first administrator. The first account created claims administration, and setup closes automatically afterward. Existing installs with `AFTERWORD_AUTH_USERNAME` and `AFTERWORD_AUTH_PASSWORD` migrate those credentials to the first administrator account automatically. After that migration, account passwords live as Argon2id hashes in Bookward's identity registry; the environment password is no longer used.
 
 ### 4. Make it yours
 
@@ -224,7 +224,7 @@ Docker is the easiest way to run Bookward as a small self-hosted service.
 cp .env.example .env
 ~~~
 
-Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade; for a new install, leave it blank and use the one-time setup token.
+Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
 
 ~~~
 docker compose up --build -d
