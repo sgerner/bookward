@@ -39,11 +39,10 @@ export const actions: Actions = {
 		const form = await request.formData();
 		const username = String(form.get('username') || '');
 		const password = String(form.get('password') || '');
-		const setup_token = String(form.get('setup_token') || '');
-		if (!username || !password || !setup_token) return fail(400, { message: 'Complete each setup field.' });
+		if (!username || !password) return fail(400, { message: 'Enter a username and password.' });
 		let result: SessionResult;
 		try {
-			result = await engine<SessionResult>('/auth/setup', { method: 'POST', body: JSON.stringify({ username, password, setup_token }) });
+			result = await engine<SessionResult>('/auth/setup', { method: 'POST', body: JSON.stringify({ username, password }) });
 		} catch (error) {
 			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Account setup is unavailable.' });
 		}

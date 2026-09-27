@@ -149,7 +149,7 @@ def validate_credentials(username: str, password: str) -> tuple[str, str]:
     return clean_username, PASSWORD_HASHER.hash(password)
 
 
-def initialize_auth() -> str | None:
+def initialize_auth() -> None:
     """Create the identity store and establish the existing-data profile."""
     with auth_connect() as con:
         con.executescript(AUTH_SCHEMA)
@@ -165,7 +165,6 @@ def initialize_auth() -> str | None:
         count = con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
         supplied_password = os.getenv("AFTERWORD_AUTH_PASSWORD", "")
         supplied_username = os.getenv("AFTERWORD_AUTH_USERNAME", "bookward")
-        setup_token = None
         if count == 0 and supplied_password:
             # Existing Basic-auth deployments may already use a shorter
             # password. Preserve that credential during migration; new local
@@ -179,16 +178,9 @@ def initialize_auth() -> str | None:
                 "VALUES(?,?,?,?,?,'admin',?)",
                 (uuid.uuid4().hex, "legacy", clean, normalize_username(clean), clean, encoded),
             )
-            con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
-        elif count == 0 and not con.execute(
-            "SELECT 1 FROM auth_meta WHERE key='setup_token_hash'"
-        ).fetchone():
-            setup_token = secrets.token_urlsafe(32)
-            con.execute(
-                "INSERT INTO auth_meta(key,value) VALUES('setup_token_hash',?)",
-                (hashlib.sha256(setup_token.encode()).hexdigest(),),
-            )
-        return setup_token
+        # Older releases stored a setup-token digest here. First-admin setup
+        # is now an atomic first-visitor claim, so remove any obsolete digest.
+        con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
 
 
 def setup_required() -> bool:
@@ -196,32 +188,16 @@ def setup_required() -> bool:
         return con.execute("SELECT 1 FROM accounts LIMIT 1").fetchone() is None
 
 
-def issue_setup_token() -> str:
-    token = secrets.token_urlsafe(32)
+def create_first_admin(username: str, password: str):
+    # Avoid an expensive Argon2 hash on every setup request after the account
+    # exists, then re-check under a write lock to make concurrent first visits
+    # mutually exclusive.
     with auth_connect() as con:
-        con.execute("BEGIN IMMEDIATE")
         if con.execute("SELECT 1 FROM accounts LIMIT 1").fetchone():
-            con.rollback()
-            raise PermissionError("An administrator account already exists.")
-        con.execute(
-            "INSERT INTO auth_meta(key,value) VALUES('setup_token_hash',?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (hashlib.sha256(token.encode()).hexdigest(),),
-        )
-    return token
-
-
-def create_first_admin(setup_token: str, username: str, password: str):
+            raise PermissionError("Initial account setup has already completed.")
     clean, password_hash = validate_credentials(username, password)
-    supplied_hash = hashlib.sha256(setup_token.encode()).hexdigest()
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        stored = con.execute(
-            "SELECT value FROM auth_meta WHERE key='setup_token_hash'"
-        ).fetchone()
-        if not stored or not hmac.compare_digest(supplied_hash, stored[0]):
-            con.rollback()
-            raise PermissionError("The setup token is invalid or has already been used.")
         if con.execute("SELECT 1 FROM accounts LIMIT 1").fetchone():
             con.rollback()
             raise PermissionError("Initial account setup has already completed.")
@@ -231,7 +207,6 @@ def create_first_admin(setup_token: str, username: str, password: str):
             "VALUES(?,?,?,?,?,'admin',?)",
             (account_id, "legacy", clean, normalize_username(clean), clean, password_hash),
         )
-        con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
     return account_by_id(account_id)
 
 

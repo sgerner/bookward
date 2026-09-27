@@ -102,7 +102,7 @@ class LocalLoginIn(BaseModel):
 
 
 class InitialAdminIn(LocalLoginIn):
-    setup_token: str = Field(min_length=20, max_length=256)
+    pass
 
 
 class PasswordChangeIn(BaseModel):
@@ -450,9 +450,7 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
-    setup_token = identity_store.initialize_auth()
-    if setup_token:
-        LOGGER.warning("Initial administrator setup token (one use): %s", setup_token)
+    identity_store.initialize_auth()
     with profile_scope("legacy"):
         recover_interrupted_restore()
         initialize()
@@ -575,9 +573,10 @@ async def authenticate_engine_request(request: Request, call_next):
 
 @app.get("/auth/config")
 def auth_config():
+    setup_pending = identity_store.setup_required()
     return {
-        "setup_required": identity_store.setup_required(),
-        "local_login_enabled": not identity_store.setup_required(),
+        "setup_required": setup_pending,
+        "local_login_enabled": not setup_pending,
         "oidc_enabled": bool(settings.oidc_issuer and settings.oidc_client_id and settings.oidc_client_secret),
     }
 
@@ -597,7 +596,7 @@ def local_login(payload: LocalLoginIn, request: Request):
 @app.post("/auth/setup")
 def initial_admin_setup(payload: InitialAdminIn):
     try:
-        account = identity_store.create_first_admin(payload.setup_token, payload.username, payload.password)
+        account = identity_store.create_first_admin(payload.username, payload.password)
         _ensure_profile_database("legacy")
         raw, account = identity_store.create_session(account["id"])
         return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}

@@ -15,9 +15,8 @@ def authenticated_headers() -> dict[str, str]:
 
     if admin is None:
         if profiles.account_count() == 0:
-            setup_token = profiles.issue_setup_token()
             account = profiles.create_first_admin(
-                setup_token, "test-admin", "test-password-with-sufficient-length"
+                "test-admin", "test-password-with-sufficient-length"
             )
         else:
             account = profiles.create_account(
