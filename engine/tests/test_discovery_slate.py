@@ -3,6 +3,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from auth_helpers import authenticated_headers
+
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
 from afterword_engine.discovery_slate import diversify_discovery_slate
@@ -171,7 +173,7 @@ def test_diversity_layer_is_deterministic_before_paginated_responses(tmp_path: P
     assert full_ids[2] == ids[3]
     assert full_ids[3] == ids[4]
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         api_first = client.get("/api/recommendations?status=recommended&limit=4&offset=0")
         api_second = client.get("/api/recommendations?status=recommended&limit=4&offset=4")
     assert api_first.status_code == api_second.status_code == 200

@@ -7,6 +7,8 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from auth_helpers import authenticated_headers
+
 from afterword_engine.association_sources.google_books import (
     GoogleBooksAssociatedProvider,
     GoogleBooksClient,
@@ -225,7 +227,7 @@ def test_google_shadow_run_records_count_but_does_not_persist_candidates(databas
 
 
 def test_association_settings_and_run_api_are_shadow_only(database):
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         saved = client.put(
             "/api/associations/settings",
             json={

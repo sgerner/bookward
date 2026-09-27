@@ -28,5 +28,13 @@ class Settings(BaseSettings):
     exploration_enabled: bool = False
     exploration_epsilon: float = 0.0
     exploration_stable_top_k: int = 4
+    # A shared secret between the SvelteKit server and engine. Leave blank only
+    # when both containers communicate on a private network.
+    service_secret: str = ""
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    oidc_auto_provision: bool = False
 
 settings = Settings()

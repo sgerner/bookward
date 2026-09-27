@@ -3,6 +3,8 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from auth_helpers import authenticated_headers
+
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
 from afterword_engine.main import app
@@ -25,7 +27,7 @@ def test_search_download_shortlists_the_source_candidate(database):
         return_value=httpx.Response(200, json={"id": "download-1"})
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, headers=authenticated_headers()) as client:
         response = client.post(
             "/api/librarr/download",
             json={

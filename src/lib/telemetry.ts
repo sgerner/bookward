@@ -26,6 +26,7 @@ type TelemetryOptions = {
   randomUUID?: () => string;
   flushDelayMs?: number;
   maxBatchSize?: number;
+  profileId?: string;
 };
 
 const DEFAULT_BATCH_SIZE = 20;
@@ -52,6 +53,7 @@ export function createTelemetryClient(options: TelemetryOptions = {}) {
   let queue: TelemetryEvent[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
+  let profileId = options.profileId;
 
   function schedule() {
     if (timer || destroyed) return;
@@ -76,7 +78,7 @@ export function createTelemetryClient(options: TelemetryOptions = {}) {
   async function flush({ beacon: preferBeacon = false } = {}) {
     if (!queue.length) return;
     const batch = queue.splice(0, maxBatchSize);
-    const body = JSON.stringify({ events: batch });
+    const body = JSON.stringify({ events: batch, ...(profileId ? { expected_profile_id: profileId } : {}) });
     if (preferBeacon && beacon) {
       try {
         if (beacon("/api/telemetry", new Blob([body], { type: "application/json" }))) {
@@ -112,7 +114,15 @@ export function createTelemetryClient(options: TelemetryOptions = {}) {
     queue = [];
   }
 
-  return { enqueue, flush, destroy };
+  function setProfileId(nextProfileId?: string) {
+    if (profileId === nextProfileId) return;
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    queue = [];
+    profileId = nextProfileId;
+  }
+
+  return { enqueue, flush, destroy, setProfileId };
 }
 
 export type TelemetryClient = ReturnType<typeof createTelemetryClient>;

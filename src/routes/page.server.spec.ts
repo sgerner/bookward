@@ -29,6 +29,7 @@ describe("page actions", () => {
 
     const result = (await load({
       url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
     } as never)) as { profile: { api_tokens: unknown[] } };
     expect(result.profile.api_tokens).toEqual([]);
   });
@@ -76,6 +77,7 @@ describe("page actions", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = (await load({
       url: new URL("http://afterword.test/"),
+      locals: { user: null },
     } as never)) as {
       recommendation_run_id: string;
       decisions: Array<{ id: number; status: string; reason: string }>;

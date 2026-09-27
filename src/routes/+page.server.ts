@@ -115,7 +115,7 @@ type DigestSettings = {
   } | null;
 };
 
-export const load: PageServerLoad = async ({ url }) => {
+export const load: PageServerLoad = async ({ url, locals }) => {
   let overview: Overview;
   try {
     overview = await engine<Overview>("/api/overview?recommendation_limit=24");
@@ -159,6 +159,7 @@ export const load: PageServerLoad = async ({ url }) => {
     }
   }
   return {
+    user: locals.user,
     recommendation_run_id: overview.recommendation_run_id ?? "",
     books: overview.recommendations.map((book) => ({
       ...book,

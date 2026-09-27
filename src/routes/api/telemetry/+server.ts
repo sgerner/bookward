@@ -7,6 +7,7 @@ const MAX_EVENTS = 100;
 export const POST: RequestHandler = async ({ request }) => {
   const payload = await request.json().catch(() => null) as {
     events?: unknown;
+    expected_profile_id?: string;
   } | null;
   if (!payload || !Array.isArray(payload.events) || payload.events.length < 1 || payload.events.length > MAX_EVENTS) {
     return new Response(null, { status: 204 });

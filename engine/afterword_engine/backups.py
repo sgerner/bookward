@@ -14,11 +14,13 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
-from .database import DATABASE_LOCK, MIGRATIONS, connect, transaction
-from .secrets import installation_key
+from .database import MIGRATIONS, connect, database_lock, transaction
+from .secrets import installation_key, installation_key_path
+from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
 BACKUP_ID = re.compile(r"^bookward-(\d{8}T\d{6}Z)-([0-9a-f]{8})$")
+AUTH_BACKUP_ID = re.compile(r"^bookward-auth-(\d{8}T\d{6}Z)-([0-9a-f]{8})$")
 BACKUP_INTERVAL_MAX_HOURS = 24 * 30
 BACKUP_RETENTION_MAX = 100
 LAST_ERROR_KEY = "backup_last_error"
@@ -31,7 +33,15 @@ class BackupError(ValueError):
 
 def backup_directory() -> Path:
     configured = str(settings.backup_dir or "").strip()
-    return Path(configured) if configured else Path(settings.db).parent / "backups"
+    base = Path(configured) if configured else Path(settings.db).parent / "backups"
+    profile_id = current_profile_id() or "legacy"
+    return base if profile_id == "legacy" else base / profile_id
+
+
+def auth_backup_directory() -> Path:
+    configured = str(settings.backup_dir or "").strip()
+    base = Path(configured) if configured else Path(settings.db).parent / "backups"
+    return base / "auth-registry"
 
 
 def backup_interval_hours() -> int:
@@ -223,8 +233,137 @@ def backup_is_due(now: datetime | None = None) -> bool:
     return current.astimezone(timezone.utc) - latest >= timedelta(hours=interval)
 
 
+def auth_backup_is_due(now: datetime | None = None) -> bool:
+    interval = backup_interval_hours()
+    if interval <= 0:
+        return False
+    directory = auth_backup_directory()
+    if not directory.is_dir():
+        return True
+    snapshots = []
+    for path in directory.iterdir():
+        if path.is_symlink() or not path.is_file() or not AUTH_BACKUP_ID.fullmatch(path.stem):
+            continue
+        match = AUTH_BACKUP_ID.fullmatch(path.stem)
+        try:
+            snapshots.append(datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc))
+        except ValueError:
+            continue
+    if not snapshots:
+        return True
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc) - max(snapshots) >= timedelta(hours=interval)
+
+
+def create_auth_backup() -> dict:
+    """Snapshot the account/profile registry alongside personal database backups."""
+    from .profiles import auth_path
+
+    source_path = auth_path()
+    if not source_path.is_file():
+        raise BackupError("The Bookward identity registry is not available for backup.")
+    directory = auth_backup_directory()
+    _ensure_private_directory(directory)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_id = f"bookward-auth-{stamp}-{uuid.uuid4().hex[:8]}"
+    destination = directory / f"{backup_id}.sqlite3"
+    descriptor, name = tempfile.mkstemp(prefix=".bookward-auth-", suffix=".tmp", dir=directory)
+    os.fchmod(descriptor, 0o600)
+    os.close(descriptor)
+    temporary = Path(name)
+    source = target = None
+    try:
+        source = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        target = sqlite3.connect(temporary, timeout=30)
+        source.backup(target)
+        integrity = target.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok" or target.execute("PRAGMA foreign_key_check").fetchone():
+            raise BackupError("The identity registry backup could not be verified.")
+        target.commit()
+        target.close(); target = None
+        source.close(); source = None
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        retention = backup_retention_count()
+        snapshots = sorted(
+            (path for path in directory.iterdir() if path.is_file() and not path.is_symlink() and AUTH_BACKUP_ID.fullmatch(path.stem)),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for old in snapshots[retention:]:
+            old.unlink(missing_ok=True)
+        return {"id": backup_id, "created_at": datetime.now(timezone.utc).isoformat(), "size_bytes": destination.stat().st_size}
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        if target is not None:
+            target.close()
+        if source is not None:
+            source.close()
+
+
+def restore_auth_backup(backup_id: str) -> dict:
+    """Restore the registry while revoking every restored session and API token.
+
+    This is an operator recovery action and must only run with the engine
+    stopped. It is intentionally not exposed as a browser route.
+    """
+    if not AUTH_BACKUP_ID.fullmatch(backup_id):
+        raise BackupError("Choose a valid identity-registry snapshot.")
+    directory = auth_backup_directory()
+    path = directory / f"{backup_id}.sqlite3"
+    if path.is_symlink() or not path.is_file() or path.resolve().parent != directory.resolve():
+        raise BackupError("That identity-registry snapshot is unavailable.")
+    source = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or source.execute("PRAGMA foreign_key_check").fetchone():
+            raise BackupError("That identity-registry snapshot is damaged.")
+    finally:
+        source.close()
+    from .profiles import auth_path
+    live = auth_path()
+    live.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=".bookward-auth-restore-", suffix=".sqlite3", dir=live.parent)
+    os.fchmod(descriptor, 0o600)
+    os.close(descriptor)
+    staged = Path(name)
+    try:
+        shutil.copyfile(path, staged)
+        con = sqlite3.connect(staged, timeout=30)
+        try:
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)")
+            con.execute("UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)")
+            con.execute("DELETE FROM auth_transactions")
+            con.execute("DELETE FROM login_attempts")
+            con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
+            con.commit()
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise BackupError("The restored identity registry failed integrity checks.")
+        finally:
+            con.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{live}{suffix}").unlink(missing_ok=True)
+        os.replace(staged, live)
+        os.chmod(live, 0o600)
+        return {"restored": True, "sessions_revoked": True, "api_tokens_revoked": True}
+    finally:
+        staged.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{staged}{suffix}").unlink(missing_ok=True)
+
+
 def _create_snapshot_unlocked() -> Path:
-    source_path = Path(settings.db)
+    source_path = profile_database_path()
     if not source_path.is_file():
         raise BackupError("The Bookward database is not available for backup.")
     directory = backup_directory()
@@ -313,7 +452,7 @@ def _prune_backups() -> None:
 
 def create_backup() -> dict:
     try:
-        with DATABASE_LOCK:
+        with database_lock(profile_database_path()):
             path = _create_snapshot_unlocked()
             _set_last_error("")
             _prune_backups()
@@ -368,7 +507,8 @@ def _remove_sidecars(path: Path) -> None:
 
 
 def _restore_journal_path() -> Path:
-    return Path(settings.db).parent / RESTORE_JOURNAL_NAME
+    path = profile_database_path()
+    return path.parent / f".{path.stem}{RESTORE_JOURNAL_NAME}"
 
 
 def _write_restore_journal(safety_backup: Path, selected_backup: Path) -> None:
@@ -418,8 +558,8 @@ def recover_interrupted_restore() -> bool:
         _validate_snapshot(safety_path)
         safety_key = _restore_key_sidecar(safety_path)
         _validate_snapshot_key(safety_path, safety_key)
-        with DATABASE_LOCK:
-            staged = _copy_to_stage(safety_path, Path(settings.db).parent)
+        with database_lock(profile_database_path()):
+            staged = _copy_to_stage(safety_path, profile_database_path().parent)
             try:
                 _replace_live_database(staged, safety_key)
             except Exception:
@@ -494,7 +634,7 @@ def _validate_snapshot_key(backup_path: Path, key_sidecar: Path | None) -> None:
 
 
 def _replace_live_database(staged: Path, key_source: Path | None = None) -> None:
-    live = Path(settings.db)
+    live = profile_database_path()
     staged_key = None
     if key_source is not None:
         descriptor, name = tempfile.mkstemp(
@@ -520,8 +660,9 @@ def _replace_live_database(staged: Path, key_source: Path | None = None) -> None
             checkpoint.close()
         _remove_sidecars(live)
         if staged_key is not None:
-            os.replace(staged_key, live.with_name("secret.key"))
-            os.chmod(live.with_name("secret.key"), 0o600)
+            key_path = installation_key_path()
+            os.replace(staged_key, key_path)
+            os.chmod(key_path, 0o600)
         os.replace(staged, live)
         os.chmod(live, 0o600)
         directory_fd = os.open(live.parent, os.O_RDONLY)
@@ -558,9 +699,9 @@ def restore_backup(backup_id: str) -> dict:
     safety_backup = None
     staged = None
     replaced = False
-    live_path = Path(settings.db)
+    live_path = profile_database_path()
     try:
-        with DATABASE_LOCK:
+        with database_lock(live_path):
             _validate_snapshot(source)
             selected_key = _restore_key_sidecar(source)
             _validate_snapshot_key(source, selected_key)
@@ -568,14 +709,14 @@ def restore_backup(backup_id: str) -> dict:
 
             # Apply this release's migrations on the staged copy first. If
             # staging fails, neither the live database nor key is touched.
-            original_db_path = settings.db
-            settings.db = str(staged)
             try:
                 from .database import initialize
+                from .tenancy import database_path_override
 
-                initialize()
-            finally:
-                settings.db = original_db_path
+                with database_path_override(staged):
+                    initialize(seed_demo=False)
+            except Exception:
+                raise
             _validate_snapshot(staged)
 
             safety_backup = _create_snapshot_unlocked()
@@ -595,7 +736,7 @@ def restore_backup(backup_id: str) -> dict:
     except BackupError as exc:
         if replaced and safety_backup:
             try:
-                with DATABASE_LOCK:
+                with database_lock(live_path):
                     rollback = _copy_to_stage(safety_backup, live_path.parent)
                     _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
                     _clear_restore_journal()
@@ -607,7 +748,7 @@ def restore_backup(backup_id: str) -> dict:
         LOGGER.exception("Bookward restore failed")
         if replaced and safety_backup:
             try:
-                with DATABASE_LOCK:
+                with database_lock(live_path):
                     rollback = _copy_to_stage(safety_backup, live_path.parent)
                     _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
                     _clear_restore_journal()
@@ -631,11 +772,20 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
     except TimeoutError:
         pass
     while not stop.is_set():
+        from .profiles import profile_ids
+        from .tenancy import profile_scope
         try:
-            if backup_is_due():
-                await asyncio.to_thread(create_backup)
+            if auth_backup_is_due():
+                await asyncio.to_thread(create_auth_backup)
         except Exception:
-            LOGGER.exception("Scheduled Bookward backup failed")
+            LOGGER.exception("Scheduled identity-registry backup failed")
+        for profile_id in profile_ids():
+            try:
+                with profile_scope(profile_id):
+                    if backup_is_due():
+                        await asyncio.to_thread(create_backup)
+            except Exception:
+                LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:
             await asyncio.wait_for(stop.wait(), timeout=60)
         except TimeoutError:

@@ -139,7 +139,9 @@
   let embeddingUrlOverride = $state<string | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
   let bookStatusOverrides = $state<Record<number, string>>({});
+  let profileHeaders = $derived({ "x-bookward-profile": data.user?.profile_id ?? "" });
   const telemetry = createTelemetryClient();
+  $effect(() => telemetry.setProfileId(data.user?.profile_id));
 
   const navItems: NavItem[] = [
     {
@@ -727,7 +729,7 @@
         limit: String(DISCOVER_PAGE_SIZE),
         offset: String(offset),
       });
-      const response = await fetch(`/api/recommendations?${params.toString()}`);
+      const response = await fetch(`/api/recommendations?${params.toString()}`, { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: PageBook[];
         has_more?: boolean;
@@ -1017,7 +1019,7 @@
       });
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
       let response = await fetch(`/api/librarr/search/stream?${params.toString()}`, {
-        headers: { accept: "text/event-stream" },
+        headers: { accept: "text/event-stream", ...profileHeaders },
         signal: controller.signal,
       });
       if (librarrSearchAbortController !== controller) return;
@@ -1030,6 +1032,7 @@
       if (streamUnsupported) {
         await response.body?.cancel().catch(() => {});
         response = await fetch(`/api/librarr/search?${params.toString()}`, {
+          headers: profileHeaders,
           signal: controller.signal,
         });
         if (librarrSearchAbortController !== controller) return;
@@ -1084,7 +1087,7 @@
     try {
       const response = await fetch("/api/librarr/download", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...profileHeaders },
         body: JSON.stringify({ media_type: librarrMediaType, candidate_id: librarrSearchBook?.id, result }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
@@ -1341,6 +1344,9 @@
             >
           </form>{/if}
         <ThemePicker />
+        <a href="/account" class="btn btn-sm min-h-11 preset-tonal-surface" title="Account settings">{data.user?.display_name || data.user?.username || 'Account'}</a>
+        {#if data.user?.role === 'admin'}<a href="/admin" class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface" aria-label="Manage accounts" title="Manage accounts"><KeyRound size={17} /></a>{/if}
+        <form method="POST" action="/auth/logout"><button class="btn btn-sm min-h-11 preset-tonal-surface" type="submit">Sign out</button></form>
       </div>
     </div>
   </header>

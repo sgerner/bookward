@@ -7,7 +7,7 @@ the Settings screen when a user needs to identify a token later.
 
 import hashlib
 import secrets
-from .secrets import installation_key
+from .secrets import auth_registry_key
 
 
 TOKEN_PREFIX = "bkw_"
@@ -28,7 +28,7 @@ def hash_api_token(token: str) -> str:
     return hashlib.pbkdf2_hmac(
         "sha256",
         token.encode("utf-8"),
-        TOKEN_HASH_SALT + installation_key(),
+        TOKEN_HASH_SALT + auth_registry_key(),
         TOKEN_HASH_ITERATIONS,
     ).hex()
 

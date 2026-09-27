@@ -2,14 +2,18 @@ import hashlib
 import json
 import asyncio
 import logging
+import base64
+import hmac
+import secrets
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -22,14 +26,6 @@ from .backups import (
     create_backup,
     recover_interrupted_restore,
     restore_backup,
-)
-from .api_tokens import (
-    TOKEN_MAX_LENGTH,
-    TOKEN_PREFIX,
-    generate_api_token,
-    hash_api_token,
-    legacy_hash_api_token,
-    token_prefix,
 )
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
@@ -88,6 +84,9 @@ from .identity import (
     book_openlibrary_work_id,
     book_row_identity_match_keys,
 )
+from . import profiles as identity_store
+from .tenancy import current_profile_id, profile_scope
+import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
@@ -95,6 +94,74 @@ SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 LOGGER = logging.getLogger(__name__)
+
+
+class LocalLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=160)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class InitialAdminIn(LocalLoginIn):
+    setup_token: str = Field(min_length=20, max_length=256)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    new_password: str = Field(min_length=12, max_length=1024)
+
+
+class AccountCreateIn(BaseModel):
+    username: str = Field(min_length=1, max_length=160)
+    password: str = Field(min_length=12, max_length=1024)
+    display_name: str = Field(default="", max_length=160)
+    role: Literal["user", "admin"] = "user"
+
+
+class AccountPasswordIn(BaseModel):
+    password: str = Field(min_length=12, max_length=1024)
+
+
+def _ensure_profile_database(profile_id: str):
+    with profile_scope(profile_id):
+        initialize(seed_demo=profile_id == "legacy")
+
+
+def _principal(request):
+    account = getattr(request.state, "account", None)
+    if account is None:
+        raise HTTPException(401, "Authentication required")
+    return account
+
+
+def _require_admin(request):
+    account = _principal(request)
+    if account["role"] != "admin":
+        raise HTTPException(403, "Administrator access required")
+    return account
+
+
+def _require_recent_authentication(account):
+    try:
+        authenticated_at = datetime.fromisoformat(account.get("session_created_at", ""))
+    except (TypeError, ValueError):
+        raise HTTPException(401, "Sign in again to confirm this change")
+    if datetime.now(timezone.utc) - authenticated_at > timedelta(minutes=10):
+        raise HTTPException(401, "Sign in again before adding a login method")
+
+
+def _mark_private_no_store(response: Response) -> None:
+    """Prevent shared/private caching while preserving stream directives."""
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type.startswith("text/event-stream"):
+        directives = [item.strip() for item in response.headers.get("cache-control", "").split(",") if item.strip()]
+        directives = [item for item in directives if item.casefold() != "public"]
+        folded = {item.casefold() for item in directives}
+        for required in ("private", "no-store"):
+            if required not in folded:
+                directives.append(required)
+        response.headers["cache-control"] = ", ".join(directives)
+    else:
+        response.headers["cache-control"] = "private, no-store"
 
 
 def source_sync_interval_hours():
@@ -193,13 +260,15 @@ async def source_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        try:
-            if source_sync_is_due() and not active_job("sync"):
-                enqueue_job("sync", dedupe=True)
-        except Exception:
-            # A transient database/read error must not kill the scheduler. The
-            # next poll will retry without affecting the API or worker.
-            pass
+        for profile_id in identity_store.profile_ids():
+            try:
+                with profile_scope(profile_id):
+                    if source_sync_is_due() and not active_job("sync"):
+                        enqueue_job("sync", dedupe=True)
+            except Exception:
+                # A transient profile database error must not stop schedules
+                # for other profiles or terminate the scheduler.
+                LOGGER.exception("Source scheduler failed for profile %s", profile_id)
         try:
             await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_POLL_SECONDS)
         except TimeoutError:
@@ -214,13 +283,13 @@ async def digest_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        try:
-            if digest_is_due(private_settings()) and not active_job("digest"):
-                enqueue_job("digest", dedupe=True)
-        except Exception:
-            # Delivery errors belong to the persisted job. A malformed legacy
-            # setting or transient DB error must not stop future source scans.
-            pass
+        for profile_id in identity_store.profile_ids():
+            try:
+                with profile_scope(profile_id):
+                    if digest_is_due(private_settings()) and not active_job("digest"):
+                        enqueue_job("digest", dedupe=True)
+            except Exception:
+                LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
         try:
             await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_POLL_SECONDS)
         except TimeoutError:
@@ -381,28 +450,36 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
-    recover_interrupted_restore()
-    initialize()
+    setup_token = identity_store.initialize_auth()
+    if setup_token:
+        LOGGER.warning("Initial administrator setup token (one use): %s", setup_token)
+    with profile_scope("legacy"):
+        recover_interrupted_restore()
+        initialize()
+        legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
+    identity_store.migrate_legacy_api_tokens(legacy_tokens)
+    for profile_id in identity_store.profile_ids():
+        if profile_id != "legacy":
+            with profile_scope(profile_id):
+                recover_interrupted_restore()
+            _ensure_profile_database(profile_id)
     stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
-    enqueue_job("metadata", dedupe=True)
-    # A migration-created legacy quality ledger is an explicit signal that the
-    # existing corpus still needs its one-time catalog audit.  Fresh installs
-    # only contain curated demo rows and therefore skip this expensive job.
-    needs_full_quality_audit = _needs_candidate_quality_audit()
-    if needs_full_quality_audit:
-        enqueue_job("candidate_quality", dedupe=True)
-    elif row(
-        "SELECT 1 FROM candidate_quality WHERE quality_status='quarantine' "
-        "AND audit_version!=? AND candidate_id IN ("
-        "SELECT id FROM candidates WHERE isbn13!='' OR isbn10!='') LIMIT 1",
-        (QUALITY_VERSION,),
-    ):
-        # Migration backfills only recover source evidence.  The targeted job
-        # retries those rows without re-auditing accepted candidates.
-        enqueue_job("candidate_quality_recovery", dedupe=True)
-    enqueue_job("read_work_identities", dedupe=True)
+    for profile_id in identity_store.profile_ids():
+        with profile_scope(profile_id):
+            enqueue_job("metadata", dedupe=True)
+            needs_full_quality_audit = _needs_candidate_quality_audit()
+            if needs_full_quality_audit:
+                enqueue_job("candidate_quality", dedupe=True)
+            elif row(
+                "SELECT 1 FROM candidate_quality WHERE quality_status='quarantine' "
+                "AND audit_version!=? AND candidate_id IN ("
+                "SELECT id FROM candidates WHERE isbn13!='' OR isbn10!='') LIMIT 1",
+                (QUALITY_VERSION,),
+            ):
+                enqueue_job("candidate_quality_recovery", dedupe=True)
+            enqueue_job("read_work_identities", dedupe=True)
     yield
     stop.set(); await scheduler; await digest_scheduler; await backup_scheduler; await worker
 
@@ -415,9 +492,418 @@ app.add_middleware(
     # API.
     allow_origins=[settings.cors_origin],
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key"],
+    allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
+
+
+@app.middleware("http")
+async def authenticate_engine_request(request: Request, call_next):
+    """Select a profile only from a verified session or profile-owned API token."""
+    path = request.url.path
+    if request.method == "OPTIONS" or path == "/api/health":
+        return await call_next(request)
+    if settings.service_secret:
+        supplied = request.headers.get("x-bookward-service", "")
+        if not hmac.compare_digest(supplied, settings.service_secret):
+            return JSONResponse(
+                {"detail": "Engine service authentication required"},
+                status_code=401,
+                headers={"cache-control": "no-store"},
+            )
+
+    if path == "/api/v1" or path.startswith("/api/v1/"):
+        authorization = request.headers.get("authorization", "")
+        api_key_header = request.headers.get("x-api-key")
+        bearer = ""
+        if authorization:
+            if not authorization.lower().startswith("bearer "):
+                return JSONResponse(
+                    {"detail": "A valid API token is required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
+            bearer = authorization[7:].strip()
+            if not bearer:
+                return JSONResponse(
+                    {"detail": "A valid API token is required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
+        api_key = api_key_header.strip() if api_key_header is not None else ""
+        if ((api_key_header is not None and not api_key) or
+                (bearer and api_key and not hmac.compare_digest(bearer.encode(), api_key.encode()))):
+            return JSONResponse(
+                {"detail": "A valid API token is required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+        candidate = bearer or api_key
+        token = identity_store.authenticate_api_token(candidate)
+        if not token:
+            return JSONResponse(
+                {"detail": "A valid API token is required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+        request.state.api_token = token
+        request.state.account = {"profile_id": token["profile_id"], "role": "user", "id": "api-token"}
+        with profile_scope(token["profile_id"]):
+            response = await call_next(request)
+        _mark_private_no_store(response)
+        return response
+
+    public_auth = path in {"/auth/config", "/auth/login", "/auth/setup"}
+    oidc_login_start = path == "/auth/oidc/start" and request.query_params.get("intent", "login") == "login"
+    oidc_callback = path == "/auth/oidc/callback"
+    if oidc_callback and request.headers.get("x-bookward-session"):
+        request.state.account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+    if public_auth or oidc_login_start or oidc_callback:
+        response = await call_next(request)
+        response.headers["cache-control"] = "no-store"
+        return response
+
+    account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+    if not account:
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    request.state.account = account
+    with profile_scope(account["profile_id"]):
+        response = await call_next(request)
+    _mark_private_no_store(response)
+    return response
+
+
+@app.get("/auth/config")
+def auth_config():
+    return {
+        "setup_required": identity_store.setup_required(),
+        "local_login_enabled": not identity_store.setup_required(),
+        "oidc_enabled": bool(settings.oidc_issuer and settings.oidc_client_id and settings.oidc_client_secret),
+    }
+
+
+@app.post("/auth/login")
+def local_login(payload: LocalLoginIn, request: Request):
+    account = identity_store.authenticate_local(
+        payload.username, payload.password,
+        request.client.host if request.client else "unknown",
+    )
+    if not account:
+        raise HTTPException(401, "Username or password is incorrect")
+    raw, account = identity_store.create_session(account["id"])
+    return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
+
+
+@app.post("/auth/setup")
+def initial_admin_setup(payload: InitialAdminIn):
+    try:
+        account = identity_store.create_first_admin(payload.setup_token, payload.username, payload.password)
+        _ensure_profile_database("legacy")
+        raw, account = identity_store.create_session(account["id"])
+        return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    account = _principal(request)
+    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    identity_store.revoke_session(request.headers.get("x-bookward-session"))
+    return {"logged_out": True}
+
+
+@app.post("/auth/password/change")
+def change_password(payload: PasswordChangeIn, request: Request):
+    account = _principal(request)
+    methods = identity_store.auth_methods(account["id"])
+    if methods["password_enabled"]:
+        verified = identity_store.authenticate_local(
+            account["username"], payload.current_password,
+            request.client.host if request.client else "unknown",
+        )
+        if not verified or verified["id"] != account["id"]:
+            raise HTTPException(401, "Current password is incorrect")
+    else:
+        _require_recent_authentication(account)
+    identity_store.update_password(account["id"], payload.new_password)
+    raw, _ = identity_store.create_session(account["id"])
+    return {"changed": True, "session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600}
+
+
+@app.get("/auth/identities")
+def auth_identities(request: Request):
+    return identity_store.auth_methods(_principal(request)["id"])
+
+
+@app.delete("/auth/identities/{identity_id}")
+def auth_unlink_identity(identity_id: int, request: Request):
+    try:
+        identity_store.unlink_oidc_identity(_principal(request)["id"], identity_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"unlinked": True, "identity_id": identity_id}
+
+
+@app.get("/admin/accounts")
+def admin_accounts(request: Request):
+    _require_admin(request)
+    return {"accounts": identity_store.accounts_list()}
+
+
+@app.post("/admin/accounts")
+def admin_create_account(payload: AccountCreateIn, request: Request):
+    _require_admin(request)
+    try:
+        account = identity_store.create_account(
+            payload.username, payload.password, payload.display_name, payload.role
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "That username is already in use") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        _ensure_profile_database(account["profile_id"])
+    except Exception as exc:
+        identity_store.set_account_status(account["id"], "disabled")
+        LOGGER.exception("Could not initialize profile database for account %s", account["id"])
+        raise HTTPException(500, "The account was created but its profile could not be initialized") from exc
+    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")}
+
+
+@app.post("/admin/accounts/{account_id}/password")
+def admin_reset_password(account_id: str, payload: AccountPasswordIn, request: Request):
+    admin = _require_admin(request)
+    if admin["id"] == account_id:
+        raise HTTPException(400, "Use Account settings to change your own password")
+    try:
+        identity_store.reset_password(account_id, payload.password)
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(400 if isinstance(exc, ValueError) else 404, str(exc)) from exc
+    return {"changed": True, "account_id": account_id}
+
+
+@app.put("/admin/accounts/{account_id}/status")
+def admin_set_account_status(account_id: str, payload: dict, request: Request):
+    admin = _require_admin(request)
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status not in {"active", "disabled"}:
+        raise HTTPException(400, "Choose active or disabled status")
+    accounts = identity_store.accounts_list()
+    found = next((item for item in accounts if item["id"] == account_id), None)
+    if not found:
+        raise HTTPException(404, "Account not found")
+    if account_id == admin["id"] and status == "disabled":
+        raise HTTPException(400, "You cannot disable your own account")
+    if status == "active":
+        # Disabled profiles are excluded from startup/background work. Apply
+        # any migrations accumulated while this account was disabled before
+        # making its data available to a new session.
+        _ensure_profile_database(found["profile_id"])
+    try:
+        identity_store.set_account_status(account_id, status)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"updated": True, "account_id": account_id, "status": status}
+
+
+def _valid_oidc_url(value: str, *, allow_local_http: bool = False) -> bool:
+    if any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return False
+    secure = parsed.scheme == "https" or (
+        allow_local_http and parsed.scheme == "http" and hostname in {"localhost", "127.0.0.1"}
+    )
+    return bool(
+        parsed.netloc and hostname and secure and parsed.username is None
+        and parsed.password is None and "#" not in value
+    )
+
+
+def _oidc_config():
+    if not (settings.oidc_issuer and settings.oidc_client_id and settings.oidc_client_secret):
+        raise HTTPException(404, "Single sign-on is not configured")
+    issuer = settings.oidc_issuer
+    if not _valid_oidc_url(issuer, allow_local_http=True):
+        raise HTTPException(500, "The configured SSO issuer must use HTTPS")
+    parsed_issuer = urlparse(issuer)
+    if "?" in issuer:
+        raise HTTPException(500, "The configured SSO issuer must use HTTPS")
+    allow_local_http = (
+        parsed_issuer.scheme == "http"
+        and parsed_issuer.hostname in {"localhost", "127.0.0.1"}
+    )
+    discovery_url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    redirect_uri = settings.oidc_redirect_uri or f"{settings.public_url.rstrip('/')}/auth/oidc/callback"
+    if not _valid_oidc_url(redirect_uri, allow_local_http=True):
+        raise HTTPException(500, "The SSO callback URL must use HTTPS")
+    return issuer, discovery_url, redirect_uri, allow_local_http
+
+
+async def _oidc_metadata():
+    issuer, discovery_url, redirect_uri, allow_local_http = _oidc_config()
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            response = await client.get(discovery_url)
+            response.raise_for_status()
+            metadata = response.json()
+    except Exception as exc:
+        raise HTTPException(502, "The SSO provider could not be reached") from exc
+    if not isinstance(metadata, dict) or metadata.get("issuer") != issuer or not all(
+        isinstance(metadata.get(field), str) and metadata[field]
+        for field in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+    ):
+        raise HTTPException(502, "The SSO provider returned invalid discovery metadata")
+    for field in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+        if not _valid_oidc_url(metadata[field], allow_local_http=allow_local_http):
+            raise HTTPException(502, "The SSO provider returned an insecure endpoint")
+    return issuer, redirect_uri, metadata
+
+
+@app.get("/auth/oidc/start")
+async def oidc_start(request: Request, intent: Literal["login", "link"] = "login"):
+    account = getattr(request.state, "account", None)
+    if intent == "link" and not account:
+        raise HTTPException(401, "Sign in before linking an SSO identity")
+    if intent == "link":
+        _require_recent_authentication(account)
+    issuer, redirect_uri, metadata = await _oidc_metadata()
+    state = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    try:
+        identity_store.create_oidc_transaction(
+            state=state, csrf=csrf, nonce=nonce, verifier=verifier,
+            purpose=intent, account_id=account["id"] if intent == "link" else None,
+            session_token=request.headers.get("x-bookward-session") if intent == "link" else None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(429, "Too many pending SSO sign-ins. Try again shortly.") from exc
+    query_values = {
+        "client_id": settings.oidc_client_id,
+        "response_type": "code",
+        "scope": "openid profile email",
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    authorization_endpoint = urlparse(metadata["authorization_endpoint"])
+    query = urlencode(
+        {**dict(parse_qsl(authorization_endpoint.query, keep_blank_values=True)), **query_values}
+    )
+    authorization_url = urlunparse(authorization_endpoint._replace(query=query))
+    return {"authorization_url": authorization_url, "csrf": csrf}
+
+
+@app.get("/auth/oidc/callback")
+async def oidc_callback(request: Request, code: str = Query(min_length=1, max_length=4096),
+                        state: str = Query(min_length=1, max_length=256),
+                        x_oidc_state: str | None = Header(default=None, alias="X-OIDC-State")):
+    transaction_record = identity_store.consume_oidc_transaction(
+        state, x_oidc_state or "", request.headers.get("x-bookward-session")
+    )
+    if not transaction_record:
+        raise HTTPException(400, "The SSO sign-in expired or could not be verified. Please try again.")
+    issuer, redirect_uri, metadata = await _oidc_metadata()
+    auth_methods = metadata.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
+    if not isinstance(auth_methods, list) or not all(isinstance(method, str) for method in auth_methods):
+        raise HTTPException(502, "The SSO provider returned invalid token authentication metadata")
+    if "client_secret_basic" in auth_methods:
+        token_auth = (settings.oidc_client_id, settings.oidc_client_secret)
+        token_client_fields = {}
+    elif "client_secret_post" in auth_methods:
+        token_auth = None
+        token_client_fields = {
+            "client_id": settings.oidc_client_id,
+            "client_secret": settings.oidc_client_secret,
+        }
+    else:
+        raise HTTPException(502, "The SSO provider does not support a configured client authentication method")
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            token_response = await client.post(
+                metadata["token_endpoint"],
+                data={
+                    "grant_type": "authorization_code", "code": code,
+                    "redirect_uri": redirect_uri,
+                    "code_verifier": transaction_record["code_verifier"],
+                    **token_client_fields,
+                },
+                auth=token_auth,
+            )
+            token_response.raise_for_status()
+            tokens = token_response.json()
+            id_token = tokens.get("id_token", "")
+            header = jwt.get_unverified_header(id_token)
+            keys_response = await client.get(metadata["jwks_uri"])
+            keys_response.raise_for_status()
+            jwks = keys_response.json().get("keys", [])
+        jwk = next((key for key in jwks if key.get("kid") == header.get("kid")), None)
+        if not jwk:
+            raise ValueError("Unknown signing key")
+        signing_key = jwt.PyJWK.from_dict(jwk).key
+        claims = jwt.decode(
+            id_token, signing_key, algorithms=["RS256", "ES256", "PS256", "EdDSA"],
+            audience=settings.oidc_client_id, issuer=issuer, leeway=60,
+            options={"require": ["exp", "iat", "iss", "sub", "aud", "nonce"]},
+        )
+        if not hmac.compare_digest(str(claims.get("nonce", "")), transaction_record["nonce"]):
+            raise ValueError("Invalid nonce")
+        audience = claims.get("aud")
+        authorized_party = claims.get("azp")
+        if authorized_party is not None and authorized_party != settings.oidc_client_id:
+            raise ValueError("Invalid authorized party")
+        if isinstance(audience, list) and len(audience) > 1 and authorized_party != settings.oidc_client_id:
+            raise ValueError("Invalid authorized party")
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject or len(subject) > 255:
+            raise ValueError("Invalid subject")
+    except Exception as exc:
+        LOGGER.info("Rejected OIDC callback: %s", type(exc).__name__)
+        raise HTTPException(401, "The SSO provider could not verify this sign-in") from exc
+
+    email_claim = claims.get("email")
+    email = email_claim[:320] if isinstance(email_claim, str) else ""
+    name_claim = claims.get("name") or claims.get("preferred_username")
+    name = (name_claim if isinstance(name_claim, str) else email or "SSO user")[:160]
+    if transaction_record["purpose"] == "link":
+        current = getattr(request.state, "account", None)
+        if not current or current["id"] != transaction_record["account_id"]:
+            raise HTTPException(401, "Sign in again before linking this identity")
+        try:
+            identity_store.link_oidc_identity(current["id"], issuer, subject, email)
+        except PermissionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"linked": True, "account": current}
+
+    account = identity_store.account_for_oidc_identity(issuer, subject)
+    if not account and settings.oidc_auto_provision:
+        try:
+            account = identity_store.create_oidc_account(issuer, subject, email, name)
+        except PermissionError as exc:
+            raise HTTPException(403, "This SSO account is disabled") from exc
+        _ensure_profile_database(account["profile_id"])
+    if not account:
+        raise HTTPException(403, "This SSO identity is not linked to a Bookward account")
+    raw, account = identity_store.create_session(account["id"])
+    return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
 
 
 @app.get("/api/backups")
@@ -601,11 +1087,7 @@ class AssociationSettingsIn(BaseModel):
 
 def api_token_list():
     """Return token metadata without ever returning a token value."""
-
-    return rows(
-        "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
-        "FROM api_tokens ORDER BY created_at DESC, id DESC"
-    )
+    return identity_store.list_profile_api_tokens(current_profile_id() or "legacy")
 
 
 def tracked_recommendations(
@@ -771,16 +1253,7 @@ def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: i
 
 @app.get("/api/health")
 async def health():
-    config = safe_settings(include_api_tokens=False)
-    return {
-        "ok": True,
-        "database": True,
-        "embedding": {
-            "backend": config["embedding_backend"],
-            "model": config["embedding_model"],
-            "configured": True,
-        },
-    }
+    return {"ok": True}
 
 
 @app.get("/api/overview")
@@ -1845,41 +2318,17 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
 
 
 def _create_api_token(name: str):
-    clean_name = name.strip()
-    if not clean_name:
-        raise HTTPException(400, "Token name cannot be blank")
-    token = generate_api_token()
-    with transaction() as con:
-        cursor = con.execute(
-            "INSERT INTO api_tokens(name,token_prefix,token_hash) VALUES(?,?,?)",
-            (clean_name, token_prefix(token), hash_api_token(token)),
-        )
-        token_id = cursor.lastrowid
-        created = con.execute(
-            "SELECT id,name,token_prefix,created_at,last_used_at,revoked_at "
-            "FROM api_tokens WHERE id=?",
-            (token_id,),
-        ).fetchone()
-    return {
-        "token": token,
-        "id": created["id"],
-        "name": created["name"],
-        "token_prefix": created["token_prefix"],
-        "created_at": created["created_at"],
-        "last_used_at": created["last_used_at"],
-        "revoked_at": created["revoked_at"],
-    }
+    try:
+        return identity_store.create_profile_api_token(current_profile_id() or "legacy", name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _revoke_api_token(token_id: int):
-    with transaction() as con:
-        found = con.execute("SELECT id FROM api_tokens WHERE id=?", (token_id,)).fetchone()
-        if not found:
-            raise HTTPException(404, "API token not found")
-        con.execute(
-            "UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) WHERE id=?",
-            (token_id,),
-        )
+    try:
+        identity_store.revoke_profile_api_token(current_profile_id() or "legacy", token_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
     return {"revoked": True, "id": token_id}
 
 
@@ -1929,6 +2378,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def require_api_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
@@ -1939,52 +2389,24 @@ def require_api_token(
     ``X-API-Key`` remains supported for clients that use API-key conventions.
     """
 
+    cached = getattr(request.state, "api_token", None)
+    if cached:
+        return cached
     candidate = credentials.credentials.strip() if credentials else ""
-    if not candidate and x_api_key:
-        candidate = x_api_key.strip()
-    if (
-        not candidate
-        or len(candidate) > TOKEN_MAX_LENGTH
-        or not candidate.startswith(TOKEN_PREFIX)
-        or any(character.isspace() for character in candidate)
-    ):
+    api_key = x_api_key.strip() if x_api_key else ""
+    if candidate and api_key and not hmac.compare_digest(candidate.encode(), api_key.encode()):
         raise HTTPException(
             status_code=401,
             detail="A valid API token is required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    current_hash = hash_api_token(candidate)
-    found = row(
-        "SELECT id,name,token_hash FROM api_tokens "
-        "WHERE token_hash=? AND revoked_at IS NULL",
-        (current_hash,),
-    )
-    legacy_hash = None
-    if not found:
-        legacy_hash = legacy_hash_api_token(candidate)
-        found = row(
-            "SELECT id,name,token_hash FROM api_tokens "
-            "WHERE token_hash=? AND revoked_at IS NULL",
-            (legacy_hash,),
-        )
+    candidate = candidate or api_key
+    found = identity_store.authenticate_api_token(candidate)
     if not found:
         raise HTTPException(
             status_code=401,
             detail="A valid API token is required",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-    with transaction() as con:
-        if found["token_hash"] == legacy_hash:
-            # Tokens created before the PBKDF2 upgrade remain valid and are
-            # upgraded on their first successful use. The predicate makes
-            # concurrent requests harmless if another request wins the race.
-            con.execute(
-                "UPDATE api_tokens SET token_hash=? WHERE id=? AND token_hash=?",
-                (current_hash, found["id"], legacy_hash),
-            )
-        con.execute(
-            "UPDATE api_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
-            (found["id"],),
         )
     return found
 
@@ -2019,6 +2441,12 @@ def api_root():
 @api_v1.get("/health")
 async def api_health():
     return await health()
+
+
+@api_v1.get("/me")
+def api_me(request: Request):
+    account = request.state.account
+    return {"profile_id": account["profile_id"], "credential": "api_token"}
 
 
 @api_v1.get("/overview")
