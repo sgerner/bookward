@@ -9,8 +9,9 @@ only and do not change the visible recommendation score.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -29,6 +30,7 @@ from ..security import resolve_public_target
 
 OPEN_LIBRARY_BASE = "https://openlibrary.org"
 OPEN_LIBRARY_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
+_OPEN_LIBRARY_BOOK_KEY = re.compile(r"^/(works|books)/(OL\d+[WM])/?$", re.IGNORECASE)
 
 
 def _title_key(value: object) -> str:
@@ -73,21 +75,56 @@ def _entry_authors(entry: Mapping[str, Any]) -> list[str]:
 
 
 def _external_key(entry: Mapping[str, Any]) -> str:
-    for key in ("work_key", "key", "work", "edition_key"):
+    for key in ("work_key", "key", "work", "edition_key", "url"):
         value = entry.get(key)
         if isinstance(value, Mapping):
             value = value.get("key") or value.get("url")
         if isinstance(value, list):
             value = value[0] if value else ""
-        value = _clean(value, 300)
-        if value:
-            return value
+        normalized = _openlibrary_book_key(value)
+        if normalized:
+            return normalized
     for work in entry.get("works", []) if isinstance(entry.get("works"), list) else []:
         if isinstance(work, Mapping):
-            value = _clean(work.get("key"), 300)
-            if value:
-                return value
+            normalized = _openlibrary_book_key(work.get("key"))
+            if normalized:
+                return normalized
     return ""
+
+
+def _openlibrary_book_key(value: object) -> str:
+    """Normalize a work or edition key, rejecting list and unrelated URLs."""
+
+    candidate = _clean(value, 500)
+    if not candidate:
+        return ""
+    if candidate.startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            return ""
+        if (parsed.hostname or "").casefold().rstrip(".") not in {
+            "openlibrary.org",
+            "www.openlibrary.org",
+        }:
+            return ""
+        candidate = parsed.path
+    elif candidate.startswith("OL"):
+        suffix = candidate[-1:].upper()
+        if suffix in {"W", "M"}:
+            candidate = f"/{'works' if suffix == 'W' else 'books'}/{candidate}"
+    match = _OPEN_LIBRARY_BOOK_KEY.fullmatch(candidate)
+    if not match:
+        return ""
+    collection, identifier = match.groups()
+    return f"/{collection.casefold()}/{identifier.upper()}"
+
+
+def _book_search_url(title: str, author: str) -> str:
+    params = {"title": title[:300]}
+    if author and author.casefold() != "unknown author":
+        params["author"] = author[:200]
+    return f"{OPEN_LIBRARY_BASE}/search?{urlencode(params)}"
 
 
 def _public_url(identifier: str, fallback: str) -> str:
@@ -240,26 +277,39 @@ class OpenLibraryListProvider:
         if not title:
             return None
         authors = _entry_authors(entry)
-        if not authors and self._resolutions < self.max_resolutions:
+        book_key = _external_key(entry)
+        if (not authors or not book_key) and self._resolutions < self.max_resolutions:
             self._resolutions += 1
+            params: dict[str, Any] = {
+                "title": title[:300],
+                "limit": 5,
+                "fields": "key,title,author_name,isbn,isbn13",
+            }
+            if authors:
+                params["author"] = authors[0][:200]
             payload = await self.client.get_json(
                 "/search.json",
-                {
-                    "title": title[:300],
-                    "limit": 5,
-                    "fields": "key,title,author_name,isbn,isbn13",
-                },
+                params,
             )
             docs = payload.get("docs", []) if isinstance(payload, Mapping) else []
             wanted = _title_key(title)
             for doc in docs if isinstance(docs, list) else []:
-                if isinstance(doc, Mapping) and _title_key(doc.get("title")) == wanted:
-                    authors = _authors(doc.get("author_name"))
-                    if authors:
-                        break
+                if not isinstance(doc, Mapping) or _title_key(doc.get("title")) != wanted:
+                    continue
+                resolved_authors = _authors(doc.get("author_name"))
+                if authors and not any(
+                    _title_key(author) == _title_key(resolved_author)
+                    for author in authors
+                    for resolved_author in resolved_authors
+                ):
+                    continue
+                book_key = book_key or _external_key(doc)
+                if not authors and resolved_authors:
+                    authors = resolved_authors
+                if book_key:
+                    break
         author = authors[0] if authors else "Unknown author"
-        external_id = _external_key(entry) or book_identity(title, author)
-        return title, author, external_id
+        return title, author, book_key
 
     async def _list_entries(self, list_url: str) -> list[Mapping[str, Any]]:
         path = list_url
@@ -321,7 +371,8 @@ class OpenLibraryListProvider:
                         resolved_entry = await self._resolve_entry(entry)
                         if resolved_entry is None:
                             continue
-                        title, author, external_id = resolved_entry
+                        title, author, book_key = resolved_entry
+                        external_id = book_key or book_identity(title, author)
                         identity = book_identity(title, author)
                         if identity in read_identities or _title_key(title) in read_titles:
                             continue
@@ -330,8 +381,8 @@ class OpenLibraryListProvider:
                             continue
                         seen.add(key)
                         source_url = _public_url(
-                            _external_key(entry),
-                            _public_url(list_url, OPEN_LIBRARY_BASE),
+                            book_key,
+                            _book_search_url(title, author),
                         )
                         output.append(
                             Association(

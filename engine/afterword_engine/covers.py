@@ -124,9 +124,10 @@ def canonical_book_source_url(title: str, author: str, source_url: object = "") 
 
     Open Library's ISBN route is only resolvable when that exact ISBN exists in
     its catalog. Upcoming-book feeds frequently publish provisional ISBNs, so
-    those links become dead 404s even though the title is searchable. Use the
-    public search route for those cases; it remains useful when metadata is
-    eventually added and never requires a network lookup during rendering.
+    those links become dead 404s even though the title is searchable. Reader
+    list pages identify a recommendation source but not the individual book.
+    Use the public search route for both cases; it remains useful if metadata
+    is eventually added and never requires a network lookup during rendering.
     """
 
     value = str(source_url or "").strip()
@@ -134,7 +135,15 @@ def canonical_book_source_url(title: str, author: str, source_url: object = "") 
         parsed = urlparse(value)
     except ValueError:
         parsed = None
-    if parsed and parsed.scheme in {"http", "https"} and (parsed.hostname or "").casefold().rstrip(".") in {"openlibrary.org", "www.openlibrary.org"} and parsed.path.casefold().startswith("/isbn/"):
+    is_openlibrary = (
+        parsed
+        and parsed.scheme in {"http", "https"}
+        and (parsed.hostname or "").casefold().rstrip(".")
+        in {"openlibrary.org", "www.openlibrary.org"}
+    )
+    path = parsed.path.casefold() if parsed else ""
+    is_list_page = path.startswith("/people/") and "/lists/" in path
+    if is_openlibrary and (path.startswith("/isbn/") or is_list_page):
         params = urlencode({"title": title[:300], "author": author[:200]})
         return f"{OPEN_LIBRARY_WEB}/search?{params}"
     return value

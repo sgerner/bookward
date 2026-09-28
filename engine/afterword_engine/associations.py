@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import time
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .database import normalize_key, row, rows, transaction
@@ -21,6 +22,21 @@ from .identity import book_identity
 
 
 OPEN_LIBRARY_LISTS_PROVIDER = "openlibrary_lists"
+
+
+def _is_openlibrary_list_url(value: object) -> bool:
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    path = parsed.path.casefold()
+    return (
+        parsed.scheme in {"http", "https"}
+        and host in {"openlibrary.org", "www.openlibrary.org"}
+        and path.startswith("/people/")
+        and "/lists/" in path
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,11 +340,30 @@ def persist_associations(
                 ),
             )
             candidate = con.execute(
-                "SELECT id FROM candidates WHERE normalized_key=?", (key,)
+                "SELECT id,source_url FROM candidates WHERE normalized_key=?", (key,)
             ).fetchone()
             if candidate is None:
                 continue
             candidate_id = int(candidate[0])
+            if (
+                provider == OPEN_LIBRARY_LISTS_PROVIDER
+                and _is_openlibrary_list_url(candidate["source_url"])
+                and association.source_url
+            ):
+                try:
+                    replacement = urlsplit(association.source_url)
+                except ValueError:
+                    replacement = None
+                if (
+                    replacement
+                    and replacement.scheme == "https"
+                    and (replacement.hostname or "").casefold().rstrip(".")
+                    in {"openlibrary.org", "www.openlibrary.org"}
+                ):
+                    con.execute(
+                        "UPDATE candidates SET source_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (association.source_url[:1000], candidate_id),
+                    )
             metadata = json.dumps(
                 dict(association.metadata), ensure_ascii=False, separators=(",", ":")
             )
