@@ -15,6 +15,8 @@
 		type ThemeMode,
 	} from '$lib/theme';
 
+	let { compact = false }: { compact?: boolean } = $props();
+
 	const modes: { id: ThemeMode; label: string; description: string; icon: typeof Sun }[] = [
 		{ id: 'system', label: 'System', description: 'Follow your device', icon: Monitor },
 		{ id: 'light', label: 'Light', description: 'Bright and clear', icon: Sun },
@@ -87,7 +89,7 @@
 <div bind:this={pickerRoot} class="relative">
 	<button
 		type="button"
-		class="btn-icon min-h-11 min-w-11 preset-tonal-surface"
+		class={compact ? 'btn min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
 		aria-label="Choose appearance"
 		title="Choose appearance"
 		aria-expanded={appearanceOpen}
@@ -95,6 +97,7 @@
 		onclick={() => (appearanceOpen = !appearanceOpen)}
 	>
 		<Palette size={18} strokeWidth={1.8} aria-hidden="true" />
+		{#if compact}<span>Appearance</span>{/if}
 	</button>
 	{#if appearanceOpen}
 		<div
@@ -103,7 +106,7 @@
 			aria-label="Appearance"
 			in:fly={{ y: -10, duration: motionDuration(260) }}
 			out:fade={{ duration: motionDuration(180) }}
-			class="absolute right-0 top-[calc(100%+0.75rem)] z-50 max-h-[min(42rem,calc(100dvh-2rem))] w-[min(24rem,calc(100vw-1rem))] overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5"
+			class={`${compact ? 'fixed right-4 top-20' : 'absolute right-0 top-[calc(100%+0.75rem)]'} z-50 max-h-[min(42rem,calc(100dvh-2rem))] w-[min(24rem,calc(100vw-2rem))] overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5`}
 		>
 			<div class="flex items-start justify-between gap-4">
 				<div>
