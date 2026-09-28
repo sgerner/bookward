@@ -1375,7 +1375,18 @@ def recommendation_list(
         )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
-        item["source_url"] = canonical_book_source_url(item["title"], item["author"], item.get("source_url", ""))
+        source_url = item.get("source_url", "")
+        parsed_source = urlparse(source_url)
+        if (
+            (parsed_source.hostname or "").casefold().rstrip(".")
+            in {"openlibrary.org", "www.openlibrary.org"}
+            and parsed_source.path.casefold().startswith("/people/")
+            and "/lists/" in parsed_source.path.casefold()
+        ):
+            work_url = book_openlibrary_work_id(item)
+            if work_url:
+                source_url = f"https://openlibrary.org{work_url}"
+        item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
         item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
     return result
 
