@@ -3,7 +3,7 @@
   import type { SubmitFunction } from "@sveltejs/kit";
   import { invalidateAll, pushState } from "$app/navigation";
   import { page } from "$app/state";
-  import { onMount, tick } from "svelte";
+  import { onMount } from "svelte";
   import { flip } from "svelte/animate";
   import { fade, fly, scale, slide } from "svelte/transition";
   import {
@@ -15,6 +15,7 @@
     ChevronDown,
     Clock,
     CircleHelp,
+    CircleUserRound,
     Compass,
     Copy,
     Database,
@@ -24,6 +25,7 @@
     KeyRound,
     Library,
     Link2,
+    LogOut,
     Mail,
     MessageCircle,
     RefreshCw,
@@ -73,8 +75,9 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let filter = $state("");
-  let searchOpen = $state(false);
-  let searchInput = $state<HTMLInputElement | null>(null);
+  let profileMenuOpen = $state(false);
+  let profileMenuRoot = $state<HTMLDivElement | null>(null);
+  let profileMenuButton = $state<HTMLButtonElement | null>(null);
   let detailsId = $state<number | null>(null);
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
@@ -153,8 +156,8 @@
     { id: "saved", label: "Shortlist", shortLabel: "Saved", icon: Bookmark },
     {
       id: "decisions",
-      label: "Past decisions",
-      shortLabel: "Review",
+      label: "History",
+      shortLabel: "History",
       icon: History,
     },
     { id: "sources", label: "Sources", shortLabel: "Sources", icon: Link2 },
@@ -270,10 +273,6 @@
     activeView === "discover" &&
       (visibleBooks.length < filteredBooks.length || discoverHasMore),
   );
-  const savedCount = $derived(
-    allBooks.filter((book) => ["saved", "imported"].includes(book.status))
-      .length,
-  );
   const upNextCount = $derived(
     savedBooks.filter((book) => Boolean(book.up_next) && book.reading_status !== "reading" && book.reading_status !== "finished").length,
   );
@@ -285,10 +284,6 @@
   );
   const finishedCount = $derived(
     savedBooks.filter((book) => book.reading_status === "finished").length,
-  );
-  const decisionCount = $derived(
-    allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status))
-      .length,
   );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
@@ -752,11 +747,6 @@
     }
   }
 
-  function toggleSearch() {
-    searchOpen = !searchOpen;
-    if (searchOpen) void tick().then(() => searchInput?.focus());
-  }
-
   function toggleDigestBook(id: number) {
     const next = new Set(selectedDigestIds);
     if (next.has(id)) next.delete(id);
@@ -1148,9 +1138,25 @@
     };
     const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && librarrSearchOpen) closeLibrarrSearch();
+      if (event.key === "Escape" && profileMenuOpen) {
+        profileMenuOpen = false;
+        profileMenuButton?.focus();
+      }
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        profileMenuOpen &&
+        profileMenuRoot &&
+        target instanceof Node &&
+        !profileMenuRoot.contains(target)
+      ) {
+        profileMenuOpen = false;
+      }
     };
     window.addEventListener("popstate", onPopState);
     window.addEventListener("keydown", onKeydown);
+    document.addEventListener("pointerdown", onPointerDown);
     const context = (
       document as Document & {
         modelContext?: {
@@ -1227,11 +1233,8 @@
       telemetry.destroy();
       window.removeEventListener("popstate", onPopState);
       window.removeEventListener("keydown", onKeydown);
+      document.removeEventListener("pointerdown", onPointerDown);
     };
-  });
-
-  $effect(() => {
-    if (activeView !== "discover" && activeView !== "saved") searchOpen = false;
   });
 </script>
 
@@ -1256,7 +1259,7 @@
     class="sticky top-0 z-40 border-b border-primary-500/15 preset-filled-surface-50-950 shadow-lg shadow-primary-500/5 backdrop-blur-xl"
   >
     <div
-      class="relative mx-auto flex min-h-16 max-w-7xl items-center gap-6 px-4 sm:px-6 lg:px-8"
+      class="relative mx-auto flex min-h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:gap-6 lg:px-8"
     >
       <a
         href="/"
@@ -1264,7 +1267,7 @@
         aria-label="Bookward home"
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
           ><img src={bookwardMark} alt="" class="size-full object-cover" aria-hidden="true" /></span
-        ><span class="hidden text-lg font-semibold tracking-tight sm:inline"
+        ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
           >Bookward</span
         ></a
       >
@@ -1277,54 +1280,10 @@
             class={`btn btn-sm min-h-11 ${activeView === item.id ? "preset-filled-primary-500" : "preset-tonal-surface text-surface-700-300"}`}
             aria-current={activeView === item.id ? "page" : undefined}
             onclick={() => go(item.id)}
-            ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span
-            >{#if item.id === "saved" && savedCount > 0}<span
-                in:scale={{ duration: motionDuration(160) }}
-                out:fade={{ duration: motionDuration(100) }}
-                class="badge badge-sm preset-tonal-surface">{savedCount}</span
-              >{/if}{#if item.id === "decisions" && decisionCount > 0}<span
-                in:scale={{ duration: motionDuration(160) }}
-                out:fade={{ duration: motionDuration(100) }}
-                class="badge badge-sm preset-tonal-surface">{decisionCount}</span
-              >{/if}</button
+            ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span></button
       >{/each}
       </nav>
       <div class="ml-auto flex items-center gap-2">
-        {#if activeView === "discover" || activeView === "saved" || activeView === "decisions"}
-          {#if searchOpen}
-            <form
-              class="flex items-center gap-1"
-              onsubmit={(event) => event.preventDefault()}
-              in:fade={{ duration: motionDuration(180) }}
-              out:fade={{ duration: motionDuration(120) }}
-            >
-              <label class="input flex min-h-11 w-[min(18rem,58vw)] items-center gap-2">
-                <Search size={16} class="shrink-0 text-surface-600-400" />
-                <input
-                  bind:this={searchInput}
-                  bind:value={filter}
-                  class="input-ghost min-w-0"
-                  aria-label="Search books"
-                  placeholder="Search books"
-                />
-              </label>
-              <button
-                type="button"
-                class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface"
-                aria-label="Close search"
-                onclick={toggleSearch}><X size={16} /></button
-              >
-            </form>
-          {:else}<button
-              type="button"
-              class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface"
-              aria-label="Search books"
-              onclick={toggleSearch}
-              in:fade={{ duration: motionDuration(180) }}
-              out:fade={{ duration: motionDuration(120) }}
-              ><Search size={17} /></button
-            >{/if}
-        {/if}
         {#if activeView === "discover" || activeView === "saved"}<form
             method="POST"
             action="?/runSync"
@@ -1343,10 +1302,37 @@
               /></button
             >
           </form>{/if}
-        <ThemePicker />
-        <a href="/account" class="btn btn-sm min-h-11 preset-tonal-surface" title="Account settings">{data.user?.display_name || data.user?.username || 'Account'}</a>
-        {#if data.user?.role === 'admin'}<a href="/admin" class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface" aria-label="Manage accounts" title="Manage accounts"><KeyRound size={17} /></a>{/if}
-        <form method="POST" action="/auth/logout"><button class="btn btn-sm min-h-11 preset-tonal-surface" type="submit">Sign out</button></form>
+        <div bind:this={profileMenuRoot} class="relative">
+          <button
+            bind:this={profileMenuButton}
+            type="button"
+            class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface"
+            aria-label="Open profile menu"
+            title="Profile"
+            aria-expanded={profileMenuOpen}
+            aria-controls="profile-menu-panel"
+            onclick={() => (profileMenuOpen = !profileMenuOpen)}
+          ><CircleUserRound size={19} strokeWidth={1.8} /></button>
+          {#if profileMenuOpen}
+            <div
+              id="profile-menu-panel"
+              class="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
+            >
+              <div class="border-b border-surface-300-700/40 px-2 pb-3">
+                <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+                {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
+              </div>
+              <div class="grid gap-1 py-2">
+                <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} />Account settings</a>
+                {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} />Manage accounts</a>{/if}
+                <ThemePicker compact />
+              </div>
+              <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
+                <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} />Sign out</button>
+              </form>
+            </div>
+          {/if}
+        </div>
       </div>
     </div>
   </header>
@@ -1391,10 +1377,20 @@
         {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : view === "saved" ? shortlistBooks : decisionBooks}
         {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
-        <section class="mb-10 px-1 sm:px-0">
+        <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : "Past decisions."}</h1>
+          <div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
+            <Search size={17} class="shrink-0 text-surface-600-400" />
+            <input
+              bind:value={filter}
+              class="input-ghost min-w-0 flex-1"
+              aria-label="Search books"
+              placeholder="Search books"
+            />
+            {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+          </div>
         </section>
         {#if view === "discover" && !digestVisible}
           <p class="mb-6 max-w-2xl text-sm leading-6 text-surface-700-300">Pass means you are not interested. Maybe later sets a book aside to revisit without counting it as a rejection.</p>
@@ -2731,17 +2727,7 @@
             out:fade={{ duration: motionDuration(90) }}
             class="absolute bottom-1 size-1 rounded-full preset-filled-primary-500"
             aria-hidden="true"
-          ></span>{/if}{#if item.id === "saved" && savedCount > 0}<span
-            in:scale={{ duration: motionDuration(160) }}
-            out:fade={{ duration: motionDuration(100) }}
-            class="absolute mb-7 ml-6 badge badge-xs preset-filled-primary-500"
-            >{savedCount}</span
-          >{/if}{#if item.id === "decisions" && decisionCount > 0}<span
-            in:scale={{ duration: motionDuration(160) }}
-            out:fade={{ duration: motionDuration(100) }}
-            class="absolute mb-7 ml-8 badge badge-xs preset-filled-primary-500"
-            >{decisionCount}</span
-          >{/if}</button
+          ></span>{/if}</button
       >{/each}
   </nav>
   {#if librarrSearchOpen}
