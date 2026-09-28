@@ -1392,9 +1392,6 @@
             {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
           </div>
         </section>
-        {#if view === "discover" && !digestVisible}
-          <p class="mb-6 max-w-2xl text-sm leading-6 text-surface-700-300">Pass means you are not interested. Maybe later sets a book aside to revisit without counting it as a rejection.</p>
-        {/if}
         {#if view === "saved"}
           <section class="mb-6" aria-label="Shortlist shelves">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
