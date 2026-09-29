@@ -199,7 +199,7 @@ def rank_candidates(
                 explanation.append(f"Closest highly rated title: {positives[nearest][0].get('title', 'a highly rated book')}")
             if negative_sim.shape[1] and negative_max[offset] > 0:
                 nearest = int(np.argmax(negative_sim[offset]))
-                explanation.append(f"Reduced for similarity to {negatives[nearest][0].get('title', 'a low-rated book')}")
+                explanation.append(f"Reduced: similar to a 1–2★ book — {negatives[nearest][0].get('title', 'a low-rated book')}")
             if candidate.get("source_name"):
                 explanation.append(f"From {candidate['source_name']}")
             if metadata_confidence < 0.65:
