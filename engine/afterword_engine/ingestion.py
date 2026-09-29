@@ -16,6 +16,7 @@ from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, r
 from .database import normalize_key, private_setting, rows, transaction
 from .identity import (
     book_author_identity_key,
+    book_identity_match_keys,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
 )
@@ -36,6 +37,9 @@ GOODREADS_TOOLTIPS_URL = "https://www.goodreads.com/tooltips"
 GOODREADS_BLOG_HOSTS = frozenset({"goodreads.com", "www.goodreads.com"})
 EDITORIAL_SOURCE_HOSTS = frozenset(
     {"andrewliptak.com", "www.andrewliptak.com", "transfer-orbit.ghost.io"}
+)
+PENGUIN_RANDOM_HOUSE_HOSTS = frozenset(
+    {"penguinrandomhouse.com", "www.penguinrandomhouse.com"}
 )
 SOURCE_MAX_REDIRECTS = 4
 SOURCE_FILTER_MAX_GENRES = 12
@@ -1581,6 +1585,197 @@ async def enrich_book_metadata(items):
         return await asyncio.gather(*(enrich(item) for item in items))
 
 
+def _penguin_random_house_book_url(value):
+    """Accept only HTTPS Penguin Random House product pages for detail fetches."""
+
+    try:
+        parsed = urlparse(str(value or ""))
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and host in PENGUIN_RANDOM_HOUSE_HOSTS
+        and port in (None, 443)
+        and not parsed.username
+        and not parsed.password
+        and re.match(r"^/books/\d+(?:/|$)", parsed.path)
+    )
+
+
+def _penguin_random_house_page_metadata(content, source_url):
+    """Extract the full description drawer and selected-edition ISBN from PRH."""
+
+    if not _penguin_random_house_book_url(source_url):
+        return {}
+    soup = BeautifulSoup(content, "html.parser")
+    description_node = (
+        soup.select_one("#book-description-copy .copy-height")
+        or soup.select_one("#book-description-copy")
+        or soup.select_one(".book-description-content .drawer-copy-text")
+    )
+    description = _clean_text(str(description_node), 4000) if description_node else ""
+    if not description:
+        description_meta = (
+            soup.select_one('meta[itemprop="description"]')
+            or soup.select_one('meta[property="og:description"]')
+            or soup.select_one('meta[name="description"]')
+        )
+        if description_meta:
+            description = _clean_text(description_meta.get("content", ""), 4000)
+    isbn_value = ""
+    tealium_node = soup.select_one('meta[name="Tealium"]')
+    isbn_node = soup.select_one('meta[name="twitter:text:isbn"]')
+    if isbn_node:
+        isbn_value = isbn_node.get("content", "")
+    if not isbn_value and tealium_node:
+        isbn_value = tealium_node.get("data-book-isbn", "")
+    isbn13, isbn10 = isbn_parts(isbn_value)
+    return {
+        "title": tealium_node.get("data-book-title", "") if tealium_node else "",
+        "author": tealium_node.get("data-book-authors", "") if tealium_node else "",
+        "description": description,
+        "isbn13": isbn13,
+        "isbn10": isbn10,
+    }
+
+
+async def enrich_penguin_random_house_items(items):
+    """Follow PRH product links for publisher descriptions and ISBNs.
+
+    The new-releases page lists a book and author but leaves the full
+    description and ISBN on the linked product page. ``parse_book_items``
+    reads the product's structured identity; this adds a bounded,
+    host-restricted detail fetch for the description drawer and only merges
+    metadata when the page identifies the same book and author.
+    """
+
+    if not items:
+        return []
+    linked_items = [
+        item
+        for item in items
+        if not _clean_text(item.get("description"), 4000)
+        and item.get("title")
+        and item.get("author")
+        and _penguin_random_house_book_url(item.get("source_url"))
+    ]
+    if not linked_items:
+        return items
+    book_keys = list(
+        dict.fromkeys(
+            normalize_key(item.get("title", ""), item.get("author", ""))
+            for item in linked_items
+            if item.get("title")
+        )
+    )
+    existing_descriptions = {}
+    if book_keys:
+        placeholders = ",".join("?" for _ in book_keys)
+        existing_descriptions = {
+            record["normalized_key"]: record.get("description", "")
+            for record in rows(
+                "SELECT normalized_key,description FROM candidates "
+                f"WHERE normalized_key IN ({placeholders})",
+                tuple(book_keys),
+            )
+        }
+    linked_items = [
+        item
+        for item in linked_items
+        if not _clean_text(
+            existing_descriptions.get(
+                normalize_key(item.get("title", ""), item.get("author", ""))
+            ),
+            4000,
+        )
+    ]
+    if not linked_items:
+        return items
+
+    semaphore = asyncio.Semaphore(8)
+    page_tasks = {}
+    async with _source_client() as client:
+        async def load_product_page(url):
+            async with semaphore:
+                try:
+                    content, content_type = await fetch_bytes(url, client=client)
+                    detail_items = parse_book_items(content, content_type, url)
+                    page_metadata = _penguin_random_house_page_metadata(
+                        content, url
+                    )
+                    if (
+                        not detail_items
+                        and page_metadata.get("title")
+                        and page_metadata.get("author")
+                    ):
+                        detail_items = [{**page_metadata, "source_url": url}]
+                    for detail in detail_items:
+                        for field in ("description", "isbn13", "isbn10"):
+                            if not detail.get(field) and page_metadata.get(field):
+                                detail[field] = page_metadata[field]
+                    return detail_items
+                except Exception:
+                    # A single unavailable product page must not fail its feed.
+                    return []
+
+        async def enrich(item):
+            if _clean_text(item.get("description"), 4000):
+                return item
+            key = normalize_key(item.get("title", ""), item.get("author", ""))
+            if _clean_text(existing_descriptions.get(key), 4000):
+                return item
+            url = str(item.get("source_url") or "")
+            if not _penguin_random_house_book_url(url):
+                return item
+            task = page_tasks.get(url)
+            if task is None:
+                task = asyncio.create_task(load_product_page(url))
+                page_tasks[url] = task
+            detail_items = await task
+            wanted = book_identity_match_keys(
+                item.get("title", ""), item.get("author", "")
+            )
+            matches = [
+                detail
+                for detail in detail_items
+                if wanted
+                & book_identity_match_keys(
+                    detail.get("title", ""), detail.get("author", "")
+                )
+            ]
+            if not matches:
+                return item
+            detail = max(
+                matches,
+                key=lambda value: (
+                    bool(_clean_text(value.get("description"), 4000)),
+                    len(_clean_text(value.get("description"), 4000)),
+                    bool(value.get("isbn13") or value.get("isbn10")),
+                ),
+            )
+            enriched = dict(item)
+            for field in (
+                "description",
+                "cover_url",
+                "isbn13",
+                "isbn10",
+                "release_date",
+                "date_kind",
+            ):
+                if not enriched.get(field) and detail.get(field):
+                    enriched[field] = detail[field]
+            enriched["genres"] = normalize_subjects(
+                normalize_subjects(enriched.get("genres", []))
+                + normalize_subjects(detail.get("genres", [])),
+                limit=8,
+            )
+            return enriched
+
+        return await asyncio.gather(*(enrich(item) for item in items))
+
+
 def normalize_stored_candidate_subjects() -> int:
     """Clean legacy source tags and keep stored subjects normalized."""
 
@@ -1702,6 +1897,7 @@ async def scan_source(source):
     _, items = await _fetch_and_parse_source(source["url"])
     raw_count = len(items)
     items = filter_source_items(items, source.get("filters"))
+    items = await enrich_penguin_random_house_items(items)
     items = await enrich_book_metadata(_clean_parsed_subjects(items))
     items = _clean_parsed_subjects(items)
     with transaction() as con:
