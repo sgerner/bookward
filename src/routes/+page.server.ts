@@ -468,12 +468,10 @@ export const actions: Actions = {
   source: async ({ request }) => {
     const data = await request.formData();
     const url = urlSchema.safeParse(data.get("url"));
-    const label = z
-      .string()
-      .trim()
-      .min(2)
-      .max(100)
-      .safeParse(data.get("label"));
+    const label = z.preprocess(
+      (value) => typeof value === "string" && !value.trim() ? undefined : value,
+      z.string().trim().min(2).max(100).optional(),
+    ).safeParse(data.get("label"));
     const lifecycle = z
       .enum(["permanent", "one_time"])
       .catch("permanent")
@@ -481,6 +479,7 @@ export const actions: Actions = {
     const filters = sourceFiltersFromForm(data);
     if (!url.success || !label.success)
       return fail(400, { message: "Add a valid name and public URL." });
+    const name = label.data ?? new URL(url.data).hostname.replace(/^www\./i, "");
     try {
       const preview = await engine<{ count: number }>("/api/sources/preview", {
         method: "POST",
@@ -495,7 +494,7 @@ export const actions: Actions = {
       await engine("/api/sources", {
         method: "POST",
         body: JSON.stringify({
-          name: label.data,
+          name,
           url: url.data,
           lifecycle,
           filters,

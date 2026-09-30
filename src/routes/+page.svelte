@@ -1964,24 +1964,21 @@
                   action="?/source"
                   use:enhance={setPending("source")}
                 >
-                  <span
-                    class="mb-4 grid size-10 place-items-center preset-tonal-tertiary"
-                    ><Link2 size={18} /></span
-                  >
-                  <h2 class="text-lg font-semibold text-surface-950-50">
-                    Add a source
-                  </h2>
-                  <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                    Paste a public list, publisher page, newsletter archive, or
-                    bookseller collection.
-                  </p>
+                  <div class="flex items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
+                      ><Link2 size={18} /></span
+                    >
+                    <h2 class="text-lg font-semibold text-surface-950-50">
+                      Add a source
+                    </h2>
+                  </div>
                   <label
                     class="mt-5 block text-sm font-medium text-surface-800-200"
-                    >Name<input
+                    >Name (optional)<input
                       class="input mt-2 w-full min-w-0 max-w-full"
                       name="label"
-                      placeholder="e.g. Reactor new releases"
-                      required
+                      placeholder="Defaults to the website name"
                     /></label
                   ><label
                     class="mt-4 block text-sm font-medium text-surface-800-200"
