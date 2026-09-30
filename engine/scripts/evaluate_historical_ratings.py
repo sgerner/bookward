@@ -91,6 +91,97 @@ def metrics(ratings, predictions):
     }
 
 
+def _auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
+    """Compute tie-aware AUC, returning None when either class is absent."""
+    labels = np.asarray(labels, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    positive, negative = scores[labels], scores[~labels]
+    if not len(positive) or not len(negative):
+        return None
+    return float(
+        ((positive[:, None] > negative).sum()
+         + 0.5 * (positive[:, None] == negative).sum())
+        / (len(positive) * len(negative))
+    )
+
+
+def _score_deciles(ratings: np.ndarray, scores: np.ndarray) -> list[dict[str, float | int | None]]:
+    """Summarize equally sized ascending-score cohorts; ties keep input order."""
+    ratings = np.asarray(ratings, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    order = np.argsort(scores, kind="stable")
+    deciles = []
+    for index, cohort in enumerate(np.array_split(order, 10), start=1):
+        count = int(len(cohort))
+        cohort_ratings = ratings[cohort]
+        high_count = int(np.sum(cohort_ratings >= 4))
+        low_count = int(np.sum(cohort_ratings <= 2))
+        deciles.append({
+            "decile": index,
+            "count": count,
+            "score_min": float(scores[cohort].min()) if count else None,
+            "score_max": float(scores[cohort].max()) if count else None,
+            "mean_rating": float(cohort_ratings.mean()) if count else None,
+            "high_4_or_5_count": high_count,
+            "high_4_or_5_fraction": float(high_count / count) if count else None,
+            "low_1_or_2_count": low_count,
+            "low_1_or_2_fraction": float(low_count / count) if count else None,
+        })
+    return deciles
+
+
+def raw_ranking_metrics(ratings, scores):
+    """Evaluate ordering directly from raw ranker scores, without calibration."""
+    ratings = np.asarray(ratings, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    if len(ratings) != len(scores):
+        raise ValueError("ratings and scores must have equal lengths")
+    if not len(ratings):
+        return {
+            "count": 0,
+            "spearman": None,
+            "graded_ndcg_at_20": None,
+            "auc_four_or_five_vs_one_to_three": None,
+            "auc_one_or_two_vs_three_to_five": None,
+            "auc_high_vs_low_excluding_neutral": None,
+            "high_4_or_5_count": 0,
+            "low_1_or_2_count": 0,
+            "high_rated_in_top_20": 0,
+            "low_rated_in_bottom_20": 0,
+            "score_deciles": _score_deciles(ratings, scores),
+        }
+
+    order = np.argsort(-scores, kind="stable")
+    top = order[:min(20, len(order))]
+    bottom = order[-min(20, len(order)):]
+    gains = 2 ** (ratings - 1) - 1
+    discounts = 1 / np.log2(np.arange(2, len(top) + 2))
+    ideal = np.sort(gains)[::-1][:len(top)] @ discounts
+    rho = (
+        spearmanr(ratings, scores).statistic
+        if len(np.unique(ratings)) > 1 and len(np.unique(scores)) > 1
+        else None
+    )
+    high = ratings >= 4
+    low = ratings <= 2
+    non_neutral = high | low
+    return {
+        "count": int(len(ratings)),
+        "spearman": float(rho) if rho is not None and np.isfinite(rho) else None,
+        "graded_ndcg_at_20": float(gains[top] @ discounts / ideal) if ideal else None,
+        "auc_four_or_five_vs_one_to_three": _auc(high, scores),
+        # Low preference means a low raw score, so reverse the score direction.
+        "auc_one_or_two_vs_three_to_five": _auc(low, -scores),
+        # This sensitivity compares only clear high and low ratings, omitting 3★.
+        "auc_high_vs_low_excluding_neutral": _auc(high[non_neutral], scores[non_neutral]),
+        "high_4_or_5_count": int(high.sum()),
+        "low_1_or_2_count": int(low.sum()),
+        "high_rated_in_top_20": int(high[top].sum()),
+        "low_rated_in_bottom_20": int(low[bottom].sum()),
+        "score_deciles": _score_deciles(ratings, scores),
+    }
+
+
 def evaluate(records):
     _, (train_stop, validation_stop) = whole_day_cuts(records)
     ratings, current, earlier, prior_mean, prior_median = replay(records)
@@ -110,6 +201,22 @@ def evaluate(records):
     _, chosen_name, chosen_method = min(choices)
     fit = np.concatenate((train, validation))
     chosen = fit_calibrator(scores[chosen_name][fit], ratings[fit], chosen_method)
+    raw_ranking = {
+        "validation": {
+            name: raw_ranking_metrics(ratings[validation], values[validation])
+            for name, values in scores.items()
+        },
+        "test": {
+            name: raw_ranking_metrics(ratings[test], values[test])
+            for name, values in scores.items()
+        },
+        "cohort_definition": (
+            "Score deciles are ascending, equally sized rank cohorts; ties preserve input order. "
+            "High means 4–5 stars and low means 1–2 stars. The primary high AUC treats 1–3 stars "
+            "as negatives, the primary low AUC treats 3–5 stars as negatives, and the sensitivity "
+            "high-vs-low AUC omits 3-star books; high and low class counts are reported."
+        ),
+    }
     return {
         "protocol": "distinct rated works; chronological 60/20/20 whole-day split; per-book strictly earlier-day history",
         "counts": {"train": int(len(train)), "validation": int(len(validation)), "test": int(len(test))},
@@ -128,7 +235,18 @@ def evaluate(records):
             "current_linear": metrics(ratings[test], fit_calibrator(current[fit], ratings[fit], "linear")(current[test])),
             "earlier_linear": metrics(ratings[test], fit_calibrator(earlier[fit], ratings[fit], "linear")(earlier[test])),
         },
-        "limitations": "One historical reader; current embeddings may postdate reads; test among chosen books, not unseen candidates.",
+        "raw_ranking": raw_ranking,
+        "legacy_metrics_note": (
+            "The existing validation/test model metrics are calculated on calibrated 1–5 star predictions. "
+            "Use raw_ranking for discrimination and ordering from uncalibrated 0–100 scorer outputs."
+        ),
+        "limitations": (
+            "One historical reader; the replay treats each eventual rating as available on its read date, "
+            "although imports/upserts do not retain a reliable historical rating-availability timestamp. "
+            "Current embeddings may postdate reads. Held-out books were chosen by the reader; NDCG and "
+            "top/bottom cohorts compare synthetic time-block groups, not contemporaneous recommendation slates "
+            "or unseen-candidate retrieval."
+        ),
     }
 
 
