@@ -125,6 +125,8 @@ The displayed score is a 0–100 ranking signal, not a percentage chance that yo
 
 To evaluate ranking changes against a private history of rated reads, run `engine/scripts/evaluate_historical_ratings.py` on a consistent read-only snapshot. Its `raw_ranking` report measures whether high scores identify 4–5-star books and low scores identify 1–2-star books, with top/bottom groups and score-decile summaries. Keep these ordering diagnostics separate from the calibrated star-error report: calibration can change score ordering. See [the historical replay protocol](docs/recommendation-historical-replay.md) for the command and limitations.
 
+The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
+
 ### Limitations
 
 - **The source list sets the boundaries.** A book outside your enabled feeds and imports is not available to rank. Incomplete or quiet sources can make the pool small or repetitive.
