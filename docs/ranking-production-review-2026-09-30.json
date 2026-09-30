@@ -1,0 +1,235 @@
+{
+  "split": {
+    "train": 966,
+    "validation": 355,
+    "test": 356,
+    "minimum_history": 100,
+    "protocol": "whole-day 60/20/20 chronological split; expanding history with only strictly earlier read days; validation selects formula and calibrator; current and the validation-selected formula are evaluated on the latest 20%"
+  },
+  "validation_selection_objective": "Maximize the unweighted mean of high 4\u20135 vs 1\u20133 AUC and low 1\u20132 vs 3\u20135 AUC; ties keep the first declared alternative; choose current if no alternative beats it.",
+  "validation": {
+    "current": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5240291688631172,
+      "auc_low_2or_less": 0.5917452113104287,
+      "top20_high_rate": 0.4,
+      "bottom20_low_rate": 0.2,
+      "calibration_mae_stars": 0.5710858578604914
+    },
+    "author_stronger": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5227332630469161,
+      "auc_low_2or_less": 0.5885780885780886,
+      "top20_high_rate": 0.4,
+      "bottom20_low_rate": 0.2,
+      "calibration_mae_stars": 0.5708976419117499
+    },
+    "kernel_ess2": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5246441750131787,
+      "auc_low_2or_less": 0.5931387453126583,
+      "top20_high_rate": 0.4,
+      "bottom20_low_rate": 0.2,
+      "calibration_mae_stars": 0.5726871443405744
+    },
+    "kernel_ess5": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5243586364435073,
+      "auc_low_2or_less": 0.59389885476842,
+      "top20_high_rate": 0.35,
+      "bottom20_low_rate": 0.25,
+      "calibration_mae_stars": 0.5736239331442291
+    },
+    "cosine_centered": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5320681778246353,
+      "auc_low_2or_less": 0.6031721901287118,
+      "top20_high_rate": 0.5,
+      "bottom20_low_rate": 0.25,
+      "calibration_mae_stars": 0.5719923173289687
+    },
+    "negative_top5": {
+      "n": 355,
+      "high_count": 84,
+      "low_count": 69,
+      "auc_high_4plus": 0.5220523633807767,
+      "auc_low_2or_less": 0.5807742981656026,
+      "top20_high_rate": 0.35,
+      "bottom20_low_rate": 0.25,
+      "calibration_mae_stars": 0.5689358655181243
+    }
+  },
+  "validation_balanced_high_low_auc": {
+    "current": 0.557887190086773,
+    "author_stronger": 0.5556556758125024,
+    "kernel_ess2": 0.5588914601629185,
+    "kernel_ess5": 0.5591287456059637,
+    "cosine_centered": 0.5676201839766736,
+    "negative_top5": 0.5514133307731897
+  },
+  "validation_calibration": {
+    "current": {
+      "method": "linear",
+      "validation_mae": 0.5710858578604914
+    },
+    "author_stronger": {
+      "method": "linear",
+      "validation_mae": 0.5708976419117499
+    },
+    "kernel_ess2": {
+      "method": "linear",
+      "validation_mae": 0.5726871443405744
+    },
+    "kernel_ess5": {
+      "method": "linear",
+      "validation_mae": 0.5736239331442291
+    },
+    "cosine_centered": {
+      "method": "linear",
+      "validation_mae": 0.5719923173289687
+    },
+    "negative_top5": {
+      "method": "linear",
+      "validation_mae": 0.5689358655181243
+    }
+  },
+  "selected_on_validation": "cosine_centered",
+  "test": {
+    "current": {
+      "n": 356,
+      "high_count": 153,
+      "low_count": 54,
+      "auc_high_4plus": 0.6020638140313597,
+      "auc_low_2or_less": 0.5428930586215355,
+      "top20_high_rate": 0.7,
+      "bottom20_low_rate": 0.25,
+      "calibration_mae_stars": 0.6861054542294875
+    },
+    "cosine_centered": {
+      "n": 356,
+      "high_count": 153,
+      "low_count": 54,
+      "auc_high_4plus": 0.6009530248881162,
+      "auc_low_2or_less": 0.5413294088790778,
+      "top20_high_rate": 0.75,
+      "bottom20_low_rate": 0.25,
+      "calibration_mae_stars": 0.6848907152775582
+    }
+  },
+  "test_selected_minus_current": {
+    "high_auc": -0.0011107891432434736,
+    "low_auc": -0.0015636497424577067,
+    "balanced_auc": -0.0013372194428505901,
+    "calibration_mae_stars": -0.0012147389519293617,
+    "bootstrap_uncertainty": {
+      "high_auc_delta_95pct": [
+        -0.013152305143755646,
+        0.011410324202496486
+      ],
+      "low_auc_delta_95pct": [
+        -0.018637702157836913,
+        0.014711676948492285
+      ],
+      "bootstrap_resamples": 2000,
+      "bootstrap_seed": 20260930
+    }
+  },
+  "score_changes_on_test": {
+    "mean_delta_points": -1.8199438202247191,
+    "median_delta_points": -1.8999999999999986,
+    "mean_absolute_delta_points": 1.8390449438202248,
+    "p90_absolute_delta_points": 3.1000000000000014,
+    "changed_by_at_least_5_points": 1,
+    "n": 356
+  },
+  "latest_20pct_is_test": true,
+  "limitations": "One production reader. Every historical target was eventually read and rated, so this replay conditions on the reader\u2019s choice to read and does not model outcomes for unseen candidates. Embeddings may postdate read dates. The later 20% may have been inspected in prior work and is not independent confirmation; only prospectively collected data frozen before analysis can provide confirmatory evidence. Iid book bootstrap does not capture reader or time dependence.",
+  "algorithm_hypotheses": {
+    "author_stronger": "Increase the author contribution and shrink author means with 3 prior books instead of 5.",
+    "kernel_ess2": "Shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 2).",
+    "kernel_ess5": "Shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 5).",
+    "cosine_centered": "Center each query cosine around its mean history similarity, keeping 0.25 as the neutral reference.",
+    "negative_top5": "Replace the maximum low-rated neighbor penalty with a similarity-weighted mean of the top five."
+  },
+  "exact_ranker_parity_check": {
+    "compared_predictions": 1677,
+    "mismatches_at_served_precision": 0,
+    "max_score_error_points": 0.0
+  },
+  "uncertainty_settings": {
+    "bootstrap_iterations": 2000,
+    "bootstrap_seed": 20260930
+  },
+  "data": {
+    "snapshot_sha256": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+    "selected_embedding": [
+      "ollama",
+      "qwen3-embedding:4b"
+    ],
+    "usable_reads": 1777,
+    "excluded": {
+      "unrated": 9,
+      "undated": 9,
+      "missing_or_stale_vector": 0,
+      "duplicate_work": 2
+    },
+    "whole_day_split_boundaries": [
+      "2022-02-18",
+      "2022-02-21",
+      "2024-06-07",
+      "2024-06-10"
+    ]
+  },
+  "feedback_diagnostic": {
+    "usable": 127,
+    "saves": 57,
+    "rejects": 70,
+    "excluded": 4,
+    "exact_ranker_parity_check": {
+      "compared_predictions": 127,
+      "mismatches_at_served_precision": 0,
+      "max_score_error_points": 0.0
+    },
+    "candidate_feature_coverage": {
+      "usable_candidates": 127,
+      "with_source_weight": 127,
+      "with_catalog_confidence_or_quality_score": 127,
+      "missing_fields_use_ranker_defaults": true
+    },
+    "protocol": "Latest non-undone save/reject per candidate; read history is restricted to earlier calendar days. This is a separate, untuned intent diagnostic without exposure correction.",
+    "metrics": {
+      "current": {
+        "save_auc": 0.40601503759398494,
+        "top20_save_count": 7,
+        "top20_save_rate": 0.35,
+        "bottom20_reject_count": 5,
+        "bottom20_reject_rate": 0.25
+      },
+      "cosine_centered": {
+        "save_auc": 0.42832080200501255,
+        "top20_save_count": 7,
+        "top20_save_rate": 0.35,
+        "bottom20_reject_count": 12,
+        "bottom20_reject_rate": 0.6
+      }
+    },
+    "original_formula": {
+      "save_auc": 0.7052631578947368,
+      "top20_save_count": 12,
+      "top20_save_rate": 0.6,
+      "bottom20_reject_count": 16,
+      "bottom20_reject_rate": 0.8
+    },
+    "limitations": "Sparse logged actions do not estimate the causal effect of ranking or exposure. The SQLite loader does not join source weight or catalog confidence; use the enriched JSON export to reproduce those production inputs. When either field is absent, the ranker uses its documented default, so parity applies to the fields supplied."
+  }
+}
