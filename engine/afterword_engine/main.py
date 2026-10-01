@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, row, rows, transaction
+from .database import connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -1334,27 +1334,74 @@ def overview(
 
 
 @app.get("/api/reading-history")
-async def reading_history():
-    """Return all reads with prior and current-profile recommendation scores."""
+def reading_history():
+    """Return the read list without waiting for current-profile scoring."""
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
         ).fetchall()]
-        existing_candidates = [dict(item) for item in connection.execute(
-            "SELECT c.title,c.author,c.description,c.genres,c.score,c.status,"
-            "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
-            "FROM candidates c "
-            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            "WHERE c.status!='new' ORDER BY c.updated_at DESC,c.id DESC"
-        ).fetchall()]
-    candidates_by_identity = {}
+        existing_scores = []
+        candidate_keys = list(dict.fromkeys(
+            normalize_key(item["title"], item["author"]) for item in items
+        ))
+        for start in range(0, len(candidate_keys), 500):
+            key_batch = candidate_keys[start:start + 500]
+            placeholders = ",".join("?" for _ in key_batch)
+            existing_scores.extend(connection.execute(
+                "SELECT title,author,score FROM candidates "
+                f"WHERE status!='new' AND normalized_key IN ({placeholders}) "
+                "ORDER BY updated_at DESC,id DESC",
+                key_batch,
+            ).fetchall())
     scores = {}
+    for candidate in existing_scores:
+        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+        scores.setdefault(key, candidate["score"])
+    for item in items:
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        item["rank_score"] = scores.get(key)
+        item["algorithm_score"] = None
+        item["algorithm_explanation"] = []
+        item["metadata_confidence"] = None
+    return items
+
+
+@app.get("/api/reading-history/scores")
+async def reading_history_scores(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=20),
+):
+    """Rank a bounded slice of read books against the current reading profile."""
+    with connect() as connection:
+        items = [dict(item) for item in connection.execute(
+            "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
+            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()]
+        candidate_keys = list(dict.fromkeys(
+            normalize_key(item["title"], item["author"]) for item in items
+        ))
+        placeholders = ",".join("?" for _ in candidate_keys)
+        existing_candidates = (
+            [dict(item) for item in connection.execute(
+                "SELECT c.title,c.author,c.description,c.genres,c.status,"
+                "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
+                "FROM candidates c "
+                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                "LEFT JOIN sources s ON s.id=c.source_id "
+                f"WHERE c.status!='new' AND c.normalized_key IN ({placeholders}) "
+                "ORDER BY c.updated_at DESC,c.id DESC",
+                candidate_keys,
+            ).fetchall()]
+            if candidate_keys else []
+        )
+    if not items:
+        return []
+    candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
         candidates_by_identity.setdefault(key, candidate)
-        scores.setdefault(key, candidate["score"])
     virtual_candidates = []
     for item in items:
         key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
@@ -1386,10 +1433,9 @@ async def reading_history():
                 config.get("embedding_url"),
                 config.get("embedding_api_key"),
             )
-            rated_reads = [
-                item for item in items
-                if 1 <= float(item.get("rating") or 0) <= 5
-            ]
+            rated_reads = rows(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            )
             read_vectors = await cached_vectors(embedder, "read", rated_reads)
             candidate_vectors = await cached_vectors(
                 embedder, "read_candidate", virtual_candidates
@@ -1402,21 +1448,18 @@ async def reading_history():
                 exclude_candidate_identity=True,
             )
             ranked_by_id = {int(item["id"]): item for item in ranked}
-            for item in items:
-                ranked_item = ranked_by_id.get(-int(item["id"]), {})
-                item["algorithm_score"] = ranked_item.get("score", 50.0)
-                item["algorithm_explanation"] = ranked_item.get("explanation", [])
-                item["metadata_confidence"] = ranked_item.get("metadata_confidence", 1.0)
+            return [
+                {
+                    "id": int(item["id"]),
+                    "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
+                    "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
+                    "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
+                }
+                for item in items
+            ]
     except Exception:
-        LOGGER.warning("Could not calculate current-profile reading history scores")
-        for item in items:
-            item["algorithm_score"] = None
-            item["algorithm_explanation"] = []
-            item["metadata_confidence"] = None
-    for item in items:
-        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
-        item["rank_score"] = scores.get(key)
-    return items
+        LOGGER.exception("Could not calculate current-profile reading history scores")
+        raise
 
 def _recommendation_rows(
     connection=None,

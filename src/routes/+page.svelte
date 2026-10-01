@@ -104,7 +104,11 @@
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
+  let readingHistoryScoreError = $state("");
+  let readingHistoryScoreOffset = 0;
+  let readingHistoryScoreTask: Promise<void> | null = null;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
@@ -276,6 +280,9 @@
   const visibleReadingHistory = $derived(
     filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
+  const scoredReadingHistoryCount = $derived(
+    readingHistory.filter((item) => item.algorithm_score !== null).length,
+  );
   const filteredBooks = $derived(
     activeView === "saved"
       ? shortlistBooks
@@ -435,6 +442,9 @@
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
     readingHistoryState = "loading";
     readingHistoryError = "";
+    readingHistoryScoreState = "idle";
+    readingHistoryScoreError = "";
+    readingHistoryScoreOffset = 0;
     try {
       const response = await fetch("/api/reading-history", { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
@@ -446,12 +456,56 @@
       }
       readingHistory = payload.items;
       readingHistoryState = "ready";
+      void loadReadingHistoryScores(payload.items.length);
     } catch (error) {
       readingHistoryError = error instanceof Error
         ? error.message
         : "Reading history could not be loaded.";
       readingHistoryState = "error";
     }
+  }
+  function loadReadingHistoryScores(total: number) {
+    if (readingHistoryScoreTask) return readingHistoryScoreTask;
+    const batchSize = 20;
+    if (total === 0) {
+      readingHistoryScoreState = "ready";
+      return Promise.resolve();
+    }
+    readingHistoryScoreState = "loading";
+    readingHistoryScoreError = "";
+    const task = (async () => {
+      try {
+        for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
+          const response = await fetch(
+            `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
+            { headers: profileHeaders },
+          );
+          const payload = (await response.json().catch(() => ({}))) as {
+            scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
+            message?: string;
+          };
+          if (!response.ok || !Array.isArray(payload.scores)) {
+            throw new Error(payload.message || "Reading history scores could not be loaded.");
+          }
+          const scoresById = new Map(payload.scores.map((item) => [item.id, item]));
+          readingHistory = readingHistory.map((item) => {
+            const score = scoresById.get(item.id);
+            return score ? { ...item, ...score } : item;
+          });
+          readingHistoryScoreOffset = offset + batchSize;
+        }
+        readingHistoryScoreState = "ready";
+      } catch (error) {
+        readingHistoryScoreError = error instanceof Error
+          ? error.message
+          : "Reading history scores could not be loaded.";
+        readingHistoryScoreState = "error";
+      } finally {
+        readingHistoryScoreTask = null;
+      }
+    })();
+    readingHistoryScoreTask = task;
+    return task;
   }
   function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
     decisionFilter = filter;
@@ -1815,6 +1869,16 @@
                 </label>
               </div>
             {/if}
+            {#if readingHistoryScoreState === "loading"}
+              <p class="mb-4 text-sm text-surface-700-300" role="status" aria-live="polite">
+                Calculating Bookward scores for {scoredReadingHistoryCount} of {readingHistory.length} read books…
+              </p>
+            {:else if readingHistoryScoreState === "error"}
+              <div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-surface-700-300" role="status">
+                <span>{readingHistoryScoreError} Scores loaded for {scoredReadingHistoryCount} of {readingHistory.length} books.</span>
+                <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+              </div>
+            {/if}
             {#if readingHistoryState === "loading"}
               <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
@@ -1832,7 +1896,7 @@
                       <div class="min-w-0 flex-1">
                         <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
                         <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
-                        <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
+                        <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
                       {#if item.rating !== null && item.rating > 0}
                         <span class="badge shrink-0 preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
