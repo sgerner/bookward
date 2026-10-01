@@ -41,7 +41,8 @@ from .ingestion import (
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
-from .scoring import rebuild_all_embeddings, score_all
+from .scoring import cached_vectors, rebuild_all_embeddings, score_all
+from .ranking import rank_candidates
 from .secrets import seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -81,6 +82,7 @@ from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import QUALITY_VERSION, audit_candidates, quality_summary
 from .identity import (
+    book_identity,
     book_identity_match_index,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
@@ -1332,20 +1334,85 @@ def overview(
 
 
 @app.get("/api/reading-history")
-def reading_history():
-    """Return the complete read list with any prior recommendation score."""
+async def reading_history():
+    """Return all reads with prior and current-profile recommendation scores."""
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
         ).fetchall()]
-        scores = {}
-        for candidate in connection.execute(
-            "SELECT title,author,score FROM candidates WHERE status!='new' "
-            "ORDER BY updated_at DESC,id DESC"
-        ).fetchall():
-            key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-            scores.setdefault(key, candidate["score"])
+        existing_candidates = [dict(item) for item in connection.execute(
+            "SELECT c.title,c.author,c.description,c.genres,c.score,c.status,"
+            "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
+            "FROM candidates c "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "WHERE c.status!='new' ORDER BY c.updated_at DESC,c.id DESC"
+        ).fetchall()]
+    candidates_by_identity = {}
+    scores = {}
+    for candidate in existing_candidates:
+        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+        candidates_by_identity.setdefault(key, candidate)
+        scores.setdefault(key, candidate["score"])
+    virtual_candidates = []
+    for item in items:
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        matched = candidates_by_identity.get(key)
+        virtual = {
+            "id": -int(item["id"]),
+            "title": item["title"],
+            "author": item["author"],
+            "description": matched.get("description", "") if matched else "",
+            "genres": matched.get("genres", "[]") if matched else "[]",
+            "source_weight": (matched.get("source_weight") or 1) if matched else 1,
+        }
+        if matched:
+            quality_score = float(matched.get("quality_score") or 0)
+            virtual["catalog_confidence"] = (
+                quality_score
+                if quality_score > 0
+                else 0.85 if matched.get("quality_status") == "accepted" else 0
+            )
+            virtual["source_name"] = matched.get("source_name") or ""
+        virtual_candidates.append(virtual)
+
+    try:
+        if virtual_candidates:
+            config = private_settings()
+            embedder = get_embedder(
+                config.get("embedding_backend"),
+                config.get("embedding_model"),
+                config.get("embedding_url"),
+                config.get("embedding_api_key"),
+            )
+            rated_reads = [
+                item for item in items
+                if 1 <= float(item.get("rating") or 0) <= 5
+            ]
+            read_vectors = await cached_vectors(embedder, "read", rated_reads)
+            candidate_vectors = await cached_vectors(
+                embedder, "read_candidate", virtual_candidates
+            )
+            ranked = rank_candidates(
+                rated_reads,
+                read_vectors,
+                virtual_candidates,
+                candidate_vectors,
+                exclude_candidate_identity=True,
+            )
+            ranked_by_id = {int(item["id"]): item for item in ranked}
+            for item in items:
+                ranked_item = ranked_by_id.get(-int(item["id"]), {})
+                item["algorithm_score"] = ranked_item.get("score", 50.0)
+                item["algorithm_explanation"] = ranked_item.get("explanation", [])
+                item["metadata_confidence"] = ranked_item.get("metadata_confidence", 1.0)
+    except Exception:
+        LOGGER.warning("Could not calculate current-profile reading history scores")
+        for item in items:
+            item["algorithm_score"] = None
+            item["algorithm_explanation"] = []
+            item["metadata_confidence"] = None
     for item in items:
         key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
         item["rank_score"] = scores.get(key)

@@ -73,6 +73,9 @@
     source: string;
     created_at: string;
     rank_score: number | null;
+    algorithm_score: number | null;
+    algorithm_explanation: string[];
+    metadata_confidence: number | null;
   };
   type LibrarrResult = Record<string, unknown>;
   type OptimisticChange = {
@@ -98,12 +101,15 @@
   let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
-  let decisionFilter = $state<"all" | "maybe_later" | "rejected">("all");
-  let historyTab = $state<"decisions" | "read">("decisions");
+  let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
   let readingHistoryVisibleCount = $state(30);
+  let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
+  let readingHistorySourceFilter = $state("all");
+  let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
+  let expandedReadingDetails = $state<number[]>([]);
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
@@ -231,11 +237,42 @@
   );
   const filteredReadingHistory = $derived.by(() => {
     const query = filter.trim().toLowerCase();
-    return readingHistory.filter(
-      (item) =>
-        !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query),
-    );
+    const matchesRating = (item: ReadingHistoryItem) => {
+      if (readingHistoryRatingFilter === "rated") return item.rating !== null && item.rating > 0;
+      if (readingHistoryRatingFilter === "unrated") return item.rating === null || item.rating <= 0;
+      return true;
+    };
+    const matchesSearch = (item: ReadingHistoryItem) =>
+      !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
+    const readTimestamp = (item: ReadingHistoryItem) => {
+      const timestamp = Date.parse(item.read_at ?? item.created_at);
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
+    return readingHistory
+      .filter((item) =>
+        matchesSearch(item) &&
+        matchesRating(item) &&
+        (readingHistorySourceFilter === "all" || item.source === readingHistorySourceFilter),
+      )
+      .sort((left, right) => {
+        if (readingHistorySort === "oldest") return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
+        if (readingHistorySort === "score_high" || readingHistorySort === "score_low") {
+          if (left.algorithm_score === null) return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
+          if (right.algorithm_score === null) return -1;
+          const scoreOrder = readingHistorySort === "score_high"
+            ? right.algorithm_score - left.algorithm_score
+            : left.algorithm_score - right.algorithm_score;
+          return scoreOrder || left.title.localeCompare(right.title);
+        }
+        if (readingHistorySort === "rating_high") return (right.rating ?? 0) - (left.rating ?? 0) || left.title.localeCompare(right.title);
+        if (readingHistorySort === "title") return left.title.localeCompare(right.title);
+        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
+      });
   });
+  const readingHistorySources = $derived(
+    [...new Set(readingHistory.map((item) => item.source).filter(Boolean))]
+      .sort((left, right) => readingSourceLabel(left).localeCompare(readingSourceLabel(right))),
+  );
   const visibleReadingHistory = $derived(
     filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
@@ -416,10 +453,15 @@
       readingHistoryState = "error";
     }
   }
-  function selectHistoryTab(tab: "decisions" | "read") {
-    historyTab = tab;
+  function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
+    decisionFilter = filter;
     readingHistoryVisibleCount = 30;
-    if (tab === "read") void loadReadingHistory();
+    if (filter === "read") void loadReadingHistory();
+  }
+  function toggleReadingDetails(id: number) {
+    expandedReadingDetails = expandedReadingDetails.includes(id)
+      ? expandedReadingDetails.filter((itemId) => itemId !== id)
+      : [...expandedReadingDetails, id];
   }
   function readingSourceLabel(source: string) {
     return ({
@@ -439,7 +481,7 @@
   function go(view: View) {
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
-    if (view === "decisions" && historyTab === "read") void loadReadingHistory();
+    if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
@@ -1458,7 +1500,7 @@
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
-          >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && historyTab === "read" ? "Your reading history." : "Past decisions."}</h1>
+          >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
             <Search size={17} class="shrink-0 text-surface-600-400" />
             <input
@@ -1470,28 +1512,6 @@
             {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
           </div>
         </section>
-        {#if view === "decisions"}
-          <div class="mb-6 flex w-full max-w-xl gap-1 rounded-container preset-tonal-surface p-1" role="tablist" aria-label="History sections">
-            <button
-              id="history-decisions-tab"
-              type="button"
-              role="tab"
-              aria-selected={historyTab === "decisions"}
-              aria-controls="history-decisions-panel"
-              class={`min-h-10 flex-1 px-3 text-sm font-medium transition ${historyTab === "decisions" ? "preset-filled-primary-500" : "text-surface-700-300 hover:preset-tonal-primary"}`}
-              onclick={() => selectHistoryTab("decisions")}
-            >Past decisions <span class="ml-1 opacity-75">{allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length}</span></button>
-            <button
-              id="history-read-tab"
-              type="button"
-              role="tab"
-              aria-selected={historyTab === "read"}
-              aria-controls="history-read-panel"
-              class={`min-h-10 flex-1 px-3 text-sm font-medium transition ${historyTab === "read" ? "preset-filled-primary-500" : "text-surface-700-300 hover:preset-tonal-primary"}`}
-              onclick={() => selectHistoryTab("read")}
-            >Read books <span class="ml-1 opacity-75">{data.readCount}</span></button>
-          </div>
-        {/if}
         {#if view === "saved"}
           <section class="mb-6" aria-label="Shortlist shelves">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
@@ -1503,17 +1523,17 @@
             </div>
           </section>
         {/if}
-        {#if view === "decisions" && historyTab === "decisions"}
-          <section class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" aria-label="Past recommendation decisions">
-            <p class="max-w-2xl text-sm leading-6 text-surface-700-300">Passed and deferred books stay here. Return any one to Discover whenever you are ready.</p>
-            <div class="flex flex-wrap gap-2" role="group" aria-label="Filter past decisions">
+        {#if view === "decisions"}
+          <section class="mb-6" aria-label="History filters">
+            <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All ({allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length})</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later ({allBooks.filter((book) => book.status === "maybe_later").length})</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed ({allBooks.filter((book) => book.status === "rejected").length})</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
           </section>
         {/if}
-        {#if view !== "decisions" || historyTab === "decisions"}
+        {#if view !== "decisions" || decisionFilter !== "read"}
         {#if view === "discover" && digestVisible}
           <section
             in:fade={{ duration: motionDuration(260) }}
@@ -1544,9 +1564,6 @@
           </section>
         {/if}
         <section
-          id={view === "decisions" ? "history-decisions-panel" : undefined}
-          role={view === "decisions" ? "tabpanel" : undefined}
-          aria-labelledby={view === "decisions" ? "history-decisions-tab" : undefined}
           class="grid gap-3 sm:gap-4 lg:grid-cols-2"
           aria-live="polite"
         >
@@ -1762,15 +1779,42 @@
         </section>
         {:else}
           <section
-            id="history-read-panel"
-            role="tabpanel"
-            aria-labelledby="history-read-tab"
+            aria-label="Read books"
             aria-busy={readingHistoryState === "loading"}
             class="min-w-0"
           >
-            <p class="mb-5 max-w-3xl text-sm leading-6 text-surface-700-300">
-              Books imported from your reading history, with their source, rating, and any score Bookward recorded when it previously recommended the title.
-            </p>
+            {#if readingHistoryState === "ready"}
+              <div class="mb-5 grid gap-3 sm:grid-cols-3" role="group" aria-label="Filter and sort read books">
+                <label class="block text-sm font-medium text-surface-800-200">
+                  Rating
+                  <select bind:value={readingHistoryRatingFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
+                    <option value="all">Any rating</option>
+                    <option value="rated">Rated</option>
+                    <option value="unrated">Unrated</option>
+                  </select>
+                </label>
+                <label class="block text-sm font-medium text-surface-800-200">
+                  Source
+                  <select bind:value={readingHistorySourceFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
+                    <option value="all">All sources</option>
+                    {#each readingHistorySources as source (source)}
+                      <option value={source}>{readingSourceLabel(source)}</option>
+                    {/each}
+                  </select>
+                </label>
+                <label class="block text-sm font-medium text-surface-800-200">
+                  Sort by
+                  <select bind:value={readingHistorySort} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Sort read books">
+                    <option value="recent">Most recently read</option>
+                    <option value="oldest">Oldest read</option>
+                    <option value="score_high">Highest Bookward score</option>
+                    <option value="score_low">Lowest Bookward score</option>
+                    <option value="rating_high">Highest rating</option>
+                    <option value="title">Title A–Z</option>
+                  </select>
+                </label>
+              </div>
+            {/if}
             {#if readingHistoryState === "loading"}
               <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
@@ -1788,6 +1832,7 @@
                       <div class="min-w-0 flex-1">
                         <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
                         <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                        <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
                       {#if item.rating !== null && item.rating > 0}
                         <span class="badge shrink-0 preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
@@ -1795,25 +1840,46 @@
                         <span class="badge shrink-0 preset-tonal-surface">Unrated</span>
                       {/if}
                     </div>
-                    <details class="group mt-3 border-t border-surface-300-700/40 pt-2">
-                      <summary class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-sm font-medium text-primary-600-400 [&::-webkit-details-marker]:hidden">
-                        Reading details <ChevronDown size={15} class="ml-auto transition group-open:rotate-180" />
-                      </summary>
-                      <dl class="grid gap-2 pt-2 text-xs">
-                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
-                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
-                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
-                      </dl>
-                      <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
-                        {#if item.rank_score !== null}
-                          <p class="font-semibold text-surface-950-50">Most recent recommendation score: {item.rank_score.toFixed(1)} / 100</p>
-                          <p class="mt-1 text-surface-700-300">This relative score was recorded before the book entered your read list; it is not a probability or star rating.</p>
-                        {:else}
-                          <p class="font-semibold text-surface-950-50">No previous recommendation score</p>
-                          <p class="mt-1 text-surface-700-300">Bookward has not ranked this title as a recommendation. Its rating still helps shape future recommendations.</p>
-                        {/if}
-                      </div>
-                    </details>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-2">
+                      <button
+                        type="button"
+                        class="flex min-h-9 w-full items-center gap-2 text-left text-sm font-medium text-primary-600-400"
+                        aria-expanded={expandedReadingDetails.includes(item.id)}
+                        aria-controls={`reading-details-${item.id}`}
+                        onclick={() => toggleReadingDetails(item.id)}
+                      >
+                        Reading details <ChevronDown size={15} class={`ml-auto transition ${expandedReadingDetails.includes(item.id) ? "rotate-180" : ""}`} />
+                      </button>
+                      {#if expandedReadingDetails.includes(item.id)}
+                        <div id={`reading-details-${item.id}`} class="pt-2" transition:slide={{ duration: motionDuration(220) }}>
+                          <dl class="grid gap-2 text-xs">
+                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
+                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
+                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
+                          </dl>
+                          <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
+                            {#if item.algorithm_score !== null}
+                              <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
+                              <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
+                              {#if item.algorithm_explanation.length}
+                                <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
+                                  {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
+                                </ul>
+                              {:else}
+                                <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
+                              {/if}
+                            {:else}
+                              <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
+                            {/if}
+                            {#if item.rank_score !== null}
+                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
+                            {:else}
+                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
+                            {/if}
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
                   </article>
                 {/each}
               </div>
@@ -1824,8 +1890,8 @@
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
-                  <h2 class="font-semibold text-surface-950-50">{filter ? "No read books match that search" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter ? "Try a different title, author, or import source." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -2852,7 +2918,7 @@
                     ><BookOpen size={19} /></span
                   >
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
-                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectHistoryTab("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
+                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if data.history.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
