@@ -5,7 +5,7 @@ Prints aggregate metrics only. No network requests or database writes.
 """
 import argparse
 import base64
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
 from pathlib import Path
@@ -21,15 +21,24 @@ from afterword_engine.scoring import document
 
 
 def read_time(value):
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, date):
+        result = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    elif not isinstance(value, str):
+        return None
+    else:
+        result = None
     try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
+        if result is None:
+            result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         try:
             result = datetime.strptime(value, "%Y/%m/%d")
-        except (ValueError, TypeError):
+        except ValueError:
             try:
                 result = parsedate_to_datetime(value)
-            except (ValueError, TypeError, AttributeError):
+            except (ValueError, TypeError, AttributeError, IndexError):
                 return None
     return result.replace(tzinfo=result.tzinfo or timezone.utc).astimezone(timezone.utc)
 
@@ -44,6 +53,9 @@ def load_corpus(path):
         con.row_factory = sqlite3.Row
         con.execute("BEGIN")
         return {
+            # Preserve row-availability time for the separate feedback
+            # sensitivity. Imported read_at dates do not imply when a row was
+            # present in the database.
             "reads": [dict(r) for r in con.execute("SELECT * FROM reads")],
             "candidates": [dict(r) for r in con.execute("SELECT * FROM candidates")],
             "feedback": [dict(r) for r in con.execute("SELECT * FROM feedback")],
@@ -170,6 +182,137 @@ def feedback_check(data, records, selected):
             "limitations": "Small intent sample, current metadata, no impression log; not a rating or live A/B test."}
 
 
+def feedback_history_available_at(records, when, candidate):
+    """Select unrelated prior-day reads whose rows existed by the action time.
+
+    Missing or malformed ``created_at`` is unknown and excluded. The returned
+    counters describe only rows that would otherwise qualify by read date and
+    identity, so callers can report the cost of this conservative gate.
+    """
+    identity = book_identity(candidate["title"], candidate["author"])
+    prior = []
+    counts = {
+        "available": 0,
+        "unknown_created_at": 0,
+        "created_after_action": 0,
+        "same_day_read_date": 0,
+        "same_identity": 0,
+    }
+    for read_date, item, vector in records:
+        day = read_date.date() if isinstance(read_date, datetime) else read_date
+        if day >= when.date():
+            if day == when.date():
+                counts["same_day_read_date"] += 1
+            continue
+        if book_identity(item["title"], item["author"]) == identity:
+            counts["same_identity"] += 1
+            continue
+        created_at = read_time(item.get("created_at"))
+        if created_at is None:
+            counts["unknown_created_at"] += 1
+            continue
+        if created_at > when:
+            counts["created_after_action"] += 1
+            continue
+        prior.append((item, vector))
+    counts["available"] = len(prior)
+    return prior, counts
+
+
+def feedback_check_engine_available_history(data, records, selected):
+    """Feedback sensitivity gated by both read day and row creation time.
+
+    This reports only current-ranker metrics. It deliberately keeps candidates
+    with an empty available history in the cohort; the ranker supports an empty
+    history and returns its neutral-history score. It does not invent a legacy
+    baseline for that case.
+    """
+    from afterword_engine.ranking import rank_candidates
+
+    candidates = {c["id"]: c for c in data.get("candidates", [])}
+    cache = {e["entity_id"]: e for e in data["embeddings"]
+             if e["entity_type"] == "candidate" and (e["backend"], e["model"]) == selected}
+    latest = {}
+    dated_events = [
+        (read_time(e.get("created_at")), e)
+        for e in data.get("feedback", [])
+        if not e.get("undone_at")
+    ]
+    for _, event in sorted(((when, event) for when, event in dated_events if when is not None),
+                           key=lambda pair: (pair[0], pair[1]["id"])):
+        latest[event["candidate_id"]] = event
+
+    labels, scores = [], []
+    availability = {
+        "prepared_history_rows": len(records),
+        "prepared_rows_with_known_created_at": sum(
+            read_time(item.get("created_at")) is not None for _, item, _ in records
+        ),
+        "prepared_rows_with_unknown_created_at": sum(
+            read_time(item.get("created_at")) is None for _, item, _ in records
+        ),
+        "cases_with_unknown_prior_row_availability": 0,
+        "cases_with_rows_created_after_action": 0,
+        "cases_with_no_available_history": 0,
+        "date_eligible_rows_missing_created_at_encounters": 0,
+        "date_eligible_rows_created_after_action_encounters": 0,
+        "date_eligible_unrelated_rows_encounters": 0,
+        "available_history_rows_across_cases_not_unique": 0,
+    }
+    read_dimensions = int(records[0][2].shape[0]) if records else 0
+
+    for candidate_id, event in latest.items():
+        item = candidates.get(candidate_id)
+        entry = cache.get(candidate_id)
+        when = read_time(event.get("created_at"))
+        if event.get("action") not in {"save", "reject"} or when is None:
+            continue
+        if not item or not entry or entry.get("content_hash") != content_hash(document(item)):
+            continue
+        query_vector = np.frombuffer(entry["vector"], dtype=np.float32)
+        if (not query_vector.size or not np.isfinite(query_vector).all()
+                or (read_dimensions and query_vector.size != read_dimensions)):
+            continue
+
+        prior, counts = feedback_history_available_at(records, when, item)
+        availability["cases_with_unknown_prior_row_availability"] += counts["unknown_created_at"] > 0
+        availability["cases_with_rows_created_after_action"] += counts["created_after_action"] > 0
+        availability["cases_with_no_available_history"] += not prior
+        availability["date_eligible_rows_missing_created_at_encounters"] += counts["unknown_created_at"]
+        availability["date_eligible_rows_created_after_action_encounters"] += counts["created_after_action"]
+        availability["date_eligible_unrelated_rows_encounters"] += (
+            counts["available"] + counts["unknown_created_at"] + counts["created_after_action"]
+        )
+        availability["available_history_rows_across_cases_not_unique"] += counts["available"]
+
+        history = [read for read, _ in prior]
+        read_vectors = (
+            np.stack([vector for _, vector in prior])
+            if prior else np.empty((0, query_vector.size), dtype=np.float32)
+        )
+        ranked = rank_candidates(history, read_vectors, [item], query_vector[None, :])
+        labels.append(event["action"] == "save")
+        scores.append(ranked[0]["score"])
+
+    if not labels:
+        return None
+    labels = np.asarray(labels, dtype=bool)
+    return {
+        "usable_candidates": len(labels),
+        "saved": int(labels.sum()),
+        "excluded_candidates": len(latest) - len(labels),
+        "neighborhood": metrics(labels, np.asarray(scores, dtype=float)),
+        "history_availability": availability,
+        "limitations": (
+            "Conservative row-availability sensitivity only. read_at is gated to days before the action, "
+            "and read.created_at must be known and no later than the exact action time. created_at "
+            "records row creation, not later rating edits or when a rating became known. Missing "
+            "availability is excluded and counted. Empty histories remain in this current-ranker cohort; "
+            "no legacy baseline is reported for them."
+        ),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
@@ -214,6 +357,9 @@ def main():
                         "baseline": metrics(labels, old), "neighborhood": metrics(labels, new),
                         "auc_delta_bootstrap_95_percent": np.quantile(differences, [.025, .975]).tolist() if differences else None}
     output["explicit_feedback_diagnostic"] = feedback_check(data, records, selected)
+    output["explicit_feedback_engine_available_history_sensitivity"] = (
+        feedback_check_engine_available_history(data, records, selected)
+    )
     print(json.dumps(output, indent=2))
 
 

@@ -28,7 +28,7 @@ compared with 0.6861 for current scores.
 The daily expanding model is an additional exploratory diagnostic, added after
 the initial frozen-model result. It refits on strictly earlier causal examples
 with the same regularization and feature set. Its later high-AUC gain of 0.0178
-comes with a low-AUC loss of 0.0419. Paired 2,000-book bootstrap intervals are
+comes with a low-AUC loss of 0.0419. Paired 2,000-resample book-bootstrap intervals are
 [-0.0166, 0.0486] for the high-AUC change and [-0.0912, 0.0040] for the low-AUC
 change. Low-AUC regressions persist in both temporal halves and are larger for
 authors absent from the earlier history. This is not a useful improvement in
