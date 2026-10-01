@@ -359,8 +359,10 @@ def metric_set(y, scores, calibrated=None):
         return {'n': 0}
     high, low = y >= 4, y <= 2
     clear = high | low
-    top = np.argsort(-scores, kind='stable')[:min(20, n)]
-    bottom = np.argsort(scores, kind='stable')[:min(20, n)]
+    # Match raw_ranking_metrics: ties share one descending stable order.
+    order = np.argsort(-scores, kind='stable')
+    top = order[:min(20, n)]
+    bottom = order[-min(20, n):]
     out = {
         'n': int(n), 'high_count': int(high.sum()), 'low_count': int(low.sum()),
         'auc_high_4plus': auc(high, scores),
@@ -579,9 +581,11 @@ def main():
                             'validation_fit_seconds': float(validation_fit_seconds)}
         expanding_latent, expanding_expected, expanding_runtime = expanding_ordinal_replay(
             records, dates, base_X, ratings, np.isfinite(current), train_stop, val_stop)
-        if not np.isfinite(expanding_latent[validation]).all() or not np.isfinite(expanding_latent[test]).all():
+        if not np.isfinite(expanding_expected[validation]).all() or not np.isfinite(expanding_expected[test]).all():
             raise ValueError('expanding ordinal replay did not cover validation and test')
-        expanding_validation = metric_set(ratings[validation], expanding_latent[validation])
+        # Independently refitted latent scales are not comparable across days.
+        # Expected ratings map each day's posterior onto the same 1–5 scale.
+        expanding_validation = metric_set(ratings[validation], expanding_expected[validation])
         expanding_validation['ordinal_expected_star_mae'] = float(
             np.mean(np.abs(expanding_expected[validation] - ratings[validation])))
         expanding_validation['balanced_high_low_auc'] = float(np.mean([
@@ -623,13 +627,13 @@ def main():
                                     'validation_balanced_auc': validation_balanced[name],
                                     'current_validation_balanced_auc': validation_balanced['current'],
                                     'paired_test_comparison': result}
-        expanding_test = paired_metrics(ratings[test], current[test], expanding_latent[test], args.bootstrap_iterations)
+        expanding_test = paired_metrics(ratings[test], current[test], expanding_expected[test], args.bootstrap_iterations)
         expanding_test['candidate']['ordinal_expected_star_mae'] = float(
             np.mean(np.abs(expanding_expected[test] - ratings[test])))
         expanding_test['temporal_halves'] = temporal_halves(
-            records, test, ratings[test], current[test], expanding_latent[test])
+            records, test, ratings[test], current[test], expanding_expected[test])
         expanding_test['author_slices'] = author_slices(
-            records, items, test, ratings[test], current[test], expanding_latent[test])
+            records, items, test, ratings[test], current[test], expanding_expected[test])
         current_cal_method, current_mae = fit_calibrator(current[train], ratings[train], current[validation], ratings[validation])
         current_test_cal = calibrate(current[fit], ratings[fit], current[test], current_cal_method)
         test_results['current']['calibrated_star_mae'] = float(np.mean(np.abs(current_test_cal - ratings[test])))
@@ -655,7 +659,7 @@ def main():
             'runtime_scope': 'Includes chronological feature replay and exact serving-ranker parity calls. Interest timing covers causal k-means initialization, assigning each newly available read, and interest-specific per-query features; per-query figures exclude the shared history-cosine matrix, database access, and embedding generation. Ordinal fit timings are reported by model below.',
             'validation': {'metrics': validation_results, 'balanced_high_low_auc': validation_balanced,
                            'post_initial_diagnostic_expanding_refit': {
-                               'model': 'same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; not included in primary variant selection',
+                               'model': 'same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; pooled ranking uses posterior expected ratings on a common 1–5 scale, not daily latent scores; not included in primary variant selection',
                                'metrics': expanding_validation,
                                'model_fit_runtime_seconds': expanding_runtime['validation']},
                            'current_calibration': {'method': current_cal_method, 'validation_mae_by_method': current_mae},
@@ -666,10 +670,10 @@ def main():
                            'family_choices': chosen, 'selected_for_test': selected_for_test},
             'test': {'current': test_results['current'], 'family_comparisons': test_details,
                      'post_initial_diagnostic_expanding_refit': {
-                         'model': 'same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; held-out outcomes become training data only after their day',
+                         'model': 'same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; pooled ranking uses posterior expected ratings on a common 1–5 scale, not daily latent scores; held-out outcomes become training data only after their day',
                          'paired_comparison': expanding_test,
                          'model_fit_runtime_seconds': expanding_runtime['test']}},
-            'limits': 'One retrospective reader-selected history; book-bootstrap intervals ignore temporal and reader dependence; embeddings and eventual ratings may postdate read dates; no evidence here covers unseen-candidate retrieval or live policy effects. The later period has been inspected in previous studies and is not independent confirmation.'
+            'limits': 'One retrospective reader-selected history; book-bootstrap intervals ignore temporal and reader dependence; embeddings and eventual ratings may postdate read dates; no evidence here covers unseen-candidate retrieval or live policy effects. The later period has been inspected in previous studies and is not independent confirmation. Ordinal calibration uses in-sample model scores for fitting its mapping; later MAE is out of sample but calibration training can be optimistic.'
         }
         rendered = json.dumps(output, indent=2, allow_nan=False) + '\n'
         if args.output is None:

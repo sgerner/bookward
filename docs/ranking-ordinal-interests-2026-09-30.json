@@ -69,6 +69,54 @@
     "mismatches_at_served_precision": 0,
     "max_score_error_points": 0.0
   },
+  "runtime_seconds": {
+    "replay_wall_seconds": 48.82566352101276,
+    "exact_ranker_parity": {
+      "compared_predictions": 1677,
+      "mismatches_at_served_precision": 0,
+      "max_score_error_points": 0.0
+    },
+    "interest_runtime": {
+      "3": {
+        "kmeans_fit_seconds": 0.015839522995520383,
+        "causal_assignment_seconds": 0.031169218505965546,
+        "median_query_feature_seconds": 0.0002776670007733628,
+        "p95_query_feature_seconds": 0.00048184883635258295,
+        "fit_prefix_size": 100
+      },
+      "5": {
+        "kmeans_fit_seconds": 0.013784861017484218,
+        "causal_assignment_seconds": 0.01989029295509681,
+        "median_query_feature_seconds": 0.0001699244894552976,
+        "p95_query_feature_seconds": 0.00032044600520748646,
+        "fit_prefix_size": 100
+      }
+    }
+  },
+  "expanding_refit_runtime_seconds": {
+    "validation": {
+      "calendar_day_fits": 339,
+      "queries_scored": 355,
+      "prior_examples_min": 966,
+      "prior_examples_max": 1320,
+      "total_fit_seconds": 12.510615187609801,
+      "median_fit_seconds_per_day": 0.036900898994645104,
+      "p95_fit_seconds_per_day": 0.04342452578130178,
+      "all_optimizer_runs_succeeded": true,
+      "optimizer_iterations_median": 40.0
+    },
+    "test": {
+      "calendar_day_fits": 293,
+      "queries_scored": 356,
+      "prior_examples_min": 1321,
+      "prior_examples_max": 1675,
+      "total_fit_seconds": 13.349483359925216,
+      "median_fit_seconds_per_day": 0.045357944996794686,
+      "p95_fit_seconds_per_day": 0.05171753122122026,
+      "all_optimizer_runs_succeeded": true,
+      "optimizer_iterations_median": 41.0
+    }
+  },
   "runtime_scope": "Includes chronological feature replay and exact serving-ranker parity calls. Interest timing covers causal k-means initialization, assigning each newly available read, and interest-specific per-query features; per-query figures exclude the shared history-cosine matrix, database access, and embedding generation. Ordinal fit timings are reported by model below.",
   "validation": {
     "metrics": {
@@ -81,10 +129,10 @@
         "auc_high_vs_low_excluding_neutral": 0.5898033126293996,
         "top20_high_count": 8,
         "top20_high_rate": 0.4,
-        "bottom20_low_count": 5,
-        "bottom20_low_rate": 0.25,
+        "bottom20_low_count": 4,
+        "bottom20_low_rate": 0.2,
         "top20_mean_rating": 3.5,
-        "bottom20_mean_rating": 2.9
+        "bottom20_mean_rating": 2.95
       },
       "ordinal_10": {
         "n": 355,
@@ -142,31 +190,31 @@
       "interests_k5": 0.5697211700540756
     },
     "post_initial_diagnostic_expanding_refit": {
-      "model": "same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; not included in primary variant selection",
+      "model": "same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; pooled ranking uses posterior expected ratings on a common 1\u20135 scale, not daily latent scores; not included in primary variant selection",
       "metrics": {
         "n": 355,
         "high_count": 84,
         "low_count": 69,
-        "auc_high_4plus": 0.5206905640484977,
-        "auc_low_2or_less_reversed": 0.5872605655214351,
-        "auc_high_vs_low_excluding_neutral": 0.5860938578329883,
-        "top20_high_count": 8,
-        "top20_high_rate": 0.4,
+        "auc_high_4plus": 0.5225795115094009,
+        "auc_low_2or_less_reversed": 0.5956724434985304,
+        "auc_high_vs_low_excluding_neutral": 0.5935127674258109,
+        "top20_high_count": 9,
+        "top20_high_rate": 0.45,
         "bottom20_low_count": 5,
         "bottom20_low_rate": 0.25,
-        "top20_mean_rating": 3.5,
-        "bottom20_mean_rating": 3.0,
+        "top20_mean_rating": 3.55,
+        "bottom20_mean_rating": 2.95,
         "ordinal_expected_star_mae": 0.5431436181827065,
-        "balanced_high_low_auc": 0.5539755647849665
+        "balanced_high_low_auc": 0.5591259775039656
       },
       "model_fit_runtime_seconds": {
         "calendar_day_fits": 339,
         "queries_scored": 355,
         "prior_examples_min": 966,
         "prior_examples_max": 1320,
-        "total_fit_seconds": 13.08651458856184,
-        "median_fit_seconds_per_day": 0.03788260300643742,
-        "p95_fit_seconds_per_day": 0.04770166439702734,
+        "total_fit_seconds": 12.510615187609801,
+        "median_fit_seconds_per_day": 0.036900898994645104,
+        "p95_fit_seconds_per_day": 0.04342452578130178,
         "all_optimizer_runs_succeeded": true,
         "optimizer_iterations_median": 40.0
       }
@@ -185,7 +233,7 @@
           "linear": 0.5368059397405985,
           "isotonic": 0.5646335596616021
         },
-        "fit_seconds": 0.033687639981508255
+        "fit_seconds": 0.032769673998700455
       },
       "interests_k3": {
         "method": "linear",
@@ -193,7 +241,7 @@
           "linear": 0.5366329089348932,
           "isotonic": 0.5537795390417639
         },
-        "fit_seconds": 0.04265466099604964
+        "fit_seconds": 0.04265445299097337
       },
       "interests_k5": {
         "method": "linear",
@@ -201,7 +249,7 @@
           "linear": 0.5361939490205742,
           "isotonic": 0.5483717832403217
         },
-        "fit_seconds": 0.043656163004925475
+        "fit_seconds": 0.04136557099991478
       }
     },
     "family_choices": {
@@ -322,10 +370,10 @@
                 "auc_high_vs_low_excluding_neutral": 0.5848063973063973,
                 "top20_high_count": 13,
                 "top20_high_rate": 0.65,
-                "bottom20_low_count": 4,
-                "bottom20_low_rate": 0.2,
+                "bottom20_low_count": 3,
+                "bottom20_low_rate": 0.15,
                 "top20_mean_rating": 3.7,
-                "bottom20_mean_rating": 3.1
+                "bottom20_mean_rating": 3.15
               },
               "candidate": {
                 "n": 182,
@@ -346,7 +394,7 @@
                 "low_auc": -0.0069295101553166205,
                 "clear_high_vs_low_auc": -0.0018939393939393367,
                 "top20_high_count": 1,
-                "bottom20_low_count": 0
+                "bottom20_low_count": 1
               }
             },
             "boundary_date": "2025-07-28"
@@ -433,7 +481,7 @@
             "optimizer_success": true,
             "optimizer_iterations": 42,
             "ridge": 0.1,
-            "refit_seconds": 0.04462424200028181
+            "refit_seconds": 0.04311945798690431
           }
         }
       },
@@ -529,10 +577,10 @@
                 "auc_high_vs_low_excluding_neutral": 0.5848063973063973,
                 "top20_high_count": 13,
                 "top20_high_rate": 0.65,
-                "bottom20_low_count": 4,
-                "bottom20_low_rate": 0.2,
+                "bottom20_low_count": 3,
+                "bottom20_low_rate": 0.15,
                 "top20_mean_rating": 3.7,
-                "bottom20_mean_rating": 3.1
+                "bottom20_mean_rating": 3.15
               },
               "candidate": {
                 "n": 182,
@@ -553,7 +601,7 @@
                 "low_auc": 0.016487455197132572,
                 "clear_high_vs_low_auc": 0.011153198653198637,
                 "top20_high_count": 1,
-                "bottom20_low_count": 1
+                "bottom20_low_count": 2
               }
             },
             "boundary_date": "2025-07-28"
@@ -640,48 +688,48 @@
             "optimizer_success": true,
             "optimizer_iterations": 47,
             "ridge": 0.1,
-            "refit_seconds": 0.05385766597464681
+            "refit_seconds": 0.05492464700364508
           }
         }
       }
     },
     "post_initial_diagnostic_expanding_refit": {
-      "model": "same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; held-out outcomes become training data only after their day",
+      "model": "same 10 features and ridge 0.1; refit on all strictly earlier causal examples for each calendar day; pooled ranking uses posterior expected ratings on a common 1\u20135 scale, not daily latent scores; held-out outcomes become training data only after their day",
       "paired_comparison": {
         "candidate": {
           "n": 356,
           "high_count": 153,
           "low_count": 54,
-          "auc_high_4plus": 0.6198203419298755,
-          "auc_low_2or_less_reversed": 0.5010424331616384,
-          "auc_high_vs_low_excluding_neutral": 0.5710481723553619,
+          "auc_high_4plus": 0.620271096944525,
+          "auc_low_2or_less_reversed": 0.49797645327446655,
+          "auc_high_vs_low_excluding_neutral": 0.5674170902929073,
           "top20_high_count": 14,
           "top20_high_rate": 0.7,
-          "bottom20_low_count": 4,
-          "bottom20_low_rate": 0.2,
+          "bottom20_low_count": 5,
+          "bottom20_low_rate": 0.25,
           "top20_mean_rating": 3.85,
           "bottom20_mean_rating": 3.2,
           "ordinal_expected_star_mae": 0.68430959590824
         },
         "delta_vs_current": {
-          "high_auc": 0.017756527898515784,
-          "low_auc": -0.04185062545989704,
-          "clear_high_vs_low_auc": -0.02426773178407171,
+          "high_auc": 0.018207282913165312,
+          "low_auc": -0.04491660534706893,
+          "clear_high_vs_low_auc": -0.02789881384652626,
           "top20_high_count": 0,
-          "bottom20_low_count": -1
+          "bottom20_low_count": 0
         },
         "paired_book_bootstrap": {
           "high_auc_delta_95pct": [
-            -0.01660885386667366,
-            0.04859149815438941
+            -0.017565356884245247,
+            0.05134867475922371
           ],
           "low_auc_delta_95pct": [
-            -0.09118818013488915,
-            0.0040257799364841465
+            -0.09900695851681264,
+            0.004367474553128077
           ],
           "clear_auc_delta_95pct": [
-            -0.07985896048396048,
-            0.02556629720853853
+            -0.08761679166290177,
+            0.025955651404556433
           ],
           "bootstrap_resamples": 2000,
           "bootstrap_unit": "individual held-out books; temporal dependence is not captured"
@@ -706,9 +754,9 @@
               "n": 174,
               "high_count": 65,
               "low_count": 27,
-              "auc_high_4plus": 0.6062103034580099,
-              "auc_low_2or_less_reversed": 0.5177626606198035,
-              "auc_high_vs_low_excluding_neutral": 0.5851851851851851,
+              "auc_high_4plus": 0.6042342978122794,
+              "auc_low_2or_less_reversed": 0.5190224237843285,
+              "auc_high_vs_low_excluding_neutral": 0.5834757834757834,
               "top20_high_count": 11,
               "top20_high_rate": 0.55,
               "bottom20_low_count": 4,
@@ -717,9 +765,9 @@
               "bottom20_mean_rating": 3.25
             },
             "delta_vs_current": {
-              "high_auc": 0.0009880028228651527,
-              "low_auc": -0.01007810531620057,
-              "clear_high_vs_low_auc": -0.010256410256410331,
+              "high_auc": -0.0009880028228652638,
+              "low_auc": -0.00881834215167554,
+              "clear_high_vs_low_auc": -0.011965811965812034,
               "top20_high_count": 1,
               "bottom20_low_count": 0
             }
@@ -734,29 +782,29 @@
               "auc_high_vs_low_excluding_neutral": 0.5848063973063973,
               "top20_high_count": 13,
               "top20_high_rate": 0.65,
-              "bottom20_low_count": 4,
-              "bottom20_low_rate": 0.2,
+              "bottom20_low_count": 3,
+              "bottom20_low_rate": 0.15,
               "top20_mean_rating": 3.7,
-              "bottom20_mean_rating": 3.1
+              "bottom20_mean_rating": 3.15
             },
             "candidate": {
               "n": 182,
               "high_count": 88,
               "low_count": 27,
-              "auc_high_4plus": 0.5990087040618955,
-              "auc_low_2or_less_reversed": 0.4888888888888889,
-              "auc_high_vs_low_excluding_neutral": 0.54503367003367,
+              "auc_high_4plus": 0.5998549323017408,
+              "auc_low_2or_less_reversed": 0.4757467144563919,
+              "auc_high_vs_low_excluding_neutral": 0.5328282828282829,
               "top20_high_count": 14,
               "top20_high_rate": 0.7,
-              "bottom20_low_count": 3,
-              "bottom20_low_rate": 0.15,
+              "bottom20_low_count": 2,
+              "bottom20_low_rate": 0.1,
               "top20_mean_rating": 3.9,
-              "bottom20_mean_rating": 3.35
+              "bottom20_mean_rating": 3.45
             },
             "delta_vs_current": {
-              "high_auc": 0.019705029013539654,
-              "low_auc": -0.06475507765830352,
-              "clear_high_vs_low_auc": -0.03977272727272729,
+              "high_auc": 0.020551257253384914,
+              "low_auc": -0.0778972520908005,
+              "clear_high_vs_low_auc": -0.0519781144781144,
               "top20_high_count": 1,
               "bottom20_low_count": -1
             }
@@ -783,9 +831,9 @@
               "n": 130,
               "high_count": 59,
               "low_count": 18,
-              "auc_high_4plus": 0.6841728336118406,
-              "auc_low_2or_less_reversed": 0.5739087301587301,
-              "auc_high_vs_low_excluding_neutral": 0.6591337099811676,
+              "auc_high_4plus": 0.6839341131534973,
+              "auc_low_2or_less_reversed": 0.5709325396825397,
+              "auc_high_vs_low_excluding_neutral": 0.6563088512241054,
               "top20_high_count": 15,
               "top20_high_rate": 0.75,
               "bottom20_low_count": 4,
@@ -794,9 +842,9 @@
               "bottom20_mean_rating": 3.1
             },
             "delta_vs_current": {
-              "high_auc": 0.007161613750298446,
-              "low_auc": 0.004712301587301515,
-              "clear_high_vs_low_auc": 0.0028248587570621764,
+              "high_auc": 0.006922893291955168,
+              "low_auc": 0.0017361111111110494,
+              "clear_high_vs_low_auc": 0.0,
               "top20_high_count": 0,
               "bottom20_low_count": 0
             }
@@ -820,22 +868,22 @@
               "n": 226,
               "high_count": 94,
               "low_count": 36,
-              "auc_high_4plus": 0.575354609929078,
-              "auc_low_2or_less_reversed": 0.45555555555555555,
-              "auc_high_vs_low_excluding_neutral": 0.5067966903073287,
-              "top20_high_count": 8,
-              "top20_high_rate": 0.4,
-              "bottom20_low_count": 3,
-              "bottom20_low_rate": 0.15,
-              "top20_mean_rating": 3.3,
-              "bottom20_mean_rating": 3.2
+              "auc_high_4plus": 0.5771276595744681,
+              "auc_low_2or_less_reversed": 0.45263157894736844,
+              "auc_high_vs_low_excluding_neutral": 0.5032505910165485,
+              "top20_high_count": 7,
+              "top20_high_rate": 0.35,
+              "bottom20_low_count": 2,
+              "bottom20_low_rate": 0.1,
+              "top20_mean_rating": 3.2,
+              "bottom20_mean_rating": 3.3
             },
             "delta_vs_current": {
-              "high_auc": 0.02554803352675694,
-              "low_auc": -0.07587719298245615,
-              "clear_high_vs_low_auc": -0.05171394799054363,
-              "top20_high_count": -1,
-              "bottom20_low_count": 1
+              "high_auc": 0.027321083172146987,
+              "low_auc": -0.07880116959064326,
+              "clear_high_vs_low_auc": -0.05526004728132383,
+              "top20_high_count": -2,
+              "bottom20_low_count": 0
             }
           },
           "author_unseen_count": 226
@@ -846,13 +894,13 @@
         "queries_scored": 356,
         "prior_examples_min": 1321,
         "prior_examples_max": 1675,
-        "total_fit_seconds": 13.490323335980065,
-        "median_fit_seconds_per_day": 0.04604342000675388,
-        "p95_fit_seconds_per_day": 0.052935916814021766,
+        "total_fit_seconds": 13.349483359925216,
+        "median_fit_seconds_per_day": 0.045357944996794686,
+        "p95_fit_seconds_per_day": 0.05171753122122026,
         "all_optimizer_runs_succeeded": true,
         "optimizer_iterations_median": 41.0
       }
     }
   },
-  "limits": "One retrospective reader-selected history; book-bootstrap intervals ignore temporal and reader dependence; embeddings and eventual ratings may postdate read dates; no evidence here covers unseen-candidate retrieval or live policy effects. The later period has been inspected in previous studies and is not independent confirmation."
+  "limits": "One retrospective reader-selected history; book-bootstrap intervals ignore temporal and reader dependence; embeddings and eventual ratings may postdate read dates; no evidence here covers unseen-candidate retrieval or live policy effects. The later period has been inspected in previous studies and is not independent confirmation. Ordinal calibration uses in-sample model scores for fitting its mapping; later MAE is out of sample but calibration training can be optimistic."
 }

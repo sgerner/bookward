@@ -213,7 +213,7 @@
           }
         }
       },
-      "limitations": "One installation. Its current read documents contain title, author, an empty genres marker, and no description. Title-only and equal title/title-author views are tested on a uniform cohort. Current production rich-candidate query text is tested separately against explicit actions because read replay lacks contemporaneous rich read/query text. Only 89 read-overlap links have enrichment among rating records; later test has 17 high and 1 low matched targets, so a full enriched-text AUC would not have adequate common class support. Current metadata and embeddings can postdate recorded dates."
+      "limitations": "Original enriched-view result was coverage only: 115 linked identities, 114 rated targets, and later coverage of 19 high, 2 low, 18 neutral books. Generated enriched vectors were not scored. See ranking-methodology-audit-2026-09-30.json for the actual paired enrichment replay. Current metadata and embeddings can postdate recorded dates."
     },
     "explicit_action_replay": {
       "protocol": "Latest non-undone save/reject per candidate with strictly earlier-day rating history, same-day reads excluded; current candidate source and catalog-confidence terms preserved.",
