@@ -127,9 +127,9 @@ To evaluate ranking changes against a private history of rated reads, run `engin
 
 The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
 
-The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests-2026-09-30.md) also found no useful improvement in both high- and low-rating detection. `engine/scripts/evaluate_ordinal_interests.py` reproduces the causal replay and compares small learned models, including a daily updating diagnostic, without changing the serving formula.
+The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests-2026-09-30.md) did not establish a scorer replacement; its cluster variant has an exploratory improvement in top and bottom tails despite weaker global discrimination. `engine/scripts/evaluate_ordinal_interests.py` reproduces the causal replay and compares small learned models, including a daily updating diagnostic, without changing the serving formula.
 
-The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also tests compatible text views, source/catalog confidence, and discovery seeds. It adds a separate action-history availability diagnostic: reads imported after an action cannot reconstruct what the engine knew then, even when their reading dates are earlier.
+The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also tests compatible text views, source/catalog confidence, and discovery seeds. The [methodology audit](docs/ranking-methodology-audit-2026-09-30.md) corrects the daily model score scale and adds the previously missing actual read-enrichment replay; enrichment remains promising but unresolved. It adds a separate action-history availability diagnostic: reads imported after an action cannot reconstruct what the engine knew then, even when their reading dates are earlier.
 
 ### Limitations
 

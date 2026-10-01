@@ -71,6 +71,37 @@ def test_ordinal_probabilities_remain_finite_and_normalized_at_extreme_scores():
     np.testing.assert_allclose(probabilities.sum(axis=1), 1.0, atol=1e-12)
 
 
+def test_expected_ratings_align_models_with_different_latent_origins():
+    first = {"mean": np.array([0.0]), "scale": np.array([1.0]),
+             "beta": np.array([1.0]), "thresholds": np.array([-1.5, -0.4, 0.5, 1.7])}
+    shifted = {**first, "mean": np.array([-10.0]),
+               "thresholds": first["thresholds"] + 10.0}
+    queries = np.array([[-2.0], [2.0]])
+
+    np.testing.assert_allclose(
+        evaluator.ordinal_expected_ratings(first, queries),
+        evaluator.ordinal_expected_ratings(shifted, queries),
+    )
+    # Raw latent scores would misorder these two different query days.
+    raw = np.array([evaluator.ordinal_scores(first, queries[1:])[0],
+                    evaluator.ordinal_scores(shifted, queries[:1])[0]])
+    common = np.array([evaluator.ordinal_expected_ratings(first, queries[1:])[0],
+                       evaluator.ordinal_expected_ratings(shifted, queries[:1])[0]])
+    assert evaluator.metric_set([5, 1], raw)["auc_high_4plus"] == 0.0
+    assert evaluator.metric_set([5, 1], common)["auc_high_4plus"] == 1.0
+
+
+def test_bottom_tail_ties_match_the_raw_ranking_report():
+    from evaluate_historical_ratings import raw_ranking_metrics
+
+    ratings = np.array([1] + [3] * 19 + [5], dtype=float)
+    scores = np.full(21, 50.0)
+    result = evaluator.metric_set(ratings, scores)
+    reference = raw_ranking_metrics(ratings, scores)
+
+    assert result["bottom20_low_count"] == reference["low_rated_in_bottom_20"] == 0
+
+
 def test_ordinal_fit_rejects_fractional_or_out_of_range_ratings():
     X = np.arange(5, dtype=np.float64)[:, None]
 

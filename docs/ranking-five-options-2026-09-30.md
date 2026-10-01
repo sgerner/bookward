@@ -1,8 +1,10 @@
 # Five ranking hypotheses: September 30, 2026
 
-All five hypotheses were tested against the private production snapshot where
-the necessary evidence existed. None yet supports replacing the serving score
-formula. This review distinguishes rating replay, action diagnostics, and
+Narrow candidates from five hypothesis families were tested against the private
+production snapshot. Actual read enrichment initially received only a coverage
+check, not a scored replay. The [methodology audit](ranking-methodology-audit-2026-09-30.md)
+adds that missing comparison and corrects the daily ordinal diagnostic. None yet
+supports replacing the serving score formula; several ideas remain unresolved. This review distinguishes rating replay, action diagnostics, and
 discovery proxies; a gain in one is not evidence of a gain in the others.
 The [aggregate report](ranking-five-options-2026-09-30.json) records the text,
 source-confidence, and seed-proxy measurements.
@@ -61,7 +63,10 @@ Existing catalog records can enrich 115 unambiguous read identities, of which
 not invalidate otherwise usable book text. Even after restoring such matches,
 later enrichment covers only 19 of 153 high-rated books, two of 54 low-rated
 books, and 18 of 149 neutral books. Metadata coverage is too uneven for a global
-enriched-text preference claim.
+enriched-text preference claim. This was a coverage check only: the generated
+enriched vectors were not scored in the original experiment. The subsequent
+paired audit finds a high-rating signal with sparse low-rating support; it does
+not establish that enrichment failed.
 
 ## Source and catalog confidence
 
