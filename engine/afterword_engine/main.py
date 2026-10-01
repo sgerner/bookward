@@ -32,6 +32,7 @@ from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
+    validate_goodreads_rss_url,
     normalize_source_filters,
     preview_source,
     refresh_read_work_identities,
@@ -40,7 +41,8 @@ from .ingestion import (
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
-from .scoring import rebuild_all_embeddings, score_all
+from .scoring import cached_vectors, rebuild_all_embeddings, score_all
+from .ranking import rank_candidates
 from .secrets import seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -80,6 +82,7 @@ from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import QUALITY_VERSION, audit_candidates, quality_summary
 from .identity import (
+    book_identity,
     book_identity_match_index,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
@@ -93,6 +96,7 @@ SOURCE_SYNC_MAX_HOURS = 720
 SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
+GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
 
 
@@ -295,6 +299,62 @@ async def digest_scheduler_loop(stop):
         except TimeoutError:
             pass
 
+
+def queue_goodreads_rss_if_due(current_time=None):
+    """Queue one persisted Goodreads feed sync per UTC night after 02:00."""
+
+    now = current_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    if now.hour < GOODREADS_RSS_SYNC_HOUR_UTC:
+        return None
+    if not private_settings().get("goodreads_rss_url", "").strip():
+        return None
+
+    sync_date = now.date().isoformat()
+    with transaction() as con:
+        claimed = con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP "
+            "WHERE settings.value!=excluded.value",
+            (sync_date,),
+        )
+        if claimed.rowcount == 0:
+            return None
+        active = con.execute(
+            "SELECT id FROM jobs WHERE kind='goodreads_rss' "
+            "AND status IN ('queued','running') LIMIT 1"
+        ).fetchone()
+        if active:
+            return active["id"]
+        job_id = str(uuid.uuid4())
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,'goodreads_rss','queued')",
+            (job_id,),
+        )
+        return job_id
+
+
+async def goodreads_rss_scheduler_loop(stop):
+    """Queue the configured Goodreads feed each night without host cron."""
+
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_INITIAL_DELAY_SECONDS + 3)
+    except TimeoutError:
+        pass
+    while not stop.is_set():
+        for profile_id in identity_store.profile_ids():
+            try:
+                with profile_scope(profile_id):
+                    queue_goodreads_rss_if_due()
+            except Exception:
+                LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_POLL_SECONDS)
+        except TimeoutError:
+            pass
+
 async def handle_job(kind: str):
     config = private_settings()
     if kind == "read_work_identities":
@@ -304,6 +364,13 @@ async def handle_job(kind: str):
         return result
     if kind == "digest":
         return await send_digest(config)
+    if kind == "goodreads_rss":
+        url = config.get("goodreads_rss_url", "").strip()
+        if not url:
+            return {"skipped": "not_configured"}
+        result = await _sync_goodreads_rss(url)
+        result["job_id"] = enqueue_job("score", dedupe=True)
+        return result
     if kind in {"digest:manual", "digest:force"}:
         # Manual runs bypass the time window through the job kind; the same
         # idempotent candidate/channel rules still apply to avoid duplicates.
@@ -461,7 +528,7 @@ async def lifespan(app):
             with profile_scope(profile_id):
                 recover_interrupted_restore()
             _ensure_profile_database(profile_id)
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
+    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
@@ -479,7 +546,7 @@ async def lifespan(app):
                 enqueue_job("candidate_quality_recovery", dedupe=True)
             enqueue_job("read_work_identities", dedupe=True)
     yield
-    stop.set(); await scheduler; await digest_scheduler; await backup_scheduler; await worker
+    stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
@@ -981,6 +1048,10 @@ class DigestTestIn(BaseModel):
 class UrlIn(BaseModel): url: HttpUrl
 
 
+class GoodreadsRSSSettingsIn(BaseModel):
+    url: str = Field(default="", max_length=2048)
+
+
 class SourcePreviewIn(UrlIn):
     filters: SourceFilters = Field(default_factory=SourceFilters)
 
@@ -1263,20 +1334,85 @@ def overview(
 
 
 @app.get("/api/reading-history")
-def reading_history():
-    """Return the complete read list with any prior recommendation score."""
+async def reading_history():
+    """Return all reads with prior and current-profile recommendation scores."""
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
         ).fetchall()]
-        scores = {}
-        for candidate in connection.execute(
-            "SELECT title,author,score FROM candidates WHERE status!='new' "
-            "ORDER BY updated_at DESC,id DESC"
-        ).fetchall():
-            key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-            scores.setdefault(key, candidate["score"])
+        existing_candidates = [dict(item) for item in connection.execute(
+            "SELECT c.title,c.author,c.description,c.genres,c.score,c.status,"
+            "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
+            "FROM candidates c "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "WHERE c.status!='new' ORDER BY c.updated_at DESC,c.id DESC"
+        ).fetchall()]
+    candidates_by_identity = {}
+    scores = {}
+    for candidate in existing_candidates:
+        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+        candidates_by_identity.setdefault(key, candidate)
+        scores.setdefault(key, candidate["score"])
+    virtual_candidates = []
+    for item in items:
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        matched = candidates_by_identity.get(key)
+        virtual = {
+            "id": -int(item["id"]),
+            "title": item["title"],
+            "author": item["author"],
+            "description": matched.get("description", "") if matched else "",
+            "genres": matched.get("genres", "[]") if matched else "[]",
+            "source_weight": (matched.get("source_weight") or 1) if matched else 1,
+        }
+        if matched:
+            quality_score = float(matched.get("quality_score") or 0)
+            virtual["catalog_confidence"] = (
+                quality_score
+                if quality_score > 0
+                else 0.85 if matched.get("quality_status") == "accepted" else 0
+            )
+            virtual["source_name"] = matched.get("source_name") or ""
+        virtual_candidates.append(virtual)
+
+    try:
+        if virtual_candidates:
+            config = private_settings()
+            embedder = get_embedder(
+                config.get("embedding_backend"),
+                config.get("embedding_model"),
+                config.get("embedding_url"),
+                config.get("embedding_api_key"),
+            )
+            rated_reads = [
+                item for item in items
+                if 1 <= float(item.get("rating") or 0) <= 5
+            ]
+            read_vectors = await cached_vectors(embedder, "read", rated_reads)
+            candidate_vectors = await cached_vectors(
+                embedder, "read_candidate", virtual_candidates
+            )
+            ranked = rank_candidates(
+                rated_reads,
+                read_vectors,
+                virtual_candidates,
+                candidate_vectors,
+                exclude_candidate_identity=True,
+            )
+            ranked_by_id = {int(item["id"]): item for item in ranked}
+            for item in items:
+                ranked_item = ranked_by_id.get(-int(item["id"]), {})
+                item["algorithm_score"] = ranked_item.get("score", 50.0)
+                item["algorithm_explanation"] = ranked_item.get("explanation", [])
+                item["metadata_confidence"] = ranked_item.get("metadata_confidence", 1.0)
+    except Exception:
+        LOGGER.warning("Could not calculate current-profile reading history scores")
+        for item in items:
+            item["algorithm_score"] = None
+            item["algorithm_explanation"] = []
+            item["metadata_confidence"] = None
     for item in items:
         key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
         item["rank_score"] = scores.get(key)
@@ -1938,11 +2074,41 @@ async def goodreads_csv(file: UploadFile = File(...)):
     enqueue_job("read_work_identities", dedupe=True)
     return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
+
+async def _sync_goodreads_rss(url: str):
+    count = await import_goodreads_rss(url)
+    synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_sync_at',?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+            (synced_at,),
+        )
+    return {"imported": count, "synced_at": synced_at}
+
+
+@app.put("/api/settings/goodreads-rss")
+def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
+    url = payload.url.strip()
+    if url:
+        try:
+            url = validate_goodreads_rss_url(url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,updated_at=CURRENT_TIMESTAMP",
+            (seal(url) if url else "",),
+        )
+    return {"saved": True, "configured": bool(url)}
+
+
 @app.post("/api/import/goodreads/rss")
 async def goodreads_rss(payload: UrlIn):
-    try: count = await import_goodreads_rss(str(payload.url))
+    try: result = await _sync_goodreads_rss(str(payload.url))
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+    return {**result, "job_id": enqueue_job("score", dedupe=True)}
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: SourcePreviewIn):
@@ -2337,6 +2503,8 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "embedding_api_key_set": bool(private.get("embedding_api_key")),
         "librarr_url": private.get("librarr_url", ""),
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
+        "goodreads_rss_url": private.get("goodreads_rss_url", ""),
+        "goodreads_rss_last_sync_at": private.get("goodreads_rss_last_sync_at", ""),
         "librarr_media_type": media_type,
         "nyt_api_key_set": bool(private.get("nyt_api_key")),
         "source_sync_interval_hours": source_sync_interval_hours(),

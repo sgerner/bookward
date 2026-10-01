@@ -1053,11 +1053,29 @@ async def _fetch_and_parse_source(url):
         parse_book_items(content, content_type, url)
     )
 
-async def import_goodreads_rss(url: str):
-    parsed = httpx.URL(url); host = parsed.host or ""
-    if not (host == "goodreads.com" or host.endswith(".goodreads.com")) or not parsed.path.startswith("/review/list_rss/"): raise ValueError("Use a Goodreads read-shelf RSS URL")
+def validate_goodreads_rss_url(url: str) -> str:
+    try:
+        parsed = httpx.URL(url)
+    except (TypeError, httpx.InvalidURL) as exc:
+        raise ValueError("Use a Goodreads read-shelf RSS URL") from exc
+    host = parsed.host or ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or not (host == "goodreads.com" or host.endswith(".goodreads.com"))
+        or not parsed.path.startswith("/review/list_rss/")
+    ):
+        raise ValueError("Use a Goodreads read-shelf RSS URL")
     shelf = parsed.params.get("shelf")
-    if shelf and shelf.casefold() != "read": raise ValueError("Use the Goodreads read shelf")
+    if shelf and shelf.casefold() != "read":
+        raise ValueError("Use the Goodreads read shelf")
+    return str(parsed)
+
+
+async def import_goodreads_rss(url: str):
+    url = validate_goodreads_rss_url(url)
     content, _ = await fetch_bytes(url, allow_goodreads_http=True)
     feed = feedparser.parse(content)
     count = 0

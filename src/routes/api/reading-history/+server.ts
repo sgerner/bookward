@@ -11,6 +11,9 @@ type ReadingHistoryItem = {
   source: string;
   created_at: string;
   rank_score: number | null;
+  algorithm_score: number | null;
+  algorithm_explanation: string[];
+  metadata_confidence: number | null;
 };
 
 const engineStatus = (error: unknown) =>
