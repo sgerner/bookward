@@ -2323,14 +2323,21 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Pull recent reads from a public read-shelf feed.
+                  Pull recent reads from a public read-shelf feed. The saved
+                  link syncs automatically each night at 02:00 UTC.
                 </p>
+                {#if data.profile.goodreads_rss_last_sync_at}
+                  <p class="mt-2 text-xs text-surface-600-400">
+                    Last successful sync (UTC): {data.profile.goodreads_rss_last_sync_at}
+                  </p>
+                {/if}
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
                   >Public shelf RSS URL<input
                     class="input mt-2"
                     name="url"
                     type="url"
+                    value={data.profile.goodreads_url}
                     placeholder="https://www.goodreads.com/review/list_rss/…"
                     required
                   /></label
@@ -2342,8 +2349,17 @@
                   >{#if isPending("goodreads-rss")}<RefreshCw
                       size={16}
                       class="animate-spin"
-                    />{:else}<RefreshCw size={16} />{/if} Sync RSS now</button
+                    />{:else}<RefreshCw size={16} />{/if} Save &amp; sync now</button
                 >
+                {#if data.profile.goodreads_url}
+                  <button
+                    class="btn mt-2 min-h-10 w-full preset-tonal-surface"
+                    type="submit"
+                    formaction="?/disconnectGoodreads"
+                    formnovalidate
+                    disabled={isPending("goodreads-rss")}
+                  >Remove saved feed</button>
+                {/if}
               </form>
               <form
                 in:fly={{

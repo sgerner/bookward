@@ -71,6 +71,8 @@ type Overview = {
     librarr_url: string;
     librarr_api_key_set: boolean;
     nyt_api_key_set?: boolean;
+    goodreads_rss_url?: string;
+    goodreads_rss_last_sync_at?: string;
     librarr_media_type: "ebook" | "audiobook";
     source_sync_interval_hours: number;
     digest: DigestSettings;
@@ -203,7 +205,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       .filter((source) => !source.is_default)
       .map((source) => ({ ...source, label: source.name })),
     profile: {
-      goodreads_url: "",
+      goodreads_url: overview.settings.goodreads_rss_url ?? "",
+      goodreads_rss_last_sync_at: overview.settings.goodreads_rss_last_sync_at ?? "",
       default_source_enabled: builtIn?.enabled ?? 1,
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,
@@ -579,17 +582,56 @@ export const actions: Actions = {
     }
   },
   connectGoodreads: async ({ request }) => {
-    const url = urlSchema.safeParse((await request.formData()).get("url"));
+    const formData = await request.formData();
+    const rawUrl = formData.get("url");
+    if (typeof rawUrl !== "string")
+      return fail(400, { message: "Enter a valid Goodreads RSS URL." });
+    const value = rawUrl.trim();
+    if (!value) {
+      try {
+        await engine("/api/settings/goodreads-rss", {
+          method: "PUT",
+          body: JSON.stringify({ url: "" }),
+        });
+        return { message: "Goodreads RSS feed removed; nightly sync is off." };
+      } catch (error) {
+        return fail(status(error), { message: message(error) });
+      }
+    }
+    const url = urlSchema.safeParse(value);
     if (!url.success)
       return fail(400, { message: "Enter a valid Goodreads RSS URL." });
+    try {
+      await engine("/api/settings/goodreads-rss", {
+        method: "PUT",
+        body: JSON.stringify({ url: url.data }),
+      });
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
     try {
       const result = await engine<{ imported: number }>(
         "/api/import/goodreads/rss",
         { method: "POST", body: JSON.stringify({ url: url.data }) },
       );
-      return { message: `Synced ${result.imported} books from Goodreads.` };
+      return {
+        message: `Saved and synced ${result.imported} books from Goodreads. Automatic sync runs nightly at 02:00 UTC.`,
+      };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(502, {
+        message: `The feed was saved for nightly sync, but this sync failed: ${message(error)}`,
+      });
+    }
+  },
+  disconnectGoodreads: async () => {
+    try {
+      await engine("/api/settings/goodreads-rss", {
+        method: "PUT",
+        body: JSON.stringify({ url: "" }),
+      });
+      return { message: "Goodreads RSS feed removed; nightly sync is off." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
     }
   },
   importGoodreadsCsv: async ({ request }) => {
