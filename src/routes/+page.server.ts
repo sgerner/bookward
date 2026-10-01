@@ -19,6 +19,7 @@ type BackupStatus = {
 };
 
 type Overview = {
+  counts?: { reads?: number };
   recommendation_run_id?: string;
   recommendations: Array<{
     id: number;
@@ -195,6 +196,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       reading_updated_at: book.reading_updated_at ?? null,
     })),
     history: overview.history,
+    readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
     digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
     sources: overview.sources

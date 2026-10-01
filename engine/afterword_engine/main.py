@@ -1261,6 +1261,27 @@ def overview(
 ):
     return overview_payload(recommendation_limit=recommendation_limit)
 
+
+@app.get("/api/reading-history")
+def reading_history():
+    """Return the complete read list with any prior recommendation score."""
+    with connect() as connection:
+        items = [dict(item) for item in connection.execute(
+            "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
+            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
+        ).fetchall()]
+        scores = {}
+        for candidate in connection.execute(
+            "SELECT title,author,score FROM candidates WHERE status!='new' "
+            "ORDER BY updated_at DESC,id DESC"
+        ).fetchall():
+            key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+            scores.setdefault(key, candidate["score"])
+    for item in items:
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        item["rank_score"] = scores.get(key)
+    return items
+
 def _recommendation_rows(
     connection=None,
     *,

@@ -64,6 +64,16 @@
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
   type ShelfFilter = "all" | "up_next" | "saved" | "reading" | "finished";
+  type ReadingHistoryItem = {
+    id: number;
+    title: string;
+    author: string;
+    rating: number | null;
+    read_at: string | null;
+    source: string;
+    created_at: string;
+    rank_score: number | null;
+  };
   type LibrarrResult = Record<string, unknown>;
   type OptimisticChange = {
     commit?: () => void;
@@ -89,6 +99,11 @@
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
   let decisionFilter = $state<"all" | "maybe_later" | "rejected">("all");
+  let historyTab = $state<"decisions" | "read">("decisions");
+  let readingHistory = $state<ReadingHistoryItem[]>([]);
+  let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let readingHistoryError = $state("");
+  let readingHistoryVisibleCount = $state(30);
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
@@ -213,6 +228,16 @@
         (decisionFilter === "all" || book.status === decisionFilter) &&
         matchesBookFilter(book),
     ),
+  );
+  const filteredReadingHistory = $derived.by(() => {
+    const query = filter.trim().toLowerCase();
+    return readingHistory.filter(
+      (item) =>
+        !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query),
+    );
+  });
+  const visibleReadingHistory = $derived(
+    filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
   const filteredBooks = $derived(
     activeView === "saved"
@@ -369,9 +394,52 @@
       ? (value as View)
       : "discover";
   }
+  async function loadReadingHistory() {
+    if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
+    readingHistoryState = "loading";
+    readingHistoryError = "";
+    try {
+      const response = await fetch("/api/reading-history", { headers: profileHeaders });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: ReadingHistoryItem[];
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Reading history could not be loaded.");
+      }
+      readingHistory = payload.items;
+      readingHistoryState = "ready";
+    } catch (error) {
+      readingHistoryError = error instanceof Error
+        ? error.message
+        : "Reading history could not be loaded.";
+      readingHistoryState = "error";
+    }
+  }
+  function selectHistoryTab(tab: "decisions" | "read") {
+    historyTab = tab;
+    readingHistoryVisibleCount = 30;
+    if (tab === "read") void loadReadingHistory();
+  }
+  function readingSourceLabel(source: string) {
+    return ({
+      goodreads_csv: "Goodreads CSV export",
+      goodreads_rss: "Goodreads read shelf RSS",
+      manual: "Added in Bookward",
+      demo: "Demo data",
+    } as Record<string, string>)[source] ?? (source || "Unknown source");
+  }
+  function formatHistoryDate(value: string | null) {
+    if (!value) return "Not provided";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf())
+      ? value
+      : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
   function go(view: View) {
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
+    if (view === "decisions" && historyTab === "read") void loadReadingHistory();
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
@@ -446,6 +514,16 @@
             return;
           }
           await update();
+          if (
+            succeeded &&
+            (key.startsWith("read-") ||
+              key.endsWith("-finished") ||
+              key === "goodreads-rss" ||
+              key === "goodreads-csv")
+          ) {
+            readingHistory = [];
+            readingHistoryState = "idle";
+          }
           if (succeeded) change?.commit?.();
         } catch (error) {
           rollback();
@@ -1380,7 +1458,7 @@
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
-          >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : "Past decisions."}</h1>
+          >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && historyTab === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
             <Search size={17} class="shrink-0 text-surface-600-400" />
             <input
@@ -1392,6 +1470,28 @@
             {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
           </div>
         </section>
+        {#if view === "decisions"}
+          <div class="mb-6 flex w-full max-w-xl gap-1 rounded-container preset-tonal-surface p-1" role="tablist" aria-label="History sections">
+            <button
+              id="history-decisions-tab"
+              type="button"
+              role="tab"
+              aria-selected={historyTab === "decisions"}
+              aria-controls="history-decisions-panel"
+              class={`min-h-10 flex-1 px-3 text-sm font-medium transition ${historyTab === "decisions" ? "preset-filled-primary-500" : "text-surface-700-300 hover:preset-tonal-primary"}`}
+              onclick={() => selectHistoryTab("decisions")}
+            >Past decisions <span class="ml-1 opacity-75">{allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length}</span></button>
+            <button
+              id="history-read-tab"
+              type="button"
+              role="tab"
+              aria-selected={historyTab === "read"}
+              aria-controls="history-read-panel"
+              class={`min-h-10 flex-1 px-3 text-sm font-medium transition ${historyTab === "read" ? "preset-filled-primary-500" : "text-surface-700-300 hover:preset-tonal-primary"}`}
+              onclick={() => selectHistoryTab("read")}
+            >Read books <span class="ml-1 opacity-75">{data.readCount}</span></button>
+          </div>
+        {/if}
         {#if view === "saved"}
           <section class="mb-6" aria-label="Shortlist shelves">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
@@ -1403,7 +1503,7 @@
             </div>
           </section>
         {/if}
-        {#if view === "decisions"}
+        {#if view === "decisions" && historyTab === "decisions"}
           <section class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" aria-label="Past recommendation decisions">
             <p class="max-w-2xl text-sm leading-6 text-surface-700-300">Passed and deferred books stay here. Return any one to Discover whenever you are ready.</p>
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter past decisions">
@@ -1413,6 +1513,7 @@
             </div>
           </section>
         {/if}
+        {#if view !== "decisions" || historyTab === "decisions"}
         {#if view === "discover" && digestVisible}
           <section
             in:fade={{ duration: motionDuration(260) }}
@@ -1442,7 +1543,13 @@
             </div>
           </section>
         {/if}
-        <section class="grid gap-3 sm:gap-4 lg:grid-cols-2" aria-live="polite">
+        <section
+          id={view === "decisions" ? "history-decisions-panel" : undefined}
+          role={view === "decisions" ? "tabpanel" : undefined}
+          aria-labelledby={view === "decisions" ? "history-decisions-tab" : undefined}
+          class="grid gap-3 sm:gap-4 lg:grid-cols-2"
+          aria-live="polite"
+        >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             {@const shelfStatus = book.reading_status ?? "saved"}
@@ -1653,6 +1760,77 @@
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
         </section>
+        {:else}
+          <section
+            id="history-read-panel"
+            role="tabpanel"
+            aria-labelledby="history-read-tab"
+            aria-busy={readingHistoryState === "loading"}
+            class="min-w-0"
+          >
+            <p class="mb-5 max-w-3xl text-sm leading-6 text-surface-700-300">
+              Books imported from your reading history, with their source, rating, and any score Bookward recorded when it previously recommended the title.
+            </p>
+            {#if readingHistoryState === "loading"}
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+            {:else if readingHistoryState === "error"}
+              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
+                <p class="text-sm text-surface-700-300">{readingHistoryError}</p>
+                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
+              </div>
+            {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
+              <p class="mb-3 text-xs text-surface-700-300">Showing {visibleReadingHistory.length} of {filteredReadingHistory.length} books</p>
+              <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {#each visibleReadingHistory as item (item.id)}
+                  <article class="card min-w-0 preset-tonal-surface p-4">
+                    <div class="flex items-start gap-3">
+                      <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
+                      <div class="min-w-0 flex-1">
+                        <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
+                        <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                      </div>
+                      {#if item.rating !== null && item.rating > 0}
+                        <span class="badge shrink-0 preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
+                      {:else}
+                        <span class="badge shrink-0 preset-tonal-surface">Unrated</span>
+                      {/if}
+                    </div>
+                    <details class="group mt-3 border-t border-surface-300-700/40 pt-2">
+                      <summary class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-sm font-medium text-primary-600-400 [&::-webkit-details-marker]:hidden">
+                        Reading details <ChevronDown size={15} class="ml-auto transition group-open:rotate-180" />
+                      </summary>
+                      <dl class="grid gap-2 pt-2 text-xs">
+                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
+                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
+                        <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
+                      </dl>
+                      <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
+                        {#if item.rank_score !== null}
+                          <p class="font-semibold text-surface-950-50">Most recent recommendation score: {item.rank_score.toFixed(1)} / 100</p>
+                          <p class="mt-1 text-surface-700-300">This relative score was recorded before the book entered your read list; it is not a probability or star rating.</p>
+                        {:else}
+                          <p class="font-semibold text-surface-950-50">No previous recommendation score</p>
+                          <p class="mt-1 text-surface-700-300">Bookward has not ranked this title as a recommendation. Its rating still helps shape future recommendations.</p>
+                        {/if}
+                      </div>
+                    </details>
+                  </article>
+                {/each}
+              </div>
+              {#if visibleReadingHistory.length < filteredReadingHistory.length}
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => (readingHistoryVisibleCount += 30)}><ArrowRight size={14} /> Load more books</button></div>
+              {/if}
+            {:else}
+              <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
+                <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
+                <div>
+                  <h2 class="font-semibold text-surface-950-50">{filter ? "No read books match that search" : "No read books yet"}</h2>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter ? "Try a different title, author, or import source." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                </div>
+              </div>
+            {/if}
+          </section>
+        {/if}
       {/snippet}
 
       <!-- Layer each view in the same grid cell so fade intros/outros overlap instead of leaving a blank frame. -->
@@ -2652,14 +2830,13 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
-                <div class="mb-5 flex items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center gap-3">
                   <span
                     class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                     ><BookOpen size={19} /></span
                   >
-                  <h2 class="text-lg font-semibold text-surface-950-50">
-                    Your reading history
-                  </h2>
+                  <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
+                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectHistoryTab("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if data.history.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
