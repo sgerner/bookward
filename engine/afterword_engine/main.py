@@ -32,6 +32,7 @@ from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
+    validate_goodreads_rss_url,
     normalize_source_filters,
     preview_source,
     refresh_read_work_identities,
@@ -95,6 +96,7 @@ SOURCE_SYNC_MAX_HOURS = 720
 SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
+GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
 
 
@@ -297,6 +299,62 @@ async def digest_scheduler_loop(stop):
         except TimeoutError:
             pass
 
+
+def queue_goodreads_rss_if_due(current_time=None):
+    """Queue one persisted Goodreads feed sync per UTC night after 02:00."""
+
+    now = current_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    if now.hour < GOODREADS_RSS_SYNC_HOUR_UTC:
+        return None
+    if not private_settings().get("goodreads_rss_url", "").strip():
+        return None
+
+    sync_date = now.date().isoformat()
+    with transaction() as con:
+        claimed = con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP "
+            "WHERE settings.value!=excluded.value",
+            (sync_date,),
+        )
+        if claimed.rowcount == 0:
+            return None
+        active = con.execute(
+            "SELECT id FROM jobs WHERE kind='goodreads_rss' "
+            "AND status IN ('queued','running') LIMIT 1"
+        ).fetchone()
+        if active:
+            return active["id"]
+        job_id = str(uuid.uuid4())
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,'goodreads_rss','queued')",
+            (job_id,),
+        )
+        return job_id
+
+
+async def goodreads_rss_scheduler_loop(stop):
+    """Queue the configured Goodreads feed each night without host cron."""
+
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_INITIAL_DELAY_SECONDS + 3)
+    except TimeoutError:
+        pass
+    while not stop.is_set():
+        for profile_id in identity_store.profile_ids():
+            try:
+                with profile_scope(profile_id):
+                    queue_goodreads_rss_if_due()
+            except Exception:
+                LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_POLL_SECONDS)
+        except TimeoutError:
+            pass
+
 async def handle_job(kind: str):
     config = private_settings()
     if kind == "read_work_identities":
@@ -306,6 +364,13 @@ async def handle_job(kind: str):
         return result
     if kind == "digest":
         return await send_digest(config)
+    if kind == "goodreads_rss":
+        url = config.get("goodreads_rss_url", "").strip()
+        if not url:
+            return {"skipped": "not_configured"}
+        result = await _sync_goodreads_rss(url)
+        result["job_id"] = enqueue_job("score", dedupe=True)
+        return result
     if kind in {"digest:manual", "digest:force"}:
         # Manual runs bypass the time window through the job kind; the same
         # idempotent candidate/channel rules still apply to avoid duplicates.
@@ -463,7 +528,7 @@ async def lifespan(app):
             with profile_scope(profile_id):
                 recover_interrupted_restore()
             _ensure_profile_database(profile_id)
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
+    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
@@ -481,7 +546,7 @@ async def lifespan(app):
                 enqueue_job("candidate_quality_recovery", dedupe=True)
             enqueue_job("read_work_identities", dedupe=True)
     yield
-    stop.set(); await scheduler; await digest_scheduler; await backup_scheduler; await worker
+    stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
@@ -981,6 +1046,10 @@ class DigestTestIn(BaseModel):
     channel: Literal["discord", "email"] | None = None
 
 class UrlIn(BaseModel): url: HttpUrl
+
+
+class GoodreadsRSSSettingsIn(BaseModel):
+    url: str = Field(default="", max_length=2048)
 
 
 class SourcePreviewIn(UrlIn):
@@ -2005,11 +2074,41 @@ async def goodreads_csv(file: UploadFile = File(...)):
     enqueue_job("read_work_identities", dedupe=True)
     return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
 
+
+async def _sync_goodreads_rss(url: str):
+    count = await import_goodreads_rss(url)
+    synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_sync_at',?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+            (synced_at,),
+        )
+    return {"imported": count, "synced_at": synced_at}
+
+
+@app.put("/api/settings/goodreads-rss")
+def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
+    url = payload.url.strip()
+    if url:
+        try:
+            url = validate_goodreads_rss_url(url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,updated_at=CURRENT_TIMESTAMP",
+            (seal(url) if url else "",),
+        )
+    return {"saved": True, "configured": bool(url)}
+
+
 @app.post("/api/import/goodreads/rss")
 async def goodreads_rss(payload: UrlIn):
-    try: count = await import_goodreads_rss(str(payload.url))
+    try: result = await _sync_goodreads_rss(str(payload.url))
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+    return {**result, "job_id": enqueue_job("score", dedupe=True)}
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: SourcePreviewIn):
@@ -2404,6 +2503,8 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "embedding_api_key_set": bool(private.get("embedding_api_key")),
         "librarr_url": private.get("librarr_url", ""),
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
+        "goodreads_rss_url": private.get("goodreads_rss_url", ""),
+        "goodreads_rss_last_sync_at": private.get("goodreads_rss_last_sync_at", ""),
         "librarr_media_type": media_type,
         "nyt_api_key_set": bool(private.get("nyt_api_key")),
         "source_sync_interval_hours": source_sync_interval_hours(),
