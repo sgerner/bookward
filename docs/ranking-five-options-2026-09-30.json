@@ -1,0 +1,1240 @@
+{
+  "snapshot_sha256": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+  "scope": "Retrospective exploratory one-reader evidence, not independent confirmation or live policy evaluation. No individual records are included.",
+  "text_views": {
+    "data": {
+      "snapshot_sha256": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+      "model": "qwen3-embedding:4b",
+      "works": 1777,
+      "excluded": {
+        "unrated": 9,
+        "undated": 9,
+        "missing_or_stale_vector": 0,
+        "duplicate_work": 2
+      },
+      "split": {
+        "train": 1066,
+        "validation": 355,
+        "test": 356,
+        "whole_day": true
+      },
+      "read_vector_variants": [
+        "title+author current template",
+        "title-only"
+      ],
+      "equal_fusion": "average of the title-author and title-only ranker scores",
+      "author_ablation": "separate exact-author prior included (1.0) or removed (0.0)",
+      "split_count_scope": "Record counts include the initial 100 history-only reads in the training window; there are 966 eligible scored training queries, 355 validation and 356 later queries."
+    },
+    "rating_replay": {
+      "protocol": "Each rated target scored from works read on strictly earlier UTC days; all target reads on the same day are held out together. Ranker score is unchanged except for declared embedding view and optional exact-author prior ablation.",
+      "validation": {
+        "title_author|author_1": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.5240291688631172,
+          "auc_low_1or2_vs_rest_reversed": 0.5917452113104287,
+          "auc_high_vs_low": 0.5898033126293996,
+          "balanced_high_low_auc": 0.557887190086773,
+          "spearman": 0.10601707148043713
+        },
+        "title_author|author_0": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.5266429450008786,
+          "auc_low_1or2_vs_rest_reversed": 0.5937468328772677,
+          "auc_high_vs_low": 0.5920462387853692,
+          "balanced_high_low_auc": 0.5601948889390731,
+          "spearman": 0.11029074759997486
+        },
+        "title_only|author_1": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.6170708135652785,
+          "auc_low_1or2_vs_rest_reversed": 0.6097598054119793,
+          "auc_high_vs_low": 0.675552104899931,
+          "balanced_high_low_auc": 0.6134153094886289,
+          "spearman": 0.2108619164997048
+        },
+        "title_only|author_0": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.6185424354243543,
+          "auc_low_1or2_vs_rest_reversed": 0.6067953785345089,
+          "auc_high_vs_low": 0.6736542443064182,
+          "balanced_high_low_auc": 0.6126689069794315,
+          "spearman": 0.20876122258917268
+        },
+        "equal_late_fusion|author_1": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.5671454928835002,
+          "auc_low_1or2_vs_rest_reversed": 0.6111786763960677,
+          "auc_high_vs_low": 0.6358695652173914,
+          "balanced_high_low_auc": 0.589162084639784,
+          "spearman": 0.16584891744592667
+        },
+        "equal_late_fusion|author_0": {
+          "n": 355,
+          "high_n": 84,
+          "low_n": 69,
+          "auc_high_4plus_vs_rest": 0.5706598137409945,
+          "auc_low_1or2_vs_rest_reversed": 0.6119641228336881,
+          "auc_high_vs_low": 0.6399240855762595,
+          "balanced_high_low_auc": 0.5913119682873413,
+          "spearman": 0.16989105931834347
+        }
+      },
+      "selected_view_validation_only": "title_only|author_1",
+      "validation_author_ablation_winner": "title_only|author_1",
+      "later_test": {
+        "serving_compatible_baseline": {
+          "n": 356,
+          "high_n": 153,
+          "low_n": 54,
+          "auc_high_4plus_vs_rest": 0.6020638140313597,
+          "auc_low_1or2_vs_rest_reversed": 0.5428930586215355,
+          "auc_high_vs_low": 0.5953159041394336,
+          "balanced_high_low_auc": 0.5724784363264476,
+          "spearman": 0.14804929207124504
+        },
+        "validation_selected_winner": {
+          "n": 356,
+          "high_n": 153,
+          "low_n": 54,
+          "auc_high_4plus_vs_rest": 0.6072957918799704,
+          "auc_low_1or2_vs_rest_reversed": 0.4374540103016924,
+          "auc_high_vs_low": 0.5091987412248851,
+          "balanced_high_low_auc": 0.5223749010908314,
+          "spearman": 0.129203154143947
+        },
+        "selected_text_view": "title_only|author_1",
+        "author_ablation_test": "not selected on validation"
+      },
+      "test_by_author_coverage": {
+        "author_seen": {
+          "baseline": {
+            "n": 130,
+            "high_n": 59,
+            "low_n": 18,
+            "auc_high_4plus_vs_rest": 0.6770112198615421,
+            "auc_low_1or2_vs_rest_reversed": 0.5691964285714286,
+            "auc_high_vs_low": 0.6563088512241054,
+            "balanced_high_low_auc": 0.6231038242164854,
+            "spearman": 0.2677539870581068
+          },
+          "selected_text_view": {
+            "n": 130,
+            "high_n": 59,
+            "low_n": 18,
+            "auc_high_4plus_vs_rest": 0.6756982573406541,
+            "auc_low_1or2_vs_rest_reversed": 0.5104166666666666,
+            "auc_high_vs_low": 0.6040489642184558,
+            "balanced_high_low_auc": 0.5930574620036604,
+            "spearman": 0.24946267305660205
+          }
+        },
+        "author_unseen": {
+          "baseline": {
+            "n": 226,
+            "high_n": 94,
+            "low_n": 36,
+            "auc_high_4plus_vs_rest": 0.5498065764023211,
+            "auc_low_1or2_vs_rest_reversed": 0.5314327485380117,
+            "auc_high_vs_low": 0.5585106382978723,
+            "balanced_high_low_auc": 0.5406196624701665,
+            "spearman": 0.06804156952848102
+          },
+          "selected_text_view": {
+            "n": 226,
+            "high_n": 94,
+            "low_n": 36,
+            "auc_high_4plus_vs_rest": 0.5690280464216635,
+            "auc_low_1or2_vs_rest_reversed": 0.39495614035087717,
+            "auc_high_vs_low": 0.449468085106383,
+            "balanced_high_low_auc": 0.48199209338627036,
+            "spearman": 0.05769535814742971
+          }
+        }
+      },
+      "test_history_size": {
+        "min": 1421,
+        "median": 1598.5,
+        "max": 1775,
+        "under_100": 0,
+        "under_500": 0
+      },
+      "enriched_view_coverage_only": {
+        "train": {
+          "high": {
+            "targets": 406,
+            "matched_enriched_targets": 35
+          },
+          "low": {
+            "targets": 230,
+            "matched_enriched_targets": 5
+          },
+          "neutral": {
+            "targets": 430,
+            "matched_enriched_targets": 17
+          }
+        },
+        "validation": {
+          "high": {
+            "targets": 84,
+            "matched_enriched_targets": 8
+          },
+          "low": {
+            "targets": 69,
+            "matched_enriched_targets": 1
+          },
+          "neutral": {
+            "targets": 202,
+            "matched_enriched_targets": 9
+          }
+        },
+        "test": {
+          "high": {
+            "targets": 153,
+            "matched_enriched_targets": 19
+          },
+          "low": {
+            "targets": 54,
+            "matched_enriched_targets": 2
+          },
+          "neutral": {
+            "targets": 149,
+            "matched_enriched_targets": 18
+          }
+        }
+      },
+      "limitations": "One installation. Its current read documents contain title, author, an empty genres marker, and no description. Title-only and equal title/title-author views are tested on a uniform cohort. Current production rich-candidate query text is tested separately against explicit actions because read replay lacks contemporaneous rich read/query text. Only 89 read-overlap links have enrichment among rating records; later test has 17 high and 1 low matched targets, so a full enriched-text AUC would not have adequate common class support. Current metadata and embeddings can postdate recorded dates."
+    },
+    "explicit_action_replay": {
+      "protocol": "Latest non-undone save/reject per candidate with strictly earlier-day rating history, same-day reads excluded; current candidate source and catalog-confidence terms preserved.",
+      "usable_candidates": 127,
+      "split": {
+        "train": {
+          "n": 76,
+          "saves": 41,
+          "rejects": 35
+        },
+        "validation": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20
+        },
+        "test": {
+          "n": 18,
+          "saves": 3,
+          "rejects": 15
+        }
+      },
+      "validation_all_six_predeclared_configs": {
+        "rich_current|author_1": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.5173076923076924
+        },
+        "compatible_title_author|author_1": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.37884615384615383
+        },
+        "equal_rich_compatible|author_1": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.3903846153846154
+        },
+        "rich_current|author_0": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.5038461538461538
+        },
+        "compatible_title_author|author_0": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.36730769230769234
+        },
+        "equal_rich_compatible|author_0": {
+          "n": 33,
+          "saves": 13,
+          "rejects": 20,
+          "auc_save_vs_reject": 0.3769230769230769
+        }
+      },
+      "selected_config_validation_only": "rich_current|author_1",
+      "later_test_selected_and_current": {
+        "current_rich_baseline": {
+          "n": 18,
+          "saves": 3,
+          "rejects": 15,
+          "auc_save_vs_reject": 0.7222222222222222
+        },
+        "validation_selected_winner": {
+          "n": 18,
+          "saves": 3,
+          "rejects": 15,
+          "auc_save_vs_reject": 0.7222222222222222
+        },
+        "selected_config": "rich_current|author_1"
+      },
+      "coverage_by_period": {
+        "train": {
+          "unseen_author_candidates": 18,
+          "sparse_metadata_candidates": 55,
+          "identity_linked_to_read": 1
+        },
+        "validation": {
+          "unseen_author_candidates": 29,
+          "sparse_metadata_candidates": 3,
+          "identity_linked_to_read": 0
+        },
+        "test": {
+          "unseen_author_candidates": 17,
+          "sparse_metadata_candidates": 3,
+          "identity_linked_to_read": 0
+        }
+      },
+      "limitations": "Small retrospective action set with no complete impression, position, or propensity record. The final period has three saves and fifteen rejects; AUC is highly uncertain and cannot establish user preference. Candidate metadata may postdate an action."
+    },
+    "privacy": {
+      "titles_authors_descriptions_or_embeddings_in_report": false,
+      "raw_embedding_cache_private": true
+    }
+  },
+  "source_confidence": {
+    "protocol": {
+      "arms": {
+        "confidence_neutral": "Keep source term; set shrink confidence to 1 for score formation.",
+        "current": "Current source term multiplier 1 and score shrink 50 + metadata_confidence * (raw_score - 50).",
+        "source0_confidence_neutral": "Remove source-weight points and neutralize confidence shrink.",
+        "source_multiplier_0": "Remove only source-weight points; retain current confidence shrink."
+      },
+      "candidate_pool": "Fixed to observed latest save/reject targets per cohort. The ablations do not filter or replace candidates.",
+      "features_held_fixed": "Same candidate identity, cached candidate vector, and historical read vectors for each arm. Source ablation changes only source_weight to 1. Confidence-neutral uses a scorer-only copy with confidence inputs set to full confidence while reusing the exact cached candidate vector; no embedding or content hash is regenerated.",
+      "history": "Use only rated reads with read_at strictly before the action calendar day; when read.created_at is available, also exclude rows created after the action timestamp. Exclude the target work itself from personal history in the primary replay.",
+      "identity_safeguards": "No identity acceptance, candidate eligibility, or quality-status gate was changed. The study replays the same observed candidates.",
+      "no_titles_in_outputs": true,
+      "unknown_history": "Current candidate catalog/source metadata is not historically versioned. The corpus candidate snapshot is used as observed at corpus acquisition, not treated as the action-date value. read.created_at is only row creation and cannot identify later rating edits."
+    },
+    "decision": {
+      "decision": "Observational sensitivity only; no ranking change is supported by this evidence.",
+      "quality_policy": "Do not relax catalog identity acceptance protections based on source/confidence score ablations.",
+      "reason": "Source/catalog feature gaps across historical ratings, current rather than action-date metadata, sparse exact-run saves, deterministic propensities, and reader-selected feedback prevent a causal preference conclusion."
+    },
+    "rating_replay": {
+      "conclusion": "Observed rating rows have no source or catalog-confidence feature values, so these terms are not identified by rating replay. Synthetic score stress only checks the formula path; it cannot validate efficacy.",
+      "exact_ranker_parity": {
+        "compared_predictions": 1677,
+        "max_score_error_points": 0.0,
+        "mismatches_at_served_precision": 0
+      },
+      "later_test_block": {
+        "catalog_confidence_present_on_rating_rows": 0,
+        "interpretation": "Scoring-path stress only. Rating rows contain no observed source weight or catalog confidence; synthetic assignments are independent of outcomes and cannot estimate efficacy or validate source/confidence policy.",
+        "metrics": {
+          "real_fields_absent_default_neutral": {
+            "high_4plus_auc_vs_1to3": 0.6020638140313597,
+            "low_1or2_auc_vs_3to5": 0.5428930586215355
+          },
+          "synthetic_confidence_neutral": {
+            "high_4plus_auc_vs_1to3": 0.5982162980134582,
+            "low_1or2_auc_vs_3to5": 0.5693831248467011
+          },
+          "synthetic_current_terms": {
+            "high_4plus_auc_vs_1to3": 0.6008886313145948,
+            "low_1or2_auc_vs_3to5": 0.554635761589404
+          },
+          "synthetic_source0_confidence_neutral": {
+            "high_4plus_auc_vs_1to3": 0.6020638140313597,
+            "low_1or2_auc_vs_3to5": 0.5428930586215355
+          },
+          "synthetic_source_multiplier_0": {
+            "high_4plus_auc_vs_1to3": 0.6060723139830645,
+            "low_1or2_auc_vs_3to5": 0.5169242089771892
+          }
+        },
+        "n": 356,
+        "period": "later chronological 20% test block",
+        "score_movement_vs_real_default": {
+          "synthetic_confidence_neutral": {
+            "changed_by_at_least_5_points": 0,
+            "mean_absolute_delta_points": 1.7654494382022472,
+            "p90_absolute_delta_points": 4.0
+          },
+          "synthetic_current_terms": {
+            "changed_by_at_least_5_points": 83,
+            "mean_absolute_delta_points": 4.048876404494382,
+            "p90_absolute_delta_points": 9.240000000000002
+          },
+          "synthetic_source0_confidence_neutral": {
+            "changed_by_at_least_5_points": 0,
+            "mean_absolute_delta_points": 0.0,
+            "p90_absolute_delta_points": 0.0
+          },
+          "synthetic_source_multiplier_0": {
+            "changed_by_at_least_5_points": 75,
+            "mean_absolute_delta_points": 2.9896629213483146,
+            "p90_absolute_delta_points": 8.68
+          }
+        },
+        "source_weight_present_on_rating_rows": 0,
+        "synthetic_assignment": {
+          "confidence_levels": [
+            0.2,
+            0.6,
+            1.0
+          ],
+          "metadata_or_embedding_hash_changed": false,
+          "same_original_candidate_text_and_vectors": true,
+          "seed": 20260930,
+          "source_weight_levels": [
+            0.2,
+            0.65,
+            1.0
+          ]
+        }
+      }
+    },
+    "latest_read_date_actions": {
+      "confidence_neutral": {
+        "bottom20_reject_rate": 0.6,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.48345864661654137,
+        "saves": 57,
+        "top20_save_rate": 0.4
+      },
+      "current": {
+        "bottom20_reject_rate": 0.25,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.40601503759398494,
+        "saves": 57,
+        "top20_save_rate": 0.35
+      },
+      "source0_confidence_neutral": {
+        "bottom20_reject_rate": 0.7,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.5708020050125313,
+        "saves": 57,
+        "top20_save_rate": 0.4
+      },
+      "source_multiplier_0": {
+        "bottom20_reject_rate": 0.2,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.43796992481203006,
+        "saves": 57,
+        "top20_save_rate": 0.45
+      }
+    },
+    "latest_row_available_actions": {
+      "confidence_neutral": {
+        "bottom20_reject_rate": 0.4,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.3418546365914787,
+        "saves": 57,
+        "top20_save_rate": 0.4
+      },
+      "current": {
+        "bottom20_reject_rate": 0.4,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.343609022556391,
+        "saves": 57,
+        "top20_save_rate": 0.35
+      },
+      "source0_confidence_neutral": {
+        "bottom20_reject_rate": 0.3,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.406390977443609,
+        "saves": 57,
+        "top20_save_rate": 0.35
+      },
+      "source_multiplier_0": {
+        "bottom20_reject_rate": 0.2,
+        "n": 127,
+        "rejects": 70,
+        "save_auc": 0.38972431077694236,
+        "saves": 57,
+        "top20_save_rate": 0.35
+      }
+    },
+    "row_availability_coverage": {
+      "median_reads": 0.0,
+      "p10_reads": 0.0,
+      "p90_reads": 1775.0,
+      "zero_read_history_cases": 66
+    },
+    "exact_same_run_actions": {
+      "confidence_neutral": {
+        "bottom20_reject_rate": 0.95,
+        "n": 47,
+        "rejects": 44,
+        "save_auc": 0.7083333333333334,
+        "saves": 3,
+        "top20_save_rate": 0.1
+      },
+      "current": {
+        "bottom20_reject_rate": 1.0,
+        "n": 47,
+        "rejects": 44,
+        "save_auc": 0.7765151515151515,
+        "saves": 3,
+        "top20_save_rate": 0.15
+      },
+      "source0_confidence_neutral": {
+        "bottom20_reject_rate": 0.95,
+        "n": 47,
+        "rejects": 44,
+        "save_auc": 0.6439393939393939,
+        "saves": 3,
+        "top20_save_rate": 0.1
+      },
+      "source_multiplier_0": {
+        "bottom20_reject_rate": 1.0,
+        "n": 47,
+        "rejects": 44,
+        "save_auc": 0.7045454545454546,
+        "saves": 3,
+        "top20_save_rate": 0.1
+      }
+    },
+    "visible_same_run_actions": {
+      "confidence_neutral": {
+        "bottom20_reject_rate": 0.8823529411764706,
+        "n": 17,
+        "rejects": 15,
+        "save_auc": 0.6166666666666667,
+        "saves": 2,
+        "top20_save_rate": 0.11764705882352941
+      },
+      "current": {
+        "bottom20_reject_rate": 0.8823529411764706,
+        "n": 17,
+        "rejects": 15,
+        "save_auc": 0.8333333333333334,
+        "saves": 2,
+        "top20_save_rate": 0.11764705882352941
+      },
+      "source0_confidence_neutral": {
+        "bottom20_reject_rate": 0.8823529411764706,
+        "n": 17,
+        "rejects": 15,
+        "save_auc": 0.5333333333333333,
+        "saves": 2,
+        "top20_save_rate": 0.11764705882352941
+      },
+      "source_multiplier_0": {
+        "bottom20_reject_rate": 0.8823529411764706,
+        "n": 17,
+        "rejects": 15,
+        "save_auc": 0.7666666666666667,
+        "saves": 2,
+        "top20_save_rate": 0.11764705882352941
+      }
+    },
+    "ranker_evaluation": {
+      "arms_scored_directly_by_rank_candidates": [
+        "current",
+        "source_multiplier_0",
+        "confidence_neutral",
+        "source0_confidence_neutral"
+      ],
+      "candidates_scored": 127,
+      "confidence_neutral_scoring_copy_reuses_original_cached_vector": true,
+      "same_candidate_vector_and_history_across_arms": true
+    },
+    "identity_sensitivity_counts": {
+      "cases_with_prior_read_identity_match_by_read_at": 0,
+      "cases_with_prior_read_row_created_after_action_time": 0,
+      "cases_with_prior_read_row_created_by_action_time": 0,
+      "cases_without_prior_read_identity_match_by_read_at": 127,
+      "prior_match_events_by_read_at": 0
+    }
+  },
+  "seed_proxy": {
+    "limitations": [
+      "Known-work title-author similarity is a retrieval proxy, not provider recall or historical candidate availability.",
+      "Books selected by the reader and final ratings may postdate read dates.",
+      "Budgets and three policies fixed before this proxy run; no model selection."
+    ],
+    "budgets": {
+      "4": {
+        "metrics": {
+          "validation": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.5343964153927253,
+              "auc_one_or_two_vs_three_to_five": 0.56121414817067,
+              "auc_high_vs_low_excluding_neutral": 0.5826432022084196,
+              "high_rated_in_top_20": 5,
+              "low_rated_in_bottom_20": 4
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5010103672465296,
+              "auc_one_or_two_vs_three_to_five": 0.5293908989561164,
+              "auc_high_vs_low_excluding_neutral": 0.5267425810904072,
+              "high_rated_in_top_20": 4,
+              "low_rated_in_bottom_20": 2
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5028553856967141,
+              "auc_one_or_two_vs_three_to_five": 0.5662815445424141,
+              "auc_high_vs_low_excluding_neutral": 0.5603864734299517,
+              "high_rated_in_top_20": 6,
+              "low_rated_in_bottom_20": 4
+            }
+          },
+          "later": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.5250330017064297,
+              "auc_one_or_two_vs_three_to_five": 0.5042310522442973,
+              "auc_high_vs_low_excluding_neutral": 0.5176712660372791,
+              "high_rated_in_top_20": 10,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5548150294600599,
+              "auc_one_or_two_vs_three_to_five": 0.5288202109394162,
+              "auc_high_vs_low_excluding_neutral": 0.5568869523117889,
+              "high_rated_in_top_20": 16,
+              "low_rated_in_bottom_20": 3
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5441578930422744,
+              "auc_one_or_two_vs_three_to_five": 0.5129997547216091,
+              "auc_high_vs_low_excluding_neutral": 0.5343742435245703,
+              "high_rated_in_top_20": 15,
+              "low_rated_in_bottom_20": 2
+            }
+          },
+          "later_first_half": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.6126616746085772,
+              "auc_one_or_two_vs_three_to_five": 0.5121412803532008,
+              "auc_high_vs_low_excluding_neutral": 0.5863247863247864,
+              "high_rated_in_top_20": 13,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5911504424778761,
+              "auc_one_or_two_vs_three_to_five": 0.5283296541574687,
+              "auc_high_vs_low_excluding_neutral": 0.58005698005698,
+              "high_rated_in_top_20": 12,
+              "low_rated_in_bottom_20": 4
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.578216473791695,
+              "auc_one_or_two_vs_three_to_five": 0.47633063527103264,
+              "auc_high_vs_low_excluding_neutral": 0.5333333333333333,
+              "high_rated_in_top_20": 12,
+              "low_rated_in_bottom_20": 3
+            }
+          },
+          "later_second_half": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.4233585858585859,
+              "auc_one_or_two_vs_three_to_five": 0.4988962472406181,
+              "auc_high_vs_low_excluding_neutral": 0.45791245791245794,
+              "high_rated_in_top_20": 10,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.506439393939394,
+              "auc_one_or_two_vs_three_to_five": 0.5342163355408388,
+              "auc_high_vs_low_excluding_neutral": 0.5340909090909091,
+              "high_rated_in_top_20": 13,
+              "low_rated_in_bottom_20": 3
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5021464646464646,
+              "auc_one_or_two_vs_three_to_five": 0.5491783173902379,
+              "auc_high_vs_low_excluding_neutral": 0.5374579124579124,
+              "high_rated_in_top_20": 14,
+              "low_rated_in_bottom_20": 4
+            }
+          },
+          "later_unseen_authors": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.539651837524178,
+              "auc_one_or_two_vs_three_to_five": 0.5587719298245614,
+              "auc_high_vs_low_excluding_neutral": 0.5697399527186762,
+              "high_rated_in_top_20": 11,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5124113475177305,
+              "auc_one_or_two_vs_three_to_five": 0.5431286549707602,
+              "auc_high_vs_low_excluding_neutral": 0.5443262411347518,
+              "high_rated_in_top_20": 11,
+              "low_rated_in_bottom_20": 5
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.501611863313991,
+              "auc_one_or_two_vs_three_to_five": 0.5347953216374269,
+              "auc_high_vs_low_excluding_neutral": 0.5274822695035462,
+              "high_rated_in_top_20": 10,
+              "low_rated_in_bottom_20": 3
+            }
+          }
+        },
+        "later_bootstrap_uncertainty": {
+          "recent": {
+            "high_auc_delta_95pct": [
+              -0.033600629187775836,
+              0.09236671624152545
+            ],
+            "low_auc_delta_95pct": [
+              -0.06434826906831256,
+              0.10805052817638464
+            ],
+            "bootstrap_resamples": 2000,
+            "bootstrap_seed": 20260930
+          },
+          "mixed": {
+            "high_auc_delta_95pct": [
+              -0.027757090704084848,
+              0.06963300679624417
+            ],
+            "low_auc_delta_95pct": [
+              -0.06232172869012433,
+              0.07508616731675606
+            ],
+            "bootstrap_resamples": 2000,
+            "bootstrap_seed": 20260930
+          }
+        },
+        "mean_seed_age_years": {
+          "current": 9.646223809485564,
+          "recent": 0.06117240339215073,
+          "mixed": 5.087890543081438
+        },
+        "scored_targets": 1677
+      },
+      "25": {
+        "metrics": {
+          "validation": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.5013178703215604,
+              "auc_one_or_two_vs_three_to_five": 0.49761832370528025,
+              "auc_high_vs_low_excluding_neutral": 0.4994824016563147,
+              "high_rated_in_top_20": 5,
+              "low_rated_in_bottom_20": 3
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5163855209980671,
+              "auc_one_or_two_vs_three_to_five": 0.524424850511807,
+              "auc_high_vs_low_excluding_neutral": 0.5307108350586611,
+              "high_rated_in_top_20": 5,
+              "low_rated_in_bottom_20": 6
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5029432437181515,
+              "auc_one_or_two_vs_three_to_five": 0.5233606972737408,
+              "auc_high_vs_low_excluding_neutral": 0.5165631469979296,
+              "high_rated_in_top_20": 5,
+              "low_rated_in_bottom_20": 3
+            }
+          },
+          "later": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.508838017965807,
+              "auc_one_or_two_vs_three_to_five": 0.48730684326710816,
+              "auc_high_vs_low_excluding_neutral": 0.49600580973129993,
+              "high_rated_in_top_20": 8,
+              "low_rated_in_bottom_20": 1
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5767088444573232,
+              "auc_one_or_two_vs_three_to_five": 0.5524895756683836,
+              "auc_high_vs_low_excluding_neutral": 0.5871459694989106,
+              "high_rated_in_top_20": 17,
+              "low_rated_in_bottom_20": 1
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5532695836955471,
+              "auc_one_or_two_vs_three_to_five": 0.5305371596762325,
+              "auc_high_vs_low_excluding_neutral": 0.556402808036795,
+              "high_rated_in_top_20": 15,
+              "low_rated_in_bottom_20": 1
+            }
+          },
+          "later_first_half": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.5746766507828455,
+              "auc_one_or_two_vs_three_to_five": 0.49816041206769685,
+              "auc_high_vs_low_excluding_neutral": 0.5521367521367522,
+              "high_rated_in_top_20": 11,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.6216473791695031,
+              "auc_one_or_two_vs_three_to_five": 0.494971792985038,
+              "auc_high_vs_low_excluding_neutral": 0.5794871794871795,
+              "high_rated_in_top_20": 15,
+              "low_rated_in_bottom_20": 4
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5795779441797141,
+              "auc_one_or_two_vs_three_to_five": 0.48442482217316657,
+              "auc_high_vs_low_excluding_neutral": 0.5470085470085471,
+              "high_rated_in_top_20": 13,
+              "low_rated_in_bottom_20": 1
+            }
+          },
+          "later_second_half": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.4152777777777778,
+              "auc_one_or_two_vs_three_to_five": 0.4687270051508462,
+              "auc_high_vs_low_excluding_neutral": 0.43223905723905726,
+              "high_rated_in_top_20": 10,
+              "low_rated_in_bottom_20": 3
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5242424242424243,
+              "auc_one_or_two_vs_three_to_five": 0.6048565121412803,
+              "auc_high_vs_low_excluding_neutral": 0.5925925925925926,
+              "high_rated_in_top_20": 16,
+              "low_rated_in_bottom_20": 2
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5075757575757576,
+              "auc_one_or_two_vs_three_to_five": 0.5766494971792985,
+              "auc_high_vs_low_excluding_neutral": 0.5627104377104377,
+              "high_rated_in_top_20": 14,
+              "low_rated_in_bottom_20": 3
+            }
+          },
+          "later_unseen_authors": {
+            "current": {
+              "auc_four_or_five_vs_one_to_three": 0.5206318504190844,
+              "auc_one_or_two_vs_three_to_five": 0.5340643274853801,
+              "auc_high_vs_low_excluding_neutral": 0.5425531914893617,
+              "high_rated_in_top_20": 11,
+              "low_rated_in_bottom_20": 2
+            },
+            "recent": {
+              "auc_four_or_five_vs_one_to_three": 0.5161186331399097,
+              "auc_one_or_two_vs_three_to_five": 0.5163742690058479,
+              "auc_high_vs_low_excluding_neutral": 0.5224586288416075,
+              "high_rated_in_top_20": 9,
+              "low_rated_in_bottom_20": 1
+            },
+            "mixed": {
+              "auc_four_or_five_vs_one_to_three": 0.5095099935525468,
+              "auc_one_or_two_vs_three_to_five": 0.520906432748538,
+              "auc_high_vs_low_excluding_neutral": 0.5245271867612293,
+              "high_rated_in_top_20": 12,
+              "low_rated_in_bottom_20": 0
+            }
+          }
+        },
+        "later_bootstrap_uncertainty": {
+          "recent": {
+            "high_auc_delta_95pct": [
+              0.015177356677375065,
+              0.11926576862039191
+            ],
+            "low_auc_delta_95pct": [
+              -0.01098188386823559,
+              0.13828152155821855
+            ],
+            "bootstrap_resamples": 2000,
+            "bootstrap_seed": 20260930
+          },
+          "mixed": {
+            "high_auc_delta_95pct": [
+              0.006429251226097255,
+              0.08398741088901311
+            ],
+            "low_auc_delta_95pct": [
+              -0.01908068457530381,
+              0.10273458870420088
+            ],
+            "bootstrap_resamples": 2000,
+            "bootstrap_seed": 20260930
+          }
+        },
+        "mean_seed_age_years": {
+          "current": 8.194116833409632,
+          "recent": 0.32701782190941,
+          "mixed": 4.6699444487576605
+        },
+        "scored_targets": 1677
+      }
+    }
+  },
+  "bounded_current_provider_probe": {
+    "corpus_sha256": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+    "protocol": {
+      "provider": "production OpenLibraryListProvider, read-only HTTP GET",
+      "seed_budget_per_arm": 4,
+      "author_cap": 2,
+      "max_lists_per_seed": 1,
+      "items_per_list": 12,
+      "max_resolutions_per_arm": 2,
+      "seed_policies": [
+        "current production selector",
+        "most-recent eligible high-rated reads"
+      ],
+      "seed_history_strictly_precedes_fold": true,
+      "provider_catalog_is_current": true,
+      "target_join": "Open Library work ID or exact normalized title+author; no fuzzy/title-only join",
+      "no_sqlite_cache_or_run_writes": true,
+      "provider_read_exclusion_uses_full_pre_fold_history": true
+    },
+    "excluded_by_prepare": {
+      "unrated": 9,
+      "undated": 9,
+      "missing_or_stale_vector": 0,
+      "duplicate_work": 2
+    },
+    "overall_request_counters": {
+      "ok": 21,
+      "error": 2
+    },
+    "folds": {
+      "validation": {
+        "current": {
+          "seeds": 4,
+          "edges": 0,
+          "unique_returned_identities": 0,
+          "request_successes": 6,
+          "request_errors": 1,
+          "api_calls": {
+            "seed_search_ok": 4,
+            "seed_search_returned_rows": 6,
+            "work_lists_ok": 2,
+            "work_lists_returned_rows": 10,
+            "list_seeds_errors": 1,
+            "error_HTTPStatusError": 1
+          },
+          "timed_out": false,
+          "edge_work_id_matches": 0,
+          "edge_exact_title_author_matches": 0,
+          "heldout": {
+            "high_4_5": {
+              "n": 84,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "low_1_2": {
+              "n": 69,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "neutral_3": {
+              "n": 202,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "all_ranked_targets": 355,
+            "auc_high_vs_rest": 0.5,
+            "auc_low_vs_rest_reversed": 0.5
+          }
+        },
+        "recent": {
+          "seeds": 4,
+          "edges": 0,
+          "unique_returned_identities": 0,
+          "request_successes": 4,
+          "request_errors": 0,
+          "api_calls": {
+            "seed_search_ok": 4,
+            "seed_search_returned_rows": 1
+          },
+          "timed_out": false,
+          "edge_work_id_matches": 0,
+          "edge_exact_title_author_matches": 0,
+          "heldout": {
+            "high_4_5": {
+              "n": 84,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "low_1_2": {
+              "n": 69,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "neutral_3": {
+              "n": 202,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "all_ranked_targets": 355,
+            "auc_high_vs_rest": 0.5,
+            "auc_low_vs_rest_reversed": 0.5
+          }
+        }
+      },
+      "later_test": {
+        "current": {
+          "seeds": 4,
+          "edges": 0,
+          "unique_returned_identities": 0,
+          "request_successes": 6,
+          "request_errors": 1,
+          "api_calls": {
+            "seed_search_ok": 4,
+            "seed_search_returned_rows": 6,
+            "work_lists_ok": 2,
+            "work_lists_returned_rows": 10,
+            "list_seeds_errors": 1,
+            "error_HTTPStatusError": 1
+          },
+          "timed_out": false,
+          "edge_work_id_matches": 0,
+          "edge_exact_title_author_matches": 0,
+          "heldout": {
+            "high_4_5": {
+              "n": 153,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "low_1_2": {
+              "n": 54,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "neutral_3": {
+              "n": 149,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "all_ranked_targets": 356,
+            "auc_high_vs_rest": 0.5,
+            "auc_low_vs_rest_reversed": 0.5
+          }
+        },
+        "recent": {
+          "seeds": 4,
+          "edges": 0,
+          "unique_returned_identities": 0,
+          "request_successes": 5,
+          "request_errors": 0,
+          "api_calls": {
+            "seed_search_ok": 4,
+            "seed_search_returned_rows": 1,
+            "work_lists_ok": 1,
+            "work_lists_returned_rows": 0
+          },
+          "timed_out": false,
+          "edge_work_id_matches": 0,
+          "edge_exact_title_author_matches": 0,
+          "heldout": {
+            "high_4_5": {
+              "n": 153,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "low_1_2": {
+              "n": 54,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "neutral_3": {
+              "n": 149,
+              "retrieved": 0,
+              "recall": 0.0,
+              "mean_reciprocal_rank": 0.0
+            },
+            "all_ranked_targets": 356,
+            "auc_high_vs_rest": 0.5,
+            "auc_low_vs_rest_reversed": 0.5
+          }
+        }
+      }
+    },
+    "limitations": [
+      "Open Library lists are live/current and may contain post-period information; this is not historical candidate availability or production graph recall.",
+      "Target universe is the reader\u2019s held-out rated-work set; it excludes books never read and is not a complete discovery catalog.",
+      "Only four seeds per arm and one list per seed; results are a small operability/yield diagnostic.",
+      "No candidate was persisted, enriched, scored, or made visible."
+    ],
+    "validation_selected_policy": "current"
+  },
+  "embedding_repeatability_diagnostic": {
+    "sample_reads": 3,
+    "cached_vs_fresh_cosines": [
+      0.996729850769043,
+      0.9981479644775391,
+      0.9977847933769226
+    ],
+    "max_absolute_vector_error": 0.005626842379570007,
+    "dimensions": 2560,
+    "local_and_production_model_digest": "df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
+    "local_ollama": {
+      "version": "0.30.5"
+    },
+    "same_read_document_template": true,
+    "private_records_not_reported": true,
+    "production_current_ollama_version": "0.35.0",
+    "cached_execution_version": "unknown"
+  },
+  "fresh_text_view_control_diagnostic": {
+    "corpus_sha256": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+    "protocol": "Same frozen corpus, strict earlier-UTC-day history, whole-day train/validation/later splits, scoring terms and author prior as prior option2 replay. Three fixed views: fresh exact title+author read documents; cached true-title-only; equal arithmetic mean of the two ranker score components before final clipping. Validation selects one view; all three later metrics are shown only to quantify the requested fresh-baseline comparison. Cached serving read vectors are an execution reference, not a selectable view.",
+    "embedding": {
+      "model": "qwen3-embedding:4b",
+      "model_digest": "df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
+      "local_ollama_version": "0.30.5",
+      "dimensions": 2560,
+      "read_count": 1797,
+      "exact_document_cache_hash_matches": 1797,
+      "batch_size": 32,
+      "sequential": true,
+      "inter_batch_delay_seconds": 0.1,
+      "old_cached_vs_fresh_local_cosine": {
+        "n": 1797,
+        "mean": 0.998155951499939,
+        "median": 0.9982529878616333,
+        "p01": 0.995649516582489,
+        "p05": 0.9968791007995605,
+        "p95": 0.9994869828224182,
+        "min": 0.9819338917732239,
+        "max": 0.9998363852500916
+      }
+    },
+    "split_sizes": {
+      "train": 1066,
+      "validation": 355,
+      "later_test": 356,
+      "whole_day": true
+    },
+    "excluded": {
+      "unrated": 9,
+      "undated": 9,
+      "missing_or_stale_vector": 0,
+      "duplicate_work": 2
+    },
+    "validation_metrics": {
+      "fresh_title_author": {
+        "n": 355,
+        "high_n": 84,
+        "low_n": 69,
+        "auc_high_4plus_vs_rest": 0.5276752767527675,
+        "auc_low_1or2_vs_rest_reversed": 0.605072463768116,
+        "auc_high_vs_low": 0.5998102139406487,
+        "balanced_high_low_auc": 0.5663738702604417,
+        "spearman": 0.1192206127877925
+      },
+      "title_only": {
+        "n": 355,
+        "high_n": 84,
+        "low_n": 69,
+        "auc_high_4plus_vs_rest": 0.6170708135652785,
+        "auc_low_1or2_vs_rest_reversed": 0.6097598054119793,
+        "auc_high_vs_low": 0.675552104899931,
+        "balanced_high_low_auc": 0.6134153094886289,
+        "spearman": 0.2108619164997048
+      },
+      "equal_score_fusion": {
+        "n": 355,
+        "high_n": 84,
+        "low_n": 69,
+        "auc_high_4plus_vs_rest": 0.5699569495694957,
+        "auc_low_1or2_vs_rest_reversed": 0.6191851626634235,
+        "auc_high_vs_low": 0.6432884748102139,
+        "balanced_high_low_auc": 0.5945710561164597,
+        "spearman": 0.1740982447243989
+      }
+    },
+    "selected_view_validation_only": "title_only",
+    "later_test_metrics": {
+      "fresh_title_author": {
+        "n": 356,
+        "high_n": 153,
+        "low_n": 54,
+        "auc_high_4plus_vs_rest": 0.5980392156862745,
+        "auc_low_1or2_vs_rest_reversed": 0.5421572234486142,
+        "auc_high_vs_low": 0.5902323892519971,
+        "balanced_high_low_auc": 0.5700982195674443,
+        "spearman": 0.1429668851973963
+      },
+      "title_only": {
+        "n": 356,
+        "high_n": 153,
+        "low_n": 54,
+        "auc_high_4plus_vs_rest": 0.6072957918799704,
+        "auc_low_1or2_vs_rest_reversed": 0.4374540103016924,
+        "auc_high_vs_low": 0.5091987412248851,
+        "balanced_high_low_auc": 0.5223749010908314,
+        "spearman": 0.129203154143947
+      },
+      "equal_score_fusion": {
+        "n": 356,
+        "high_n": 153,
+        "low_n": 54,
+        "auc_high_4plus_vs_rest": 0.612994623136611,
+        "auc_low_1or2_vs_rest_reversed": 0.4791513367672308,
+        "auc_high_vs_low": 0.5530137981118374,
+        "balanced_high_low_auc": 0.546072979951921,
+        "spearman": 0.14561849531609763
+      }
+    },
+    "cached_serving_reference": {
+      "validation": {
+        "n": 355,
+        "high_n": 84,
+        "low_n": 69,
+        "auc_high_4plus_vs_rest": 0.5240291688631172,
+        "auc_low_1or2_vs_rest_reversed": 0.5917452113104287,
+        "auc_high_vs_low": 0.5898033126293996,
+        "balanced_high_low_auc": 0.557887190086773,
+        "spearman": 0.10601707148043713
+      },
+      "later_test": {
+        "n": 356,
+        "high_n": 153,
+        "low_n": 54,
+        "auc_high_4plus_vs_rest": 0.6020638140313597,
+        "auc_low_1or2_vs_rest_reversed": 0.5428930586215355,
+        "auc_high_vs_low": 0.5953159041394336,
+        "balanced_high_low_auc": 0.5724784363264476,
+        "spearman": 0.14804929207124504
+      },
+      "prior_option2_result_sha256": "00480d826c4a558b8086270d4ac0491b697386be23afdfae6e09686c09830274"
+    },
+    "text_only_vs_fresh_delta_later": {
+      "high_auc": 0.009256576193695909,
+      "low_auc": -0.10470321314692177,
+      "balanced_auc": -0.04772331847661293
+    },
+    "limitations": [
+      "The fresh and title-only views use the same local Ollama service and model digest, but title-only generation runtime was not recorded in its manifest; the original cached serving vectors may have been generated under production Ollama 0.35.0, whereas local Ollama is 0.30.5.",
+      "The frozen later period has been examined in earlier work and is exploratory, not independent confirmation.",
+      "One installation and retrospective ratings only; a view change is not promoted by this diagnostic."
+    ],
+    "privacy": {
+      "titles_authors_or_vectors_in_report": false,
+      "fresh_raw_vectors_private": true
+    }
+  }
+}

@@ -129,6 +129,8 @@ The [September 30 production review](docs/ranking-production-review-2026-09-30.m
 
 The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests-2026-09-30.md) also found no useful improvement in both high- and low-rating detection. `engine/scripts/evaluate_ordinal_interests.py` reproduces the causal replay and compares small learned models, including a daily updating diagnostic, without changing the serving formula.
 
+The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also tests compatible text views, source/catalog confidence, and discovery seeds. It adds a separate action-history availability diagnostic: reads imported after an action cannot reconstruct what the engine knew then, even when their reading dates are earlier.
+
 ### Limitations
 
 - **The source list sets the boundaries.** A book outside your enabled feeds and imports is not available to rank. Incomplete or quiet sources can make the pool small or repetitive.
