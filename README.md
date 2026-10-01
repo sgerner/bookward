@@ -131,6 +131,8 @@ The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests
 
 The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also tests compatible text views, source/catalog confidence, and discovery seeds. The [methodology audit](docs/ranking-methodology-audit-2026-09-30.md) corrects the daily model score scale and adds the previously missing actual read-enrichment replay; enrichment remains promising but unresolved. It adds a separate action-history availability diagnostic: reads imported after an action cannot reconstruct what the engine knew then, even when their reading dates are earlier.
 
+The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs; no serving scorer change is supported.
+
 ### Limitations
 
 - **The source list sets the boundaries.** A book outside your enabled feeds and imports is not available to rank. Incomplete or quiet sources can make the pool small or repetitive.
