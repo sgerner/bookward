@@ -127,6 +127,8 @@ To evaluate ranking changes against a private history of rated reads, run `engin
 
 The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
 
+The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests-2026-09-30.md) also found no useful improvement in both high- and low-rating detection. `engine/scripts/evaluate_ordinal_interests.py` reproduces the causal replay and compares small learned models, including a daily updating diagnostic, without changing the serving formula.
+
 ### Limitations
 
 - **The source list sets the boundaries.** A book outside your enabled feeds and imports is not available to rank. Incomplete or quiet sources can make the pool small or repetitive.
