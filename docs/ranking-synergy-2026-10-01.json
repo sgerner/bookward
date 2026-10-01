@@ -1,0 +1,320 @@
+{
+  "title": "Ranking synergy follow-up",
+  "date": "2026-10-01",
+  "decision": "Keep several modest signals for prospective study; no serving scorer change is supported.",
+  "data": {
+    "frozen_corpus_distinct_dated_rated_works": 1777,
+    "eligible_after_100_read_warmup": 1677,
+    "whole_day_splits": {
+      "train": 966,
+      "validation": 355,
+      "later_exploratory": 356
+    },
+    "primary_metadata_coverage": {
+      "prepared": 978,
+      "eligible": 921,
+      "validation": 191,
+      "later": 187
+    },
+    "verified_title_author_only_coverage": {
+      "prepared": 143,
+      "eligible": 134
+    },
+    "same_utc_day_hidden": true,
+    "later_period_reused_and_exploratory": true,
+    "new_production_snapshot_taken": false
+  },
+  "metric_contract": {
+    "high_auc": "4-5 stars positive vs 1-3",
+    "low_auc": "1-2 stars positive vs 3-5, reversed ranking",
+    "balanced_auc": "unweighted mean of high and low AUC",
+    "tails": "top-20 high and bottom-20 low, reported separately",
+    "served_score_precision": 0.1
+  },
+  "history_signal_grid": {
+    "formula": "z(current) + 0.25 * z(signal); means/scales fit on the 966 training rows",
+    "signals": [
+      "causal k=3 cluster",
+      "recency",
+      "local rating",
+      "ordinal expected stars"
+    ],
+    "fixed_pairs": [
+      "cluster+recency",
+      "cluster+ordinal",
+      "local+recency"
+    ],
+    "validation_selected": "ordinal",
+    "current": {
+      "validation_high_low_auc": [
+        0.524,
+        0.5917
+      ],
+      "validation_balanced_auc": 0.5579,
+      "validation_tails_high_low": [
+        8,
+        4
+      ],
+      "later_high_low_auc": [
+        0.6021,
+        0.5429
+      ],
+      "later_balanced_auc": 0.5725,
+      "later_tails_high_low": [
+        14,
+        5
+      ]
+    },
+    "ordinal": {
+      "validation_high_low_auc": [
+        0.5273,
+        0.5933
+      ],
+      "validation_balanced_auc": 0.5603,
+      "validation_tails_high_low": [
+        8,
+        5
+      ],
+      "later_high_low_auc": [
+        0.599,
+        0.5412
+      ],
+      "later_balanced_auc": 0.5701,
+      "later_tails_high_low": [
+        15,
+        5
+      ]
+    },
+    "interpretation": "Small validation gain, slightly weaker later AUC; author/day intervals include zero. Recency and cluster+recency were not validation winners."
+  },
+  "current_ranker_factorial": {
+    "design": "Fixed 2^3 factorial: stronger author weighting, ESS5 kernel shrinkage, and similarity-weighted top-five negative aggregation.",
+    "validation_selected": "ESS5 kernel shrinkage",
+    "current_validation": {
+      "high_low_auc": [
+        0.524029,
+        0.591745
+      ],
+      "balanced_auc": 0.557887,
+      "tails_high_low": [
+        8,
+        4
+      ]
+    },
+    "ess5_validation": {
+      "high_low_auc": [
+        0.524359,
+        0.593899
+      ],
+      "balanced_auc": 0.559129,
+      "tails_high_low": [
+        7,
+        5
+      ]
+    },
+    "current_later": {
+      "high_low_auc": [
+        0.602064,
+        0.542893
+      ],
+      "balanced_auc": 0.572478,
+      "tails_high_low": [
+        14,
+        5
+      ]
+    },
+    "ess5_later": {
+      "high_low_auc": [
+        0.59878,
+        0.550006
+      ],
+      "balanced_auc": 0.574393,
+      "tails_high_low": [
+        14,
+        5
+      ]
+    },
+    "author_ess5_negative_later": {
+      "high_low_auc": [
+        0.600808,
+        0.548504
+      ],
+      "balanced_auc": 0.574656,
+      "tails_high_low": [
+        15,
+        4
+      ]
+    },
+    "uncertainty": "Paired whole-calendar-day intervals include zero; later period is reused exploratory evidence.",
+    "selected_later_auc_delta_95pct": {
+      "high": [
+        -0.007897247713114435,
+        0.001744973535620532
+      ],
+      "low": [
+        -0.002087242033968967,
+        0.01976884102921401
+      ]
+    }
+  },
+  "metadata_views": {
+    "templates": {
+      "labeled_metadata": "Title: \u2026 Author: \u2026 Description: \u2026 Subjects: \u2026 on history and query; retrospective vector-only counterfactual.",
+      "production_read_rich_history_candidate_query": "Production read document on history; production candidate document on query. Read text includes title, author, cleaned description up to 4000 chars and up to 8 normalized subjects.",
+      "production_read_rich_symmetric": "Production read document on both history and query; rating key only selects the read branch and is not embedded.",
+      "canonical_candidate_shared": "Production candidate document on both history and query."
+    },
+    "missing_metadata": "Falls back to fresh title-author vectors.",
+    "availability": "Enrichment was collected in September 2026; historical availability at read time is unknown.",
+    "standalone_primary_validation_selection": "Fresh title-author selected by the two-direction gate. Production read-symmetric standalone balanced AUC was 0.585666 (high 0.560284, low 0.611047) vs 0.583675 fresh (high 0.539137, low 0.628213); the 0.017166 low-AUC decline exceeds the 0.01 allowance.",
+    "later_all_targets": "Production read-symmetric standalone high/low AUC 0.6307/0.5214 vs 0.5980/0.5422 fresh; low-rating discrimination weakens."
+  },
+  "fixed_score_fusion": {
+    "formula": "round(0.75 * fresh_title_author_served_score + 0.25 * rich_view_served_score, 1)",
+    "registered_views": [
+      "labeled_metadata",
+      "production_read_rich_history_candidate_query",
+      "production_read_rich_symmetric",
+      "canonical_candidate_shared"
+    ],
+    "arms": "Each view fused with its matching current and ESS5 score; no weight search.",
+    "registration_timing": "Fixed composability test registered after constituent validation and later outcomes were viewed; all fusion outcomes are descriptive.",
+    "production_read_symmetric_candidate": {
+      "primary_validation_n": 191,
+      "validation_fresh_high_low_balanced": [
+        0.5391,
+        0.6282,
+        0.5837
+      ],
+      "validation_fused_high_low_balanced": [
+        0.5426,
+        0.629,
+        0.5858
+      ],
+      "validation_balanced_delta": 0.0021,
+      "validation_tail_precision_high_low_fresh_to_fused": [
+        [
+          0.3,
+          0.25
+        ],
+        [
+          0.3,
+          0.25
+        ]
+      ],
+      "later_all_n": 356,
+      "later_fresh_high_low_balanced": [
+        0.598,
+        0.5422,
+        0.5701
+      ],
+      "later_fused_high_low_balanced": [
+        0.6105,
+        0.5387,
+        0.5746
+      ],
+      "later_balanced_delta": 0.0045,
+      "later_tail_precision_high_low_fresh_to_fused": [
+        [
+          0.65,
+          0.25
+        ],
+        [
+          0.7,
+          0.25
+        ]
+      ],
+      "later_primary_n": 187,
+      "later_primary_fresh_high_low_balanced": [
+        0.6378,
+        0.5731,
+        0.6055
+      ],
+      "later_primary_fused_high_low_balanced": [
+        0.6639,
+        0.5814,
+        0.6227
+      ],
+      "later_primary_balanced_delta": 0.0172,
+      "later_primary_tail_precision_high_low_fresh_to_fused": [
+        [
+          0.5,
+          0.2
+        ],
+        [
+          0.5,
+          0.15
+        ]
+      ],
+      "temporal_halves_balanced_fresh_to_fused": {
+        "first_174": [
+          0.56,
+          0.5757
+        ],
+        "second_182": [
+          0.5664,
+          0.5615
+        ]
+      },
+      "status": "Promising candidate for a fresh prospective test; not the validation-selected fusion arm. Low-tail and temporal tradeoffs remain."
+    }
+  },
+  "other_bounded_families": {
+    "source_confidence": "Rated-read rows lack source/confidence fields. ESS5 composition: 127 save/reject actions (57 saves, 70 rejects, propensity 1), latest-feedback AUC 0.4060 to 0.4041; 47 same-run impressions AUC 0.7765 to 0.7879 with only 3 saves. Selected/incomplete exposure; no causal source-confidence claim.",
+    "seed_order": "Recent-first seeds improved all-book similarity, not unseen-author similarity; see five-hypothesis review.",
+    "provider_probe": "Bounded probe returned zero recommendation edges.",
+    "slate": "Existing bounded local swaps cover the first eight results; no live utility or full historical slate reconstruction."
+  },
+  "parity_and_limits": {
+    "current_ranker_parity": {
+      "eligible_targets": 1677,
+      "served_precision_mismatches": 0
+    },
+    "production_template_parity": {
+      "eligible_targets_per_view": 1677,
+      "direct_ranker_mismatches": 0
+    },
+    "embedding_repeatability": "Cached/fresh execution cosine 0.9967-0.9981; score differences up to 4 points. Each view uses its matching fresh title-author control.",
+    "causal_scope": "Retrospective ratings cannot establish live utility, historical candidate availability, or reader preference. Later outcomes are reused exploratory evidence.",
+    "serving_promotion": false
+  },
+  "reproduction": {
+    "command": "OPENBLAS_NUM_THREADS=1 uv run --project engine --extra dev python engine/scripts/evaluate_ranking_synergy.py --corpus /path/to/private-corpus.json --backend ollama --model qwen3-embedding:4b --output /path/to/private-aggregate.json",
+    "focused_tests_passed": 12,
+    "engine_suite_tests_passed": 259
+  },
+  "private_artifact_sha256": {
+    "corpus": "839ca5fcdafaf42e96f4551d66a72e426f31a7f22134bdf82f7e04e61cde6749",
+    "history_aggregate": "8f03b69fe2c661e6089ea6f1dc5d7c603b546705e7db37dff95f6bbf8e519bc4",
+    "history_metadata_joint_aggregate": "7bfa93dd1632d08dde46cba9321b289d61e84987afafe707d4388766cb5ad743",
+    "production_template_scores": "2de90acdae692f1d669097fa2dfa0cbeff9c12ea9e0529f3a4a18e5d4d46e82e",
+    "score_fusion_preregistration": "727d437cb829094216cc99511d3f27ef62a49bd19c59997982d379eccdbdfe7e",
+    "score_fusion_aggregate": "89f8571c265b9c875b49cd0625cfe9e9ddab93c089ff9d9894cbdcfe6dbb7591",
+    "score_fusion_scores": "e23aacd6211ce7d59ceb54379c7224f7299d8d5b653de7ad598ef879f6ed6d5d"
+  },
+  "private_content_included": false,
+  "metadata_history_joint_replay": {
+    "description": "Fixed 0.25-SD history additions to the validation-selected older labeled metadata score; descriptive joint replay.",
+    "later_n": 356,
+    "metadata_only_high_low_balanced": [
+      0.6158,
+      0.4976,
+      0.5567
+    ],
+    "metadata_plus_ordinal_high_low_balanced": [
+      0.6162,
+      0.5015,
+      0.5589
+    ],
+    "metadata_plus_cluster_high_low_balanced": [
+      0.618,
+      0.5026,
+      0.5603
+    ],
+    "balanced_delta_vs_metadata_only": {
+      "ordinal": 0.0022,
+      "cluster": 0.0036
+    },
+    "caveat": "Both favor high-rating AUC while low-rating AUC remains below matched fresh title-author controls; interaction residuals near zero and paired block intervals cross zero. Labeled template is not production-template evidence."
+  }
+}
