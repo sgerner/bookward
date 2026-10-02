@@ -34,6 +34,12 @@ The best bounded fusion, at 10%, is 0.0035 below the corrected-capture control i
 
 The result is not an endorsement of the query-control uplift over the historical proxy. On all 355 prepared validation targets, the existing proxy scores 0.5884 balanced AUC and the corrected-capture query control scores 0.5726. Among the 309 valid-ISBN targets in the later period, the control scores 0.5430 while 10% fusion scores 0.5448. Other arms also change direction across periods. These variations reinforce that richer catalog text does not automatically improve recommendations and do not justify selecting an arm from the previously inspected later period.
 
+## Serving metadata-confidence sensitivity
+
+A separately preregistered full-pipeline query sensitivity reused frozen vectors and applied the serving metadata-confidence formula with identity confidence fixed at 1.0. Both arms used the same title-and-author history, identities, authors, and source weights; descriptions and subjects matched each arm’s query representation. No embeddings or blend weights were changed.
+
+On the 324 primary validation targets, current-query high/low AUC was 0.5547/0.6608; captured-query AUC was 0.5496/0.6154. Mean metadata confidence increased from 0.4612 to 0.5839, but balanced AUC decreased by 0.0253 (paired whole-day bootstrap 95% interval −0.0680 to 0.0156). Captured queries also decreased balanced AUC by 0.0199 against the earlier neutral proxy (interval −0.0655 to 0.0225). All 355 validation targets likewise showed worse low-rating discrimination. Later, previously inspected targets were mixed across high and low ratings. This exploratory historical proxy sensitivity did not select an enrichment arm.
+
 ## Persistence rehearsal
 
 An offline replay against a private copy of the production database exercised the actual resolver, strict identity verifier, and metadata persistence. It exposed 337 valid ISBN matches rejected by literal title comparison: every difference was a parenthetical numbered-series annotation. The pipeline now shares the existing conservative full-title identity key, removing only known format annotations while keeping substantive subtitles distinct. No ISBN or author requirement was relaxed.
