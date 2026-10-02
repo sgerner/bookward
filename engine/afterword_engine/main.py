@@ -1247,8 +1247,15 @@ def tracked_recommendations(
                 connection, status=status, limit=None, offset=0
             )
             interaction_events = load_interaction_events(connection)
+            # The event primary key orders actions; cached vectors are keyed by
+            # candidate id. Normalize only the cache inputs so learner event
+            # ordering and latest-event semantics keep their original ids.
+            cache_events = [
+                {**event, "id": event["candidate_id"]}
+                for event in interaction_events
+            ]
             cached_vectors = load_cached_candidate_vectors(
-                [*ranked, *interaction_events], connection
+                [*ranked, *cache_events], connection
             )
             interaction_vectors = {
                 int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
