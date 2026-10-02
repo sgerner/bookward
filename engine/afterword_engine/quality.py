@@ -868,7 +868,7 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "OR q.audit_version='legacy-pending-audit-v1' "
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND COALESCE(q.audit_version,'')!=? "
-        "AND (c.isbn13!='' OR c.isbn10!='')) "
+        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
         "OR (q.quality_status='quarantine' AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
         "AND datetime(q.audited_at)<=datetime(?)))"
@@ -890,7 +890,10 @@ def candidate_quality_audit_candidates(
     offset = 0
     while len(selected_ids) < batch_limit:
         page = rows(
-            "SELECT c.id,c.isbn13,c.isbn10,c.source_url,q.quality_status,q.audit_version,q.flags_json "
+            "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
+            "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
+            "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
+            "q.quality_status,q.audit_version,q.flags_json "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             f"WHERE c.status!='rejected' AND {predicate} ORDER BY c.id LIMIT ? OFFSET ?",
             (*params, page_size, offset),
@@ -914,7 +917,7 @@ def candidate_quality_audit_candidates(
                 selected_ids.append(int(candidate["id"]))
             elif any(
                 isbn_parts_from_source(
-                    [candidate.get("isbn13"), candidate.get("isbn10")],
+                    [candidate.get("eligibility_isbn13"), candidate.get("eligibility_isbn10")],
                     candidate.get("source_url", ""),
                 )
             ):

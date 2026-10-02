@@ -215,6 +215,8 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
     assert QUALITY_VERSION == "candidate-quality-v4"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
+    quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
+    quality_isbn_quarantine = add_candidate("Old Quarantine Quality ISBN", "A Writer")
     invalid_isbn = add_candidate("Invalid ISBN", "A Writer", isbn13="9780307474279")
     curated = add_candidate("Curated Seed", "A Writer", isbn13="9780307474278")
     expired_outage = add_candidate("Expired Outage", "A Writer")
@@ -227,6 +229,8 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         for candidate_id, status, version in (
             (old_accepted, "accepted", "candidate-quality-v3"),
             (old_quarantine, "quarantine", "candidate-quality-v2"),
+            (quality_isbn_accepted, "accepted", "candidate-quality-v3"),
+            (quality_isbn_quarantine, "quarantine", "candidate-quality-v2"),
             (invalid_isbn, "accepted", "candidate-quality-v3"),
             (curated, "accepted", "builtin-curated-v1"),
             (expired_outage, "quarantine", QUALITY_VERSION),
@@ -245,6 +249,14 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         con.execute(
             "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
             ('["catalog_provider_unavailable"]', "2026-10-01T12:00:00+00:00", fresh_outage),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET isbn13=? WHERE candidate_id=?",
+            ("9780307474278", quality_isbn_accepted),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET isbn10=? WHERE candidate_id=?",
+            ("0307474275", quality_isbn_quarantine),
         )
         source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
         for index in range(55):
@@ -266,7 +278,18 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
 
     selected = candidate_quality_audit_candidates(limit=50, now=reference_time)
     selected_ids = {int(item["id"]) for item in selected}
-    assert {old_accepted, old_quarantine, expired_outage, pending, legacy_pending} <= selected_ids
+    assert {
+        old_accepted,
+        old_quarantine,
+        quality_isbn_accepted,
+        quality_isbn_quarantine,
+        expired_outage,
+        pending,
+        legacy_pending,
+    } <= selected_ids
+    selected_by_id = {int(item["id"]): item for item in selected}
+    assert selected_by_id[quality_isbn_accepted]["isbn13"] == ""
+    assert selected_by_id[quality_isbn_quarantine]["isbn10"] == ""
     assert invalid_isbn not in selected_ids
     assert curated not in selected_ids
     assert fresh_outage not in selected_ids
