@@ -141,6 +141,151 @@ def test_read_metadata_job_drains_batches_and_negative_caches_mismatches(databas
     assert all(len(item["source_payload"].encode("utf-8")) <= 8192 for item in provenance)
 
 
+@pytest.mark.parametrize(
+    ("attempt_status", "trace_status", "stale_after"),
+    [
+        ("no_verified_record", "no_match", timedelta(days=31)),
+        ("provider_unavailable", "server_error", timedelta(hours=25)),
+    ],
+)
+def test_known_work_negative_metadata_respects_retry_cooldown(
+    database, attempt_status, trace_status, stale_after
+):
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source,openlibrary_work_id) VALUES(?,?,?,?,?,?)",
+            ("Known work", "A Writer", 4.0, "9780307474278", "goodreads_csv", "/works/OL900W"),
+        ).lastrowid
+    read = row("SELECT * FROM reads WHERE id=?", (read_id,))
+    attempt = {
+        "attempt_status": attempt_status,
+        "fetch_trace": [{
+            "provider": "openlibrary",
+            "provider_id": "/works/OL900W",
+            "query_kind": "verified_work_id",
+            "status": trace_status,
+        }],
+    }
+    checked_at = datetime.now(timezone.utc).isoformat()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_hash,metadata_provenance,metadata_checked_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                read_id,
+                "",
+                ingestion._read_metadata_identity_hash(read),
+                json.dumps(attempt),
+                checked_at,
+            ),
+        )
+
+    assert ingestion.read_metadata_refresh_remaining() == 0
+
+    stale_at = (datetime.now(timezone.utc) - stale_after).isoformat()
+    with transaction() as con:
+        con.execute(
+            "UPDATE read_metadata SET metadata_checked_at=? WHERE read_id=?",
+            (stale_at, read_id),
+        )
+    assert ingestion.read_metadata_refresh_remaining() == 1
+
+
+def test_known_work_identity_change_bypasses_negative_retry_cooldown(database):
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source,openlibrary_work_id) VALUES(?,?,?,?,?,?)",
+            ("Known work", "A Writer", 4.0, "9780307474278", "goodreads_csv", "/works/OL900W"),
+        ).lastrowid
+    read = row("SELECT * FROM reads WHERE id=?", (read_id,))
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_hash,metadata_provenance,metadata_checked_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                read_id,
+                "",
+                ingestion._read_metadata_identity_hash(read),
+                json.dumps({"attempt_status": "no_verified_record", "fetch_trace": []}),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    assert ingestion.read_metadata_refresh_remaining() == 0
+    with transaction() as con:
+        con.execute("UPDATE reads SET openlibrary_work_id=? WHERE id=?", ("/works/OL901W", read_id))
+    assert ingestion.read_metadata_refresh_remaining() == 1
+
+
+def test_read_metadata_normalizes_work_url_before_storing(database, monkeypatch):
+    raw_work_url = "https://openlibrary.org/works/OL900W"
+    normalized_work_id = "/works/OL900W"
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source,openlibrary_work_id) VALUES(?,?,?,?,?,?)",
+            ("URL form work", "A Writer", 4.0, "9780307474278", "goodreads_csv", raw_work_url),
+        ).lastrowid
+
+    async def resolve_work(work_id, *, title="", author="", **_kwargs):
+        assert work_id == normalized_work_id
+        return {
+            "description": "A verified synopsis.",
+            "description_kind": "synopsis",
+            "genres": ["Fantasy"],
+            "work_id": normalized_work_id,
+            "catalog_title": "URL form work",
+            "metadata_provenance": {
+                "fetched_at": "2026-10-02T12:00:00Z",
+                "fields": {
+                    "description": {
+                        "provider": "openlibrary",
+                        "provider_id": normalized_work_id,
+                        "kind": "synopsis",
+                        "source_field": "description",
+                    },
+                    "genres": {
+                        "provider": "openlibrary",
+                        "provider_id": normalized_work_id,
+                        "source_field": "subjects",
+                    },
+                },
+                "fetch_trace": [{
+                    "provider": "openlibrary",
+                    "provider_id": normalized_work_id,
+                    "query_kind": "verified_work_id",
+                    "status": "matched",
+                }],
+                "source_payloads": [{
+                    "provider": "openlibrary",
+                    "provider_id": normalized_work_id,
+                    "payload": {
+                        "key": normalized_work_id,
+                        "title": "URL form work",
+                        "description": "A verified synopsis.",
+                        "genres": ["Fantasy"],
+                    },
+                }],
+            },
+        }
+
+    monkeypatch.setattr(ingestion, "resolve_openlibrary_work_metadata", resolve_work)
+    result = asyncio.run(handle_job("read_metadata"))
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert result["remaining"] == 0
+    cached = row(
+        "SELECT verified_work_id,identity_provider,identity_provider_id,description,genres "
+        "FROM read_metadata WHERE read_id=?",
+        (read_id,),
+    )
+    assert cached["verified_work_id"] == normalized_work_id
+    assert cached["identity_provider"] == "openlibrary"
+    assert cached["identity_provider_id"] == normalized_work_id
+    assert cached["description"] == "A verified synopsis."
+    assert json.loads(cached["genres"]) == ["Fantasy"]
+
+
 def test_read_metadata_failure_preserves_verified_cache_and_records_attempt(database, monkeypatch):
     with transaction() as con:
         read_id = con.execute(
