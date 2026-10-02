@@ -23,6 +23,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
+from .identity import book_author_identity_key, book_catalog_title_identity_key
 from .isbn import canonical_isbn, isbn_parts
 from .subjects import normalize_subjects
 
@@ -322,7 +323,7 @@ def _identity_text(value: object) -> str:
 
 
 def _normalized_title(value: object) -> str:
-    return _identity_text(value)
+    return book_catalog_title_identity_key(value)
 
 
 def _title_matches(wanted: str, candidate: object) -> bool:
@@ -354,6 +355,8 @@ def _author_matches(wanted: str, candidates: object) -> bool:
             candidate_tokens = candidate_normalized.split()
             if not candidate_tokens:
                 continue
+            if book_author_identity_key(wanted_author) == book_author_identity_key(candidate):
+                return True
             if wanted_normalized == candidate_normalized:
                 return True
             if (
@@ -425,6 +428,22 @@ def _publication_date(value: object) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
+def _openlibrary_publication_date(record: object) -> tuple[str | None, str | None, str]:
+    """Return the parsed date and the exact Open Library field that supplied it."""
+
+    if not isinstance(record, dict):
+        return None, None, ""
+    source_field = (
+        "first_publish_date" if record.get("first_publish_date")
+        else "first_publish_year" if record.get("first_publish_year")
+        else ""
+    )
+    if not source_field:
+        return None, None, ""
+    release_date, date_kind = _publication_date(record.get(source_field))
+    return release_date, date_kind, source_field
+
+
 async def _lookup_open_library_record(
     title: str,
     author: str,
@@ -479,9 +498,7 @@ async def _lookup_open_library_record(
         authors = doc.get("author_name")
         if not _title_matches(wanted, doc.get("title")) or not _author_matches(author, authors):
             continue
-        release_date, date_kind = _publication_date(
-            doc.get("first_publish_date") or doc.get("first_publish_year")
-        )
+        release_date, date_kind, release_date_source_field = _openlibrary_publication_date(doc)
         synopsis = _clean_metadata_text(doc.get("description"))
         opening_sentence = _clean_metadata_text(doc.get("first_sentence"), 1500)
         description = synopsis or opening_sentence
@@ -496,6 +513,7 @@ async def _lookup_open_library_record(
             "description_source_field": "description" if synopsis else "first_sentence" if opening_sentence else "",
             "release_date": release_date or "",
             "date_kind": date_kind or "",
+            "release_date_source_field": release_date_source_field if release_date else "",
             "genres": genres,
             "provider": "openlibrary",
             "provider_id": provider_id,
@@ -513,6 +531,7 @@ async def _lookup_open_library_record(
                 "genres": genres,
                 "identifiers": identifiers,
                 "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+                "publication_date_source_field": release_date_source_field if release_date else "",
                 "cover_id": str(doc.get("cover_i") or "")[:40],
             }),
         })
@@ -628,6 +647,7 @@ async def _lookup_google_books_record(
             "description_source_field": "description" if description else "",
             "release_date": release_date or "",
             "date_kind": date_kind or "",
+            "release_date_source_field": "publishedDate" if release_date else "",
             "genres": genres,
             "provider": "google_books",
             "provider_id": provider_id,
@@ -644,6 +664,7 @@ async def _lookup_google_books_record(
                 "genres": genres,
                 "identifiers": _isbn_provenance_values(isbn, identifiers),
                 "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
+                "publication_date_source_field": "publishedDate" if release_date else "",
                 "cover_url": _google_cover_url(info.get("imageLinks")),
             }),
         })
@@ -791,6 +812,7 @@ async def resolve_book_metadata(
         "cover_url": supplied_url,
         "description": _clean_metadata_text(description),
         "release_date": str(release_date or ""),
+        "release_date_source_field": "",
         "date_kind": "",
         "genres": [],
         "provider": "",
@@ -938,6 +960,7 @@ async def resolve_book_metadata(
     if needs_release_date and date_record:
         result["release_date"] = date_record["release_date"]
         result["date_kind"] = date_record.get("date_kind", "")
+        result["release_date_source_field"] = date_record.get("release_date_source_field", "")
         result["release_date_provider"] = date_record.get("provider", "")
         result["release_date_provider_id"] = date_record.get("provider_id", "")
 
@@ -951,9 +974,13 @@ async def resolve_book_metadata(
         prior = len(catalog_genres)
         catalog_genres = _catalog_genres(catalog_genres + additions, limit=METADATA_GENRE_LIMIT)
         if len(catalog_genres) > prior:
+            provider = str(record.get("provider") or "")
             genre_sources.append({
-                "provider": str(record.get("provider") or ""),
+                "provider": provider,
                 "provider_id": str(record.get("provider_id") or ""),
+                "kind": "subjects",
+                "source_field": "subject" if provider == "openlibrary" else "categories",
+                "normalization_version": METADATA_NORMALIZATION_VERSION,
             })
             remaining_genres = max(0, METADATA_GENRE_LIMIT - len(source_genres) - len(catalog_genres))
     result["genres"] = catalog_genres
@@ -1004,7 +1031,7 @@ async def resolve_book_metadata(
     if result["release_date_provider"]:
         fields["release_date"] = _field_provenance(
             str(result["release_date_provider"]), str(result["release_date_provider_id"]), result["release_date"],
-            kind=str(result["date_kind"]), source_field="first_publish_date" if result["release_date_provider"] == "openlibrary" else "publishedDate",
+            kind=str(result["date_kind"]), source_field=str(result["release_date_source_field"] or ""),
         )
     result["metadata_provenance"] = {
         "fetched_at": _utc_now(),
@@ -1033,6 +1060,7 @@ async def resolve_openlibrary_work_metadata(
         "cover_url": "",
         "description": "",
         "release_date": "",
+        "release_date_source_field": "",
         "date_kind": "",
         "genres": [],
         "provider": "openlibrary",
@@ -1102,9 +1130,7 @@ async def resolve_openlibrary_work_metadata(
             opening_sentence = _clean_metadata_text(payload.get("first_sentence"), 1500)
             description = synopsis or opening_sentence
             description_kind = "synopsis" if synopsis else "opening_sentence" if opening_sentence else ""
-            release_date, date_kind = _publication_date(
-                payload.get("first_publish_date") or payload.get("first_publish_year")
-            )
+            release_date, date_kind, release_date_source_field = _openlibrary_publication_date(payload)
             raw_covers = payload.get("covers") or []
             cover_url = ""
             if isinstance(raw_covers, list):
@@ -1118,6 +1144,7 @@ async def resolve_openlibrary_work_metadata(
                 "description_provider_id": work_id if description else "",
                 "description_kind": description_kind,
                 "release_date": release_date or "",
+                "release_date_source_field": release_date_source_field if release_date else "",
                 "date_kind": date_kind or "",
                 "genres": genres,
                 "genres_provider": "openlibrary" if genres else "",
@@ -1141,7 +1168,7 @@ async def resolve_openlibrary_work_metadata(
                 fields["cover_url"] = _field_provenance("openlibrary", work_id, cover_url, kind="cover", source_field="covers")
             if release_date:
                 fields["release_date"] = _field_provenance(
-                    "openlibrary", work_id, release_date, kind=date_kind or "", source_field="first_publish_date",
+                    "openlibrary", work_id, release_date, kind=date_kind or "", source_field=release_date_source_field,
                 )
             trace["status"] = "matched"
             trace["available_fields"] = [field for field in ("description", "genres", "cover_url", "release_date") if result.get(field)]
@@ -1155,6 +1182,7 @@ async def resolve_openlibrary_work_metadata(
                     "opening_sentence": opening_sentence,
                     "genres": genres,
                     "publication_date": _clean_metadata_text(payload.get("first_publish_date") or payload.get("first_publish_year"), 40),
+                    "publication_date_source_field": release_date_source_field if release_date else "",
                     "cover_ids": [str(value)[:40] for value in raw_covers[:8]] if isinstance(raw_covers, list) else [],
                 }),
             })

@@ -137,7 +137,7 @@ The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.m
 
 ### Catalog enrichment
 
-Metadata backfills run in bounded background batches, including on existing installations. Candidate changes queue rescoring; empty or unverified read lookups are cached for 30 days; temporary provider failures become eligible for retry after 24 hours. Each stored field records its provider and a bounded source projection. Open Library requests share a one-request-per-second budget, and an unsuccessful lookup preserves an existing real cover.
+Metadata backfills run in bounded background batches, including on existing installations. Candidate changes queue rescoring; empty or unverified read lookups are cached for 30 days; temporary provider failures become eligible for retry after 24 hours. Each stored field records its provider and a bounded source projection. Full-title matching ignores known format and numbered-series annotations while preserving substantive subtitles, and publication dates retain their year, month, or day precision. Open Library requests share a one-request-per-second budget, and an unsuccessful lookup preserves an existing real cover.
 
 Open Library and Google Books can supply different parts of a record. The Google Books discovery API key is also used for metadata lookups when configured. A provider outage or rate limit is recorded separately from a catalog identity mismatch. Verified read metadata is cached separately for inspection and future evaluations; it is not added to the historical scoring embeddings. Enrichment preserves imported titles, authors, ISBNs, ratings, and read dates; changing a read's identity invalidates its cached metadata.
 

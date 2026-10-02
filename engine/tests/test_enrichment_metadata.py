@@ -29,6 +29,46 @@ def _provider_client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+@pytest.mark.parametrize(
+    ("requested_title", "catalog_title", "expected_match"),
+    [
+        ("Dune (Unabridged)", "Dune", True),
+        ("Dune", "Dune: Messiah", False),
+    ],
+)
+def test_metadata_title_matching_strips_known_suffixes_but_keeps_subtitles(
+    requested_title, catalog_title, expected_match
+):
+    def handler(request):
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": "/works/OLTITLE",
+                    "title": catalog_title,
+                    "author_name": ["Kurt Vonnegut"],
+                    "description": "A matched catalog synopsis.",
+                }]},
+            )
+        return httpx.Response(200, json={"items": []})
+
+    async def run():
+        async with _provider_client(handler) as client:
+            return await resolve_book_metadata(
+                requested_title,
+                "Kurt Vonnegut Jr.",
+                client=client,
+            )
+
+    metadata = asyncio.run(run())
+
+    assert bool(metadata["description"]) is expected_match
+    if expected_match:
+        assert metadata["description_provider"] == "openlibrary"
+    else:
+        assert metadata["description_provider"] == ""
+
+
 def _isbn13_with_prefix(number):
     body = f"978{number:09d}"
     checksum = (10 - sum(int(digit) * (1 if index % 2 == 0 else 3) for index, digit in enumerate(body)) % 10) % 10
@@ -177,14 +217,27 @@ def test_metadata_resolver_uses_verified_per_field_fallback_and_merges_catalog_s
     assert metadata["genres"] == ["Historical fiction", "Women's fiction", "Mystery", "Literature"]
     assert metadata["release_date"] == "2004-05-01"
     assert metadata["release_date_provider"] == "google_books"
+    assert metadata["metadata_provenance"]["fields"]["release_date"]["source_field"] == "publishedDate"
     assert metadata["cover_provider"] == "google_books"
     assert [trace["provider"] for trace in metadata["metadata_provenance"]["fetch_trace"]] == [
         "openlibrary",
         "google_books",
     ]
     assert metadata["metadata_provenance"]["fields"]["genres"]["sources"] == [
-        {"provider": "openlibrary", "provider_id": "/works/OL202W"},
-        {"provider": "google_books", "provider_id": "google-volume-202"},
+        {
+            "provider": "openlibrary",
+            "provider_id": "/works/OL202W",
+            "kind": "subjects",
+            "source_field": "subject",
+            "normalization_version": covers.METADATA_NORMALIZATION_VERSION,
+        },
+        {
+            "provider": "google_books",
+            "provider_id": "google-volume-202",
+            "kind": "subjects",
+            "source_field": "categories",
+            "normalization_version": covers.METADATA_NORMALIZATION_VERSION,
+        },
     ]
 
 
@@ -477,6 +530,9 @@ def test_quality_resolver_uses_configured_google_books_key_without_recording_it(
     provenance = json.dumps(match["metadata_provenance"], sort_keys=True)
     assert api_key not in provenance
     assert "key=" not in provenance
+    genres = match["metadata_provenance"]["fields"]["genres"]
+    assert genres["source_field"] == "categories"
+    assert genres["sources"][0]["source_field"] == "categories"
 
 
 def test_isbn_fetch_trace_distinguishes_exact_identifiers_from_omitted_identifiers():
@@ -586,6 +642,132 @@ def test_isbn_match_after_projection_limit_is_verified_and_retained():
     covers_ids = cover_metadata["metadata_provenance"]["source_payloads"][0]["payload"]["identifiers"]
     assert len(covers_ids) <= 8
     assert covers_ids[0] == requested_isbn
+    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == "first_publish_year"
+    assert cover_metadata["metadata_provenance"]["fields"]["release_date"]["source_field"] == "first_publish_year"
+
+
+@pytest.mark.parametrize(
+    ("source_field", "source_value", "expected_release_date"),
+    [
+        ("first_publish_date", "2002-03-04", "2002-03-04"),
+        ("first_publish_year", 2002, "2002-01-01"),
+    ],
+)
+def test_openlibrary_release_date_provenance_tracks_actual_source_field(
+    source_field, source_value, expected_release_date
+):
+    work_id = "/works/OL224W"
+    requested_isbn = "9780307474278"
+
+    def catalog_record(key):
+        record = {
+            "key": key,
+            "title": "Year Only Work",
+            "author_name": ["A Writer"],
+            "isbn": [requested_isbn],
+            "subjects": ["Literary fiction"],
+        }
+        record[source_field] = source_value
+        return record
+
+    def handler(request):
+        if request.url.host == "openlibrary.org":
+            if request.url.path == "/search.json":
+                return httpx.Response(200, json={"docs": [catalog_record(work_id)]})
+            assert request.url.path == f"{work_id}.json"
+            return httpx.Response(200, json={**catalog_record(work_id), "key": work_id})
+        if request.url.host == "www.googleapis.com":
+            return httpx.Response(200, json={"items": []})
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    async def run():
+        async with _provider_client(handler) as client:
+            metadata = await resolve_book_metadata(
+                "Year Only Work",
+                "A Writer",
+                isbn13=requested_isbn,
+                client=client,
+            )
+            quality_match = await resolve_catalog_match(
+                "Year Only Work",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+            )
+            work_metadata = await resolve_openlibrary_work_metadata(
+                work_id,
+                title="Year Only Work",
+                client=client,
+            )
+            return metadata, quality_match, work_metadata
+
+    results = asyncio.run(run())
+
+    for metadata in results:
+        date_kind = metadata.get("release_date_kind") or metadata.get("date_kind")
+        assert date_kind == ("year" if source_field == "first_publish_year" else "day")
+        assert metadata["release_date"] == expected_release_date
+        assert metadata["release_date_source_field"] == source_field
+        assert metadata["metadata_provenance"]["fields"]["release_date"]["source_field"] == source_field
+        payload = metadata["metadata_provenance"]["source_payloads"][0]["payload"]
+        assert payload["publication_date_source_field"] == source_field
+
+
+def test_quality_release_date_ranking_preserves_openlibrary_year_precision():
+    requested_isbn = "9780307474278"
+
+    def handler(request):
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": "/works/OLYEARPRECISION",
+                    "title": "Precision Book",
+                    "author_name": ["A Writer"],
+                    "isbn": [requested_isbn],
+                    "first_publish_year": 2010,
+                    "description": "Open Library synopsis.",
+                    "subject": ["Fiction"],
+                    "cover_i": 123,
+                }]},
+            )
+        if request.url.host == "www.googleapis.com":
+            return httpx.Response(
+                200,
+                json={"items": [{
+                    "id": "google-day-precision",
+                    "volumeInfo": {
+                        "title": "Precision Book",
+                        "authors": ["A Writer"],
+                        "industryIdentifiers": [{"type": "ISBN_13", "identifier": requested_isbn}],
+                        "publishedDate": "2005-06-07",
+                        "description": "Google Books synopsis.",
+                        "categories": ["Fiction"],
+                        "imageLinks": {"thumbnail": "https://books.google.com/books/content?id=precision"},
+                    },
+                }]},
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    async def run():
+        async with _provider_client(handler) as client:
+            return await resolve_catalog_match(
+                "Precision Book",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+                existing_fields_complete=True,
+            )
+
+    match = asyncio.run(run())
+
+    assert match is not None
+    assert match["release_date"] == "2005-06-07"
+    assert match["release_date_kind"] == "day"
+    assert match["release_date_provider"] == "google_books"
+    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == "publishedDate"
 
 
 def test_isbn_search_rejects_returned_identifiers_that_contradict_query():

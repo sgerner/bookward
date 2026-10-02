@@ -97,8 +97,10 @@ def test_audit_accepts_catalog_match_and_persists_identifier(database):
     assert quality["isbn13"] == "9780307474278"
     assert quality["work_id"] == "/works/OL1W"
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "new"
-    candidate = row("SELECT description,genres FROM candidates WHERE id=?", (candidate_id,))
+    candidate = row("SELECT description,release_date,date_kind,genres FROM candidates WHERE id=?", (candidate_id,))
     assert candidate["description"] == "A checked catalog summary."
+    assert candidate["release_date"] == "2010-01-01"
+    assert candidate["date_kind"] == "year"
     assert json.loads(candidate["genres"]) == ["Source genre", "Literary fiction", "Family life"]
     provenance = rows(
         "SELECT field,provider,provider_id,source_payload FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",

@@ -361,6 +361,32 @@ def test_verified_read_genres_drop_unverified_merged_provider(database):
     assert len(field["sources"]) == 1
 
 
+def test_read_verifier_accepts_only_known_title_suffixes_and_keeps_isbn_author_strict(database):
+    isbn = "9780307474278"
+
+    def verify(read_title, record_title, *, author="Frank Herbert", record_author=None, mismatch=False):
+        read = {
+            "title": read_title,
+            "author": author,
+            "isbn": isbn,
+            "openlibrary_work_id": "",
+        }
+        result = _catalog_result(
+            record_title,
+            record_author or author,
+            isbn,
+            mismatch=mismatch,
+        )
+        _filtered, evidence, _work_id = ingestion._verified_read_metadata(result, read)
+        return bool(evidence)
+
+    assert verify("Dune", "Dune (Unabridged)")
+    assert verify("Ninth House", "Ninth House (Alex Stern, Book 1)", author="Leigh Bardugo")
+    assert not verify("Dune", "Dune: Messiah")
+    assert not verify("Dune", "Dune (Unabridged)", record_author="Robert Jordan")
+    assert not verify("Dune", "Dune (Unabridged)", mismatch=True)
+
+
 def test_read_identity_edit_invalidates_cache_without_changing_rating(database):
     with transaction() as con:
         read_id = con.execute(
@@ -458,6 +484,79 @@ def test_candidate_metadata_upgrade_is_versioned_and_field_auditable(database, m
     assert quality["metadata_checked_at"]
     assert provenance["provider"] == "openlibrary"
     assert provenance["provider_id"] == "/works/OL987W"
+
+
+def test_legacy_catalog_dates_are_normalized_only_when_valid(database):
+    values = [
+        ("Legacy year", "1998", "catalog"),
+        ("Legacy month", "2001-04", "catalog"),
+        ("Legacy day", "2004-06-07", "catalog"),
+        ("Invalid year zero", "0000", "catalog"),
+        ("Invalid day", "2024-02-30", "catalog"),
+        ("Source year", "1998", "source"),
+        ("Manual year", "1998", "manual"),
+    ]
+    ids = {}
+    with transaction() as con:
+        con.execute("UPDATE candidates SET date_kind='source'")
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        for title, release_date, date_kind in values:
+            ids[title] = con.execute(
+                "INSERT INTO candidates(title,author,release_date,date_kind,source_url,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (title, "A Writer", release_date, date_kind, "https://example.com/book", source_id, title.casefold()),
+            ).lastrowid
+
+    assert ingestion.normalize_stored_candidate_catalog_dates() == 3
+    normalized = rows(
+        "SELECT title,release_date,date_kind FROM candidates WHERE id IN (%s) ORDER BY title"
+        % ",".join("?" for _ in ids),
+        tuple(ids.values()),
+    )
+    found = {item["title"]: (item["release_date"], item["date_kind"]) for item in normalized}
+    assert found == {
+        "Invalid day": ("2024-02-30", "catalog"),
+        "Invalid year zero": ("0000", "catalog"),
+        "Legacy day": ("2004-06-07", "day"),
+        "Legacy month": ("2001-04-01", "month"),
+        "Legacy year": ("1998-01-01", "year"),
+        "Manual year": ("1998", "manual"),
+        "Source year": ("1998", "source"),
+    }
+    assert row(
+        "SELECT id FROM metadata_field_provenance WHERE entity_type='candidate' "
+        "AND entity_id IN (%s) AND field='release_date' LIMIT 1"
+        % ",".join("?" for _ in ids),
+        tuple(ids.values()),
+    ) is None
+
+
+def test_catalog_date_repair_counts_as_metadata_update_and_queues_rescore(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,cover_url,release_date,date_kind,genres,source_url,source_id,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "Year only catalog book", "A Writer", "Existing synopsis.",
+                "https://images.example.com/cover.jpg", "1998", "catalog", json.dumps(["Fantasy"]),
+                "https://example.com/book", source_id, "year only catalog book",
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_version=?,metadata_checked_at=CURRENT_TIMESTAMP "
+            "WHERE candidate_id=?",
+            (METADATA_NORMALIZATION_VERSION, candidate_id),
+        )
+
+    result = asyncio.run(handle_job("metadata"))
+    candidate = row("SELECT release_date,date_kind FROM candidates WHERE id=?", (candidate_id,))
+    assert candidate == {"release_date": "1998-01-01", "date_kind": "year"}
+    assert result["metadata"] == 1
+    assert result["remaining"] == 0
+    assert result["score_job_id"]
+    assert row("SELECT status FROM jobs WHERE id=?", (result["score_job_id"],))["status"] == "queued"
 
 
 def test_candidate_quality_recovery_batches_and_schedules_one_followup(database, monkeypatch):

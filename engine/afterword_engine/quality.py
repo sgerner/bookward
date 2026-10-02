@@ -33,7 +33,9 @@ from .covers import (
     _field_provenance,
     _isbn_identifier_evidence,
     _isbn_provenance_values,
+    _openlibrary_publication_date,
     _openlibrary_request,
+    _publication_date,
     _query_isbn_matches,
     _utc_now,
     is_weak_cover_url,
@@ -161,6 +163,8 @@ def _provider_match(
     description_source_field: str = "",
     opening_sentence: str = "",
     release_date: str = "",
+    release_date_kind: str = "",
+    release_date_source_field: str = "",
     cover_url: str = "",
     genres: list[str] | None = None,
     source_payload: object = None,
@@ -181,6 +185,14 @@ def _provider_match(
             else 0.5 * length_quality,
             4,
         )
+    if release_date:
+        normalized_release_date, inferred_date_kind = _publication_date(release_date)
+        if normalized_release_date:
+            release_date = normalized_release_date
+            release_date_kind = release_date_kind or inferred_date_kind or ""
+        else:
+            release_date = ""
+            release_date_kind = ""
     fields: dict[str, Any] = {}
     if cleaned_description:
         fields["description"] = _field_provenance(
@@ -206,8 +218,8 @@ def _provider_match(
         )
     if release_date:
         fields["release_date"] = _field_provenance(
-            provider, provider_id, release_date, kind="date",
-            source_field="first_publish_date" if provider == "openlibrary" else "publishedDate",
+            provider, provider_id, release_date, kind=release_date_kind or "date",
+            source_field=release_date_source_field,
         )
     return {
         "provider": provider,
@@ -229,6 +241,8 @@ def _provider_match(
         "description_provider_id": provider_id if cleaned_description else "",
         "description_content_quality_heuristic": description_content_quality_heuristic,
         "release_date": _text(release_date, 32),
+        "release_date_kind": release_date_kind if release_date else "",
+        "release_date_source_field": release_date_source_field if release_date else "",
         "cover_url": cover_url,
         "genres": normalized_genres,
         "genres_provider": provider if normalized_genres else "",
@@ -309,6 +323,8 @@ async def _open_library_match(
         opening_sentence = _clean_metadata_text(doc.get("first_sentence"), 1500)
         description = synopsis or opening_sentence
         description_kind = "synopsis" if synopsis else "opening_sentence" if opening_sentence else ""
+        _parsed_release_date, release_date_kind, release_date_source_field = _openlibrary_publication_date(doc)
+        release_date = _text(doc.get(release_date_source_field), 32) if release_date_kind else ""
         provider_id = str(doc.get("key") or "")
         genres = _catalog_genres(doc.get("subject"), limit=METADATA_GENRE_LIMIT)
         source_payload = {
@@ -320,6 +336,7 @@ async def _open_library_match(
             "genres": genres,
             "identifiers": projected_identifiers,
             "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+            "publication_date_source_field": release_date_source_field if release_date else "",
             "cover_id": str(doc.get("cover_i") or "")[:40],
         }
         match = _provider_match(
@@ -336,7 +353,9 @@ async def _open_library_match(
             description_kind=description_kind,
             description_source_field="description" if synopsis else "first_sentence" if opening_sentence else "",
             opening_sentence=opening_sentence,
-            release_date=str(doc.get("first_publish_date") or doc.get("first_publish_year") or ""),
+            release_date=release_date or "",
+            release_date_kind=release_date_kind or "",
+            release_date_source_field=release_date_source_field if release_date else "",
             cover_url=safe_cover_url(cover),
             genres=genres,
             source_payload=source_payload,
@@ -447,6 +466,9 @@ async def _google_books_match(
         description = _clean_metadata_text(info.get("description"), 4000)
         provider_id = str(item.get("id") or "")
         genres = _catalog_genres(info.get("categories"), limit=METADATA_GENRE_LIMIT)
+        raw_release_date = _text(info.get("publishedDate"), 32)
+        _parsed_release_date, release_date_kind = _publication_date(raw_release_date)
+        release_date = raw_release_date if release_date_kind else ""
         source_payload = {
             "id": provider_id,
             "title": _clean_metadata_text(info.get("title"), 500),
@@ -455,6 +477,7 @@ async def _google_books_match(
             "genres": genres,
                 "identifiers": projected_identifiers,
             "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
+            "publication_date_source_field": "publishedDate" if release_date else "",
             "cover_url": image,
         }
         match = _provider_match(
@@ -470,7 +493,9 @@ async def _google_books_match(
             description=description,
             description_kind="synopsis" if description else "",
             description_source_field="description" if description else "",
-            release_date=str(info.get("publishedDate") or ""),
+            release_date=release_date,
+            release_date_kind=release_date_kind or "",
+            release_date_source_field="publishedDate" if release_date else "",
             cover_url=image,
             genres=genres,
             source_payload=source_payload,
@@ -669,15 +694,21 @@ async def resolve_catalog_match(
             before = len(genres)
             genres = _catalog_genres(genres + list(record.get("genres") or []), limit=METADATA_GENRE_LIMIT)
             if len(genres) > before:
+                provider = str(record.get("provider") or "")
                 genre_sources.append({
-                    "provider": str(record.get("provider") or ""),
+                    "provider": provider,
                     "provider_id": str(record.get("provider_id") or ""),
+                    "kind": "subjects",
+                    "source_field": "subject" if provider == "openlibrary" else "categories",
+                    "normalization_version": METADATA_NORMALIZATION_VERSION,
                 })
         cover_record = next((record for record in metadata_records if record.get("cover_url")), None)
         date_rank = {"day": 3, "month": 2, "year": 1}
         date_record = max(
             (record for record in metadata_records if record.get("release_date")),
-            key=lambda record: date_rank.get(_publication_date_kind(record.get("release_date")), 0),
+            key=lambda record: date_rank.get(
+                record.get("release_date_kind") or _publication_date_kind(record.get("release_date")), 0
+            ),
             default=None,
         )
 
@@ -707,6 +738,8 @@ async def resolve_catalog_match(
             "cover_provider": cover_record.get("provider", "") if cover_record else "",
             "cover_provider_id": cover_record.get("provider_id", "") if cover_record else "",
             "release_date": date_record.get("release_date", "") if date_record else "",
+            "release_date_kind": date_record.get("release_date_kind", "") if date_record else "",
+            "release_date_source_field": date_record.get("release_date_source_field", "") if date_record else "",
             "release_date_provider": date_record.get("provider", "") if date_record else "",
             "release_date_provider_id": date_record.get("provider_id", "") if date_record else "",
             "metadata_provider": (
@@ -742,6 +775,7 @@ async def resolve_catalog_match(
                 "provider_id": genre_sources[0]["provider_id"],
                 "sources": genre_sources,
                 "kind": "subjects",
+                "source_field": genre_sources[0]["source_field"],
                 "value_sha256": _field_provenance("", "", genres)["value_sha256"],
                 "normalization_version": METADATA_NORMALIZATION_VERSION,
             }
@@ -754,8 +788,9 @@ async def resolve_catalog_match(
         if date_record:
             fields["release_date"] = _field_provenance(
                 str(date_record.get("provider") or ""), str(date_record.get("provider_id") or ""),
-                date_record.get("release_date", ""), kind="date",
-                source_field="first_publish_date" if date_record.get("provider") == "openlibrary" else "publishedDate",
+                date_record.get("release_date", ""),
+                kind=str(date_record.get("release_date_kind") or "date"),
+                source_field=str(date_record.get("release_date_source_field") or ""),
             )
         result["metadata_provenance"] = {
             "fetched_at": _utc_now(),
@@ -980,6 +1015,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     )
     release_date = _text(result.get("release_date"), 32)
     store_release_date = bool(release_date and not candidate.get("release_date"))
+    release_date_kind = str(result.get("release_date_kind") or "catalog") if store_release_date else ""
     existing_genres = candidate.get("genres", "[]")
     if isinstance(existing_genres, str):
         try:
@@ -1064,14 +1100,14 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 description=CASE WHEN ?=1 THEN ? ELSE description END,
                 cover_url=CASE WHEN ?=1 THEN ? ELSE cover_url END,
                 release_date=CASE WHEN ?=1 THEN ? ELSE release_date END,
-                date_kind=CASE WHEN ?=1 THEN 'catalog' ELSE date_kind END,
+                date_kind=CASE WHEN ?=1 THEN ? ELSE date_kind END,
                 genres=CASE WHEN ?=1 THEN ? ELSE genres END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (
                 int(store_description), description,
                 int(store_cover), cover_url,
                 int(store_release_date), release_date,
-                int(store_release_date),
+                int(store_release_date), release_date_kind,
                 int(store_genres), genres_json,
                 candidate_id,
             ),

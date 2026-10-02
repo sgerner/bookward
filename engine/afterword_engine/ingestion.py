@@ -16,6 +16,7 @@ from .config import settings
 from .covers import (
     METADATA_GENRE_LIMIT,
     METADATA_NORMALIZATION_VERSION,
+    _publication_date,
     is_weak_cover_url,
     metadata_client,
     resolve_book_metadata,
@@ -27,6 +28,7 @@ from .covers import (
 from .database import normalize_key, persist_metadata_field_provenance, private_setting, row, rows, transaction
 from .identity import (
     book_author_identity_key,
+    book_catalog_title_identity_key,
     book_identity_match_keys,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
@@ -1006,8 +1008,8 @@ def _verified_read_metadata(metadata, read):
         returned_id = book_openlibrary_work_id(
             {"openlibrary_work_id": metadata.get("work_id") or metadata.get("provider_id", "")}
         )
-        candidate_title = normalize_key(metadata.get("catalog_title", ""), "")
-        read_title = normalize_key(read.get("title", ""), "")
+        candidate_title = book_catalog_title_identity_key(metadata.get("catalog_title", ""))
+        read_title = book_catalog_title_identity_key(read.get("title", ""))
         matching_trace = any(
             isinstance(trace, dict)
             and trace.get("provider") == "openlibrary"
@@ -1019,7 +1021,7 @@ def _verified_read_metadata(metadata, read):
             verified[("openlibrary", known_work_id)] = {"kind": "verified_work_id"}
     else:
         wanted13, wanted10 = isbn_parts(read.get("isbn"))
-        read_title = normalize_key(read.get("title", ""), "")
+        read_title = book_catalog_title_identity_key(read.get("title", ""))
         read_author = book_author_identity_key(read.get("author", ""))
         matched_isbn_traces = [
             trace for trace in traces
@@ -1048,7 +1050,7 @@ def _verified_read_metadata(metadata, read):
             identifier_matches = _returned_identifiers_match_read(
                 source_payload.get("identifiers", []), wanted13, wanted10
             )
-            catalog_title = normalize_key(source_payload.get("title", ""), "")
+            catalog_title = book_catalog_title_identity_key(source_payload.get("title", ""))
             catalog_authors = source_payload.get("authors", [])
             if not isinstance(catalog_authors, (list, tuple)):
                 catalog_authors = [catalog_authors]
@@ -2587,6 +2589,38 @@ def normalize_stored_candidate_subjects() -> int:
     return len(updates)
 
 
+def normalize_stored_candidate_catalog_dates() -> int:
+    """Canonicalize legacy catalog dates without inventing field provenance."""
+
+    candidates = rows(
+        "SELECT id,release_date,date_kind FROM candidates "
+        "WHERE date_kind='catalog' AND release_date IS NOT NULL AND TRIM(release_date)!=''"
+    )
+    updates = []
+    for candidate in candidates:
+        canonical_date, precision = _publication_date(candidate.get("release_date"))
+        if not canonical_date or not precision:
+            # Keep malformed legacy text visible for manual/source review.
+            continue
+        try:
+            parsed_date = date.fromisoformat(canonical_date)
+        except ValueError:
+            # In particular, reject year zero even though a year-only catalog
+            # value can otherwise be expanded into an ISO-looking string.
+            continue
+        if not 1 <= parsed_date.year <= 9999:
+            continue
+        if (canonical_date, precision) != (candidate.get("release_date"), candidate.get("date_kind")):
+            updates.append((canonical_date, precision, candidate["id"]))
+    if updates:
+        with transaction() as con:
+            con.executemany(
+                "UPDATE candidates SET release_date=?,date_kind=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                updates,
+            )
+    return len(updates)
+
+
 def _persist_metadata_field_provenance(
     con,
     entity_type,
@@ -2643,6 +2677,7 @@ async def refresh_missing_candidate_metadata():
     """Backfill sparse metadata for catalog-accepted candidates only."""
 
     normalize_stored_candidate_subjects()
+    normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
@@ -2667,7 +2702,7 @@ async def refresh_missing_candidate_metadata():
         ),
     )
     if not candidates:
-        return 0
+        return normalized_catalog_dates
     inputs = []
     for candidate in candidates:
         item = {**candidate, "genres": _stored_genre_values(candidate.get("genres"))}
@@ -2787,7 +2822,7 @@ async def refresh_missing_candidate_metadata():
                     item["id"],
                 )
             )
-    return changed
+    return changed + normalized_catalog_dates
 
 
 async def refresh_missing_candidate_covers():

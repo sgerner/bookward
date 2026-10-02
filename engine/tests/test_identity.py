@@ -6,6 +6,7 @@ from afterword_engine.config import settings
 from afterword_engine.database import initialize, transaction
 from afterword_engine.digest import _candidate_rows
 from afterword_engine.identity import (
+    book_catalog_title_identity_key,
     book_identity,
     book_identity_match_index,
     book_identity_matches,
@@ -43,6 +44,12 @@ def test_identity_is_conservative_and_handles_audio_metadata():
     assert book_identity("Collected Tales (Books 1-3)", "Author") != book_identity("Collected Tales", "Author")
     assert book_identity("Dune 2", "Author") != book_identity("Dune", "Author")
     assert book_identity("Same Title", "Author A") != book_identity("Same Title", "Author B")
+
+
+def test_catalog_title_identity_only_removes_known_format_and_series_suffixes():
+    assert book_catalog_title_identity_key("Dune (Unabridged)") == book_catalog_title_identity_key("Dune")
+    assert book_catalog_title_identity_key("Ninth House (Alex Stern, Book 1)") == book_catalog_title_identity_key("Ninth House")
+    assert book_catalog_title_identity_key("Dune: Messiah") != book_catalog_title_identity_key("Dune")
 
 
 def test_identity_matching_handles_catalog_author_suffixes_and_subtitles():

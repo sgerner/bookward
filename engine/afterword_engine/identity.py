@@ -42,12 +42,31 @@ def _title_without_format_suffix(title: object) -> str:
     return value
 
 
-def _canonical_part(value: object) -> str:
+def canonical_part(value: object) -> str:
+    """Canonicalize text into stable lowercase alphanumeric word tokens."""
+
     value = unicodedata.normalize("NFKC", str(value or "")).casefold()
     # Treat punctuation as spacing. This makes initials such as "N. K." and
     # "N K" equivalent without merging adjacent substantive words.
     chars = [char if (char.isalnum() or char.isspace()) else " " for char in value]
     return " ".join("".join(chars).split())
+
+
+def _canonical_part(value: object) -> str:
+    """Compatibility alias for internal identity callers."""
+
+    return canonical_part(value)
+
+
+def book_catalog_title_identity_key(value: object) -> str:
+    """Return a full catalog title key after removing only known format suffixes.
+
+    The suffix rules cover parenthetical series numbering and common audiobook
+    labels. The function deliberately keeps all substantive title and subtitle
+    words, so ``Dune`` and ``Dune: Messiah`` remain distinct.
+    """
+
+    return canonical_part(_title_without_format_suffix(value))
 
 
 def _canonical_author(value: object) -> str:
@@ -210,7 +229,7 @@ def book_identity_match_index(items) -> set[tuple[str, ...]]:
 def book_identity(title: object, author: object) -> str:
     """Return a conservative, deterministic title/author identity."""
 
-    return f"{_canonical_part(_title_without_format_suffix(title))}\x1f{_canonical_author(author)}"
+    return f"{book_catalog_title_identity_key(title)}\x1f{_canonical_author(author)}"
 
 
 def book_identity_matches(
