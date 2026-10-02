@@ -43,6 +43,39 @@ def public_dns(monkeypatch):
     )
 
 
+def test_librarything_run_excludes_all_known_reads(database, monkeypatch):
+    class FixtureClient:
+        async def recommendations(self, _isbns, **_kwargs):
+            return {"recommendations": [
+                {"work": str(i), "isbns": [isbn]} for i, isbn in enumerate(
+                    ("9782222222222", "9783333333333", "9784444444444"), start=1)
+            ]}
+
+    provider = LibraryThingProvider("fixture-key", client=FixtureClient())
+    metadata = {
+        "9782222222222": ("Disliked Book", "B Author", "/works/OL2W"),
+        "9783333333333": ("Unrated Book", "C Author", "/works/OL3W"),
+        "9784444444444": ("Unread Book", "D Author", "/works/OL4W"),
+    }
+
+    async def resolve(isbn):
+        return metadata[isbn]
+
+    monkeypatch.setattr(provider, "_metadata_for_isbn", resolve)
+    reads = [
+        {"id": 1, "title": "Loved Book", "author": "A Author", "rating": 5,
+         "isbn": "9781111111111"},
+        {"id": 2, "title": "Disliked Book", "author": "B Author", "rating": 1},
+        {"id": 3, "title": "Unrated Book", "author": "C Author", "rating": None},
+    ]
+    result = asyncio.run(run_association_provider(provider, reads))
+    assert result.seeds == 1
+    assert result.edges == result.persisted == 1
+    assert row("SELECT c.title FROM candidates c JOIN association_evidence e "
+               "ON e.candidate_id=c.id WHERE e.provider=?", (LIBRARYTHING_PROVIDER,)) == {
+                   "title": "Unread Book"}
+
+
 @respx.mock
 def test_librarything_batches_isbns_resolves_titles_and_reuses_cache(database, monkeypatch):
     public_dns(monkeypatch)

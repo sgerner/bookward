@@ -133,6 +133,8 @@ The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also te
 
 The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs. At that stage, no serving scorer change was adopted.
 
+Association providers select a bounded set of favorite seeds from the complete reading library. Their exclusion checks also cover disliked, unrated, and other books outside that seed set, so those books are not rediscovered as unread candidates.
+
 The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The subsequent [full-corpus enrichment evaluation](docs/enrichment-full-corpus-evaluation.md) found no reliable gain from richer read embeddings or score blends, so these remain disabled.
 
 ### Catalog enrichment
