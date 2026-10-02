@@ -26,7 +26,19 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(ENGINE))
 from afterword_engine.identity import book_identity
-from afterword_engine.ranking import _metadata_confidence, _read_day, _top_weighted, rank_candidates
+from afterword_engine.ranking import (
+    _KERNEL_ESS_PRIOR,
+    _KERNEL_FULL_HISTORY,
+    _KERNEL_NEIGHBORS,
+    _KERNEL_POWER,
+    _KERNEL_SCORE_PER_STAR,
+    _RECENCY_SCORE_PER_STAR,
+    _RECENCY_TIMESCALE_YEARS,
+    _metadata_confidence,
+    _read_day,
+    _top_weighted,
+    rank_candidates,
+)
 from evaluate_ranking import load_corpus, prepare
 from evaluate_historical_ratings import whole_day_cuts
 
@@ -79,9 +91,10 @@ def history_components(history, history_vectors, query, query_vectors):
         neg_max = float(np.max(neg)) if len(neg) else 0.0
         neg_top = float(_top_weighted(neg[None, :], default=0.0)[0]) if len(neg) else 0.0
         if len(sim) and np.any(sim > 0):
-            neighbors = np.argsort(-sim, kind='stable')[:min(40, len(sim))]
-            weights = (np.maximum(sim[neighbors], 0.0) + 1e-8) ** 8
+            neighbors = np.argsort(-sim, kind='stable')[:min(_KERNEL_NEIGHBORS, len(sim))]
+            weights = (np.maximum(sim[neighbors], 0.0) + 1e-8) ** _KERNEL_POWER
             kernel = float(np.dot(weights, ratings[neighbors]) / weights.sum())
+            effective_sample_size = float(weights.sum() ** 2 / np.dot(weights, weights))
             neighbor_days = days[neighbors]
             known = np.isfinite(neighbor_days)
             if known.any():
@@ -97,19 +110,21 @@ def history_components(history, history_vectors, query, query_vectors):
         else:
             kernel = recent = global_mean
             local_rating = 3.0
+            effective_sample_size = 0.0
         author = book_identity('', candidate.get('author', ''))
         values = author_ratings.get(author, [])
         author_mean = float(np.mean(values)) if values else global_mean
         author_delta = ((len(values) * author_mean + 5 * global_mean) / (len(values) + 5) - global_mean) if values else 0.0
         count = len(history)
-        kernel_strength = 10.0 * min(1.0, count / 100.0)
-        recency_strength = 20.0 * min(1.0, count / 100.0)
+        kernel_strength = _KERNEL_SCORE_PER_STAR * min(1.0, count / _KERNEL_FULL_HISTORY)
+        recency_strength = _RECENCY_SCORE_PER_STAR * min(1.0, count / _KERNEL_FULL_HISTORY)
         X[row] = (pos_top, pos_max, neg_max, neg_top, local_rating - 3.0,
                   kernel - global_mean, recent - kernel, author_delta,
                   global_mean - 3.0, np.log1p(count))
         raw_score = (42.0 + 48.0 * pos_top - 24.0 * neg_max
                      + 3.5 * (local_rating - 3.0) + 3.5 * author_delta
                      + kernel_strength * (kernel - global_mean)
+                     * effective_sample_size / (effective_sample_size + _KERNEL_ESS_PRIOR)
                      + recency_strength * (recent - kernel)
                      + (float(candidate.get('source_weight') or 1.0) - 1.0) * 5.0)
         confidence = _metadata_confidence(candidate)
@@ -647,6 +662,8 @@ def main():
                                          'validation_end_day': str(dates[val_stop - 1]),
                                          'test_start_day': str(dates[val_stop])}},
             'protocol': 'Chronological 60/20/20 whole-day boundaries; each query uses strictly earlier calendar days; same-day targets are hidden together; exact current serving score parity required; learned models train on causal examples from the train window with train-only standardization; model families and calibration are selected on validation; a selected model is refit on train+validation before one later-period evaluation.',
+            'current_score_formula': 'Current serving ranker, with the kernel rating adjustment multiplied by effective_sample_size / (effective_sample_size + 5); recency is unchanged.',
+            'feature_note': 'The kernel_rating_delta model input is the raw component. The current score reference uses the ESS5-shrunk adjustment and exact serving-ranker parity is checked separately.',
             'labels': {'high': '4-5 stars versus 1-3', 'low': '1-2 stars versus 3-5', 'neutral_sensitivity': 'high versus low, excluding 3-star ratings'},
             'features': {'ordinal_10': list(ORDINAL_NAMES), 'interests_k3_or_k5': list(INTEREST_NAMES),
                          'interest_definition': 'K-means is fit once on the first strictly earlier 100-read prefix using unit title/author embeddings; each later read is assigned to the frozen nearest center only after its day is scored. Candidate evidence combines shrunk cluster rating deltas across all neighborhoods using query-center cosine weights and the nearest neighborhood low-rating cosine.'},

@@ -68,7 +68,88 @@ def test_kernel_rating_ramps_in_for_short_history():
     reads = [book(1, "Loved", "A", 5), book(2, "Disliked", "B", 1)]
     candidates = [book(3, "Near loved", "C"), book(4, "Near disliked", "D")]
     ranked = rank_candidates(reads, [[1, 0], [0, 1]], candidates, [[1, 0], [0, 1]])
-    assert [item["score"] for item in ranked] == [97.4, 10.6]
+    # One effective neighbor contributes only 1/(1+5) of the old kernel term.
+    assert [item["score"] for item in ranked] == [97.1, 10.9]
+
+
+def test_kernel_ess5_distinguishes_one_dominant_neighbor_from_diffuse_evidence():
+    dimensions = 101
+    candidate_vector = np.zeros(dimensions, dtype=np.float32)
+    candidate_vector[0] = 1.0
+    reads = [
+        book(index, f"Read {index}", f"Author {index}", 5 if index < 40 else 3)
+        for index in range(100)
+    ]
+    dominant_vectors = []
+    diffuse_vectors = []
+    for index in range(40):
+        dominant_similarity = 1.0 if index == 0 else 0.25
+        dominant_vector = np.zeros(dimensions, dtype=np.float32)
+        dominant_vector[0] = dominant_similarity
+        dominant_vector[index + 1] = np.sqrt(1.0 - dominant_similarity ** 2)
+        dominant_vectors.append(dominant_vector)
+
+        diffuse_vector = np.zeros(dimensions, dtype=np.float32)
+        diffuse_vector[0] = 0.5
+        diffuse_vector[index + 1] = np.sqrt(0.75)
+        diffuse_vectors.append(diffuse_vector)
+    for index in range(60):
+        vector = np.zeros(dimensions, dtype=np.float32)
+        vector[41 + index] = 1.0
+        dominant_vectors.append(vector)
+        diffuse_vectors.append(vector)
+
+    candidate = book(1000, "Candidate", "Unseen author")
+    dominant = rank_candidates(
+        reads, dominant_vectors, [candidate], [candidate_vector]
+    )[0]
+    diffuse = rank_candidates(
+        reads, diffuse_vectors, [candidate], [candidate_vector]
+    )[0]
+
+    # Both fixtures have the same kernel rating (5), global mean (3.8),
+    # local top-five rating (5), and undated recency term (zero). The dominant
+    # kernel has ESS≈1; the equal-weight kernel has ESS=40.
+    assert dominant["score"] == 81.0
+    assert diffuse["score"] == 83.7
+
+
+def test_kernel_leave_one_identity_out_matches_a_history_without_that_identity():
+    reads = [
+        book(1, "Target", "Target author", 5),
+        book(2, "Target", "Target author", 1),  # duplicate identity is ignored
+        book(3, "Neighbor A", "Author A", 5),
+        book(4, "Neighbor B", "Author B", 4),
+        book(5, "Neighbor C", "Author C", 2),
+        book(6, "Neighbor D", "Author D", 3),
+    ]
+    vectors = [
+        [1, 0, 0, 0],
+        [1, 0, 0, 0],
+        [.8, .6, 0, 0],
+        [.6, 0, .8, 0],
+        [.4, 0, 0, np.sqrt(.84)],
+        [0, 1, 0, 0],
+    ]
+    candidate = book(10, "Target", "Target author")
+    candidate_vector = [1, 0, 0, 0]
+
+    excluded = rank_candidates(
+        reads,
+        vectors,
+        [candidate],
+        [candidate_vector],
+        exclude_candidate_identity=True,
+    )[0]
+    remaining = [index for index, item in enumerate(reads) if item["title"] != "Target"]
+    explicit = rank_candidates(
+        [reads[index] for index in remaining],
+        [vectors[index] for index in remaining],
+        [candidate],
+        [candidate_vector],
+    )[0]
+
+    assert excluded["score"] == explicit["score"]
 
 
 def test_kernel_does_not_infer_a_rating_without_positive_similarity():

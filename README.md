@@ -117,7 +117,7 @@ Bookward ranks books that it can find through your enabled sources; it does not 
 1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads CSV and RSS imports describe what you have read and how you rated it.
 2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
 3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. These representations are cached and refreshed when the source text changes.
-4. **Rank likely matches.** Books that resemble highly rated reads move up; close matches to low-rated books move down. Ratings for the same author, reading dates, and the weight of a source also contribute. The engine gives less weight to a candidate when its catalog details are sparse.
+4. **Rank likely matches.** Books that resemble highly rated reads move up; close matches to low-rated books move down. Ratings for the same author, reading dates, and the weight of a source also contribute. The adjustment from nearby rated books is smaller when only a few books carry most of the similarity weight. The engine gives less weight to a candidate when its catalog details are sparse.
 5. **Learn from clear choices.** Shortlisting or explicitly passing on a book, and some reads linked back to a recommendation, can refine later rankings when there is enough consistent evidence. Maybe later is neutral and does not count as a rejection. Simply seeing a book or opening its details is not counted as a dislike.
 6. **Show the strongest reasons.** Each card can point to a similar rated book, an author pattern, its source, or missing catalog details. These notes summarize useful evidence; they are not a line-by-line account of every scoring factor.
 
@@ -131,7 +131,9 @@ The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests
 
 The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also tests compatible text views, source/catalog confidence, and discovery seeds. The [methodology audit](docs/ranking-methodology-audit-2026-09-30.md) corrects the daily model score scale and adds the previously missing actual read-enrichment replay; enrichment remains promising but unresolved. It adds a separate action-history availability diagnostic: reads imported after an action cannot reconstruct what the engine knew then, even when their reading dates are earlier.
 
-The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs; no serving scorer change is supported.
+The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs. At that stage, no serving scorer change was adopted.
+
+The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The 75/25 enrichment blend remains a candidate for further testing.
 
 ### Limitations
 

@@ -21,6 +21,39 @@ def test_same_day_queries_do_not_enter_causal_history():
     assert evaluator.causal_history_end(days, days[4]) == 4
 
 
+def test_current_score_component_matches_serving_ranker():
+    from afterword_engine.ranking import rank_candidates
+
+    history = []
+    vectors = []
+    for index in range(60):
+        is_high = index < 20
+        history.append({
+            "id": index + 1,
+            "title": f"History {index + 1}",
+            "author": f"Writer {index}",
+            "rating": 5 if is_high else 1,
+            "read_at": "2020-01-01",
+        })
+        vectors.append(
+            np.asarray([1.0, 0.0] if is_high else [0.5, np.sqrt(0.75)], dtype=np.float32)
+        )
+    query = {
+        "id": 100,
+        "title": "Query",
+        "author": "Unseen writer",
+        "rating": 5,
+        "read_at": "2020-01-02",
+        "source_weight": 1.0,
+    }
+    query_vector = np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+    _, current = evaluator.history_components(history, np.stack(vectors), [query], query_vector)
+    served = rank_candidates(history, vectors, [query], query_vector)[0]["score"]
+
+    assert round(current[0], 1) == served
+
+
 def test_prefix_clusters_freeze_centers_and_append_only_after_scoring():
     rng = np.random.default_rng(20260930)
     vectors = evaluator.normalize(rng.normal(size=(101, 8)).astype(np.float32))

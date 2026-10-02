@@ -15,6 +15,7 @@ _KERNEL_NEIGHBORS = 40
 _KERNEL_POWER = 8
 _KERNEL_SCORE_PER_STAR = 10
 _KERNEL_FULL_HISTORY = 100
+_KERNEL_ESS_PRIOR = 5.0
 _RECENCY_TIMESCALE_YEARS = 8
 _RECENCY_SCORE_PER_STAR = 20
 
@@ -214,12 +215,16 @@ def rank_candidates(
                 else 0.0
             )
             profile_similarities = all_sim[offset, profile_indices]
+            kernel_effective_sample_size = 0.0
             if len(profile_similarities) and np.any(profile_similarities > 0):
                 neighbor_positions = np.argsort(-profile_similarities, kind="stable")[:min(_KERNEL_NEIGHBORS, len(profile_indices))]
                 neighbors = np.asarray([profile_indices[position] for position in neighbor_positions], dtype=np.int64)
                 similarities = np.maximum(all_sim[offset, neighbors].astype(np.float64), 0)
                 kernel_weights = (similarities + 1e-8) ** _KERNEL_POWER
                 kernel_rating = float(np.dot(kernel_weights, rating_values[neighbors]) / kernel_weights.sum())
+                kernel_effective_sample_size = float(
+                    kernel_weights.sum() ** 2 / np.dot(kernel_weights, kernel_weights)
+                )
                 neighbor_days = read_ordinals[neighbors]
                 known = np.isfinite(neighbor_days)
                 if known.any():
@@ -242,7 +247,10 @@ def rank_candidates(
             # The historical comparison begins at 100 reads. Ramp in the new
             # term for smaller libraries, where one neighbor is weak evidence.
             kernel_strength = _KERNEL_SCORE_PER_STAR * min(1.0, len(profile_indices) / _KERNEL_FULL_HISTORY)
-            score += kernel_strength * (kernel_rating - global_mean)
+            kernel_confidence = kernel_effective_sample_size / (
+                kernel_effective_sample_size + _KERNEL_ESS_PRIOR
+            )
+            score += kernel_strength * (kernel_rating - global_mean) * kernel_confidence
             recency_strength = _RECENCY_SCORE_PER_STAR * min(1.0, len(profile_indices) / _KERNEL_FULL_HISTORY)
             score += recency_strength * (recent_rating - kernel_rating)
             score += (float(candidate.get("source_weight") or 1) - 1) * 5
