@@ -11,16 +11,19 @@ on the server, which keeps the cover enrichment path out of SSRF territory.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import unicodedata
-from datetime import date, datetime
+import weakref
+from datetime import date, datetime, timezone
 from urllib.parse import urlencode, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
+from .isbn import canonical_isbn, isbn_parts
 from .subjects import normalize_subjects
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
@@ -46,6 +49,149 @@ KNOWN_COVER_HOSTS = frozenset(
 )
 
 METADATA_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
+METADATA_NORMALIZATION_VERSION = "catalog-metadata-v1"
+METADATA_GENRE_LIMIT = 12
+SOURCE_PAYLOAD_LIMIT_BYTES = 8192
+OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS = 1.0
+_CATALOG_PROVIDER_FAILURE_STATUSES = frozenset({
+    "rate_limited",
+    "http_error",
+    "request_error",
+    "invalid_json",
+    "invalid_response",
+})
+_OPEN_LIBRARY_RATE_LIMITERS = weakref.WeakKeyDictionary()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+async def _openlibrary_rate_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+def _openlibrary_rate_clock(loop: asyncio.AbstractEventLoop) -> float:
+    return loop.time()
+
+
+async def wait_for_openlibrary_request_slot() -> None:
+    """Reserve the shared one-request-per-second slot for Open Library."""
+    loop = asyncio.get_running_loop()
+    state = _OPEN_LIBRARY_RATE_LIMITERS.get(loop)
+    if state is None:
+        state = {"lock": asyncio.Lock(), "last_started": None}
+        _OPEN_LIBRARY_RATE_LIMITERS[loop] = state
+    async with state["lock"]:
+        now = _openlibrary_rate_clock(loop)
+        previous = state["last_started"]
+        if previous is not None:
+            delay = OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS - (now - previous)
+            if delay > 0:
+                await _openlibrary_rate_sleep(delay)
+        state["last_started"] = _openlibrary_rate_clock(loop)
+
+
+async def _openlibrary_request(
+    client: httpx.AsyncClient,
+    url: str,
+    **kwargs,
+) -> httpx.Response:
+    """Send a request through the shared Open Library rate budget."""
+
+    await wait_for_openlibrary_request_slot()
+    return await client.get(url, **kwargs)
+
+
+def _bounded_source_payload(value: object) -> dict[str, object]:
+    """Return a compact JSON-safe projection of a public provider record."""
+
+    if not isinstance(value, dict):
+        return {}
+    node_budget = [128]
+
+    def sanitize(item: object, depth: int = 0) -> object:
+        if node_budget[0] <= 0:
+            return "[omitted]"
+        node_budget[0] -= 1
+        if depth >= 5:
+            return "[depth limited]"
+        if isinstance(item, dict):
+            return {
+                str(key)[:48]: sanitize(child, depth + 1)
+                for key, child in list(item.items())[:12]
+            }
+        if isinstance(item, (list, tuple)):
+            return [sanitize(child, depth + 1) for child in list(item)[:12]]
+        if isinstance(item, set):
+            return [sanitize(child, depth + 1) for child in sorted(item, key=str)[:12]]
+        if isinstance(item, str):
+            return item[:12000]
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return str(item)[:512]
+
+    payload = sanitize(value)
+    if not isinstance(payload, dict):
+        return {}
+
+    def encode() -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    changed = payload != value
+    while len(encode().encode("utf-8")) > SOURCE_PAYLOAD_LIMIT_BYTES - 32:
+        string_values: list[tuple[object, object, str]] = []
+
+        def collect(node: object) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if isinstance(child, str):
+                        string_values.append((node, key, child))
+                    else:
+                        collect(child)
+            elif isinstance(node, list):
+                for index, child in enumerate(node):
+                    if isinstance(child, str):
+                        string_values.append((node, index, child))
+                    else:
+                        collect(child)
+
+        collect(payload)
+        if not string_values:
+            encoded = encode()
+            preview = encoded[: SOURCE_PAYLOAD_LIMIT_BYTES // 16]
+            return {"truncated": True, "preview": preview}
+        container, key, longest = max(string_values, key=lambda item: len(item[2].encode("utf-8")))
+        next_length = max(0, len(longest) // 2)
+        container[key] = longest[:next_length]
+        changed = True
+    if changed:
+        payload["_truncated"] = True
+    # Reserve space for the marker above; retain this final guard against
+    # unusual dictionary shapes or escaping expansion.
+    encoded = encode()
+    if len(encoded.encode("utf-8")) > SOURCE_PAYLOAD_LIMIT_BYTES:
+        return {"truncated": True, "preview": encoded[: SOURCE_PAYLOAD_LIMIT_BYTES // 16]}
+    return payload
+
+
+def _field_provenance(
+    provider: str,
+    provider_id: str,
+    value: object,
+    *,
+    kind: str = "",
+    source_field: str = "",
+) -> dict[str, str]:
+    normalized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if isinstance(value, (list, dict)) else str(value or "")
+    return {
+        "provider": provider,
+        "provider_id": provider_id,
+        "kind": kind,
+        "source_field": source_field,
+        "value_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        "normalization_version": METADATA_NORMALIZATION_VERSION,
+    }
 
 
 def metadata_client() -> httpx.AsyncClient:
@@ -283,53 +429,127 @@ async def _lookup_open_library_record(
     title: str,
     author: str,
     client: httpx.AsyncClient | None = None,
+    *,
+    isbn: str = "",
 ) -> dict[str, object]:
     params = {
-        "title": title[:500],
-        "author": author[:300],
+        ("isbn" if isbn else "title"): isbn or title[:500],
+        **({} if isbn else {"author": author[:300]}),
         "limit": 5,
-        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject",
+        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13",
+    }
+    trace: dict[str, object] = {
+        "provider": "openlibrary",
+        "fetched_at": _utc_now(),
+        "query_kind": "isbn" if isbn else "title_author",
+        "status": "request_error",
     }
     try:
         if client is None:
             async with metadata_client() as owned_client:
-                response = await owned_client.get(OPEN_LIBRARY_SEARCH, params=params)
+                response = await _openlibrary_request(owned_client, OPEN_LIBRARY_SEARCH, params=params)
         else:
-            response = await client.get(OPEN_LIBRARY_SEARCH, params=params)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        return {}
+            response = await _openlibrary_request(client, OPEN_LIBRARY_SEARCH, params=params)
+        trace["http_status"] = response.status_code
+        if response.is_error:
+            trace["status"] = "http_error"
+            return {"_fetch_trace": trace}
+        try:
+            payload = response.json()
+        except ValueError:
+            trace["status"] = "invalid_json"
+            return {"_fetch_trace": trace}
+    except Exception as exc:
+        trace["error_type"] = type(exc).__name__
+        return {"_fetch_trace": trace}
     docs = payload.get("docs", []) if isinstance(payload, dict) else []
     if not isinstance(docs, list):
-        return {}
+        trace["status"] = "invalid_response"
+        return {"_fetch_trace": trace}
     wanted = _normalized_title(title)
+    matched: list[dict[str, object]] = []
+    mismatched_identifiers = 0
     for doc in docs:
-        if (
-            not isinstance(doc, dict)
-            or not _title_matches(wanted, doc.get("title"))
-            or not _author_matches(author, doc.get("author_name"))
-        ):
+        if not isinstance(doc, dict):
+            continue
+        returned_isbns = [doc.get("isbn13"), doc.get("isbn")]
+        if isbn and not _query_isbn_matches(isbn, returned_isbns):
+            mismatched_identifiers += 1
+            continue
+        authors = doc.get("author_name")
+        if not _title_matches(wanted, doc.get("title")) or not _author_matches(author, authors):
             continue
         release_date, date_kind = _publication_date(
             doc.get("first_publish_date") or doc.get("first_publish_year")
         )
-        return {
+        synopsis = _clean_metadata_text(doc.get("description"))
+        opening_sentence = _clean_metadata_text(doc.get("first_sentence"), 1500)
+        description = synopsis or opening_sentence
+        description_kind = "synopsis" if synopsis else "opening_sentence" if opening_sentence else ""
+        provider_id = str(doc.get("key") or "")
+        genres = _catalog_genres(doc.get("subject"), limit=METADATA_GENRE_LIMIT)
+        identifiers = _isbn_provenance_values(isbn, returned_isbns)
+        matched.append({
             "cover_url": cover_url_from_open_library(doc.get("cover_i")),
-            "description": _clean_metadata_text(
-                doc.get("first_sentence") or doc.get("description")
-            ),
+            "description": description,
+            "description_kind": description_kind,
+            "description_source_field": "description" if synopsis else "first_sentence" if opening_sentence else "",
             "release_date": release_date or "",
             "date_kind": date_kind or "",
-            "genres": _catalog_genres(doc.get("subject")),
+            "genres": genres,
             "provider": "openlibrary",
-            "provider_id": str(doc.get("key") or ""),
+            "provider_id": provider_id,
             "catalog_title": str(doc.get("title") or ""),
-            "catalog_author": _author_display(doc.get("author_name")),
+            "catalog_author": _author_display(authors),
             "title_match": 1.0,
             "author_match": 1.0,
-        }
-    return {}
+            "_fetched_at": trace["fetched_at"],
+            "_source_payload": _bounded_source_payload({
+                "key": provider_id,
+                "title": _clean_metadata_text(doc.get("title"), 500),
+                "authors": [_clean_metadata_text(value, 300) for value in (authors if isinstance(authors, list) else [authors]) if value],
+                "description": synopsis,
+                "opening_sentence": opening_sentence,
+                "genres": genres,
+                "identifiers": identifiers,
+                "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+                "cover_id": str(doc.get("cover_i") or "")[:40],
+            }),
+        })
+    trace["matched_count"] = len(matched)
+    trace["mismatched_identifier_count"] = mismatched_identifiers
+    if not matched:
+        trace["status"] = "no_match"
+        if isbn:
+            trace["identifier_evidence"] = "mismatch" if mismatched_identifiers else "no_result"
+            trace["identifier_verified"] = False
+        return {"_fetch_trace": trace}
+    date_rank = {"day": 3, "month": 2, "year": 1}
+    best = max(
+        matched,
+        key=lambda value: (
+            value.get("description_kind") == "synopsis",
+            len(str(value.get("description") or "")),
+            date_rank.get(str(value.get("date_kind") or ""), 0),
+            len(value.get("genres") or []),
+            bool(value.get("cover_url")),
+        ),
+    )
+    trace.update({
+        "status": "matched",
+        "provider_id": best.get("provider_id", ""),
+        "available_fields": [
+            field for field in ("description", "genres", "release_date", "cover_url")
+            if best.get(field)
+        ],
+    })
+    source_payload = best.get("_source_payload", {})
+    returned_identifiers = source_payload.get("identifiers", []) if isinstance(source_payload, dict) else []
+    evidence, verified = _isbn_identifier_evidence(isbn, returned_identifiers)
+    trace["identifier_evidence"] = evidence
+    trace["identifier_verified"] = verified
+    best["_fetch_trace"] = trace
+    return best
 
 
 async def _lookup_google_books(
@@ -343,46 +563,200 @@ async def _lookup_google_books_record(
     title: str,
     author: str,
     client: httpx.AsyncClient | None = None,
+    *,
+    isbn: str = "",
+    google_books_api_key: str = "",
 ) -> dict[str, object]:
-    params = {"q": f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": 5}
+    params = {"q": f"isbn:{isbn}" if isbn else f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": 5}
+    if google_books_api_key:
+        # Google Books accepts credentials as a query parameter. The URL is
+        # intentionally excluded from traces and logs so this stays private.
+        params["key"] = google_books_api_key
+    trace: dict[str, object] = {
+        "provider": "google_books",
+        "fetched_at": _utc_now(),
+        "query_kind": "isbn" if isbn else "title_author",
+        "status": "request_error",
+    }
     try:
         if client is None:
             async with metadata_client() as owned_client:
                 response = await owned_client.get(GOOGLE_BOOKS_SEARCH, params=params)
         else:
             response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        return {}
+        trace["http_status"] = response.status_code
+        if response.is_error:
+            trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"
+            return {"_fetch_trace": trace}
+        try:
+            payload = response.json()
+        except ValueError:
+            trace["status"] = "invalid_json"
+            return {"_fetch_trace": trace}
+    except Exception as exc:
+        trace["error_type"] = type(exc).__name__
+        return {"_fetch_trace": trace}
     items = payload.get("items", []) if isinstance(payload, dict) else []
     if not isinstance(items, list):
-        return {}
+        trace["status"] = "invalid_response"
+        return {"_fetch_trace": trace}
     wanted = _normalized_title(title)
+    matched: list[dict[str, object]] = []
+    mismatched_identifiers = 0
     for item in items:
         info = item.get("volumeInfo", {}) if isinstance(item, dict) else {}
         if not isinstance(info, dict):
             continue
-        if (
-            not _title_matches(wanted, info.get("title"))
-            or not _author_matches(author, info.get("authors"))
-        ):
+        identifiers = [
+            value.get("identifier")
+            for value in info.get("industryIdentifiers", [])
+            if isinstance(value, dict) and value.get("type") in {"ISBN_10", "ISBN_13"}
+        ]
+        if isbn and not _query_isbn_matches(isbn, identifiers):
+            mismatched_identifiers += 1
+            continue
+        if not _title_matches(wanted, info.get("title")) or not _author_matches(author, info.get("authors")):
             continue
         release_date, date_kind = _publication_date(info.get("publishedDate"))
-        return {
+        description = _clean_metadata_text(info.get("description"))
+        genres = _catalog_genres(info.get("categories"), limit=METADATA_GENRE_LIMIT)
+        provider_id = str(item.get("id") or "")
+        matched.append({
             "cover_url": _google_cover_url(info.get("imageLinks")),
-            "description": _clean_metadata_text(info.get("description")),
+            "description": description,
+            "description_kind": "synopsis" if description else "",
+            "description_source_field": "description" if description else "",
             "release_date": release_date or "",
             "date_kind": date_kind or "",
-            "genres": _catalog_genres(info.get("categories")),
+            "genres": genres,
             "provider": "google_books",
-            "provider_id": str(item.get("id") or ""),
+            "provider_id": provider_id,
             "catalog_title": str(info.get("title") or ""),
             "catalog_author": _author_display(info.get("authors")),
             "title_match": 1.0,
             "author_match": 1.0,
-        }
-    return {}
+            "_fetched_at": trace["fetched_at"],
+            "_source_payload": _bounded_source_payload({
+                "id": provider_id,
+                "title": _clean_metadata_text(info.get("title"), 500),
+                "authors": [_clean_metadata_text(value, 300) for value in (info.get("authors") if isinstance(info.get("authors"), list) else [info.get("authors")]) if value],
+                "description": description,
+                "genres": genres,
+                "identifiers": _isbn_provenance_values(isbn, identifiers),
+                "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
+                "cover_url": _google_cover_url(info.get("imageLinks")),
+            }),
+        })
+    trace["matched_count"] = len(matched)
+    trace["mismatched_identifier_count"] = mismatched_identifiers
+    if not matched:
+        trace["status"] = "no_match"
+        if isbn:
+            trace["identifier_evidence"] = "mismatch" if mismatched_identifiers else "no_result"
+            trace["identifier_verified"] = False
+        return {"_fetch_trace": trace}
+    date_rank = {"day": 3, "month": 2, "year": 1}
+    best = max(
+        matched,
+        key=lambda value: (
+            value.get("description_kind") == "synopsis",
+            len(str(value.get("description") or "")),
+            date_rank.get(str(value.get("date_kind") or ""), 0),
+            len(value.get("genres") or []),
+            bool(value.get("cover_url")),
+        ),
+    )
+    trace.update({
+        "status": "matched",
+        "provider_id": best.get("provider_id", ""),
+        "available_fields": [
+            field for field in ("description", "genres", "release_date", "cover_url")
+            if best.get(field)
+        ],
+    })
+    source_payload = best.get("_source_payload", {})
+    returned_identifiers = source_payload.get("identifiers", []) if isinstance(source_payload, dict) else []
+    evidence, verified = _isbn_identifier_evidence(isbn, returned_identifiers)
+    trace["identifier_evidence"] = evidence
+    trace["identifier_verified"] = verified
+    best["_fetch_trace"] = trace
+    return best
+
+
+def _isbn_display_values(values: object) -> list[str]:
+    result: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                collect(item)
+            return
+        raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
+        if len(raw) in {10, 13} and canonical_isbn(raw):
+            normalized = raw.upper()
+            if normalized not in result:
+                result.append(normalized)
+
+    collect(values)
+    return result[:8]
+
+
+def _matching_returned_isbn(query: object, returned: object) -> str:
+    """Find an exact ISBN match anywhere in a provider's identifier list."""
+
+    query13, query10 = isbn_parts(query)
+    if not (query13 or query10):
+        return ""
+
+    def visit(value: object):
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from visit(item)
+            return
+        raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
+        if len(raw) in {10, 13} and canonical_isbn(raw):
+            yield raw.upper()
+
+    for value in visit(returned):
+        returned13, returned10 = isbn_parts(value)
+        if (query13 and returned13 == query13) or (query10 and returned10 == query10):
+            return value
+    return ""
+
+
+def _isbn_provenance_values(query: object, returned: object) -> list[str]:
+    """Keep a bounded identifier projection with the query match promoted."""
+
+    values = _isbn_display_values(returned)
+    matching = _matching_returned_isbn(query, returned)
+    if matching and matching not in values:
+        values = [matching, *values[:7]]
+    elif matching:
+        values = [matching, *(value for value in values if value != matching)][:8]
+    return values
+
+
+def _query_isbn_matches(query: object, returned: object) -> bool:
+    """Reject ISBN-query results whose returned valid ISBNs contradict it."""
+
+    evidence, _ = _isbn_identifier_evidence(query, returned)
+    return evidence != "mismatch"
+
+
+def _isbn_identifier_evidence(query: object, returned: object) -> tuple[str, bool]:
+    """Distinguish exact returned identifiers from providers that omit them."""
+
+    query13, query10 = isbn_parts(query)
+    if not (query13 or query10):
+        return "not_applicable", False
+    matched = _matching_returned_isbn(query, returned)
+    if matched:
+        return "matched", True
+    returned_values = _isbn_display_values(returned)
+    if not returned_values:
+        # Some provider work records omit edition identifiers altogether.
+        return "absent", False
+    return "mismatch", False
 
 
 async def resolve_book_metadata(
@@ -394,9 +768,13 @@ async def resolve_book_metadata(
     release_date: object = "",
     genres: object = (),
     client: httpx.AsyncClient | None = None,
-    lookup_cache: dict[tuple[str, str], asyncio.Task[dict[str, str]]] | None = None,
+    lookup_cache: dict[tuple[str, ...], asyncio.Task[dict[str, object]]] | None = None,
     expected_provider: str = "",
     expected_provider_id: str = "",
+    isbn13: object = "",
+    isbn10: object = "",
+    prefer_catalog_synopsis: bool = False,
+    google_books_api_key: str = "",
 ) -> dict[str, object]:
     """Resolve summary, publication date, and cover from public book catalogs.
 
@@ -407,7 +785,9 @@ async def resolve_book_metadata(
     """
 
     supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
-    result = {
+    source_isbn13, source_isbn10 = isbn_parts(isbn13, isbn10)
+    source_genres = _catalog_genres(genres, limit=METADATA_GENRE_LIMIT)
+    result: dict[str, object] = {
         "cover_url": supplied_url,
         "description": _clean_metadata_text(description),
         "release_date": str(release_date or ""),
@@ -420,73 +800,371 @@ async def resolve_book_metadata(
         "catalog_author": "",
         "title_match": 0.0,
         "author_match": 0.0,
+        "description_provider": "",
+        "description_provider_id": "",
+        "description_kind": "",
+        "description_candidate": {},
+        "genres_provider": "",
+        "genres_provider_id": "",
+        "cover_provider": "",
+        "cover_provider_id": "",
+        "release_date_provider": "",
+        "release_date_provider_id": "",
     }
     needs_description = not result["description"]
     needs_release_date = not result["release_date"]
-    if isinstance(genres, str):
-        try:
-            genres = json.loads(genres)
-        except (TypeError, ValueError):
-            genres = [genres] if genres.strip() else []
-    needs_genres = not _catalog_genres(genres)
-    description_source = ""
+    needs_genres = len(source_genres) < METADATA_GENRE_LIMIT
+    traces: list[dict[str, object]] = []
+    records: list[dict[str, object]] = []
     if (needs_description or needs_release_date or needs_genres or not supplied_url) and title and author:
         for lookup in (_lookup_open_library_record, _lookup_google_books_record):
-            if lookup_cache is None:
-                record = await lookup(title, author, client=client)
-            else:
-                cache_key = (lookup.__name__, f"{_normalized_title(title)}|{_normalized_title(author)}")
+            async def cached_lookup(query_isbn: str):
+                kwargs = (
+                    {"google_books_api_key": google_books_api_key}
+                    if lookup is _lookup_google_books_record
+                    else {}
+                )
+                if lookup_cache is None:
+                    return await lookup(title, author, client=client, isbn=query_isbn, **kwargs)
+                cache_key = (
+                    lookup.__name__,
+                    _normalized_title(title),
+                    _normalized_title(author),
+                    query_isbn,
+                    "google-key" if google_books_api_key else "no-google-key",
+                )
                 task = lookup_cache.get(cache_key)
                 if task is None:
-                    task = asyncio.create_task(lookup(title, author, client=client))
+                    task = asyncio.create_task(
+                        lookup(title, author, client=client, isbn=query_isbn, **kwargs)
+                    )
                     lookup_cache[cache_key] = task
-                record = await task
+                return await task
+
+            record = await cached_lookup(source_isbn13 or source_isbn10)
+            trace = record.get("_fetch_trace")
+            if isinstance(trace, dict):
+                traces.append(trace)
+            if not record.get("provider") and (source_isbn13 or source_isbn10):
+                # An ISBN miss or contradiction can still be followed by an
+                # identity-verified title/author query. The ISBN result itself
+                # is never accepted when its returned identifier disagrees.
+                # Do not repeat a failed provider request immediately with a
+                # broader query; it cannot recover from an outage in this job.
+                if isinstance(trace, dict) and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES:
+                    continue
+                record = await cached_lookup("")
+                trace = record.get("_fetch_trace")
+                if isinstance(trace, dict):
+                    traces.append(trace)
             if (
+                record.get("provider")
+                and
                 expected_provider
                 and record.get("provider") == expected_provider
                 and expected_provider_id
                 and record.get("provider_id") != expected_provider_id
             ):
                 continue
-            contributed_primary_metadata = False
-            contributed_description = False
-            contributed_genres = False
-            if not result["cover_url"] and record.get("cover_url"):
-                result["cover_url"] = record["cover_url"]
-                contributed_primary_metadata = True
-            if needs_description and record.get("description"):
-                result["description"] = record["description"]
-                needs_description = False
-                contributed_primary_metadata = True
-                contributed_description = True
-                description_source = str(record.get("provider") or "")
-            if needs_release_date and record.get("release_date"):
-                result["release_date"] = record["release_date"]
-                result["date_kind"] = record.get("date_kind", "")
-                needs_release_date = False
-                contributed_primary_metadata = True
-            if needs_genres and record.get("genres"):
-                result["genres"] = record["genres"]
-                needs_genres = False
-                contributed_primary_metadata = True
-                contributed_genres = True
-            # Attribute the metadata record to its description source when
-            # possible. A later provider that only supplies genres must not
-            # replace the provenance of a description already selected.
-            if contributed_primary_metadata and (
-                contributed_description
-                or (contributed_genres and not description_source)
-                or not result["provider"]
-            ):
-                for field in (
-                    "provider", "provider_id", "catalog_title", "catalog_author",
-                    "title_match", "author_match",
-                ):
-                    result[field] = record.get(field, result[field])
-                result["work_id"] = result["provider_id"] if result["provider"] == "openlibrary" else ""
-            if not needs_description and not needs_release_date and not needs_genres and result["cover_url"]:
-                break
+            if record.get("provider"):
+                records.append(record)
+
+    description_records = [record for record in records if record.get("description")]
+    description_record = max(
+        description_records,
+        key=lambda record: (
+            record.get("description_kind") == "synopsis",
+            len(str(record.get("description") or "")),
+        ),
+        default=None,
+    )
+    if description_record:
+        description_payload = description_record.get("_source_payload", {})
+        opening_sentence = (
+            str(description_payload.get("opening_sentence") or "")
+            if isinstance(description_payload, dict)
+            else ""
+        )
+        result["description_candidate"] = {
+            "provider": description_record.get("provider", ""),
+            "provider_id": description_record.get("provider_id", ""),
+            "text": description_record.get("description", ""),
+            "kind": description_record.get("description_kind", ""),
+            "source_field": description_record.get("description_source_field", ""),
+            "opening_sentence": opening_sentence,
+            "content_quality_heuristic": (
+                0.5 + 0.5 * min(1.0, len(str(description_record.get("description") or "")) / 600.0)
+                if description_record.get("description_kind") == "synopsis"
+                else 0.5 * min(1.0, len(str(description_record.get("description") or "")) / 600.0)
+            ),
+            "content_quality_note": "Heuristic from field type and normalized character length; not a calibrated probability.",
+        }
+        source_description_matches_opening = bool(
+            result["description"]
+            and opening_sentence
+            and _clean_metadata_text(result["description"]) == opening_sentence
+        )
+        same_expected_record = bool(
+            expected_provider
+            and expected_provider_id
+            and description_record.get("provider") == expected_provider
+            and description_record.get("provider_id") == expected_provider_id
+        )
+        should_select = needs_description or bool(
+            prefer_catalog_synopsis
+            and description_record.get("description_kind") == "synopsis"
+            and source_description_matches_opening
+            and same_expected_record
+        )
+        if should_select:
+            result["description"] = description_record["description"]
+            result["description_provider"] = description_record.get("provider", "")
+            result["description_provider_id"] = description_record.get("provider_id", "")
+            result["description_kind"] = description_record.get("description_kind", "")
+
+    if not result["cover_url"]:
+        cover_record = next((record for record in records if record.get("cover_url")), None)
+        if cover_record:
+            result["cover_url"] = cover_record["cover_url"]
+            result["cover_provider"] = cover_record.get("provider", "")
+            result["cover_provider_id"] = cover_record.get("provider_id", "")
+
+    date_rank = {"day": 3, "month": 2, "year": 1}
+    date_record = max(
+        (record for record in records if record.get("release_date")),
+        key=lambda record: date_rank.get(str(record.get("date_kind") or ""), 0),
+        default=None,
+    )
+    if needs_release_date and date_record:
+        result["release_date"] = date_record["release_date"]
+        result["date_kind"] = date_record.get("date_kind", "")
+        result["release_date_provider"] = date_record.get("provider", "")
+        result["release_date_provider_id"] = date_record.get("provider_id", "")
+
+    remaining_genres = max(0, METADATA_GENRE_LIMIT - len(source_genres))
+    catalog_genres: list[str] = []
+    genre_sources: list[dict[str, str]] = []
+    for record in records:
+        if not remaining_genres:
+            break
+        additions = _catalog_genres(record.get("genres"), limit=METADATA_GENRE_LIMIT)
+        prior = len(catalog_genres)
+        catalog_genres = _catalog_genres(catalog_genres + additions, limit=METADATA_GENRE_LIMIT)
+        if len(catalog_genres) > prior:
+            genre_sources.append({
+                "provider": str(record.get("provider") or ""),
+                "provider_id": str(record.get("provider_id") or ""),
+            })
+            remaining_genres = max(0, METADATA_GENRE_LIMIT - len(source_genres) - len(catalog_genres))
+    result["genres"] = catalog_genres
+    if genre_sources:
+        result["genres_provider"] = genre_sources[0]["provider"]
+        result["genres_provider_id"] = genre_sources[0]["provider_id"]
+
+    primary_record = (
+        description_record if result["description_provider"] else None
+    ) or next(
+        (record for record in records if record.get("provider") == result["genres_provider"] and record.get("provider_id") == result["genres_provider_id"]),
+        None,
+    ) or next(
+        (record for record in records if record.get("provider") == result["cover_provider"] and record.get("provider_id") == result["cover_provider_id"]),
+        None,
+    ) or next(
+        (record for record in records if record.get("provider") == result["release_date_provider"] and record.get("provider_id") == result["release_date_provider_id"]),
+        None,
+    )
+    if primary_record:
+        result["provider"] = primary_record.get("provider", "")
+        result["provider_id"] = primary_record.get("provider_id", "")
+        result["work_id"] = result["provider_id"] if result["provider"] == "openlibrary" else ""
+        for field in ("catalog_title", "catalog_author", "title_match", "author_match"):
+            result[field] = primary_record.get(field, result[field])
+    fields: dict[str, object] = {}
+    if result["description_provider"]:
+        fields["description"] = _field_provenance(
+            str(result["description_provider"]), str(result["description_provider_id"]),
+            result["description"], kind=str(result["description_kind"]),
+            source_field=str(description_record.get("description_source_field", "") if description_record else ""),
+        )
+    if genre_sources:
+        fields["genres"] = {
+            "provider": genre_sources[0]["provider"],
+            "provider_id": genre_sources[0]["provider_id"],
+            "sources": genre_sources,
+            "kind": "subjects",
+            "source_field": "subject" if genre_sources[0]["provider"] == "openlibrary" else "categories",
+            "value_sha256": hashlib.sha256(json.dumps(catalog_genres, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "normalization_version": METADATA_NORMALIZATION_VERSION,
+        }
+    if result["cover_provider"]:
+        fields["cover_url"] = _field_provenance(
+            str(result["cover_provider"]), str(result["cover_provider_id"]), result["cover_url"],
+            kind="cover", source_field="cover_i" if result["cover_provider"] == "openlibrary" else "imageLinks",
+        )
+    if result["release_date_provider"]:
+        fields["release_date"] = _field_provenance(
+            str(result["release_date_provider"]), str(result["release_date_provider_id"]), result["release_date"],
+            kind=str(result["date_kind"]), source_field="first_publish_date" if result["release_date_provider"] == "openlibrary" else "publishedDate",
+        )
+    result["metadata_provenance"] = {
+        "fetched_at": _utc_now(),
+        "normalization_version": METADATA_NORMALIZATION_VERSION,
+        "fields": fields,
+        "fetch_trace": traces,
+        "source_payloads": [
+            {"provider": record.get("provider", ""), "provider_id": record.get("provider_id", ""), "payload": record.get("_source_payload", {})}
+            for record in records
+        ],
+    }
     result["cover_url"] = result["cover_url"] or placeholder_cover_url(title, author)
+    return result
+
+
+async def resolve_openlibrary_work_metadata(
+    work_id: str,
+    title: str = "",
+    author: str = "",
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, object]:
+    """Fetch metadata for a previously verified Open Library work ID only."""
+
+    result: dict[str, object] = {
+        "cover_url": "",
+        "description": "",
+        "release_date": "",
+        "date_kind": "",
+        "genres": [],
+        "provider": "openlibrary",
+        "provider_id": work_id,
+        "work_id": work_id,
+        "catalog_title": "",
+        "catalog_author": "",
+        "title_match": 1.0,
+        "author_match": 1.0,
+        "description_provider": "",
+        "description_provider_id": "",
+        "description_kind": "",
+        "genres_provider": "",
+        "genres_provider_id": "",
+        "cover_provider": "",
+        "cover_provider_id": "",
+        "release_date_provider": "",
+        "release_date_provider_id": "",
+    }
+    if not re.fullmatch(r"/works/OL\d+W", str(work_id or "")):
+        result["metadata_provenance"] = {
+            "fetched_at": _utc_now(),
+            "normalization_version": METADATA_NORMALIZATION_VERSION,
+            "fields": {},
+            "fetch_trace": [{"provider": "openlibrary", "status": "invalid_work_id"}],
+            "source_payloads": [],
+        }
+        return result
+
+    fetched_at = _utc_now()
+    trace: dict[str, object] = {
+        "provider": "openlibrary",
+        "provider_id": work_id,
+        "fetched_at": fetched_at,
+        "query_kind": "verified_work_id",
+        "status": "request_error",
+    }
+    payload: object = None
+    try:
+        url = f"{OPEN_LIBRARY_WEB}{work_id}.json"
+        if client is None:
+            async with metadata_client() as owned_client:
+                response = await _openlibrary_request(owned_client, url)
+        else:
+            response = await _openlibrary_request(client, url)
+        trace["http_status"] = response.status_code
+        if response.is_error:
+            trace["status"] = "http_error"
+        else:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+                trace["status"] = "invalid_json"
+    except Exception as exc:
+        trace["error_type"] = type(exc).__name__
+
+    fields: dict[str, object] = {}
+    source_payloads: list[dict[str, object]] = []
+    if isinstance(payload, dict):
+        returned_id = str(payload.get("key") or "")
+        trace["returned_work_id"] = returned_id
+        if returned_id != work_id:
+            trace["status"] = "work_id_mismatch"
+        else:
+            synopsis = _clean_metadata_text(payload.get("description"))
+            opening_sentence = _clean_metadata_text(payload.get("first_sentence"), 1500)
+            description = synopsis or opening_sentence
+            description_kind = "synopsis" if synopsis else "opening_sentence" if opening_sentence else ""
+            release_date, date_kind = _publication_date(
+                payload.get("first_publish_date") or payload.get("first_publish_year")
+            )
+            raw_covers = payload.get("covers") or []
+            cover_url = ""
+            if isinstance(raw_covers, list):
+                cover_url = next((cover_url_from_open_library(value) for value in raw_covers if cover_url_from_open_library(value)), "")
+            genres = _catalog_genres(payload.get("subjects"), limit=METADATA_GENRE_LIMIT)
+            result.update({
+                "catalog_title": _clean_metadata_text(payload.get("title"), 500),
+                "catalog_author": _clean_metadata_text(author, 300),
+                "description": description,
+                "description_provider": "openlibrary" if description else "",
+                "description_provider_id": work_id if description else "",
+                "description_kind": description_kind,
+                "release_date": release_date or "",
+                "date_kind": date_kind or "",
+                "genres": genres,
+                "genres_provider": "openlibrary" if genres else "",
+                "genres_provider_id": work_id if genres else "",
+                "cover_url": cover_url,
+                "cover_provider": "openlibrary" if cover_url else "",
+                "cover_provider_id": work_id if cover_url else "",
+                "release_date_provider": "openlibrary" if release_date else "",
+                "release_date_provider_id": work_id if release_date else "",
+            })
+            if description:
+                fields["description"] = _field_provenance(
+                    "openlibrary", work_id, description, kind=description_kind,
+                    source_field="description" if synopsis else "first_sentence",
+                )
+            if genres:
+                fields["genres"] = _field_provenance(
+                    "openlibrary", work_id, genres, kind="subjects", source_field="subjects",
+                )
+            if cover_url:
+                fields["cover_url"] = _field_provenance("openlibrary", work_id, cover_url, kind="cover", source_field="covers")
+            if release_date:
+                fields["release_date"] = _field_provenance(
+                    "openlibrary", work_id, release_date, kind=date_kind or "", source_field="first_publish_date",
+                )
+            trace["status"] = "matched"
+            trace["available_fields"] = [field for field in ("description", "genres", "cover_url", "release_date") if result.get(field)]
+            source_payloads.append({
+                "provider": "openlibrary",
+                "provider_id": work_id,
+                "payload": _bounded_source_payload({
+                    "key": returned_id,
+                    "title": _clean_metadata_text(payload.get("title"), 500),
+                    "description": synopsis,
+                    "opening_sentence": opening_sentence,
+                    "genres": genres,
+                    "publication_date": _clean_metadata_text(payload.get("first_publish_date") or payload.get("first_publish_year"), 40),
+                    "cover_ids": [str(value)[:40] for value in raw_covers[:8]] if isinstance(raw_covers, list) else [],
+                }),
+            })
+    result["metadata_provenance"] = {
+        "fetched_at": fetched_at,
+        "normalization_version": METADATA_NORMALIZATION_VERSION,
+        "fields": fields,
+        "fetch_trace": [trace],
+        "source_payloads": source_payloads,
+    }
     return result
 
 
@@ -496,6 +1174,7 @@ async def resolve_cover_url(
     supplied: object = "",
     source_url: str = "",
     client: httpx.AsyncClient | None = None,
+    google_books_api_key: str = "",
 ) -> str:
     """Resolve a useful cover URL, always returning a non-empty value."""
 
@@ -507,7 +1186,10 @@ async def resolve_cover_url(
     cover = await _lookup_open_library(title, author, client=client)
     if cover:
         return cover
-    cover = await _lookup_google_books(title, author, client=client)
+    record = await _lookup_google_books_record(
+        title, author, client=client, google_books_api_key=google_books_api_key
+    )
+    cover = str(record.get("cover_url") or "")
     return cover or placeholder_cover_url(title, author)
 
 

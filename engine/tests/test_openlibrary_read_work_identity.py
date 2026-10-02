@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from afterword_engine import ingestion
+from afterword_engine import covers, ingestion
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
 
@@ -170,7 +170,7 @@ def test_failed_lookup_timestamp_blocks_immediate_retry_but_allows_stale_retry(
         raise httpx.ConnectError("temporary Open Library failure")
 
     monkeypatch.setattr(ingestion, "_request_openlibrary_edition", failed_lookup)
-    monkeypatch.setattr(ingestion, "READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(covers, "OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS", 0)
 
     first = asyncio.run(ingestion.refresh_read_work_identities())
     attempted_at = row(

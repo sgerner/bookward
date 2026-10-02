@@ -1,15 +1,33 @@
 import asyncio
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 import respx
 
+from afterword_engine import covers
 from afterword_engine.covers import GOOGLE_BOOKS_SEARCH, OPEN_LIBRARY_SEARCH
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, rows, transaction
-from afterword_engine.quality import audit_candidates, canonical_isbn, local_flags, _author_similarity
+from afterword_engine.quality import (
+    QUALITY_VERSION,
+    audit_candidates,
+    candidate_quality_audit_candidates,
+    canonical_isbn,
+    has_candidate_quality_audit_candidates,
+    local_flags,
+    _author_similarity,
+)
+
+
+@pytest.fixture(autouse=True)
+def no_real_rate_limit_wait(monkeypatch):
+    async def advance_without_wait(delay):
+        return None
+
+    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_without_wait)
 
 
 @pytest.fixture()
@@ -50,6 +68,8 @@ def test_isbn_validation_and_local_quality(database):
 @respx.mock
 def test_audit_accepts_catalog_match_and_persists_identifier(database):
     candidate_id = add_candidate("A Book", "A Writer")
+    with transaction() as con:
+        con.execute("UPDATE candidates SET genres=? WHERE id=?", ('["Source genre"]', candidate_id))
     respx.get(OPEN_LIBRARY_SEARCH).mock(
         return_value=httpx.Response(
             200,
@@ -79,7 +99,16 @@ def test_audit_accepts_catalog_match_and_persists_identifier(database):
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "new"
     candidate = row("SELECT description,genres FROM candidates WHERE id=?", (candidate_id,))
     assert candidate["description"] == "A checked catalog summary."
-    assert json.loads(candidate["genres"]) == ["Literary fiction", "Family life"]
+    assert json.loads(candidate["genres"]) == ["Source genre", "Literary fiction", "Family life"]
+    provenance = rows(
+        "SELECT field,provider,provider_id,source_payload FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+        (candidate_id,),
+    )
+    assert {item["field"] for item in provenance} >= {"description", "genres"}
+    description_source = next(item for item in provenance if item["field"] == "description")
+    assert description_source["provider"] == "openlibrary"
+    assert description_source["provider_id"] == "/works/OL1W"
+    assert json.loads(description_source["source_payload"])["payload"]["opening_sentence"] == "A checked catalog summary."
 
 
 @respx.mock
@@ -90,8 +119,8 @@ def test_audit_tries_source_isbn_before_title_author_search(database):
         isbn13="9780307474278",
         isbn10="0307474275",
     )
-    isbn_route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(
+    def openlibrary_response(request):
+        return httpx.Response(
             200,
             json={
                 "docs": [
@@ -99,28 +128,150 @@ def test_audit_tries_source_isbn_before_title_author_search(database):
                         "key": "/works/OLISBN",
                         "title": "Recovered Book",
                         "author_name": ["A Writer"],
+                        "isbn": ["0307474275"],
+                        "first_publish_year": 2010,
                     }
                 ]
             },
         )
-    )
-    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    def google_response(request):
+        if request.url.params.get("q", "").startswith("isbn:"):
+            info = {
+                "title": "Recovered Book",
+                "authors": ["A Writer"],
+                "description": "Wrong ISBN metadata must be rejected.",
+                "industryIdentifiers": [{"type": "ISBN_13", "identifier": "9780061120084"}],
+            }
+            return httpx.Response(200, json={"items": [{"id": "wrong-volume", "volumeInfo": info}]})
+        info = {
+            "title": "Recovered Book",
+            "authors": ["A Writer"],
+            "description": "Verified fallback synopsis.",
+            "categories": ["Historical fiction"],
+            "publishedDate": "2010",
+            "imageLinks": {"thumbnail": "https://books.google.com/books/content?id=verified-volume"},
+        }
+        return httpx.Response(200, json={"items": [{"id": "verified-volume", "volumeInfo": info}]})
+
+    isbn_route = respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=openlibrary_response)
+    google_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(side_effect=google_response)
 
     asyncio.run(audit_candidates(only_pending=False))
 
     quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
     assert quality["quality_status"] == "accepted"
     assert quality["isbn13"] == "9780307474278"
+    assert quality["provider"] == "openlibrary"
+    assert quality["provider_id"] == "/works/OLISBN"
+    assert quality["metadata_provider"] == "google_books"
+    assert quality["metadata_provider_id"] == "verified-volume"
+    assert candidate["description"] == "Verified fallback synopsis."
+    assert "Wrong ISBN metadata" not in candidate["description"]
     isbn_call = next(
         call
         for call in isbn_route.calls
         if call.request.url.params.get("isbn") == "9780307474278"
     )
     assert "title" not in isbn_call.request.url.params
-    assert not any(
+    assert any(
         call.request.url.params.get("title") == "Recovered Book"
         for call in isbn_route.calls
     )
+    assert any(call.request.url.params.get("q", "").startswith("isbn:") for call in google_route.calls)
+    assert any(call.request.url.params.get("q", "").startswith("intitle:") for call in google_route.calls)
+
+
+@respx.mock
+def test_provider_unavailable_quarantine_retries_after_backoff(database):
+    candidate_id = add_candidate(
+        "Rate Limited Candidate",
+        "A Writer",
+        isbn13="9780307474278",
+        isbn10="0307474275",
+    )
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(429, json={"error": "rate limited"}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429, json={"error": "quota"}))
+
+    asyncio.run(audit_candidates(only_pending=False))
+    quality = row("SELECT quality_status,flags_json,audited_at FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert quality["quality_status"] == "quarantine"
+    assert "catalog_provider_unavailable" in json.loads(quality["flags_json"])
+    assert asyncio.run(audit_candidates(only_pending=True))["audited"] == 0
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+    assert asyncio.run(audit_candidates(only_pending=True))["audited"] >= 1
+    quality = row("SELECT audited_at FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert datetime.fromisoformat(quality["audited_at"]) > datetime(2000, 1, 1)
+    assert asyncio.run(audit_candidates(only_pending=True))["audited"] == 0
+
+
+def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
+    assert QUALITY_VERSION == "candidate-quality-v4"
+    old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
+    old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
+    invalid_isbn = add_candidate("Invalid ISBN", "A Writer", isbn13="9780307474279")
+    curated = add_candidate("Curated Seed", "A Writer", isbn13="9780307474278")
+    expired_outage = add_candidate("Expired Outage", "A Writer")
+    fresh_outage = add_candidate("Fresh Outage", "A Writer", isbn13="9780307474278")
+    pending = add_candidate("Pending Without ISBN", "A Writer")
+    legacy_pending = add_candidate("Legacy Pending Without ISBN", "A Writer")
+    reference_time = datetime(2026, 10, 2, tzinfo=timezone.utc)
+
+    with transaction() as con:
+        for candidate_id, status, version in (
+            (old_accepted, "accepted", "candidate-quality-v3"),
+            (old_quarantine, "quarantine", "candidate-quality-v2"),
+            (invalid_isbn, "accepted", "candidate-quality-v3"),
+            (curated, "accepted", "builtin-curated-v1"),
+            (expired_outage, "quarantine", QUALITY_VERSION),
+            (fresh_outage, "quarantine", QUALITY_VERSION),
+            (pending, "pending", QUALITY_VERSION),
+            (legacy_pending, "accepted", "legacy-pending-audit-v1"),
+        ):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status=?,audit_version=? WHERE candidate_id=?",
+                (status, version, candidate_id),
+            )
+        con.execute(
+            "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+            ('["catalog_provider_unavailable"]', "2026-09-30T22:00:00+00:00", expired_outage),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+            ('["catalog_provider_unavailable"]', "2026-10-01T12:00:00+00:00", fresh_outage),
+        )
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        for index in range(55):
+            cursor = con.execute(
+                "INSERT INTO candidates(title,author,source_url,source_id,status,normalized_key) VALUES(?,?,?,?,?,?)",
+                (
+                    f"Pending batch {index}",
+                    "A Writer",
+                    "https://example.com/book",
+                    source_id,
+                    "new",
+                    f"quality-pending-batch-{index}",
+                ),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+                (QUALITY_VERSION, cursor.lastrowid),
+            )
+
+    selected = candidate_quality_audit_candidates(limit=50, now=reference_time)
+    selected_ids = {int(item["id"]) for item in selected}
+    assert {old_accepted, old_quarantine, expired_outage, pending, legacy_pending} <= selected_ids
+    assert invalid_isbn not in selected_ids
+    assert curated not in selected_ids
+    assert fresh_outage not in selected_ids
+    assert len(candidate_quality_audit_candidates(limit=500, now=reference_time)) == 50
+    assert has_candidate_quality_audit_candidates(now=reference_time)
 
 
 @respx.mock

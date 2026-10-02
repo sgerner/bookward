@@ -115,7 +115,7 @@ Keep the engine port private; the versioned web proxy is the intended external A
 Bookward ranks books that it can find through your enabled sources; it does not invent titles or search every book in print. The ranking process is:
 
 1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads CSV and RSS imports describe what you have read and how you rated it.
-2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
+2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It prefers a synopsis over an opening sentence, checks returned identifiers, and combines useful fields from verified records. Rated reads with valid ISBNs also receive a separate metadata cache. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
 3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. These representations are cached and refreshed when the source text changes.
 4. **Rank likely matches.** Books that resemble highly rated reads move up; close matches to low-rated books move down. Ratings for the same author, reading dates, and the weight of a source also contribute. The adjustment from nearby rated books is smaller when only a few books carry most of the similarity weight. The engine gives less weight to a candidate when its catalog details are sparse.
 5. **Learn from clear choices.** Shortlisting or explicitly passing on a book, and some reads linked back to a recommendation, can refine later rankings when there is enough consistent evidence. Maybe later is neutral and does not count as a rejection. Simply seeing a book or opening its details is not counted as a dislike.
@@ -133,7 +133,13 @@ The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also te
 
 The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs. At that stage, no serving scorer change was adopted.
 
-The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The 75/25 enrichment blend remains a candidate for further testing.
+The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The subsequent [full-corpus enrichment evaluation](docs/enrichment-full-corpus-evaluation.md) found no reliable gain from richer read embeddings or score blends, so these remain disabled.
+
+### Catalog enrichment
+
+Metadata backfills run in bounded background batches, including on existing installations. Candidate changes queue rescoring; empty or unverified read lookups are cached for 30 days; temporary provider failures become eligible for retry after 24 hours. Each stored field records its provider and a bounded source projection. Open Library requests share a one-request-per-second budget, and an unsuccessful lookup preserves an existing real cover.
+
+Open Library and Google Books can supply different parts of a record. The Google Books discovery API key is also used for metadata lookups when configured. A provider outage or rate limit is recorded separately from a catalog identity mismatch. Verified read metadata is cached separately for inspection and future evaluations; it is not added to the historical scoring embeddings. Enrichment preserves imported titles, authors, ISBNs, ratings, and read dates; changing a read's identity invalidates its cached metadata.
 
 ### Limitations
 

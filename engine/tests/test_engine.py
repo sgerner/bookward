@@ -1121,7 +1121,9 @@ def test_reading_progress_migration_backfills_existing_shortlist(tmp_path):
         # Leave both the reading-progress backfill and the next migration
         # pending so legacy shortlist rows exist before reading_progress is
         # created and populated.
-        for version, script in MIGRATIONS[:-2]:
+        for version, script in MIGRATIONS:
+            if version >= 16:
+                break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
         for index, status in enumerate(("saved", "imported", "recommended"), start=1):
@@ -1651,8 +1653,10 @@ def test_refresh_metadata_preserves_curated_description_and_serializes_genres(da
     assert quality["provider"] == "openlibrary"
     assert quality["provider_id"] == "/works/OLCURATED"
     assert quality["work_id"] == "/works/OLCURATED"
-    assert quality["metadata_provider"] == "google_books"
-    assert quality["metadata_provider_id"] == "volume-fallback"
+    # The legacy metadata provider is the only prior description attribution
+    # available to older rows, so adding genres/covers must not replace it.
+    assert quality["metadata_provider"] == ""
+    assert quality["metadata_provider_id"] == ""
     assert quality["metadata_checked_at"]
 
 
