@@ -201,6 +201,9 @@ class LibraryThingProvider:
         return None
 
     async def collect(self, reads: Sequence[Mapping[str, Any]]) -> list[Association]:
+        read_identities = {
+            book_identity(read.get("title", ""), read.get("author", "")) for read in reads
+        }
         seeds = select_seed_reads(
             reads,
             max_seeds=self.max_seeds,
@@ -255,6 +258,8 @@ class LibraryThingProvider:
             if resolved is None:
                 continue
             title, author, open_library_id = resolved
+            if book_identity(title, author) in read_identities:
+                continue
             recommendation_work = _clean(recommendation.get("work"), 100)
             fromworks = recommendation.get("fromworks")
             if isinstance(fromworks, list):
