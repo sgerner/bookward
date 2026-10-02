@@ -59,6 +59,42 @@ def test_expanding_replay_fails_closed_when_served_scores_disagree(monkeypatch):
         experiments.replay(synthetic_records())
 
 
+def test_current_matches_served_ess5_and_keeps_former_unshrunk_formula():
+    from afterword_engine.ranking import rank_candidates
+
+    history = []
+    vectors = []
+    for index in range(60):
+        is_high = index < 20
+        history.append({
+            "id": index + 1,
+            "title": f"History {index + 1}",
+            "author": f"Writer {index}",
+            "rating": 5 if is_high else 1,
+            "read_at": "2020-01-01",
+        })
+        vectors.append(
+            np.asarray([1.0, 0.0] if is_high else [0.5, np.sqrt(0.75)], dtype=np.float32)
+        )
+    query = {
+        "id": 100,
+        "title": "Query",
+        "author": "Unseen writer",
+        "rating": 5,
+        "read_at": "2020-01-02",
+        "source_weight": 1.0,
+    }
+    query_vector = np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+    scores = experiments.scores_for_group(history, np.stack(vectors), [query], query_vector)
+    served = rank_candidates(history, vectors, [query], query_vector)[0]["score"]
+
+    assert "kernel_unshrunk" in scores
+    assert scores["current"][0] == scores["kernel_ess5"][0]
+    assert scores["kernel_unshrunk"][0] != scores["current"][0]
+    assert round(scores["current"][0], 1) == served
+
+
 def test_formula_selection_uses_validation_then_reports_later_test():
     ratings = np.asarray([1, 5, 1, 5, 5, 1, 5, 1], dtype=float)
     current = np.asarray([10, 90, 20, 80, 20, 80, 80, 20], dtype=float)

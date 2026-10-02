@@ -25,6 +25,7 @@ sys.path.insert(0, str(ENGINE_ROOT))
 
 from afterword_engine.identity import book_identity
 from afterword_engine.ranking import (
+    _KERNEL_ESS_PRIOR,
     _KERNEL_FULL_HISTORY,
     _KERNEL_NEIGHBORS,
     _KERNEL_POWER,
@@ -39,13 +40,15 @@ from afterword_engine.ranking import (
 from evaluate_historical_ratings import raw_ranking_metrics, whole_day_cuts
 from evaluate_ranking import baseline, content_hash, document, load_corpus, prepare, read_time
 
-VARIANTS = ('current', 'author_stronger', 'kernel_ess2', 'kernel_ess5', 'cosine_centered', 'negative_top5')
+VARIANTS = ('current', 'kernel_unshrunk', 'author_stronger', 'kernel_ess2', 'kernel_ess5', 'cosine_centered', 'negative_top5')
 HYPOTHESES = {
-    'author_stronger': 'Increase the author contribution and shrink author means with 3 prior books instead of 5.',
-    'kernel_ess2': 'Shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 2).',
-    'kernel_ess5': 'Shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 5).',
-    'cosine_centered': 'Center each query cosine around its mean history similarity, keeping 0.25 as the neutral reference.',
-    'negative_top5': 'Replace the maximum low-rated neighbor penalty with a similarity-weighted mean of the top five.',
+    'current': 'Deployed formula: kernel_unshrunk with only its kernel rating adjustment multiplied by effective_sample_size / (effective_sample_size + 5).',
+    'kernel_unshrunk': 'Former deployed formula; the kernel rating adjustment has no effective-sample-size shrinkage.',
+    'author_stronger': 'Starting from kernel_unshrunk, increase the author contribution and shrink author means with 3 prior books instead of 5.',
+    'kernel_ess2': 'Starting from kernel_unshrunk, shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 2).',
+    'kernel_ess5': 'Starting from kernel_unshrunk, shrink the kernel rating adjustment by effective_sample_size / (effective_sample_size + 5); this equals current.',
+    'cosine_centered': 'Starting from kernel_unshrunk, center each query cosine around its mean history similarity, keeping 0.25 as the neutral reference.',
+    'negative_top5': 'Starting from kernel_unshrunk, replace the maximum low-rated neighbor penalty with a similarity-weighted mean of the top five.',
 }
 MIN_HISTORY = 100
 
@@ -151,10 +154,14 @@ def scores_for_group(history, history_vectors, queries, query_vectors):
         robust = 42 + 48 * positive_top - 24 * robust_negative + 3.5 * (local_rating - 3) + 3.5 * author_delta
         robust += kernel_strength * (kernel_rating - global_mean)
         robust += recency_strength * (recent_rating - kernel_rating) + source_term
-        ess2 = base - kernel_strength * (kernel_rating - global_mean) + kernel_strength * (kernel_rating - global_mean) * ess / (ess + 2)
-        ess5 = base - kernel_strength * (kernel_rating - global_mean) + kernel_strength * (kernel_rating - global_mean) * ess / (ess + 5)
+        kernel_term = kernel_strength * (kernel_rating - global_mean)
+        ess2 = base - kernel_term + kernel_term * ess / (ess + 2)
+        ess5 = base - kernel_term + kernel_term * ess / (ess + _KERNEL_ESS_PRIOR)
         stronger_author = base - 3.5 * author_delta + 5.0 * stronger_author_delta
-        outputs['current'][row] = np.clip(50 + metadata_confidence * (base - 50), 0, 100)
+        # ``current`` follows the deployed ranker. Keep the old unshrunk
+        # formula and the original ESS2/ESS5 values available as comparisons.
+        outputs['current'][row] = np.clip(50 + metadata_confidence * (ess5 - 50), 0, 100)
+        outputs['kernel_unshrunk'][row] = np.clip(50 + metadata_confidence * (base - 50), 0, 100)
         outputs['author_stronger'][row] = np.clip(50 + metadata_confidence * (stronger_author - 50), 0, 100)
         outputs['kernel_ess2'][row] = np.clip(50 + metadata_confidence * (ess2 - 50), 0, 100)
         outputs['kernel_ess5'][row] = np.clip(50 + metadata_confidence * (ess5 - 50), 0, 100)
@@ -322,7 +329,7 @@ def fit_evaluation(ratings, predictions, cuts, bootstrap_iterations, bootstrap_s
     }
     # Selection is validation-only: maximize balanced discrimination for high and low ratings.
     winner = max(
-        (name for name in VARIANTS if name != 'current'),
+        (name for name in VARIANTS if name not in {'current', 'kernel_ess5'}),
         key=lambda name: balanced[name] if balanced[name] is not None else float('-inf'),
     )
     if balanced[winner] is None or balanced[winner] <= balanced['current']:
@@ -518,6 +525,11 @@ def main():
         bootstrap_seed=args.bootstrap_seed,
     )
     fitted['algorithm_hypotheses'] = HYPOTHESES
+    fitted['comparison_references'] = {
+        'current': 'Deployed ESS5 formula, identical to kernel_ess5.',
+        'kernel_unshrunk': 'Former deployed formula before kernel ESS shrinkage.',
+        'author_stronger_cosine_centered_negative_top5': 'Frozen historical alternatives computed from kernel_unshrunk; their metrics do not isolate a one-factor change against the current ESS5 formula.',
+    }
     fitted['exact_ranker_parity_check'] = parity
     fitted['uncertainty_settings'] = {
         'bootstrap_iterations': args.bootstrap_iterations,

@@ -219,6 +219,10 @@ def evaluate(records):
     }
     return {
         "protocol": "distinct rated works; chronological 60/20/20 whole-day split; per-book strictly earlier-day history",
+        "score_definitions": {
+            "current": "Current serving rank_candidates output; its kernel rating adjustment uses effective_sample_size / (effective_sample_size + 5).",
+            "earlier": "Original pre-neighborhood scorer from evaluate_ranking.baseline.",
+        },
         "counts": {"train": int(len(train)), "validation": int(len(validation)), "test": int(len(test))},
         "validation": {
             "prior_mean": metrics(ratings[validation], prior_mean[validation]),
