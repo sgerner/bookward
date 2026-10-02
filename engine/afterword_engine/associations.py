@@ -407,7 +407,9 @@ async def run_association_provider(
     seeds = select_seed_reads(reads)
     run_id = begin_association_run(provider.provider, seed_count=len(seeds))
     try:
-        associations = await provider.collect(seeds)
+        # Providers bound and select their own discovery seeds. They also need
+        # the complete library to exclude low-rated, unrated, and non-seed reads.
+        associations = await provider.collect(reads)
         persisted = persist_associations(associations, run_id=run_id) if persist else 0
     except Exception as exc:
         finish_association_run(run_id, status="failed", error=str(exc))

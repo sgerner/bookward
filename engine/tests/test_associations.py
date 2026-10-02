@@ -190,3 +190,60 @@ def test_run_association_provider_records_failure(database):
     assert failed["status"] == "failed"
     assert failed["error"] == "upstream unavailable"
 
+
+@respx.mock
+def test_provider_run_excludes_reads_outside_favorite_seed_subset(database, monkeypatch):
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    search = respx.get("https://93.184.216.34/search.json").mock(
+        return_value=httpx.Response(200, json={"docs": [
+            {"key": "OL1W", "title": "Loved", "author_name": ["A Author"]}
+        ]})
+    )
+    respx.get("https://93.184.216.34/works/OL1W/lists.json").mock(
+        return_value=httpx.Response(200, json={"entries": [
+            {"url": "/people/r/lists/OL2L", "seed_count": 4}
+        ]})
+    )
+    respx.get("https://93.184.216.34/people/r/lists/OL2L/seeds.json").mock(
+        return_value=httpx.Response(200, json={"entries": [
+            {"key": "/works/OL3W", "title": "Disliked", "authors": [{"name": "B Author"}]},
+            {"key": "/works/OL4W", "title": "Unrated", "authors": [{"name": "C Author"}]},
+            {"key": "/works/OL5W", "title": "New Book", "authors": [{"name": "D Author"}]},
+        ]})
+    )
+    provider = OpenLibraryListProvider(
+        client=OpenLibraryClient(rate_limiter=RateLimiter(0)), max_lists_per_seed=1
+    )
+    reads = [
+        {"id": 1, "title": "Loved", "author": "A Author", "rating": 5},
+        {"id": 2, "title": "Disliked", "author": "B Author", "rating": 1},
+        {"id": 3, "title": "Unrated", "author": "C Author", "rating": None},
+    ]
+    result = asyncio.run(run_association_provider(provider, reads))
+    assert result.seeds == 1
+    assert result.edges == result.persisted == 1
+    assert search.call_count == 1
+    assert row("SELECT c.title FROM candidates c JOIN association_evidence e "
+               "ON e.candidate_id=c.id WHERE e.provider='openlibrary_lists'") == {"title": "New Book"}
+    assert row("SELECT COUNT(*) n FROM candidates WHERE title IN ('Disliked','Unrated')") == {"n": 0}
+
+
+def test_provider_receives_reads_beyond_runner_seed_limit(database):
+    reads = [{"id": i, "title": f"Book {i}", "author": f"Author {i}", "rating": 5}
+             for i in range(1, 31)]
+
+    class RecordingProvider:
+        provider = "recording"
+
+        async def collect(self, library):
+            assert library == reads
+            return []
+
+    result = asyncio.run(run_association_provider(RecordingProvider(), reads, persist=False))
+    assert result.seeds == 25
+    assert result.edges == result.persisted == 0
