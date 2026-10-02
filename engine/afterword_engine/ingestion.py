@@ -955,11 +955,13 @@ def _read_metadata_rows():
 def _read_metadata_attempt_is_due(read, retry_before):
     if not any(isbn_parts(read.get("isbn"))):
         return False
-    current_work_id = str(read.get("openlibrary_work_id") or "")
-    cached_work_id = str(read.get("cached_work_id") or "")
+    current_work_id = book_openlibrary_work_id(read)
+    cached_work_id = book_openlibrary_work_id(
+        {"openlibrary_work_id": read.get("cached_work_id") or ""}
+    )
     if (
         str(read.get("cached_identity_hash") or "") != _read_metadata_identity_hash(read)
-        or (current_work_id and cached_work_id != current_work_id)
+        or (current_work_id and cached_work_id and cached_work_id != current_work_id)
     ):
         return True
     attempted_at = read.get("metadata_checked_at")
@@ -1454,7 +1456,7 @@ async def refresh_read_metadata(
                 if current is None or _read_metadata_identity_hash(dict(current)) != identity_hash:
                     # A title, author, or ISBN edit landed while fetching.
                     continue
-                if str(current["openlibrary_work_id"] or "") != work_id:
+                if book_openlibrary_work_id(dict(current)) != work_id:
                     # Do not attach work-specific metadata after identity
                     # verification changed in another job.
                     continue
