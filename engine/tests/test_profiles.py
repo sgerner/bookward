@@ -819,15 +819,19 @@ def test_identity_registry_restore_revokes_restored_sessions_and_tokens(identity
 
 
 def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identity_store):
+    feedback_migration = next(
+        version for version, script in MIGRATIONS
+        if "ALTER TABLE feedback ADD COLUMN previous_status" in script
+    )
     reader = profiles.create_account("returning-reader", "temporary-password-123")
     profile_id = reader["profile_id"]
     with profile_scope(profile_id):
         initialize(seed_demo=False)
-        # Model a profile that was disabled during the latest schema upgrade.
+        # Model a profile that was disabled during the feedback schema upgrade.
         with connect() as con:
             con.execute("ALTER TABLE feedback DROP COLUMN undone_at")
             con.execute("ALTER TABLE feedback DROP COLUMN previous_status")
-            con.execute("DELETE FROM schema_migrations WHERE version=?", (MIGRATIONS[-1][0],))
+            con.execute("DELETE FROM schema_migrations WHERE version=?", (feedback_migration,))
     profiles.set_account_status(reader["id"], "disabled")
     admin_session, _ = profiles.create_session(identity_store["id"])
 
@@ -840,4 +844,4 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
         columns = {row[1] for row in con.execute("PRAGMA table_info(feedback)")}
         applied = {row[0] for row in con.execute("SELECT version FROM schema_migrations")}
     assert {"previous_status", "undone_at"} <= columns
-    assert MIGRATIONS[-1][0] in applied
+    assert feedback_migration in applied

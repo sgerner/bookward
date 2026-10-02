@@ -35,6 +35,9 @@ from .ingestion import (
     validate_goodreads_rss_url,
     normalize_source_filters,
     preview_source,
+    candidate_metadata_refresh_remaining,
+    read_metadata_refresh_remaining,
+    refresh_read_metadata,
     refresh_read_work_identities,
     refresh_missing_candidate_metadata,
     scan_source,
@@ -80,7 +83,12 @@ from .associations import run_association_provider
 from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
-from .quality import QUALITY_VERSION, audit_candidates, quality_summary
+from .quality import (
+    QUALITY_AUDIT_BATCH_SIZE,
+    audit_candidates,
+    has_candidate_quality_audit_candidates,
+    quality_summary,
+)
 from .identity import (
     book_identity,
     book_identity_match_index,
@@ -96,6 +104,7 @@ SOURCE_SYNC_MAX_HOURS = 720
 SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
+ENRICHMENT_RETRY_POLL_SECONDS = 300
 GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
 
@@ -225,19 +234,47 @@ def active_job(kind: str):
     )
 
 
-def _needs_candidate_quality_audit():
-    """Backfill confidence only for candidate rows that remain eligible."""
+def enqueue_followup_job(kind: str):
+    """Keep at most one queued continuation while the current job is running."""
 
-    return bool(
-        row(
-            """SELECT 1 FROM candidate_quality q
-            JOIN candidates c ON c.id=q.candidate_id
-            WHERE c.status!='rejected'
-              AND (q.audit_version='legacy-pending-audit-v1'
-                   OR q.quality_status='pending')
-            LIMIT 1"""
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT id FROM jobs WHERE kind=? AND status='queued' LIMIT 1",
+            (kind,),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        job_id = str(uuid.uuid4())
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,?,'queued')",
+            (job_id, kind),
         )
-    )
+        return job_id
+
+
+def _needs_candidate_quality_audit():
+    """Compatibility name for the bounded provider's due-work selector."""
+
+    return has_candidate_quality_audit_candidates()
+
+
+def _enqueue_candidate_quality_followup():
+    if has_candidate_quality_audit_candidates():
+        return enqueue_followup_job("candidate_quality_recovery")
+    return None
+
+
+def _queue_due_enrichment_retries():
+    """Schedule bounded retry jobs without performing provider requests here."""
+
+    queued = {}
+    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+        queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
+    if not active_job("metadata") and candidate_metadata_refresh_remaining():
+        queued["metadata"] = enqueue_job("metadata", dedupe=True)
+    if not active_job("read_metadata") and read_metadata_refresh_remaining():
+        queued["read_metadata"] = enqueue_job("read_metadata", dedupe=True)
+    return queued
 
 
 def queue_digest_if_due():
@@ -259,16 +296,23 @@ async def source_scheduler_loop(stop):
     bounded; the actual cadence is persisted in ``settings``.
     """
 
+    next_enrichment_retry_check = 0.0
     try:
         await asyncio.wait_for(stop.wait(), timeout=SCHEDULER_INITIAL_DELAY_SECONDS)
     except TimeoutError:
         pass
     while not stop.is_set():
+        current_monotonic = asyncio.get_running_loop().time()
+        check_enrichment_retries = current_monotonic >= next_enrichment_retry_check
+        if check_enrichment_retries:
+            next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
         for profile_id in identity_store.profile_ids():
             try:
                 with profile_scope(profile_id):
                     if source_sync_is_due() and not active_job("sync"):
                         enqueue_job("sync", dedupe=True)
+                    if check_enrichment_retries:
+                        _queue_due_enrichment_retries()
             except Exception:
                 # A transient profile database error must not stop schedules
                 # for other profiles or terminate the scheduler.
@@ -360,8 +404,15 @@ async def handle_job(kind: str):
     if kind == "read_work_identities":
         result = await refresh_read_work_identities()
         if result["remaining"]:
-            enqueue_job("read_work_identities", dedupe=False)
+            enqueue_followup_job("read_work_identities")
+        if result["matched"]:
+            enqueue_job("read_metadata", dedupe=True)
         return result
+    if kind == "read_metadata":
+        result = await refresh_read_metadata()
+        if result["remaining"]:
+            enqueue_followup_job("read_metadata")
+        return {**result, "score_job_id": None}
     if kind == "digest":
         return await send_digest(config)
     if kind == "goodreads_rss":
@@ -407,7 +458,8 @@ async def handle_job(kind: str):
             result = await run_association_provider(provider, reads, persist=False)
         else:
             raise ValueError("Unknown association provider")
-        quality = await audit_candidates(only_pending=True)
+        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        _enqueue_candidate_quality_followup()
         enqueue_job("read_work_identities", dedupe=True)
         return {
             "run_id": result.id,
@@ -433,7 +485,12 @@ async def handle_job(kind: str):
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         return {"scored": scored, "digest_job_id": queue_digest_if_due()}
     if kind == "metadata":
-        return {"metadata": await refresh_missing_candidate_metadata()}
+        metadata = await refresh_missing_candidate_metadata()
+        remaining = candidate_metadata_refresh_remaining()
+        score_job_id = enqueue_job("score", dedupe=True) if metadata else None
+        if remaining:
+            enqueue_followup_job("metadata")
+        return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
         quality = await audit_candidates(only_pending=False)
         enqueue_job("read_work_identities", dedupe=True)
@@ -445,7 +502,8 @@ async def handle_job(kind: str):
         )
         return {**quality, "scored": scored}
     if kind == "candidate_quality_recovery":
-        quality = await audit_candidates(only_pending=True)
+        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        _enqueue_candidate_quality_followup()
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
@@ -481,7 +539,10 @@ async def handle_job(kind: str):
                 )
             raise
         metadata = await refresh_missing_candidate_metadata()
-        quality = await audit_candidates(only_pending=True)
+        if candidate_metadata_refresh_remaining():
+            enqueue_job("metadata", dedupe=True)
+        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        _enqueue_candidate_quality_followup()
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
@@ -508,7 +569,10 @@ async def handle_job(kind: str):
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
         metadata = await refresh_missing_candidate_metadata()
-        quality = await audit_candidates(only_pending=True)
+        if candidate_metadata_refresh_remaining():
+            enqueue_job("metadata", dedupe=True)
+        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        _enqueue_candidate_quality_followup()
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
@@ -534,17 +598,10 @@ async def lifespan(app):
     for profile_id in identity_store.profile_ids():
         with profile_scope(profile_id):
             enqueue_job("metadata", dedupe=True)
-            needs_full_quality_audit = _needs_candidate_quality_audit()
-            if needs_full_quality_audit:
-                enqueue_job("candidate_quality", dedupe=True)
-            elif row(
-                "SELECT 1 FROM candidate_quality WHERE quality_status='quarantine' "
-                "AND audit_version!=? AND candidate_id IN ("
-                "SELECT id FROM candidates WHERE isbn13!='' OR isbn10!='') LIMIT 1",
-                (QUALITY_VERSION,),
-            ):
+            if has_candidate_quality_audit_candidates():
                 enqueue_job("candidate_quality_recovery", dedupe=True)
             enqueue_job("read_work_identities", dedupe=True)
+            enqueue_job("read_metadata", dedupe=True)
     yield
     stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
 

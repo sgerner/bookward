@@ -4,13 +4,20 @@ import threading
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from .config import settings
-from .covers import canonical_book_source_url, fallback_cover_url, is_weak_cover_url
+from .covers import (
+    METADATA_NORMALIZATION_VERSION,
+    canonical_book_source_url,
+    fallback_cover_url,
+    is_weak_cover_url,
+)
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
 from .tenancy import profile_database_path
+
+METADATA_PROVENANCE_MAX_BYTES = 8192
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -452,6 +459,87 @@ MIGRATIONS = [
             ON feedback(candidate_id, id DESC);
         """,
     ),
+    (
+        18,
+        """
+        ALTER TABLE candidate_quality ADD COLUMN metadata_version TEXT NOT NULL DEFAULT '';
+        -- Enrichment values live on the canonical candidate/read metadata
+        -- rows. Keep field-level attribution separately so one catalog's
+        -- match identity is never mistaken for provenance of every field.
+        CREATE TABLE IF NOT EXISTS metadata_field_provenance (
+            id INTEGER PRIMARY KEY,
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('candidate','read')),
+            entity_id INTEGER NOT NULL,
+            field TEXT NOT NULL CHECK(field IN ('description','genres','cover_url','release_date')),
+            provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.0
+                CHECK(confidence >= 0 AND confidence <= 1),
+            source_payload TEXT NOT NULL DEFAULT '{}',
+            verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(entity_type,entity_id,field,provider,provider_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_metadata_provenance_entity
+            ON metadata_field_provenance(entity_type,entity_id,field);
+        CREATE INDEX IF NOT EXISTS idx_metadata_provenance_verified
+            ON metadata_field_provenance(verified_at DESC);
+
+        -- Read enrichment is a separate cache keyed by a verified work ID and
+        -- the original read identity fingerprint. Imports and ratings remain
+        -- authoritative in reads and are never rewritten by metadata jobs.
+        CREATE TABLE IF NOT EXISTS read_metadata (
+            read_id INTEGER PRIMARY KEY REFERENCES reads(id) ON DELETE CASCADE,
+            verified_work_id TEXT NOT NULL,
+            identity_provider TEXT NOT NULL DEFAULT '',
+            identity_provider_id TEXT NOT NULL DEFAULT '',
+            identity_evidence TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(identity_evidence)),
+            metadata_provenance TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(metadata_provenance)),
+            identity_hash TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            description_kind TEXT NOT NULL DEFAULT '',
+            genres TEXT NOT NULL DEFAULT '[]',
+            cover_url TEXT NOT NULL DEFAULT '',
+            release_date TEXT NOT NULL DEFAULT '',
+            date_kind TEXT NOT NULL DEFAULT '',
+            metadata_checked_at TEXT,
+            CHECK(json_valid(genres))
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_metadata_verified_work
+            ON read_metadata(verified_work_id);
+        CREATE INDEX IF NOT EXISTS idx_read_metadata_checked
+            ON read_metadata(metadata_checked_at);
+        CREATE TRIGGER IF NOT EXISTS metadata_provenance_clear_after_candidate_delete
+        AFTER DELETE ON candidates
+        BEGIN
+            DELETE FROM metadata_field_provenance
+                WHERE entity_type='candidate' AND entity_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS metadata_provenance_clear_after_read_delete
+        AFTER DELETE ON reads
+        BEGIN
+            DELETE FROM metadata_field_provenance
+                WHERE entity_type='read' AND entity_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS read_metadata_clear_on_source_identity_change
+        AFTER UPDATE OF title,author,isbn ON reads
+        WHEN OLD.title IS NOT NEW.title OR OLD.author IS NOT NEW.author OR OLD.isbn IS NOT NEW.isbn
+        BEGIN
+            UPDATE reads SET openlibrary_work_id='',openlibrary_lookup_attempted_at=NULL
+                WHERE id=NEW.id;
+            DELETE FROM metadata_field_provenance
+                WHERE entity_type='read' AND entity_id=NEW.id;
+            DELETE FROM read_metadata WHERE read_id=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS read_metadata_clear_on_work_identity_change
+        AFTER UPDATE OF openlibrary_work_id ON reads
+        WHEN OLD.openlibrary_work_id IS NOT NEW.openlibrary_work_id
+        BEGIN
+            DELETE FROM metadata_field_provenance
+                WHERE entity_type='read' AND entity_id=NEW.id;
+            DELETE FROM read_metadata WHERE read_id=NEW.id;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -708,6 +796,90 @@ def transaction():
         con.close()
         _restrict_database_files()
 
+
+def persist_metadata_field_provenance(
+    con,
+    entity_type,
+    entity_id,
+    field,
+    item,
+    *,
+    default_provider="",
+    default_provider_id="",
+    default_confidence=0.0,
+):
+    """Persist bounded, field-specific catalog attribution for stored values."""
+
+    if field not in {"description", "genres", "cover_url", "release_date"}:
+        return 0
+    provenance = item.get("_metadata_provenance") or item.get("metadata_provenance") or {}
+    fields = provenance.get("fields", {}) if isinstance(provenance, dict) else {}
+    field_info = fields.get(field, {}) if isinstance(fields, dict) else {}
+    sources = field_info.get("sources") if isinstance(field_info, dict) else None
+    if not isinstance(sources, list):
+        sources = [field_info] if isinstance(field_info, dict) and field_info else []
+    if not sources:
+        provider_key = "cover" if field == "cover_url" else field
+        provider = item.get(f"_{provider_key}_provider") or item.get(f"{provider_key}_provider") or ""
+        provider_id = item.get(f"_{provider_key}_provider_id") or item.get(f"{provider_key}_provider_id") or ""
+        if provider or default_provider:
+            sources = [{"provider": provider or default_provider, "provider_id": provider_id or default_provider_id}]
+    if not sources and default_provider:
+        sources = [{"provider": default_provider, "provider_id": default_provider_id}]
+
+    payloads = provenance.get("source_payloads", []) if isinstance(provenance, dict) else []
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    written = 0
+    seen = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        provider = str(source.get("provider") or default_provider or "")[:100]
+        provider_id = str(source.get("provider_id") or default_provider_id or "")[:500]
+        if not provider or (provider, provider_id) in seen:
+            continue
+        seen.add((provider, provider_id))
+        source_payload = {}
+        if isinstance(payloads, list):
+            for candidate in payloads:
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("provider") == provider
+                    and str(candidate.get("provider_id") or "") == provider_id
+                ):
+                    source_payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+                    break
+        confidence = source.get("confidence", source.get("identity_quality_score", default_confidence))
+        try:
+            confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence = float(default_confidence)
+        bounded = {
+            "field": field,
+            "field_provenance": source,
+            "payload": source_payload,
+            "fetched_at": provenance.get("fetched_at", "") if isinstance(provenance, dict) else "",
+        }
+        encoded = json.dumps(bounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > METADATA_PROVENANCE_MAX_BYTES:
+            encoded = json.dumps(
+                {"field": field, "provider": provider, "provider_id": provider_id, "truncated": True},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        con.execute(
+            """INSERT INTO metadata_field_provenance(
+                entity_type,entity_id,field,provider,provider_id,confidence,
+                source_payload,verified_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(entity_type,entity_id,field,provider,provider_id) DO UPDATE SET
+                confidence=excluded.confidence,source_payload=excluded.source_payload,
+                verified_at=excluded.verified_at""",
+            (entity_type, entity_id, field, provider, provider_id, confidence, encoded, now),
+        )
+        written += 1
+    return written
+
 def initialize(*, seed_demo: bool = True):
     db_path = profile_database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -780,6 +952,11 @@ def initialize(*, seed_demo: bool = True):
             "WHERE candidate_id IN (SELECT id FROM candidates WHERE source_id=? AND status IN ('new','recommended')) "
             "AND audit_version='candidate-quality-v1'",
             (builtin_id,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET metadata_version=? "
+            "WHERE audit_version='builtin-curated-v1' AND metadata_version=''",
+            (METADATA_NORMALIZATION_VERSION,),
         )
         # Keep an existing self-hosted installation from displaying the old
         # Open Library ISBN URLs that render as 1x1 transparent GIFs.  This is

@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hashlib
 import html
 import io
 import json
@@ -12,15 +13,27 @@ import feedparser
 import httpx
 from bs4 import BeautifulSoup
 from .config import settings
-from .covers import is_weak_cover_url, metadata_client, resolve_book_metadata, resolve_cover_url, safe_cover_url
-from .database import normalize_key, private_setting, rows, transaction
+from .covers import (
+    METADATA_GENRE_LIMIT,
+    METADATA_NORMALIZATION_VERSION,
+    _publication_date,
+    is_weak_cover_url,
+    metadata_client,
+    resolve_book_metadata,
+    resolve_cover_url,
+    resolve_openlibrary_work_metadata,
+    safe_cover_url,
+    wait_for_openlibrary_request_slot,
+)
+from .database import normalize_key, persist_metadata_field_provenance, private_setting, row, rows, transaction
 from .identity import (
     book_author_identity_key,
+    book_catalog_title_identity_key,
     book_identity_match_keys,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
 )
-from .isbn import isbn_parts, isbn_parts_from_source
+from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .security import resolve_public_target
 from .subjects import normalize_subjects
 
@@ -46,7 +59,12 @@ SOURCE_FILTER_MAX_GENRES = 12
 SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 READ_WORK_IDENTITY_BATCH_SIZE = 25
 READ_WORK_IDENTITY_RETRY_DAYS = 30
-READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS = 1.0
+READ_METADATA_BATCH_SIZE = 5
+READ_METADATA_RETRY_DAYS = 30
+READ_METADATA_TRANSIENT_RETRY_HOURS = 24
+CANDIDATE_METADATA_BATCH_SIZE = 50
+CANDIDATE_METADATA_RETRY_DAYS = 30
+SOURCE_METADATA_ENRICHMENT_BATCH_SIZE = 50
 READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
 
@@ -78,7 +96,7 @@ def _filter_genre_values(value):
 
 
 def _stored_genre_values(value):
-    return normalize_subjects(value, limit=8)
+    return normalize_subjects(value, limit=METADATA_GENRE_LIMIT)
 
 
 def normalize_source_filters(value):
@@ -710,6 +728,7 @@ async def _request_openlibrary_edition(client, isbn13: str):
 
     url = f"https://openlibrary.org/isbn/{isbn13}.json"
     for _ in range(READ_WORK_IDENTITY_MAX_REDIRECTS + 1):
+        await wait_for_openlibrary_request_slot()
         response = await _request_pinned(client, "GET", url)
         location = response.headers.get("location", "").strip()
         if not response.is_redirect or not location:
@@ -849,7 +868,6 @@ async def refresh_read_work_identities(
     lookup_failures = 0
     async with metadata_client() as client:
         for _priority, read in batch:
-            await asyncio.sleep(READ_WORK_IDENTITY_REQUEST_INTERVAL_SECONDS)
             isbn13, _isbn10 = isbn_parts(read.get("isbn"))
             work_id = ""
             try:
@@ -885,6 +903,684 @@ async def refresh_read_work_identities(
         "remaining": max(0, len(targets) - len(batch)),
     }
 
+
+def _read_metadata_identity_hash(read):
+    """Fingerprint the read's bibliographic identity and verified work key."""
+
+    isbn13, isbn10 = isbn_parts(read.get("isbn"))
+    identity = {
+        "title": normalize_key(read.get("title", ""), ""),
+        "author": normalize_key("", read.get("author", "")),
+        "source_isbn": re.sub(r"[^0-9xX]", "", str(read.get("isbn") or "")).upper(),
+        "isbn13": isbn13,
+        "isbn10": isbn10,
+        "openlibrary_work_id": book_openlibrary_work_id(read),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _returned_identifiers_match_read(returned, wanted13, wanted10):
+    """Compare every projected provider identifier with the read's ISBN."""
+
+    values = list(returned) if isinstance(returned, (list, tuple, set)) else [returned]
+    for value in values:
+        returned13, returned10 = isbn_parts(value)
+        canonical = canonical_isbn(value)
+        if canonical and (canonical == wanted13 or canonical == wanted10):
+            return True
+        if (wanted13 and returned13 == wanted13) or (wanted10 and returned10 == wanted10):
+            return True
+    return False
+
+
+def _read_metadata_rows():
+    return rows(
+        """SELECT r.*,m.verified_work_id AS cached_work_id,
+            m.identity_provider AS cached_identity_provider,
+            m.identity_provider_id AS cached_identity_provider_id,
+            m.identity_hash AS cached_identity_hash,
+            m.description AS cached_description,
+            m.description_kind AS cached_description_kind,
+            m.genres AS cached_genres,m.cover_url AS cached_cover_url,
+            m.release_date AS cached_release_date,m.date_kind AS cached_date_kind,
+            m.metadata_provenance AS cached_metadata_provenance,
+            m.metadata_checked_at
+        FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id
+        WHERE r.rating IS NOT NULL AND TRIM(COALESCE(r.isbn,''))!=''
+        ORDER BY COALESCE(m.metadata_checked_at,'') ASC,r.id"""
+    )
+
+
+def _read_metadata_attempt_is_due(read, retry_before):
+    if not any(isbn_parts(read.get("isbn"))):
+        return False
+    current_work_id = str(read.get("openlibrary_work_id") or "")
+    cached_work_id = str(read.get("cached_work_id") or "")
+    if (
+        str(read.get("cached_identity_hash") or "") != _read_metadata_identity_hash(read)
+        or (current_work_id and cached_work_id != current_work_id)
+    ):
+        return True
+    attempted_at = read.get("metadata_checked_at")
+    if not attempted_at:
+        return True
+    try:
+        attempted = datetime.fromisoformat(str(attempted_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if attempted.tzinfo is None:
+        attempted = attempted.replace(tzinfo=timezone.utc)
+    try:
+        provenance = json.loads(read.get("cached_metadata_provenance") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        provenance = {}
+    attempt = provenance.get("last_attempt", provenance) if isinstance(provenance, dict) else {}
+    traces = attempt.get("fetch_trace", []) if isinstance(attempt, dict) else []
+    transient_statuses = {"request_error", "http_error", "rate_limited", "server_error", "timeout", "provider_unavailable"}
+    transient = bool(
+        isinstance(attempt, dict)
+        and (attempt.get("error_type") or attempt.get("attempt_status") in {"request_error", "provider_unavailable"})
+    ) or (
+        isinstance(traces, list)
+        and any(isinstance(trace, dict) and trace.get("status") in transient_statuses for trace in traces)
+    )
+    if transient:
+        transient_retry_before = datetime.now(timezone.utc) - timedelta(hours=READ_METADATA_TRANSIENT_RETRY_HOURS)
+        return attempted <= transient_retry_before
+    return attempted <= retry_before
+
+
+def _verified_read_metadata(metadata, read):
+    """Keep only fields from an exact ISBN result or a cached exact work key."""
+
+    provenance = metadata.get("metadata_provenance", {})
+    if not isinstance(provenance, dict):
+        return {}, {}, ""
+    traces = provenance.get("fetch_trace", [])
+    payloads = provenance.get("source_payloads", [])
+    if not isinstance(traces, list) or not isinstance(payloads, list):
+        return {}, {}, ""
+
+    known_work_id = book_openlibrary_work_id(read)
+    verified: dict[tuple[str, str], dict] = {}
+    if known_work_id:
+        returned_id = book_openlibrary_work_id(
+            {"openlibrary_work_id": metadata.get("work_id") or metadata.get("provider_id", "")}
+        )
+        candidate_title = book_catalog_title_identity_key(metadata.get("catalog_title", ""))
+        read_title = book_catalog_title_identity_key(read.get("title", ""))
+        matching_trace = any(
+            isinstance(trace, dict)
+            and trace.get("provider") == "openlibrary"
+            and trace.get("status") == "matched"
+            and trace.get("provider_id") == known_work_id
+            for trace in traces
+        )
+        if returned_id == known_work_id and candidate_title == read_title and matching_trace:
+            verified[("openlibrary", known_work_id)] = {"kind": "verified_work_id"}
+    else:
+        wanted13, wanted10 = isbn_parts(read.get("isbn"))
+        read_title = book_catalog_title_identity_key(read.get("title", ""))
+        read_author = book_author_identity_key(read.get("author", ""))
+        matched_isbn_traces = [
+            trace for trace in traces
+            if isinstance(trace, dict)
+            and trace.get("query_kind") == "isbn"
+            and trace.get("status") == "matched"
+            and trace.get("provider")
+            and trace.get("provider_id")
+        ]
+        for trace in matched_isbn_traces:
+            provider = str(trace.get("provider") or "")
+            provider_id = str(trace.get("provider_id") or "")
+            source = next(
+                (
+                    item for item in payloads
+                    if isinstance(item, dict)
+                    and item.get("provider") == provider
+                    and str(item.get("provider_id") or "") == provider_id
+                    and isinstance(item.get("payload"), dict)
+                ),
+                None,
+            )
+            if not source:
+                continue
+            source_payload = source["payload"]
+            identifier_matches = _returned_identifiers_match_read(
+                source_payload.get("identifiers", []), wanted13, wanted10
+            )
+            catalog_title = book_catalog_title_identity_key(source_payload.get("title", ""))
+            catalog_authors = source_payload.get("authors", [])
+            if not isinstance(catalog_authors, (list, tuple)):
+                catalog_authors = [catalog_authors]
+            author_matches = any(
+                book_author_identity_key(author) == read_author
+                for author in catalog_authors
+                if author
+            )
+            if identifier_matches and catalog_title == read_title and author_matches:
+                verified[(provider, provider_id)] = {
+                    "kind": "isbn_record",
+                    "query_kind": "isbn",
+                    "identifier_verified": True,
+                }
+
+    if not verified:
+        return {}, {}, ""
+
+    fields = provenance.get("fields", {})
+    if not isinstance(fields, dict):
+        fields = {}
+    trusted_payloads = [
+        source for source in payloads
+        if isinstance(source, dict)
+        and (str(source.get("provider") or ""), str(source.get("provider_id") or "")) in verified
+    ]
+    filtered_fields = {}
+    selected_by_field = {}
+    for field in ("description", "genres", "cover_url", "release_date"):
+        info = fields.get(field)
+        if not isinstance(info, dict):
+            continue
+        sources = info.get("sources")
+        if not isinstance(sources, list):
+            sources = [info]
+        selected = [
+            source for source in sources
+            if isinstance(source, dict)
+            and (str(source.get("provider") or ""), str(source.get("provider_id") or "")) in verified
+        ]
+        if selected:
+            # Never carry a merged field's top-level attribution through after
+            # its source has been filtered out. In particular, genres can be
+            # merged from one verified and one unrelated catalog result.
+            selected_by_field[field] = selected
+            selected_field = dict(selected[0])
+            selected_field["provider"] = str(selected[0].get("provider") or "")
+            selected_field["provider_id"] = str(selected[0].get("provider_id") or "")
+            selected_field["source_field"] = str(selected[0].get("source_field") or "")
+            if field == "genres":
+                selected_values = normalize_subjects(
+                    [
+                        value
+                        for source in selected
+                        for payload in trusted_payloads
+                        if payload.get("provider") == source.get("provider")
+                        and str(payload.get("provider_id") or "") == str(source.get("provider_id") or "")
+                        and isinstance(payload.get("payload"), dict)
+                        for value in payload["payload"].get("genres", [])
+                    ],
+                    limit=METADATA_GENRE_LIMIT,
+                )
+                selected_field["value_sha256"] = hashlib.sha256(
+                    json.dumps(selected_values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            filtered_fields[field] = (
+                {**info, **selected_field, "sources": selected}
+                if len(selected) != 1 or info.get("sources")
+                else selected_field
+            )
+
+    filtered = dict(metadata)
+    filtered["metadata_provenance"] = {
+        **provenance,
+        "fields": filtered_fields,
+        "fetch_trace": [
+            trace for trace in traces
+            if isinstance(trace, dict)
+            and (str(trace.get("provider") or ""), str(trace.get("provider_id") or "")) in verified
+        ],
+        "source_payloads": trusted_payloads,
+    }
+    for field, provider_key in (
+        ("description", "description"),
+        ("cover_url", "cover"),
+        ("release_date", "release_date"),
+        ("genres", "genres"),
+    ):
+        selected = selected_by_field.get(field, [])
+        if not selected:
+            filtered[field] = [] if field == "genres" else ""
+            filtered[f"{provider_key}_provider"] = ""
+            filtered[f"{provider_key}_provider_id"] = ""
+            continue
+        first = selected[0]
+        filtered[f"{provider_key}_provider"] = str(first.get("provider") or "")
+        filtered[f"{provider_key}_provider_id"] = str(first.get("provider_id") or "")
+        if field == "genres":
+            filtered["genres"] = normalize_subjects(
+                [
+                    value
+                    for source in selected
+                    for payload in trusted_payloads
+                    if payload.get("provider") == source.get("provider")
+                    and str(payload.get("provider_id") or "") == str(source.get("provider_id") or "")
+                    and isinstance(payload.get("payload"), dict)
+                    for value in payload["payload"].get("genres", [])
+                ],
+                limit=METADATA_GENRE_LIMIT,
+            )
+
+    identity_provider, identity_provider_id = next(iter(verified))
+    verified_work_id = (
+        book_openlibrary_work_id({"openlibrary_work_id": identity_provider_id})
+        if identity_provider == "openlibrary"
+        else ""
+    )
+    evidence = {
+        "kind": verified[(identity_provider, identity_provider_id)]["kind"],
+        "provider": identity_provider,
+        "provider_id": identity_provider_id,
+        "isbn_sha256": hashlib.sha256("|".join(isbn_parts(read.get("isbn"))).encode()).hexdigest(),
+    }
+    return filtered, evidence, verified_work_id
+
+
+def _read_metadata_attempt_provenance(provenance, *, status, error_type=""):
+    """Keep bounded request evidence without caching an unverified book record."""
+
+    traces = provenance.get("fetch_trace", []) if isinstance(provenance, dict) else []
+    safe_traces = []
+    if isinstance(traces, list):
+        for trace in traces[:12]:
+            if not isinstance(trace, dict):
+                continue
+            item = {
+                key: str(trace[key])[:100]
+                for key in ("provider", "status", "query_kind", "identifier_evidence", "error_type")
+                if trace.get(key) is not None
+            }
+            if isinstance(trace.get("http_status"), int):
+                item["http_status"] = trace["http_status"]
+            if isinstance(trace.get("matched_count"), int):
+                item["matched_count"] = max(0, trace["matched_count"])
+            if item:
+                safe_traces.append(item)
+    fetched_at = provenance.get("fetched_at") if isinstance(provenance, dict) else ""
+    result = {
+        "fetched_at": str(fetched_at or datetime.now(timezone.utc).isoformat(timespec="seconds"))[:40],
+        "attempt_status": str(status)[:60],
+        "fetch_trace": safe_traces,
+        "source_payloads": [],
+    }
+    if error_type:
+        result["error_type"] = str(error_type)[:100]
+    return result
+
+
+def read_metadata_refresh_remaining(
+    retry_days: int = READ_METADATA_RETRY_DAYS,
+) -> int:
+    """Count rated reads with a valid ISBN due for bounded enrichment."""
+
+    retry_before = datetime.now(timezone.utc) - timedelta(days=max(1, int(retry_days)))
+    return sum(
+        1 for read in _read_metadata_rows()
+        if _read_metadata_attempt_is_due(read, retry_before)
+    )
+
+
+def _read_field_sources(provenance, field):
+    fields = provenance.get("fields", {}) if isinstance(provenance, dict) else {}
+    info = fields.get(field) if isinstance(fields, dict) else None
+    if not isinstance(info, dict):
+        return []
+    sources = info.get("sources")
+    if not isinstance(sources, list):
+        sources = [info]
+    return [source for source in sources if isinstance(source, dict)]
+
+
+def _read_description_upgrade_allowed(con, read_id, existing, metadata, description, description_kind):
+    """Allow opener-to-synopsis replacement only for the exact cached source."""
+
+    if (
+        not existing
+        or not existing["description"]
+        or existing["description_kind"] != "opening_sentence"
+        or description_kind != "synopsis"
+        or not description
+    ):
+        return False
+
+    cached_source = con.execute(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='read' AND entity_id=? AND field='description' "
+        "ORDER BY verified_at DESC LIMIT 1",
+        (read_id,),
+    ).fetchone()
+    if cached_source:
+        cached_pair = (str(cached_source["provider"] or ""), str(cached_source["provider_id"] or ""))
+    else:
+        try:
+            prior = json.loads(existing["metadata_provenance"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            prior = {}
+        sources = _read_field_sources(prior, "description")
+        if not sources:
+            return False
+        cached_pair = (str(sources[0].get("provider") or ""), str(sources[0].get("provider_id") or ""))
+    if not all(cached_pair):
+        return False
+
+    provenance = metadata.get("metadata_provenance", {})
+    for source in _read_field_sources(provenance, "description"):
+        pair = (str(source.get("provider") or ""), str(source.get("provider_id") or ""))
+        if pair != cached_pair or str(source.get("kind") or "") != "synopsis":
+            continue
+        for payload in provenance.get("source_payloads", []) if isinstance(provenance, dict) else []:
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("provider") or "") == pair[0]
+                and str(payload.get("provider_id") or "") == pair[1]
+                and isinstance(payload.get("payload"), dict)
+                and str(payload["payload"].get("opening_sentence") or "") == existing["description"]
+            ):
+                return True
+    return False
+
+
+def _read_metadata_provenance_for_storage(existing, attempt, fields_added, verified):
+    """Retain provenance for cached primitives while recording each attempt."""
+
+    try:
+        previous = json.loads(existing["metadata_provenance"] or "{}") if existing else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+    try:
+        previous_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        previous_evidence = {}
+    has_previous_identity = bool(
+        existing
+        and str(existing["identity_provider"] or "")
+        and str(existing["identity_provider_id"] or "")
+        and isinstance(previous_evidence, dict)
+        and previous_evidence
+    )
+    if not verified:
+        if has_previous_identity:
+            previous["last_attempt"] = attempt
+            return previous
+        return attempt
+
+    if not has_previous_identity:
+        return attempt
+
+    old_fields = previous.get("fields", {})
+    if not isinstance(old_fields, dict):
+        old_fields = {}
+    new_fields = attempt.get("fields", {}) if isinstance(attempt, dict) else {}
+    if not isinstance(new_fields, dict):
+        new_fields = {}
+    stored_fields = dict(old_fields)
+    for field, contributed in fields_added.items():
+        if contributed and field in new_fields:
+            stored_fields[field] = new_fields[field]
+
+    needed_sources = set()
+    for field_info in stored_fields.values():
+        sources = field_info.get("sources") if isinstance(field_info, dict) else None
+        if not isinstance(sources, list):
+            sources = [field_info] if isinstance(field_info, dict) else []
+        for source in sources:
+            if isinstance(source, dict) and source.get("provider") and source.get("provider_id"):
+                needed_sources.add((str(source["provider"]), str(source["provider_id"])))
+    payload_by_source = {}
+    for provenance in (previous, attempt):
+        payloads = provenance.get("source_payloads", []) if isinstance(provenance, dict) else []
+        if not isinstance(payloads, list):
+            continue
+        for source in payloads:
+            if not isinstance(source, dict):
+                continue
+            pair = (str(source.get("provider") or ""), str(source.get("provider_id") or ""))
+            if pair in needed_sources and isinstance(source.get("payload"), dict):
+                payload_by_source[pair] = source
+
+    combined = dict(attempt)
+    combined["fields"] = stored_fields
+    combined["source_payloads"] = [payload_by_source[pair] for pair in sorted(payload_by_source)]
+    combined["attempt_status"] = "verified"
+    return combined
+
+
+async def refresh_read_metadata(
+    limit: int = READ_METADATA_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache exact-identity public metadata without editing reads or ratings."""
+
+    retry_before = datetime.now(timezone.utc) - timedelta(days=READ_METADATA_RETRY_DAYS)
+    due = [
+        read for read in _read_metadata_rows()
+        if _read_metadata_attempt_is_due(read, retry_before)
+    ]
+    batch_size = max(1, min(int(limit), READ_METADATA_BATCH_SIZE))
+    batch = due[:batch_size]
+    if not batch:
+        return {"checked": 0, "updated": 0, "lookup_failures": 0, "remaining": 0}
+
+    checked_at = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    updated = 0
+    lookup_failures = 0
+    async with metadata_client() as client:
+        for read in batch:
+            read_isbn13, read_isbn10 = isbn_parts(read.get("isbn"))
+            work_id = book_openlibrary_work_id(read)
+            metadata = {}
+            attempt_provenance = {}
+            attempt_error_type = ""
+            try:
+                if work_id:
+                    metadata = await resolve_openlibrary_work_metadata(
+                        work_id,
+                        title=str(read.get("title") or ""),
+                        author=str(read.get("author") or ""),
+                        client=client,
+                    )
+                    attempt_provenance = metadata.get("metadata_provenance", {})
+                    traces = metadata.get("metadata_provenance", {}).get("fetch_trace", [])
+                    if not any(
+                        isinstance(trace, dict)
+                        and trace.get("status") == "matched"
+                        and trace.get("provider_id") == work_id
+                        for trace in traces
+                    ):
+                        metadata = {}
+                else:
+                    metadata = await resolve_book_metadata(
+                        str(read.get("title") or ""),
+                        str(read.get("author") or ""),
+                        isbn13=read_isbn13,
+                        isbn10=read_isbn10,
+                        google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
+                        client=client,
+                    )
+                    attempt_provenance = metadata.get("metadata_provenance", {})
+                metadata, identity_evidence, verified_work_id = _verified_read_metadata(metadata, read)
+                if identity_evidence:
+                    attempt_provenance = {
+                        **metadata.get("metadata_provenance", {}),
+                        "attempt_status": "verified",
+                    }
+                else:
+                    attempt_provenance = _read_metadata_attempt_provenance(
+                        attempt_provenance,
+                        status="identity_unverified",
+                    )
+            except Exception as exc:
+                # Provider failures and invalid identity matches receive the
+                # same negative-cache window, so one bad record cannot spin.
+                lookup_failures += 1
+                attempt_error_type = type(exc).__name__
+                attempt_provenance = _read_metadata_attempt_provenance(
+                    attempt_provenance,
+                    status="request_error",
+                    error_type=attempt_error_type,
+                )
+                metadata, identity_evidence, verified_work_id = {}, {}, ""
+
+            identity_hash = _read_metadata_identity_hash(read)
+            identity_provider = str(identity_evidence.get("provider") or "")
+            identity_provider_id = str(identity_evidence.get("provider_id") or "")
+            if identity_evidence or attempt_error_type:
+                metadata_provenance = attempt_provenance
+            else:
+                attempt_status = (
+                    "provider_unavailable"
+                    if any(
+                        isinstance(trace, dict)
+                        and trace.get("status") in {"request_error", "http_error", "rate_limited", "server_error", "timeout"}
+                        for trace in attempt_provenance.get("fetch_trace", [])
+                    )
+                    else "no_verified_record"
+                )
+                metadata_provenance = _read_metadata_attempt_provenance(
+                    attempt_provenance,
+                    status=attempt_status,
+                )
+            description = str(metadata.get("description") or "").strip()
+            description_kind = str(metadata.get("description_kind") or "")
+            genres = normalize_subjects(metadata.get("genres", []), limit=METADATA_GENRE_LIMIT)
+            cover_url = safe_cover_url(metadata.get("cover_url", ""))
+            release_date = str(metadata.get("release_date") or "")
+            date_kind = str(metadata.get("date_kind") or "")
+
+            with transaction() as con:
+                current = con.execute("SELECT * FROM reads WHERE id=?", (read["id"],)).fetchone()
+                if current is None or _read_metadata_identity_hash(dict(current)) != identity_hash:
+                    # A title, author, or ISBN edit landed while fetching.
+                    continue
+                if str(current["openlibrary_work_id"] or "") != work_id:
+                    # Do not attach work-specific metadata after identity
+                    # verification changed in another job.
+                    continue
+                existing = con.execute("SELECT * FROM read_metadata WHERE read_id=?", (read["id"],)).fetchone()
+                if existing and existing["identity_hash"] != identity_hash:
+                    con.execute(
+                        "DELETE FROM metadata_field_provenance WHERE entity_type='read' AND entity_id=?",
+                        (read["id"],),
+                    )
+                    con.execute("DELETE FROM read_metadata WHERE read_id=?", (read["id"],))
+                    existing = None
+
+                previous_genres = normalize_subjects(existing["genres"] if existing else [], limit=METADATA_GENRE_LIMIT)
+                merged_genres = normalize_subjects(previous_genres + genres, limit=METADATA_GENRE_LIMIT)
+                previous_description = existing["description"] if existing else ""
+                previous_cover = existing["cover_url"] if existing else ""
+                previous_release = existing["release_date"] if existing else ""
+                description_upgrade = _read_description_upgrade_allowed(
+                    con,
+                    int(read["id"]),
+                    existing,
+                    metadata,
+                    description,
+                    description_kind,
+                )
+                new_description = (
+                    description
+                    if not previous_description or description_upgrade
+                    else previous_description
+                )
+                new_description_kind = (
+                    description_kind
+                    if not previous_description or description_upgrade
+                    else existing["description_kind"]
+                )
+                new_cover = cover_url if cover_url and (not previous_cover or is_weak_cover_url(previous_cover)) else previous_cover
+                new_release = previous_release or release_date
+                new_date_kind = existing["date_kind"] if existing and previous_release else date_kind
+                fields_added = {
+                    "description": bool(description and (not previous_description or description_upgrade)),
+                    "genres": merged_genres != previous_genres,
+                    "cover_url": bool(new_cover and new_cover != previous_cover),
+                    "release_date": bool(release_date and not previous_release),
+                }
+                try:
+                    existing_identity_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_identity_evidence = {}
+                preserve_identity = bool(
+                    existing
+                    and not identity_evidence
+                    and existing["identity_provider"]
+                    and existing["identity_provider_id"]
+                    and isinstance(existing_identity_evidence, dict)
+                    and existing_identity_evidence
+                )
+                stored_identity_provider = (
+                    identity_provider if identity_evidence else str(existing["identity_provider"] or "") if preserve_identity else ""
+                )
+                stored_identity_provider_id = (
+                    identity_provider_id if identity_evidence else str(existing["identity_provider_id"] or "") if preserve_identity else ""
+                )
+                stored_verified_work_id = (
+                    verified_work_id if identity_evidence else str(existing["verified_work_id"] or "") if preserve_identity else ""
+                )
+                stored_identity_evidence = (
+                    identity_evidence
+                    if identity_evidence
+                    else existing_identity_evidence if preserve_identity
+                    else {}
+                )
+                metadata_provenance = _read_metadata_provenance_for_storage(
+                    existing,
+                    metadata_provenance,
+                    fields_added,
+                    bool(identity_evidence),
+                )
+                con.execute(
+                    """INSERT INTO read_metadata(
+                        read_id,verified_work_id,identity_provider,identity_provider_id,
+                        identity_evidence,metadata_provenance,identity_hash,
+                        description,description_kind,genres,cover_url,release_date,
+                        date_kind,metadata_checked_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(read_id) DO UPDATE SET
+                        verified_work_id=excluded.verified_work_id,
+                        identity_provider=excluded.identity_provider,
+                        identity_provider_id=excluded.identity_provider_id,
+                        identity_evidence=excluded.identity_evidence,
+                        metadata_provenance=excluded.metadata_provenance,
+                        identity_hash=excluded.identity_hash,
+                        description=excluded.description,description_kind=excluded.description_kind,
+                        genres=excluded.genres,cover_url=excluded.cover_url,
+                        release_date=excluded.release_date,date_kind=excluded.date_kind,
+                        metadata_checked_at=excluded.metadata_checked_at""",
+                    (
+                        read["id"], stored_verified_work_id, stored_identity_provider, stored_identity_provider_id,
+                        json.dumps(stored_identity_evidence, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(metadata_provenance, ensure_ascii=False, separators=(",", ":")),
+                        identity_hash, new_description, new_description_kind,
+                        json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":")),
+                        new_cover, new_release, new_date_kind, checked_at(),
+                    ),
+                )
+                provenance_item = dict(metadata)
+                provenance_item["_metadata_provenance"] = metadata.get("metadata_provenance", {})
+                for field, contributed in fields_added.items():
+                    if contributed:
+                        _persist_metadata_field_provenance(
+                            con,
+                            "read",
+                            int(read["id"]),
+                            field,
+                            provenance_item,
+                            default_provider=identity_provider,
+                            default_provider_id=identity_provider_id,
+                            default_confidence=1.0,
+                        )
+                updated += int(any(fields_added.values()))
+
+    return {
+        "checked": len(batch),
+        "updated": updated,
+        "lookup_failures": lookup_failures,
+        "remaining": read_metadata_refresh_remaining(),
+    }
 
 async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
     current_url = str(url)
@@ -1035,7 +1731,7 @@ def _nyt_request_url(url: str) -> str:
 
 def _clean_parsed_subjects(items):
     return [
-        {**item, "genres": normalize_subjects(item.get("genres"), limit=8)}
+        {**item, "genres": normalize_subjects(item.get("genres"), limit=METADATA_GENRE_LIMIT)}
         for item in items
     ]
 
@@ -1168,7 +1864,7 @@ def _schema_image(value):
 
 def _schema_genres(value):
     raw_genres = value.get("genre", []) if isinstance(value, dict) else []
-    return normalize_subjects(raw_genres, limit=8)
+    return normalize_subjects(raw_genres, limit=METADATA_GENRE_LIMIT)
 
 
 def _date_kind(raw_value):
@@ -1217,7 +1913,7 @@ def _merge_book_item(items, item, source_url):
         "source_url": item_source_url,
         "release_date": item.get("release_date"),
         "date_kind": item.get("date_kind", "") or "",
-        "genres": normalize_subjects(item.get("genres"), limit=8),
+        "genres": normalize_subjects(item.get("genres"), limit=METADATA_GENRE_LIMIT),
     }
     if isbn13:
         normalized["isbn13"] = isbn13
@@ -1258,7 +1954,7 @@ def _merge_book_item(items, item, source_url):
             existing["date_kind"] = normalized["date_kind"]
         if normalized.get("genres"):
             existing["genres"] = normalize_subjects(
-                (existing.get("genres") or []) + normalized["genres"], limit=8
+                (existing.get("genres") or []) + normalized["genres"], limit=METADATA_GENRE_LIMIT
             )
         if existing_author_key in unknown_authors and author_key not in unknown_authors:
             existing["author"] = normalized["author"]
@@ -1550,6 +2246,7 @@ async def enrich_cover_urls(items):
                     item.get("cover_url", ""),
                     item.get("source_url", ""),
                     client=client,
+                    google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
                 )
                 return {**item, "cover_url": cover}
 
@@ -1579,6 +2276,10 @@ async def enrich_book_metadata(items):
                     lookup_cache=lookup_cache,
                     expected_provider=item.get("_expected_provider", ""),
                     expected_provider_id=item.get("_expected_provider_id", ""),
+                    isbn13=item.get("isbn13", ""),
+                    isbn10=item.get("isbn10", ""),
+                    google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
+                    prefer_catalog_synopsis=bool(item.get("_prefer_catalog_synopsis")),
                 )
                 enriched = {**item, "cover_url": metadata["cover_url"]}
                 if not enriched.get("description") and metadata["description"]:
@@ -1589,15 +2290,51 @@ async def enrich_book_metadata(items):
                 elif enriched.get("release_date") and not enriched.get("date_kind"):
                     enriched["date_kind"] = "source"
                 enriched["genres"] = normalize_subjects(
-                    normalize_subjects(enriched.get("genres", []))
-                    + normalize_subjects(metadata.get("genres", [])),
-                    limit=8,
+                    normalize_subjects(enriched.get("genres", []), limit=METADATA_GENRE_LIMIT)
+                    + normalize_subjects(metadata.get("genres", []), limit=METADATA_GENRE_LIMIT),
+                    limit=METADATA_GENRE_LIMIT,
                 )
                 enriched["_metadata_provider"] = metadata.get("provider", "")
                 enriched["_metadata_provider_id"] = metadata.get("provider_id", "")
                 enriched["_metadata_work_id"] = metadata.get("work_id", "")
                 enriched["_metadata_title_match"] = metadata.get("title_match", 0.0)
                 enriched["_metadata_author_match"] = metadata.get("author_match", 0.0)
+                for field in ("description", "genres", "cover", "release_date"):
+                    provider_field = "cover_url" if field == "cover" else field
+                    enriched[f"_{provider_field}_provider"] = (
+                        metadata.get(f"{field}_provider")
+                        or item.get(f"_{provider_field}_provider", "")
+                    )
+                    enriched[f"_{provider_field}_provider_id"] = (
+                        metadata.get(f"{field}_provider_id")
+                        or item.get(f"_{provider_field}_provider_id", "")
+                    )
+                enriched["_description_candidate"] = metadata.get("description_candidate")
+                catalog_provenance = metadata.get("metadata_provenance", {})
+                prior_provenance = item.get("_metadata_provenance", {})
+                if isinstance(prior_provenance, dict) and isinstance(catalog_provenance, dict):
+                    fields = dict(prior_provenance.get("fields", {}))
+                    fields.update(catalog_provenance.get("fields", {}))
+                    payloads = list(prior_provenance.get("source_payloads", []))
+                    payload_keys = {
+                        (entry.get("provider"), entry.get("provider_id"))
+                        for entry in payloads
+                        if isinstance(entry, dict)
+                    }
+                    payloads.extend(
+                        entry
+                        for entry in catalog_provenance.get("source_payloads", [])
+                        if isinstance(entry, dict)
+                        and (entry.get("provider"), entry.get("provider_id")) not in payload_keys
+                    )
+                    enriched["_metadata_provenance"] = {
+                        **prior_provenance,
+                        **catalog_provenance,
+                        "fields": fields,
+                        "source_payloads": payloads,
+                    }
+                else:
+                    enriched["_metadata_provenance"] = catalog_provenance or prior_provenance
                 return enriched
 
         return await asyncio.gather(*(enrich(item) for item in items))
@@ -1774,6 +2511,7 @@ async def enrich_penguin_random_house_items(items):
                 ),
             )
             enriched = dict(item)
+            publisher_fields = {}
             for field in (
                 "description",
                 "cover_url",
@@ -1784,11 +2522,46 @@ async def enrich_penguin_random_house_items(items):
             ):
                 if not enriched.get(field) and detail.get(field):
                     enriched[field] = detail[field]
+                    if field == "description":
+                        publisher_fields[field] = detail[field]
             enriched["genres"] = normalize_subjects(
-                normalize_subjects(enriched.get("genres", []))
-                + normalize_subjects(detail.get("genres", [])),
-                limit=8,
+                normalize_subjects(enriched.get("genres", []), limit=METADATA_GENRE_LIMIT)
+                + normalize_subjects(detail.get("genres", []), limit=METADATA_GENRE_LIMIT),
+                limit=METADATA_GENRE_LIMIT,
             )
+            if publisher_fields:
+                parsed_url = urlparse(url)
+                provider_id = f"https://{parsed_url.netloc}{parsed_url.path}"
+                payload = {
+                    "title": str(detail.get("title") or item.get("title") or "")[:500],
+                    "authors": [str(detail.get("author") or item.get("author") or "")[:300]],
+                    "description": str(publisher_fields["description"])[:4000],
+                    "identifiers": [
+                        value for value in (detail.get("isbn13"), detail.get("isbn10")) if value
+                    ],
+                }
+                provenance = dict(enriched.get("_metadata_provenance") or {})
+                fields = dict(provenance.get("fields", {}))
+                fields["description"] = {
+                    "provider": "penguinrandomhouse",
+                    "provider_id": provider_id,
+                    "kind": "publisher_product",
+                    "source_field": "description",
+                }
+                payloads = list(provenance.get("source_payloads", []))
+                payloads.append({
+                    "provider": "penguinrandomhouse",
+                    "provider_id": provider_id,
+                    "payload": payload,
+                })
+                enriched["_description_provider"] = "penguinrandomhouse"
+                enriched["_description_provider_id"] = provider_id
+                enriched["_metadata_provenance"] = {
+                    **provenance,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "fields": fields,
+                    "source_payloads": payloads,
+                }
             return enriched
 
         return await asyncio.gather(*(enrich(item) for item in items))
@@ -1801,7 +2574,7 @@ def normalize_stored_candidate_subjects() -> int:
     updates = []
     for candidate in candidates:
         normalized = json.dumps(
-            normalize_subjects(candidate.get("genres"), limit=8),
+            normalize_subjects(candidate.get("genres"), limit=METADATA_GENRE_LIMIT),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -1816,83 +2589,240 @@ def normalize_stored_candidate_subjects() -> int:
     return len(updates)
 
 
+def normalize_stored_candidate_catalog_dates() -> int:
+    """Canonicalize legacy catalog dates without inventing field provenance."""
+
+    candidates = rows(
+        "SELECT id,release_date,date_kind FROM candidates "
+        "WHERE date_kind='catalog' AND release_date IS NOT NULL AND TRIM(release_date)!=''"
+    )
+    updates = []
+    for candidate in candidates:
+        canonical_date, precision = _publication_date(candidate.get("release_date"))
+        if not canonical_date or not precision:
+            # Keep malformed legacy text visible for manual/source review.
+            continue
+        try:
+            parsed_date = date.fromisoformat(canonical_date)
+        except ValueError:
+            # In particular, reject year zero even though a year-only catalog
+            # value can otherwise be expanded into an ISO-looking string.
+            continue
+        if not 1 <= parsed_date.year <= 9999:
+            continue
+        if (canonical_date, precision) != (candidate.get("release_date"), candidate.get("date_kind")):
+            updates.append((canonical_date, precision, candidate["id"]))
+    if updates:
+        with transaction() as con:
+            con.executemany(
+                "UPDATE candidates SET release_date=?,date_kind=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                updates,
+            )
+    return len(updates)
+
+
+def _persist_metadata_field_provenance(
+    con,
+    entity_type,
+    entity_id,
+    field,
+    item,
+    *,
+    default_provider="",
+    default_provider_id="",
+    default_confidence=0.0,
+):
+    return persist_metadata_field_provenance(
+        con,
+        entity_type,
+        entity_id,
+        field,
+        item,
+        default_provider=default_provider,
+        default_provider_id=default_provider_id,
+        default_confidence=default_confidence,
+    )
+
+
+def candidate_metadata_refresh_remaining(
+    retry_days: int = CANDIDATE_METADATA_RETRY_DAYS,
+) -> int:
+    """Count accepted candidates due for a sparse-field or version refresh."""
+
+    retry_before = (
+        datetime.now(timezone.utc) - timedelta(days=max(1, int(retry_days)))
+    ).isoformat(timespec="seconds")
+    result = row(
+        """SELECT COUNT(*) AS count FROM candidates c
+        JOIN candidate_quality q ON q.candidate_id=c.id
+        WHERE c.status!='rejected' AND q.quality_status='accepted'
+          AND (
+            q.metadata_version!=?
+            OR c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%'
+            OR c.cover_url LIKE 'https://placehold.co/%'
+            OR c.description='' OR c.release_date IS NULL
+            OR CASE WHEN json_valid(c.genres) THEN json_array_length(c.genres) ELSE 0 END=0
+          )
+          AND (
+            q.metadata_version!=?
+            OR q.metadata_checked_at IS NULL
+            OR q.metadata_checked_at<=?
+          )""",
+        (METADATA_NORMALIZATION_VERSION, METADATA_NORMALIZATION_VERSION, retry_before),
+    )
+    return int(result["count"] if result else 0)
+
+
 async def refresh_missing_candidate_metadata():
     """Backfill sparse metadata for catalog-accepted candidates only."""
 
     normalize_stored_candidate_subjects()
+    normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
-        "q.provider AS _expected_provider,q.provider_id AS _expected_provider_id "
+        "q.provider AS _expected_provider,q.provider_id AS _expected_provider_id,"
+        "q.metadata_provider AS _legacy_metadata_provider,"
+        "q.metadata_provider_id AS _legacy_metadata_provider_id,"
+        "q.metadata_version AS _metadata_version "
         "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status!='rejected' AND q.quality_status='accepted' AND ("
-        "cover_url='' OR cover_url LIKE '%/b/isbn/%' OR cover_url LIKE 'https://placehold.co/%' "
-        "OR description='' OR release_date IS NULL "
+        "q.metadata_version!=? OR cover_url='' OR cover_url LIKE '%/b/isbn/%' "
+        "OR cover_url LIKE 'https://placehold.co/%' OR description='' OR release_date IS NULL "
         "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
-        "ORDER BY q.metadata_checked_at ASC,c.score DESC,c.id LIMIT 50"
+        "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR q.metadata_checked_at<=?) "
+        "ORDER BY CASE WHEN q.metadata_version!=? THEN 0 ELSE 1 END,"
+        "q.metadata_checked_at ASC,c.score DESC,c.id LIMIT ?",
+        (
+            METADATA_NORMALIZATION_VERSION,
+            METADATA_NORMALIZATION_VERSION,
+            (datetime.now(timezone.utc) - timedelta(days=CANDIDATE_METADATA_RETRY_DAYS)).isoformat(timespec="seconds"),
+            METADATA_NORMALIZATION_VERSION,
+            CANDIDATE_METADATA_BATCH_SIZE,
+        ),
     )
     if not candidates:
-        return 0
-    enriched = await enrich_book_metadata(
-        [{**candidate, "genres": _stored_genre_values(candidate.get("genres"))} for candidate in candidates]
-    )
+        return normalized_catalog_dates
+    inputs = []
+    for candidate in candidates:
+        item = {**candidate, "genres": _stored_genre_values(candidate.get("genres"))}
+        has_legacy_description = bool(
+            candidate.get("description")
+            and candidate.get("_legacy_metadata_provider")
+            and not row(
+                "SELECT 1 FROM metadata_field_provenance "
+                "WHERE entity_type='candidate' AND entity_id=? AND field='description' LIMIT 1",
+                (candidate["id"],),
+            )
+        )
+        item["_legacy_description_upgrade"] = has_legacy_description
+        if has_legacy_description:
+            item["_expected_provider"] = candidate.get("_legacy_metadata_provider") or ""
+            item["_expected_provider_id"] = candidate.get("_legacy_metadata_provider_id") or ""
+            item["_prefer_catalog_synopsis"] = True
+        inputs.append(item)
+    enriched = await enrich_book_metadata(inputs)
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
             description = item.get("description", "")
+            description_upgrade = False
+            candidate_description = item.get("_description_candidate")
+            if (
+                previous.get("description")
+                and item.get("_legacy_description_upgrade")
+                and isinstance(candidate_description, dict)
+            ):
+                description_upgrade = bool(
+                    candidate_description.get("kind") == "synopsis"
+                    and candidate_description.get("opening_sentence") == previous.get("description")
+                    and candidate_description.get("provider") == previous.get("_legacy_metadata_provider")
+                    and candidate_description.get("provider_id") == previous.get("_legacy_metadata_provider_id")
+                    and candidate_description.get("text")
+                )
+                if description_upgrade:
+                    description = str(candidate_description["text"])
             cover_url = item.get("cover_url", "")
             release_date = item.get("release_date") or None
             date_kind = item.get("date_kind") or previous.get("date_kind") or "unknown"
             previous_genres = _stored_genre_values(previous.get("genres", []))
-            item_genres = normalize_subjects(item.get("genres", []), limit=8)
-            genres = normalize_subjects(previous_genres + item_genres, limit=8)
+            item_genres = normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT)
+            genres = normalize_subjects(previous_genres + item_genres, limit=METADATA_GENRE_LIMIT)
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             metadata_provider = str(item.get("_metadata_provider", "") or "")
             metadata_provider_id = str(item.get("_metadata_provider_id", "") or "")
-            metadata_work_id = str(item.get("_metadata_work_id", "") or "")
-            if (
-                (description and not previous.get("description"))
-                or (cover_url and (not previous.get("cover_url") or is_weak_cover_url(previous.get("cover_url"))))
-                or (release_date and not previous.get("release_date"))
-                or (len(genres) > len(previous_genres))
-            ):
+            cover_changed = bool(
+                cover_url
+                and not is_weak_cover_url(cover_url)
+                and (
+                    not previous.get("cover_url")
+                    or is_weak_cover_url(previous.get("cover_url"))
+                    or cover_url != previous.get("cover_url")
+                )
+            )
+            description_changed = bool(description and (not previous.get("description") or description_upgrade))
+            release_changed = bool(release_date and not previous.get("release_date"))
+            genres_changed = len(genres) > len(previous_genres)
+            if description_changed or cover_changed or release_changed or genres_changed:
                 changed += 1
             con.execute(
                 """UPDATE candidates SET
-                description=CASE WHEN description='' AND ?!='' THEN ? ELSE description END,
-                cover_url=CASE WHEN (cover_url='' OR cover_url LIKE '%/b/isbn/%' OR cover_url LIKE 'https://placehold.co/%') AND ?!='' THEN ? ELSE cover_url END,
+                description=CASE WHEN (description='' AND ?!='') OR ?=1 THEN ? ELSE description END,
+                cover_url=CASE WHEN ?=1 THEN ? ELSE cover_url END,
                 release_date=COALESCE(release_date, ?),
                 date_kind=CASE WHEN release_date IS NULL AND ? IS NOT NULL THEN ? ELSE date_kind END,
                 genres=CASE WHEN ?!='[]' THEN ? ELSE genres END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (description, description, cover_url, cover_url, release_date, release_date, date_kind, genres_json, genres_json, item["id"]),
+                (
+                    description,
+                    int(description_upgrade),
+                    description,
+                    int(cover_changed),
+                    cover_url,
+                    release_date,
+                    release_date,
+                    date_kind,
+                    genres_json,
+                    genres_json,
+                    item["id"],
+                ),
             )
+            for field, contributed in (
+                ("description", description_changed),
+                ("cover_url", cover_changed),
+                ("release_date", release_changed),
+                ("genres", genres_changed),
+            ):
+                if contributed:
+                    _persist_metadata_field_provenance(
+                        con,
+                        "candidate",
+                        int(item["id"]),
+                        field,
+                        item,
+                        default_provider=metadata_provider or "catalog",
+                        default_provider_id=metadata_provider_id,
+                        default_confidence=1.0,
+                    )
             con.execute(
-                """UPDATE candidate_quality SET metadata_checked_at=?,
-                    metadata_provider=CASE WHEN ?!='' THEN ? ELSE metadata_provider END,
-                    metadata_provider_id=CASE WHEN ?!='' THEN ? ELSE metadata_provider_id END,
-                    provider=CASE WHEN provider='' THEN ? ELSE provider END,
-                    provider_id=CASE WHEN provider='' THEN ? ELSE provider_id END,
-                    work_id=CASE WHEN provider='' THEN ? ELSE work_id END,
-                    title_match=CASE WHEN provider='' THEN ? ELSE title_match END,
-                    author_match=CASE WHEN provider='' THEN ? ELSE author_match END,
+                """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,
+                    metadata_provider=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider END,
+                    metadata_provider_id=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider_id END,
                     updated_at=CURRENT_TIMESTAMP
                     WHERE candidate_id=? AND quality_status='accepted'""",
                 (
                     datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    METADATA_NORMALIZATION_VERSION,
+                    int(description_changed),
                     metadata_provider,
                     metadata_provider,
+                    int(description_changed),
                     metadata_provider_id,
                     metadata_provider_id,
-                    metadata_provider,
-                    metadata_provider_id,
-                    metadata_work_id,
-                    float(item.get("_metadata_title_match", 0) or 0),
-                    float(item.get("_metadata_author_match", 0) or 0),
                     item["id"],
                 )
             )
-    return changed
+    return changed + normalized_catalog_dates
 
 
 async def refresh_missing_candidate_covers():
@@ -1914,10 +2844,68 @@ async def preview_source(url, filters=None):
 async def scan_source(source):
     _, items = await _fetch_and_parse_source(source["url"])
     raw_count = len(items)
-    items = filter_source_items(items, source.get("filters"))
-    items = await enrich_penguin_random_house_items(items)
-    items = await enrich_book_metadata(_clean_parsed_subjects(items))
-    items = _clean_parsed_subjects(items)
+    configured_filters = normalize_source_filters(source.get("filters"))
+    cleaned = _clean_parsed_subjects(items)
+    if configured_filters["include_genres"]:
+        # Keep untagged rows in the candidate pool until the catalog has had a
+        # chance to supply subjects. Known non-matches can still be removed
+        # before the expensive provider pass.
+        possible = [
+            item for item in cleaned
+            if not item.get("genres")
+            or (
+                any(
+                    _genre_matches(wanted, genre)
+                    for wanted in configured_filters["include_genres"]
+                    for genre in item.get("genres", [])
+                )
+                and not any(
+                    _genre_matches(blocked, genre)
+                    for blocked in configured_filters["exclude_genres"]
+                    for genre in item.get("genres", [])
+                )
+            )
+        ]
+    else:
+        possible = filter_source_items(cleaned, configured_filters)
+    for item in possible:
+        item["_source_provided_fields"] = [
+            field for field in ("description", "cover_url", "release_date", "genres")
+            if item.get(field)
+        ]
+        item["_source_provider_id"] = str(source["id"])
+    enrichment_pool = (
+        sorted(possible, key=lambda item: bool(item.get("genres")))
+        if configured_filters["include_genres"]
+        else possible
+    )
+    publisher_batch = await enrich_penguin_random_house_items(
+        enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+    )
+    publisher_by_key = {
+        normalize_key(item.get("title", ""), item.get("author", "Unknown author")): item
+        for item in publisher_batch
+    }
+    enrichment_batch = [
+        publisher_by_key.get(
+            normalize_key(item.get("title", ""), item.get("author", "Unknown author")),
+            item,
+        )
+        for item in enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+    ]
+    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(enrichment_batch))
+    enriched_by_key = {
+        normalize_key(item.get("title", ""), item.get("author", "Unknown author")): item
+        for item in enriched_batch
+    }
+    items = [
+        enriched_by_key.get(
+            normalize_key(item.get("title", ""), item.get("author", "Unknown author")),
+            item,
+        )
+        for item in possible
+    ]
+    items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
     with transaction() as con:
         seen = []
         for item in items:
@@ -1928,19 +2916,19 @@ async def scan_source(source):
                 item.get("source_url", source["url"]),
             )
             existing = con.execute(
-                "SELECT id,isbn13,isbn10,genres FROM candidates WHERE normalized_key=?",
+                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
             genres = normalize_subjects(
                 _stored_genre_values(existing["genres"] if existing else [])
-                + normalize_subjects(item.get("genres", []), limit=8),
-                limit=8,
+                + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
+                limit=METADATA_GENRE_LIMIT,
             )
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
             description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
-            cover_url=CASE WHEN length(excluded.cover_url)>0 THEN excluded.cover_url ELSE cover_url END,
+            cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
             source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
             release_date=COALESCE(excluded.release_date, release_date),
             date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
@@ -1949,9 +2937,70 @@ async def scan_source(source):
             isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
             updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
             candidate = con.execute(
-                "SELECT id,isbn13,isbn10 FROM candidates WHERE normalized_key=?",
+                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
+            if candidate:
+                description_added = bool(
+                    item.get("description")
+                    and not (existing["description"] if existing else "")
+                    and candidate["description"] == item.get("description")
+                )
+                cover_added = bool(
+                    item.get("cover_url")
+                    and not is_weak_cover_url(item.get("cover_url"))
+                    and candidate["cover_url"] == item.get("cover_url")
+                    and (not existing or existing["cover_url"] != candidate["cover_url"])
+                )
+                release_added = bool(
+                    item.get("release_date")
+                    and not (existing["release_date"] if existing else "")
+                    and candidate["release_date"] == item.get("release_date")
+                )
+                previous_genres = _stored_genre_values(existing["genres"] if existing else [])
+                genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
+                source_fields = set(item.get("_source_provided_fields", []))
+                source_provenance = {
+                    "metadata_provenance": {
+                        "fields": {
+                            field: {
+                                "provider": "source",
+                                "provider_id": str(source["id"]),
+                                "kind": "source_item",
+                            }
+                            for field in source_fields
+                        },
+                        "source_payloads": [],
+                    }
+                }
+                contributed = {
+                    "description": description_added,
+                    "cover_url": cover_added,
+                    "release_date": release_added,
+                    "genres": genres_added,
+                }
+                for field, applied in contributed.items():
+                    if not applied:
+                        continue
+                    source_provided = field in source_fields
+                    if source_provided:
+                        _persist_metadata_field_provenance(
+                            con,
+                            "candidate",
+                            int(candidate["id"]),
+                            field,
+                            source_provenance,
+                            default_provider="source",
+                            default_provider_id=str(source["id"]),
+                            default_confidence=1.0,
+                        )
+                    _persist_metadata_field_provenance(
+                        con,
+                        "candidate",
+                        int(candidate["id"]),
+                        field,
+                        item,
+                    )
             if candidate and (isbn13 or isbn10):
                 con.execute(
                     """UPDATE candidate_quality SET
