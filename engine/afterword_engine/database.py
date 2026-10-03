@@ -782,6 +782,161 @@ MIGRATIONS = [
         END;
         """,
     ),
+    (
+        20,
+        """
+        ALTER TABLE candidates ADD COLUMN score_batch_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_candidates_score_batch_id
+            ON candidates(score_batch_id);
+
+        -- A scoring batch is the immutable job-time basis for materialized
+        -- candidate scores. Candidate links intentionally survive catalog
+        -- cleanup; an explicit privacy purge removes the entire batch.
+        CREATE TABLE IF NOT EXISTS scoring_batches (
+            id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL,
+            capture_status TEXT NOT NULL
+                CHECK(capture_status IN ('complete','incomplete')),
+            reason TEXT NOT NULL DEFAULT '',
+            captured_at TEXT NOT NULL,
+            payload_encoding TEXT NOT NULL DEFAULT '',
+            payload BLOB,
+            payload_sha256 TEXT NOT NULL DEFAULT '',
+            payload_bytes INTEGER NOT NULL DEFAULT 0 CHECK(payload_bytes >= 0),
+            read_count INTEGER NOT NULL DEFAULT 0 CHECK(read_count >= 0),
+            candidate_count INTEGER NOT NULL DEFAULT 0 CHECK(candidate_count >= 0),
+            vector_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_count >= 0),
+            CHECK(
+                (capture_status='complete' AND payload IS NOT NULL AND payload_sha256!='')
+                OR (capture_status='incomplete' AND payload IS NULL AND payload_sha256='')
+            )
+        );
+        CREATE TABLE IF NOT EXISTS scoring_batch_vectors (
+            batch_id TEXT NOT NULL REFERENCES scoring_batches(id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('read','candidate')),
+            entity_id INTEGER NOT NULL,
+            artifact_hash TEXT NOT NULL REFERENCES recommendation_evidence_vectors(artifact_hash) ON DELETE RESTRICT,
+            PRIMARY KEY(batch_id,entity_type,entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scoring_batch_vector_artifact
+            ON scoring_batch_vectors(artifact_hash);
+        CREATE TABLE IF NOT EXISTS scoring_batch_candidates (
+            batch_id TEXT NOT NULL REFERENCES scoring_batches(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL,
+            score REAL NOT NULL,
+            identity_hash TEXT NOT NULL,
+            input_content_hash TEXT NOT NULL,
+            PRIMARY KEY(batch_id,candidate_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scoring_batch_candidate
+            ON scoring_batch_candidates(candidate_id,batch_id);
+
+        -- Read IDs support targeted history erasure without a live reads FK.
+        -- A batch's copied ratings/text/vectors are erased as a unit when any
+        -- read from its historical input set is intentionally deleted.
+        CREATE TABLE IF NOT EXISTS scoring_batch_reads (
+            batch_id TEXT NOT NULL REFERENCES scoring_batches(id) ON DELETE CASCADE,
+            read_id INTEGER NOT NULL,
+            PRIMARY KEY(batch_id,read_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scoring_batch_read
+            ON scoring_batch_reads(read_id,batch_id);
+
+        -- Serving snapshots retain a copy of scorer-batch lineage. Keep a
+        -- normalized reverse link so a read/candidate privacy purge can also
+        -- remove those run payloads before deleting the referenced batch.
+        CREATE TABLE IF NOT EXISTS recommendation_run_evidence_scoring_batches (
+            run_id TEXT NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            score_batch_id TEXT NOT NULL,
+            PRIMARY KEY(run_id,score_batch_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_evidence_score_batch
+            ON recommendation_run_evidence_scoring_batches(score_batch_id,run_id);
+
+        CREATE TRIGGER scoring_batches_immutable
+        BEFORE UPDATE ON scoring_batches
+        BEGIN SELECT RAISE(ABORT,'scoring batch evidence is immutable'); END;
+        CREATE TRIGGER scoring_batch_vectors_immutable
+        BEFORE UPDATE ON scoring_batch_vectors
+        BEGIN SELECT RAISE(ABORT,'scoring batch vector links are immutable'); END;
+        CREATE TRIGGER scoring_batch_candidates_immutable
+        BEFORE UPDATE ON scoring_batch_candidates
+        BEGIN SELECT RAISE(ABORT,'scoring batch candidate links are immutable'); END;
+        CREATE TRIGGER scoring_batch_reads_immutable
+        BEFORE UPDATE ON scoring_batch_reads
+        BEGIN SELECT RAISE(ABORT,'scoring batch read links are immutable'); END;
+        CREATE TRIGGER run_evidence_scoring_batches_immutable
+        BEFORE UPDATE ON recommendation_run_evidence_scoring_batches
+        BEGIN SELECT RAISE(ABORT,'recommendation score-batch links are immutable'); END;
+
+        CREATE TRIGGER scoring_batch_budget_insert
+        AFTER INSERT ON scoring_batches
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+192+length(CAST(NEW.reason AS BLOB))
+                +length(CAST(NEW.captured_at AS BLOB))
+                +COALESCE(length(NEW.payload),0) WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_budget_delete
+        AFTER DELETE ON scoring_batches
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-192-length(CAST(OLD.reason AS BLOB))
+                -length(CAST(OLD.captured_at AS BLOB))
+                -COALESCE(length(OLD.payload),0)) WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_vector_budget_insert
+        AFTER INSERT ON scoring_batch_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+96 WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_vector_budget_delete
+        AFTER DELETE ON scoring_batch_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-96) WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_candidate_budget_insert
+        AFTER INSERT ON scoring_batch_candidates
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+96+length(NEW.identity_hash)
+                +length(NEW.input_content_hash) WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_candidate_budget_delete
+        AFTER DELETE ON scoring_batch_candidates
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-96-length(OLD.identity_hash)
+                -length(OLD.input_content_hash)) WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_read_budget_insert
+        AFTER INSERT ON scoring_batch_reads
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+64 WHERE id=1;
+        END;
+        CREATE TRIGGER scoring_batch_read_budget_delete
+        AFTER DELETE ON scoring_batch_reads
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-64) WHERE id=1;
+        END;
+        CREATE TRIGGER run_evidence_scoring_batch_budget_insert
+        AFTER INSERT ON recommendation_run_evidence_scoring_batches
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+64 WHERE id=1;
+        END;
+        CREATE TRIGGER run_evidence_scoring_batch_budget_delete
+        AFTER DELETE ON recommendation_run_evidence_scoring_batches
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-64) WHERE id=1;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
