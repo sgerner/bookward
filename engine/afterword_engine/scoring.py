@@ -1,5 +1,8 @@
 import json
 import math
+import logging
+import uuid
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -9,6 +12,7 @@ from .ranking import rank_candidates
 from .identity import book_identity_match_index, book_row_identity_match_keys
 from .subjects import normalize_subjects
 SCORING_BATCH_SIZE = 256
+LOGGER = logging.getLogger(__name__)
 
 def document(item):
     # Read embeddings already exist in production with this exact representation.
@@ -112,7 +116,8 @@ def _max_cosine_similarities(vectors, references, default):
 
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
-    all_read_keys = book_identity_match_index(rows("SELECT * FROM reads"))
+    read_history = rows("SELECT * FROM reads ORDER BY id")
+    all_read_keys = book_identity_match_index(read_history)
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.work_id quality_work_id,q.provider quality_provider,"
@@ -157,13 +162,73 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     }
     candidate_vectors = [vectors_by_id[int(item["id"])] for item in candidates]
     ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
+    candidate_inputs_by_id = {int(item["id"]): item for item in candidates}
+    batch_id = uuid.uuid4().hex
+    captured_at = datetime.now(timezone.utc).isoformat()
     with transaction() as con:
+        written = []
         for candidate in ranked:
-            con.execute("UPDATE candidates SET score=?, explanation=?, status=CASE WHEN status='new' THEN 'recommended' ELSE status END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate["score"], json.dumps(candidate["explanation"]), candidate["id"]))
+            cursor = con.execute(
+                "UPDATE candidates SET score=?, explanation=?, score_batch_id=NULL, "
+                "status=CASE WHEN status='new' THEN 'recommended' ELSE status END, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (candidate["score"], json.dumps(candidate["explanation"]), candidate["id"]),
+            )
+            if cursor.rowcount != 1:
+                continue
             con.execute(
                 "UPDATE candidate_quality SET metadata_confidence=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
                 (candidate["metadata_confidence"], candidate["id"]),
             )
+            written.append(candidate)
+        if written:
+            written_ids = {int(item["id"]) for item in written}
+            written_inputs = [
+                candidate_inputs_by_id[candidate_id]
+                for candidate_id in candidate_inputs_by_id
+                if candidate_id in written_ids
+            ]
+            written_vectors = {
+                candidate_id: vectors_by_id[candidate_id]
+                for candidate_id in written_ids
+            }
+            try:
+                from .scoring_evidence import (
+                    build_scoring_batch_evidence,
+                    persist_scoring_batch,
+                )
+
+                con.execute("SAVEPOINT scoring_batch_evidence")
+                evidence = build_scoring_batch_evidence(
+                    con,
+                    captured_at=captured_at,
+                    read_history=read_history,
+                    rated_reads=reads,
+                    candidates=written_inputs,
+                    ranked=written,
+                    read_vectors=read_vectors,
+                    candidate_vectors=written_vectors,
+                    backend=embedder.name,
+                    model=embedder.model,
+                    scoring_batch_size=SCORING_BATCH_SIZE,
+                )
+                capture_status = persist_scoring_batch(
+                    con, batch_id=batch_id, evidence=evidence
+                )
+                if capture_status in {"complete", "incomplete"}:
+                    marks = ",".join("?" for _ in written_ids)
+                    con.execute(
+                        f"UPDATE candidates SET score_batch_id=? WHERE id IN ({marks})",
+                        (batch_id, *sorted(written_ids)),
+                    )
+                con.execute("RELEASE SAVEPOINT scoring_batch_evidence")
+            except Exception:
+                try:
+                    con.execute("ROLLBACK TO SAVEPOINT scoring_batch_evidence")
+                    con.execute("RELEASE SAVEPOINT scoring_batch_evidence")
+                except Exception:
+                    pass
+                LOGGER.warning("Could not persist base-score evidence; scores were still written")
     return len(candidates)
 
 

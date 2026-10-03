@@ -56,7 +56,7 @@ POOL_FIELDS = (
     "id", "title", "author", "description", "genres", "score", "explanation",
     "status", "source_id", "source_name", "source_weight", "catalog_confidence",
     "quality_score", "quality_status", "quality_work_id", "quality_provider",
-    "quality_isbn13", "quality_isbn10", "metadata_confidence", "release_date",
+    "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
     "date_kind", "reading_status", "up_next", "reading_rating", "started_at",
     "finished_at", "propensity",
 )
@@ -194,6 +194,7 @@ def _runtime_source_lineage() -> dict[str, Any]:
         "identity.py",
         "learning.py",
         "decision_evidence.py",
+        "scoring_evidence.py",
     )
     digests: dict[str, str] = {}
     for name in modules:
@@ -293,6 +294,133 @@ def _embedding_hashes(connection, backend: str, model: str, candidate_ids: list[
                 str(row["content_hash"] or ""), int(row["dimensions"] or 0)
             )
     return result
+
+
+def _base_score_provenance(connection, base_items, actual_document_hashes):
+    """Verify each served materialized score against its immutable job link."""
+
+    by_id: dict[int, Mapping[str, Any]] = {}
+    batch_ids: set[str] = set()
+    for item in base_items:
+        candidate_id = _candidate_id(item)
+        if candidate_id is None:
+            continue
+        by_id[candidate_id] = item
+        batch_id = item.get("score_batch_id")
+        if isinstance(batch_id, str) and batch_id:
+            batch_ids.add(batch_id)
+
+    batch_rows: dict[tuple[str, int], dict[str, Any]] = {}
+    batch_status: dict[str, str] = {}
+    try:
+        ordered_batch_ids = sorted(batch_ids)
+        for start in range(0, len(ordered_batch_ids), 400):
+            batch = ordered_batch_ids[start : start + 400]
+            if not batch:
+                continue
+            marks = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT b.id,b.capture_status,c.candidate_id,c.score,c.identity_hash,"
+                "c.input_content_hash FROM scoring_batches b "
+                "LEFT JOIN scoring_batch_candidates c ON c.batch_id=b.id "
+                f"WHERE b.id IN ({marks})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                batch_id = str(row["id"])
+                batch_status[batch_id] = str(row["capture_status"])
+                if row["candidate_id"] is not None:
+                    batch_rows[(batch_id, int(row["candidate_id"]))] = dict(row)
+    except Exception:
+        LOGGER.warning("Base-score lineage lookup failed; retaining unknown provenance")
+        return {
+            "kind": "stored_candidate_score",
+            "derivation_status": "unknown",
+            "detail": "Scoring batch lineage could not be read for this serving request.",
+            "candidate_count": len(by_id),
+            "replayable_candidate_count": 0,
+            "unlinked_candidate_count": len(by_id),
+            "stale_input_candidate_count": 0,
+            "candidates": [],
+        }
+
+    candidates = []
+    replayable_count = 0
+    unlinked_count = 0
+    stale_count = 0
+    attempted_count = 0
+    for candidate_id, item in sorted(by_id.items()):
+        batch_id = item.get("score_batch_id")
+        record: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "score_batch_id": batch_id if isinstance(batch_id, str) and batch_id else "",
+            "status": "unlinked",
+            "score_matches_batch": False,
+            "identity_matches_batch": False,
+            "input_freshness": "unknown",
+        }
+        if not isinstance(batch_id, str) or not batch_id:
+            unlinked_count += 1
+            candidates.append(record)
+            continue
+        attempted_count += 1
+        status = batch_status.get(batch_id)
+        if status is None:
+            record["status"] = "batch_missing"
+            candidates.append(record)
+            continue
+        if status != "complete":
+            record["status"] = "batch_incomplete"
+            candidates.append(record)
+            continue
+        link = batch_rows.get((batch_id, candidate_id))
+        if link is None:
+            record["status"] = "output_link_missing"
+            candidates.append(record)
+            continue
+        try:
+            score_matches = float(item.get("score")) == float(link["score"])
+        except (TypeError, ValueError, OverflowError):
+            score_matches = False
+        identity_matches = _identity_hash(item.get("title"), item.get("author")) == str(
+            link["identity_hash"] or ""
+        )
+        record["score_matches_batch"] = score_matches
+        record["identity_matches_batch"] = identity_matches
+        if not score_matches or not identity_matches:
+            record["status"] = "current_output_mismatch"
+            candidates.append(record)
+            continue
+        replayable_count += 1
+        current_hash = actual_document_hashes.get(candidate_id, "")
+        matches_input = bool(current_hash) and current_hash == str(link["input_content_hash"] or "")
+        record["input_freshness"] = "matches_batch_input" if matches_input else "stale_batch_input"
+        record["status"] = "replayable"
+        if not matches_input:
+            stale_count += 1
+        candidates.append(record)
+
+    if replayable_count == len(by_id) and by_id:
+        derivation_status = "complete"
+    elif replayable_count:
+        derivation_status = "partial"
+    elif attempted_count:
+        derivation_status = "incomplete"
+    else:
+        derivation_status = "unknown"
+    return {
+        "kind": "stored_candidate_score",
+        "derivation_status": derivation_status,
+        "detail": (
+            "Complete scoring-job snapshots reproduce historical base scores; input_freshness "
+            "separately reports whether serving-time candidate text still matches the archived scorer input."
+        ),
+        "candidate_count": len(by_id),
+        "replayable_candidate_count": replayable_count,
+        "unlinked_candidate_count": unlinked_count,
+        "stale_input_candidate_count": stale_count,
+        "candidates": candidates,
+    }
 
 
 def build_decision_evidence(
@@ -470,14 +598,9 @@ def build_decision_evidence(
                     discovery_slate_metadata, SLATE_DIAGNOSTIC_FIELDS
                 ),
             },
-            "base_score_provenance": {
-                "kind": "stored_candidate_score",
-                "derivation_status": "unknown",
-                "detail": (
-                    "The serving request used candidate.score materialized by the latest "
-                    "scoring job. That job's read/vector input artifact was not attached."
-                ),
-            },
+            "base_score_provenance": _base_score_provenance(
+                connection, base_items, actual_document_hashes
+            ),
             "pools": pools,
             "interaction_profile": profile,
             "vectors": [],
@@ -630,6 +753,24 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
 
     artifacts = evidence.get("_vector_artifacts", [])
     identities = evidence.get("_candidate_identities", [])
+    provenance = evidence.get("base_score_provenance", {})
+    provenance_candidates = provenance.get("candidates", []) if isinstance(provenance, Mapping) else []
+    if not isinstance(provenance_candidates, list):
+        _incomplete_row(connection, run_id, "invalid_score_batch_manifest", captured_at)
+        return "incomplete"
+    score_batch_ids: set[str] = set()
+    for item in provenance_candidates:
+        if not isinstance(item, Mapping):
+            _incomplete_row(connection, run_id, "invalid_score_batch_manifest", captured_at)
+            return "incomplete"
+        batch_id = item.get("score_batch_id")
+        if not batch_id:
+            continue
+        normalized = _safe_identifier(batch_id, fallback="")
+        if normalized != batch_id:
+            _incomplete_row(connection, run_id, "invalid_score_batch_manifest", captured_at)
+            return "incomplete"
+        score_batch_ids.add(normalized)
     if not isinstance(artifacts, list) or len(artifacts) > MAX_VECTOR_COUNT:
         _incomplete_row(connection, run_id, "invalid_vector_manifest", captured_at)
         return "incomplete"
@@ -648,6 +789,7 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
 
     vector_records: list[tuple[dict[str, Any], bytes, str]] = []
     new_vector_bytes = 0
+    counted_new_artifacts: set[str] = set()
     manifest = []
     try:
         for artifact in artifacts:
@@ -698,8 +840,9 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
                 "WHERE artifact_hash=?",
                 (artifact_hash,),
             ).fetchone()
-            if existing is None:
+            if existing is None and artifact_hash not in counted_new_artifacts:
                 new_vector_bytes += len(raw)
+                counted_new_artifacts.add(artifact_hash)
             vector_records.append((descriptor, raw, artifact_hash))
             manifest.append(descriptor)
         payload_value = {
@@ -724,7 +867,7 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
             72 + len(str(item.get("identity_hash") or "").encode("utf-8"))
             for item in identities
             if isinstance(item, Mapping)
-        )
+        ) + 64 * len(score_batch_ids)
         if used_bytes + len(packed_json) + new_vector_bytes + reference_bytes > MAX_STORED_EVIDENCE_BYTES:
             raise _EvidenceLimitError("storage_quota_exceeded")
     except _EvidenceLimitError as exc:
@@ -788,6 +931,12 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
             "run_id,candidate_id,identity_hash) VALUES(?,?,?)",
             (run_id, candidate_id, str(identity.get("identity_hash") or "")),
         )
+    for batch_id in sorted(score_batch_ids):
+        connection.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id,score_batch_id) "
+            "VALUES(?,?)",
+            (run_id, batch_id),
+        )
     return "complete"
 
 
@@ -823,6 +972,25 @@ def load_decision_evidence(connection, run_id: str) -> dict[str, Any] | None:
         raise ValueError("Recommendation evidence payload is unreadable") from exc
     if not isinstance(payload, dict) or int(payload.get("schema_version", 0)) != EVIDENCE_SCHEMA_VERSION:
         raise ValueError("Unsupported recommendation evidence schema")
+    provenance = payload.get("base_score_provenance")
+    provenance_candidates = provenance.get("candidates", []) if isinstance(provenance, Mapping) else []
+    if not isinstance(provenance_candidates, list):
+        raise ValueError("Recommendation score-batch manifest is invalid")
+    expected_batches = {
+        str(item["score_batch_id"])
+        for item in provenance_candidates
+        if isinstance(item, Mapping) and item.get("score_batch_id")
+    }
+    linked_batches = {
+        str(item["score_batch_id"])
+        for item in connection.execute(
+            "SELECT score_batch_id FROM recommendation_run_evidence_scoring_batches "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+    }
+    if expected_batches != linked_batches:
+        raise ValueError("Recommendation score-batch links do not match payload")
 
     vectors = []
     for descriptor in payload.get("vectors", []):
@@ -1023,21 +1191,36 @@ def purge_recommendation_evidence(
     connection,
     *,
     candidate_ids: Iterable[int] = (),
+    read_ids: Iterable[int] = (),
     run_ids: Iterable[str] = (),
+    clear_scoring_batches: bool = False,
+    clear_all_evidence: bool = False,
 ) -> dict[str, int]:
-    """Explicitly erase archived and live telemetry for a candidate or run.
+    """Explicitly erase archived and live evidence for selected identities.
 
     Candidate purge removes every run snapshot that contained that candidate,
     because its title, text, and vectors may also appear in shared pool
-    artifacts. It also removes the candidate's ordinary recommendation events
-    and feedback. Callers may then delete the catalog row. Whole-profile
-    deletion continues to remove the profile database itself.
+    artifacts. It also removes every scoring batch that scored that candidate.
+    Read purge removes every scoring batch whose captured history included a
+    read ID and every served run with an attributed outcome for that read.
+    `clear_scoring_batches=True` removes every scorer batch, including
+    one without candidate or read-reference rows. Whole-profile history reset
+    should use `clear_all_evidence=True` to also remove run snapshots and
+    ordinary interaction history. Callers delete live library/profile rows in
+    the same outer transaction.
     """
 
     candidates = sorted({int(item) for item in candidate_ids if int(item) > 0})
+    reads = sorted({int(item) for item in read_ids if int(item) > 0})
     selected_runs = {str(item) for item in run_ids if item}
-    if not candidates and not selected_runs:
-        raise ValueError("Candidate IDs or run IDs are required for evidence purge")
+    if not candidates and not reads and not selected_runs and not clear_scoring_batches and not clear_all_evidence:
+        raise ValueError("Candidate IDs, read IDs, run IDs, or clear_scoring_batches are required")
+    if clear_all_evidence:
+        selected_runs.update(
+            str(row["id"])
+            for row in connection.execute("SELECT id FROM recommendation_runs").fetchall()
+        )
+        clear_scoring_batches = True
     marks = ",".join("?" for _ in candidates)
     if candidates:
         rows = connection.execute(
@@ -1050,6 +1233,88 @@ def purge_recommendation_evidence(
             (*candidates, *candidates, *candidates),
         ).fetchall()
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
+    if reads:
+        read_marks = ",".join("?" for _ in reads)
+        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
+        event_marks = ",".join("?" for _ in read_event_keys)
+        rows = connection.execute(
+            "SELECT i.run_id FROM recommendation_outcomes o "
+            "JOIN recommendation_impressions i ON i.id=o.impression_id "
+            f"WHERE o.read_id IN ({read_marks}) UNION "
+            "SELECT run_id FROM recommendation_events "
+            f"WHERE event_key IN ({event_marks}) UNION "
+            "SELECT run_id FROM recommendation_evidence_events "
+            f"WHERE event_key IN ({event_marks})",
+            (*reads, *read_event_keys, *read_event_keys),
+        ).fetchall()
+        selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
+
+    scoring_batch_ids: set[str] = set()
+    if candidates:
+        scoring_batch_ids.update(
+            str(row["batch_id"])
+            for row in connection.execute(
+                "SELECT batch_id FROM scoring_batch_candidates "
+                f"WHERE candidate_id IN ({marks})",
+                candidates,
+            ).fetchall()
+        )
+        scoring_batch_ids.update(
+            str(row["score_batch_id"])
+            for row in connection.execute(
+                "SELECT score_batch_id FROM candidates "
+                f"WHERE id IN ({marks}) AND score_batch_id IS NOT NULL",
+                candidates,
+            ).fetchall()
+        )
+    if reads:
+        read_marks = ",".join("?" for _ in reads)
+        scoring_batch_ids.update(
+            str(row["batch_id"])
+            for row in connection.execute(
+                "SELECT DISTINCT batch_id FROM scoring_batch_reads "
+                f"WHERE read_id IN ({read_marks})",
+                reads,
+            ).fetchall()
+        )
+    if clear_scoring_batches:
+        scoring_batch_ids.update(
+            str(row["id"])
+            for row in connection.execute("SELECT id FROM scoring_batches").fetchall()
+        )
+    if scoring_batch_ids:
+        ordered_batches = sorted(scoring_batch_ids)
+        for start in range(0, len(ordered_batches), 400):
+            batch = ordered_batches[start : start + 400]
+            batch_marks = ",".join("?" for _ in batch)
+            selected_runs.update(
+                str(row["run_id"])
+                for row in connection.execute(
+                    "SELECT run_id FROM recommendation_run_evidence_scoring_batches "
+                    f"WHERE score_batch_id IN ({batch_marks})",
+                    batch,
+                ).fetchall()
+            )
+    removed_scoring_batches = 0
+    if scoring_batch_ids:
+        score_batches = sorted(scoring_batch_ids)
+        for start in range(0, len(score_batches), 400):
+            batch = score_batches[start : start + 400]
+            batch_marks = ",".join("?" for _ in batch)
+            removed_scoring_batches += int(
+                connection.execute(
+                    f"SELECT COUNT(*) count FROM scoring_batches WHERE id IN ({batch_marks})",
+                    batch,
+                ).fetchone()["count"]
+            )
+            connection.execute(
+                f"UPDATE candidates SET score_batch_id=NULL WHERE score_batch_id IN ({batch_marks})",
+                batch,
+            )
+            connection.execute(
+                f"DELETE FROM scoring_batches WHERE id IN ({batch_marks})", batch
+            )
+
     run_list = sorted(selected_runs)
     removed_runs = 0
     if run_list:
@@ -1090,9 +1355,37 @@ def purge_recommendation_evidence(
             f"DELETE FROM recommendation_evidence_exposures WHERE candidate_id IN ({marks})",
             candidates,
         )
+    if reads:
+        read_marks = ",".join("?" for _ in reads)
+        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
+        event_marks = ",".join("?" for _ in read_event_keys)
+        connection.execute(
+            f"DELETE FROM recommendation_outcomes WHERE read_id IN ({read_marks})",
+            reads,
+        )
+        connection.execute(
+            f"DELETE FROM recommendation_events WHERE event_key IN ({event_marks})",
+            read_event_keys,
+        )
+        connection.execute(
+            f"DELETE FROM recommendation_evidence_events WHERE event_key IN ({event_marks})",
+            read_event_keys,
+        )
+    if clear_all_evidence:
+        connection.execute("DELETE FROM recommendation_events")
+        connection.execute("DELETE FROM feedback")
+        connection.execute("DELETE FROM recommendation_evidence_events")
+        connection.execute("DELETE FROM recommendation_evidence_outcomes")
+        connection.execute("DELETE FROM recommendation_evidence_exposures")
     removed_vectors = connection.execute(
         "DELETE FROM recommendation_evidence_vectors WHERE NOT EXISTS ("
         "SELECT 1 FROM recommendation_run_evidence_vectors r "
-        "WHERE r.artifact_hash=recommendation_evidence_vectors.artifact_hash)"
+        "WHERE r.artifact_hash=recommendation_evidence_vectors.artifact_hash) "
+        "AND NOT EXISTS (SELECT 1 FROM scoring_batch_vectors s "
+        "WHERE s.artifact_hash=recommendation_evidence_vectors.artifact_hash)"
     ).rowcount
-    return {"runs_removed": removed_runs, "vectors_removed": max(0, int(removed_vectors))}
+    return {
+        "runs_removed": removed_runs,
+        "scoring_batches_removed": removed_scoring_batches,
+        "vectors_removed": max(0, int(removed_vectors)),
+    }

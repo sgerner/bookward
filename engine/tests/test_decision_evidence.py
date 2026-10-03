@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 from datetime import datetime
+import zlib
 
 import numpy as np
 import pytest
@@ -12,8 +13,10 @@ from afterword_engine.database import connect, initialize, transaction
 from afterword_engine.decision_evidence import (
     build_decision_evidence,
     load_decision_evidence,
+    persist_run_evidence,
     purge_recommendation_evidence,
 )
+import afterword_engine.decision_evidence as decision_evidence_module
 from afterword_engine.embeddings import content_hash, vector_blob
 from afterword_engine.learning import create_recommendation_run, record_event_in_connection
 from afterword_engine.scoring import document
@@ -320,6 +323,74 @@ def test_privacy_purge_removes_entire_run_and_unreferenced_artifacts(database):
         assert removed["runs_removed"] == 1
         assert con.execute("SELECT COUNT(*) FROM recommendation_evidence_vectors").fetchone()[0] == 0
         assert con.execute("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1").fetchone()[0] == 0
+
+
+def test_run_quota_counts_shared_vector_bytes_once(database, monkeypatch):
+    shared_vector = np.asarray([0.25, -0.5, 0.75], dtype=np.float32)
+    with transaction() as con:
+        first = _candidate(con, "Shared Vector First", "E. Author")
+        second = _candidate(con, "Shared Vector Second", "F. Author")
+        vectors = {first["id"]: shared_vector, second["id"]: shared_vector}
+        _set_embeddings(con, [first, second], vectors)
+        evidence = _build(con, [first, second], [], vectors)
+
+        artifacts = evidence["_vector_artifacts"]
+        manifest = []
+        unique_bytes = {}
+        for artifact in artifacts:
+            raw = artifact["vector_bytes"]
+            spec = decision_evidence_module._canonical_json(
+                {
+                    "backend": artifact["backend"],
+                    "model": artifact["model"],
+                    "dimensions": artifact["dimensions"],
+                    "encoding": "float32-le",
+                }
+            )
+            artifact_hash = hashlib.sha256(spec + b"\0" + raw).hexdigest()
+            unique_bytes[artifact_hash] = len(raw)
+            manifest.append(
+                {
+                    "entity_type": artifact["entity_type"],
+                    "entity_id": artifact["entity_id"],
+                    "backend": artifact["backend"],
+                    "model": artifact["model"],
+                    "dimensions": artifact["dimensions"],
+                    "encoding": "float32-le",
+                    "source_content_hash": artifact["source_content_hash"],
+                    "artifact_hash": artifact_hash,
+                    "vector_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        payload = {
+            key: value
+            for key, value in evidence.items()
+            if not key.startswith("_") and key != "vectors"
+        }
+        payload["vectors"] = manifest
+        packed = zlib.compress(decision_evidence_module._canonical_json(payload), level=1)
+        identities = evidence["_candidate_identities"]
+        references = 96 * len(artifacts) + sum(
+            72 + len(str(item["identity_hash"]).encode("utf-8"))
+            for item in identities
+        )
+        exact_budget = len(packed) + sum(unique_bytes.values()) + references
+        monkeypatch.setattr(
+            decision_evidence_module, "MAX_STORED_EVIDENCE_BYTES", exact_budget
+        )
+        run_id = "shared-vector-quota-run"
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count) "
+            "VALUES(?,?,?,?)",
+            (run_id, "fixture", "fixture-v1", 2),
+        )
+        assert persist_run_evidence(con, run_id=run_id, evidence=evidence) == "complete"
+        assert con.execute(
+            "SELECT COUNT(*) FROM recommendation_evidence_vectors"
+        ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+        ).fetchone()[0] == exact_budget
 
 
 def test_actual_vector_and_text_hash_are_retained_when_cache_row_is_stale(database):
