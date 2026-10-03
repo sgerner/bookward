@@ -133,6 +133,8 @@ The [metric and grounded-facet study](docs/ranking-metric-facets-2026-10-02.md) 
 
 The [embedding comparison](docs/ranking-embedding-representations-2026-10-02.md), [reading-experience coverage pilot](docs/reading-experience-source-pilot-2026-10-02.md), and [combined first-eight experiments](docs/ranking-track-combinations-2026-10-02.md) preserve frozen cohorts and provenance checks. Their corrected results do not establish a scoring-policy improvement; the experiment tools leave production rankings unchanged.
 
+The [blinded discovery-interest pilot](docs/discovery-interest-pilot-2026-10-02.md) reports actual reader judgments and the synopsis gaps in its completed form. Future forms use a shared verified-source resolver; missing synopses and unsure answers remain unknown, and any judgments after recovered descriptions are recorded separately.
+
 The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
 
 The [ordinal and interest-neighborhood follow-up](docs/ranking-ordinal-interests-2026-09-30.md) did not establish a scorer replacement; its cluster variant has an exploratory improvement in top and bottom tails despite weaker global discrimination. `engine/scripts/evaluate_ordinal_interests.py` reproduces the causal replay and compares small learned models, including a daily updating diagnostic, without changing the serving formula.
