@@ -7,20 +7,36 @@ residual model was fitted. Every aligned target retains the current score.
 ## Historical synopsis pilot
 
 The cohort contains 1,677 eligible targets, with verified synopsis provenance
-for 610 and verified catalog subjects for 322. A label-blind stratified sample
-of 60 targets contained a verified synopsis for 26. Only one sampled synopsis
-had a span matching a frozen cue phrase. Across the full cohort, 45 targets had
-at least one literal cue: 10 pace, 33 tone, 1 density, and 2 structure matches.
-Only tone reached the frozen minimum of 20 matches in a cue family. In the
-first 300 targets, the family counts were 3 pace, 7 tone, 0 density, and 0
-structure, below the required early-prefix minimum of 8 per family.
+for 610 and verified catalog subjects for 724. The original report showed 322
+verified subject fields because its provenance check used the eight-subject
+feature limit; the corrected check now hashes all 12 subjects accepted by
+production. The downstream topic representation remains capped at eight
+subjects, and its subject-known mask covers 724 targets.
 
-The gate required at least 100 targets with cues, at least 20 matches in each
-of three families, and sufficient early-prefix and source-audit support. It
-failed. Unmatched cue families remain unknown; they are not treated as evidence
-against a book. No outcome labels were accessed for this pilot. An aligned
-fallback archive records the current score for all 1,677 targets without
-fitting an appeal model.
+The original label-blind stratified sample of 60 targets is unchanged: its
+frozen pre-correction strata contained 34 targets with no verified synopsis,
+10 rich-fiction targets, 4 rich-nonfiction targets, and 12 with unknown genre.
+Those are the strata used to select the original sample, not a resample under
+the corrected verifier. The corrected 12-subject descriptive classification
+has 1,067 targets with no verified synopsis, 479 rich-fiction targets, 7
+rich-nonfiction targets, and 124 with unknown genre. The same 60 sample IDs
+still contain a verified synopsis for 26; only one sampled synopsis has a span
+matching a frozen cue phrase.
+
+Across the full cohort, 45 targets have at least one literal cue: 10 pace, 33
+tone, 1 density, and 2 structure matches. Only tone reaches the frozen minimum
+of 20 matches in a cue family. In the first 300 targets, the family counts are
+3 pace, 7 tone, 0 density, and 0 structure, below the required early-prefix
+minimum of 8 per family. The corrected rerun reproduces these synopsis and cue
+counts exactly.
+
+The gate still fails. It required at least 100 targets with cues, at least 20
+matches in each of three families, and sufficient early-prefix and source-audit
+support. Unmatched cue families remain unknown; they are not treated as
+evidence against a book. No outcome labels were accessed for this pilot. An
+aligned fallback archive records the current score for all 1,677 targets
+without fitting an appeal model. Its scores, IDs, and train/validation/later/OOF
+masks match the original fallback archive exactly.
 
 ## Publisher-source check
 
