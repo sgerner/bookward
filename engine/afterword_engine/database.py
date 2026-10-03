@@ -540,6 +540,248 @@ MIGRATIONS = [
         END;
         """,
     ),
+    (
+        19,
+        """
+        -- These run-linked copies intentionally have no candidate foreign key.
+        -- Feed refresh cleanup may remove catalog rows; the run snapshot remains
+        -- available for replay until an explicit privacy purge removes it.
+        CREATE TABLE IF NOT EXISTS recommendation_run_evidence (
+            run_id TEXT PRIMARY KEY REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            schema_version INTEGER NOT NULL,
+            capture_status TEXT NOT NULL
+                CHECK(capture_status IN ('complete','incomplete')),
+            reason TEXT NOT NULL DEFAULT '',
+            captured_at TEXT NOT NULL,
+            payload_encoding TEXT NOT NULL DEFAULT '',
+            payload BLOB,
+            payload_sha256 TEXT NOT NULL DEFAULT '',
+            payload_bytes INTEGER NOT NULL DEFAULT 0 CHECK(payload_bytes >= 0),
+            vector_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_count >= 0),
+            CHECK(
+                (capture_status='complete' AND payload IS NOT NULL AND payload_sha256!='')
+                OR (capture_status='incomplete' AND payload IS NULL AND payload_sha256='')
+            )
+        );
+
+        -- Content-addressed float32 artifacts are deduplicated across runs and
+        -- are not tied to the current mutable embeddings/candidates tables.
+        CREATE TABLE IF NOT EXISTS recommendation_evidence_vectors (
+            artifact_hash TEXT PRIMARY KEY,
+            backend TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            encoding TEXT NOT NULL CHECK(encoding='float32-le'),
+            vector BLOB NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS recommendation_run_evidence_vectors (
+            run_id TEXT NOT NULL REFERENCES recommendation_run_evidence(run_id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('candidate','interaction')),
+            entity_id INTEGER NOT NULL,
+            artifact_hash TEXT NOT NULL REFERENCES recommendation_evidence_vectors(artifact_hash) ON DELETE RESTRICT,
+            PRIMARY KEY(run_id,entity_type,entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_vectors_artifact
+            ON recommendation_run_evidence_vectors(artifact_hash);
+
+        -- Identity links let an explicit privacy purge remove every run whose
+        -- replay artifact contains a requested catalog identity.
+        CREATE TABLE IF NOT EXISTS recommendation_run_evidence_candidates (
+            run_id TEXT NOT NULL REFERENCES recommendation_run_evidence(run_id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL,
+            identity_hash TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(run_id,candidate_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_candidate
+            ON recommendation_run_evidence_candidates(candidate_id,run_id);
+
+        -- Durable copies of actually served slots and later first-party events
+        -- remain joinable after ordinary catalog cleanup cascades old rows.
+        CREATE TABLE IF NOT EXISTS recommendation_evidence_exposures (
+            run_id TEXT NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL,
+            identity_hash TEXT NOT NULL DEFAULT '',
+            rank INTEGER NOT NULL CHECK(rank > 0),
+            score REAL NOT NULL,
+            propensity REAL NOT NULL CHECK(propensity > 0 AND propensity <= 1),
+            presented_at TEXT NOT NULL,
+            candidate_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            snapshot_status TEXT NOT NULL DEFAULT 'complete'
+                CHECK(snapshot_status IN ('complete','minimal')),
+            PRIMARY KEY(run_id,candidate_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_exposure_identity
+            ON recommendation_evidence_exposures(identity_hash,presented_at DESC);
+
+        CREATE TABLE IF NOT EXISTS recommendation_evidence_events (
+            id INTEGER PRIMARY KEY,
+            event_key TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            run_id TEXT REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            value REAL,
+            source TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(event_key,revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_events_candidate
+            ON recommendation_evidence_events(candidate_id,occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_events_run
+            ON recommendation_evidence_events(run_id,candidate_id,occurred_at);
+
+        CREATE TABLE IF NOT EXISTS recommendation_evidence_outcomes (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            event_key TEXT NOT NULL,
+            event_revision INTEGER NOT NULL CHECK(event_revision > 0),
+            candidate_id INTEGER NOT NULL,
+            rank INTEGER NOT NULL CHECK(rank > 0),
+            score REAL NOT NULL,
+            propensity REAL NOT NULL CHECK(propensity > 0 AND propensity <= 1),
+            presented_at TEXT NOT NULL,
+            visible_at TEXT,
+            label REAL NOT NULL,
+            label_kind TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            attributed_at TEXT NOT NULL,
+            UNIQUE(run_id,event_key,event_revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recommendation_evidence_outcomes_run
+            ON recommendation_evidence_outcomes(run_id,rank,attributed_at);
+
+        -- Enforce append-only semantics for ordinary callers. DELETE remains
+        -- available to the explicit privacy-purge helper below.
+        CREATE TRIGGER recommendation_run_evidence_immutable
+        BEFORE UPDATE ON recommendation_run_evidence
+        BEGIN SELECT RAISE(ABORT,'recommendation run evidence is immutable'); END;
+        CREATE TRIGGER recommendation_evidence_vectors_immutable
+        BEFORE UPDATE ON recommendation_evidence_vectors
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence vectors are immutable'); END;
+        CREATE TRIGGER recommendation_run_evidence_vectors_immutable
+        BEFORE UPDATE ON recommendation_run_evidence_vectors
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence links are immutable'); END;
+        CREATE TRIGGER recommendation_run_evidence_candidates_immutable
+        BEFORE UPDATE ON recommendation_run_evidence_candidates
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence candidates are immutable'); END;
+        CREATE TRIGGER recommendation_evidence_exposures_immutable
+        BEFORE UPDATE ON recommendation_evidence_exposures
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence exposures are immutable'); END;
+        CREATE TRIGGER recommendation_evidence_events_immutable
+        BEFORE UPDATE ON recommendation_evidence_events
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence events are immutable'); END;
+        CREATE TRIGGER recommendation_evidence_outcomes_immutable
+        BEFORE UPDATE ON recommendation_evidence_outcomes
+        BEGIN SELECT RAISE(ABORT,'recommendation evidence outcomes are immutable'); END;
+
+        -- This counter bounds durable replay payloads and vector binaries. Once
+        -- it reaches the application quota, later run records stay explicit
+        -- but incomplete and the normal recommendation response still serves.
+        CREATE TABLE IF NOT EXISTS recommendation_evidence_budget (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes >= 0)
+        );
+        INSERT OR IGNORE INTO recommendation_evidence_budget(id,used_bytes) VALUES(1,0);
+        CREATE TRIGGER recommendation_run_evidence_budget_insert
+        AFTER INSERT ON recommendation_run_evidence
+        WHEN NEW.payload IS NOT NULL
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+length(NEW.payload) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_run_evidence_budget_delete
+        AFTER DELETE ON recommendation_run_evidence
+        WHEN OLD.payload IS NOT NULL
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-length(OLD.payload)) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_vector_budget_insert
+        AFTER INSERT ON recommendation_evidence_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+length(NEW.vector) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_vector_budget_delete
+        AFTER DELETE ON recommendation_evidence_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-length(OLD.vector)) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_run_evidence_link_budget_insert
+        AFTER INSERT ON recommendation_run_evidence_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+96 WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_run_evidence_link_budget_delete
+        AFTER DELETE ON recommendation_run_evidence_vectors
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-96) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_run_evidence_candidate_budget_insert
+        AFTER INSERT ON recommendation_run_evidence_candidates
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+72+length(NEW.identity_hash) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_run_evidence_candidate_budget_delete
+        AFTER DELETE ON recommendation_run_evidence_candidates
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-72-length(OLD.identity_hash)) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_exposure_budget_insert
+        AFTER INSERT ON recommendation_evidence_exposures
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+160+length(CAST(NEW.candidate_snapshot_json AS BLOB)) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_exposure_budget_delete
+        AFTER DELETE ON recommendation_evidence_exposures
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-160-length(CAST(OLD.candidate_snapshot_json AS BLOB))) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_event_budget_insert
+        AFTER INSERT ON recommendation_evidence_events
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+128+length(CAST(NEW.event_key AS BLOB))
+                +length(CAST(NEW.event_type AS BLOB))+length(CAST(NEW.source AS BLOB))
+                +length(CAST(NEW.occurred_at AS BLOB)) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_event_budget_delete
+        AFTER DELETE ON recommendation_evidence_events
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-128-length(CAST(OLD.event_key AS BLOB))
+                -length(CAST(OLD.event_type AS BLOB))-length(CAST(OLD.source AS BLOB))
+                -length(CAST(OLD.occurred_at AS BLOB))) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_outcome_budget_insert
+        AFTER INSERT ON recommendation_evidence_outcomes
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=used_bytes+192+length(CAST(NEW.event_key AS BLOB))
+                +length(CAST(NEW.label_kind AS BLOB))+length(CAST(NEW.presented_at AS BLOB))
+                +length(CAST(NEW.attributed_at AS BLOB))
+                +COALESCE(length(CAST(NEW.visible_at AS BLOB)),0) WHERE id=1;
+        END;
+        CREATE TRIGGER recommendation_evidence_outcome_budget_delete
+        AFTER DELETE ON recommendation_evidence_outcomes
+        BEGIN
+            UPDATE recommendation_evidence_budget
+            SET used_bytes=MAX(0,used_bytes-192-length(CAST(OLD.event_key AS BLOB))
+                -length(CAST(OLD.label_kind AS BLOB))-length(CAST(OLD.presented_at AS BLOB))
+                -length(CAST(OLD.attributed_at AS BLOB))
+                -COALESCE(length(CAST(OLD.visible_at AS BLOB)),0)) WHERE id=1;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

@@ -67,6 +67,7 @@ from .digest import (
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
+    build_decision_evidence,
     record_event_in_connection,
     record_events,
 )
@@ -1225,6 +1226,10 @@ def tracked_recommendations(
     connection=None,
     recommended_limit: int | None = None,
 ):
+    ranking_at = datetime.now(timezone.utc)
+    base_pool = personalized_pool = final_pool = None
+    interaction_events = []
+    cached_vectors = {}
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata = {
         "mode": "confidence_gated_live",
@@ -1246,6 +1251,7 @@ def tracked_recommendations(
             ranked = recommendation_list(
                 connection, status=status, limit=None, offset=0
             )
+            base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
             # The event primary key orders actions; cached vectors are keyed by
             # candidate id. Normalize only the cache inputs so learner event
@@ -1265,9 +1271,11 @@ def tracked_recommendations(
             ranked, diagnostics = personalize_recommendations(
                 ranked,
                 interaction_events,
+                now=ranking_at,
                 interaction_vectors=interaction_vectors,
                 candidate_vectors=cached_vectors,
             )
+            personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
             recommended = [
                 item for item in ranked if item.get("status") == "recommended"
@@ -1283,6 +1291,7 @@ def tracked_recommendations(
                 discovery_metadata = empty_discovery_slate_diagnostics(
                     "no_recommended_candidates"
                 )
+            final_pool = [dict(item) for item in ranked]
             if recommended_limit is not None and status is None and offset == 0:
                 recommended = [item for item in ranked if item.get("status") == "recommended"]
                 remaining = [
@@ -1338,8 +1347,37 @@ def tracked_recommendations(
             epsilon=settings.exploration_epsilon,
             stable_top_k=settings.exploration_stable_top_k,
         )
+    if base_pool is not None and personalized_pool is not None and final_pool is not None:
+        decision_evidence = build_decision_evidence(
+            connection,
+            base_pool=base_pool,
+            personalized_pool=personalized_pool,
+            final_pool=final_pool,
+            interaction_events=interaction_events,
+            cached_vectors=cached_vectors,
+            ranking_metadata=learning_metadata,
+            discovery_slate_metadata=discovery_metadata,
+            request_context={
+                "status": status,
+                "limit": limit,
+                "offset": offset,
+                "recommended_limit": recommended_limit,
+                "ranking_at": ranking_at.isoformat(),
+                "exploration_enabled": settings.exploration_enabled,
+                "exploration_epsilon": settings.exploration_epsilon,
+                "exploration_stable_top_k": settings.exploration_stable_top_k,
+            },
+        )
+    else:
+        decision_evidence = {
+            "schema_version": 1,
+            "capture_status": "incomplete",
+            "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
+            "captured_at": ranking_at.isoformat(),
+        }
     run_id = create_recommendation_run(
         recommendations,
+        decision_evidence=decision_evidence,
         status=status,
         limit=limit,
         ranking_metadata=learning_metadata,
