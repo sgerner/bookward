@@ -9,6 +9,7 @@ treating a missing action as a negative label.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import uuid
@@ -16,11 +17,20 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .database import transaction
+from .decision_evidence import (
+    POLICY,
+    POLICY_VERSION,
+    archive_recommendation_event,
+    archive_recommendation_outcome,
+    archive_served_exposures,
+    persist_run_evidence,
+    purge_recommendation_evidence,
+    build_decision_evidence,
+)
 from .identity import book_identity
 
 
-POLICY = "rating-neighborhood"
-POLICY_VERSION = "rating-kernel-recency-interaction-installation-slate-v1"
+LOGGER = logging.getLogger(__name__)
 EVENT_TYPES = {
     "visible",
     "detail_open",
@@ -99,6 +109,7 @@ def create_recommendation_run(
     limit: int | None = None,
     ranking_metadata: dict[str, Any] | None = None,
     discovery_slate_metadata: dict[str, Any] | None = None,
+    decision_evidence: dict[str, Any] | None = None,
 ) -> str:
     """Persist a ranked response and return its opaque run identifier.
 
@@ -144,6 +155,28 @@ def create_recommendation_run(
                 "VALUES(?,?,?,?,?,?)",
                 (run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
             )
+        try:
+            con.execute("SAVEPOINT archive_served_exposures")
+            archive_served_exposures(
+                con,
+                run_id=run_id,
+                recommendations=items,
+                presented_at=now,
+            )
+            con.execute("RELEASE SAVEPOINT archive_served_exposures")
+        except Exception:
+            con.execute("ROLLBACK TO SAVEPOINT archive_served_exposures")
+            con.execute("RELEASE SAVEPOINT archive_served_exposures")
+            LOGGER.warning("Recommendation exposure archive failed; serving telemetry continues")
+        if decision_evidence is not None:
+            try:
+                con.execute("SAVEPOINT persist_decision_evidence")
+                persist_run_evidence(con, run_id=run_id, evidence=decision_evidence)
+                con.execute("RELEASE SAVEPOINT persist_decision_evidence")
+            except Exception:
+                con.execute("ROLLBACK TO SAVEPOINT persist_decision_evidence")
+                con.execute("RELEASE SAVEPOINT persist_decision_evidence")
+                LOGGER.warning("Recommendation decision evidence persistence failed")
     return run_id
 
 
@@ -207,6 +240,7 @@ def _record_outcome(
     label: float,
     label_kind: str,
     confidence: float,
+    attributed_at: str | None = None,
 ):
     if impression_id is None:
         return "none"
@@ -233,7 +267,7 @@ def _record_outcome(
             label,
             label_kind,
             confidence,
-            utc_now(),
+            attributed_at or utc_now(),
         ),
     )
     return "updated" if existing else "created"
@@ -276,6 +310,7 @@ def record_event_in_connection(
         "FROM recommendation_events WHERE event_key=?",
         (event_key,),
     ).fetchone()
+    read_value_changed = False
     if existing:
         if not _existing_event_matches(
             existing,
@@ -293,6 +328,7 @@ def record_event_in_connection(
                 "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
                 (value, timestamp, event_id),
             )
+            read_value_changed = True
     else:
         cursor = con.execute(
             "INSERT INTO recommendation_events(event_key,run_id,candidate_id,event_type,value,source,occurred_at,metadata) "
@@ -310,6 +346,18 @@ def record_event_in_connection(
         )
         event_id = int(cursor.lastrowid)
         duplicate = False
+    archived_revision = None
+    if not duplicate or read_value_changed:
+        archived_revision = archive_recommendation_event(
+            con,
+            event_key=event_key,
+            run_id=run_id,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            value=value,
+            source=source,
+            occurred_at=timestamp,
+        )
     if event_type == "visible" and run_id is not None:
         con.execute(
             "UPDATE recommendation_impressions SET visible_at=COALESCE(visible_at,?) "
@@ -322,6 +370,7 @@ def record_event_in_connection(
         if not 0 <= confidence <= 1:
             raise ValueError("Outcome confidence must be between 0 and 1")
         impression = _find_latest_impression(con, candidate_id, run_id)
+        outcome_at = utc_now()
         outcome_status = _record_outcome(
             con,
             impression_id=int(impression["id"]) if impression else None,
@@ -330,7 +379,24 @@ def record_event_in_connection(
             label=float(label),
             label_kind=label_kind or event_type,
             confidence=confidence,
+            attributed_at=outcome_at,
         )
+        if (
+            archived_revision is not None
+            and impression is not None
+            and outcome_status in {"created", "updated"}
+        ):
+            archive_recommendation_outcome(
+                con,
+                event_key=event_key,
+                event_revision=archived_revision,
+                candidate_id=candidate_id,
+                impression=impression,
+                label=float(label),
+                label_kind=label_kind or event_type,
+                confidence=confidence,
+                attributed_at=outcome_at,
+            )
     else:
         outcome_status = "none"
     return {"id": event_id, "duplicate": duplicate, "outcome": outcome_status}
