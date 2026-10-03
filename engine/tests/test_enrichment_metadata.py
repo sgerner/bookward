@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from afterword_engine import covers
+from afterword_engine import ingestion
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -121,6 +122,54 @@ def test_openlibrary_description_prefers_synopsis_and_records_field_provenance()
     assert source["provider"] == "openlibrary"
     assert source["provider_id"] == "/works/OL101W"
     assert source["payload"]["opening_sentence"] == opening
+
+
+def test_penguin_random_house_description_requires_direct_link_identity_and_matching_isbn(monkeypatch):
+    item = {
+        "title": "Source Work",
+        "author": "A Writer",
+        "source_url": "https://www.penguinrandomhouse.com/books/123/source-work-by-a-writer",
+        "isbn13": "9780306406157",
+    }
+    html = b'''<html><head>
+      <meta name="Tealium" data-book-title="Source Work" data-book-authors="A Writer" data-book-isbn="9780306406157">
+      <meta name="twitter:text:isbn" content="9780306406157">
+    </head><body><div id="book-description-copy"><div class="copy-height">Official publisher description.</div></div></body></html>'''
+    calls = []
+
+    async def fetch(url, client=None):
+        calls.append(url)
+        return html, "text/html"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fetch)
+    metadata = asyncio.run(ingestion.resolve_penguin_random_house_product_description(item))
+
+    assert calls == [item["source_url"]]
+    assert metadata["description"] == "Official publisher description."
+    assert metadata["provider"] == "penguinrandomhouse"
+    assert metadata["provider_id"] == item["source_url"]
+    assert metadata["isbn13"] == item["isbn13"]
+    assert metadata["source_payload"]["identifiers"] == [item["isbn13"]]
+
+    async def mismatched_page(url, client=None):
+        return html.replace(b"9780306406157", b"9780140328721"), "text/html"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", mismatched_page)
+    assert asyncio.run(ingestion.resolve_penguin_random_house_product_description(item)) == {}
+
+
+def test_penguin_random_house_description_rejects_nonproduct_urls_without_fetch(monkeypatch):
+    async def fail_if_fetched(*args, **kwargs):
+        raise AssertionError("disallowed publisher URL was fetched")
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fail_if_fetched)
+    result = asyncio.run(ingestion.resolve_penguin_random_house_product_description({
+        "title": "Source Work",
+        "author": "A Writer",
+        "source_url": "https://example.org/books/123",
+        "isbn13": "9780306406157",
+    }))
+    assert result == {}
 
 
 def test_source_description_is_preserved_and_legacy_opening_upgrade_is_exact_record_only():

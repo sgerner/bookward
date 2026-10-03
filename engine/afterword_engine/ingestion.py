@@ -2398,6 +2398,89 @@ def _penguin_random_house_page_metadata(content, source_url):
     }
 
 
+async def _load_penguin_random_house_product_items(source_url, client=None):
+    """Fetch and parse one allowlisted publisher page with its page metadata."""
+
+    if not _penguin_random_house_book_url(source_url):
+        return []
+    content, content_type = await fetch_bytes(source_url, client=client)
+    detail_items = parse_book_items(content, content_type, source_url)
+    page_metadata = _penguin_random_house_page_metadata(content, source_url)
+    if not detail_items and page_metadata.get("title") and page_metadata.get("author"):
+        detail_items = [{**page_metadata, "source_url": source_url}]
+    for detail in detail_items:
+        for field in ("description", "isbn13", "isbn10"):
+            if not detail.get(field) and page_metadata.get(field):
+                detail[field] = page_metadata[field]
+    return detail_items
+
+
+def _penguin_random_house_item_matches(item, detail):
+    wanted = book_identity_match_keys(item.get("title", ""), item.get("author", ""))
+    if not wanted or not (wanted & book_identity_match_keys(detail.get("title", ""), detail.get("author", ""))):
+        return False
+    supplied_isbn = item.get("isbn13") or item.get("isbn10") or item.get("isbn")
+    if not supplied_isbn:
+        return True
+    returned_isbns = [detail.get("isbn13"), detail.get("isbn10"), detail.get("isbn")]
+    wanted13, wanted10 = isbn_parts(supplied_isbn)
+    return _returned_identifiers_match_read(returned_isbns, wanted13, wanted10)
+
+
+async def resolve_penguin_random_house_product_description(item, client=None):
+    """Resolve a description from the exact linked PRH product page.
+
+    When the candidate has an ISBN, the product page must return that same
+    ISBN as well as a matching title and author. The result carries the field
+    provenance needed by private pilot cards and metadata storage.
+    """
+
+    source_url = str(item.get("source_url") or "")
+    if not (
+        _penguin_random_house_book_url(source_url)
+        and item.get("title")
+        and item.get("author")
+    ):
+        return {}
+    detail_items = await _load_penguin_random_house_product_items(source_url, client=client)
+    matches = [
+        detail for detail in detail_items
+        if _penguin_random_house_item_matches(item, detail)
+        and _clean_text(detail.get("description"), 4000)
+    ]
+    if not matches:
+        return {}
+    detail = max(
+        matches,
+        key=lambda value: (
+            len(_clean_text(value.get("description"), 4000)),
+            bool(value.get("isbn13") or value.get("isbn10")),
+        ),
+    )
+    parsed_url = urlparse(source_url)
+    provider_id = f"https://{parsed_url.netloc}{parsed_url.path}"
+    description = _clean_text(detail.get("description"), 4000)
+    identifiers = [
+        value for value in (detail.get("isbn13"), detail.get("isbn10")) if value
+    ]
+    payload = {
+        "title": str(detail.get("title") or item.get("title") or "")[:500],
+        "authors": [str(detail.get("author") or item.get("author") or "")[:300]],
+        "description": description,
+        "identifiers": identifiers,
+    }
+    return {
+        "description": description,
+        "isbn13": str(detail.get("isbn13") or ""),
+        "isbn10": str(detail.get("isbn10") or ""),
+        "provider": "penguinrandomhouse",
+        "provider_id": provider_id,
+        "kind": "publisher_product",
+        "source_field": "description",
+        "source_payload": payload,
+    }
+
+
 async def enrich_penguin_random_house_items(items):
     """Follow PRH product links for publisher descriptions and ISBNs.
 
@@ -2457,22 +2540,7 @@ async def enrich_penguin_random_house_items(items):
         async def load_product_page(url):
             async with semaphore:
                 try:
-                    content, content_type = await fetch_bytes(url, client=client)
-                    detail_items = parse_book_items(content, content_type, url)
-                    page_metadata = _penguin_random_house_page_metadata(
-                        content, url
-                    )
-                    if (
-                        not detail_items
-                        and page_metadata.get("title")
-                        and page_metadata.get("author")
-                    ):
-                        detail_items = [{**page_metadata, "source_url": url}]
-                    for detail in detail_items:
-                        for field in ("description", "isbn13", "isbn10"):
-                            if not detail.get(field) and page_metadata.get(field):
-                                detail[field] = page_metadata[field]
-                    return detail_items
+                    return await _load_penguin_random_house_product_items(url, client=client)
                 except Exception:
                     # A single unavailable product page must not fail its feed.
                     return []
@@ -2491,16 +2559,10 @@ async def enrich_penguin_random_house_items(items):
                 task = asyncio.create_task(load_product_page(url))
                 page_tasks[url] = task
             detail_items = await task
-            wanted = book_identity_match_keys(
-                item.get("title", ""), item.get("author", "")
-            )
             matches = [
                 detail
                 for detail in detail_items
-                if wanted
-                & book_identity_match_keys(
-                    detail.get("title", ""), detail.get("author", "")
-                )
+                if _penguin_random_house_item_matches(item, detail)
             ]
             if not matches:
                 return item
