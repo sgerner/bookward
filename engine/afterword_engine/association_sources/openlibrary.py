@@ -24,7 +24,8 @@ from ..associations import (
     record_association_request,
 )
 from ..config import settings
-from ..identity import book_identity
+from ..identity import ReadIdentityIndex, book_identity
+from ..isbn import isbn_parts
 from ..security import resolve_public_target
 
 
@@ -72,6 +73,18 @@ def _entry_authors(entry: Mapping[str, Any]) -> list[str]:
             if lower.startswith("by "):
                 names.append(statement[3:].strip())
     return names
+
+
+def _entry_isbn(entry: Mapping[str, Any]) -> str:
+    values = []
+    for field in ("isbn", "isbn13", "isbn10", "isbn_13", "isbn_10"):
+        value = entry.get(field)
+        if isinstance(value, Mapping):
+            value = value.get("identifier")
+        if value:
+            values.append(value)
+    isbn13, isbn10 = isbn_parts(values)
+    return isbn13 or isbn10
 
 
 def _external_key(entry: Mapping[str, Any]) -> str:
@@ -272,12 +285,15 @@ class OpenLibraryListProvider:
                 return key, dict(doc)
         return None
 
-    async def _resolve_entry(self, entry: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    async def _resolve_entry(
+        self, entry: Mapping[str, Any]
+    ) -> tuple[str, str, str, str] | None:
         title = _clean(entry.get("title"), 500)
         if not title:
             return None
         authors = _entry_authors(entry)
         book_key = _external_key(entry)
+        candidate_isbn = _entry_isbn(entry)
         if (not authors or not book_key) and self._resolutions < self.max_resolutions:
             self._resolutions += 1
             params: dict[str, Any] = {
@@ -304,12 +320,13 @@ class OpenLibraryListProvider:
                 ):
                     continue
                 book_key = book_key or _external_key(doc)
+                candidate_isbn = candidate_isbn or _entry_isbn(doc)
                 if not authors and resolved_authors:
                     authors = resolved_authors
                 if book_key:
                     break
         author = authors[0] if authors else "Unknown author"
-        return title, author, book_key
+        return title, author, book_key, candidate_isbn
 
     async def _list_entries(self, list_url: str) -> list[Mapping[str, Any]]:
         path = list_url
@@ -331,11 +348,7 @@ class OpenLibraryListProvider:
             max_per_author=self.max_per_author,
         )
         self._resolutions = 0
-        read_identities = {
-            book_identity(read.get("title", ""), read.get("author", ""))
-            for read in reads
-        }
-        read_titles = {_title_key(read.get("title", "")) for read in reads}
+        read_identity_index = ReadIdentityIndex.from_reads(reads)
         output: list[Association] = []
         seen: set[tuple[int, str]] = set()
         for seed in seeds:
@@ -371,10 +384,16 @@ class OpenLibraryListProvider:
                         resolved_entry = await self._resolve_entry(entry)
                         if resolved_entry is None:
                             continue
-                        title, author, book_key = resolved_entry
+                        title, author, book_key, candidate_isbn = resolved_entry
                         external_id = book_key or book_identity(title, author)
-                        identity = book_identity(title, author)
-                        if identity in read_identities or _title_key(title) in read_titles:
+                        candidate_identity = {
+                            "title": title,
+                            "author": author,
+                            "quality_work_id": book_key,
+                            "quality_provider": "openlibrary",
+                            "isbn": candidate_isbn,
+                        }
+                        if read_identity_index.matches(candidate_identity):
                             continue
                         key = (int(seed["id"]), external_id)
                         if key in seen:
@@ -392,6 +411,7 @@ class OpenLibraryListProvider:
                                 title=title,
                                 author=author,
                                 source_url=source_url,
+                                isbn=candidate_isbn,
                                 rank=position,
                                 metadata={
                                     "work_key": work_key,
