@@ -35,7 +35,21 @@ def document(item):
         if str(value or "").strip()
     )
 
-async def cached_vectors(embedder, entity_type, items, *, force=False, persist=True):
+async def cached_vectors(
+    embedder,
+    entity_type,
+    items,
+    *,
+    force=False,
+    persist=True,
+    expected_dimensions=None,
+):
+    if expected_dimensions is not None and (
+        isinstance(expected_dimensions, bool)
+        or not isinstance(expected_dimensions, int)
+        or expected_dimensions <= 0
+    ):
+        raise ValueError("Expected embedding dimensions must be a positive integer")
     vectors, missing = [None] * len(items), []
 
     cached_by_id = {}
@@ -66,6 +80,11 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
         if cached and cached["content_hash"] == digest:
             vector = _cached_vector_values(cached)
             if vector is not None:
+                if expected_dimensions is not None and len(vector) != expected_dimensions:
+                    raise ValueError(
+                        "Cached embedding dimensions differ from expected dimensions; "
+                        "rebuild the affected cache"
+                    )
                 vectors[index] = vector
                 cached_dimensions.add(len(vector))
                 continue
@@ -80,6 +99,11 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
         generated, dimensions = _provider_vector_values(generated)
         if not dimensions:
             raise ValueError("Embedding provider returned invalid or inconsistent vectors")
+        if expected_dimensions is not None and dimensions != expected_dimensions:
+            raise ValueError(
+                "Embedding provider dimensions differ from expected dimensions; "
+                "rebuild the affected cache"
+            )
         if cached_dimensions and dimensions not in cached_dimensions:
             raise ValueError("Embedding provider dimensions differ from valid cached vectors; rebuild the full cache")
         if persist:
@@ -91,6 +115,16 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
             for (index,_item,_text,_digest), vector in zip(missing,generated):
                 vectors[index] = vector
     return vectors
+
+
+def _vector_dimensions(vectors):
+    """Return the established dimension for a validated vector set, if any."""
+    if not vectors:
+        return None
+    dimensions = {len(vector) for vector in vectors}
+    if len(dimensions) != 1 or next(iter(dimensions)) <= 0:
+        raise ValueError("Embedding dimensions are inconsistent; rebuild the affected cache")
+    return next(iter(dimensions))
 
 
 def _cached_vector_values(cached):
@@ -211,7 +245,12 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         attach_publication_years(con, reads, candidates)
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)
-    all_candidate_vectors = await cached_vectors(embedder,"candidate",candidate_items)
+    all_candidate_vectors = await cached_vectors(
+        embedder,
+        "candidate",
+        candidate_items,
+        expected_dimensions=_vector_dimensions(read_vectors),
+    )
     vectors_by_id = {
         int(item["id"]): vector
         for item, vector in zip(candidate_items, all_candidate_vectors)
@@ -303,7 +342,14 @@ async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=Non
     # Generate off to the side first. A provider failure must leave both the
     # current provider cache and caches for other providers untouched.
     read_vectors = await cached_vectors(embedder, "read", reads, force=True, persist=False)
-    candidate_vectors = await cached_vectors(embedder, "candidate", candidates, force=True, persist=False)
+    candidate_vectors = await cached_vectors(
+        embedder,
+        "candidate",
+        candidates,
+        force=True,
+        persist=False,
+        expected_dimensions=_vector_dimensions(read_vectors),
+    )
     with transaction() as con:
         con.execute(
             "DELETE FROM embeddings WHERE backend=? AND model=?",

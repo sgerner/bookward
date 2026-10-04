@@ -1820,6 +1820,66 @@ def test_cached_and_new_embedding_dimension_mismatch_fails_before_persist(databa
     ) is None
 
 
+def test_expected_embedding_dimension_rejects_provider_output_before_persist(database):
+    class TwoDimEmbedder:
+        name, model = "expected-dimension", "fixture-v1"
+
+        async def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    item = {"id": 992, "title": "Expected width", "author": "Fixture"}
+    with pytest.raises(ValueError, match="provider dimensions differ from expected"):
+        asyncio.run(
+            cached_vectors(
+                TwoDimEmbedder(),
+                "candidate",
+                [item],
+                expected_dimensions=3,
+            )
+        )
+    assert row(
+        "SELECT 1 present FROM embeddings WHERE entity_type='candidate' AND entity_id=? AND backend='expected-dimension'",
+        (item["id"],),
+    ) is None
+
+
+def test_expected_embedding_dimension_rejects_valid_cached_vector(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class UnexpectedEmbedder:
+        name, model = "expected-cached-dimension", "fixture-v1"
+
+        async def embed(self, _texts):
+            raise AssertionError("A valid but incompatible cached vector must abstain")
+
+    item = {"id": 993, "title": "Cached width", "author": "Fixture"}
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+            (
+                "candidate",
+                item["id"],
+                "expected-cached-dimension",
+                "fixture-v1",
+                np.asarray([1.0, 0.0], dtype=np.float32).tobytes(),
+                2,
+                content_hash(document(item)),
+            ),
+        )
+    with pytest.raises(ValueError, match="Cached embedding dimensions differ from expected"):
+        asyncio.run(
+            cached_vectors(
+                UnexpectedEmbedder(),
+                "candidate",
+                [item],
+                expected_dimensions=3,
+            )
+        )
+
+
 def test_float32_overflow_from_finite_provider_values_is_not_persisted(database):
     class OverflowEmbedder:
         name, model = "overflow-check", "fixture-v1"
@@ -1865,6 +1925,180 @@ def test_score_all_recovers_from_corrupt_matching_hash_cache(database):
     assert np.isfinite(np.frombuffer(repaired["vector"], dtype=np.float32)).all()
     assert all(np.isfinite(score) for score in scores)
     assert scores == baseline_scores
+
+
+def test_score_all_rejects_candidate_provider_dimension_change_before_persist(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class TwoDimEmbedder:
+        name, model = "cross-kind-provider", "fixture-v1"
+
+        async def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    assert reads
+    with transaction() as con:
+        for item in reads:
+            con.execute(
+                "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "read",
+                    item["id"],
+                    "cross-kind-provider",
+                    "fixture-v1",
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+                    3,
+                    content_hash(document(item)),
+                ),
+            )
+
+    with pytest.raises(ValueError, match="provider dimensions differ from expected"):
+        asyncio.run(score_all(embedder=TwoDimEmbedder()))
+    assert row(
+        "SELECT COUNT(*) count FROM embeddings WHERE entity_type='candidate' AND backend='cross-kind-provider'"
+    )["count"] == 0
+
+
+def test_score_all_rejects_cross_kind_valid_cache_dimension_mismatch(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class UnexpectedEmbedder:
+        name, model = "cross-kind-cache", "fixture-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def embed(self, texts):
+            self.calls += 1
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    candidates = rows("SELECT * FROM candidates ORDER BY id")
+    assert reads and candidates
+    with transaction() as con:
+        for item in reads:
+            con.execute(
+                "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "read",
+                    item["id"],
+                    "cross-kind-cache",
+                    "fixture-v1",
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+                    3,
+                    content_hash(document(item)),
+                ),
+            )
+        for item in candidates:
+            con.execute(
+                "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "candidate",
+                    item["id"],
+                    "cross-kind-cache",
+                    "fixture-v1",
+                    np.asarray([1.0, 0.0], dtype=np.float32).tobytes(),
+                    2,
+                    content_hash(document(item)),
+                ),
+            )
+
+    embedder = UnexpectedEmbedder()
+    with pytest.raises(ValueError, match="Cached embedding dimensions differ from expected"):
+        asyncio.run(score_all(embedder=embedder))
+    assert embedder.calls == 0
+
+
+def test_forced_nonpersistent_rebuild_rejects_cross_kind_dimension_change(database, monkeypatch):
+    class ChangingDimensionEmbedder:
+        name, model = "forced-cross-kind", "fixture-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def embed(self, texts):
+            self.calls += 1
+            width = 3 if self.calls == 1 else 2
+            return [[1.0] + [0.0] * (width - 1) for _ in texts]
+
+    embedder = ChangingDimensionEmbedder()
+    monkeypatch.setattr(
+        "afterword_engine.scoring.get_embedder",
+        lambda *_args, **_kwargs: embedder,
+    )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+            (
+                "read",
+                9999,
+                "forced-cross-kind",
+                "fixture-v1",
+                np.asarray([0.5], dtype=np.float32).tobytes(),
+                1,
+                "old-cache-entry",
+            ),
+        )
+    with pytest.raises(ValueError, match="provider dimensions differ from expected"):
+        asyncio.run(rebuild_all_embeddings("forced-cross-kind", "fixture-v1"))
+    assert embedder.calls == 2
+    retained = row(
+        "SELECT vector,dimensions,content_hash FROM embeddings "
+        "WHERE backend='forced-cross-kind' AND entity_id=9999"
+    )
+    assert retained["vector"] == np.asarray([0.5], dtype=np.float32).tobytes()
+    assert retained["dimensions"] == 1
+    assert retained["content_hash"] == "old-cache-entry"
+    assert row(
+        "SELECT COUNT(*) count FROM embeddings WHERE backend='forced-cross-kind'"
+    )["count"] == 1
+
+
+def test_reading_history_score_path_rejects_cross_kind_dimension_change(database, monkeypatch):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.main import reading_history_scores
+    from afterword_engine.scoring import document
+
+    class TwoDimEmbedder:
+        name, model = "history-cross-kind", "fixture-v1"
+
+        async def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    assert reads
+    with transaction() as con:
+        for item in reads:
+            con.execute(
+                "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "read",
+                    item["id"],
+                    "history-cross-kind",
+                    "fixture-v1",
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32).tobytes(),
+                    3,
+                    content_hash(document(item)),
+                ),
+            )
+    monkeypatch.setattr(
+        "afterword_engine.main.get_embedder",
+        lambda *_args, **_kwargs: TwoDimEmbedder(),
+    )
+    with pytest.raises(ValueError, match="provider dimensions differ from expected"):
+        asyncio.run(reading_history_scores(offset=0, limit=20))
+    assert row(
+        "SELECT COUNT(*) count FROM embeddings WHERE entity_type='read_candidate' AND backend='history-cross-kind'"
+    )["count"] == 0
 
 def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
     settings.db = str(tmp_path / "legacy.db")
