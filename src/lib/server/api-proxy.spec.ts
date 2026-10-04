@@ -118,6 +118,33 @@ describe("public API proxy", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("preserves percent escapes that SvelteKit has already decoded once", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+    const request = new Request(
+      "http://bookward.test/api/v1/reports%252Fprivate?format=json",
+    );
+
+    await proxyApi(eventFor(request, "reports%2Fprivate"));
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://127.0.0.1:8000/api/v1/reports%252Fprivate?format=json",
+    );
+  });
+
+  it("forwards literal percent text in a decoded route segment", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+    const request = new Request("http://bookward.test/api/v1/items%25ZZ");
+
+    const response = await proxyApi(eventFor(request, "items%ZZ"));
+
+    expect(response.status).toBe(200);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://127.0.0.1:8000/api/v1/items%25ZZ",
+    );
+  });
+
   it("preserves the engine auth challenge for API clients", async () => {
     vi.stubGlobal(
       "fetch",
