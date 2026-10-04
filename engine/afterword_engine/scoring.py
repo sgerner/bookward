@@ -169,9 +169,20 @@ def _normalized_vectors(vectors):
     if not vectors:
         return np.empty((0, 0), dtype=np.float32)
 
-    matrix = np.asarray(vectors, dtype=np.float32)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    return np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms != 0)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            matrix = np.asarray(vectors, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Embedding vectors must contain numeric rows") from exc
+    if matrix.ndim != 2 or not matrix.shape[1]:
+        raise ValueError("Embedding vectors must be non-empty, equally sized rows")
+    if not np.isfinite(matrix).all():
+        raise ValueError("Embedding vectors must contain only finite values")
+    scales = np.max(np.abs(matrix), axis=1, keepdims=True)
+    scaled = np.divide(matrix, scales, out=np.zeros_like(matrix), where=scales != 0)
+    norms = np.linalg.norm(scaled, axis=1, keepdims=True)
+    normalized = np.divide(scaled, norms, out=np.zeros_like(scaled), where=norms != 0)
+    return normalized.astype(np.float32)
 
 
 def _max_cosine_similarities(vectors, references, default):

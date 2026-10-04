@@ -47,6 +47,22 @@ def _title_key(value: object) -> str:
     return book_identity(value, "").split("\x1f", 1)[0]
 
 
+def _recommendation_rank(value: object, fallback: int) -> int:
+    """Use a provider rank only when it is an unambiguous positive integer."""
+
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int):
+        return value if 0 < value <= 100 else fallback
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned.isascii() or not cleaned.isdigit() or len(cleaned) > 9:
+            return fallback
+        parsed = int(cleaned)
+        return parsed if 0 < parsed <= 100 else fallback
+    return fallback
+
+
 def _today_start() -> str:
     current = datetime.now(timezone.utc)
     # SQLite's CURRENT_TIMESTAMP uses a space separator and no timezone
@@ -286,7 +302,7 @@ class LibraryThingProvider:
                         title=title,
                         author=author,
                         isbn=candidate_isbn,
-                        rank=int(recommendation.get("rank") or fallback_rank),
+                        rank=_recommendation_rank(recommendation.get("rank"), fallback_rank),
                         source_url=(
                             f"https://www.librarything.com/work/{recommendation_work}"
                             if recommendation_work

@@ -34,6 +34,7 @@ from afterword_engine.ingestion import (
     fetch_bytes,
     filter_source_items,
     import_goodreads_csv,
+    import_goodreads_rss,
     normalize_source_filters,
     normalize_stored_candidate_subjects,
     parse_book_items,
@@ -882,6 +883,52 @@ def test_goodreads_csv_import_is_idempotent(database):
     assert import_goodreads_csv(payload) == 1
     assert import_goodreads_csv(payload) == 1
     assert row("SELECT COUNT(*) count FROM reads WHERE title='A Book, With Comma'")["count"] == 1
+
+
+def test_goodreads_reimports_preserve_known_read_date_when_feed_date_is_blank(database, monkeypatch):
+    dated_csv = (
+        b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
+        b'1,CSV Read,Writer,5,2024/03/04,\n'
+    )
+    undated_csv = (
+        b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
+        b'1,CSV Read,Writer,5,,\n'
+    )
+    import_goodreads_csv(dated_csv)
+    import_goodreads_csv(undated_csv)
+    assert row("SELECT read_at FROM reads WHERE title='CSV Read'")["read_at"] == "2024/03/04"
+    import_goodreads_csv(
+        b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
+        b'1,CSV Read,Writer,5,not-a-date,\n'
+    )
+    assert row("SELECT read_at FROM reads WHERE title='CSV Read'")["read_at"] == "2024/03/04"
+    # DictReader yields None for an omitted field in a short row. Ignore it
+    # safely instead of turning a malformed upload into an AttributeError.
+    assert import_goodreads_csv(
+        b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
+        b'2,Truncated row\n'
+    ) == 0
+
+    import_goodreads_csv(
+        b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
+        b'2,RSS Read,Writer,4,2023/02/01,\n'
+    )
+
+    async def fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [{
+            "title": "RSS Read",
+            "author_name": "Writer",
+            "user_rating": "4",
+            "user_read_at": "not-a-date",
+        }]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+    asyncio.run(import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read"))
+    assert row("SELECT read_at FROM reads WHERE title='RSS Read'")["read_at"] == "2023/02/01"
 
 def test_local_cpu_scoring_runs_without_model_download(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 4

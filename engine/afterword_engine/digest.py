@@ -85,7 +85,7 @@ def digest_config(values: dict | None = None) -> dict:
     # down the scheduler, so normalize it to UTC here.
     try:
         ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         timezone_name = "UTC"
     time_value = str(values.get("digest_time") or "09:00")
     if not _TIME_RE.fullmatch(time_value):
@@ -117,7 +117,7 @@ def validate_digest_config(config: dict) -> None:
 
     try:
         ZoneInfo(config["timezone"])
-    except (ZoneInfoNotFoundError, KeyError) as exc:
+    except (ZoneInfoNotFoundError, KeyError, ValueError, TypeError) as exc:
         raise ValueError("Digest timezone is not recognized") from exc
     if not _TIME_RE.fullmatch(str(config.get("time", ""))):
         raise ValueError("Digest time must be HH:MM")
@@ -177,7 +177,7 @@ def period_key(at: datetime | None = None, timezone_name: str = "UTC") -> str:
     at = at or datetime.now(timezone.utc)
     try:
         local = at.astimezone(ZoneInfo(timezone_name))
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         local = at.astimezone(timezone.utc)
     year, week, _ = local.isocalendar()
     return f"{year}-W{week:02d}"
@@ -290,14 +290,17 @@ def _discord_payload(items: list[dict], config: dict, key: str, test=False) -> d
     content = _lines(items, config, key, test)
     # Discord rejects content over 2,000 characters. The selection limit keeps
     # this uncommon, but truncate as a final guard for long titles/reasons.
-    return {"username": "Bookward", "content": content[:1990]}
+    return {"username": "Bookward", "content": content[:1990], "allowed_mentions": {"parse": []}}
 
 
 async def _send_discord(config: dict, payload: dict) -> str:
     validate_public_url(config["discord_webhook_url"])
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
-            response = await client.post(config["discord_webhook_url"], json=payload)
+            # Enforce this at delivery too, including retries of old payloads.
+            response = await client.post(config["discord_webhook_url"], json={
+                **payload, "allowed_mentions": {"parse": []},
+            })
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(f"Discord webhook returned HTTP {exc.response.status_code}") from exc
@@ -483,10 +486,11 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
     )
     # A recommendation is considered seen only after every configured channel
     # received the message. Failed channels remain retryable independently.
-    if not test and configured_channels and successful == set(configured_channels):
+    fully_delivered = bool(configured_channels) and set(configured_channels).issubset(successful)
+    if not test and fully_delivered:
         _mark_period_sent(key, candidate_ids)
     return {
-        "status": "sent" if (test and successful) or (not test and configured_channels and successful == set(configured_channels)) else "failed",
+        "status": "sent" if (test and successful) or (not test and fully_delivered) else "failed",
         "period": key,
         "items": len(items),
         "deliveries": deliveries,
