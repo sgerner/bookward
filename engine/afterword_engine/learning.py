@@ -43,6 +43,7 @@ EVENT_TYPES = {
     "restore",
     "read",
 }
+HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv"})
 EVENT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 MAX_METADATA_BYTES = 4096
@@ -468,7 +469,9 @@ def attribute_read_outcomes() -> dict[str, int]:
     """Join imported reads to the latest preceding recommendation exposure.
 
     No exposure means no outcome. This function is safe to call repeatedly;
-    event and outcome keys are stable across Goodreads re-imports.
+    event and outcome keys are stable across Goodreads re-imports. Historical
+    imports need an explicit completion date; their creation time is import
+    time, not evidence of when the book was read.
     """
 
     scanned = created = updated = attributed = 0
@@ -482,7 +485,8 @@ def attribute_read_outcomes() -> dict[str, int]:
             if not candidate:
                 continue
             read_time, day_precision = _read_time(read.get("read_at"))
-            if read_time is None:
+            source = str(read.get("source") or "").strip().casefold()
+            if read_time is None and source not in HISTORICAL_READ_SOURCES:
                 read_time, day_precision = _read_time(read.get("created_at"))
             if read_time is None:
                 continue
