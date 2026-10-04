@@ -2,6 +2,7 @@
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from .isbn import isbn_parts
@@ -224,6 +225,45 @@ def book_identity_match_index(items) -> set[tuple[str, ...]]:
     for item in items:
         index.update(book_row_identity_match_keys(item))
     return index
+
+
+@dataclass(frozen=True, slots=True)
+class ReadIdentityIndex:
+    """Indexed read identities for filtering provider-discovered candidates.
+
+    Known authors use the same title/author aliases, provider-scoped work IDs,
+    and validated ISBN keys as serving eligibility. A title-only fallback is
+    retained for candidates with no author or the exact ``Unknown author``
+    placeholder, where the provider has not supplied enough identity to do a
+    safer comparison.
+    """
+
+    match_keys: frozenset[tuple[str, ...]]
+    title_keys: frozenset[str]
+
+    @classmethod
+    def from_reads(cls, reads) -> "ReadIdentityIndex":
+        rows = list(reads)
+        return cls(
+            match_keys=frozenset(book_identity_match_index(rows)),
+            title_keys=frozenset(
+                key
+                for read in rows
+                for key in _title_match_keys(_row_value(read, "title"))
+            ),
+        )
+
+    def matches(self, candidate) -> bool:
+        """Return whether a provider result identifies a known read."""
+
+        if book_row_identity_match_keys(candidate) & self.match_keys:
+            return True
+        author_key = _author_match_key(_row_value(candidate, "author"))
+        if author_key and author_key != "unknown author":
+            return False
+        return bool(
+            _title_match_keys(_row_value(candidate, "title")) & self.title_keys
+        )
 
 
 def book_identity(title: object, author: object) -> str:

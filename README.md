@@ -149,6 +149,8 @@ The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) te
 
 Association providers select a bounded set of favorite seeds from the complete reading library. Their exclusion checks also cover disliked, unrated, and other books outside that seed set, so those books are not rediscovered as unread candidates.
 
+Association adapters use shared title/author, provider-scoped work ID, and valid ISBN identity checks. Known-author title collisions alone no longer suppress candidates; exact unknown-author results retain a conservative title fallback. See [the association identity audit](docs/association-source-identity.md) for the offline evidence and limits.
+
 The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The subsequent [full-corpus enrichment evaluation](docs/enrichment-full-corpus-evaluation.md) found no reliable gain from richer read embeddings or score blends, so these remain disabled.
 
 ### Catalog enrichment
