@@ -32,7 +32,7 @@ from .scoring import document
 LOGGER = logging.getLogger(__name__)
 
 POLICY = "rating-neighborhood"
-POLICY_VERSION = "rating-kernel-recency-interaction-installation-slate-v1"
+POLICY_VERSION = "rating-kernel-recency-era-confidence-interaction-installation-slate-v2"
 EVIDENCE_SCHEMA_VERSION = 1
 
 # Request-time caps keep evidence work predictable. Current recommendation
@@ -58,7 +58,7 @@ POOL_FIELDS = (
     "quality_score", "quality_status", "quality_work_id", "quality_provider",
     "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
     "date_kind", "reading_status", "up_next", "reading_rating", "started_at",
-    "finished_at", "propensity",
+    "finished_at", "propensity", "first_publication_year", "publication_work_id", "publication_era",
 )
 PROFILE_FIELDS = (
     "id", "candidate_id", "event_type", "value", "occurred_at", "title",
@@ -186,6 +186,8 @@ def _runtime_source_lineage() -> dict[str, Any]:
         "config.py",
         "scoring.py",
         "ranking.py",
+        "publication_era_signal.py",
+        "publication_year_metadata.py",
         "interaction_personalization.py",
         "discovery_slate.py",
         "exploration.py",

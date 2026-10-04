@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .database import rows, transaction
+from .database import rows, transaction, connect
 from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
 from .ranking import rank_candidates
 from .identity import book_identity_match_index, book_row_identity_match_keys
@@ -153,6 +153,9 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     for item in interaction_candidates:
         candidate_items_by_id.setdefault(int(item["id"]), item)
     candidate_items = list(candidate_items_by_id.values())
+    from .publication_year_metadata import attach_publication_years
+    with connect() as con:
+        attach_publication_years(con, reads, candidates)
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)
     all_candidate_vectors = await cached_vectors(embedder,"candidate",candidate_items)
