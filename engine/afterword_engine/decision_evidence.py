@@ -194,6 +194,7 @@ def _runtime_source_lineage() -> dict[str, Any]:
         "embeddings.py",
         "subjects.py",
         "identity.py",
+        "ingestion.py",
         "learning.py",
         "decision_evidence.py",
         "scoring_evidence.py",
