@@ -37,6 +37,7 @@ from .ingestion import (
     preview_source,
     candidate_metadata_refresh_remaining,
     read_metadata_refresh_remaining,
+    read_identity_rows_with_current_verified_work_ids,
     refresh_read_metadata,
     refresh_read_work_identities,
     refresh_missing_candidate_metadata,
@@ -1639,7 +1640,20 @@ def _recommendation_rows(
         if connection is not None
         else rows(sql, values)
     )
-    read_keys = book_identity_match_index(fetch("SELECT * FROM reads"))
+    read_rows = fetch("SELECT * FROM reads")
+    try:
+        read_metadata_rows = fetch(
+            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+            "FROM read_metadata WHERE verified_work_id!=''"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: read_metadata" not in str(exc).casefold():
+            raise
+        read_metadata_rows = []
+    read_identity_rows = read_identity_rows_with_current_verified_work_ids(
+        read_rows, read_metadata_rows
+    )
+    read_keys = book_identity_match_index(read_identity_rows)
     shortlisted_keys = book_identity_match_index(
         fetch(
             "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"

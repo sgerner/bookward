@@ -43,6 +43,9 @@ READ_FIELDS = (
 )
 IDENTITY_READ_FIELDS = (
     "id", "title", "author", "isbn", "openlibrary_work_id",
+    "quality_work_id", "quality_provider",
+    "read_metadata_work_id", "read_metadata_identity_provider",
+    "read_metadata_identity_provider_id", "read_metadata_identity_hash",
 )
 CANDIDATE_FIELDS = (
     "id", "title", "author", "description", "genres", "status", "score",
@@ -331,7 +334,10 @@ def build_scoring_batch_evidence(
             },
             "input_selection": {
                 "rated_read_ids": rated_read_ids,
-                "candidate_filter": "active_new_or_recommended_accepted_enabled_not_in_any_read_identity",
+                "candidate_filter": (
+                    "active_new_or_recommended_accepted_enabled_not_in_any_read_identity_or_"
+                    "current_verified_openlibrary_read_work_id"
+                ),
                 "candidate_count": len(candidate_items),
             },
             "read_history": read_snapshots,

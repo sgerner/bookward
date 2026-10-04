@@ -137,7 +137,7 @@ The [embedding comparison](docs/ranking-embedding-representations-2026-10-02.md)
 
 The [blinded discovery-interest pilot](docs/discovery-interest-pilot-2026-10-02.md) reports actual reader judgments and the synopsis gaps in its completed form. Future forms use a shared verified-source resolver; missing synopses and unsure answers remain unknown, and any judgments after recovered descriptions are recorded separately.
 
-Marking a recommendation read, or marking a shortlisted book Finished, preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling; existing read identifiers and ratings are preserved when no new rating is supplied.
+Marking a recommendation read, or marking a shortlisted book Finished, preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling; current provider-verified read work IDs also exclude matching editions, with identity proof retained in scoring evidence for replay.
 
 The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
 

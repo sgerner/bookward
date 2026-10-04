@@ -5,6 +5,7 @@ import pytest
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, transaction
 from afterword_engine.digest import _candidate_rows
+from afterword_engine.ingestion import _read_metadata_identity_hash
 from afterword_engine.identity import (
     book_catalog_title_identity_key,
     book_identity,
@@ -165,6 +166,99 @@ def test_recommendation_and_digest_hide_unrated_reads_but_keep_saved(database):
     digest = _candidate_rows({"minimum_score": 0, "maximum_books": 1, "only_new": False})
     assert "Already Read" not in {item["title"] for item in digest}
     assert "New Book" in {item["title"] for item in digest}
+
+
+def test_recommendation_filter_uses_only_current_provider_consistent_read_work_ids(database):
+    work_ids = {
+        "fresh": "/works/OL111W",
+        "stale": "/works/OL222W",
+        "provider_mismatch": "/works/OL333W",
+    }
+    read_ids = {}
+    with transaction() as con:
+        read_ids["fresh"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'test')",
+            ("Northern Lights", "Philip Pullman", "9781407130221"),
+        ).lastrowid
+        read_ids["stale"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'test')",
+            ("Stale Source Title", "S. Writer", "9780307474278"),
+        ).lastrowid
+        read_ids["provider_mismatch"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'test')",
+            ("Provider Source Title", "P. Writer", "9780439023528"),
+        ).lastrowid
+        for key, read_id in read_ids.items():
+            read = dict(con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone())
+            provider = "google_books" if key == "provider_mismatch" else "openlibrary"
+            provider_id = "volume:wrong-provider" if key == "provider_mismatch" else work_ids[key]
+            identity_hash = (
+                "stale-identity-hash"
+                if key == "stale"
+                else _read_metadata_identity_hash(read)
+            )
+            con.execute(
+                "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+                "identity_provider_id,identity_hash) VALUES(?,?,?,?,?)",
+                (read_id, work_ids[key], provider, provider_id, identity_hash),
+            )
+
+    candidate_ids = {
+        "fresh": add_candidate("The Golden Compass", "Philip Pullman"),
+        "stale": add_candidate("Stale Catalog Alias", "S. Writer"),
+        "provider_mismatch": add_candidate("Provider Catalog Alias", "P. Writer"),
+    }
+    with transaction() as con:
+        for key, candidate_id in candidate_ids.items():
+            con.execute(
+                "UPDATE candidate_quality SET provider='openlibrary',work_id=? "
+                "WHERE candidate_id=?",
+                (work_ids[key], candidate_id),
+            )
+
+    visible_ids = {item["id"] for item in recommendation_list(limit=None)}
+    assert candidate_ids["fresh"] not in visible_ids
+    assert candidate_ids["stale"] in visible_ids
+    assert candidate_ids["provider_mismatch"] in visible_ids
+
+
+def test_read_metadata_alias_does_not_replace_a_conflicting_raw_work_id(database):
+    raw_work_id = "/works/OL444W"
+    metadata_work_id = "/works/OL445W"
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source,openlibrary_work_id) "
+            "VALUES('Known Work','K. Writer',NULL,'9780307474278','test',?)",
+            (raw_work_id,),
+        ).lastrowid
+        read = dict(con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone())
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+            "identity_provider_id,identity_hash) VALUES(?,?,?,?,?)",
+            (
+                read_id,
+                metadata_work_id,
+                "openlibrary",
+                metadata_work_id,
+                _read_metadata_identity_hash(read),
+            ),
+        )
+
+    candidate_id = add_candidate("Conflicting Metadata Alias", "Different Author")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET provider='openlibrary',work_id=? WHERE candidate_id=?",
+            (metadata_work_id, candidate_id),
+        )
+
+    assert candidate_id in {item["id"] for item in recommendation_list(limit=None)}
+    raw_candidate_id = add_candidate("Raw Work Alias", "Different Author")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET provider='openlibrary',work_id=? WHERE candidate_id=?",
+            (raw_work_id, raw_candidate_id),
+        )
+    assert raw_candidate_id not in {item["id"] for item in recommendation_list(limit=None)}
 
 
 def test_recommendations_hide_recommended_duplicate_of_imported_work(database):

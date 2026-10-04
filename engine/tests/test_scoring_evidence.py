@@ -14,6 +14,8 @@ from afterword_engine.decision_evidence import (
     purge_recommendation_evidence,
 )
 from afterword_engine.embeddings import content_hash, vector_blob
+from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import book_identity_match_index, book_row_identity_match_keys
 from afterword_engine.ranking import rank_candidates
 from afterword_engine.scoring import SCORING_BATCH_SIZE, document, score_all
 from afterword_engine.scoring_evidence import (
@@ -245,6 +247,127 @@ def test_scoring_job_archives_and_replays_actual_scored_inputs(database):
         assert stale["stale_input_candidate_count"] == 1
         assert stale["candidates"][0]["status"] == "replayable"
         assert stale["candidates"][0]["input_freshness"] == "stale_batch_input"
+
+
+def test_score_all_filters_only_current_verified_metadata_work_aliases_and_archives_them(database):
+    rated_id, unrated_id, raw_excluded_id, eligible_id = _create_production_shape(database)
+    work_ids = {
+        "fresh": "/works/OL111W",
+        "stale": "/works/OL222W",
+        "provider_mismatch": "/works/OL333W",
+    }
+    read_ids = {}
+    with transaction() as con:
+        read_ids["fresh"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'fixture')",
+            ("Northern Lights", "Philip Pullman", "9781407130221"),
+        ).lastrowid
+        read_ids["stale"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'fixture')",
+            ("Stale Source Title", "S. Writer", "9780307474278"),
+        ).lastrowid
+        read_ids["provider_mismatch"] = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'fixture')",
+            ("Provider Source Title", "P. Writer", "9780439023528"),
+        ).lastrowid
+        for key, read_id in read_ids.items():
+            read = dict(con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone())
+            provider = "google_books" if key == "provider_mismatch" else "openlibrary"
+            provider_id = "volume:wrong-provider" if key == "provider_mismatch" else work_ids[key]
+            identity_hash = (
+                "stale-identity-hash"
+                if key == "stale"
+                else _read_metadata_identity_hash(read)
+            )
+            con.execute(
+                "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+                "identity_provider_id,identity_hash) VALUES(?,?,?,?,?)",
+                (read_id, work_ids[key], provider, provider_id, identity_hash),
+            )
+
+    candidate_ids = {}
+    candidate_names = {
+        "fresh": ("The Golden Compass", "Philip Pullman"),
+        "stale": ("Stale Catalog Alias", "S. Writer"),
+        "provider_mismatch": ("Provider Catalog Alias", "P. Writer"),
+    }
+    with transaction() as con:
+        for position, (key, (title, author)) in enumerate(candidate_names.items(), start=1):
+            candidate_id = _candidate(con, title, author)
+            con.execute(
+                "UPDATE candidate_quality SET provider='openlibrary',work_id=? "
+                "WHERE candidate_id=?",
+                (work_ids[key], candidate_id),
+            )
+            candidate = dict(
+                con.execute(
+                    "SELECT c.*,s.name source_name,s.weight source_weight,"
+                    "q.work_id quality_work_id,q.provider quality_provider,"
+                    "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+                    "CASE WHEN q.quality_score>0 THEN q.quality_score "
+                    "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
+                    "FROM candidates c JOIN sources s ON s.id=c.source_id "
+                    "JOIN candidate_quality q ON q.candidate_id=c.id WHERE c.id=?",
+                    (candidate_id,),
+                ).fetchone()
+            )
+            _store_vector(
+                con, "candidate", candidate_id, candidate,
+                [0.4 + position * 0.1, 0.3, 0.2],
+            )
+            candidate_ids[key] = int(candidate_id)
+
+    # The verified alias read is intentionally unrated: it affects the
+    # all-read exclusion index but must not enter the ranking vectors.
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 3
+
+    with connect() as con:
+        assert con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (candidate_ids["fresh"],)
+        ).fetchone()[0] is None
+        assert con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (raw_excluded_id,)
+        ).fetchone()[0] is None
+        for key in ("stale", "provider_mismatch"):
+            assert con.execute(
+                "SELECT score_batch_id FROM candidates WHERE id=?", (candidate_ids[key],)
+            ).fetchone()[0]
+
+        batch_id = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (candidate_ids["stale"],)
+        ).fetchone()[0]
+        decision = load_scoring_batch(con, batch_id)["decision"]
+        assert decision["input_selection"]["rated_read_ids"] == [rated_id]
+        assert [item["id"] for item in decision["rated_read_inputs"]] == [rated_id]
+        assert next(
+            item for item in decision["read_history"] if item["id"] == read_ids["fresh"]
+        )["rating"] is None
+        identity_by_id = {
+            item["id"]: item for item in decision["read_identity_projection"]
+        }
+        fresh_identity = identity_by_id[read_ids["fresh"]]
+        assert fresh_identity["read_metadata_work_id"] == work_ids["fresh"]
+        assert fresh_identity["read_metadata_identity_provider"] == "openlibrary"
+        assert fresh_identity["quality_work_id"] == work_ids["fresh"]
+        assert fresh_identity["quality_provider"] == "openlibrary"
+        assert fresh_identity["read_metadata_identity_hash"] == _read_metadata_identity_hash(
+            dict(con.execute("SELECT * FROM reads WHERE id=?", (read_ids["fresh"],)).fetchone())
+        )
+        assert book_row_identity_match_keys(
+            {
+                "title": "The Golden Compass",
+                "author": "Philip Pullman",
+                "quality_work_id": work_ids["fresh"],
+                "quality_provider": "openlibrary",
+            }
+        ) & book_identity_match_index(decision["read_identity_projection"])
+        assert "read_metadata_work_id" not in identity_by_id[read_ids["stale"]]
+        assert "read_metadata_work_id" not in identity_by_id[read_ids["provider_mismatch"]]
+        assert "read_metadata_work_id" not in next(
+            item for item in decision["read_history"] if item["id"] == read_ids["fresh"]
+        )
+        assert "ingestion.py" in decision["policy"]["source_hashes"]
+        assert len(decision["vectors"]) == 4
 
 
 def test_exact_rated_read_rows_are_separate_from_same_id_history_projection(database):
