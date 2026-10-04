@@ -1,7 +1,7 @@
 from pathlib import Path
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, Thread
 
 import pytest
 import base64
@@ -285,6 +285,207 @@ def test_background_worker_processes_each_profiles_jobs_in_its_own_scope(identit
         with profile_scope(account["profile_id"]), connect() as con:
             status = con.execute("SELECT status FROM jobs WHERE id=?", (job_ids[label],)).fetchone()[0]
         assert status == "complete"
+
+
+def test_workers_do_not_requeue_a_live_job_claimed_by_another_worker(identity_store):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("single_execution")
+
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(kind):
+        nonlocal calls
+        assert kind == "single_execution"
+        calls += 1
+        started.set()
+        await release.wait()
+        stop.set()
+        return {"calls": calls}
+
+    async def run_workers():
+        workers = [
+            asyncio.create_task(worker_loop(handler, stop)),
+            asyncio.create_task(worker_loop(handler, stop)),
+        ]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            await asyncio.sleep(0.05)
+            assert calls == 1
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(*workers), timeout=2)
+
+    asyncio.run(run_workers())
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,lease_token,heartbeat_at FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert calls == 1
+    assert job["status"] == "complete"
+    assert job["lease_token"] is None
+    assert job["heartbeat_at"] is None
+
+
+@pytest.mark.parametrize(
+    "started_at",
+    [None, "not-a-date", "2000-01-01T00:00:00+00:00"],
+)
+def test_worker_recovers_jobs_with_expired_leases(identity_store, started_at):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("recover_expired")
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at=?,lease_token='dead-worker' WHERE id=?",
+                (started_at, job_id),
+            )
+
+    stop = asyncio.Event()
+    recovered = []
+
+    async def handler(kind):
+        recovered.append(kind)
+        stop.set()
+        return {"recovered": True}
+
+    asyncio.run(worker_loop(handler, stop))
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,result,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert recovered == ["recover_expired"]
+    assert job["status"] == "complete"
+    assert job["result"] == '{"recovered": true}'
+    assert job["lease_token"] is None
+
+
+def test_expired_worker_cannot_overwrite_the_reclaimed_job_result(identity_store):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("lease_fencing")
+
+    stop = asyncio.Event()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    calls = 0
+
+    async def handler(kind):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+            return {"worker": "expired"}
+        second_started.set()
+        stop.set()
+        return {"worker": "reclaimed"}
+
+    async def run_workers():
+        first_worker = asyncio.create_task(worker_loop(handler, stop))
+        await asyncio.wait_for(first_started.wait(), timeout=2)
+        with profile_scope("legacy"), transaction() as con:
+            con.execute(
+                "UPDATE jobs SET heartbeat_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (job_id,),
+            )
+        second_worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=2)
+            await asyncio.wait_for(second_worker, timeout=2)
+        finally:
+            release_first.set()
+        await asyncio.wait_for(first_worker, timeout=2)
+
+    asyncio.run(run_workers())
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,result,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert calls == 2
+    assert job["status"] == "complete"
+    assert job["result"] == '{"worker": "reclaimed"}'
+    assert job["lease_token"] is None
+
+
+def test_job_heartbeat_survives_a_blocked_worker_event_loop(identity_store, monkeypatch):
+    monkeypatch.setattr("afterword_engine.jobs.JOB_LEASE_SECONDS", 0.12)
+    monkeypatch.setattr("afterword_engine.jobs.JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("blocked_handler")
+
+    handler_started = Event()
+    main_worker_finished = Event()
+    competitor_finished = Event()
+    duplicates = []
+    competitor_errors = []
+    main_stop = asyncio.Event()
+
+    async def main_handler(kind):
+        assert kind == "blocked_handler"
+        handler_started.set()
+        # Deliberately block the main worker's event loop for longer than its
+        # lease. A loop-bound heartbeat would be unable to renew during this.
+        time.sleep(0.75)
+        main_worker_finished.set()
+        main_stop.set()
+        return {"worker": "original"}
+
+    def run_competing_worker():
+        if not handler_started.wait(timeout=2):
+            competitor_errors.append("original handler did not start")
+            competitor_finished.set()
+            return
+
+        async def run():
+            stop = asyncio.Event()
+
+            async def stop_when_original_finishes():
+                while not main_worker_finished.wait(timeout=0):
+                    await asyncio.sleep(0.01)
+                stop.set()
+
+            async def duplicate_handler(kind):
+                duplicates.append(kind)
+                stop.set()
+                return {"worker": "duplicate"}
+
+            monitor = asyncio.create_task(stop_when_original_finishes())
+            try:
+                await worker_loop(duplicate_handler, stop)
+            finally:
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+
+        try:
+            asyncio.run(run())
+        except Exception as exc:
+            competitor_errors.append(str(exc))
+        finally:
+            competitor_finished.set()
+
+    competitor = Thread(target=run_competing_worker, daemon=True)
+    competitor.start()
+    asyncio.run(worker_loop(main_handler, main_stop))
+    assert competitor_finished.wait(timeout=2)
+    competitor.join(timeout=2)
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert competitor_errors == []
+    assert duplicates == []
+    assert job["status"] == "complete"
+    assert job["result"] == '{"worker": "original"}'
 
 
 def test_profile_database_connections_lock_independently(identity_store):
