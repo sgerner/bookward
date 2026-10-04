@@ -26,12 +26,9 @@ function corsHeaders(request: Request, methods = nestedApiMethods) {
 
 function encodedApiPath(path: string | undefined) {
   if (!path) return '';
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(path).replaceAll('\\', '/');
-  } catch {
-    return null;
-  }
+  // SvelteKit has already decoded route params. Decoding a second time would
+  // turn literal percent escapes in a segment into path separators or dots.
+  const decoded = path.replaceAll('\\', '/');
   const segments = decoded.split('/');
   if (segments.some((segment) => segment === '.' || segment === '..')) return null;
   return segments.map((segment) => encodeURIComponent(segment)).join('/');

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
+	import ProfileField from '$lib/components/ProfileField.svelte';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 </script>
@@ -19,6 +20,7 @@
 		<h2 class="text-xl font-semibold">Password</h2>
 		<p class="mt-1 text-sm text-surface-700-300">{data.methods.password_enabled ? 'Change your local password.' : 'Set a local password as another way to sign in.'}</p>
 		<form method="POST" action="?/changePassword" use:enhance class="mt-5 grid gap-4">
+			<ProfileField profileId={data.user?.profile_id} />
 			{#if data.methods.password_enabled}<label class="grid gap-2 text-sm font-medium">Current password<input class="input" type="password" name="current_password" autocomplete="current-password" required /></label>{/if}
 			<label class="grid gap-2 text-sm font-medium">New password<input class="input" type="password" name="new_password" autocomplete="new-password" minlength="12" required /></label>
 			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
@@ -32,7 +34,8 @@
 				{#each data.methods.oidc_identities as identity}
 					<div class="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-100-800 p-3">
 						<div><p class="break-all font-medium">{identity.issuer}</p><p class="text-sm text-surface-700-300">{identity.email || 'Connected identity'}</p></div>
-						<form method="POST" action="?/unlink" use:enhance><input type="hidden" name="id" value={identity.id} /><button class="btn btn-sm preset-tonal-error" type="submit">Disconnect</button></form>
+						<form method="POST" action="?/unlink" use:enhance>
+							<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="id" value={identity.id} /><button class="btn btn-sm preset-tonal-error" type="submit">Disconnect</button></form>
 					</div>
 				{/each}
 			</div>
