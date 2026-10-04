@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -70,9 +71,40 @@ jobs:
       - name: Python compilation
         run: uv run --project engine python -m compileall -q engine/afterword_engine
 
+  smoke:
+    name: First-run integration smoke
+    needs: [web, engine]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: engine/uv.lock
+      - name: Install dependencies
+        run: |
+          npm ci
+          uv sync --project engine --extra dev --frozen
+      - name: Build web app
+        run: npm run build
+      - name: Verify fresh-install web and engine flows
+        run: uv run --project engine python scripts/community_smoke.py
+
   containers:
     name: Container builds
-    needs: [web, engine]
+    needs: [web, engine, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
