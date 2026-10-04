@@ -272,7 +272,7 @@ Set `OIDC_AUTO_LOGIN=true` to send unauthenticated visitors directly to the conf
 
 Candidate pools, reads, shortlists, sources, learning history, jobs, API tokens, and integration settings are stored in separate SQLite files per profile. Bookward currently keeps embeddings inside each profile database; this spends more disk and compute while preserving the same isolation boundary.
 
-The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. To try Ollama locally:
+The default `local` embedding backend needs no model download and works on CPU-only machines. Optional alternatives include FastEmbed, an Ollama model, or an OpenAI-compatible endpoint. OpenAI-compatible endpoints must return one vector per input with unique integer indexes from 0 to N−1; responses without indexes are rejected because their input order cannot be verified. Use the Ollama backend for Ollama's separate embedding protocol. To try Ollama locally:
 
 ~~~
 docker compose --profile ollama up --build -d
@@ -329,6 +329,9 @@ npm run build
 uv sync --project engine --extra dev --frozen
 uv run --project engine pytest -q engine/tests
 uv run --project engine python -m compileall -q engine/afterword_engine
+
+# First-run web/engine integration, with isolated temporary data (requires the web build)
+uv run --project engine python scripts/community_smoke.py
 
 # Container smoke build
 docker compose build
@@ -392,4 +395,4 @@ The URL must be reachable from the engine process, not just from your browser. U
 
 Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly.
 
-Pushing a tag matching `v*.*.*` publishes the Bookward and engine images to GitHub Container Registry as the version tag and `latest`.
+Pushing a tag matching `vMAJOR.MINOR.PATCH` runs the complete CI checks before publishing the Bookward and engine images to GitHub Container Registry as the version tag and `latest`. Manual publishing must also select a version tag; branches cannot overwrite release images.
