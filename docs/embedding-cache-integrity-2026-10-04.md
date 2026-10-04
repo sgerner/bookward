@@ -37,8 +37,9 @@ candidate vectors, forced rebuild behavior, float32 overflow, invalid provider
 values, and full `score_all` recovery. The end-to-end test records normal
 deterministic scores, corrupts one matching-hash cached candidate vector,
 reruns scoring, then asserts exact score equality and finite repaired cache
-contents. The full engine suite passed after this extension: 512 passed, with
-two existing deprecation warnings, in 84.03 seconds.
+contents. The focused production change passed all 499 engine tests on the
+latest main dependency lock, with two existing deprecation warnings. The
+separate research archive also passed 512 tests, including 13 benchmark fixtures.
 
 An independent valid-cache parity check covered 1,803 matching read vectors
 (including 9 unrated reads) and 549 matching candidate vectors. Every value
