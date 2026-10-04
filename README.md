@@ -396,6 +396,8 @@ The default local embedder is intentionally small and predictable. FastEmbed, Ol
 
 Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
 
+Goodreads CSV and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
+
 ### Librarr works in Docker but not locally (or vice versa)
 
 The URL must be reachable from the engine process, not just from your browser. Use `http://librarr:5050` between containers and `http://127.0.0.1:5050` when both services run on the host.
