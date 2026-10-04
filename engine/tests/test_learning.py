@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -22,6 +23,7 @@ from afterword_engine.interaction_personalization import (
     personalize_recommendations,
 )
 from afterword_engine.main import app, recommendation_list, tracked_recommendations
+from afterword_engine.scoring import score_all
 
 
 @pytest.fixture()
@@ -640,3 +642,162 @@ def test_day_precision_does_not_attribute_same_day_exposure(database):
         )
     assert attribute_read_outcomes()["reads_attributed"] == 0
     assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 0
+
+
+def test_unrated_manual_read_keeps_verified_isbn_for_aliases_imports_and_rescoring(database):
+    isbn13 = "9780593418574"
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        marked_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,90,'recommended',?,?)",
+            ("Unreasonable Hospitality", "Will Guidara", source_id, "marked hospitality"),
+        ).lastrowid
+        alias_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,89,'recommended',?,?)",
+            ("Hospitality: A New Approach", "Catalog Variant", source_id, "hospitality alias"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=? "
+            "WHERE candidate_id IN (?,?)",
+            (isbn13, marked_id, alias_id),
+        )
+
+    assert {marked_id, alias_id} <= {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.post(f"/api/recommendations/{marked_id}/read", json={})
+    assert response.status_code == 200
+    assert response.json()["rating"] is None
+    assert row(
+        "SELECT isbn,rating,source FROM reads WHERE title=? AND author=?",
+        ("Unreasonable Hospitality", "Will Guidara"),
+    ) == {"isbn": isbn13, "rating": None, "source": "manual"}
+    assert alias_id not in {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
+
+    class FakeEmbedder:
+        name, model = "test", "manual-read-isbn-exclusion"
+
+        async def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    assert asyncio.run(score_all(embedder=FakeEmbedder())) == 0
+
+    count = import_goodreads_csv(
+        b"Title,Author,My Rating,Date Read,ISBN13,Exclusive Shelf\r\n"
+        b"Unreasonable Hospitality,Will Guidara,0,2022-08-12,,read\r\n"
+    )
+    assert count == 1
+    assert row(
+        "SELECT isbn,rating,source FROM reads WHERE title=? AND author=?",
+        ("Unreasonable Hospitality", "Will Guidara"),
+    ) == {"isbn": isbn13, "rating": None, "source": "manual"}
+    assert alias_id not in {
+        item["id"] for item in recommendation_list(status="recommended", limit=None)
+    }
+    assert asyncio.run(score_all(embedder=FakeEmbedder())) == 0
+
+
+
+def test_manual_read_keeps_existing_isbn_rating_and_read_source(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,90,'recommended',?,?)",
+            ("Existing Work", "A Reader", source_id, "existing work marker"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=? "
+            "WHERE candidate_id=?",
+            ("9780593418574", candidate_id),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) "
+            "VALUES('Existing Work','A Reader',3,'9780306406157','goodreads_csv')"
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.post(f"/api/recommendations/{candidate_id}/read", json={})
+    assert response.status_code == 200
+    assert response.json()["rating"] == 3
+    assert row(
+        "SELECT isbn,rating,source FROM reads WHERE title='Existing Work' AND author='A Reader'"
+    ) == {"isbn": "9780306406157", "rating": 3.0, "source": "goodreads_csv"}
+    assert row(
+        "SELECT event_type,value,source FROM recommendation_events "
+        "WHERE candidate_id=? AND source='manual_read'",
+        (candidate_id,),
+    ) == {"event_type": "read", "value": 3.0, "source": "manual_read"}
+
+
+@pytest.mark.parametrize(
+    ("quality_isbn13", "quality_isbn10", "expected_isbn"),
+    [
+        ("", "0593418573", "9780593418574"),
+        ("9780593418575", "", None),
+    ],
+)
+def test_manual_read_canonicalizes_valid_isbn10_and_ignores_invalid_isbn(
+    database, quality_isbn13, quality_isbn10, expected_isbn
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,90,'recommended',?,?)",
+            ("Identifier Check", "A Reader", source_id, "identifier check"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,isbn10=? "
+            "WHERE candidate_id=?",
+            (quality_isbn13, quality_isbn10, candidate_id),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.post(f"/api/recommendations/{candidate_id}/read", json={})
+    assert response.status_code == 200
+    assert row(
+        "SELECT isbn,rating FROM reads WHERE title='Identifier Check' AND author='A Reader'"
+    ) == {"isbn": expected_isbn, "rating": None}
+
+
+def test_finished_shortlist_uses_the_same_verified_isbn_persistence(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES(?,?,90,'saved',?,?)",
+            ("Finished Work", "A Reader", source_id, "finished work marker"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn10=? "
+            "WHERE candidate_id=?",
+            ("0593418573", candidate_id),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.put(
+            f"/api/reading-list/{candidate_id}", json={"status": "finished"}
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "finished"
+    assert row(
+        "SELECT isbn,rating,source FROM reads WHERE title='Finished Work' AND author='A Reader'"
+    ) == {"isbn": "9780593418574", "rating": None, "source": "manual"}
