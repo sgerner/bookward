@@ -39,7 +39,7 @@ MAX_SCORING_FIELD_BYTES = 24 * 1024
 
 READ_FIELDS = (
     "id", "title", "author", "rating", "read_at", "isbn",
-    "openlibrary_work_id", "genres", "description",
+    "openlibrary_work_id", "genres", "description", "first_publication_year", "publication_work_id",
 )
 IDENTITY_READ_FIELDS = (
     "id", "title", "author", "isbn", "openlibrary_work_id",
@@ -49,6 +49,7 @@ CANDIDATE_FIELDS = (
     "source_id", "source_name", "source_weight", "quality_status",
     "quality_score", "catalog_confidence", "quality_work_id",
     "quality_provider", "quality_isbn13", "quality_isbn10", "score_batch_id",
+    "first_publication_year", "publication_work_id",
 )
 
 
@@ -218,6 +219,8 @@ def build_scoring_batch_evidence(
                     "score": score,
                     "metadata_confidence": metadata_confidence,
                     "explanation": _json_value(output.get("explanation") or []),
+                    **({"publication_era": _json_value(output["publication_era"])}
+                       if "publication_era" in output else {}),
                 }
             )
 
@@ -310,7 +313,7 @@ def build_scoring_batch_evidence(
             "captured_at": captured_at,
             "policy": {
                 "name": "materialized_base_score",
-                "version": "rank-candidates-source-confidence-v1",
+                "version": "rank-candidates-source-confidence-era-gated-v2",
                 "runtime_code_id": lineage["runtime_code_id"],
                 "source_hashes": lineage["source_hashes"],
                 "deployment_build_id": _safe_identifier(os.environ.get("BOOKWARD_BUILD_ID")),

@@ -410,10 +410,23 @@ async def handle_job(kind: str):
             enqueue_job("read_metadata", dedupe=True)
         return result
     if kind == "read_metadata":
+        from .publication_year_metadata import attach_publication_years
+
+        def rated_publication_years():
+            rated = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+            with connect() as con:
+                attach_publication_years(con, rated, [])
+            return {item["id"]: (item.get("first_publication_year"), item.get("publication_work_id")) for item in rated}
+
+        before_years = rated_publication_years()
         result = await refresh_read_metadata()
         if result["remaining"]:
             enqueue_followup_job("read_metadata")
-        return {**result, "score_job_id": None}
+        score_job_id = (
+            enqueue_job("score", dedupe=True)
+            if rated_publication_years() != before_years else None
+        )
+        return {**result, "score_job_id": score_job_id}
     if kind == "digest":
         return await send_digest(config)
     if kind == "goodreads_rss":

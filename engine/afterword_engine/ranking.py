@@ -97,6 +97,7 @@ def rank_candidates(
     candidate_vectors: Sequence[Sequence[float]],
     *,
     exclude_candidate_identity: bool = False,
+    publication_era: bool = True,
 ) -> list[dict[str, Any]]:
     """Rank candidates using positive/negative neighborhoods and author affinity.
 
@@ -159,6 +160,26 @@ def rank_candidates(
         author_history_indices.setdefault(
             book_identity("", item.get("author", "")), []
         ).append(index)
+    era_fit = None
+    # History diagnostics deliberately omit this fitted feature: fitting its
+    # gates with the target's own rating would leak the leave-one-out label.
+    # Prediction validation inside the era model also uses the baseline only.
+    if publication_era and not exclude_candidate_identity and any(
+        item.get("first_publication_year") is not None for item in candidates
+    ):
+        from .publication_era_signal import fit_publication_era_signal
+
+        def baseline_score(history_rows, history_vectors, query_rows, query_vectors):
+            return [item["score"] for item in rank_candidates(
+                history_rows, history_vectors, query_rows, query_vectors,
+                exclude_candidate_identity=True, publication_era=False,
+            )]
+
+        era_fit = fit_publication_era_signal(
+            [item for item, _ in history],
+            [vector for _, vector in history],
+            baseline_score,
+        )
     results: list[dict[str, Any]] = []
     for start in range(0, len(candidates), _BATCH_SIZE):
         batch = candidates[start : start + _BATCH_SIZE]
@@ -259,6 +280,13 @@ def rank_candidates(
             # ranking signal toward a neutral score instead of letting a
             # title-only match dominate the top of discovery.
             score = 50 + metadata_confidence * (score - 50)
+            era_adjustment = (
+                era_fit.adjustment(candidate.get("first_publication_year"))
+                if era_fit is not None else 0.0
+            )
+            if era_adjustment:
+                # Validate and deploy the same one-decimal baseline scale.
+                score = round(max(0.0, min(100.0, score)), 1) + era_adjustment
             score = max(0.0, min(100.0, score))
             explanation: list[str] = []
             if any(rating >= 4 for rating in author_ratings):
@@ -272,6 +300,12 @@ def rank_candidates(
             if len(negative_values) and negative_max > 0:
                 nearest = negative_columns[int(np.argmax(negative_values))]
                 explanation.append(f"Reduced: similar to a 1–2★ book — {negatives[nearest][0].get('title', 'a low-rated book')}")
+            if era_adjustment:
+                explanation.append(
+                    "Publication-era preference supported by held-out ratings"
+                    if era_adjustment > 0 else
+                    "Reduced: publication-era preference supported by held-out ratings"
+                )
             if candidate.get("source_name"):
                 explanation.append(f"From {candidate['source_name']}")
             if metadata_confidence < 0.65:
@@ -283,6 +317,10 @@ def rank_candidates(
                     **candidate,
                     "score": round(score, 1),
                     "metadata_confidence": metadata_confidence,
+                    **({"publication_era": {
+                        **era_fit.diagnostics,
+                        "score_adjustment": round(era_adjustment, 4),
+                    }} if era_fit is not None else {}),
                     "explanation": explanation,
                 }
             )

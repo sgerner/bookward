@@ -187,7 +187,7 @@ def test_diversity_layer_is_deterministic_before_paginated_responses(tmp_path: P
         (full_run_id,),
     )
     metadata = json.loads(run["metadata"])
-    assert run["policy_version"] == "rating-kernel-recency-interaction-installation-slate-v1"
+    assert run["policy_version"] == "rating-kernel-recency-era-confidence-interaction-installation-slate-v2"
     assert metadata["discovery_slate"]["policy_version"] == "discovery-slate-v1"
     assert metadata["discovery_slate"]["author_repeat_swaps"] > 0
     assert "Series Author" not in json.dumps(metadata["discovery_slate"])
