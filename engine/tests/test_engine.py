@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import respx
 import httpx
+import numpy as np
 from fastapi.testclient import TestClient
 
 from auth_helpers import authenticated_headers
@@ -1721,6 +1722,149 @@ def test_invalid_embedding_vectors_are_rejected(database):
         async def embed(self, texts): return [[1.0, float("nan")]] * len(texts)
     with pytest.raises(ValueError, match="invalid"):
         asyncio.run(cached_vectors(BadEmbedder(), "read", [{"id":99,"title":"Bad","author":"Vector"}]))
+
+
+@pytest.mark.parametrize(
+    ("blob", "dimensions"),
+    [
+        (np.asarray([float("nan"), 0.0, 1.0], dtype=np.float32).tobytes(), 3),
+        (b"", 3),
+        (b"\x01\x02", 3),
+        (np.asarray([0.0, 1.0, 2.0], dtype=np.float32).tobytes(), 2),
+    ],
+)
+def test_corrupt_matching_hash_cache_is_reembedded(database, blob, dimensions):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class FixedEmbedder:
+        name, model = "cache-repair", "fixture-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def embed(self, texts):
+            self.calls += 1
+            return [[0.25, 0.5, 0.75] for _ in texts]
+
+    item = {"id": 987, "title": "Cache repair", "author": "Fixture", "description": "A stable description."}
+    digest = content_hash(document(item))
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+            ("candidate", item["id"], "cache-repair", "fixture-v1", blob, dimensions, digest),
+        )
+
+    embedder = FixedEmbedder()
+    result = asyncio.run(cached_vectors(embedder, "candidate", [item]))
+    stored = row(
+        "SELECT vector,dimensions,content_hash FROM embeddings WHERE entity_type='candidate' AND entity_id=? AND backend=? AND model=?",
+        (item["id"], embedder.name, embedder.model),
+    )
+    vector = np.frombuffer(stored["vector"], dtype=np.float32)
+    assert embedder.calls == 1
+    assert result == [[0.25, 0.5, 0.75]]
+    assert stored["dimensions"] == 3
+    assert stored["content_hash"] == digest
+    assert np.isfinite(vector).all()
+
+
+def test_zero_vector_is_a_valid_cached_embedding(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class UnexpectedEmbedder:
+        name, model = "zero-cache", "fixture-v1"
+
+        async def embed(self, texts):
+            raise AssertionError("A valid cached zero vector should be reused")
+
+    item = {"id": 988, "title": "Empty text", "author": "", "description": ""}
+    digest = content_hash(document(item))
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+            ("candidate", item["id"], "zero-cache", "fixture-v1", np.zeros(3, dtype=np.float32).tobytes(), 3, digest),
+        )
+    assert asyncio.run(cached_vectors(UnexpectedEmbedder(), "candidate", [item])) == [[0.0, 0.0, 0.0]]
+
+
+def test_cached_and_new_embedding_dimension_mismatch_fails_before_persist(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash
+    from afterword_engine.scoring import document
+
+    class WrongDimensionEmbedder:
+        name, model = "dimension-check", "fixture-v1"
+
+        async def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    cached_item = {"id": 989, "title": "Valid cached", "author": "Fixture"}
+    missing_item = {"id": 990, "title": "New vector", "author": "Fixture"}
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?)",
+            ("candidate", cached_item["id"], "dimension-check", "fixture-v1", np.asarray([1.0, 0.0, 0.0], dtype=np.float32).tobytes(), 3, content_hash(document(cached_item))),
+        )
+    with pytest.raises(ValueError, match="differ from valid cached vectors"):
+        asyncio.run(cached_vectors(WrongDimensionEmbedder(), "candidate", [cached_item, missing_item]))
+    assert row(
+        "SELECT 1 present FROM embeddings WHERE entity_type='candidate' AND entity_id=? AND backend='dimension-check'",
+        (missing_item["id"],),
+    ) is None
+
+
+def test_float32_overflow_from_finite_provider_values_is_not_persisted(database):
+    class OverflowEmbedder:
+        name, model = "overflow-check", "fixture-v1"
+
+        async def embed(self, texts):
+            return [[1e100, 0.0, 1.0] for _ in texts]
+
+    item = {"id": 991, "title": "Overflow", "author": "Fixture"}
+    with pytest.raises(ValueError, match="invalid or inconsistent"):
+        asyncio.run(cached_vectors(OverflowEmbedder(), "candidate", [item]))
+    assert row(
+        "SELECT 1 present FROM embeddings WHERE entity_type='candidate' AND entity_id=? AND backend='overflow-check'",
+        (item["id"],),
+    ) is None
+
+
+def test_score_all_recovers_from_corrupt_matching_hash_cache(database):
+    import numpy as np
+
+    from afterword_engine.embeddings import content_hash, get_embedder
+    from afterword_engine.scoring import document
+
+    embedder = get_embedder("local", "hashing-768")
+    assert asyncio.run(score_all(embedder=embedder)) == 4
+    baseline_scores = [float(candidate["score"]) for candidate in rows("SELECT score FROM candidates ORDER BY id")]
+    assert len(baseline_scores) == 4
+    assert all(np.isfinite(score) for score in baseline_scores)
+    item = rows("SELECT id,title,author,description,genres FROM candidates ORDER BY id LIMIT 1")[0]
+    digest = content_hash(document(item))
+    with transaction() as con:
+        con.execute(
+            "UPDATE embeddings SET vector=?,dimensions=768,content_hash=? WHERE entity_type='candidate' AND entity_id=? AND backend=? AND model=?",
+            (np.asarray([float("nan")] + [0.0] * 767, dtype=np.float32).tobytes(), digest, item["id"], embedder.name, embedder.model),
+        )
+    assert asyncio.run(score_all(embedder=embedder)) == 4
+    repaired = row(
+        "SELECT vector,dimensions,content_hash FROM embeddings WHERE entity_type='candidate' AND entity_id=? AND backend=? AND model=?",
+        (item["id"], embedder.name, embedder.model),
+    )
+    scores = [float(candidate["score"]) for candidate in rows("SELECT score FROM candidates ORDER BY id")]
+    assert repaired["dimensions"] == 768
+    assert repaired["content_hash"] == digest
+    assert np.isfinite(np.frombuffer(repaired["vector"], dtype=np.float32)).all()
+    assert all(np.isfinite(score) for score in scores)
+    assert scores == baseline_scores
 
 def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
     settings.db = str(tmp_path / "legacy.db")
