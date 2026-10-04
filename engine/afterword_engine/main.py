@@ -96,6 +96,7 @@ from .identity import (
     book_openlibrary_work_id,
     book_row_identity_match_keys,
 )
+from .isbn import isbn_parts
 from . import profiles as identity_store
 from .tenancy import current_profile_id, profile_scope
 import jwt
@@ -1722,22 +1723,22 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     ).fetchone()
     saved_rating = rating if rating is not None else existing["rating"] if existing else None
     openlibrary_work_id = book_openlibrary_work_id(candidate)
+    isbn13, _isbn10 = isbn_parts(
+        candidate["quality_isbn13"], candidate["quality_isbn10"]
+    )
     con.execute(
         "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
         "openlibrary_work_id,openlibrary_lookup_attempted_at) "
-        "VALUES(?,?,?,NULL,NULL,'manual',?,"
+        "VALUES(?,?,?,NULL,?,'manual',?,"
         "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
         "ON CONFLICT(title,author) DO UPDATE SET "
         "rating=COALESCE(excluded.rating,reads.rating),"
-        "openlibrary_work_id=CASE WHEN reads.openlibrary_work_id='' "
-        "THEN excluded.openlibrary_work_id ELSE reads.openlibrary_work_id END,"
-        "openlibrary_lookup_attempted_at=CASE "
-        "WHEN reads.openlibrary_work_id='' AND excluded.openlibrary_work_id!='' "
-        "THEN CURRENT_TIMESTAMP ELSE reads.openlibrary_lookup_attempted_at END",
+        "isbn=COALESCE(reads.isbn,excluded.isbn)",
         (
             candidate["title"],
             candidate["author"],
             rating,
+            isbn13 or None,
             openlibrary_work_id,
             openlibrary_work_id,
         ),
@@ -1746,6 +1747,13 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "SELECT id,rating FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
+    if openlibrary_work_id:
+        con.execute(
+            "UPDATE reads SET openlibrary_work_id=?,"
+            "openlibrary_lookup_attempted_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND openlibrary_work_id=''",
+            (openlibrary_work_id, read["id"]),
+        )
     try:
         record_event_in_connection(
             con,
@@ -1786,7 +1794,8 @@ def update_reading_progress(candidate_id: int, payload: ReadingProgressIn):
     with transaction() as con:
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.status,c.source_url,"
-            "q.work_id quality_work_id,q.provider quality_provider "
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.id=?",
             (candidate_id,),
@@ -1988,7 +1997,8 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
     with transaction() as con:
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,"
-            "q.work_id quality_work_id,q.provider quality_provider "
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.id=?",
             (candidate_id,),
