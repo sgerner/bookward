@@ -1,6 +1,6 @@
 # Community readiness audit — 2026-10-04
 
-This audit reviewed the web application, API proxy, authentication and profile boundaries, persistence and jobs, ingestion, recommendation numerics, notifications, and release configuration. Changes remain uncommitted on the existing branch. The pre-existing edit to `docs/scoped-user-profiles.md` was preserved.
+This audit reviewed the web application, API proxy, authentication and profile boundaries, persistence and jobs, ingestion, recommendation numerics, notifications, and release configuration. The audited fixes were merged to `main` in PRs #150 (frontend), #149 (engine), and #151 (release safeguards). The pre-existing edit to `docs/scoped-user-profiles.md` was preserved and excluded from those PRs.
 
 ## Concrete issues and repairs
 
@@ -43,6 +43,6 @@ The baseline passed 500 engine tests and 77 frontend tests. Final post-repair ch
 - Python compilation, locked container-dependency export comparison, workflow YAML/dependency-gate checks, and `git diff --check`.
 - A clean `npm ci` reported zero dependency vulnerabilities.
 
-Container image builds and live third-party integration tests remain unverified locally, as described above. No branch, worktree, commit, push, or pull request was created.
+Container image builds passed in the protected CI checks for PRs #149 and #151, although Docker was unavailable on the local host. Live third-party integration tests remain unverified locally, as described above.
 
 The reproducible first-run check is `uv run --project engine python scripts/community_smoke.py` after `npm run build`. It runs services on loopback with temporary databases, backups, keys, and credentials, then stops both services and removes the temporary data. It is now part of CI and the release gate.
