@@ -9,10 +9,11 @@ When evidence is uncertain, the existing neighborhood ranker is served as-is.
 When the confidence gate passes, a bounded adjustment is applied to that same
 ranker before pagination.
 
-Bookward is designed for one reader per self-hosted installation, so every
-browser and device shares the same learned profile. The engine aggregates all
-eligible actions in its local database, including actions attached to older
-browser sessions and legacy feedback rows. Recommendation requests do not need
+Each account owns a separate profile database. Browsers and devices signed
+into the same account share that profile's learned preferences; another account
+has separate history and feedback. The engine aggregates eligible actions
+within the current profile, including older browser sessions and legacy
+feedback rows. Recommendation requests do not need
 a device cookie or session header for personalization. Historical run session
 identifiers remain telemetry only; they do not split the learning data.
 
@@ -48,11 +49,11 @@ most 5,000 recent action events are read, and evidence uses a two-year half-life
 
 ## Learning and serving rules
 
-The engine combines two kinds of evidence across the installation's action
+The engine combines two kinds of evidence across the current profile's action
 history:
 
 1. **Explicit metadata preferences.** It compares save/positive-rating rates
-   for an author's books or normalized subjects against the installation's other
+   for an author's books or normalized subjects against the profile's other
    interacted books. Both sides need at least six effective distinct books and
    4.5 total reliability/recency weight. The feature is used only when the two
    95% Wilson intervals do not overlap.
