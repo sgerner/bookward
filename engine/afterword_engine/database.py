@@ -937,6 +937,15 @@ MIGRATIONS = [
         END;
         """,
     ),
+    (
+        21,
+        """
+        ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT;
+        ALTER TABLE jobs ADD COLUMN lease_token TEXT;
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_heartbeat
+            ON jobs(status,heartbeat_at);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

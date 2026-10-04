@@ -100,6 +100,34 @@ def test_librarything_run_excludes_all_known_reads(database, monkeypatch):
                    "title": "Unread Book"}
 
 
+@pytest.mark.parametrize("bad_rank", ["not-a-rank", "²", "9" * 5000])
+def test_librarything_ignores_malformed_recommendation_rank(database, monkeypatch, bad_rank):
+    class FixtureClient:
+        async def recommendations(self, _isbns, **_kwargs):
+            return {
+                "recommendations": [
+                    {"rank": bad_rank, "work": "safe-work", "isbns": ["9782222222222"]}
+                ]
+            }
+
+    provider = LibraryThingProvider("fixture-key", client=FixtureClient())
+
+    async def resolve(_isbn):
+        return "Recommended book", "Author", "/works/OL2W"
+
+    monkeypatch.setattr(provider, "_metadata_for_isbn", resolve)
+    result = asyncio.run(provider.collect([{
+        "id": 1,
+        "title": "Read book",
+        "author": "Reader",
+        "rating": 5,
+        "isbn": "9781111111111",
+    }]))
+
+    assert len(result) == 1
+    assert result[0].rank == 1
+
+
 @respx.mock
 def test_librarything_batches_isbns_resolves_titles_and_reuses_cache(database, monkeypatch):
     public_dns(monkeypatch)

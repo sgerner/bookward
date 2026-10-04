@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from afterword_engine.ranking import _read_day, rank_candidates
+from afterword_engine.scoring import _normalized_vectors
+from afterword_engine.embeddings import cosine
 
 
 def book(book_id, title, author, rating=None):
@@ -52,6 +54,25 @@ def test_invalid_or_mismatched_vectors_fail_cleanly():
         rank_candidates([book(1, "A", "A", 5)], [[1, 0]], [book(2, "B", "B")], [[1, 0, 0]])
     with pytest.raises(ValueError):
         rank_candidates([book(1, "A", "A", 5)], [[np.nan, 0]], [book(2, "B", "B")], [[1, 0]])
+
+
+def test_large_finite_vectors_keep_direction_during_normalization():
+    ranked = rank_candidates(
+        [book(1, "Loved", "Writer", 5)],
+        [[1e300, 0]],
+        [book(2, "Candidate", "New")],
+        [[1e300, 0]],
+    )
+    assert ranked[0]["score"] == 97.0
+    np.testing.assert_allclose(_normalized_vectors([[1e300, 0]]), [[1, 0]])
+    assert cosine([1e300, 0], [1e300, 0]) == 1.0
+
+
+def test_scoring_normalization_rejects_nonfinite_and_ragged_vectors():
+    with pytest.raises(ValueError, match="finite"):
+        _normalized_vectors([[np.inf, 0]])
+    with pytest.raises(ValueError, match="numeric rows"):
+        _normalized_vectors([[1, 0], [1]])
 
 
 def test_formula_parity_no_negative_neighbors_and_zero_vectors_stay_finite():

@@ -8,6 +8,7 @@ import re
 import math
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import feedparser
 import httpx
@@ -205,6 +206,29 @@ def _date_value(value):
         except ValueError:
             continue
     return None
+
+
+def _read_date_value(value):
+    """Keep only supported completion dates; blank or malformed values are unknown."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return raw
+    except ValueError:
+        pass
+    try:
+        datetime.strptime(raw, "%Y/%m/%d")
+        return raw
+    except ValueError:
+        pass
+    try:
+        parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    return raw
 
 
 def _apple_value(entry, *keys):
@@ -649,39 +673,47 @@ def metadata_url(value, fallback=""):
 
 def import_goodreads_csv(content: bytes):
     if len(content) > 10_000_000: raise ValueError("CSV is larger than 10 MB")
-    text = content.decode("utf-8-sig", errors="strict")
+    try:
+        text = content.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("CSV must be UTF-8 encoded") from exc
     reader = csv.DictReader(io.StringIO(text))
     required = {"Title", "Author"}
     if not reader.fieldnames or not required.issubset(reader.fieldnames): raise ValueError("This does not look like a Goodreads export")
     count = 0
-    with transaction() as con:
-        for row in reader:
-            if count >= 20_000: raise ValueError("CSV exceeds the 20,000-book limit")
-            title, author = row.get("Title", "").strip()[:500], row.get("Author", "").strip()[:300]
-            if not title or not author: continue
-            if row.get("Exclusive Shelf") and row.get("Exclusive Shelf", "").strip().lower() != "read": continue
-            rating = float(row.get("My Rating") or 0) or None
-            if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): raise ValueError("Ratings must be between 0 and 5")
-            con.execute(
-                "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,'goodreads_csv') "
-                "ON CONFLICT(title,author) DO UPDATE SET "
-                "rating=excluded.rating,read_at=excluded.read_at,"
-                "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
-                "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
-                "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
-                "AND excluded.isbn IS NOT reads.isbn THEN NULL "
-                "ELSE reads.openlibrary_lookup_attempted_at END,"
-                "isbn=COALESCE(excluded.isbn,reads.isbn)",
-                (
-                    title,
-                    author,
-                    rating,
-                    row.get("Date Read") or None,
-                    (row.get("ISBN13") or row.get("ISBN") or "").strip('="') or None,
-                ),
-            )
-            count += 1
+    try:
+        with transaction() as con:
+            for row_number, source_row in enumerate(reader, start=2):
+                if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
+                # DictReader uses None for fields omitted from a truncated row.
+                title = str(source_row.get("Title") or "").strip()[:500]
+                author = str(source_row.get("Author") or "").strip()[:300]
+                if not title or not author: continue
+                shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+                if shelf and shelf != "read": continue
+                try:
+                    rating = float(source_row.get("My Rating") or 0) or None
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Ratings must be numeric values between 0 and 5") from exc
+                if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): raise ValueError("Ratings must be between 0 and 5")
+                read_at = _read_date_value(source_row.get("Date Read"))
+                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                con.execute(
+                    "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+                    "VALUES(?,?,?,?,?,'goodreads_csv') "
+                    "ON CONFLICT(title,author) DO UPDATE SET "
+                    "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
+                    "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
+                    "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
+                    "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
+                    "AND excluded.isbn IS NOT reads.isbn THEN NULL "
+                    "ELSE reads.openlibrary_lookup_attempted_at END,"
+                    "isbn=COALESCE(excluded.isbn,reads.isbn)",
+                    (title, author, rating, read_at, isbn),
+                )
+                count += 1
+    except csv.Error as exc:
+        raise ValueError("CSV is malformed") from exc
     # Importing a history is also the point at which naturally supplied
     # ratings can become outcomes for recommendations shown earlier. Import
     # lazily to keep the ingestion module independent of the telemetry module
@@ -1848,7 +1880,8 @@ async def import_goodreads_rss(url: str):
             try: rating = float(raw_rating) if raw_rating else None
             except ValueError: rating = None
             if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): rating = None
-            con.execute("INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,'goodreads_rss') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=excluded.read_at", (title, author, rating, entry.get("user_read_at")))
+            read_at = _read_date_value(entry.get("user_read_at"))
+            con.execute("INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,'goodreads_rss') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at)", (title, author, rating, read_at))
             count += 1
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
