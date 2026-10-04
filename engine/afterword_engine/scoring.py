@@ -117,7 +117,16 @@ def _max_cosine_similarities(vectors, references, default):
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
     read_history = rows("SELECT * FROM reads ORDER BY id")
-    all_read_keys = book_identity_match_index(read_history)
+    read_metadata_rows = rows(
+        "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+        "FROM read_metadata WHERE verified_work_id!=''"
+    )
+    from .ingestion import read_identity_rows_with_current_verified_work_ids
+
+    read_identity_history = read_identity_rows_with_current_verified_work_ids(
+        read_history, read_metadata_rows
+    )
+    all_read_keys = book_identity_match_index(read_identity_history)
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.work_id quality_work_id,q.provider quality_provider,"
@@ -205,7 +214,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
                 evidence = build_scoring_batch_evidence(
                     con,
                     captured_at=captured_at,
-                    read_history=read_history,
+                    read_history=read_identity_history,
                     rated_reads=reads,
                     candidates=written_inputs,
                     ranked=written,

@@ -137,7 +137,7 @@ The [embedding comparison](docs/ranking-embedding-representations-2026-10-02.md)
 
 The [blinded discovery-interest pilot](docs/discovery-interest-pilot-2026-10-02.md) reports actual reader judgments and the synopsis gaps in its completed form. Future forms use a shared verified-source resolver; missing synopses and unsure answers remain unknown, and any judgments after recovered descriptions are recorded separately.
 
-Marking a recommendation read, or marking a shortlisted book Finished, preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling; existing read identifiers and ratings are preserved when no new rating is supplied.
+Marking a recommendation read, or marking a shortlisted book Finished, preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling; current provider-verified read work IDs also exclude matching editions, with identity proof retained in scoring evidence for replay.
 
 The [September 30 production review](docs/ranking-production-review-2026-09-30.md) tested stronger author evidence, uncertainty shrinkage, cosine centering, and robust negative neighborhoods on 1,777 rated works. None justified changing the serving weights. High scores showed modest preference ordering; low scores were weak predictors of dislike, and production action evidence remained too sparse and confounded for a policy-quality claim.
 
@@ -148,6 +148,8 @@ The [five-hypothesis follow-up](docs/ranking-five-options-2026-09-30.md) also te
 The [October 1 ranking synergy follow-up](docs/ranking-synergy-2026-10-01.md) tests fixed history blends, production-template enrichment views, and an exploratory 75/25 score fusion. It keeps a modest production read-symmetric fusion as a prospective candidate while documenting the low-rating and temporal tradeoffs. At that stage, no serving scorer change was adopted.
 
 Association providers select a bounded set of favorite seeds from the complete reading library. Their exclusion checks also cover disliked, unrated, and other books outside that seed set, so those books are not rediscovered as unread candidates.
+
+Association adapters use shared title/author, provider-scoped work ID, and valid ISBN identity checks. Known-author title collisions alone no longer suppress candidates; records with an unknown author on either side retain a conservative title fallback. See [the association identity audit](docs/association-source-identity.md) for the offline evidence and limits.
 
 The subsequent [kernel uncertainty decision](docs/kernel-uncertainty-shrinkage.md) adopts the small uncertainty adjustment from that study. It improves average high/low discrimination in both retrospective periods, with a small high-rating tradeoff. The subsequent [full-corpus enrichment evaluation](docs/enrichment-full-corpus-evaluation.md) found no reliable gain from richer read embeddings or score blends, so these remain disabled.
 
@@ -395,6 +397,8 @@ The default local embedder is intentionally small and predictable. FastEmbed, Ol
 ### Goodreads import is incomplete
 
 Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
+
+Goodreads CSV and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
 
 ### Librarr works in Docker but not locally (or vice versa)
 
