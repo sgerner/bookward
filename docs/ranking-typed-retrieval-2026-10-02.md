@@ -1,5 +1,8 @@
 # Typed retrieval probe: October 2, 2026
 
+The author-ID absence conclusions are superseded by the Search-ID parser
+correction below. The captured subject-pool observations remain recorded.
+
 The bounded current-catalog probe found that verified author/subject expansion
 can produce a large pool of quality-gated candidate works under a small public
 request budget. It found no evidence that those pools cover the reader's future
@@ -126,3 +129,22 @@ Private artifact identities:
 - Cached-work-ID identity audit: `b977ae0d224664bdc97232de5e59a41836ecf63652b1fd30c219fb6c22d7c666`
 - Later typed-current compatible full-rank replay: `33e3109c36f4f1ad532d69e62b34a230d61d34645fa1ffb9eda77f34c551c030`
 - Later typed-current compatible candidate vectors: `d6a9f5a0aa2116224e13619ba3a22917aa0c3db87ad27bbf849a8f66df8c026a`
+
+## Search-ID parser correction
+
+The October 4 audit found that this evaluator's shared author/work parsers
+accepted only path-prefixed keys. The official [Search API response
+example](https://openlibrary.org/dev/docs/api/search) also uses bare identifiers
+such as `OL26320A`. Those author keys were discarded, so the earlier
+missing-author-ID counts cannot establish catalog absence. The mostly
+subject-based captures above did not test a fully functioning verified-author
+expansion arm. Their measured subject-pool coverage remains an observation;
+it should not be generalized to the corrected author arm.
+
+The correction accepts only validated Open Library identifiers and retains
+trusted-host checks for URLs. The October 4 rerun recovered all four verified
+author seeds at both boundaries using the same frozen seeds and budgets.
+Neither corrected arm retrieved a held-out favorite; their top-eight books
+have unknown judgments. This does not demonstrate a production retrieval
+bug or establish that author retrieval cannot help other readers. See the
+[four-test decision record](four-focused-ranking-tests-2026-10-04.md).

@@ -66,6 +66,8 @@ RELATION_WEIGHTS = {"same_author": 1.0, "shared_subject": 0.5, "same_series": 1.
 OPEN_LIBRARY_USER_AGENT = "Bookward typed-retrieval offline study/1.0"
 OPEN_LIBRARY_WORK_RE = re.compile(r"^/works/(OL\d+W)(?:\.json)?$", re.IGNORECASE)
 OPEN_LIBRARY_AUTHOR_RE = re.compile(r"^/authors/(OL\d+A)(?:\.json)?$", re.IGNORECASE)
+OPEN_LIBRARY_BARE_WORK_RE = re.compile(r"^OL\d+W$", re.IGNORECASE)
+OPEN_LIBRARY_BARE_AUTHOR_RE = re.compile(r"^OL\d+A$", re.IGNORECASE)
 _SUBJECT_SLUG_RE = re.compile(r"^[a-z0-9_]{1,120}$")
 PRIVATE_STUDY_DIR = Path("/home/steven/.local/share/bookward-next-five-20261002")
 FROZEN_PROTOCOL_SHA256 = "8c58739a896acb2d0284f3c51eb5752121ed9262a415ecd313b8f124d7dd935d"
@@ -128,6 +130,8 @@ def _work_key(value: object) -> str:
         }:
             return ""
         raw = parsed.path
+    if OPEN_LIBRARY_BARE_WORK_RE.fullmatch(raw):
+        return f"/works/{raw.upper()}"
     match = OPEN_LIBRARY_WORK_RE.fullmatch(raw)
     return f"/works/{match.group(1).upper()}" if match else ""
 
@@ -144,6 +148,8 @@ def _author_key(value: object) -> str:
         }:
             return ""
         raw = parsed.path
+    if OPEN_LIBRARY_BARE_AUTHOR_RE.fullmatch(raw):
+        return f"/authors/{raw.upper()}"
     match = OPEN_LIBRARY_AUTHOR_RE.fullmatch(raw)
     return f"/authors/{match.group(1).upper()}" if match else ""
 

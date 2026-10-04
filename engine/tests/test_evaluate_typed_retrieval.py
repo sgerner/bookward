@@ -42,12 +42,31 @@ def work(work_id: str, title: str, author: str, **kwargs) -> study.Work:
     )
 
 
-def test_work_and_author_keys_accept_only_open_library_catalog_paths():
+def test_work_and_author_keys_accept_documented_identifiers_and_trusted_paths():
     assert study._work_key("/works/OL123W.json") == "/works/OL123W"
+    assert study._work_key("OL123W") == "/works/OL123W"
     assert study._work_key("https://www.openlibrary.org/works/OL123w") == "/works/OL123W"
     assert study._work_key("https://openlibrary.org.evil.example/works/OL123W") == ""
     assert study._work_key("/books/OL123M") == ""
     assert study._author_key("/authors/OL99A.json") == "/authors/OL99A"
+    assert study._author_key("OL99A") == "/authors/OL99A"
+    assert study._author_key("https://openlibrary.org/authors/OL99a.json") == "/authors/OL99A"
+    assert study._author_key("https://openlibrary.org.evil.example/authors/OL99A") == ""
+
+
+def test_documented_search_bare_ids_resolve_verified_author_and_work_keys():
+    # Open Library Search API's documented response shape uses key "OL27448W"
+    # and author_key ["OL26320A"], rather than path-prefixed identifiers.
+    item = {
+        "key": "OL27448W",
+        "title": "A Catalog Work",
+        "author_name": ["Catalog Writer"],
+        "author_key": ["OL26320A"],
+    }
+    parsed = study._work_from_catalog(item, source="seed_search")
+    assert parsed is not None
+    assert parsed.work_id == "/works/OL27448W"
+    assert parsed.author_keys == {"/authors/OL26320A"}
 
 
 def test_series_edges_require_an_explicit_catalog_series_field():
