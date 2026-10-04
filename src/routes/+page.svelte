@@ -2128,9 +2128,32 @@
                             <p class="mt-1 truncate text-sm text-surface-700-300">
                               {source.url}
                             </p>
-                            <span class="mt-1 block text-xs text-surface-600-400"
-                              >{source.lifecycle === "one_time" ? "One-time import" : "Permanent feed"} · {formatSourceScan(source.last_scanned_at, source.last_status)}</span
-                            >
+                            <span class="mt-1 block text-xs text-surface-600-400">
+                              {#if source.lifecycle === "one_time"}
+                                One-time import · {formatSourceScan(source.last_scanned_at, source.last_status)}
+                              {:else}
+                                Permanent feed
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <span aria-hidden="true"> · </span>
+                                  <form
+                                    class="inline"
+                                    method="POST"
+                                    action="?/switchSourceToOneTime"
+                                    use:enhance={setPending(`source-lifecycle-${source.id}`)}
+                                  >
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <button
+                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      type="submit"
+                                      disabled={isPending(`source-lifecycle-${source.id}`)}
+                                      aria-busy={isPending(`source-lifecycle-${source.id}`)}
+                                    >Switch to One-Time Import</button>
+                                  </form>
+                                {/if}
+                                <span aria-hidden="true"> · </span>
+                                {formatSourceScan(source.last_scanned_at, source.last_status)}
+                              {/if}
+                            </span>
                             <details class="mt-3 w-full max-w-full">
                               <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                 Filters{source.filters.include_genres.length || source.filters.exclude_genres.length

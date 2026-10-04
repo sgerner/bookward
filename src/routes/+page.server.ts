@@ -527,6 +527,19 @@ export const actions: Actions = {
       return fail(status(error), { message: message(error) });
     }
   },
+  switchSourceToOneTime: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    try {
+      await engine(`/api/sources/${id.data}`, {
+        method: "PUT",
+        body: JSON.stringify({ lifecycle: "one_time" }),
+      });
+      return { message: "Source changed to a one-time import." };
+    } catch (error) {
+      return fail(status(error), { message: message(error) });
+    }
+  },
   toggleSource: async ({ request }) => {
     const id = idSchema.safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
