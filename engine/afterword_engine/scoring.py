@@ -1,5 +1,4 @@
 import json
-import math
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -7,7 +6,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from .database import rows, transaction, connect
-from .embeddings import get_embedder, content_hash, vector_blob, blob_vector
+from .embeddings import get_embedder, content_hash, vector_blob
 from .ranking import rank_candidates
 from .identity import book_identity_match_index, book_row_identity_match_keys
 from .subjects import normalize_subjects
@@ -36,7 +35,21 @@ def document(item):
         if str(value or "").strip()
     )
 
-async def cached_vectors(embedder, entity_type, items, *, force=False, persist=True):
+async def cached_vectors(
+    embedder,
+    entity_type,
+    items,
+    *,
+    force=False,
+    persist=True,
+    expected_dimensions=None,
+):
+    if expected_dimensions is not None and (
+        isinstance(expected_dimensions, bool)
+        or not isinstance(expected_dimensions, int)
+        or expected_dimensions <= 0
+    ):
+        raise ValueError("Expected embedding dimensions must be a positive integer")
     vectors, missing = [None] * len(items), []
 
     cached_by_id = {}
@@ -52,7 +65,7 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
             {
                 int(cached["entity_id"]): cached
                 for cached in rows(
-                    f"SELECT entity_id,vector,content_hash FROM embeddings "
+                    f"SELECT entity_id,vector,dimensions,content_hash FROM embeddings "
                     f"WHERE entity_type=? AND backend=? AND model=? "
                     f"AND entity_id IN ({placeholders})",
                     (entity_type, embedder.name, embedder.model, *batch_ids),
@@ -60,31 +73,96 @@ async def cached_vectors(embedder, entity_type, items, *, force=False, persist=T
             }
         )
 
+    cached_dimensions = set()
     for index, item in enumerate(items):
         text = document(item); digest = content_hash(text)
         cached = None if force else cached_by_id.get(item["id"])
         if cached and cached["content_hash"] == digest:
-            vectors[index] = blob_vector(cached["vector"])
-        else: missing.append((index,item,text,digest))
+            vector = _cached_vector_values(cached)
+            if vector is not None:
+                if expected_dimensions is not None and len(vector) != expected_dimensions:
+                    raise ValueError(
+                        "Cached embedding dimensions differ from expected dimensions; "
+                        "rebuild the affected cache"
+                    )
+                vectors[index] = vector
+                cached_dimensions.add(len(vector))
+                continue
+        missing.append((index,item,text,digest))
+    if len(cached_dimensions) > 1:
+        raise ValueError("Cached embedding dimensions are inconsistent; rebuild the affected cache")
     if missing:
         generated = []
         for start in range(0, len(missing), 64):
             generated.extend(await embedder.embed([entry[2] for entry in missing[start:start + 64]]))
         if len(generated) != len(missing): raise ValueError("Embedding provider returned the wrong number of vectors")
-        dimensions = len(generated[0]) if generated else 0
-        if not dimensions or any(len(vector) != dimensions or not all(math.isfinite(float(value)) for value in vector) for vector in generated):
+        generated, dimensions = _provider_vector_values(generated)
+        if not dimensions:
             raise ValueError("Embedding provider returned invalid or inconsistent vectors")
+        if expected_dimensions is not None and dimensions != expected_dimensions:
+            raise ValueError(
+                "Embedding provider dimensions differ from expected dimensions; "
+                "rebuild the affected cache"
+            )
+        if cached_dimensions and dimensions not in cached_dimensions:
+            raise ValueError("Embedding provider dimensions differ from valid cached vectors; rebuild the full cache")
         if persist:
             with transaction() as con:
                 for (index,item,_text,digest), vector in zip(missing,generated):
-                    if not vector: raise ValueError("Embedding provider returned an empty vector")
                     vectors[index] = vector
                     con.execute("INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",(entity_type,item["id"],embedder.name,embedder.model,vector_blob(vector),len(vector),digest))
         else:
             for (index,_item,_text,_digest), vector in zip(missing,generated):
-                if not vector: raise ValueError("Embedding provider returned an empty vector")
                 vectors[index] = vector
     return vectors
+
+
+def _vector_dimensions(vectors):
+    """Return the established dimension for a validated vector set, if any."""
+    if not vectors:
+        return None
+    dimensions = {len(vector) for vector in vectors}
+    if len(dimensions) != 1 or next(iter(dimensions)) <= 0:
+        raise ValueError("Embedding dimensions are inconsistent; rebuild the affected cache")
+    return next(iter(dimensions))
+
+
+def _cached_vector_values(cached):
+    """Decode a cached float32 vector only when its stored shape is trustworthy."""
+    try:
+        raw = bytes(cached["vector"])
+        dimensions = cached["dimensions"]
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int):
+            return None
+        if dimensions <= 0 or not raw or len(raw) % np.dtype(np.float32).itemsize:
+            return None
+        vector = np.frombuffer(raw, dtype=np.float32)
+        if len(vector) != dimensions or not np.isfinite(vector).all():
+            return None
+        # Detach from SQLite's buffer and preserve intentional zero vectors.
+        return vector.copy().tolist()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _provider_vector_values(vectors):
+    """Validate and canonicalize provider output before any vector is persisted."""
+    validated = []
+    dimensions = None
+    for vector in vectors:
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                array = np.asarray(vector, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Embedding provider returned invalid vectors") from exc
+        if array.ndim != 1 or not len(array) or not np.isfinite(array).all():
+            raise ValueError("Embedding provider returned invalid or inconsistent vectors")
+        if dimensions is None:
+            dimensions = len(array)
+        elif len(array) != dimensions:
+            raise ValueError("Embedding provider returned invalid or inconsistent vectors")
+        validated.append(array.tolist())
+    return validated, dimensions
 
 
 def _normalized_vectors(vectors):
@@ -167,7 +245,12 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         attach_publication_years(con, reads, candidates)
     embedder = embedder or get_embedder(backend, model, url, api_key)
     read_vectors = await cached_vectors(embedder,"read",reads)
-    all_candidate_vectors = await cached_vectors(embedder,"candidate",candidate_items)
+    all_candidate_vectors = await cached_vectors(
+        embedder,
+        "candidate",
+        candidate_items,
+        expected_dimensions=_vector_dimensions(read_vectors),
+    )
     vectors_by_id = {
         int(item["id"]): vector
         for item, vector in zip(candidate_items, all_candidate_vectors)
@@ -259,7 +342,14 @@ async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=Non
     # Generate off to the side first. A provider failure must leave both the
     # current provider cache and caches for other providers untouched.
     read_vectors = await cached_vectors(embedder, "read", reads, force=True, persist=False)
-    candidate_vectors = await cached_vectors(embedder, "candidate", candidates, force=True, persist=False)
+    candidate_vectors = await cached_vectors(
+        embedder,
+        "candidate",
+        candidates,
+        force=True,
+        persist=False,
+        expected_dimensions=_vector_dimensions(read_vectors),
+    )
     with transaction() as con:
         con.execute(
             "DELETE FROM embeddings WHERE backend=? AND model=?",

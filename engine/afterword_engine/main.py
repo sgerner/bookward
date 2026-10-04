@@ -45,7 +45,7 @@ from .ingestion import (
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
-from .scoring import cached_vectors, rebuild_all_embeddings, score_all
+from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
 from .ranking import rank_candidates
 from .secrets import seal, unseal
 from .librarr import (
@@ -1556,7 +1556,10 @@ async def reading_history_scores(
             )
             read_vectors = await cached_vectors(embedder, "read", rated_reads)
             candidate_vectors = await cached_vectors(
-                embedder, "read_candidate", virtual_candidates
+                embedder,
+                "read_candidate",
+                virtual_candidates,
+                expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
                 rated_reads,
