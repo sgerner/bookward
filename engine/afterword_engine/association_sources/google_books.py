@@ -20,7 +20,8 @@ import httpx
 
 from ..associations import Association, RateLimiter, canonical_isbn, record_association_request, select_seed_reads
 from ..config import settings
-from ..identity import book_identity
+from ..identity import ReadIdentityIndex, book_identity
+from ..isbn import isbn_parts
 from ..security import resolve_public_target
 
 
@@ -42,6 +43,21 @@ def _authors(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [_clean(item, 300) for item in value if _clean(item, 300)]
+
+
+def _volume_isbn(volume_info: Mapping[str, Any]) -> str:
+    identifiers = volume_info.get("industryIdentifiers")
+    if not isinstance(identifiers, list):
+        return ""
+    values = [
+        entry.get("identifier")
+        for entry in identifiers
+        if isinstance(entry, Mapping)
+        and str(entry.get("type") or "").upper() in {"ISBN_10", "ISBN_13"}
+        and entry.get("identifier")
+    ]
+    isbn13, isbn10 = isbn_parts(values)
+    return isbn13 or isbn10
 
 
 @dataclass(slots=True)
@@ -189,10 +205,7 @@ class GoogleBooksAssociatedProvider:
 
     async def collect(self, reads: Sequence[Mapping[str, Any]]) -> list[Association]:
         seeds = select_seed_reads(reads, max_seeds=self.max_seeds, max_per_author=2)
-        read_identities = {
-            book_identity(read.get("title", ""), read.get("author", "")) for read in reads
-        }
-        read_titles = {_title_key(read.get("title", "")) for read in reads}
+        read_identity_index = ReadIdentityIndex.from_reads(reads)
         output: list[Association] = []
         seen: set[tuple[int, str]] = set()
         for seed in seeds:
@@ -218,7 +231,15 @@ class GoogleBooksAssociatedProvider:
                 external_id = _clean(item.get("id"), 200)
                 if not title or not author or not external_id:
                     continue
-                if book_identity(title, author) in read_identities or _title_key(title) in read_titles:
+                candidate_isbn = _volume_isbn(info)
+                candidate_identity = {
+                    "title": title,
+                    "author": author,
+                    "work_id": external_id,
+                    "work_id_provider": "google_books",
+                    "isbn": candidate_isbn,
+                }
+                if read_identity_index.matches(candidate_identity):
                     continue
                 key = (int(seed["id"]), external_id)
                 if key in seen:
@@ -236,6 +257,7 @@ class GoogleBooksAssociatedProvider:
                         title=title,
                         author=author,
                         source_url=source_url,
+                        isbn=candidate_isbn,
                         rank=rank,
                         metadata={
                             "seed_volume_id": volume_id,

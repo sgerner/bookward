@@ -28,6 +28,41 @@ def database(tmp_path: Path):
     return settings.db
 
 
+def _openlibrary_provider_with_entries(entries, *, max_resolutions=75):
+    class FixtureClient:
+        async def get_json(self, path, params=None):
+            if path == "/search.json":
+                return {
+                    "docs": [
+                        {
+                            "key": "OL1W",
+                            "title": "Seed Book",
+                            "author_name": ["Seed Author"],
+                        }
+                    ]
+                }
+            if path == "/works/OL1W/lists.json":
+                return {
+                    "entries": [
+                        {
+                            "url": "/people/reader/lists/OL2L",
+                            "name": "Favorites",
+                            "seed_count": 3,
+                        }
+                    ]
+                }
+            if path == "/people/reader/lists/OL2L/seeds.json":
+                return {"entries": entries}
+            raise AssertionError(f"unexpected Open Library path: {path}")
+
+    provider = OpenLibraryListProvider(
+        client=FixtureClient(), max_seeds=1, max_lists_per_seed=1,
+        max_resolutions=max_resolutions,
+    )
+    reads = [{"id": 1, "title": "Seed Book", "author": "Seed Author", "rating": 5}]
+    return provider, reads
+
+
 @respx.mock
 def test_open_library_list_graph_is_cached_and_excludes_read_seed(database, monkeypatch):
     monkeypatch.setattr(
@@ -129,6 +164,56 @@ def test_open_library_missing_author_is_resolved_by_bounded_search(database, mon
     assert len(result) == 1
     assert result[0].author == "B Author"
     assert search.call_count == 2
+
+
+def test_openlibrary_association_keeps_same_title_with_different_known_author():
+    provider, reads = _openlibrary_provider_with_entries(
+        [
+            {
+                "key": "/works/OL3W",
+                "title": "The Shared Title",
+                "authors": [{"name": "Different Author"}],
+            }
+        ]
+    )
+    reads.append(
+        {"id": 2, "title": "The Shared Title", "author": "Read Author", "rating": 1}
+    )
+
+    result = asyncio.run(provider.collect(reads))
+
+    assert [(item.title, item.author) for item in result] == [
+        ("The Shared Title", "Different Author")
+    ]
+
+
+def test_openlibrary_association_excludes_same_title_and_author():
+    provider, reads = _openlibrary_provider_with_entries(
+        [
+            {
+                "key": "/works/OL3W",
+                "title": "The Shared Title",
+                "authors": [{"name": "Read Author"}],
+            }
+        ]
+    )
+    reads.append(
+        {"id": 2, "title": "The Shared Title", "author": "Read Author", "rating": 1}
+    )
+
+    assert asyncio.run(provider.collect(reads)) == []
+
+
+def test_openlibrary_association_keeps_title_only_fallback_for_unknown_author():
+    provider, reads = _openlibrary_provider_with_entries(
+        [{"key": "/works/OL3W", "title": "The Shared Title"}],
+        max_resolutions=0,
+    )
+    reads.append(
+        {"id": 2, "title": "The Shared Title", "author": "Read Author", "rating": 1}
+    )
+
+    assert asyncio.run(provider.collect(reads)) == []
 
 
 def test_persist_associations_is_evidence_only_and_idempotent(database):
