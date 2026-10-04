@@ -5,8 +5,9 @@ conservative read-identity rules used by recommendation eligibility. A known
 author match uses normalized title/author aliases; a matching provider-scoped
 work ID or checksum-valid ISBN can identify the same work across title or
 author variations. Work IDs stay within their provider namespace. If the
-source gives no author or the exact `Unknown author` placeholder, a title-only
-fallback remains to avoid reintroducing a possible read.
+source result or read history gives no author or the exact `Unknown author`
+placeholder, a title-only fallback remains to avoid reintroducing a possible
+read. Distinct books with known authors on both sides remain eligible.
 
 This corrects a source-stage false exclusion: a candidate with the same title
 as a read but a different known author is no longer discarded solely because
