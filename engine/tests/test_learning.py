@@ -608,6 +608,92 @@ def test_read_attribution_requires_prior_exposure_and_updates_rating(database):
     assert future_run
 
 
+def _set_candidate_exposure_time(candidate_id: int, run_id: str, presented_at: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "UPDATE recommendation_impressions SET presented_at=?,visible_at=NULL "
+            "WHERE candidate_id=? AND run_id=?",
+            (presented_at, candidate_id, run_id),
+        )
+
+
+@pytest.mark.parametrize("source", ["manual_history", "goodreads_csv"])
+@pytest.mark.parametrize("read_at", [None, "not-a-date"], ids=["missing-date", "invalid-date"])
+def test_historical_imports_do_not_use_import_time_as_completion_time(database, source, read_at):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-01-01T12:00:00+00:00")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                candidate["title"],
+                candidate["author"],
+                5,
+                read_at,
+                source,
+                "2099-01-02T12:00:00+00:00",
+            ),
+        )
+
+    assert attribute_read_outcomes()["reads_attributed"] == 0
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_events "
+        "WHERE event_type='read' AND candidate_id=?",
+        (candidate["id"],),
+    )["count"] == 0
+
+
+@pytest.mark.parametrize("source", ["manual_history", "goodreads_csv"])
+def test_historical_imports_use_an_explicit_valid_completion_date(database, source):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-01-01T12:00:00+00:00")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                candidate["title"],
+                candidate["author"],
+                5,
+                "2025-01-02",
+                source,
+                "2099-01-02T12:00:00+00:00",
+            ),
+        )
+
+    assert attribute_read_outcomes()["reads_attributed"] == 1
+    event = row(
+        "SELECT occurred_at FROM recommendation_events "
+        "WHERE event_type='read' AND candidate_id=?",
+        (candidate["id"],),
+    )
+    assert event["occurred_at"] == "2025-01-02"
+
+
+def test_current_manual_read_still_uses_created_at_when_read_date_is_missing(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2099-01-01T12:00:00+00:00")
+    created_at = "2099-01-02T12:00:00+00:00"
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (candidate["title"], candidate["author"], 5, None, "manual", created_at),
+        )
+
+    assert attribute_read_outcomes()["reads_attributed"] == 1
+    event = row(
+        "SELECT occurred_at FROM recommendation_events "
+        "WHERE event_type='read' AND candidate_id=?",
+        (candidate["id"],),
+    )
+    assert event["occurred_at"] == created_at
+
+
 def test_goodreads_import_runs_read_attribution(database):
     with transaction() as con:
         source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]

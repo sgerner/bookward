@@ -43,6 +43,30 @@ def public_dns(monkeypatch):
     )
 
 
+def _google_provider_with_candidates(candidates):
+    class FixtureClient:
+        async def get_json(self, path, _params=None):
+            if path == "/books/v1/volumes":
+                return {
+                    "items": [
+                        {
+                            "id": "seed-volume",
+                            "volumeInfo": {
+                                "title": "Seed Book",
+                                "authors": ["Seed Author"],
+                            },
+                        }
+                    ]
+                }
+            if path == "/books/v1/volumes/seed-volume/associated":
+                return {"items": candidates}
+            raise AssertionError(f"unexpected Google Books path: {path}")
+
+    provider = GoogleBooksAssociatedProvider(client=FixtureClient(), max_seeds=1)
+    reads = [{"id": 1, "title": "Seed Book", "author": "Seed Author", "rating": 5}]
+    return provider, reads
+
+
 def test_librarything_run_excludes_all_known_reads(database, monkeypatch):
     class FixtureClient:
         async def recommendations(self, _isbns, **_kwargs):
@@ -233,6 +257,76 @@ def test_google_no_cache_header_fetches_again(database, monkeypatch):
     asyncio.run(provider.collect(reads))
     assert volumes.call_count == 2
     assert associated.call_count == 2
+
+
+def test_google_association_keeps_same_title_with_different_known_author():
+    provider, reads = _google_provider_with_candidates(
+        [
+            {
+                "id": "different-work-volume",
+                "volumeInfo": {
+                    "title": "The Shared Title",
+                    "authors": ["Different Author"],
+                },
+            }
+        ]
+    )
+    reads.append(
+        {"id": 2, "title": "The Shared Title", "author": "Read Author", "rating": 1}
+    )
+
+    result = asyncio.run(provider.collect(reads))
+
+    assert [(item.title, item.author) for item in result] == [
+        ("The Shared Title", "Different Author")
+    ]
+
+
+def test_google_association_excludes_same_title_and_author():
+    provider, reads = _google_provider_with_candidates(
+        [
+            {
+                "id": "same-work-new-volume",
+                "volumeInfo": {
+                    "title": "The Shared Title",
+                    "authors": ["Read Author"],
+                },
+            }
+        ]
+    )
+    reads.append(
+        {"id": 2, "title": "The Shared Title", "author": "Read Author", "rating": 1}
+    )
+
+    assert asyncio.run(provider.collect(reads)) == []
+
+
+def test_google_association_excludes_isbn_match_across_different_metadata():
+    provider, reads = _google_provider_with_candidates(
+        [
+            {
+                "id": "same-edition-volume",
+                "volumeInfo": {
+                    "title": "A Different Catalog Title",
+                    "authors": ["Different Catalog Author"],
+                    "industryIdentifiers": [
+                        {"type": "ISBN_13", "identifier": "9780140328721"}
+                    ],
+                },
+            }
+        ]
+    )
+    reads.append(
+        {
+            "id": 2,
+            "title": "Read Edition",
+            "author": "Read Author",
+            "isbn": "9780140328721",
+            "rating": 1,
+        }
+    )
+
+    assert asyncio.run(provider.collect(reads)) == []
 
 
 def test_google_shadow_run_records_count_but_does_not_persist_candidates(database, monkeypatch):

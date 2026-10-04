@@ -920,6 +920,68 @@ def _read_metadata_identity_hash(read):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def read_identity_rows_with_current_verified_work_ids(reads, metadata_rows):
+    """Project fresh, provider-consistent verified work IDs onto read rows.
+
+    Read metadata is a cache, not an authority over the live read row. Its
+    identity hash must still match the current read, and the persisted Open
+    Library work ID must agree with the provider identity that was verified.
+    If the read already carries a different Open Library work ID, its metadata
+    row is ignored so the projection cannot replace a raw identity key.
+    """
+
+    metadata_by_read_id = {}
+    for metadata in metadata_rows:
+        try:
+            metadata_by_read_id[int(metadata["read_id"])] = dict(metadata)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+
+    projected = []
+    for read in reads:
+        item = dict(read)
+        try:
+            metadata = metadata_by_read_id.get(int(item["id"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            metadata = None
+        if metadata is None:
+            projected.append(item)
+            continue
+
+        if str(metadata.get("identity_hash") or "") != _read_metadata_identity_hash(item):
+            projected.append(item)
+            continue
+        if str(metadata.get("identity_provider") or "").strip().casefold() != "openlibrary":
+            projected.append(item)
+            continue
+
+        work_id = book_openlibrary_work_id(
+            {"openlibrary_work_id": metadata.get("verified_work_id") or ""}
+        )
+        provider_work_id = book_openlibrary_work_id(
+            {"openlibrary_work_id": metadata.get("identity_provider_id") or ""}
+        )
+        if not work_id or work_id != provider_work_id:
+            projected.append(item)
+            continue
+
+        current_work_id = book_openlibrary_work_id(item)
+        if current_work_id and current_work_id != work_id:
+            projected.append(item)
+            continue
+
+        item.update(
+            quality_work_id=work_id,
+            quality_provider="openlibrary",
+            read_metadata_work_id=work_id,
+            read_metadata_identity_provider="openlibrary",
+            read_metadata_identity_provider_id=provider_work_id,
+            read_metadata_identity_hash=str(metadata["identity_hash"]),
+        )
+        projected.append(item)
+    return projected
+
+
 def _returned_identifiers_match_read(returned, wanted13, wanted10):
     """Compare every projected provider identifier with the read's ISBN."""
 
