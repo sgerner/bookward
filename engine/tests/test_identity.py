@@ -424,3 +424,12 @@ def test_read_identity_index_uses_provider_ids_isbns_and_conservative_title_fall
     })
     assert indexed.matches({"title": "Title Collision", "author": "Unknown author"})
     assert not indexed.matches({"title": "Title Collision", "author": "Different Known Author"})
+
+
+@pytest.mark.parametrize("read_author", ["", "Unknown author"])
+def test_read_identity_index_keeps_unknown_history_author_title_fallback(read_author):
+    indexed = ReadIdentityIndex.from_reads([
+        {"title": "Title Collision", "author": read_author},
+    ])
+    assert indexed.matches({"title": "Title Collision", "author": "Known Author"})
+    assert not indexed.matches({"title": "A Different Title", "author": "Known Author"})
