@@ -11,6 +11,7 @@ from afterword_engine.identity import (
     book_identity,
     book_identity_match_index,
     book_identity_matches,
+    ReadIdentityIndex,
     book_row_identity_match_keys,
 )
 from afterword_engine.main import recommendation_list
@@ -376,3 +377,50 @@ def test_scoring_refreshes_vectors_for_interacted_books(database):
 
     assert asyncio.run(score_all(embedder=embedder)) > 0
     assert any("Previously Saved" in text for text in embedder.texts)
+
+def test_read_identity_index_uses_provider_ids_isbns_and_conservative_title_fallback():
+    indexed = ReadIdentityIndex.from_reads([
+        {
+            "title": "Read Work",
+            "author": "Read Author",
+            "openlibrary_work_id": "/works/OL123W",
+        },
+        {
+            "title": "A Separate Edition",
+            "author": "Another Author",
+            "isbn": "9780140328721",
+        },
+        {
+            "title": "Opaque Source Title",
+            "author": "Opaque Source Author",
+            "work_id": "volume-123",
+            "work_id_provider": "openlibrary",
+        },
+        {"title": "Title Collision", "author": "Known Read Author"},
+    ])
+
+    assert indexed.matches({
+        "title": "Different Catalog Title",
+        "author": "Different Catalog Author",
+        "quality_work_id": "/works/OL123W",
+        "quality_provider": "openlibrary",
+    })
+    assert indexed.matches({
+        "title": "Other Open Library Title",
+        "author": "Other Open Library Author",
+        "work_id": "volume-123",
+        "work_id_provider": "openlibrary",
+    })
+    assert not indexed.matches({
+        "title": "Different Google Books Title",
+        "author": "Different Google Books Author",
+        "work_id": "volume-123",
+        "work_id_provider": "google_books",
+    })
+    assert indexed.matches({
+        "title": "Different Edition Title",
+        "author": "Different Edition Author",
+        "isbn": "9780140328721",
+    })
+    assert indexed.matches({"title": "Title Collision", "author": "Unknown author"})
+    assert not indexed.matches({"title": "Title Collision", "author": "Different Known Author"})
