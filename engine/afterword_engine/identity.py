@@ -233,13 +233,14 @@ class ReadIdentityIndex:
 
     Known authors use the same title/author aliases, provider-scoped work IDs,
     and validated ISBN keys as serving eligibility. A title-only fallback is
-    retained for candidates with no author or the exact ``Unknown author``
-    placeholder, where the provider has not supplied enough identity to do a
-    safer comparison.
+    retained when either side has no author or the exact ``Unknown author``
+    placeholder, where the available history or provider identity cannot
+    support a safer comparison.
     """
 
     match_keys: frozenset[tuple[str, ...]]
     title_keys: frozenset[str]
+    unknown_author_title_keys: frozenset[str]
 
     @classmethod
     def from_reads(cls, reads) -> "ReadIdentityIndex":
@@ -251,6 +252,12 @@ class ReadIdentityIndex:
                 for read in rows
                 for key in _title_match_keys(_row_value(read, "title"))
             ),
+            unknown_author_title_keys=frozenset(
+                key
+                for read in rows
+                if _author_match_key(_row_value(read, "author")) in {"", "unknown author"}
+                for key in _title_match_keys(_row_value(read, "title"))
+            ),
         )
 
     def matches(self, candidate) -> bool:
@@ -260,7 +267,10 @@ class ReadIdentityIndex:
             return True
         author_key = _author_match_key(_row_value(candidate, "author"))
         if author_key and author_key != "unknown author":
-            return False
+            return bool(
+                _title_match_keys(_row_value(candidate, "title"))
+                & self.unknown_author_title_keys
+            )
         return bool(
             _title_match_keys(_row_value(candidate, "title")) & self.title_keys
         )
