@@ -1086,7 +1086,8 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
-    filters: SourceFilters = Field(default_factory=SourceFilters)
+    filters: SourceFilters | None = None
+    lifecycle: Literal["permanent", "one_time"] | None = None
 
 
 class SourceScheduleIn(BaseModel):
@@ -2373,18 +2374,45 @@ def update_nyt_settings(payload: NYTApiKeyIn):
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
-    filters = payload.filters.model_dump()
+    updates = []
+    values = []
+    if payload.filters is not None:
+        updates.append("filters=?")
+        values.append(json.dumps(payload.filters.model_dump()))
+    if payload.lifecycle is not None:
+        updates.append("lifecycle=?")
+        values.append(payload.lifecycle)
     with transaction() as con:
-        source = con.execute("SELECT enabled,kind FROM sources WHERE id=?", (source_id,)).fetchone()
+        source = con.execute(
+            "SELECT enabled,kind,lifecycle,filters FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
         if not source: raise HTTPException(404, "Source not found")
-        if source["kind"] == "builtin": raise HTTPException(400, "The built-in source cannot be filtered")
-        con.execute("UPDATE sources SET filters=? WHERE id=?", (json.dumps(filters), source_id))
+        if payload.filters is not None and source["kind"] == "builtin":
+            raise HTTPException(400, "The built-in source cannot be filtered")
+        if payload.lifecycle is not None and source["kind"] in {"builtin", "association"}:
+            raise HTTPException(400, "This source lifecycle cannot be changed")
+        if updates:
+            values.append(source_id)
+            con.execute(
+                f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
+            )
+    filters = (
+        payload.filters.model_dump()
+        if payload.filters is not None
+        else normalize_source_filters(source["filters"])
+    )
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
-        if source["enabled"] and source["kind"] != "association"
+        if updates and source["enabled"] and source["kind"] != "association"
         else None
     )
-    return {"id": source_id, "filters": filters, "job_id": job_id}
+    return {
+        "id": source_id,
+        "filters": filters,
+        "lifecycle": payload.lifecycle or source["lifecycle"],
+        "job_id": job_id,
+    }
 
 
 def _save_digest_settings(updates: dict):
