@@ -43,6 +43,8 @@ KNOWN_COVER_HOSTS = frozenset(
         "googleusercontent.com",
         "images-na.ssl-images-amazon.com",
         "images.amazon.com",
+        "static01.nyt.com",
+        "penguinrandomhouse.com",
         "mzstatic.com",
         "gr-assets.com",
         "placehold.co",

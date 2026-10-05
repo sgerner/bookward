@@ -65,6 +65,7 @@ READ_METADATA_RETRY_DAYS = 30
 READ_METADATA_TRANSIENT_RETRY_HOURS = 24
 CANDIDATE_METADATA_BATCH_SIZE = 50
 CANDIDATE_METADATA_RETRY_DAYS = 30
+CANDIDATE_METADATA_COVER_RETRY_DAYS = 7
 SOURCE_METADATA_ENRICHMENT_BATCH_SIZE = 50
 READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
@@ -233,16 +234,22 @@ def _read_date_value(value):
 
 def _apple_value(entry, *keys):
     for key in keys:
-        value = entry.get(key) if isinstance(entry, dict) else entry.get(key)
+        value = entry.get(key)
         if isinstance(value, dict):
-            value = value.get("label") or value.get("attributes", {}).get("label")
+            value = (
+                value.get("label")
+                or value.get("name")
+                or value.get("attributes", {}).get("label")
+            )
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
 
 
 def _apple_link(entry):
-    value = entry.get("link") if isinstance(entry, dict) else entry.get("link")
+    if not isinstance(entry, dict):
+        return ""
+    value = entry.get("url") or entry.get("link")
     if isinstance(value, str):
         return metadata_url(value)
     if isinstance(value, dict):
@@ -263,11 +270,29 @@ def _apple_link(entry):
 
 
 def _apple_cover(entry, summary, source_url):
-    value = entry.get("im:image") if isinstance(entry, dict) else None
-    if isinstance(value, list):
-        values = [item.get("label") for item in value if isinstance(item, dict) and item.get("label")]
-        if values:
-            return safe_cover_url(values[-1], source_url)
+    if isinstance(entry, dict):
+        for key in (
+            "artworkUrl600",
+            "artworkUrl512",
+            "artworkUrl100",
+            "artworkUrl",
+            "im:image",
+            "im_image",
+        ):
+            value = entry.get(key)
+            if isinstance(value, list):
+                values = [
+                    item.get("label") or item.get("attributes", {}).get("href")
+                    for item in value
+                    if isinstance(item, dict)
+                ]
+                value = next((item for item in reversed(values) if item), "")
+            elif isinstance(value, dict):
+                value = value.get("label") or value.get("attributes", {}).get("href")
+            if isinstance(value, str) and value.strip():
+                cover = safe_cover_url(value, source_url)
+                if cover:
+                    return cover
     soup = BeautifulSoup(str(summary or ""), "html.parser")
     images = [image.get("src") for image in soup.select("img[src]")]
     return safe_cover_url(images[0] if images else "", source_url)
@@ -291,8 +316,8 @@ def _parse_apple_entries(entries, source_url):
     items = []
     for entry in entries[: settings.source_max_items]:
         summary = _apple_value(entry, "summary")
-        title = _apple_value(entry, "im:name", "im_name")
-        author = _apple_value(entry, "im:artist", "im_artist")
+        title = _apple_value(entry, "im:name", "im_name", "name", "trackName")
+        author = _apple_value(entry, "im:artist", "im_artist", "artistName", "author")
         if not title:
             raw_title = _apple_value(entry, "title")
             title, _, inferred_author = raw_title.rpartition(" - ")
@@ -301,7 +326,9 @@ def _parse_apple_entries(entries, source_url):
             raw_title = _apple_value(entry, "title")
             _, _, author = raw_title.rpartition(" - ")
         link = _apple_link(entry) or source_url
-        release = _apple_value(entry, "im:releaseDate", "im_releasedate")
+        release = _apple_value(
+            entry, "im:releaseDate", "im_releasedate", "releaseDate"
+        )
         if isinstance(entry, dict) and isinstance(entry.get("im:releaseDate"), dict):
             release = entry["im:releaseDate"].get("label") or entry["im:releaseDate"].get("attributes", {}).get("label") or release
         tags = entry.get("category") if isinstance(entry, dict) else None
@@ -310,8 +337,19 @@ def _parse_apple_entries(entries, source_url):
             term = tags.get("attributes", {}).get("term")
             if term:
                 genres.append(str(term))
-        if not genres and not isinstance(entry, dict):
-            genres = [str(tag.get("term")) for tag in entry.get("tags", []) if tag.get("term")]
+        if not genres and isinstance(entry, dict):
+            raw_genres = entry.get("genres") or entry.get("tags") or []
+            if isinstance(raw_genres, (str, dict)):
+                raw_genres = [raw_genres]
+            if isinstance(raw_genres, list):
+                for genre in raw_genres:
+                    value = (
+                        genre.get("name") or genre.get("term")
+                        if isinstance(genre, dict)
+                        else genre
+                    )
+                    if value:
+                        genres.append(str(value))
         if not genres:
             genre_match = re.search(
                 r"Genre:\s*(.*?)(?:\s+Price:|\s+Publish Date:|$)",
@@ -466,6 +504,22 @@ def _is_apple_source(source_url):
         _source_matches(source_url, host)
         for host in ("itunes.apple.com", "rss.marketingtools.apple.com")
     )
+
+
+def _apple_artwork_request_url(source_url):
+    """Prefer Apple's JSON feed, which includes artwork absent from its RSS."""
+
+    try:
+        parsed = urlparse(source_url)
+    except ValueError:
+        return source_url
+    if (
+        (parsed.hostname or "").casefold().rstrip(".")
+        == "rss.marketingtools.apple.com"
+        and parsed.path.casefold().endswith(".rss")
+    ):
+        return parsed._replace(path=f"{parsed.path[:-4]}.json").geturl()
+    return source_url
 
 
 def _is_goodreads_blog_source(source_url):
@@ -1833,14 +1887,19 @@ def _clean_parsed_subjects(items):
 
 
 async def _fetch_and_parse_source(url):
-    request_url = _nyt_request_url(url)
+    request_url = _nyt_request_url(_apple_artwork_request_url(url))
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
             content, content_type = await fetch_bytes(url, client=client)
             items = parse_book_items(content, content_type, url)
             items = await enrich_goodreads_blog_items(items, client)
             return content_type, _clean_parsed_subjects(items)
-    content, content_type = await fetch_bytes(request_url)
+    try:
+        content, content_type = await fetch_bytes(request_url)
+    except (httpx.HTTPError, ValueError):
+        if request_url == url:
+            raise
+        content, content_type = await fetch_bytes(url)
     return content_type, _clean_parsed_subjects(
         parse_book_items(content, content_type, url)
     )
@@ -2097,10 +2156,41 @@ def _html_node_value(node):
     return node.get("content") or node.get("datetime") or node.get_text(" ", strip=True)
 
 
+def _generic_container_cover(container, source_url):
+    if not container:
+        return ""
+    attributes = (
+        "data-lazy-src",
+        "data-src",
+        "data-original",
+        "data-srcset",
+        "src",
+        "srcset",
+        "content",
+    )
+    for node in container.select(
+        "img, [itemprop='image'], meta[property='og:image'], meta[name='twitter:image']"
+    ):
+        for attribute in attributes:
+            image = node.get(attribute)
+            if not image:
+                continue
+            if "srcset" in attribute:
+                image = image.split(",", 1)[0].strip().split(" ", 1)[0]
+            if not image or image.startswith("data:"):
+                continue
+            cover = safe_cover_url(urljoin(source_url, image), source_url)
+            if cover:
+                return cover
+    return ""
+
+
 def _generic_card_container(heading):
     for ancestor in heading.parents:
         if not ancestor or ancestor.name in ("body", "html"):
             break
+        if ancestor.name == "tr" and ancestor.select_one("td.starredreview-grid"):
+            return ancestor
         classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
         itemtype = str(ancestor.get("itemtype") or "").casefold()
         if ancestor.name in ("article", "li") or "book" in itemtype or classes.intersection(
@@ -2157,18 +2247,6 @@ def _parse_generic_book_cards(soup, source_url):
             for node in (container.select(".genre-tag, [itemprop='genre']") if container else [])
             if _clean_text(node, 80)
         ]
-        image = ""
-        for node in (container.select("img, [itemprop='image']") if container else []):
-            image = (
-                node.get("data-lazy-src")
-                or node.get("data-src")
-                or node.get("data-original")
-                or node.get("src")
-                or _html_node_value(node)
-                or ""
-            )
-            if image and not image.startswith("data:"):
-                break
         date_node = container.select_one("[itemprop='datePublished'], time") if container else None
         raw_date = _html_node_value(date_node)
         _merge_book_item(
@@ -2177,7 +2255,7 @@ def _parse_generic_book_cards(soup, source_url):
                 "title": title,
                 "author": author,
                 "description": description,
-                "cover_url": safe_cover_url(urljoin(source_url, image), source_url) if image else "",
+                "cover_url": _generic_container_cover(container, source_url),
                 "source_url": metadata_url(urljoin(source_url, href), source_url),
                 "release_date": _date_value(raw_date),
                 "date_kind": _date_kind(raw_date),
@@ -2247,7 +2325,7 @@ def _parse_generic_heading_pairs(soup, source_url):
                 "title": title,
                 "author": author,
                 "description": description,
-                "cover_url": "",
+                "cover_url": _generic_container_cover(book_container, source_url),
                 "source_url": metadata_url(urljoin(source_url, href), source_url),
                 "release_date": None,
                 "date_kind": "",
@@ -2293,7 +2371,13 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         except (json.JSONDecodeError, UnicodeDecodeError): return []
         payload = payloads[0]
         if _is_apple_source(source_url) and isinstance(payload, dict):
-            return _parse_apple_entries(payload.get("feed", {}).get("entry", []), source_url)
+            feed = payload.get("feed", {})
+            entries = feed.get("entry") if isinstance(feed, dict) else None
+            if not isinstance(entries, list) or not entries:
+                entries = feed.get("results", []) if isinstance(feed, dict) else []
+            if not entries and isinstance(payload.get("results"), list):
+                entries = payload["results"]
+            return _parse_apple_entries(entries, source_url)
         if (
             _source_matches(source_url, "openlibrary.org")
             and isinstance(payload, dict)
@@ -2577,7 +2661,7 @@ async def resolve_penguin_random_house_product_description(item, client=None):
 
 
 async def enrich_penguin_random_house_items(items):
-    """Follow PRH product links for publisher descriptions and ISBNs.
+    """Follow PRH product links for publisher descriptions, ISBNs, and covers.
 
     The new-releases page lists a book and author but leaves the full
     description and ISBN on the linked product page. ``parse_book_items``
@@ -2588,43 +2672,53 @@ async def enrich_penguin_random_house_items(items):
 
     if not items:
         return []
-    linked_items = [
+    candidate_items = [
         item
         for item in items
-        if not _clean_text(item.get("description"), 4000)
-        and item.get("title")
+        if item.get("title")
         and item.get("author")
         and _penguin_random_house_book_url(item.get("source_url"))
     ]
-    if not linked_items:
+    if not candidate_items:
         return items
     book_keys = list(
         dict.fromkeys(
             normalize_key(item.get("title", ""), item.get("author", ""))
-            for item in linked_items
-            if item.get("title")
+            for item in candidate_items
         )
     )
-    existing_descriptions = {}
+    existing_metadata = {}
     if book_keys:
         placeholders = ",".join("?" for _ in book_keys)
-        existing_descriptions = {
-            record["normalized_key"]: record.get("description", "")
+        existing_metadata = {
+            record["normalized_key"]: {
+                "description": record.get("description", ""),
+                "cover_url": record.get("cover_url", ""),
+            }
             for record in rows(
-                "SELECT normalized_key,description FROM candidates "
+                "SELECT normalized_key,description,cover_url FROM candidates "
                 f"WHERE normalized_key IN ({placeholders})",
                 tuple(book_keys),
             )
         }
+    def missing_detail_fields(item):
+        existing = existing_metadata.get(
+            normalize_key(item.get("title", ""), item.get("author", "")), {}
+        )
+        description_missing = not (
+            _clean_text(item.get("description"), 4000)
+            or _clean_text(existing.get("description"), 4000)
+        )
+        has_cover = any(
+            cover and not is_weak_cover_url(cover)
+            for cover in (item.get("cover_url"), existing.get("cover_url"))
+        )
+        return description_missing, not has_cover
+
     linked_items = [
         item
-        for item in linked_items
-        if not _clean_text(
-            existing_descriptions.get(
-                normalize_key(item.get("title", ""), item.get("author", ""))
-            ),
-            4000,
-        )
+        for item in candidate_items
+        if any(missing_detail_fields(item))
     ]
     if not linked_items:
         return items
@@ -2641,10 +2735,9 @@ async def enrich_penguin_random_house_items(items):
                     return []
 
         async def enrich(item):
-            if _clean_text(item.get("description"), 4000):
-                return item
             key = normalize_key(item.get("title", ""), item.get("author", ""))
-            if _clean_text(existing_descriptions.get(key), 4000):
+            need_description, need_cover = missing_detail_fields(item)
+            if not need_description and not need_cover:
                 return item
             url = str(item.get("source_url") or "")
             if not _penguin_random_house_book_url(url):
@@ -2679,10 +2772,23 @@ async def enrich_penguin_random_house_items(items):
                 "release_date",
                 "date_kind",
             ):
-                if not enriched.get(field) and detail.get(field):
+                if (
+                    field == "description"
+                    and need_description
+                    and not enriched.get(field)
+                    and detail.get(field)
+                ):
                     enriched[field] = detail[field]
-                    if field == "description":
-                        publisher_fields[field] = detail[field]
+                    publisher_fields[field] = detail[field]
+                elif (
+                    field == "cover_url"
+                    and need_cover
+                    and detail.get(field)
+                    and not is_weak_cover_url(detail[field])
+                ):
+                    enriched[field] = detail[field]
+                elif field not in ("description", "cover_url") and not enriched.get(field) and detail.get(field):
+                    enriched[field] = detail[field]
             enriched["genres"] = normalize_subjects(
                 normalize_subjects(enriched.get("genres", []), limit=METADATA_GENRE_LIMIT)
                 + normalize_subjects(detail.get("genres", []), limit=METADATA_GENRE_LIMIT),
@@ -2808,9 +2914,16 @@ def candidate_metadata_refresh_remaining(
 ) -> int:
     """Count accepted candidates due for a sparse-field or version refresh."""
 
-    retry_before = (
-        datetime.now(timezone.utc) - timedelta(days=max(1, int(retry_days)))
-    ).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc)
+    retry_before = (now - timedelta(days=max(1, int(retry_days)))).isoformat(
+        timespec="seconds"
+    )
+    cover_retry_days = min(
+        max(1, int(retry_days)), CANDIDATE_METADATA_COVER_RETRY_DAYS
+    )
+    cover_retry_before = (now - timedelta(days=cover_retry_days)).isoformat(
+        timespec="seconds"
+    )
     result = row(
         """SELECT COUNT(*) AS count FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
@@ -2825,9 +2938,17 @@ def candidate_metadata_refresh_remaining(
           AND (
             q.metadata_version!=?
             OR q.metadata_checked_at IS NULL
-            OR q.metadata_checked_at<=?
+            OR q.metadata_checked_at<=CASE
+              WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%'
+                OR c.cover_url LIKE 'https://placehold.co/%'
+              THEN ? ELSE ? END
           )""",
-        (METADATA_NORMALIZATION_VERSION, METADATA_NORMALIZATION_VERSION, retry_before),
+        (
+            METADATA_NORMALIZATION_VERSION,
+            METADATA_NORMALIZATION_VERSION,
+            cover_retry_before,
+            retry_before,
+        ),
     )
     return int(result["count"] if result else 0)
 
@@ -2849,13 +2970,22 @@ async def refresh_missing_candidate_metadata():
         "q.metadata_version!=? OR cover_url='' OR cover_url LIKE '%/b/isbn/%' "
         "OR cover_url LIKE 'https://placehold.co/%' OR description='' OR release_date IS NULL "
         "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
-        "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR q.metadata_checked_at<=?) "
+        "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR "
+        "q.metadata_checked_at<=CASE WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
+        "OR c.cover_url LIKE 'https://placehold.co/%' THEN ? ELSE ? END) "
         "ORDER BY CASE WHEN q.metadata_version!=? THEN 0 ELSE 1 END,"
         "q.metadata_checked_at ASC,c.score DESC,c.id LIMIT ?",
         (
             METADATA_NORMALIZATION_VERSION,
             METADATA_NORMALIZATION_VERSION,
-            (datetime.now(timezone.utc) - timedelta(days=CANDIDATE_METADATA_RETRY_DAYS)).isoformat(timespec="seconds"),
+            (
+                datetime.now(timezone.utc)
+                - timedelta(days=CANDIDATE_METADATA_COVER_RETRY_DAYS)
+            ).isoformat(timespec="seconds"),
+            (
+                datetime.now(timezone.utc)
+                - timedelta(days=CANDIDATE_METADATA_RETRY_DAYS)
+            ).isoformat(timespec="seconds"),
             METADATA_NORMALIZATION_VERSION,
             CANDIDATE_METADATA_BATCH_SIZE,
         ),
