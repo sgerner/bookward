@@ -239,6 +239,7 @@ def _apple_value(entry, *keys):
             value = (
                 value.get("label")
                 or value.get("name")
+                or value.get("value")
                 or value.get("attributes", {}).get("label")
             )
         if isinstance(value, str) and value.strip():
@@ -282,13 +283,21 @@ def _apple_cover(entry, summary, source_url):
             value = entry.get(key)
             if isinstance(value, list):
                 values = [
-                    item.get("label") or item.get("attributes", {}).get("href")
+                    item.get("label")
+                    or item.get("value")
+                    or item.get("href")
+                    or item.get("attributes", {}).get("href")
                     for item in value
                     if isinstance(item, dict)
                 ]
                 value = next((item for item in reversed(values) if item), "")
             elif isinstance(value, dict):
-                value = value.get("label") or value.get("attributes", {}).get("href")
+                value = (
+                    value.get("label")
+                    or value.get("value")
+                    or value.get("href")
+                    or value.get("attributes", {}).get("href")
+                )
             if isinstance(value, str) and value.strip():
                 cover = safe_cover_url(value, source_url)
                 if cover:
@@ -519,6 +528,17 @@ def _apple_artwork_request_url(source_url):
         and parsed.path.casefold().endswith(".rss")
     ):
         return parsed._replace(path=f"{parsed.path[:-4]}.json").geturl()
+    if (parsed.hostname or "").casefold().rstrip(".") == "itunes.apple.com":
+        match = re.fullmatch(
+            r"/(?P<storefront>[a-z]{2})/rss/top(?P<chart>paid|free)ebooks/limit=(?P<limit>\d+)/xml/?",
+            parsed.path.casefold(),
+        )
+        if match:
+            return (
+                "https://rss.marketingtools.apple.com/api/v2/"
+                f"{match.group('storefront')}/books/top-{match.group('chart')}/"
+                f"{match.group('limit')}/books.json"
+            )
     return source_url
 
 
