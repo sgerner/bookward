@@ -2441,12 +2441,18 @@ async def enrich_cover_urls(items):
     async with metadata_client() as client:
         async def enrich(item):
             async with semaphore:
+                isbn13, isbn10 = isbn_parts_from_source(
+                    [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+                    item.get("source_url", ""),
+                )
                 cover = await resolve_cover_url(
                     item["title"],
                     item.get("author", "Unknown author"),
                     item.get("cover_url", ""),
                     item.get("source_url", ""),
                     client=client,
+                    isbn13=isbn13,
+                    isbn10=isbn10,
                     google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
                 )
                 return {**item, "cover_url": cover}
@@ -2465,6 +2471,10 @@ async def enrich_book_metadata(items):
     async with metadata_client() as client:
         async def enrich(item):
             async with semaphore:
+                isbn13, isbn10 = isbn_parts_from_source(
+                    [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+                    item.get("source_url", ""),
+                )
                 metadata = await resolve_book_metadata(
                     item["title"],
                     item.get("author", "Unknown author"),
@@ -2477,12 +2487,17 @@ async def enrich_book_metadata(items):
                     lookup_cache=lookup_cache,
                     expected_provider=item.get("_expected_provider", ""),
                     expected_provider_id=item.get("_expected_provider_id", ""),
-                    isbn13=item.get("isbn13", ""),
-                    isbn10=item.get("isbn10", ""),
+                    isbn13=isbn13,
+                    isbn10=isbn10,
+                    prefer_isbn_cover=bool(isbn13 or isbn10),
                     google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
                     prefer_catalog_synopsis=bool(item.get("_prefer_catalog_synopsis")),
                 )
                 enriched = {**item, "cover_url": metadata["cover_url"]}
+                if isbn13:
+                    enriched["isbn13"] = isbn13
+                if isbn10:
+                    enriched["isbn10"] = isbn10
                 if not enriched.get("description") and metadata["description"]:
                     enriched["description"] = metadata["description"]
                 if not enriched.get("release_date") and metadata["release_date"]:
@@ -2981,6 +2996,8 @@ async def refresh_missing_candidate_metadata():
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
+        "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
+        "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
         "q.provider AS _expected_provider,q.provider_id AS _expected_provider_id,"
         "q.metadata_provider AS _legacy_metadata_provider,"
         "q.metadata_provider_id AS _legacy_metadata_provider_id,"
@@ -3177,43 +3194,100 @@ async def scan_source(source):
         ]
     else:
         possible = filter_source_items(cleaned, configured_filters)
-    for item in possible:
+
+    # A prior scan or quality pass may already know an ISBN even when the
+    # current feed item omits it. Carry that identifier into catalog cover
+    # verification before deciding whether the source image is trustworthy.
+    possible_keys = list(
+        dict.fromkeys(
+            normalize_key(item["title"], item.get("author", "Unknown author"))
+            for item in possible
+        )
+    )
+    known_isbns = {}
+    for start in range(0, len(possible_keys), 400):
+        key_batch = possible_keys[start : start + 400]
+        if not key_batch:
+            continue
+        placeholders = ",".join("?" for _ in key_batch)
+        for candidate in rows(
+            "SELECT c.normalized_key,"
+            "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
+            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            f"WHERE c.normalized_key IN ({placeholders})",
+            tuple(key_batch),
+        ):
+            known_isbns[candidate["normalized_key"]] = (
+                candidate.get("isbn13", ""),
+                candidate.get("isbn10", ""),
+            )
+    for item_index, item in enumerate(possible):
+        known_isbn13, known_isbn10 = known_isbns.get(
+            normalize_key(item["title"], item.get("author", "Unknown author")),
+            ("", ""),
+        )
+        known_isbn13, known_isbn10 = isbn_parts(known_isbn13, known_isbn10)
+        source_isbn13, source_isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        source_matches_known_isbn = _returned_identifiers_match_read(
+            [source_isbn13, source_isbn10], known_isbn13, known_isbn10
+        )
+        if (
+            (known_isbn13 or known_isbn10)
+            and (source_isbn13 or source_isbn10)
+            and not source_matches_known_isbn
+        ):
+            # Candidate rows are keyed by title and author, so a source can
+            # occasionally expose another edition ISBN for the same book.
+            # Keep the stored candidate's identifier as the cover identity.
+            isbn13, isbn10 = known_isbn13, known_isbn10
+        else:
+            isbn13, isbn10 = isbn_parts_from_source(
+                [item.get("isbn13"), item.get("isbn10"), item.get("isbn"), known_isbn13, known_isbn10],
+                item.get("source_url", source["url"]),
+            )
+        if isbn13:
+            item["isbn13"] = isbn13
+        if isbn10:
+            item["isbn10"] = isbn10
+        item["_scan_enrichment_id"] = item_index
         item["_source_provided_fields"] = [
             field for field in ("description", "cover_url", "release_date", "genres")
             if item.get(field)
         ]
         item["_source_provider_id"] = str(source["id"])
-    enrichment_pool = (
-        sorted(possible, key=lambda item: bool(item.get("genres")))
-        if configured_filters["include_genres"]
-        else possible
-    )
+
+    def enrichment_priority(item):
+        isbn13, isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        source_cover = safe_cover_url(item.get("cover_url", ""), item.get("source_url", ""))
+        return (
+            bool(item.get("genres")) if configured_filters["include_genres"] else False,
+            not bool(isbn13 or isbn10),
+            bool(source_cover),
+        )
+
+    enrichment_pool = sorted(possible, key=enrichment_priority)
     publisher_batch = await enrich_penguin_random_house_items(
         enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
     )
-    publisher_by_key = {
-        normalize_key(item.get("title", ""), item.get("author", "Unknown author")): item
-        for item in publisher_batch
-    }
-    enrichment_batch = [
-        publisher_by_key.get(
-            normalize_key(item.get("title", ""), item.get("author", "Unknown author")),
-            item,
-        )
-        for item in enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
-    ]
-    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(enrichment_batch))
-    enriched_by_key = {
-        normalize_key(item.get("title", ""), item.get("author", "Unknown author")): item
+    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
+    enriched_by_id = {
+        item["_scan_enrichment_id"]: item
         for item in enriched_batch
+        if "_scan_enrichment_id" in item
     }
     items = [
-        enriched_by_key.get(
-            normalize_key(item.get("title", ""), item.get("author", "Unknown author")),
-            item,
-        )
+        enriched_by_id.get(item.get("_scan_enrichment_id"), item)
         for item in possible
     ]
+    for item in items:
+        item.pop("_scan_enrichment_id", None)
     items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
     with transaction() as con:
         seen = []
@@ -3291,7 +3365,9 @@ async def scan_source(source):
                 for field, applied in contributed.items():
                     if not applied:
                         continue
-                    source_provided = field in source_fields
+                    source_provided = field in source_fields and not (
+                        field == "cover_url" and item.get("_cover_url_provider")
+                    )
                     if source_provided:
                         _persist_metadata_field_provenance(
                             con,

@@ -798,13 +798,16 @@ async def resolve_book_metadata(
     isbn10: object = "",
     prefer_catalog_synopsis: bool = False,
     google_books_api_key: str = "",
+    prefer_isbn_cover: bool = False,
 ) -> dict[str, object]:
     """Resolve summary, publication date, and cover from public book catalogs.
 
     Source pages frequently expose covers but omit descriptions or dates.  This
     enrichment is best-effort and only uses fixed public providers; callers can
     safely persist the returned fields without making recommendation rendering
-    depend on a remote catalog being available.
+    depend on a remote catalog being available. When ``prefer_isbn_cover`` is
+    set, a catalog cover replaces source artwork only after the provider returns
+    the same ISBN and the title and author also match.
     """
 
     supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
@@ -840,7 +843,14 @@ async def resolve_book_metadata(
     needs_genres = len(source_genres) < METADATA_GENRE_LIMIT
     traces: list[dict[str, object]] = []
     records: list[dict[str, object]] = []
-    if (needs_description or needs_release_date or needs_genres or not supplied_url) and title and author:
+    has_source_isbn = bool(source_isbn13 or source_isbn10)
+    if (
+        needs_description
+        or needs_release_date
+        or needs_genres
+        or not supplied_url
+        or (prefer_isbn_cover and has_source_isbn)
+    ) and title and author:
         for lookup in (_lookup_open_library_record, _lookup_google_books_record):
             async def cached_lookup(query_isbn: str):
                 kwargs = (
@@ -869,7 +879,7 @@ async def resolve_book_metadata(
             trace = record.get("_fetch_trace")
             if isinstance(trace, dict):
                 traces.append(trace)
-            if not record.get("provider") and (source_isbn13 or source_isbn10):
+            if not record.get("provider") and has_source_isbn:
                 # An ISBN miss or contradiction can still be followed by an
                 # identity-verified title/author query. The ISBN result itself
                 # is never accepted when its returned identifier disagrees.
@@ -877,6 +887,23 @@ async def resolve_book_metadata(
                 # broader query; it cannot recover from an outage in this job.
                 if isinstance(trace, dict) and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES:
                     continue
+                record = await cached_lookup("")
+                trace = record.get("_fetch_trace")
+                if isinstance(trace, dict):
+                    traces.append(trace)
+            elif (
+                prefer_isbn_cover
+                and has_source_isbn
+                and not supplied_url
+                and isinstance(trace, dict)
+                and trace.get("query_kind") == "isbn"
+                and trace.get("identifier_verified") is not True
+            ):
+                # A provider can return a title/author match from its ISBN
+                # search without echoing the ISBN. Keep that record out of the
+                # ISBN-authoritative cover path and try the broader, still
+                # identity-checked lookup only when no usable source cover
+                # exists.
                 record = await cached_lookup("")
                 trace = record.get("_fetch_trace")
                 if isinstance(trace, dict):
@@ -889,7 +916,13 @@ async def resolve_book_metadata(
                 and expected_provider_id
                 and record.get("provider_id") != expected_provider_id
             ):
-                continue
+                trace = record.get("_fetch_trace")
+                if not (
+                    isinstance(trace, dict)
+                    and trace.get("query_kind") == "isbn"
+                    and trace.get("identifier_verified") is True
+                ):
+                    continue
             if record.get("provider"):
                 records.append(record)
 
@@ -946,7 +979,22 @@ async def resolve_book_metadata(
             result["description_provider_id"] = description_record.get("provider_id", "")
             result["description_kind"] = description_record.get("description_kind", "")
 
-    if not result["cover_url"]:
+    verified_isbn_cover_record = next(
+        (
+            record
+            for record in records
+            if record.get("cover_url")
+            and isinstance(record.get("_fetch_trace"), dict)
+            and record["_fetch_trace"].get("query_kind") == "isbn"
+            and record["_fetch_trace"].get("identifier_verified") is True
+        ),
+        None,
+    )
+    if prefer_isbn_cover and has_source_isbn and verified_isbn_cover_record:
+        result["cover_url"] = verified_isbn_cover_record["cover_url"]
+        result["cover_provider"] = verified_isbn_cover_record.get("provider", "")
+        result["cover_provider_id"] = verified_isbn_cover_record.get("provider_id", "")
+    elif not result["cover_url"] and not (prefer_isbn_cover and has_source_isbn):
         cover_record = next((record for record in records if record.get("cover_url")), None)
         if cover_record:
             result["cover_url"] = cover_record["cover_url"]
@@ -1205,8 +1253,28 @@ async def resolve_cover_url(
     source_url: str = "",
     client: httpx.AsyncClient | None = None,
     google_books_api_key: str = "",
+    isbn13: object = "",
+    isbn10: object = "",
 ) -> str:
     """Resolve a useful cover URL, always returning a non-empty value."""
+
+    if isbn_parts(isbn13, isbn10) != ("", ""):
+        metadata = await resolve_book_metadata(
+            title,
+            author,
+            supplied=supplied,
+            source_url=source_url,
+            client=client,
+            isbn13=isbn13,
+            isbn10=isbn10,
+            prefer_isbn_cover=True,
+            google_books_api_key=google_books_api_key,
+        )
+        if metadata.get("cover_url"):
+            return str(metadata["cover_url"])
+        # With an ISBN, do not replace a missing exact catalog match with a
+        # title-only result that could belong to another edition.
+        return placeholder_cover_url(title, author)
 
     supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
     if supplied_url:
