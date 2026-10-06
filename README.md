@@ -42,7 +42,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 - **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads credentials. The default Docker binding is localhost.
 - **Recommendations are explainable.** Each book includes a match score, source, and plain-language reasons instead of an unexplained ranking.
 - **You control the inputs.** Import your Goodreads history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
-- **Discovery can become a reading habit.** Shortlist books, pin a few as Up next, track what you are Reading, and mark books Finished with an optional rating. You can also add a title to a Librarr ebook or audiobook waitlist.
+- **Discovery stays focused.** Shortlist recommendations, mark books Read to add them to your history, or find them in Librarr. Bookward does not track reading progress.
 - **Automation is optional and gentle.** Scheduled source refreshes and weekly Discord or email digests are off until you choose them. Delivery is recorded and retryable.
 - **It is comfortable to use.** The responsive interface includes keyboard-friendly controls, a skip-to-content link, accessible labels, light/dark/system modes, and reduced-motion support.
 
@@ -53,8 +53,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 - Import a complete Goodreads CSV export, including ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
-- Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Move saved books through Saved, Reading, and Finished, with an optional rating when you finish.
-- Pin a saved book as Up next to keep it at the front of your shortlist.
+- Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Mark a shortlisted book Read to add it to your history, with an optional rating.
 - Search Librarr from a recommendation and add a matching ebook or audiobook directly.
 - Choose the visual theme and appearance mode that work best for you.
 
@@ -79,7 +78,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 Bookward exposes a versioned API for automations and other applications. Open Settings → API access, name a token, and select **Generate token**. The full token is displayed only once; store it in the calling application and revoke it from the same screen if it is no longer needed.
 
-When upgrading an existing install, restart the engine once so pending SQLite migrations are applied. Existing saved and Librarr-imported books remain on your shortlist and start in the Saved shelf.
+When upgrading an existing install, restart the engine once so pending SQLite migrations are applied. Read history is preserved. The migration removes the old Up next, Reading, and Finished progress records.
 
 The public base URL is:
 
@@ -97,11 +96,9 @@ curl https://your-bookward-host.example/api/v1/recommendations \
 The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
 
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
-- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
 - `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, `maybe_later`, or `restore`. Only `reject` is a negative learning signal; `maybe_later` is neutral.
 - `POST /api/v1/recommendations/{id}/undo` — send `{"decision_id":123}` from a recent feedback response to undo the latest choice.
-- `GET /api/v1/reading-list` — list shortlisted books with their `reading_status`, `up_next`, rating, and timestamps.
-- `PUT /api/v1/reading-list/{id}` — set `{"status":"reading"}`, `{"status":"finished","rating":5}`, `{"status":"saved"}`, or `{"up_next":true}`.
 - `GET /api/v1/sources` — list configured sources.
 - `POST /api/v1/sync` — queue a source refresh and return a job ID.
 - `GET /api/v1/jobs/{id}` — check a background job.
@@ -133,7 +130,7 @@ To evaluate ranking changes against a private history of rated reads, run `engin
 
 All experiment findings, corrected measurements and adoption decisions are in the [central experiment record](docs/recommendation-experiments.md). It includes the complete pipeline audit, enrichment and embedding comparisons, first-eight and combination studies, fresh reader judgments, and independent-reader checks. Richer read embeddings and the proposed 75/25 score blend were not adopted; the current kernel remains at power 8. Positive retrospective point estimates are not proof of live or cross-user recommendation gains.
 
-Marking a recommendation read, or marking a shortlisted book Finished, preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling. Fresh, provider-consistent verified metadata work IDs also exclude matching editions, with identity proof retained in scoring evidence. The [already-read audit and completed repair](docs/recommendation-experiments.md#already-read-exclusion-audit-2026-10-03) distinguish missing history from exclusion defects.
+Marking a recommendation or shortlisted book Read preserves its valid catalog ISBN even without a rating. Matching editions stay excluded when another source uses a different title or author spelling. Fresh, provider-consistent verified metadata work IDs also exclude matching editions, with identity proof retained in scoring evidence. The [already-read audit and completed repair](docs/recommendation-experiments.md#already-read-exclusion-audit-2026-10-03) distinguish missing history from exclusion defects.
 
 Association providers select bounded favorite seeds from the complete reading library and exclude known reads outside that seed set, including disliked and unrated books. Their shared checks use title/author, provider-scoped work IDs and valid ISBNs. Known-author title collisions alone do not suppress a different work; an unknown author on either side retains a conservative title fallback. See [the association identity findings](docs/recommendation-experiments.md#association-source-identity).
 
@@ -172,7 +169,7 @@ Goodreads CSV / RSS + trusted public lists
      (optional)           weekly digest
 ~~~
 
-Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, digest scheduling, and the SQLite reading list. See [the reading workflow guide](docs/reading-workflow.md) for state transitions and API examples.
+Bookward is deliberately split into a friendly web UI and an independent engine. The engine keeps working when the browser is closed: it owns source refreshes, scoring jobs, cover enrichment, digest scheduling, and the SQLite shortlist and read history. See [the reading workflow guide](docs/reading-workflow.md) for the shortlist and read-history behavior.
 
 The first eight discovery recommendations use a bounded anti-redundancy pass to reduce third-author repeats and near-duplicate books; see [the discovery slate policy](docs/discovery-slate-diversity.md) for its limits and telemetry.
 
@@ -264,7 +261,7 @@ Profile snapshots include that profile's data and encrypted integration credenti
 
 The first administrator can create accounts at **Manage accounts**. Each account owns one profile, which Bookward opens automatically after sign-in; there is no profile-selection step. A password is a way to authenticate an account, not a profile identifier. New accounts receive a temporary password set by the administrator and must change it on first sign-in. Readers can link an OpenID Connect identity under **Account** after signing in; later SSO sign-ins resolve that identity to the same account and profile. Matching email addresses never link accounts automatically.
 
-Each profile has its own data store. Candidate pools and discovery decisions, read history, shortlists and reading progress, sources, recommendations and learning history, jobs, API tokens, and integration settings stay with that profile. Signing in to another account opens its separate data. Embeddings are also stored per profile today, so the same book may be embedded more than once.
+Each profile has its own data store. Candidate pools and discovery decisions, read history, shortlists, sources, recommendations and learning history, jobs, API tokens, and integration settings stay with that profile. Signing in to another account opens its separate data. Embeddings are also stored per profile today, so the same book may be embedded more than once.
 
 Configure one OpenID Connect provider with `OIDC_ISSUER`, `OIDC_CLIENT_ID`, and `OIDC_CLIENT_SECRET`. `OIDC_REDIRECT_URI` is optional; when omitted, Bookward uses `{AFTERWORD_PUBLIC_URL}/auth/oidc/callback`. Set `OIDC_AUTO_PROVISION=true` only when every authenticated identity from the configured issuer should receive a profile automatically. Automatically provisioned identities receive regular reader accounts with new profiles; OIDC does not automatically create administrators. The default is `false`, so SSO identities must first be linked to an existing account. SSO uses authorization code flow with PKCE and validates issuer, audience, signature, state, nonce, and redirect configuration.
 

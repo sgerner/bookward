@@ -528,11 +528,6 @@ def test_undo_reverses_save_and_pass_state_without_relabeling_maybe_later(
         "(SELECT id FROM recommendation_events WHERE event_key=?)",
         (f"feedback:{decision['decision_id']}",),
     )["count"] == 0
-    if action == "save" and recommendations[0]["status"] not in {"saved", "imported"}:
-        assert row(
-            "SELECT COUNT(*) count FROM reading_progress WHERE candidate_id=?",
-            (candidate_id,),
-        )["count"] == 0
     assert stale.status_code == 409
 
 
@@ -861,7 +856,7 @@ def test_manual_read_canonicalizes_valid_isbn10_and_ignores_invalid_isbn(
     ) == {"isbn": expected_isbn, "rating": None}
 
 
-def test_finished_shortlist_uses_the_same_verified_isbn_persistence(database):
+def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
     with transaction() as con:
         source_id = con.execute(
             "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
@@ -879,11 +874,9 @@ def test_finished_shortlist_uses_the_same_verified_isbn_persistence(database):
         )
 
     with TestClient(app, headers=authenticated_headers()) as client:
-        response = client.put(
-            f"/api/reading-list/{candidate_id}", json={"status": "finished"}
-        )
+        response = client.post(f"/api/recommendations/{candidate_id}/read", json={})
     assert response.status_code == 200
-    assert response.json()["status"] == "finished"
+    assert response.json()["status"] == "read"
     assert row(
         "SELECT isbn,rating,source FROM reads WHERE title='Finished Work' AND author='A Reader'"
     ) == {"isbn": "9780593418574", "rating": None, "source": "manual"}

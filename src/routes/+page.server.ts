@@ -36,12 +36,6 @@ type Overview = {
     explanation: string[];
     status: string;
     source_name: string | null;
-    reading_status?: "saved" | "reading" | "finished" | null;
-    up_next?: number | boolean;
-    reading_rating?: number | null;
-    started_at?: string | null;
-    finished_at?: string | null;
-    reading_updated_at?: string | null;
   }>;
   decisions?: Overview["recommendations"];
   history: Array<{
@@ -174,12 +168,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       synopsis: book.description,
       reason: book.explanation.join(" · "),
       source_type: "engine",
-      librar_id: book.status === "imported" ? "imported" : null,
-      reading_status:
-        book.reading_status ??
-        (["saved", "imported"].includes(book.status) ? "saved" : null),
-      up_next: book.up_next ?? 0,
-      reading_rating: book.reading_rating ?? null,
     })),
     decisions: (overview.decisions ?? []).map((book) => ({
       ...book,
@@ -191,13 +179,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       synopsis: book.description,
       reason: book.explanation.join(" · "),
       source_type: "engine",
-      librar_id: book.status === "imported" ? "imported" : null,
-      reading_status: book.reading_status ?? null,
-      up_next: book.up_next ?? 0,
-      reading_rating: book.reading_rating ?? null,
-      started_at: book.started_at ?? null,
-      finished_at: book.finished_at ?? null,
-      reading_updated_at: book.reading_updated_at ?? null,
     })),
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
@@ -413,61 +394,9 @@ export const actions: Actions = {
       });
       return {
         message: rating === undefined
-          ? "Added to your read list and removed from Discover."
-          : `Added to your read list with a ${rating}-star rating.`,
+          ? "Marked Read and added to your history."
+          : `Marked Read and added to your history with a ${rating}-star rating.`,
       };
-    } catch (error) {
-      return fail(status(error), { message: message(error) });
-    }
-  },
-  readingProgress: async ({ request }) => {
-    const data = await request.formData();
-    const id = idSchema.safeParse(data.get("id"));
-    const rawStatus = data.get("status");
-    const readingStatus = rawStatus === null
-      ? null
-      : z.enum(["saved", "reading", "finished"]).safeParse(rawStatus);
-    const rawUpNext = data.get("up_next");
-    const upNext = rawUpNext === null
-      ? null
-      : z.enum(["true", "false"]).safeParse(rawUpNext);
-    const hasRating = data.has("rating");
-    const rawRating = formText(data, "rating");
-    const rating = rawRating ? Number(rawRating) : null;
-
-    if (
-      !id.success ||
-      (readingStatus !== null && !readingStatus.success) ||
-      (upNext !== null && !upNext.success) ||
-      (readingStatus === null && upNext === null) ||
-      (hasRating && (readingStatus === null || !readingStatus.success || readingStatus.data !== "finished")) ||
-      (rating !== null && (!Number.isInteger(rating) || rating < 1 || rating > 5))
-    ) {
-      return fail(400, { message: "Choose a valid reading status and optional 1 to 5 star rating." });
-    }
-
-    const body = {
-      ...(readingStatus?.success ? { status: readingStatus.data } : {}),
-      ...(upNext?.success ? { up_next: upNext.data === "true" } : {}),
-      ...(hasRating ? { rating } : {}),
-    };
-    try {
-      await engine(`/api/reading-list/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
-      const actionMessage = readingStatus?.success
-        ? readingStatus.data === "reading"
-          ? "Moved to Reading."
-          : readingStatus.data === "finished"
-            ? rating === null
-              ? "Marked Finished."
-              : `Marked Finished with a ${rating}-star rating.`
-            : "Moved back to Saved."
-        : upNext?.success && upNext.data === "true"
-          ? "Marked Up next."
-          : "Removed from Up next.";
-      return { message: actionMessage };
     } catch (error) {
       return fail(status(error), { message: message(error) });
     }

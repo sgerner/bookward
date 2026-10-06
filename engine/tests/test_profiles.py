@@ -88,10 +88,12 @@ def test_private_api_selects_data_from_the_authenticated_profile(identity_store)
             "/api/overview", headers={"x-bookward-session": alice_session}
         ).json()["history"]
         owner_shortlist = client.get(
-            "/api/reading-list", headers={"x-bookward-session": owner_session}
+            "/api/recommendations?status=saved",
+            headers={"x-bookward-session": owner_session},
         ).json()
         alice_shortlist = client.get(
-            "/api/reading-list", headers={"x-bookward-session": alice_session}
+            "/api/recommendations?status=saved",
+            headers={"x-bookward-session": alice_session},
         ).json()
 
     assert "Owner private read" in {item["title"] for item in owner_history}
@@ -725,17 +727,15 @@ def test_profile_api_token_authentication_uses_the_shared_registry_key(identity_
         )
         alice_headers = {"authorization": f"Bearer {token}"}
         bob_headers = {"authorization": f"Bearer {other_token}"}
-        alice_list = client.get("/api/v1/reading-list", headers=alice_headers)
-        bob_list = client.get("/api/v1/reading-list", headers=bob_headers)
+        alice_list = client.get(
+            "/api/v1/recommendations?status=saved", headers=alice_headers
+        )
+        bob_list = client.get(
+            "/api/v1/recommendations?status=saved", headers=bob_headers
+        )
         alice_job = client.get("/api/jobs/alice-private-job", headers={"x-bookward-session": profiles.create_session(alice["id"])[0]})
         foreign_job = client.get("/api/jobs/alice-private-job", headers={"x-bookward-session": profiles.create_session(bob["id"])[0]})
         bob_job = client.get("/api/jobs/bob-private-job", headers={"x-bookward-session": profiles.create_session(bob["id"])[0]})
-        progress = client.put(
-            "/api/v1/reading-list/1",
-            json={"status": "finished", "rating": 5},
-            headers=alice_headers,
-        )
-        bob_list_after_update = client.get("/api/v1/reading-list", headers=bob_headers)
 
     assert response.status_code == 200
     assert response.json()["profile_id"] == alice["profile_id"]
@@ -745,12 +745,6 @@ def test_profile_api_token_authentication_uses_the_shared_registry_key(identity_
     assert alice_job.status_code == 200
     assert foreign_job.status_code == 404
     assert bob_job.status_code == 200
-    assert progress.status_code == 200
-    assert [item["title"] for item in bob_list_after_update.json()] == ["Bob API shortlist"]
-    with profile_scope(alice["profile_id"]), connect() as con:
-        assert con.execute("SELECT rating FROM reads WHERE title='Alice API shortlist'").fetchone()[0] == 5
-    with profile_scope(bob["profile_id"]), connect() as con:
-        assert con.execute("SELECT COUNT(*) FROM reading_progress").fetchone()[0] == 0
 
 
 @respx.mock

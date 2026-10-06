@@ -946,6 +946,13 @@ MIGRATIONS = [
             ON jobs(status,heartbeat_at);
         """,
     ),
+    (
+        22,
+        """
+        DROP INDEX IF EXISTS idx_reading_progress_shelf;
+        DROP TABLE IF EXISTS reading_progress;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
