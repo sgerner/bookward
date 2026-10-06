@@ -1677,12 +1677,14 @@
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             {@const shelfStatus = book.reading_status ?? "saved"}
+            {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
+            {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
             <article
               use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
-              class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 preset-tonal-surface shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
+              class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
               {#if book.cover_url}
                 <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden rounded-[inherit] sm:hidden" aria-hidden="true">
@@ -1731,6 +1733,7 @@
               <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
                 <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                  {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
                   {#if view === "saved"}
                     <span class="badge badge-sm preset-tonal-primary">{shelfStatus === "reading" ? "Reading" : shelfStatus === "finished" ? "Finished" : book.up_next ? "Up next" : "Saved"}</span>
@@ -1955,7 +1958,7 @@
               <p class="mb-3 text-xs text-surface-700-300">Showing {visibleReadingHistory.length} of {filteredReadingHistory.length} books</p>
               <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {#each visibleReadingHistory as item (item.id)}
-                  <article class="card min-w-0 preset-tonal-surface p-4">
+                  <article class="card min-w-0 preset-tonal-success p-4">
                     <div class="flex items-start gap-3">
                       <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
                       <div class="min-w-0 flex-1">
@@ -1963,11 +1966,14 @@
                         <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
                         <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
-                      {#if item.rating !== null && item.rating > 0}
-                        <span class="badge shrink-0 preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
-                      {:else}
-                        <span class="badge shrink-0 preset-tonal-surface">Unrated</span>
-                      {/if}
+                      <div class="flex shrink-0 flex-col items-end gap-2">
+                        <span class="badge badge-sm preset-tonal-success">Read</span>
+                        {#if item.rating !== null && item.rating > 0}
+                          <span class="badge preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
+                        {:else}
+                          <span class="badge preset-tonal-surface">Unrated</span>
+                        {/if}
+                      </div>
                     </div>
                     <div class="mt-3 border-t border-surface-300-700/40 pt-2">
                       <button
