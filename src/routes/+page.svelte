@@ -1078,7 +1078,7 @@
     eventType: "visible" | "detail_open" | "source_open" | "librarr_search" | "librarr_import",
     metadata: Record<string, unknown> = {},
   ) {
-    const runId = String(data.recommendation_run_id || "");
+    const runId = String(allBooks.find((book) => book.id === candidateId)?.recommendation_run_id || "");
     telemetry.enqueue({
       candidate_id: candidateId,
       event_type: eventType,
@@ -1381,7 +1381,7 @@
               const body = new URLSearchParams({
                 id: String(id),
                 status: "saved",
-                run_id: String(data.recommendation_run_id || ""),
+                run_id: String(allBooks.find((book) => book.id === id)?.recommendation_run_id || ""),
               });
               const change = optimisticBookStatus(id, "saved");
               try {
@@ -1658,7 +1658,6 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <input type="hidden" name="run_id" value={data.recommendation_run_id} />
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -1780,15 +1779,15 @@
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
                     <div class="relative z-50 ml-auto shrink-0">
                       <button
@@ -1875,7 +1874,7 @@
                     {#if book.status === "saved"}
                       <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={data.recommendation_run_id} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                       </form>
                     {/if}
                   {:else if book.status === "rejected" || book.status === "maybe_later"}

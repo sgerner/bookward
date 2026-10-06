@@ -1,5 +1,6 @@
 export type Recommendation = {
   id: number;
+  recommendation_run_id?: string;
   title: string;
   author: string;
   description: string;
@@ -32,6 +33,7 @@ const publicUrl = (value: string) => {
 export function toPageBook(book: Recommendation) {
   return {
     ...book,
+    recommendation_run_id: book.recommendation_run_id ?? "",
     cover_url: publicUrl(book.cover_url),
     source_url: publicUrl(book.source_url),
     published_on: book.release_date,
