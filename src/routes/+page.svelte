@@ -64,7 +64,6 @@
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
-  type ShelfFilter = "all" | "up_next" | "saved" | "reading" | "finished";
   type ReadingHistoryItem = {
     id: number;
     title: string;
@@ -88,6 +87,8 @@
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
+  let markReadBook = $state<PageBook | null>(null);
+  let markReadRating = $state(0);
   let filter = $state("");
   let profileMenuOpen = $state(false);
   let profileMenuRoot = $state<HTMLDivElement | null>(null);
@@ -122,7 +123,6 @@
   let previousDataBooks: PageBook[] | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
-  let shelfFilter = $state<ShelfFilter>("all");
   let librarrSearchOpen = $state(false);
   let librarrSearchBook = $state<{
     id: number;
@@ -219,21 +219,8 @@
       (book) => book.status === "recommended" && matchesBookFilter(book),
     ),
   );
-  const savedBooks = $derived(
-    allBooks.filter(
-      (book) =>
-        ["saved", "imported"].includes(book.status) && matchesBookFilter(book),
-    ),
-  );
-  const shortlistBooks = $derived(
-    savedBooks.filter((book) => {
-      const state = book.reading_status ?? "saved";
-      if (shelfFilter === "all") return true;
-      if (shelfFilter === "up_next") return state === "saved" && Boolean(book.up_next);
-      if (shelfFilter === "saved") return state === "saved" && !book.up_next;
-      return state === shelfFilter;
-    }),
-  );
+  const savedBooks = $derived(allBooks.filter((book) => book.status === "saved"));
+  const shortlistBooks = $derived(savedBooks);
   const decisionBooks = $derived(
     allBooks.filter(
       (book) =>
@@ -344,18 +331,6 @@
   const hasMoreDiscoverBooks = $derived(
     activeView === "discover" &&
       (visibleBooks.length < filteredBooks.length || discoverHasMore),
-  );
-  const upNextCount = $derived(
-    savedBooks.filter((book) => Boolean(book.up_next) && book.reading_status !== "reading" && book.reading_status !== "finished").length,
-  );
-  const savedShelfCount = $derived(
-    savedBooks.filter((book) => (book.reading_status ?? "saved") === "saved" && !book.up_next).length,
-  );
-  const readingCount = $derived(
-    savedBooks.filter((book) => book.reading_status === "reading").length,
-  );
-  const finishedCount = $derived(
-    savedBooks.filter((book) => book.reading_status === "finished").length,
   );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
@@ -625,7 +600,7 @@
           if (
             succeeded &&
             (key.startsWith("read-") ||
-              key.endsWith("-finished") ||
+              key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
               key === "goodreads-csv")
           ) {
@@ -689,6 +664,17 @@
   function optimisticRead(formData: FormData) {
     const id = Number(formData.get("id"));
     return Number.isInteger(id) ? optimisticBookStatus(id, "read") : undefined;
+  }
+
+  function optimisticShortlistRead(formData: FormData) {
+    const change = optimisticRead(formData);
+    return {
+      commit: () => {
+        change?.commit?.();
+        closeMarkRead();
+      },
+      rollback: () => change?.rollback?.(),
+    };
   }
 
   function optimisticImport(formData: FormData) {
@@ -1067,6 +1053,14 @@
     librarrSearchOpen = true;
     void searchLibrarr();
   }
+  function openMarkRead(book: PageBook) {
+    markReadBook = book;
+    markReadRating = 0;
+  }
+  function closeMarkRead() {
+    markReadBook = null;
+    markReadRating = 0;
+  }
   function closeLibrarrSearch() {
     librarrSearchAbortController?.abort();
     librarrSearchAbortController = null;
@@ -1307,6 +1301,7 @@
     if (failed) {
       librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
+      if (added) await invalidateAll();
     } else if (added) {
       closeLibrarrSearch();
       await invalidateAll();
@@ -1323,6 +1318,7 @@
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
     const onKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && markReadBook) closeMarkRead();
       if (event.key === "Escape" && librarrSearchOpen) closeLibrarrSearch();
       if (event.key === "Escape" && profileMenuOpen) {
         profileMenuOpen = false;
@@ -1607,28 +1603,17 @@
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
-          <div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
-            <Search size={17} class="shrink-0 text-surface-600-400" />
-            <input
-              bind:value={filter}
-              class="input-ghost min-w-0 flex-1"
-              aria-label="Search books"
-              placeholder="Search books"
-            />
-            {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
-          </div>
+          {#if view !== "saved"}<div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
+              <Search size={17} class="shrink-0 text-surface-600-400" />
+              <input
+                bind:value={filter}
+                class="input-ghost min-w-0 flex-1"
+                aria-label="Search books"
+                placeholder="Search books"
+              />
+              {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+            </div>{/if}
         </section>
-        {#if view === "saved"}
-          <section class="mb-6" aria-label="Shortlist shelves">
-            <div class="flex flex-wrap gap-2" role="group" aria-label="Filter shortlist by reading status">
-              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "all"} onclick={() => (shelfFilter = "all")}>All <span class="badge badge-sm preset-tonal-surface">{savedBooks.length}</span></button>
-              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "up_next" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "up_next"} onclick={() => (shelfFilter = "up_next")}>Up next <span class="badge badge-sm preset-tonal-surface">{upNextCount}</span></button>
-              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "saved" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "saved"} onclick={() => (shelfFilter = "saved")}>Saved <span class="badge badge-sm preset-tonal-surface">{savedShelfCount}</span></button>
-              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "reading" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "reading"} onclick={() => (shelfFilter = "reading")}>Reading <span class="badge badge-sm preset-tonal-surface">{readingCount}</span></button>
-              <button type="button" class={`btn btn-sm min-h-10 ${shelfFilter === "finished" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={shelfFilter === "finished"} onclick={() => (shelfFilter = "finished")}>Finished <span class="badge badge-sm preset-tonal-surface">{finishedCount}</span></button>
-            </div>
-          </section>
-        {/if}
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
@@ -1675,7 +1660,6 @@
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
-            {@const shelfStatus = book.reading_status ?? "saved"}
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
             <article
@@ -1734,10 +1718,6 @@
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
-                  {#if view === "saved"}
-                    <span class="badge badge-sm preset-tonal-primary">{shelfStatus === "reading" ? "Reading" : shelfStatus === "finished" ? "Finished" : book.up_next ? "Up next" : "Saved"}</span>
-                    {#if shelfStatus === "finished" && book.reading_rating}<span class="badge badge-sm preset-tonal-secondary" aria-label={`Your rating: ${book.reading_rating} ${book.reading_rating === 1 ? "star" : "stars"}`}>{book.reading_rating} ★</span>{/if}
-                  {/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
                   {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
@@ -1820,57 +1800,20 @@
                         </form>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved" || book.status === "imported"}
+                  {:else if book.status === "saved"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     {#if book.status === "saved"}
                       <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
                       </form>
-                    {:else}
-                      <span class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>
                     {/if}
-                    {#if shelfStatus === "saved"}
-                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-up-next`)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="up_next" value={book.up_next ? "false" : "true"} />
-                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-secondary" disabled={isPending(`progress-${book.id}-up-next`)} aria-busy={isPending(`progress-${book.id}-up-next`)}>{#if isPending(`progress-${book.id}-up-next`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} {book.up_next ? "Remove Up next" : "Up next"}</button>
-                      </form>
-                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-reading`)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="reading" />
-                        <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`progress-${book.id}-reading`)} aria-busy={isPending(`progress-${book.id}-reading`)}>{#if isPending(`progress-${book.id}-reading`)}<RefreshCw size={15} class="animate-spin" />{:else}<BookOpen size={15} />{/if} Start reading</button>
-                      </form>
-                    {:else if shelfStatus === "reading"}
-                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-saved`)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" />
-                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" disabled={isPending(`progress-${book.id}-saved`)} aria-busy={isPending(`progress-${book.id}-saved`)}>{#if isPending(`progress-${book.id}-saved`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Move to Saved</button>
-                      </form>
-                    {:else}
-                      <form method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-reading`)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="reading" />
-                        <button type="submit" class="btn btn-sm min-h-10 preset-tonal-secondary" disabled={isPending(`progress-${book.id}-reading`)} aria-busy={isPending(`progress-${book.id}-reading`)}>{#if isPending(`progress-${book.id}-reading`)}<RefreshCw size={15} class="animate-spin" />{:else}<BookOpen size={15} />{/if} Move to Reading</button>
-                      </form>
-                    {/if}
-                    {#if shelfStatus !== "finished"}
-                      <details class="min-w-0">
-                        <summary class="btn btn-sm min-h-10 list-none preset-tonal-primary [&::-webkit-details-marker]:hidden"><Check size={15} /> Finish book</summary>
-                        <form class="mt-2 flex flex-wrap items-end gap-2" method="POST" action="?/readingProgress" use:enhance={setPending(`progress-${book.id}-finished`)}>
-                          <ProfileField profileId={data.user?.profile_id} />
-                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="finished" />
-                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`finish-rating-${book.id}`}>
-                            Rating <span class="sr-only">for {book.title}, optional</span>
-                            <select id={`finish-rating-${book.id}`} name="rating" class="select select-sm min-h-10 preset-tonal-surface">
-                              <option value="" selected={!book.reading_rating}>No rating</option>
-                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating} selected={book.reading_rating === rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
-                            </select>
-                          </label>
-                          <button type="submit" class="btn btn-sm min-h-10 preset-tonal-primary" disabled={isPending(`progress-${book.id}-finished`)} aria-busy={isPending(`progress-${book.id}-finished`)}>{#if isPending(`progress-${book.id}-finished`)}<RefreshCw size={15} class="animate-spin" />{:else}<Check size={15} />{/if} Mark Finished</button>
-                        </form>
-                      </details>
-                    {/if}
+                    <button
+                      in:fly={{ y: 8, duration: motionDuration(180) }}
+                      type="button"
+                      class="btn btn-sm min-h-10 preset-filled-primary-500"
+                      onclick={() => openMarkRead(book)}
+                    ><Check size={15} /> Mark Read</button>
                     {#if book.status === "saved"}
                       <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                         <ProfileField profileId={data.user?.profile_id} />
@@ -1882,15 +1825,15 @@
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
-                  {:else}<span in:scale={{ duration: motionDuration(180) }} class="badge min-h-10 preset-tonal-success"><Check size={15} /> Added to Librarr</span>{/if}
+                  {/if}
                 </div>
               </div>
             </article>
           {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
               <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
               <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">{filter ? "No books match that search" : view === "saved" ? "Your shortlist is empty" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
-                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{filter ? "Try an author, title, or genre." : view === "saved" ? "Shortlist a recommendation when one catches your eye." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+                <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" ? "Your shortlist is empty" : filter ? "No books match that search" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
+                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" ? "Shortlist a recommendation when one catches your eye." : filter ? "Try an author, title, or genre." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
               </div>
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
             </div>{/each}
@@ -3159,6 +3102,106 @@
           ></span>{/if}</button
       >{/each}
   </nav>
+  {#if markReadBook}
+    <div
+      in:fade={{ duration: motionDuration(240) }}
+      out:fade={{ duration: motionDuration(180) }}
+      class="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-surface-950/75 p-4 backdrop-blur-md"
+      role="presentation"
+      onclick={closeMarkRead}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mark-read-title"
+        aria-describedby="mark-read-description"
+        tabindex="-1"
+        in:scale={{ duration: motionDuration(260), start: 0.94 }}
+        out:scale={{ duration: motionDuration(170), start: 0.97 }}
+        class="relative isolate w-full max-w-xl overflow-hidden rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
+        onclick={(event) => event.stopPropagation()}
+      >
+        <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
+          <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
+          <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
+        </div>
+        <div class="flex items-start justify-between gap-5 border-b border-surface-200-800/70 p-5 sm:p-7">
+          <div class="flex min-w-0 items-center gap-4">
+            <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
+              <BookOpen size={22} />
+            </span>
+            <div class="min-w-0">
+              <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
+              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read</h2>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="btn btn-icon btn-sm shrink-0 rounded-full preset-tonal-surface"
+            aria-label="Close Mark Read dialog"
+            autofocus
+            onclick={closeMarkRead}
+          ><X size={17} /></button>
+        </div>
+
+        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
+          <div class="p-5 sm:p-7">
+            <ProfileField profileId={data.user?.profile_id} />
+            <input type="hidden" name="id" value={markReadBook.id} />
+            <input type="hidden" name="rating" value={markReadRating || ""} />
+
+            <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
+              <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
+                {#if markReadBook.cover_url}
+                  <img src={markReadBook.cover_url} alt="" class="h-full w-full object-cover" />
+                {:else}
+                  <BookOpen size={24} class="text-surface-600-400" />
+                {/if}
+              </div>
+              <div class="min-w-0">
+                <p class="line-clamp-2 text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
+                <p class="mt-1 truncate text-sm text-surface-700-300">{markReadBook.author}</p>
+              </div>
+              <span class="ml-auto hidden size-9 shrink-0 place-items-center rounded-full bg-secondary-500/10 text-secondary-600-400 sm:grid" aria-hidden="true"><Check size={17} /></span>
+            </div>
+
+            <p id="mark-read-description" class="mt-5 max-w-md text-sm leading-6 text-surface-700-300">Add this book to your read history. You can leave a rating now, or keep the moment unrated.</p>
+
+            <div class="mt-6">
+              <div class="flex items-baseline justify-between gap-3">
+                <p class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
+                <span class="text-xs text-surface-600-400">Optional</span>
+              </div>
+              <div class="mt-3 flex flex-wrap items-center gap-2" role="group" aria-label="Optional book rating">
+                {#each [1, 2, 3, 4, 5] as rating (rating)}
+                  <button
+                    type="button"
+                    class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
+                    aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
+                    aria-pressed={markReadRating === rating}
+                    onclick={() => (markReadRating = rating)}
+                  ><span aria-hidden="true">★</span></button>
+                {/each}
+                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => (markReadRating = 0)}>Clear rating</button>{/if}
+              </div>
+            </div>
+          </div>
+
+          <div class="flex flex-col-reverse gap-2 border-t border-surface-200-800/70 bg-surface-950/5 p-5 sm:flex-row sm:justify-end sm:p-6">
+            <button type="button" class="btn min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
+            <button
+              type="submit"
+              class="btn min-h-11 rounded-xl bg-gradient-to-r from-primary-500 to-secondary-500 px-5 font-semibold text-white shadow-lg shadow-primary-950/30 transition hover:-translate-y-0.5 hover:shadow-xl disabled:translate-y-0 disabled:opacity-60"
+              disabled={isPending(`shortlist-read-${markReadBook.id}`)}
+              aria-busy={isPending(`shortlist-read-${markReadBook.id}`)}
+            >
+              {#if isPending(`shortlist-read-${markReadBook.id}`)}<RefreshCw size={16} class="animate-spin" /> Saving…{:else}<Check size={16} /> Mark Read{/if}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  {/if}
   {#if librarrSearchOpen}
     <div
       in:fade={{ duration: motionDuration(180) }}

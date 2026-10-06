@@ -1149,12 +1149,6 @@ class MarkReadIn(BaseModel):
     )
 
 
-class ReadingProgressIn(BaseModel):
-    status: Literal["saved", "reading", "finished"] | None = None
-    up_next: bool | None = None
-    rating: int | None = Field(default=None, ge=1, le=5)
-
-
 class TelemetryEventIn(BaseModel):
     event_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
     candidate_id: int = Field(gt=0)
@@ -1619,20 +1613,13 @@ def _recommendation_rows(
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
-        "q.isbn10 quality_isbn10,"
-        "CASE WHEN c.status IN ('saved','imported') "
-        "THEN COALESCE(rp.status,'saved') END reading_status,"
-        "COALESCE(rp.up_next,0) up_next,rp.rating reading_rating,"
-        "rp.started_at,rp.finished_at,rp.updated_at reading_updated_at "
+        "q.isbn10 quality_isbn10 "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-        "LEFT JOIN reading_progress rp ON rp.candidate_id=c.id WHERE "
+        "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END,"
-        " CASE WHEN rp.status='saved' AND rp.up_next=1 THEN 0 "
-        "WHEN rp.status='reading' THEN 1 WHEN rp.status='saved' THEN 2 "
-        "WHEN rp.status='finished' THEN 3 ELSE 4 END, c.score DESC"
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
     )
     result = (
         [dict(item) for item in connection.execute(query, params).fetchall()]
@@ -1668,8 +1655,10 @@ def _recommendation_rows(
     )
     visible = []
     for item in result:
-        if item["status"] in {"saved", "imported"}:
+        if item["status"] == "saved":
             visible.append(item)
+            continue
+        if item["status"] == "imported":
             continue
         keys = book_row_identity_match_keys(item)
         if keys & read_keys or keys & shortlisted_keys:
@@ -1727,7 +1716,7 @@ def recommendation_list(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -1740,13 +1729,6 @@ def recommendations(
         item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
-
-
-def _ensure_reading_progress(con, candidate_id: int):
-    con.execute(
-        "INSERT OR IGNORE INTO reading_progress(candidate_id,status) VALUES(?,'saved')",
-        (candidate_id,),
-    )
 
 
 def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=None):
@@ -1802,106 +1784,6 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     return read, existing is not None
 
 
-def _reading_list_items(con):
-    return [
-        item
-        for item in recommendation_list(connection=con, status="all", limit=None)
-        if item["status"] in {"saved", "imported"}
-    ]
-
-
-@app.get("/api/reading-list")
-def get_reading_list():
-    with connect() as con:
-        return _reading_list_items(con)
-
-
-@app.put("/api/reading-list/{candidate_id}")
-def update_reading_progress(candidate_id: int, payload: ReadingProgressIn):
-    fields = payload.model_fields_set
-    if not fields:
-        raise HTTPException(400, "Choose a reading status or update Up next.")
-    if "rating" in fields and payload.status != "finished":
-        raise HTTPException(400, "A rating can only be saved when a book is Finished.")
-
-    with transaction() as con:
-        candidate = con.execute(
-            "SELECT c.id,c.title,c.author,c.status,c.source_url,"
-            "q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.id=?",
-            (candidate_id,),
-        ).fetchone()
-        if not candidate:
-            raise HTTPException(404, "Book not found")
-        if candidate["status"] not in {"saved", "imported"}:
-            raise HTTPException(409, "Shortlist this book before updating its reading status.")
-
-        _ensure_reading_progress(con, candidate_id)
-        progress = con.execute(
-            "SELECT * FROM reading_progress WHERE candidate_id=?", (candidate_id,)
-        ).fetchone()
-        current_status = progress["status"]
-        next_status = payload.status or current_status
-        if "up_next" in fields:
-            if current_status != "saved" or next_status != "saved":
-                raise HTTPException(409, "Up next is available for books in Saved.")
-            con.execute(
-                "UPDATE reading_progress SET up_next=?,updated_at=CURRENT_TIMESTAMP "
-                "WHERE candidate_id=?",
-                (int(bool(payload.up_next)), candidate_id),
-            )
-
-        if payload.status is not None:
-            if next_status == "saved":
-                con.execute(
-                    "UPDATE reading_progress SET status='saved',up_next=0,rating=NULL,"
-                    "started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP "
-                    "WHERE candidate_id=?",
-                    (candidate_id,),
-                )
-            elif next_status == "reading":
-                con.execute(
-                    "UPDATE reading_progress SET status='reading',up_next=0,rating=NULL,"
-                    "started_at=COALESCE(started_at,CURRENT_TIMESTAMP),finished_at=NULL,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-                    (candidate_id,),
-                )
-            else:
-                if current_status == "finished" and "rating" not in fields:
-                    read_rating = progress["rating"]
-                else:
-                    read, _already_present = _mark_candidate_read_in_connection(
-                        con,
-                        candidate,
-                        rating=payload.rating,
-                    )
-                    read_rating = read["rating"]
-                con.execute(
-                    "UPDATE reading_progress SET status='finished',up_next=0,rating=?,"
-                    "finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP),"
-                    "updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-                    (read_rating, candidate_id),
-                )
-        updated = con.execute(
-            "SELECT status,up_next,rating,started_at,finished_at,updated_at "
-            "FROM reading_progress WHERE candidate_id=?",
-            (candidate_id,),
-        ).fetchone()
-
-    if payload.status == "finished":
-        enqueue_job("score", dedupe=True)
-    return {
-        "id": candidate_id,
-        "status": updated["status"],
-        "up_next": bool(updated["up_next"]),
-        "rating": updated["rating"],
-        "started_at": updated["started_at"],
-        "finished_at": updated["finished_at"],
-        "updated_at": updated["updated_at"],
-    }
-
 @app.post("/api/recommendations/{candidate_id}/feedback")
 def feedback(candidate_id: int, payload: FeedbackIn):
     status = {
@@ -1918,10 +1800,6 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             raise HTTPException(404, "Recommendation not found")
         previous_status = str(candidate["status"])
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
-        if payload.action == "save":
-            _ensure_reading_progress(con, candidate_id)
-        elif payload.action == "restore":
-            con.execute("DELETE FROM reading_progress WHERE candidate_id=?", (candidate_id,))
         feedback_id = con.execute(
             "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
             (candidate_id, payload.action, previous_status),
@@ -1985,14 +1863,6 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
         if current["status"] != expected_status:
             raise HTTPException(409, "The recommendation changed after this decision")
         previous_status = str(decision["previous_status"])
-        if decision["action"] == "save":
-            if previous_status in {"saved", "imported"}:
-                _ensure_reading_progress(con, candidate_id)
-            else:
-                con.execute(
-                    "DELETE FROM reading_progress WHERE candidate_id=?",
-                    (candidate_id,),
-                )
         con.execute(
             "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (previous_status, candidate_id),
@@ -2044,6 +1914,10 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
             rating=payload.rating,
             session_id=payload.session_id,
         )
+        con.execute(
+            "UPDATE candidates SET status='read',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (candidate_id,),
+        )
 
     job_id = enqueue_job("score", dedupe=True)
     return {
@@ -2068,10 +1942,6 @@ def bulk_feedback(payload: BulkFeedbackIn):
         }
         for candidate_id in found:
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
-            if payload.action == "save":
-                _ensure_reading_progress(con, candidate_id)
-            elif payload.action == "restore":
-                con.execute("DELETE FROM reading_progress WHERE candidate_id=?", (candidate_id,))
             feedback_id = con.execute(
                 "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
                 (candidate_id, payload.action),
@@ -2143,7 +2013,6 @@ async def import_librarr(candidate_id: int):
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
             con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
-            _ensure_reading_progress(con, candidate_id)
         return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
     except (httpx.HTTPError, ValueError) as exc:
         message = safe_error_message(exc, limit=1000)
@@ -2222,13 +2091,19 @@ async def download_librarr(payload: LibrarrDownloadIn):
         response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
         if candidate:
             status = candidate["status"]
-            if status not in {"saved", "imported"}:
+            if status == "saved":
+                with transaction() as con:
+                    con.execute(
+                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (candidate["id"],),
+                    )
+                status = "imported"
+            elif status != "imported":
                 with transaction() as con:
                     con.execute(
                         "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (candidate["id"],),
                     )
-                    _ensure_reading_progress(con, int(candidate["id"]))
                     feedback_id = con.execute(
                         "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
                         (candidate["id"], "save"),
@@ -2844,8 +2719,6 @@ def api_root():
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
-            "reading_list": "GET /api/v1/reading-list",
-            "reading_progress": "PUT /api/v1/reading-list/{id}",
             "sources": "GET /api/v1/sources",
             "sync": "POST /api/v1/sync",
         },
@@ -2876,7 +2749,7 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -2885,16 +2758,6 @@ def api_recommendations(
         item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
-
-
-@api_v1.get("/reading-list")
-def api_reading_list():
-    return get_reading_list()
-
-
-@api_v1.put("/reading-list/{candidate_id}")
-def api_update_reading_progress(candidate_id: int, payload: ReadingProgressIn):
-    return update_reading_progress(candidate_id, payload)
 
 
 @api_v1.post("/recommendations/bulk-feedback")

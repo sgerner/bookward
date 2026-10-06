@@ -57,8 +57,7 @@ POOL_FIELDS = (
     "status", "source_id", "source_name", "source_weight", "catalog_confidence",
     "quality_score", "quality_status", "quality_work_id", "quality_provider",
     "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
-    "date_kind", "reading_status", "up_next", "reading_rating", "started_at",
-    "finished_at", "propensity", "first_publication_year", "publication_work_id", "publication_era",
+    "date_kind", "propensity", "first_publication_year", "publication_work_id", "publication_era",
 )
 PROFILE_FIELDS = (
     "id", "candidate_id", "event_type", "value", "occurred_at", "title",

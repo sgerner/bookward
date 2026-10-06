@@ -13,12 +13,6 @@ export type Recommendation = {
   explanation: string[];
   status: string;
   source_name: string | null;
-  reading_status?: "saved" | "reading" | "finished" | null;
-  up_next?: number | boolean;
-  reading_rating?: number | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-  reading_updated_at?: string | null;
 };
 
 const publicUrl = (value: string) => {
@@ -41,6 +35,5 @@ export function toPageBook(book: Recommendation) {
     synopsis: book.description,
     reason: book.explanation.join(" · "),
     source_type: "engine" as const,
-    librar_id: book.status === "imported" ? "imported" : null,
   };
 }

@@ -162,7 +162,7 @@ def test_recommendation_and_digest_hide_unrated_reads_but_keep_saved(database):
     assert [(item["title"], item["status"]) for item in visible] == [("New Book", "recommended")]
     visible_all = recommendation_list()
     assert {(item["title"], item["status"]) for item in visible_all if item["title"] == "Already Read"} == {
-        ("Already Read", "saved"), ("Already Read", "imported")
+        ("Already Read", "saved")
     }
     digest = _candidate_rows({"minimum_score": 0, "maximum_books": 1, "only_new": False})
     assert "Already Read" not in {item["title"] for item in digest}
@@ -271,7 +271,7 @@ def test_recommendations_hide_recommended_duplicate_of_imported_work(database):
     visible = recommendation_list(limit=None)
 
     assert recommended_id not in {item["id"] for item in visible}
-    assert imported_id in {item["id"] for item in visible}
+    assert imported_id not in {item["id"] for item in visible}
 
 
 def test_discovery_never_returns_the_three_read_book_identity_variants(database):

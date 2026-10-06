@@ -1,47 +1,18 @@
-# Shortlist and reading workflow
+# Shortlist and read history
 
-Books on the shortlist can move through three reading states:
+Bookward is for book discovery. A recommendation can be shortlisted, passed on, or set aside for later. The shortlist has no reading-progress shelves or status filters.
 
-| State | Meaning | Available actions |
-| --- | --- | --- |
-| Saved | A book you want to keep in mind | Mark it Up next, start reading, or mark it Finished |
-| Reading | A book you have started | Move it back to Saved or mark it Finished |
-| Finished | A book you have completed | Move it back to Reading |
+Use **Mark Read** on a shortlisted book to add it to the account's read history, with an optional one-to-five-star rating. It leaves the shortlist and appears under **Read** in history. A successful Librarr handoff also removes the book from the shortlist.
 
-Up next is a pin for books in Saved. Starting a book clears its pin. Finishing a book records it in reading history and accepts an optional rating from one to five stars. Returning a book to Saved clears its current progress and rating; the read-history entry remains available as a record of the earlier completion.
+The v22 SQLite migration removes the obsolete `reading_progress` table and its Up next, Reading, and Finished records. Read history is stored separately in `reads` and remains intact.
 
-These fields are stored in SQLite in `reading_progress`, keyed to the recommendation candidate. The v16 migration creates the table and places existing saved and Librarr-imported candidates in Saved. Older recommendation clients can continue reading the existing `status` field; reading fields are additive.
+## Shortlist API
 
-## API
-
-Use a Bookward API token from Settings → API access and send it as a bearer token. The API base URL is `/api/v1`.
-
-List the shortlist:
+List shortlisted recommendations with a bearer token from Settings → API access:
 
 ```bash
-curl https://your-bookward-host.example/api/v1/reading-list \
+curl 'https://your-bookward-host.example/api/v1/recommendations?status=saved' \
   -H 'Authorization: Bearer bkw_…'
 ```
 
-The response includes each book's `reading_status`, `up_next`, `reading_rating`, `started_at`, and `finished_at`. The same fields are included on recommendation records when applicable.
-
-Pin a saved book, start reading it, or finish it with an optional rating:
-
-```bash
-curl -X PUT https://your-bookward-host.example/api/v1/reading-list/42 \
-  -H 'Authorization: Bearer bkw_…' \
-  -H 'Content-Type: application/json' \
-  -d '{"up_next":true}'
-
-curl -X PUT https://your-bookward-host.example/api/v1/reading-list/42 \
-  -H 'Authorization: Bearer bkw_…' \
-  -H 'Content-Type: application/json' \
-  -d '{"status":"reading"}'
-
-curl -X PUT https://your-bookward-host.example/api/v1/reading-list/42 \
-  -H 'Authorization: Bearer bkw_…' \
-  -H 'Content-Type: application/json' \
-  -d '{"status":"finished","rating":5}'
-```
-
-`up_next` can only be changed while a book is Saved. Reading-status updates apply to saved or Librarr-imported books. Ratings are integers from one to five and can be included when setting Finished.
+Use `POST /api/v1/recommendations/{id}/feedback` with `{"action":"save"}` to shortlist a recommendation. The separate reading-list and reading-progress endpoints have been removed.

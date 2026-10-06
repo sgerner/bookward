@@ -101,10 +101,6 @@ def _fixture_connection(snapshot: Mapping[str, Any]) -> sqlite3.Connection:
             rating REAL, read_at TEXT, isbn TEXT, source TEXT NOT NULL DEFAULT '',
             created_at TEXT, openlibrary_work_id TEXT
         );
-        CREATE TABLE reading_progress (
-            candidate_id INTEGER PRIMARY KEY, status TEXT, up_next INTEGER DEFAULT 0,
-            rating REAL, started_at TEXT, finished_at TEXT, updated_at TEXT
-        );
         CREATE TABLE feedback (
             id INTEGER PRIMARY KEY, candidate_id INTEGER NOT NULL, action TEXT NOT NULL,
             created_at TEXT, previous_status TEXT, undone_at TEXT
@@ -183,19 +179,6 @@ def _fixture_connection(snapshot: Mapping[str, Any]) -> sqlite3.Connection:
                 item.get("openlibrary_work_id"),
             )
             for item in snapshot.get("reads", [])
-        ],
-    )
-    con.executemany(
-        """INSERT INTO reading_progress(
-            candidate_id,status,up_next,rating,started_at,finished_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?)""",
-        [
-            (
-                int(item["candidate_id"]), item.get("status"), int(item.get("up_next") or 0),
-                item.get("rating"), item.get("started_at"), item.get("finished_at"),
-                item.get("updated_at"),
-            )
-            for item in snapshot.get("reading_progress", [])
         ],
     )
     con.executemany(
@@ -1068,7 +1051,7 @@ def _run_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 key: len(snapshot.get(key, []))
                 for key in (
                     "reads", "candidates", "sources", "candidate_quality",
-                    "reading_progress", "feedback", "recommendation_events",
+                    "feedback", "recommendation_events",
                     "recommendation_runs", "recommendation_impressions",
                     "recommendation_outcomes", "embeddings",
                 )
