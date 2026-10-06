@@ -166,6 +166,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     recommendation_run_id: overview.recommendation_run_id ?? "",
     books: overview.recommendations.map((book) => ({
       ...book,
+      recommendation_run_id: overview.recommendation_run_id ?? "",
       cover_url: publicUrl(book.cover_url),
       source_url: publicUrl(book.source_url),
       published_on: book.release_date,
@@ -182,6 +183,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     })),
     decisions: (overview.decisions ?? []).map((book) => ({
       ...book,
+      recommendation_run_id: "",
       cover_url: publicUrl(book.cover_url),
       source_url: publicUrl(book.source_url),
       published_on: book.release_date,

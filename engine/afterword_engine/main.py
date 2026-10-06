@@ -1736,6 +1736,8 @@ def recommendations(
         limit=limit,
         offset=offset,
     )
+    for item in values:
+        item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
@@ -2879,6 +2881,8 @@ def api_recommendations(
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
     values, run_id = tracked_recommendations(status=status, limit=limit, offset=offset)
+    for item in values:
+        item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
