@@ -96,6 +96,8 @@
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const FORM_NOTIFICATION_DISMISS_MS = 5000;
+  const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
+  const FORM_NOTIFICATION_UNDO_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 3500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
@@ -421,15 +423,17 @@
     const currentForm = form as FormState;
     const message = currentForm?.message;
     formNotificationDismissed = false;
-    if (!message || currentForm?.undo_id) return;
+    if (!message) return;
 
     const dismissTimer = setTimeout(
       () => {
         formNotificationDismissed = true;
       },
       currentForm?.error
-        ? FORM_NOTIFICATION_DISMISS_MS + 1500
-        : FORM_NOTIFICATION_DISMISS_MS,
+        ? FORM_NOTIFICATION_ERROR_DISMISS_MS
+        : currentForm?.undo_id
+          ? FORM_NOTIFICATION_UNDO_DISMISS_MS
+          : FORM_NOTIFICATION_DISMISS_MS,
     );
     return () => clearTimeout(dismissTimer);
   });
@@ -554,7 +558,14 @@
       optimisticNotification = null;
       formNotificationDismissed = true;
       optimisticNotificationTimer = null;
-    }, FORM_NOTIFICATION_DISMISS_MS + 1500);
+    }, FORM_NOTIFICATION_ERROR_DISMISS_MS);
+  }
+
+  function dismissNotification() {
+    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+    optimisticNotificationTimer = null;
+    optimisticNotification = null;
+    formNotificationDismissed = true;
   }
 
   function actionResultMessage(result: {
@@ -1518,37 +1529,74 @@
     class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
     <div id="main-content" role="main" class="min-w-0 flex-1">
-      {#if visibleNotification}{#key visibleNotification.message}<div
-            in:fly={{ y: -12, duration: motionDuration(240) }}
-            out:fade={{ duration: motionDuration(140) }}
-            class={`mb-6 flex items-start gap-3 border p-4 text-sm ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
-            role={formIsError ? "alert" : "status"}
+      {#if visibleNotification}
+        {#key visibleNotification.id ?? visibleNotification.message}
+          <div
+            class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
           >
-            {#if formIsError}<CircleHelp
-                size={18}
-                class="mt-0.5 shrink-0"
-              />{:else}<Check size={18} class="mt-0.5 shrink-0" />{/if}<span
-              >{visibleNotification.message}</span
-            >{#if visibleNotification.undo_id && visibleNotification.id}<form
-                method="POST"
-                action="?/undoDecision"
-                use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
-              >
-              <ProfileField profileId={data.user?.profile_id} />
-                <input type="hidden" name="id" value={visibleNotification.id} />
-                <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
-                <button
-                  type="submit"
-                  class="btn btn-sm min-h-9 preset-tonal-surface"
-                  disabled={isPending(`undo-${visibleNotification.undo_id}`)}
-                  aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
-                  aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
+            <div
+              in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+              out:fly={{ x: 16, duration: motionDuration(170) }}
+              class={`pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
+              role={formIsError ? "alert" : "status"}
+              aria-atomic="true"
+            >
+              <span
+                aria-hidden="true"
+                class={`absolute inset-y-0 left-0 w-1 ${formIsError ? "bg-error-500" : "bg-success-500"}`}
+              ></span>
+              <div class="flex items-start gap-3 pl-1">
+                <span
+                  class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
+                  aria-hidden="true"
                 >
-                  {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
-                  Undo
+                  {#if formIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
+                </span>
+                <div class="min-w-0 flex-1">
+                  <p
+                    class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${formIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                  >
+                    {formIsError ? "Action needs attention" : "All set"}
+                  </p>
+                  <p class="leading-relaxed text-surface-900-100">
+                    {visibleNotification.message}
+                  </p>
+                  {#if visibleNotification.undo_id && visibleNotification.id}
+                    <form
+                      method="POST"
+                      action="?/undoDecision"
+                      class="mt-3"
+                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={visibleNotification.id} />
+                      <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                      <button
+                        type="submit"
+                        class="btn btn-sm min-h-9 preset-tonal-primary"
+                        disabled={isPending(`undo-${visibleNotification.undo_id}`)}
+                        aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                        aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
+                      >
+                        {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        Undo
+                      </button>
+                    </form>
+                  {/if}
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                  aria-label="Dismiss notification"
+                  onclick={dismissNotification}
+                >
+                  <X size={15} />
                 </button>
-              </form>{/if}
-            </div>{/key}{/if}
+              </div>
+            </div>
+          </div>
+        {/key}
+      {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
 
