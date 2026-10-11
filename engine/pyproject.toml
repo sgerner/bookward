@@ -4,11 +4,11 @@ version = "0.1.0"
 description = "Independent ingestion and recommendation engine for Bookward"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi==0.142.2",
+  "fastapi==0.142.4",
   "uvicorn[standard]==0.54.0",
   "httpx==0.28.1",
   "feedparser==6.0.14",
-  "fastembed==0.8.1",
+  "fastembed==0.9.0",
   "beautifulsoup4==4.15.0",
   "cryptography==50.0.2",
   "numpy==2.5.3",
