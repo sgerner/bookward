@@ -2,7 +2,7 @@
 	import { enhance } from '$app/forms';
 	import type { ActionData, PageData } from './$types';
 	import { ArrowRight, BookOpen, Check, KeyRound, Sparkles } from '@lucide/svelte';
-	import bookwardMark from '$lib/assets/bookward-mark.svg';
+	import bookwardMark from '#lib/assets/bookward-mark.svg';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 </script>

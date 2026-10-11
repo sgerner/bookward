@@ -1,7 +1,7 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
-import { safeNext } from '$lib/server/safe-next';
+import { EngineError, engine } from '#lib/server/engine.js';
+import { safeNext } from '#lib/server/safe-next.js';
 
 function loginErrorLocation(next: string) {
 	const query = new URLSearchParams({ error: 'sso' });
@@ -45,5 +45,5 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	} else {
 		cookies.delete('oidc_next', { path: '/auth/oidc' });
 	}
-	throw redirect(302, destination.toString());
+	throw redirect(302, destination.toString(), { external: true });
 };

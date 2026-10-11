@@ -1,8 +1,8 @@
+const env = process.env;
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
-import { safeNext } from '$lib/server/safe-next';
-import { env } from '$env/dynamic/private';
+import { EngineError, engine } from '#lib/server/engine.js';
+import { safeNext } from '#lib/server/safe-next.js';
 
 type AuthConfig = { setup_required: boolean; local_login_enabled: boolean; oidc_enabled: boolean };
 type SessionResult = { session_token: string; max_age: number };

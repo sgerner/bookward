@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { applyAction, deserialize, enhance } from "$app/forms";
-  import type { SubmitFunction } from "@sveltejs/kit";
+  import { applyAction, deserialize, enhance, type SubmitFunction } from "$app/forms";
   import { invalidateAll, pushState } from "$app/navigation";
   import { page } from "$app/state";
   import { onMount } from "svelte";
@@ -39,13 +38,13 @@
     Upload,
     X,
   } from "@lucide/svelte";
-  import ThemePicker from "$lib/components/ThemePicker.svelte";
-  import ProfileField from "$lib/components/ProfileField.svelte";
-  import { copyApiTokenText } from "$lib/api-token-clipboard";
-  import { tokenForView } from "$lib/api-token-ui";
-  import { createTelemetryClient } from "$lib/telemetry";
-  import { readLibrarrSearchStream } from "$lib/librarr-stream";
-  import bookwardMark from "$lib/assets/bookward-mark.svg";
+  import ThemePicker from "#lib/components/ThemePicker.svelte";
+  import ProfileField from "#lib/components/ProfileField.svelte";
+  import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import { tokenForView } from "#lib/api-token-ui.js";
+  import { createTelemetryClient } from "#lib/telemetry.js";
+  import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
+  import bookwardMark from "#lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "decisions" | "sources" | "settings";
   type NavItem = {

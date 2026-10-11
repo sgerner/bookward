@@ -53,7 +53,8 @@ def main():
                    AFTERWORD_SECRET_KEY="", AFTERWORD_OIDC_ISSUER="", AFTERWORD_OIDC_CLIENT_ID="",
                    AFTERWORD_PUBLIC_URL=origin, ENGINE_SERVICE_SECRET="isolated-smoke-service",
                    ENGINE_URL=f"http://127.0.0.1:{engine_port}", ORIGIN=origin,
-                   HOST="127.0.0.1", PORT=str(web_port), OIDC_AUTO_LOGIN="false")
+                   HOST="127.0.0.1", PORT=str(web_port), OIDC_AUTO_LOGIN="false",
+                   PROTOCOL_HEADER="x-forwarded-proto")
         processes = []
         with tempfile.TemporaryFile(mode="w+") as logs:
             try:
@@ -63,7 +64,7 @@ def main():
                     "--port", str(engine_port),
                 ], cwd=root, env=env, stdout=logs, stderr=logs))
                 processes.append(subprocess.Popen(["node", "build"], cwd=root, env=env, stdout=logs, stderr=logs))
-                with httpx.Client(base_url=origin, timeout=15, headers={"accept": "text/html"}) as client:
+                with httpx.Client(base_url=origin, timeout=15, headers={"accept": "text/html", "x-forwarded-proto": "http"}) as client:
                     for _ in range(100):
                         if any(process.poll() is not None for process in processes):
                             raise RuntimeError("A smoke-test service exited before startup")

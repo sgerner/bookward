@@ -1,6 +1,6 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
+import { EngineError, engine } from '#lib/server/engine.js';
 
 type Account = { id: string; profile_id: string; username: string; display_name: string; role: 'admin' | 'user'; status: 'active' | 'disabled' };
 const failure = (error: unknown) => fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Account operation failed.', error: true as const });

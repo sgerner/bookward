@@ -1,7 +1,7 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { EngineError, engine } from "$lib/server/engine";
-import { toPageBook, type Recommendation } from "$lib/server/recommendations";
+import { EngineError, engine } from "#lib/server/engine.js";
+import { toPageBook, type Recommendation } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
 const querySchema = z.object({

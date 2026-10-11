@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authorized, handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
-import { currentSessionToken } from '$lib/server/request-context';
+import { currentSessionToken } from '#lib/server/request-context.js';
 
 afterEach(() => vi.unstubAllGlobals());
 

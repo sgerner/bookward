@@ -1,6 +1,6 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { engine } from "$lib/server/engine";
+import { engine } from "#lib/server/engine.js";
 
 const MAX_EVENTS = 100;
 

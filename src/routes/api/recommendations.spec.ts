@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { engineMock } = vi.hoisted(() => ({ engineMock: vi.fn() }));
 
-vi.mock("$lib/server/engine", () => ({
+vi.mock("#lib/server/engine.js", () => ({
   engine: engineMock,
   EngineError: class EngineError extends Error {
     status = 502;
