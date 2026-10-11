@@ -1,6 +1,6 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
+import { EngineError, engine } from '#lib/server/engine.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
 type AuthMethods = { password_enabled: boolean; oidc_identities: IdentityInfo[] };

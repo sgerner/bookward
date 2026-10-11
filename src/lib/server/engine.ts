@@ -1,5 +1,5 @@
-import { env } from '$env/dynamic/private';
-import { currentSessionToken } from '$lib/server/request-context';
+const env = process.env;
+import { currentSessionToken } from '#lib/server/request-context.js';
 
 const base = (env.ENGINE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 function internalHeaders(headers?: HeadersInit, accept = 'application/json') {

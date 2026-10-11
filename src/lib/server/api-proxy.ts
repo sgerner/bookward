@@ -1,4 +1,4 @@
-import { env } from "$env/dynamic/private";
+const env = process.env;
 import type { RequestEvent } from "@sveltejs/kit";
 
 const engineBase = (env.ENGINE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");

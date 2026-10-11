@@ -1,7 +1,7 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
-import { safeNext } from '$lib/server/safe-next';
+import { EngineError, engine } from '#lib/server/engine.js';
+import { safeNext } from '#lib/server/safe-next.js';
 
 type CallbackResult = { linked?: boolean; session_token?: string; max_age?: number };
 

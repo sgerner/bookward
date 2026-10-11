@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const { engineStreamMock } = vi.hoisted(() => ({ engineStreamMock: vi.fn() }));
 
-vi.mock('$lib/server/engine', () => ({
+vi.mock('#lib/server/engine.js', () => ({
   engineStream: engineStreamMock,
   EngineError: class EngineError extends Error {
     constructor(message: string, readonly status: number) {

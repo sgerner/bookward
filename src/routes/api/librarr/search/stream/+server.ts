@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { EngineError, engineStream } from '$lib/server/engine';
+import { EngineError, engineStream } from '#lib/server/engine.js';
 
 const engineStatus = (error: unknown) => {
   if (!(error instanceof EngineError)) return 502;

@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { EngineError, engine } from '$lib/server/engine';
+import { EngineError, engine } from '#lib/server/engine.js';
 
 const engineStatus = (error: unknown) => error instanceof EngineError && error.status < 500 ? error.status : 502;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Librarr search failed.';

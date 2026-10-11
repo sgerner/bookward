@@ -2,8 +2,8 @@
 	import './layout.css';
 	import { onMount } from 'svelte';
 	import type { LayoutProps } from './$types';
-	import favicon from '$lib/assets/favicon.svg';
-	import { initAppearance } from '$lib/theme';
+	import favicon from '#lib/assets/favicon.svg';
+	import { initAppearance } from '#lib/theme.js';
 
 	let { children, data }: LayoutProps = $props();
 	let profileChannel: BroadcastChannel | null = null;

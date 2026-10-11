@@ -2,7 +2,7 @@
   import { page } from '$app/state';
   import { fly, scale } from 'svelte/transition';
   import { ArrowRight } from '@lucide/svelte';
-  import bookwardMark from '$lib/assets/bookward-mark.svg';
+  import bookwardMark from '#lib/assets/bookward-mark.svg';
 
   function motionDuration(duration: number) {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return duration;

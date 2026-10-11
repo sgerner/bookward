@@ -1,12 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { env, engine } = vi.hoisted(() => ({
-	env: { OIDC_AUTO_LOGIN: 'false' as string },
+const { engine } = vi.hoisted(() => ({
 	engine: vi.fn(),
 }));
 
-vi.mock('$env/dynamic/private', () => ({ env }));
-vi.mock('$lib/server/engine', () => ({
+vi.mock('#lib/server/engine.js', () => ({
 	EngineError: class EngineError extends Error {
 		status = 500;
 	},
@@ -19,12 +17,12 @@ const oidcConfig = { setup_required: false, local_login_enabled: true, oidc_enab
 
 describe('login page loader', () => {
 	beforeEach(() => {
-		env.OIDC_AUTO_LOGIN = 'false';
-		engine.mockReset();
-	});
+		vi.stubEnv('OIDC_AUTO_LOGIN', 'false');
+		engine.mockReset();	});
+	afterEach(() => vi.unstubAllEnvs());
 
 	it('starts configured SSO automatically and keeps the requested page', async () => {
-		env.OIDC_AUTO_LOGIN = 'true';
+		vi.stubEnv('OIDC_AUTO_LOGIN', 'true');
 		engine.mockResolvedValue(oidcConfig);
 
 		await expect(load({ url: new URL('https://bookward.test/login?next=%2Faccount') } as never))
@@ -32,7 +30,7 @@ describe('login page loader', () => {
 	});
 
 	it('does not auto-start SSO during setup, after an SSO failure, or on the explicit local-login route', async () => {
-		env.OIDC_AUTO_LOGIN = 'true';
+		vi.stubEnv('OIDC_AUTO_LOGIN', 'true');
 		engine.mockResolvedValue(oidcConfig);
 		const manual = await load({ url: new URL('https://bookward.test/login?manual=1') } as never);
 		expect(manual).toMatchObject({ auto_sso: true, manual_login: true, oidc_enabled: true });
@@ -46,7 +44,7 @@ describe('login page loader', () => {
 	});
 
 	it('keeps the local form when no OIDC provider is configured', async () => {
-		env.OIDC_AUTO_LOGIN = 'true';
+		vi.stubEnv('OIDC_AUTO_LOGIN', 'true');
 		engine.mockResolvedValue({ ...oidcConfig, oidc_enabled: false });
 
 		const result = await load({ url: new URL('https://bookward.test/login') } as never);
@@ -54,7 +52,7 @@ describe('login page loader', () => {
 	});
 
 	it('ignores an unsafe next URL before starting SSO', async () => {
-		env.OIDC_AUTO_LOGIN = 'true';
+		vi.stubEnv('OIDC_AUTO_LOGIN', 'true');
 		engine.mockResolvedValue(oidcConfig);
 
 		await expect(load({ url: new URL('https://bookward.test/login?next=%2F%2Fevil.example') } as never))

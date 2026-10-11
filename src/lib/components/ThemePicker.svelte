@@ -13,7 +13,7 @@
 		persistPreferences,
 		type SkeletonThemeName,
 		type ThemeMode,
-	} from '$lib/theme';
+	} from '#lib/theme.js';
 
 	let { compact = false }: { compact?: boolean } = $props();
 

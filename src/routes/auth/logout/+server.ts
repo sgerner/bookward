@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { engine } from '$lib/server/engine';
+import { engine } from '#lib/server/engine.js';
 
 export const POST: RequestHandler = async ({ cookies }) => {
 	try {

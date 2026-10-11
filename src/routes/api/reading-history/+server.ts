@@ -1,6 +1,6 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { EngineError, engine } from "$lib/server/engine";
+import { EngineError, engine } from "#lib/server/engine.js";
 
 type ReadingHistoryItem = {
   id: number;

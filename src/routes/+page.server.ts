@@ -1,6 +1,6 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
-import { engine, EngineError } from "$lib/server/engine";
+import { engine, EngineError } from "#lib/server/engine.js";
 import { z } from "zod";
 
 type SourceFilters = {

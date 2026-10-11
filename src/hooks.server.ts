@@ -1,8 +1,8 @@
-import type { Handle } from '@sveltejs/kit';
+import type { Handle } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
 import { timingSafeEqual } from 'node:crypto';
-import { EngineError, engine } from '$lib/server/engine';
-import { withSessionToken } from '$lib/server/request-context';
+import { EngineError, engine } from '#lib/server/engine.js';
+import { withSessionToken } from '#lib/server/request-context.js';
 
 const SESSION_COOKIE = 'bookward_session';
 
