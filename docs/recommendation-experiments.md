@@ -1,6 +1,6 @@
 # Recommendation experiments and findings
 
-Last reviewed: October 4, 2026. Current implementation baseline: main `184c269` (PRs #146 and #147). This is the central record of completed recommendation experiments, corrections, and historical proposals. Operational guides remain separate. Private captures, individual books, ratings, vectors, and judgments remain outside Git; aggregate JSON reports and executable evaluators remain available where already tracked.
+Last reviewed: October 13, 2026. The production corpus and scorer baseline used for the October 12–13 SubQ replays is commit `d296d4d`; its ranking modules match the captured production runtime. PRs #146 and #147 were included in that capture. This is the central record of completed recommendation experiments, corrections, and historical proposals. Operational guides remain separate. Private captures, individual books, ratings, vectors, and judgments remain outside Git; aggregate JSON reports and executable evaluators remain available where already tracked.
 
 ## Current decisions
 
@@ -16,12 +16,13 @@ Last reviewed: October 4, 2026. Current implementation baseline: main `184c269` 
 | Identity, history and replay integrity | Shipped ISBN preservation, verified metadata work-ID exclusions, full-library association exclusions, conservative known/unknown-author identity handling, import-date safeguards, interaction-vector handoff and immutable scoring/serving evidence. Eight confirmed missing original works were repaired as unrated historical entries; no invented dates or ratings. |
 | October 4 retrieval and power-6 tests | Closed without adoption. No held-out favorite retrieval gain; top-eight enjoyment unknown. Power 6 failed to establish improvement, including twenty independent Goodbooks readers. Keep power 8 and existing retrieval. |
 | Embedding cache | PR #146 shipped validated float32 shape/finite/dimension checks and atomic rebuild safeguards. No production corruption observed; all 358 captured scores reproduced exactly and 2,352 valid cache vectors reused without inference. PR #147 fixed only the offline bare Open Library ID parser. |
+| SubQ Snap narrow decisions (October 12) | Closed without adoption. Tested source quality, grounded experience facets, yes/no entailment verification, and image-visible title checks against a fresh production capture. Tiny retrospective AUC changes did not improve top-eight counts; corrected grounding intervals include zero. The October 13 neighbor-evidence follow-up also closed without adoption: active discounts did not establish lift beyond placebo controls. No runtime feature flag or external model dependency added. |
 
 ## How to read the record
 
 The dated sections below preserve original methods, results, limitations, hashes and reproduction notes. Their past-tense deployment statuses and phrases such as “current”, “open”, “pending” or “experimental” describe that capture date, not today's shipping decision. The table above and later explicitly corrected results take precedence. Reused historical labels are development/regression evidence, not untouched confirmation. A missing judgment is unknown; interest, completion and enjoyment are different endpoints. The independent-reader benchmark uses source order without timestamps and has substantial popular-book/prolific-reader bias.
 
-The September 22 roadmap and October 2 plan are archived proposals, not tests already executed or authorization to deploy. Some October 3 evaluators were retained only in private study archives: reproduction commands in those sections refer to the archived checkout, not files promised in current main. No new experiment or model tuning was performed for this documentation consolidation.
+The September 22 roadmap and October 2 plan are archived proposals, not tests already executed or authorization to deploy. Some October 3 evaluators were retained only in private study archives: reproduction commands in those sections refer to the archived checkout, not files promised in current main. The October 4 documentation consolidation itself ran no new model experiments; the October 12 SubQ follow-up below is a separate, completed test.
 
 ### Delivered follow-up to the already-read audit
 
@@ -29,6 +30,8 @@ The original audit below predates delivery. PR #136 preserved valid ISBNs; #141 
 
 ## Study index
 
+- [SubQ Snap narrow-decision integration: October 12, 2026](#subq-snap-2026-10-12)
+- [SubQ neighbor-evidence follow-up: October 13, 2026](#subq-neighbors-2026-10-13)
 - [Recommendation quality study](#recommendation-quality)
 - [Already-read eligibility audit and repair](#already-read-exclusion-audit-2026-10-03)
 - [Association source identity correction](#association-source-identity)
@@ -4709,3 +4712,137 @@ Original source content was retained with scoped heading anchors and updated lin
 | `recommendation-production-study.md` | `ad1cb1730064372c70a32cc8decac51bcb2162804c0cdd4ae33fd07f0db41875` |
 | `recommendation-recency-study.md` | `c5bcc107c14c10fb8a3f387ff1954d9020f4d498e72e0d14397db55c2467e768` |
 | `recommendation-research-roadmap.md` | `93d8a6788cb5a16c86f0cdce8a6b591606e6513644cea85d1ed08dc41d620561` |
+
+
+<a id="subq-snap-2026-10-12"></a>
+
+## SubQ Snap narrow-decision integration: October 12, 2026
+
+**Decision: closed without adoption.** Keep the current recommendation engine. This test used real production data and real `subq-snap-preview` requests, rather than a model-generated “recommend this book” score. Neither the source-quality gate nor the experience residual establishes useful recommendation improvement. No serving flag, ranking weight, API credential, or external-model dependency was added to production. The study tools and credentials are private and outside Git. This entry is an uncommitted documentation update until explicitly reviewed and authorized for Git publication.
+
+### Capture and model inputs
+
+The new read-only Skynet snapshot has 1,817 reads, 1,800 rated reads, 2,006 candidates and 350 currently score-eligible candidates. All 1,800 rated-read vectors and all 350 eligible candidate vectors are fresh, finite, 2,560-dimensional Ollama `qwen3-embedding:4b` vectors. All 33 runtime module hashes and the ten strict audit module hashes match the local checkout. Nine complete materialized-score batches replay exactly across 3,302 outputs, including score, explanation and confidence. One of 61 current candidate score pointers references an incomplete batch: batch parity does not mean every current served card has complete lineage.
+
+Input selection was outcome-blind. Strict field-provenance and value-hash checks admitted 682 read synopses and 62 eligible-candidate descriptions. Ratings, read dates, reviews from personal notes, profile identifiers, titles and authors were excluded from the source-classification API payloads; only verbatim description chunks were sent. Opaque IDs remained local. Model classifications never override verified book identity. Missing or unverified descriptions remain unknown.
+
+Each source request asked nine narrow choices: description kind; pace, tone, narrative complexity and reading mode; and one supporting source chunk for each facet. Reading mode distinguishes narrative/story, explanatory ideas and practical guidance. The reading-mode addition was frozen before production classifications or outcome metrics. Source text is not an instruction. The request/response schema validates finite probabilities, answer keys, model identity and exact evidence substrings. Probabilities are model outputs, not demonstrated calibration for these tasks.
+
+### Fixed ranking comparisons and methodology corrections
+
+Historical preparation yields 1,786 distinct dated rated reads and 1,686 scored targets after 100 warmup reads. Whole-day 60/20/20 boundaries are 1,071 / 357 / 358 records, giving 971 development targets, 357 validation targets and 358 later targets. Every target hides its own work and all same-UTC-day ratings. The full 1,686 unchanged-score fingerprint is identical across the no-feature, choice-evidence and entailment-verifier replays.
+
+The facet residual compares a similarity-weighted mean of earlier ratings with the earlier-history mean. Compatibility is the mean class-probability dot product across supported shared facets. The initial protocol draft used a minimum-history label; the implemented correction contract, fixed before feature outcome calculations, defines a ramp instead. The fixed scale is two score points per star; ESS shrinkage uses prior 20, the history ramp reaches full strength at 20 compatible reads, and the correction is capped at ±2 points. This is a ramp, not a hard requirement for 20 reads. Unknown features contribute no correction. This residual was tested on top of the existing semantic, author, recency and ESS5 ranker; no weight grid or post-outcome tuning was used. A separate arm additionally requires synopsis probability ≥0.80 for both target and history.
+
+Two measurement issues were resolved explicitly:
+
+- Separate typed answers can disagree about a facet and its supporting chunk. A mismatch now invalidates the affected facet, rather than aborting the study or discarding other valid facets. Raw paid responses are preserved and reused without another request. Fifteen offline tests cover schemas, budgets, cache recovery and this behavior.
+- The provider's `confidence` is distinct from selected-choice probability. The frozen 0.80 threshold applies to probabilities, not the confidence field. Separately, confidence in selecting one particular passage is not confidence that its contents entail a claim: multiple passages may be valid. After observing the first result, a separately frozen follow-up asked yes/no source-entailment questions about each existing high-probability classification and its exact selected passage. That follow-up is development evidence, not untouched confirmation. Derived evidence gates are explicitly labeled and retain both original and verifier response hashes.
+
+The yes/no verification stage made 645 further source-only calls, with no schema failures. It accepted 620 reading-mode, 15 tone and 22 complexity claims; pace remained unsupported. Compatible-target coverage rose from 159/1,686 (9.43%) to 529/1,686 (31.38%). Source-quality-gated coverage rose from 83/1,686 (4.92%) to 241/1,686 (14.29%). These changes increase feature coverage, not demonstrated enjoyment or source truth.
+
+### Recommendation results
+
+Balanced AUC is the mean of high-rating discrimination (4–5 vs 1–3) and reversed low-rating discrimination (1–2 vs 3–5). The exact shared cohorts and serving one-decimal score rounding are retained.
+
+| Fixed arm | Validation balanced AUC | Later balanced AUC |
+| --- | ---: | ---: |
+| Current | 0.556663 | 0.569949 |
+| Choice-evidence facets | 0.556732 | 0.570685 |
+| Choice-evidence facets + synopsis gate | 0.556457 | 0.570034 |
+| Yes/no-grounded facets | 0.556955 | 0.570058 |
+| Yes/no-grounded facets + synopsis gate | 0.556581 | 0.569787 |
+
+The initial ungated arm's later gain is +0.000736, with paired day-bootstrap 95% interval [0.000118, 0.001507], but its validation gain is +0.000069 with interval [−0.000957, 0.000946]. The corrected entailment arm gains +0.000292 in validation, interval [−0.000283, 0.000894], and +0.000109 later, interval [−0.000390, 0.000593]. The source-quality-gated entailment arm regresses slightly in both periods and both intervals include zero. Intervals use 1,000 paired whole-UTC-day resamples and do not account for repeated investigation or establish independent-reader confirmation.
+
+Every tested arm retains **4/8 favorites and 0/8 dislikes in validation**, and **7/8 favorites and 0/8 dislikes later**. Top-20 favorite counts also remain 7 and 13. These are synthetic pools of eventually read books, not fresh judgments of today's Discover slate. Current enriched metadata can postdate reads, and this single reader's historical labels have been inspected repeatedly. Neither capture freshness nor changing the classification model makes these outcomes independent confirmation. A source-quality-only historical ablation is not identifiable: the corpus does not contain the catalog confidence used when each read occurred, and current classifications cannot substitute for it.
+
+Target/same-day rating mutation left all tested predictions unchanged on 100 sampled targets. Reversing prior ratings produced the expected correction antisymmetry across 1,686 targets (maximum residual about 6e−15). Current-score fingerprints match exactly; feature joins cover all 744 returned source rows with zero hash mismatches, duplicate IDs or missing rows.
+
+### Grounding, stability and multimodal checks
+
+An independent blinded gpt-6-luna audit used 32 hash-selected sources (16 reads, 16 candidates), without seeing API results, titles or outcomes. It labeled 29 synopses, one review, one excerpt and one insufficient source. It found only one supported pace and four tone labels, no complexity labels, and 29 supported reading-mode labels. Four sources were ambiguous. This is an automated source audit, not human gold labels or a calibration study.
+
+Under the initial source-gated classifier, only three reading-mode predictions survived; all three agreed with the reviewer. One complexity prediction survived but the reviewer found it unsupported. After yes/no entailment verification, 12 source-gated reading-mode predictions survived and all 12 agreed; the unsupported complexity prediction no longer survived. This is useful evidence about the grounding design, with a small sample and correlated model errors still possible. It is not a ranking-quality gain.
+
+Eight independently repeated book requests kept every question's choice unchanged for seven books; four entire answer objects were exact. Maximum probability movement was 0.099906. All eight retained the same source-gated facet sets. Thus raw probabilities should not be treated as stable certainty measurements merely because output types are valid.
+
+A separately frozen image audit used eight real eligible-candidate covers and 16 calls: actual printed-title matches versus rotated wrong-title controls. Seven actual covers passed the high-confidence printed-title match and all eight rotated controls failed. The remaining actual cover used a French translation of the expected English title; direct visual inspection confirmed the same original work. This exposes a limit of strict printed-title matching, not a proven wrong-cover or ranking defect. No fuzzy work suppression or cover-based preference model was adopted.
+
+### Cost, provenance and reproduction
+
+There were 1,414 total API requests including the synthetic schema smoke test, 744 source classifications, eight repeat calls, 16 image calls and 645 grounding calls. Reported input usage totals 1,769,657 tokens, with output tokens zero. At the published $0.05/million input rate the estimated cost is **$0.0885**, below the approved $2 cap; this is a usage-based estimate rather than a final invoice. See [SubQ's decision API](https://docs.subq.ai/endpoints/decisions-api/), [model pricing](https://docs.subq.ai/using-the-api/models/) and [retention policy](https://docs.subq.ai/using-the-api/data-retention/). Classification data was public catalog text; private reading ratings stayed local. API retention is organization-controlled and defaults to indefinite retention; this experiment does not claim per-request zero retention for decision calls.
+
+Private artifacts and runnable tools are retained under `/home/steven/.local/share/bookward-subq-20261012/`, with directory mode 700 and data/credential mode 600. Run `tools/subq_decisions.py` without `--execute` for a no-network dry run; authorized execution reads `SUBQ_KEY_FILE`. `tools/subq_feature_replay.py` reads the immutable corpus and either original or explicitly derived feature JSONL. Run temporal replays with `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1` to avoid severe small-matrix oversubscription. No live database writes, service restarts, policy changes, Git commits or pushes were performed for this test.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Sanitized production corpus | `e91c8a38c56c52beb2e46df95c603fef8f14ba292a4c75af27e3b3d7d5e57755` |
+| Verified source export | `60e86d29d7aa3863cc0540d01d2ecff00d29ad0777fe4a617831aad1c6c8a262` |
+| Initial ranking protocol | `b988b4d4636be70d9ae25994fe2684038cec32f2f6aa04ba0b27de23c70bedd7` |
+| Source classifier specification | `1996d0d4b6812fbfb640e922b2e298850c29470d60e75e46f72f63e1cfad9d73` |
+| Entailment follow-up protocol | `ee48f8059a59d135f97985b304631be83de55bd5e6aa0da5b29e84de6c06fbc4` |
+| Shared complete unchanged-score fingerprint | `f792b0bc8b1d46f0e084bd4327b006c9aff344a99135a51660c497b00ef41ac3` |
+
+| `subq-feature-replay-results-private.json` | `f69b42a4727de23505eabd9a602c480f8e3a2399996cde529c610022c1cffc10` |
+| `subq-grounded-replay-results-private.json` | `a5b2dfb5c7e52318cf2b2ae287d52fecc5d344e94574f0e390227150c0ff86f7` |
+| `reviewer-audit.json` | `8b6e67a1e77c569de7708757b1e82713a88fb6cf3d02e74c725c6411be662da3` |
+| `grounded-features-private.jsonl` | `2d9e98f6254e271a69c399762d8d0e8726e21f1f2f509f6234925468399f4403` |
+
+
+<a id="subq-neighbors-2026-10-13"></a>
+
+## SubQ neighbor-evidence follow-up: October 13, 2026
+
+**Decision: close this approach without adoption.** Keep the production ranking engine unchanged. This follow-up tested whether SubQ could distinguish useful recommendation analogies from books sharing only subject matter, rather than directly predicting a reader's rating. Its active combined arm improved later balanced AUC by 0.009173, but shuffled discounts improved it by 0.008010 and constant discounts by 0.006396. Validation favored both controls over SubQ. No arm improved top-eight favorite counts. These results do not establish that the model's classifications provide useful ranking information; they also do not establish that SubQ cannot help a different task.
+
+### Mechanism and controls
+
+Two gpt-6-luna xhigh subagents supported pair planning and protocol review. The implementation agent reached its quota; the primary agent completed the clients, instrumentation and replay. No serving code was modified.
+
+Using the same immutable production capture as the preceding study, the planner selected 3,120 unique verified-description pairs from the existing positive top-five, negative top-one and rating-kernel top-three witnesses. Historical witnesses came only from strictly earlier UTC days. Public descriptions were sent without reading ratings, user identifiers or ranking scores. A fixed hash-selected subset of 800 pairs was additionally tested with public titles/authors, allowing an explicitly unverified remembered-trait comparator. Both clients returned zero request errors.
+
+Choices were shared reading appeal, subject-only overlap, explicitly opposed primary experience traits on the same axis, or insufficient information. Genre differences and absent traits were not grounds for declaring a mismatch. Source-excerpt choices provided exact-text traceability, not proof of logical entailment. Only 83 of the 3,120 source-only pairs selected excerpts on both sides. Source-only choices were 2,136 insufficient, 746 subject-only, 206 shared appeal and 32 experience mismatch. Adding identities still produced 612 insufficient choices among 800 pairs. A small blinded primary-agent review agreed with six of eight categorical choices; this was automated review, not independent human gold or calibrated probabilities.
+
+The original frozen policy required a selected discount class probability of at least 0.8. **No returned discount class met that threshold**, so every hard-gated arm was exactly neutral. That replay was an implementation/parity check, not evidence against the utility of an active intervention.
+
+After observing that inactivity, but before viewing active-policy outcome metrics, a documented amendment reused the cached responses with expected reliability `q = 1 − 0.5 p(subject_only) − 0.75 p(experience_mismatch)`. Insufficient probability mass contributed neutral weight. This removed the hard confidence threshold; probabilities remain uncalibrated estimates. Separate arms required two source excerpts, added identity context, or allowed unverified remembered traits. There was no prompt, coefficient or parameter search after active results.
+
+Discounts kept the original witness membership, with no backfill. Kernel discounts multiplied weights **after** cosine-to-the-eighth power, retaining the original top 40 and modifying only three witnesses; weighted ratings, effective sample size and recency were recomputed consistently. Author and local-neighbor rating terms were unchanged. Each net correction was capped at ±3 points after metadata confidence and before normal clipping/one-decimal rounding. Controls used a fixed-seed shuffle of historical pair discounts and a constant historical-pair mean discount on the same queried-pair mask, without fitting outcome labels.
+
+### Production-corpus replay results
+
+All 1,686 historical predictions exactly reproduced the unchanged scorer's baseline fingerprint. The same whole-day cohorts were retained: 971 development, 357 validation and 358 later predictions. The soft combined arm changed 599 rounded scores; the kernel-only arm changed 386 and source-excerpt-gated arm 62. Thus the active test actually affected predictions.
+
+| Arm | Validation balanced AUC | Later balanced AUC |
+| --- | ---: | ---: |
+| Current | 0.556663 | 0.569949 |
+| Semantic witnesses | 0.558249 | 0.578933 |
+| Kernel and recency | 0.557290 | 0.570983 |
+| Combined | 0.557931 | 0.579122 |
+| Shuffled combined | 0.563097 | 0.577959 |
+| Constant combined | 0.560780 | 0.576345 |
+| Identity context, source-excerpt gate | 0.554482 | 0.574358 |
+| Identity prior, unverified traits | 0.557740 | 0.579386 |
+| Source-excerpt-gated combined | 0.556415 | 0.569423 |
+
+Combined versus current paired whole-day bootstrap 95% intervals were [−0.010516, 0.013194] in validation and [−0.004181, 0.024295] later, using 1,000 draws. Kernel-only intervals also included zero in both periods. These are comparisons against current, not confidence intervals for superiority over controls. Development combined AUC regressed from 0.585522 to 0.577526.
+
+Every arm retained 4/8 favorites and zero dislikes in validation, and 7/8 favorites and zero dislikes later. Later top-20 favorites increased from 13 to 14 for combined, but shuffled and constant controls produced that same increase. These are historical pools of eventually read books, not fresh Discover judgments. Target/same-day rating mutation left predictions unchanged for 11 targets across ten selected day groups, including active-discount groups. Four private tests passed for outcome exclusion, invalid-probability rejection, exact neutral parity and post-power kernel weighting.
+
+The corpus represents one reader, with repeatedly inspected outcomes and descriptions that may postdate reading. It cannot establish general-user benefit. The current-candidate planner used 1,786 dated prepared reads and omitted 14 undated rated reads; its 62-description candidate pairs were only coverage diagnostics, not a replay of the complete live candidate order. No current-candidate preference gain is claimed.
+
+### Cost and reproduction
+
+This follow-up made 3,920 API calls, reporting 5,275,587 input tokens: estimated cost $0.263779 at the preceding study's recorded rate. Together with the preceding study, the total is 5,334 calls, 7,045,244 input tokens and approximately **$0.3523**, within the authorized $2 cap. This is a usage estimate, not an invoice. The soft-policy amendment made no additional API calls.
+
+Private inputs, captures, protocols and tools are in `/home/steven/.local/share/bookward-subq-20261012-neighbors/`; descriptions, reading labels and credentials remain outside Git. Run `evaluate_pairs.py` for the hard-gated replay or `evaluate_soft_pairs.py` for the active follow-up with the engine virtualenv and `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`. The original corpus SHA-256 remains unchanged. No production writes, deployment, Git commits or pushes were performed.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Frozen initial neighbor protocol | `0f51e94a114380bbe138cc79169d844c6ac16c5844d1c38913a460652242c4d2` |
+| Source classifier specification | `4abbb48cc4c863877864ea0d4c9af9f003ff59844e0b81fa16b60513e60e5637` |
+| Soft-policy amendment | `0be298a15e144d81aa3d25897a99e1d116848a463223da7c9684f0811cf23a33` |
+| Soft evaluator | `b32cfdea9b62522a74244bb0367023c1c8680d1eb38c7ab482ebf4f572351831` |
+| Soft replay results | `733102c24a52af14b998971ee0a3c4e4daf63178952d91ed2bef68e94f5a4c05` |
+| Exact unchanged-score fingerprint | `f792b0bc8b1d46f0e084bd4327b006c9aff344a99135a51660c497b00ef41ac3` |
