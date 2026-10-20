@@ -91,6 +91,8 @@
   let markReadRating = $state(0);
   let filter = $state("");
   let profileMenuOpen = $state(false);
+  let goodreadsRssHelpOpen = $state(false);
+  let goodreadsExportHelpOpen = $state(false);
   let profileMenuRoot = $state<HTMLDivElement | null>(null);
   let profileMenuButton = $state<HTMLButtonElement | null>(null);
   let detailsId = $state<number | null>(null);
@@ -2501,6 +2503,34 @@
                   Pull recent reads from a public read-shelf feed. The saved
                   link syncs automatically each night at 02:00 UTC.
                 </p>
+                <div class="mt-3 text-sm text-surface-700-300">
+                  <button
+                    type="button"
+                    class="flex min-h-10 w-full items-center gap-2 rounded-md py-2 text-left font-medium text-secondary-600-400 hover:text-secondary-500-300 focus-visible:outline-2 focus-visible:outline-offset-4"
+                    aria-expanded={goodreadsRssHelpOpen}
+                    aria-controls="goodreads-rss-help"
+                    onclick={() => (goodreadsRssHelpOpen = !goodreadsRssHelpOpen)}
+                  >
+                    <CircleHelp size={16} class="shrink-0" aria-hidden="true" />
+                    <span class="flex-1">How do I find my RSS link?</span>
+                    <ChevronDown size={16} class={`shrink-0 transition-transform duration-200 motion-reduce:transition-none ${goodreadsRssHelpOpen ? "rotate-180" : ""}`} aria-hidden="true" />
+                  </button>
+                  <div id="goodreads-rss-help">
+                    {#if goodreadsRssHelpOpen}
+                      <div transition:slide={{ duration: motionDuration(240) }}>
+                        <div class="mt-2 space-y-3 rounded-xl border border-secondary-500/20 bg-secondary-500/5 p-4 leading-6">
+                    <p>Use the Goodreads website in a browser and sign in. On a phone, request the desktop site if you cannot see these options.</p>
+                    <ol class="list-decimal space-y-2 pl-5">
+                      <li>Open <a class="underline underline-offset-2" href="https://www.goodreads.com/review/list" target="_blank" rel="noopener noreferrer">My Books on Goodreads (opens in a new tab)</a> and select your <strong>Read</strong> shelf.</li>
+                      <li>Scroll to the bottom of the book list and find the <strong>RSS</strong> link. Right-click it and choose <strong>Copy link address</strong>, or open it and copy the address from your browser.</li>
+                      <li>Paste the full link into <strong>Public shelf RSS URL</strong> below, then select <strong>Save &amp; sync now</strong>.</li>
+                    </ol>
+                    <p>The address should contain <code class="break-all">goodreads.com/review/list_rss/</code> and <code>shelf=read</code>. Your shelf must be publicly accessible for syncing. For your complete reading history, use the CSV export instead.</p>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                </div>
                 {#if data.profile.goodreads_rss_last_sync_at}
                   <p class="mt-2 text-xs text-surface-600-400">
                     Last successful sync (UTC): {data.profile.goodreads_rss_last_sync_at}
@@ -2568,6 +2598,34 @@
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
                   Import your complete library, ratings, and read dates.
                 </p>
+                <div class="mt-3 text-sm text-surface-700-300">
+                  <button
+                    type="button"
+                    class="flex min-h-10 w-full items-center gap-2 rounded-md py-2 text-left font-medium text-tertiary-600-400 hover:text-tertiary-500-300 focus-visible:outline-2 focus-visible:outline-offset-4"
+                    aria-expanded={goodreadsExportHelpOpen}
+                    aria-controls="goodreads-export-help"
+                    onclick={() => (goodreadsExportHelpOpen = !goodreadsExportHelpOpen)}
+                  >
+                    <CircleHelp size={16} class="shrink-0" aria-hidden="true" />
+                    <span class="flex-1">How do I download my Goodreads export?</span>
+                    <ChevronDown size={16} class={`shrink-0 transition-transform duration-200 motion-reduce:transition-none ${goodreadsExportHelpOpen ? "rotate-180" : ""}`} aria-hidden="true" />
+                  </button>
+                  <div id="goodreads-export-help">
+                    {#if goodreadsExportHelpOpen}
+                      <div transition:slide={{ duration: motionDuration(240) }}>
+                        <div class="mt-2 space-y-3 rounded-xl border border-tertiary-500/20 bg-tertiary-500/5 p-4 leading-6">
+                    <p>Use the Goodreads website in a browser and sign in. On a phone, request the desktop site; exporting is not available in the Goodreads app.</p>
+                    <ol class="list-decimal space-y-2 pl-5">
+                      <li>Open <a class="underline underline-offset-2" href="https://www.goodreads.com/review/import" target="_blank" rel="noopener noreferrer">Goodreads Import and Export (opens in a new tab)</a>. You can also find it under <strong>My Books → Tools → Import and export</strong>.</li>
+                      <li>Under <strong>Export</strong>, select <strong>Export Library</strong> and wait for Goodreads to prepare the file. Large libraries may take a few minutes.</li>
+                      <li>Click the dated export link to download your CSV. If you have exported before, generate a fresh file to include your latest books and ratings.</li>
+                      <li>Choose that file under <strong>Goodreads CSV</strong> below, then select <strong>Import CSV</strong>.</li>
+                    </ol>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                </div>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
                   >Goodreads CSV<input
