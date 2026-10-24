@@ -5,9 +5,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock requirements.lock ./
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock
+RUN pip install --no-cache-dir --no-deps --require-hashes -r requirements.lock
 COPY afterword_engine ./afterword_engine
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 RUN useradd --create-home --uid 10001 afterword \
     && mkdir -p /data /backups \
     && chown -R afterword:afterword /app /data /backups
