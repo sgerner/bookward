@@ -419,7 +419,23 @@ def signal_diagnostics(
 
     groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[str(row.get("label_kind") or row.get("signal_type") or "unknown")].append(row)
+        observed = row.get("observed_outcomes")
+        if not observed:
+            groups[str(row.get("label_kind") or row.get("signal_type") or "unknown")].append(row)
+            continue
+        # Preserve each kind of observed signal without counting repeated
+        # events for one impression more than once within that signal.
+        by_signal: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for outcome in observed:
+            by_signal[str(outcome.get("label_kind") or "unknown")].append(outcome)
+        for signal, outcomes in by_signal.items():
+            selected = max(outcomes, key=lambda item: (
+                _as_float(item.get("confidence"), default=0),
+                str(item.get("attributed_at") or ""),
+            ))
+            groups[signal].append({**row, **{
+                field: selected.get(field) for field in ("label", "confidence", "label_kind")
+            }})
     return {signal: _metric_bundle(values, score_key=score_key, k=k) for signal, values in sorted(groups.items())}
 
 
@@ -433,7 +449,11 @@ def promotion_gate(
     min_precision_delta: float = 0.0,
     min_ndcg_delta: float = 0.01,
 ) -> dict[str, Any]:
-    """Apply minimum sample and metric-improvement gates to a candidate ranker."""
+    """Screen metric improvements; this is not authorization to promote a ranker.
+
+    Callers must independently verify held-out provenance, paired uncertainty,
+    and cohort regressions before changing serving behavior.
+    """
 
     counts = dict(sample or candidate)
     limits = {**DEFAULT_MINIMUMS, **(minimums or {})}
@@ -492,6 +512,7 @@ def load_rows(source: str | Path | Mapping[str, Any]) -> list[dict[str, Any]]:
             "label": outcome.get("label") if outcome else None,
             "confidence": outcome.get("confidence", 1.0) if outcome else None,
             "label_kind": outcome.get("label_kind") if outcome else None,
+            "observed_outcomes": [dict(item) for item in candidates],
         })
     return values
 
@@ -512,6 +533,11 @@ def build_report(
         "sample": _metric_bundle(values, score_key="score", k=k),
         "splits": {},
         "signal_diagnostics": signal_diagnostics(values, score_key="score", k=k),
+        "enjoyment": _metric_bundle(
+            [row for row in values if row.get("label_kind") in {"rating_positive", "rating_negative", "rating_neutral"}],
+            score_key="score", k=k,
+        ),
+        "metric_scope": "Logged-policy metrics mix observed intent and outcomes; enjoyment uses explicit ratings only. Neither authorizes serving promotion.",
         "minimums": {**DEFAULT_MINIMUMS, **(minimums or {})},
     }
     for split_name, split_rows in splits.items():

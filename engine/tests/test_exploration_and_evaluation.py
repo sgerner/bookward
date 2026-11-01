@@ -192,3 +192,27 @@ def test_bootstrap_remaps_repeated_run_draws():
     assert result["estimate"] == pytest.approx(0.5)
     assert result["lower"] == 0
     assert result["upper"] == 1
+
+
+def test_enjoyment_report_excludes_unrated_completions_and_intent():
+    rows = _rows() + [
+        {"run_id": "intent", "rank": 1, "score": 100, "label": 1, "label_kind": "save"},
+        {"run_id": "unrated", "rank": 1, "score": 100, "label": .75, "label_kind": "completed_unrated"},
+    ]
+    report = build_report(rows, bootstrap_iterations=0)
+    assert report["enjoyment"]["labeled_impressions"] == 10
+    assert report["sample"]["labeled_impressions"] == 12
+
+
+def test_load_rows_preserves_earlier_intent_alongside_rated_outcome():
+    outcomes = [
+        {"impression_id": 1, "label": 1, "label_kind": "save", "confidence": .5},
+        {"impression_id": 1, "label": 0, "label_kind": "rating_negative", "confidence": 1},
+    ]
+    rows = load_rows({"recommendation_impressions": [{"id": 1, "run_id": "r", "rank": 1, "score": 90}],
+                      "recommendation_outcomes": outcomes})
+    assert rows[0]["label_kind"] == "rating_negative"
+    assert rows[0]["observed_outcomes"] == outcomes
+    diagnostics = signal_diagnostics(rows)
+    assert diagnostics["save"]["labeled_impressions"] == 1
+    assert diagnostics["rating_negative"]["labeled_impressions"] == 1

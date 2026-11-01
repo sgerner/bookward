@@ -281,7 +281,7 @@ def _lines(items: list[dict], config: dict, key: str, test: bool = False) -> str
     for item in items:
         explanation = item.get("explanation") or []
         reason = f" — {explanation[0]}" if explanation else ""
-        lines.append(f"• {item['title']} — {item['author']} ({float(item['score']):.0f}%){reason}")
+        lines.append(f"• {item['title']} — {item['author']} (ranking score {float(item['score']):.0f}){reason}")
     lines += ["", f"Review and shortlist these books in Bookward: {_link(config, key)}"]
     return "\n".join(lines)
 
