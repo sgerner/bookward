@@ -5,25 +5,26 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("page actions", () => {
   it("keeps the Settings view compatible with an engine before the token migration", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          recommendations: [],
-          history: [],
-          sources: [],
-          settings: {
-            embedding_backend: "local",
-            embedding_model: "hashing-768",
-            embedding_url: "",
-            embedding_api_key_set: false,
-            librarr_url: "",
-            librarr_api_key_set: false,
-            librarr_media_type: "audiobook",
-            digest: {},
-          },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -35,9 +36,7 @@ describe("page actions", () => {
   });
 
   it("loads recommendations without creating or forwarding a device cookie", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
+    const overview = {
           recommendation_run_id: "run-1234",
           recommendations: [],
           decisions: [
@@ -70,9 +69,12 @@ describe("page actions", () => {
             librarr_media_type: "audiobook",
             digest: {},
           },
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const result = (await load({

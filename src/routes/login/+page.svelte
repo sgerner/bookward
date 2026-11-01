@@ -12,7 +12,8 @@
 	<meta name="robots" content="noindex, nofollow" />
 </svelte:head>
 
-<main class="login-page relative isolate grid min-h-dvh overflow-hidden text-surface-900-100">
+<a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
+<main id="main-content" tabindex="-1" class="login-page relative isolate grid min-h-dvh overflow-hidden text-surface-900-100">
 	<div
 		class="mx-auto grid min-h-dvh w-full max-w-7xl items-center gap-8 px-5 py-8 sm:px-8 sm:py-12 lg:grid-cols-[minmax(0,1fr)_minmax(25rem,32rem)] lg:gap-16 lg:px-12 lg:py-14"
 	>

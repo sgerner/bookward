@@ -26,14 +26,14 @@ export const GET: RequestHandler = async ({ url }) => {
 
   const params = new URLSearchParams({
     status: parsed.data.status,
-    limit: String(parsed.data.limit),
+    limit: String(parsed.data.limit + 1),
     offset: String(parsed.data.offset),
   });
   try {
     const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
     return json({
-      items: items.map(toPageBook),
-      has_more: items.length === parsed.data.limit,
+      items: items.slice(0, parsed.data.limit).map(toPageBook),
+      has_more: items.length > parsed.data.limit,
     });
   } catch (error) {
     return json({ message: errorMessage(error) }, { status: engineStatus(error) });

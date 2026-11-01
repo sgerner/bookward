@@ -1,6 +1,7 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { engine, EngineError } from "#lib/server/engine.js";
+import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
 type SourceFilters = {
@@ -38,6 +39,7 @@ type Overview = {
     source_name: string | null;
   }>;
   decisions?: Overview["recommendations"];
+  decisions_has_more?: boolean;
   history: Array<{
     id: number;
     title: string;
@@ -113,14 +115,6 @@ type DigestSettings = {
 };
 
 export const load: PageServerLoad = async ({ url, locals }) => {
-  let overview: Overview;
-  try {
-    overview = await engine<Overview>("/api/overview?recommendation_limit=24");
-  } catch (cause) {
-    throw httpError(503, {
-      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    });
-  }
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
     interval_hours: 0,
@@ -130,12 +124,21 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     next_backup_at: null,
     backups: [],
   };
-  let backupStatus = fallbackBackupStatus;
+  const overviewRequest = engine<Overview>(
+    "/api/overview?recommendation_limit=24&decision_limit=24",
+  );
+  const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
+    () => fallbackBackupStatus,
+  );
+  let overview: Overview;
   try {
-    backupStatus = await engine<BackupStatus>("/api/backups");
-  } catch {
-    // The main Bookward view remains usable while the engine upgrades.
+    overview = await overviewRequest;
+  } catch (cause) {
+    throw httpError(503, {
+      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
+    });
   }
+  const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
   let digestPeriod = url.searchParams.get("digest_period");
   let digestReviewIds: number[] = [];
@@ -158,28 +161,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   return {
     user: locals.user,
     recommendation_run_id: overview.recommendation_run_id ?? "",
-    books: overview.recommendations.map((book) => ({
-      ...book,
-      recommendation_run_id: overview.recommendation_run_id ?? "",
-      cover_url: publicUrl(book.cover_url),
-      source_url: publicUrl(book.source_url),
-      published_on: book.release_date,
-      published_kind: book.date_kind,
-      synopsis: book.description,
-      reason: book.explanation.join(" · "),
-      source_type: "engine",
-    })),
-    decisions: (overview.decisions ?? []).map((book) => ({
-      ...book,
-      recommendation_run_id: "",
-      cover_url: publicUrl(book.cover_url),
-      source_url: publicUrl(book.source_url),
-      published_on: book.release_date,
-      published_kind: book.date_kind,
-      synopsis: book.description,
-      reason: book.explanation.join(" · "),
-      source_type: "engine",
-    })),
+    books: overview.recommendations.map((book) =>
+      toPageBook({
+        ...book,
+        recommendation_run_id: overview.recommendation_run_id ?? "",
+      }),
+    ),
+    decisions: (overview.decisions ?? []).map((book) =>
+      toPageBook({ ...book, recommendation_run_id: "" }),
+    ),
+    decisions_has_more: overview.decisions_has_more === true,
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
@@ -215,15 +206,6 @@ const message = (error: unknown) =>
     : "The engine could not complete that request.";
 const status = (error: unknown) =>
   error instanceof EngineError && error.status < 500 ? error.status : 502;
-const publicUrl = (value: string) => {
-  try {
-    const parsed = new URL(value);
-    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
-  } catch {
-    return "";
-  }
-};
-
 const formText = (data: FormData, key: string) => String(data.get(key) ?? "").trim();
 const sourceGenreList = (value: FormDataEntryValue | null) => {
   const seen = new Set<string>();

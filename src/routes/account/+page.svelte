@@ -7,7 +7,8 @@
 
 <svelte:head><title>Account · Bookward</title></svelte:head>
 
-<main class="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+<a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
+<main id="main-content" tabindex="-1" class="mx-auto max-w-3xl px-4 py-10 sm:px-6">
 	<a href="/" class="text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Account</h1>
 	<p class="mt-2 text-surface-700-300">Signed in as <strong>{data.user.display_name || data.user.username}</strong>. Your recommendations and reading lists are private to this profile.</p>

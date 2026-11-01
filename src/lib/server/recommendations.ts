@@ -10,6 +10,7 @@ export type Recommendation = {
   date_kind: string;
   genres: string[];
   score: number;
+  metadata_confidence?: number | null;
   explanation: string[];
   status: string;
   source_name: string | null;

@@ -2,6 +2,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { engineMock } = vi.hoisted(() => ({ engineMock: vi.fn() }));
 
+const recommendation = (id: number) => ({
+  id,
+  title: `Book ${id}`,
+  author: "A Writer",
+  description: "",
+  cover_url: "",
+  source_url: "",
+  release_date: null,
+  date_kind: "unknown",
+  genres: [],
+  score: 80,
+  explanation: [],
+  status: "rejected",
+  source_name: "A source",
+});
+
 vi.mock("#lib/server/engine.js", () => ({
   engine: engineMock,
   EngineError: class EngineError extends Error {
@@ -41,7 +57,7 @@ describe("recommendations endpoint", () => {
 
     expect(response.status).toBe(200);
     expect(engineMock).toHaveBeenCalledWith(
-      "/api/recommendations?status=recommended&limit=2&offset=4",
+      "/api/recommendations?status=recommended&limit=3&offset=4",
     );
     expect(await response.json()).toEqual({
       items: [
@@ -107,7 +123,47 @@ describe("recommendations endpoint", () => {
 
     expect(response.status).toBe(200);
     expect(engineMock).toHaveBeenCalledWith(
-      "/api/recommendations?status=decisions&limit=8&offset=0",
+      "/api/recommendations?status=decisions&limit=9&offset=0",
     );
+  });
+
+  it("reports no next page when a full decisions page is terminal", async () => {
+    engineMock.mockResolvedValue(
+      Array.from({ length: 24 }, (_, index) => recommendation(index + 1)),
+    );
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=decisions&limit=24&offset=24",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=decisions&limit=25&offset=24",
+    );
+    expect(payload.items).toHaveLength(24);
+    expect(payload.has_more).toBe(false);
+  });
+
+  it("trims the extra row and reports another decisions page", async () => {
+    engineMock.mockResolvedValue(
+      Array.from({ length: 25 }, (_, index) => recommendation(index + 1)),
+    );
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=decisions&limit=24&offset=24",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.items).toHaveLength(24);
+    expect(payload.items.map((item: { id: number }) => item.id)).toEqual(
+      Array.from({ length: 24 }, (_, index) => index + 1),
+    );
+    expect(payload.has_more).toBe(true);
   });
 });
