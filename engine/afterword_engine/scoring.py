@@ -8,7 +8,7 @@ import numpy as np
 from .database import rows, transaction, connect
 from .embeddings import get_embedder, content_hash, vector_blob
 from .ranking import rank_candidates
-from .identity import book_identity_match_index, book_row_identity_match_keys
+from .identity import ReadIdentityIndex
 from .subjects import normalize_subjects
 SCORING_BATCH_SIZE = 256
 LOGGER = logging.getLogger(__name__)
@@ -215,7 +215,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     read_identity_history = read_identity_rows_with_current_verified_work_ids(
         read_history, read_metadata_rows
     )
-    all_read_keys = book_identity_match_index(read_identity_history)
+    read_identity_index = ReadIdentityIndex.from_reads(read_identity_history)
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.work_id quality_work_id,q.provider quality_provider,"
@@ -229,7 +229,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     )
     candidates = [
         item for item in candidates
-        if not book_row_identity_match_keys(item) & all_read_keys
+        if not read_identity_index.matches(item)
     ]
     if not candidates: return 0
     interaction_candidates = rows(

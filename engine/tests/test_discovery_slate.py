@@ -7,6 +7,7 @@ from auth_helpers import authenticated_headers
 
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
+from afterword_engine import discovery_slate
 from afterword_engine.discovery_slate import diversify_discovery_slate
 from afterword_engine.main import app, tracked_recommendations
 
@@ -93,6 +94,27 @@ def test_near_duplicate_swaps_only_when_score_floor_and_local_bound_allow_it():
     )
     assert [item["id"] for item in unchanged] == [1, 2, 3, 4, 5]
     assert unchanged_diagnostics["applied"] is False
+
+
+def test_candidate_vectors_are_normalized_once_per_slate(monkeypatch):
+    recommendations = [
+        book(1, "Repeated author", 100),
+        book(2, "Repeated author", 99),
+        book(3, "Repeated author", 98),
+    ]
+    vectors = {1: [1.0, 0.0], 2: [0.0, 1.0], 3: [-1.0, 0.0]}
+    original_norm = discovery_slate.np.linalg.norm
+    calls = 0
+
+    def count_norm(value):
+        nonlocal calls
+        calls += 1
+        return original_norm(value)
+
+    monkeypatch.setattr(discovery_slate.np.linalg, "norm", count_norm)
+    diversify_discovery_slate(recommendations, vectors, slate_size=3)
+
+    assert calls == len(vectors)
 
 
 def test_close_candidate_from_later_rank_can_enter_visible_slate():

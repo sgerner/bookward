@@ -18,25 +18,18 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from ..associations import Association, RateLimiter, canonical_isbn, record_association_request, select_seed_reads
+from ..associations import Association, RateLimiter, record_association_request, select_seed_reads
 from ..config import settings
-from ..identity import ReadIdentityIndex, book_identity
-from ..isbn import isbn_parts
+from ..identity import ReadIdentityIndex
+from ..isbn import isbn_parts, normalize_isbn_identifier
 from ..security import resolve_public_target
+from .common import clean as _clean, title_key as _title_key
 
 
 GOOGLE_BOOKS_PROVIDER = "google_books_associated"
 GOOGLE_BOOKS_BASE = "https://www.googleapis.com"
 GOOGLE_BOOKS_PATH = "/books/v1"
 GOOGLE_BOOKS_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
-
-
-def _clean(value: object, limit: int = 500) -> str:
-    return " ".join(str(value or "").split()).strip()[:limit]
-
-
-def _title_key(value: object) -> str:
-    return book_identity(value, "").split("\x1f", 1)[0]
 
 
 def _authors(value: object) -> list[str]:
@@ -183,7 +176,7 @@ class GoogleBooksAssociatedProvider:
         self.max_items_per_seed = max(1, int(max_items_per_seed))
 
     async def _find_volume(self, read: Mapping[str, Any]) -> str | None:
-        isbn = canonical_isbn(read.get("isbn"))
+        isbn = normalize_isbn_identifier(read.get("isbn"))
         query = f"isbn:{isbn}" if isbn else f"intitle:{read.get('title', '')} inauthor:{read.get('author', '')}"
         payload = await self.client.get_json(
             f"{GOOGLE_BOOKS_PATH}/volumes",

@@ -56,27 +56,43 @@ def _score(item: Mapping[str, Any]) -> float:
     return value if math.isfinite(value) else 0.0
 
 
-def _normalized_vector(vectors: Mapping[int, Any], item: Mapping[str, Any]):
+def _normalized_vector(
+    vectors: Mapping[int, Any],
+    item: Mapping[str, Any],
+    cache: dict[int, np.ndarray | None],
+):
     try:
-        raw = vectors.get(int(item["id"]))
-        vector = np.asarray(raw, dtype=np.float32)
+        candidate_id = int(item["id"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
+    if candidate_id in cache:
+        return cache[candidate_id]
+    try:
+        raw = vectors.get(candidate_id)
+        vector = np.asarray(raw, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError):
+        cache[candidate_id] = None
+        return None
     if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+        cache[candidate_id] = None
         return None
     norm = float(np.linalg.norm(vector))
     if not math.isfinite(norm) or norm <= 0:
+        cache[candidate_id] = None
         return None
-    return vector / norm
+    normalized = vector / norm
+    cache[candidate_id] = normalized
+    return normalized
 
 
 def _similarity(
     left: Mapping[str, Any],
     right: Mapping[str, Any],
     vectors: Mapping[int, Any],
+    normalized_vectors: dict[int, np.ndarray | None],
 ) -> float | None:
-    left_vector = _normalized_vector(vectors, left)
-    right_vector = _normalized_vector(vectors, right)
+    left_vector = _normalized_vector(vectors, left, normalized_vectors)
+    right_vector = _normalized_vector(vectors, right, normalized_vectors)
     if (
         left_vector is None
         or right_vector is None
@@ -91,12 +107,13 @@ def _redundancy(
     candidate: Mapping[str, Any],
     selected: list[Mapping[str, Any]],
     vectors: Mapping[int, Any],
+    normalized_vectors: dict[int, np.ndarray | None],
 ) -> tuple[int, int]:
     author = _author_key(candidate)
     author_count = sum(bool(author) and _author_key(item) == author for item in selected)
     author_overflow = int(author_count >= MAX_BOOKS_PER_AUTHOR)
     similar_pairs = sum(
-        (similarity := _similarity(candidate, item, vectors)) is not None
+        (similarity := _similarity(candidate, item, vectors, normalized_vectors)) is not None
         and similarity >= NEAR_DUPLICATE_COSINE
         for item in selected
     )
@@ -137,6 +154,7 @@ def diversify_discovery_slate(
     slate_size = min(int(slate_size), len(items))
     max_displacement = int(max_displacement)
     vectors = candidate_vectors or {}
+    normalized_vectors: dict[int, np.ndarray | None] = {}
     diagnostics = empty_diagnostics("no_qualifying_swaps")
     diagnostics.update(
         {
@@ -150,7 +168,9 @@ def diversify_discovery_slate(
     similarity_swaps = 0
     for position in range(slate_size):
         prefix = items[:position]
-        current_redundancy = _redundancy(items[position], prefix, vectors)
+        current_redundancy = _redundancy(
+            items[position], prefix, vectors, normalized_vectors
+        )
         current_cost = sum(current_redundancy)
         if current_cost == 0:
             continue
@@ -169,7 +189,9 @@ def diversify_discovery_slate(
             candidate = items[candidate_position]
             if _score(candidate) < current_score - max_score_sacrifice:
                 continue
-            candidate_redundancy = _redundancy(candidate, prefix, vectors)
+            candidate_redundancy = _redundancy(
+                candidate, prefix, vectors, normalized_vectors
+            )
             candidate_cost = sum(candidate_redundancy)
             if candidate_cost >= current_cost:
                 continue

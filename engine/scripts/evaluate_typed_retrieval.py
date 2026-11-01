@@ -39,7 +39,6 @@ from afterword_engine.association_sources.openlibrary import (  # noqa: E402
 from afterword_engine.associations import (  # noqa: E402
     Association,
     RateLimiter,
-    canonical_isbn,
     select_seed_reads,
 )
 from afterword_engine.embeddings import content_hash  # noqa: E402
@@ -50,6 +49,7 @@ from afterword_engine.identity import (  # noqa: E402
     book_row_identity_match_keys,
     canonical_part,
 )
+from afterword_engine.isbn import normalize_isbn_identifier  # noqa: E402
 from afterword_engine.quality import local_flags  # noqa: E402
 from afterword_engine.scoring import document  # noqa: E402
 from afterword_engine.security import resolve_public_target  # noqa: E402
@@ -318,7 +318,7 @@ def _work_from_catalog(
     description = _description_text(item.get("description"))
     isbn = ""
     for raw in _field_list(item.get("isbn13")) + _field_list(item.get("isbn")):
-        isbn = canonical_isbn(raw)
+        isbn = normalize_isbn_identifier(raw)
         if len(isbn) in {10, 13}:
             break
         isbn = ""
@@ -592,7 +592,7 @@ def choose_seed_reads(
 async def _resolve_seed(
     read: Mapping[str, Any], client: OpenLibraryProbeClient
 ) -> Work | None:
-    isbn = canonical_isbn(read.get("isbn"))
+    isbn = normalize_isbn_identifier(read.get("isbn"))
     params: dict[str, Any] = {
         "limit": 5,
         "fields": "key,title,author_name,author_key,isbn,isbn13,subject,series,first_publish_year",
@@ -616,7 +616,7 @@ async def _resolve_seed(
             book_identity("", author) == book_identity("", read.get("author"))
             for author in names
         )
-        doc_isbns = [canonical_isbn(value) for value in _field_list(doc.get("isbn13")) + _field_list(doc.get("isbn"))]
+        doc_isbns = [normalize_isbn_identifier(value) for value in _field_list(doc.get("isbn13")) + _field_list(doc.get("isbn"))]
         isbn_match = bool(isbn and isbn in doc_isbns)
         if (title_match and author_match) or isbn_match:
             if not candidate.author_keys:

@@ -21,14 +21,15 @@ from ..associations import (
     Association,
     AssociationCache,
     RateLimiter,
-    canonical_isbn,
     record_association_request,
     select_seed_reads,
 )
 from ..database import rows
 from ..identity import book_identity
+from ..isbn import normalize_isbn_identifier
 from ..security import resolve_public_target
 from .openlibrary import OpenLibraryClient
+from .common import clean as _clean
 
 
 LIBRARYTHING_PROVIDER = "librarything_multirecommendations"
@@ -37,14 +38,6 @@ LIBRARYTHING_PATH = "/api/multirecommendations.php"
 LIBRARYTHING_MAX_DAILY_REQUESTS = 25
 LIBRARYTHING_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
 _LIBRARYTHING_RATE_LIMITER = RateLimiter(1.0)
-
-
-def _clean(value: object, limit: int = 500) -> str:
-    return " ".join(str(value or "").split()).strip()[:limit]
-
-
-def _title_key(value: object) -> str:
-    return book_identity(value, "").split("\x1f", 1)[0]
 
 
 def _recommendation_rank(value: object, fallback: int) -> int:
@@ -114,7 +107,7 @@ class LibraryThingClient:
     ) -> Mapping[str, Any]:
         normalized = []
         for isbn in isbns:
-            value = canonical_isbn(isbn)
+            value = normalize_isbn_identifier(isbn)
             if value and value not in normalized:
                 normalized.append(value)
         if not normalized:
@@ -196,7 +189,7 @@ class LibraryThingProvider:
         payload = await self.metadata_client.get_json(
             "/search.json",
             {
-                "isbn": canonical_isbn(isbn),
+                "isbn": normalize_isbn_identifier(isbn),
                 "limit": 5,
                 "fields": "key,title,author_name,isbn,isbn13",
             },
@@ -213,7 +206,7 @@ class LibraryThingProvider:
                 author = _clean(authors, 300)
             key = _clean(doc.get("key"), 300)
             if title and author:
-                return title, author, key or f"isbn:{canonical_isbn(isbn)}"
+                return title, author, key or f"isbn:{normalize_isbn_identifier(isbn)}"
         return None
 
     async def collect(self, reads: Sequence[Mapping[str, Any]]) -> list[Association]:
@@ -227,7 +220,7 @@ class LibraryThingProvider:
         )
         seed_by_isbn: dict[str, Mapping[str, Any]] = {}
         for seed in seeds:
-            isbn = canonical_isbn(seed.get("isbn"))
+            isbn = normalize_isbn_identifier(seed.get("isbn"))
             if len(isbn) in {10, 13}:
                 seed_by_isbn.setdefault(isbn, seed)
         if not seed_by_isbn:
@@ -242,7 +235,7 @@ class LibraryThingProvider:
         for request in requests if isinstance(requests, list) else []:
             if not isinstance(request, Mapping):
                 continue
-            isbn = canonical_isbn(request.get("isbn"))
+            isbn = normalize_isbn_identifier(request.get("isbn"))
             seed = seed_by_isbn.get(isbn)
             work = _clean(request.get("work"), 100)
             if seed is not None and work:
@@ -260,10 +253,12 @@ class LibraryThingProvider:
             isbns = recommendation.get("isbns")
             if not isinstance(isbns, list):
                 continue
-            candidate_isbn = next(
-                (canonical_isbn(value) for value in isbns if len(canonical_isbn(value)) in {10, 13}),
-                "",
-            )
+            candidate_isbn = ""
+            for value in isbns:
+                normalized_isbn = normalize_isbn_identifier(value)
+                if len(normalized_isbn) in {10, 13}:
+                    candidate_isbn = normalized_isbn
+                    break
             if not candidate_isbn or lookups >= self.max_metadata_lookups:
                 continue
             lookups += 1

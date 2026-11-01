@@ -92,6 +92,7 @@ from .quality import (
     quality_summary,
 )
 from .identity import (
+    ReadIdentityIndex,
     book_identity,
     book_identity_match_index,
     book_openlibrary_work_id,
@@ -253,12 +254,6 @@ def enqueue_followup_job(kind: str):
             (job_id, kind),
         )
         return job_id
-
-
-def _needs_candidate_quality_audit():
-    """Compatibility name for the bounded provider's due-work selector."""
-
-    return has_candidate_quality_audit_candidates()
 
 
 def _enqueue_candidate_quality_followup():
@@ -1396,7 +1391,12 @@ def tracked_recommendations(
     return recommendations, run_id
 
 
-def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: int | None = None):
+def overview_payload(
+    *,
+    include_api_tokens: bool = True,
+    recommendation_limit: int | None = None,
+    decision_limit: int = 24,
+):
     def source_payload(source):
         item = dict(source)
         item["filters"] = normalize_source_filters(item.get("filters"))
@@ -1412,13 +1412,16 @@ def overview_payload(*, include_api_tokens: bool = True, recommendation_limit: i
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
         )
-        decisions = recommendation_list(
-            connection, status="decisions", limit=None
+        decision_batch = recommendation_list(
+            connection, status="decisions", limit=decision_limit + 1
         )
+        decisions_has_more = len(decision_batch) > decision_limit
+        decisions = decision_batch[:decision_limit]
         return {
             "counts": counts,
             "recommendations": recommendations,
             "decisions": decisions,
+            "decisions_has_more": decisions_has_more,
             "recommendation_run_id": run_id,
             "sources": [source_payload(item) for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
@@ -1441,8 +1444,12 @@ async def health():
 @app.get("/api/overview")
 def overview(
     recommendation_limit: int | None = Query(default=None, ge=1, le=100),
+    decision_limit: int = Query(default=24, ge=1, le=24),
 ):
-    return overview_payload(recommendation_limit=recommendation_limit)
+    return overview_payload(
+        recommendation_limit=recommendation_limit,
+        decision_limit=decision_limit,
+    )
 
 
 @app.get("/api/reading-history")
@@ -1644,7 +1651,7 @@ def _recommendation_rows(
     read_identity_rows = read_identity_rows_with_current_verified_work_ids(
         read_rows, read_metadata_rows
     )
-    read_keys = book_identity_match_index(read_identity_rows)
+    read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlisted_keys = book_identity_match_index(
         fetch(
             "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
@@ -1654,6 +1661,7 @@ def _recommendation_rows(
         )
     )
     visible = []
+    seen_recommendation_keys = set()
     for item in result:
         if item["status"] == "saved":
             visible.append(item)
@@ -1661,8 +1669,12 @@ def _recommendation_rows(
         if item["status"] == "imported":
             continue
         keys = book_row_identity_match_keys(item)
-        if keys & read_keys or keys & shortlisted_keys:
+        if read_identity_index.matches(item) or keys & shortlisted_keys:
             continue
+        if item["status"] == "recommended" and keys & seen_recommendation_keys:
+            continue
+        if item["status"] == "recommended":
+            seen_recommendation_keys.update(keys)
         visible.append(item)
     end = None if limit is None else offset + limit
     return visible[offset:end]
@@ -1720,11 +1732,13 @@ def recommendations(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    values, run_id = tracked_recommendations(
-        status=status,
-        limit=limit,
-        offset=offset,
-    )
+    with connect() as connection:
+        values, run_id = tracked_recommendations(
+            connection=connection,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
     for item in values:
         item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id
@@ -2648,13 +2662,43 @@ def revoke_api_token(token_id: int):
 async def update_settings(payload: EngineSettings):
     try: payload.validate_values()
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings(); values = payload.model_dump()
+    current = private_settings()
+    current_values = {
+        "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
+        "embedding_model": current.get("embedding_model", settings.embedding_model),
+        "embedding_url": current.get("embedding_url", settings.embedding_url),
+        "embedding_api_key": current.get("embedding_api_key", settings.embedding_api_key),
+        "librarr_url": current.get("librarr_url", ""),
+        "librarr_api_key": current.get("librarr_api_key", ""),
+        "librarr_media_type": current.get("librarr_media_type", "audiobook"),
+    }
+    values = {**current_values, **payload.model_dump(exclude_unset=True)}
     for key in ("embedding_api_key","librarr_api_key"):
         if not values[key]: values[key] = current.get(key,"")
-    test = await asyncio.to_thread(get_embedder, values["embedding_backend"],values["embedding_model"],values["embedding_url"],values["embedding_api_key"])
-    health = await test.health()
-    if not health.get("ok"): raise HTTPException(400, f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}")
-    values["embedding_model"] = test.model
+    embedding_fields = (
+        "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"
+    )
+    embedding_changed = any(
+        key in payload.model_fields_set and values[key] != current_values[key]
+        for key in embedding_fields
+    )
+    if embedding_changed:
+        test = await asyncio.to_thread(
+            get_embedder,
+            values["embedding_backend"],
+            values["embedding_model"],
+            values["embedding_url"],
+            values["embedding_api_key"],
+        )
+        health = await test.health()
+        if not health.get("ok"):
+            raise HTTPException(
+                400,
+                f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}",
+            )
+        values["embedding_model"] = test.model
+    else:
+        health = {"ok": True, "checked": False, "model": values["embedding_model"]}
     with transaction() as con:
         for key,value in values.items():
             secret = key.endswith("api_key")
@@ -2753,7 +2797,13 @@ def api_recommendations(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    values, run_id = tracked_recommendations(status=status, limit=limit, offset=offset)
+    with connect() as connection:
+        values, run_id = tracked_recommendations(
+            connection=connection,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
     for item in values:
         item["recommendation_run_id"] = run_id
     response.headers["X-Bookward-Recommendation-Run"] = run_id

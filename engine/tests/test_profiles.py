@@ -18,6 +18,7 @@ from afterword_engine import backups, profiles
 from afterword_engine.api_tokens import generate_api_token, legacy_hash_api_token
 from afterword_engine.config import settings
 from afterword_engine.database import MIGRATIONS, connect, database_lock, initialize, transaction
+import afterword_engine.jobs as jobs
 from afterword_engine.jobs import enqueue_job, worker_loop
 from afterword_engine.main import app
 from afterword_engine.secrets import installation_key, installation_key_path, seal, unseal
@@ -365,6 +366,151 @@ def test_worker_recovers_jobs_with_expired_leases(identity_store, started_at):
     assert job["status"] == "complete"
     assert job["result"] == '{"recovered": true}'
     assert job["lease_token"] is None
+
+
+def test_worker_preserves_a_recent_lease_owned_by_another_worker(identity_store):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("recover_on_startup")
+        claimed_at = jobs.now()
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                "lease_token='previous-process',attempts=1 WHERE id=?",
+                (claimed_at, claimed_at, job_id),
+            )
+
+    stop = asyncio.Event()
+    handled = []
+
+    async def handler(kind):
+        handled.append(kind)
+        return {}
+
+    async def stop_worker():
+        await asyncio.sleep(0.05)
+        stop.set()
+
+    async def run():
+        stopper = asyncio.create_task(stop_worker())
+        await worker_loop(handler, stop)
+        await stopper
+
+    asyncio.run(run())
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,lease_token,attempts FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert handled == []
+    assert job["status"] == "running"
+    assert job["lease_token"] == "previous-process"
+    assert job["attempts"] == 1
+
+
+def test_worker_fails_jobs_after_the_retry_limit(identity_store):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("exhausted_lease")
+        claimed_at = "2000-01-01T00:00:00+00:00"
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                "lease_token='last-process',attempts=? WHERE id=?",
+                (claimed_at, claimed_at, jobs.JOB_MAX_ATTEMPTS, job_id),
+            )
+
+    stop = asyncio.Event()
+    handled = []
+
+    async def handler(kind):
+        handled.append(kind)
+        return {}
+
+    async def stop_worker():
+        await asyncio.sleep(0.05)
+        stop.set()
+
+    async def run():
+        stopper = asyncio.create_task(stop_worker())
+        await worker_loop(handler, stop)
+        await stopper
+
+    asyncio.run(run())
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,error,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert handled == []
+    assert job["status"] == "failed"
+    assert job["error"] == "Job lease expired after maximum attempts"
+    assert job["lease_token"] is None
+
+
+def test_lease_reaper_preserves_a_lease_renewed_after_its_read(identity_store, monkeypatch):
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("renewed_during_reap")
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                "lease_token='renewed-worker',attempts=1 WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", job_id),
+            )
+
+    original_rows = jobs.rows
+
+    def renew_after_read(query, params=()):
+        result = original_rows(query, params)
+        if "FROM jobs WHERE status='running'" in query:
+            with profile_scope("legacy"), transaction() as con:
+                con.execute(
+                    "UPDATE jobs SET heartbeat_at=? WHERE id=?",
+                    (jobs.now(), job_id),
+                )
+        return result
+
+    monkeypatch.setattr(jobs, "rows", renew_after_read)
+    with profile_scope("legacy"):
+        recovered = jobs._reap_abandoned_jobs()
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute(
+            "SELECT status,lease_token,heartbeat_at FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert recovered == 0
+    assert job["status"] == "running"
+    assert job["lease_token"] == "renewed-worker"
+    assert job["heartbeat_at"] != "2000-01-01T00:00:00+00:00"
+
+
+def test_idle_worker_does_not_open_write_transactions_for_lease_reaping(
+    identity_store, monkeypatch
+):
+    calls = 0
+    original_transaction = jobs.transaction
+
+    def count_transactions():
+        nonlocal calls
+        calls += 1
+        return original_transaction()
+
+    monkeypatch.setattr(jobs, "transaction", count_transactions)
+    stop = asyncio.Event()
+
+    async def stop_worker():
+        await asyncio.sleep(0.05)
+        stop.set()
+
+    async def run():
+        stopper = asyncio.create_task(stop_worker())
+        await worker_loop(lambda _kind: asyncio.sleep(0), stop)
+        await stopper
+
+    asyncio.run(run())
+
+    assert calls == 0
 
 
 def test_expired_worker_cannot_overwrite_the_reclaimed_job_result(identity_store):

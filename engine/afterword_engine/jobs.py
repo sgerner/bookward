@@ -4,14 +4,70 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
-from .database import transaction
+import time
+
+from .database import rows, transaction
 from .security import safe_error_message
 
 LOGGER = logging.getLogger(__name__)
 JOB_LEASE_SECONDS = 300
 JOB_HEARTBEAT_SECONDS = 30
+JOB_REAPER_SECONDS = 30
+JOB_MAX_ATTEMPTS = 3
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def _reap_abandoned_jobs() -> int:
+    """Recover expired leases, failing jobs after bounded attempts."""
+
+    stale_before = (
+        datetime.now(timezone.utc) - timedelta(seconds=JOB_LEASE_SECONDS)
+    ).isoformat()
+    running = rows(
+        "SELECT id,lease_token,attempts,"
+        "CASE WHEN COALESCE(heartbeat_at,started_at) IS NULL "
+        "OR julianday(COALESCE(heartbeat_at,started_at)) IS NULL "
+        "OR julianday(COALESCE(heartbeat_at,started_at)) < julianday(?) "
+        "THEN 1 ELSE 0 END AS expired "
+        "FROM jobs WHERE status='running'",
+        (stale_before,),
+    )
+    abandoned = [item for item in running if item["expired"]]
+    if not abandoned:
+        return 0
+
+    recovered = 0
+    with transaction() as con:
+        for item in abandoned:
+            if int(item["attempts"] or 0) >= JOB_MAX_ATTEMPTS:
+                updated = con.execute(
+                    "UPDATE jobs SET status='failed',error=?,finished_at=?,"
+                    "heartbeat_at=NULL,lease_token=NULL "
+                    "WHERE id=? AND status='running' AND lease_token IS ? "
+                    "AND (COALESCE(heartbeat_at,started_at) IS NULL "
+                    "OR julianday(COALESCE(heartbeat_at,started_at)) IS NULL "
+                    "OR julianday(COALESCE(heartbeat_at,started_at)) < julianday(?))",
+                    (
+                        "Job lease expired after maximum attempts",
+                        now(),
+                        item["id"],
+                        item["lease_token"],
+                        stale_before,
+                    ),
+                ).rowcount
+            else:
+                updated = con.execute(
+                    "UPDATE jobs SET status='queued',started_at=NULL,"
+                    "heartbeat_at=NULL,lease_token=NULL "
+                    "WHERE id=? AND status='running' AND lease_token IS ? "
+                    "AND (COALESCE(heartbeat_at,started_at) IS NULL "
+                    "OR julianday(COALESCE(heartbeat_at,started_at)) IS NULL "
+                    "OR julianday(COALESCE(heartbeat_at,started_at)) < julianday(?))",
+                    (item["id"], item["lease_token"], stale_before),
+                ).rowcount
+            recovered += updated
+    return recovered
 
 def enqueue_job(kind: str, dedupe: bool = False):
     with transaction() as con:
@@ -30,23 +86,20 @@ async def worker_loop(handler, stop):
     from .database import row
     from .profiles import profile_ids
     from .tenancy import profile_scope
+    last_reaped_at: dict[str, float] = {}
     while not stop.is_set():
         worked = False
         for profile_id in profile_ids():
             if stop.is_set():
                 break
             with profile_scope(profile_id):
-                with transaction() as con:
-                    stale_before = (
-                        datetime.now(timezone.utc) - timedelta(seconds=JOB_LEASE_SECONDS)
-                    ).isoformat()
-                    con.execute(
-                        "UPDATE jobs SET status='queued',started_at=NULL,heartbeat_at=NULL,lease_token=NULL "
-                        "WHERE status='running' AND (COALESCE(heartbeat_at,started_at) IS NULL "
-                        "OR julianday(COALESCE(heartbeat_at,started_at)) IS NULL "
-                        "OR julianday(COALESCE(heartbeat_at,started_at)) < julianday(?))",
-                        (stale_before,),
-                    )
+                current = time.monotonic()
+                if (
+                    profile_id not in last_reaped_at
+                    or current - last_reaped_at[profile_id] >= JOB_REAPER_SECONDS
+                ):
+                    _reap_abandoned_jobs()
+                    last_reaped_at[profile_id] = current
                 job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
                 if not job:
                     continue
@@ -54,7 +107,8 @@ async def worker_loop(handler, stop):
                 claimed_at = now()
                 with transaction() as con:
                     claimed = con.execute(
-                        "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,lease_token=? "
+                        "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                        "lease_token=?,attempts=attempts+1 "
                         "WHERE id=? AND status='queued'",
                         (claimed_at, claimed_at, lease_token, job["id"]),
                     ).rowcount

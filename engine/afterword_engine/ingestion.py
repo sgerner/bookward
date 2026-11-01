@@ -768,8 +768,9 @@ def import_goodreads_csv(content: bytes):
                 try:
                     rating = float(source_row.get("My Rating") or 0) or None
                 except (TypeError, ValueError) as exc:
-                    raise ValueError("Ratings must be numeric values between 0 and 5") from exc
-                if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): raise ValueError("Ratings must be between 0 and 5")
+                    raise ValueError(f"CSV row {row_number} ({title!r}): rating must be numeric and between 0 and 5. No books were imported.") from exc
+                if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
+                    raise ValueError(f"CSV row {row_number} ({title!r}): rating must be between 0 and 5. No books were imported.")
                 read_at = _read_date_value(source_row.get("Date Read"))
                 isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
                 con.execute(
@@ -3061,7 +3062,6 @@ async def refresh_missing_candidate_metadata():
             ):
                 description_upgrade = bool(
                     candidate_description.get("kind") == "synopsis"
-                    and candidate_description.get("opening_sentence") == previous.get("description")
                     and candidate_description.get("provider") == previous.get("_legacy_metadata_provider")
                     and candidate_description.get("provider_id") == previous.get("_legacy_metadata_provider_id")
                     and candidate_description.get("text")

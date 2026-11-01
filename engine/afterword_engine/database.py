@@ -953,6 +953,12 @@ MIGRATIONS = [
         DROP TABLE IF EXISTS reading_progress;
         """,
     ),
+    (
+        23,
+        """
+        ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

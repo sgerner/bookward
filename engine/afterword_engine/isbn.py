@@ -6,10 +6,22 @@ import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 
+def normalize_isbn_identifier(value: object) -> str:
+    """Remove ISBN presentation punctuation without validating the value.
+
+    Some association APIs accept both ISBN-10 and ISBN-13 as entered, so this
+    lightweight transport helper intentionally preserves the identifier type.
+    Use :func:`canonical_isbn` when checksum validation or ISBN-13 matching is
+    required.
+    """
+
+    return re.sub(r"[^0-9Xx]", "", str(value or "")).upper()
+
+
 def canonical_isbn(value: object) -> str:
     """Return a checksum-valid ISBN-10/13, or an empty string."""
 
-    raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
+    raw = normalize_isbn_identifier(value)
     if len(raw) == 13 and raw.isdigit():
         total = sum(
             (1 if index % 2 == 0 else 3) * int(char)
@@ -52,7 +64,7 @@ def isbn_parts(*values: object) -> tuple[str, str]:
         if isinstance(value, (list, tuple, set)):
             pending[0:0] = list(value)
             continue
-        raw = re.sub(r"[^0-9Xx]", "", str(value or ""))
+        raw = normalize_isbn_identifier(value)
         if len(raw) == 10 and not isbn10 and canonical_isbn(raw):
             isbn10 = raw.upper()
             isbn13 = isbn13 or canonical_isbn(raw)

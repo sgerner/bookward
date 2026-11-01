@@ -274,6 +274,42 @@ def test_recommendations_hide_recommended_duplicate_of_imported_work(database):
     assert imported_id not in {item["id"] for item in visible}
 
 
+def test_recommendations_use_title_fallback_for_reads_without_an_author(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("The Unnamed Book", "Unknown author", "test"),
+        )
+    candidate_id = add_candidate("The Unnamed Book", "A Cataloged Writer")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+
+    assert candidate_id not in visible_ids
+
+
+def test_recommendations_deduplicate_edition_title_variants(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+    first_edition = add_candidate("The Lost City: A Novel", "A. Writer", score=100)
+    duplicate_edition = add_candidate("The Lost City", "A. Writer", score=90)
+    different_author = add_candidate("The Lost City", "Another Writer", score=80)
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            [(first_edition,), (duplicate_edition,), (different_author,)],
+        )
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+
+    assert visible_ids == {first_edition, different_author}
+
+
 def test_discovery_never_returns_the_three_read_book_identity_variants(database):
     with transaction() as con:
         con.execute("UPDATE candidates SET status='rejected'")
@@ -433,3 +469,37 @@ def test_read_identity_index_keeps_unknown_history_author_title_fallback(read_au
     ])
     assert indexed.matches({"title": "Title Collision", "author": "Known Author"})
     assert not indexed.matches({"title": "A Different Title", "author": "Known Author"})
+
+
+def test_scoring_filters_known_read_with_missing_author_before_embedding(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,4,'test')",
+            ("Known Work Without Read Author", "Unknown author"),
+        )
+    candidate_id = add_candidate(
+        "Known Work Without Read Author",
+        "Catalog Author",
+        status="new",
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    class FakeEmbedder:
+        name, model = "test", "missing-author-filter"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+
+    assert asyncio.run(score_all(embedder=embedder)) == 0
+    assert not any("Known Work Without Read Author" in text for text in embedder.texts)
