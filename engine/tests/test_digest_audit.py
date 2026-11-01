@@ -25,6 +25,8 @@ def test_untrusted_catalog_text_cannot_trigger_discord_mentions():
     )
     assert payload["allowed_mentions"] == {"parse": []}
     assert "@everyone" in payload["content"]
+    assert "ranking score 90" in payload["content"]
+    assert "90%" not in payload["content"]
 
 
 def test_legacy_discord_payloads_also_disable_mentions_on_delivery(monkeypatch):

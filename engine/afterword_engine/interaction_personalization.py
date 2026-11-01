@@ -537,6 +537,20 @@ def personalize_recommendations(
                 if delta > 0
                 else "Lowered using books you rejected or rated poorly"
             )
+            # Name a contributing feature only when its learned effect agrees
+            # with the actual movement; semantic-only changes retain the
+            # general explanation rather than inventing a seed-book match.
+            contributing = sorted(
+                (feature for feature in feature_keys if effects.get(feature, 0.0) * delta > 0),
+                key=lambda feature: (-abs(effects[feature]), feature),
+            )
+            if contributing:
+                feature = contributing[0]
+                if feature.startswith("author:"):
+                    detail = f"author {item.get('author')}"
+                else:
+                    detail = f"subject {feature.removeprefix('subject:')}"
+                message += f" ({detail})"
             if message not in explanation:
                 item["explanation"] = [*explanation, message]
             adjusted_count += 1
