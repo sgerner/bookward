@@ -2,7 +2,7 @@
   import { applyAction, deserialize, enhance, type SubmitFunction } from "$app/forms";
   import { invalidateAll, pushState } from "$app/navigation";
   import { page } from "$app/state";
-  import { onMount } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { flip } from "svelte/animate";
   import { fade, fly, scale, slide } from "svelte/transition";
   import {
@@ -44,6 +44,7 @@
   import { tokenForView } from "#lib/api-token-ui.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
+  import { modalFocus } from "#lib/actions/modal-focus.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "decisions" | "sources" | "settings";
@@ -92,18 +93,22 @@
   let profileMenuOpen = $state(false);
   let profileMenuRoot = $state<HTMLDivElement | null>(null);
   let profileMenuButton = $state<HTMLButtonElement | null>(null);
-  let detailsId = $state<number | null>(null);
+  let expandedRecommendationDetails = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
+  const DECISION_PAGE_SIZE = 24;
   const FORM_NOTIFICATION_DISMISS_MS = 5000;
   const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
-  const FORM_NOTIFICATION_UNDO_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 3500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
+  let additionalDecisionBooks = $state<PageBook[]>([]);
   let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
+  let decisionsHasMoreOverride = $state<boolean | null>(null);
+  let decisionsLoading = $state(false);
+  let decisionsLoadError = $state("");
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
@@ -120,6 +125,8 @@
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
+  let previousDataDecisions: PageBook[] | null = null;
+  let previousDataDecisionsHasMore: boolean | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -149,6 +156,11 @@
   let apiTokenCopyMessage = $state<string | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
+  let notificationPointerInside = false;
+  let notificationFocusInside = false;
+  let notificationPaused = false;
+  let formNotificationTimer: ReturnType<typeof setTimeout> | null = null;
+  let formNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
   let optimisticNotification = $state<{
     message: string;
     error: boolean;
@@ -158,6 +170,7 @@
   } | null>(null);
   let optimisticNotificationId = 0;
   let optimisticNotificationTimer: ReturnType<typeof setTimeout> | null = null;
+  let optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
   let defaultSourceEnabledOverride = $state<boolean | null>(null);
   let sourceEnabledOverrides = $state<Record<number, boolean>>({});
   let sourceScheduleOverride = $state<number | null>(null);
@@ -208,10 +221,13 @@
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
   const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks].map((book) => {
+    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
       const status = bookStatusOverrides[book.id];
       return status === undefined ? book : { ...book, status };
     }),
+  );
+  const decisionsHasMore = $derived(
+    decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
   const discoverBooks = $derived(
     allBooks.filter(
@@ -237,9 +253,14 @@
     };
     const matchesSearch = (item: ReadingHistoryItem) =>
       !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
+    const timestamps = new Map<number, number>();
     const readTimestamp = (item: ReadingHistoryItem) => {
+      const cached = timestamps.get(item.id);
+      if (cached !== undefined) return cached;
       const timestamp = Date.parse(item.read_at ?? item.created_at);
-      return Number.isFinite(timestamp) ? timestamp : 0;
+      const normalized = Number.isFinite(timestamp) ? timestamp : 0;
+      timestamps.set(item.id, normalized);
+      return normalized;
     };
     return readingHistory
       .filter((item) =>
@@ -391,6 +412,53 @@
   );
   const formIsError = $derived(Boolean(visibleNotification?.error));
 
+  function scheduleFormNotificationDismiss() {
+    if (formNotificationTimer) clearTimeout(formNotificationTimer);
+    formNotificationTimer = null;
+    if (untrack(() => notificationPaused || Boolean(optimisticNotification))) return;
+    if (formNotificationDismissDelay === 0) return;
+    formNotificationTimer = setTimeout(() => {
+      formNotificationDismissed = true;
+      formNotificationTimer = null;
+    }, formNotificationDismissDelay);
+  }
+
+  function scheduleOptimisticNotificationDismiss() {
+    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+    optimisticNotificationTimer = null;
+    const id = optimisticNotification?.id;
+    if (id === undefined || notificationPaused) return;
+    optimisticNotificationTimer = setTimeout(() => {
+      if (optimisticNotification?.id !== id) return;
+      optimisticNotification = null;
+      formNotificationDismissed = true;
+      optimisticNotificationTimer = null;
+    }, optimisticNotificationDismissDelay);
+  }
+
+  function updateNotificationPause() {
+    const shouldPause = notificationPointerInside || notificationFocusInside;
+    if (shouldPause === notificationPaused) return;
+    notificationPaused = shouldPause;
+    if (notificationPaused) {
+      if (formNotificationTimer) clearTimeout(formNotificationTimer);
+      if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+      formNotificationTimer = null;
+      optimisticNotificationTimer = null;
+    } else if (optimisticNotification) {
+      scheduleOptimisticNotificationDismiss();
+    } else if (formState?.message && !formNotificationDismissed) {
+      scheduleFormNotificationDismiss();
+    }
+  }
+
+  function onNotificationFocusOut(event: FocusEvent) {
+    const container = event.currentTarget as HTMLElement;
+    if (event.relatedTarget instanceof Node && container.contains(event.relatedTarget)) return;
+    notificationFocusInside = false;
+    updateNotificationPause();
+  }
+
   $effect(() => {
     // Read the prop itself so identical messages from separate submissions
     // still restart the notification timer.
@@ -399,17 +467,16 @@
     formNotificationDismissed = false;
     if (!message) return;
 
-    const dismissTimer = setTimeout(
-      () => {
-        formNotificationDismissed = true;
-      },
-      currentForm?.error
-        ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-        : currentForm?.undo_id
-          ? FORM_NOTIFICATION_UNDO_DISMISS_MS
-          : FORM_NOTIFICATION_DISMISS_MS,
-    );
-    return () => clearTimeout(dismissTimer);
+    formNotificationDismissDelay = currentForm?.error
+      ? FORM_NOTIFICATION_ERROR_DISMISS_MS
+      : currentForm?.undo_id
+        ? 0
+        : FORM_NOTIFICATION_DISMISS_MS;
+    scheduleFormNotificationDismiss();
+    return () => {
+      if (formNotificationTimer) clearTimeout(formNotificationTimer);
+      formNotificationTimer = null;
+    };
   });
 
   function readView(value: string | null): View {
@@ -496,6 +563,12 @@
       ? expandedReadingDetails.filter((itemId) => itemId !== id)
       : [...expandedReadingDetails, id];
   }
+  function toggleRecommendationDetails(id: number) {
+    const next = new Set(expandedRecommendationDetails);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    expandedRecommendationDetails = next;
+  }
   function readingSourceLabel(source: string) {
     return ({
       goodreads_csv: "Goodreads CSV export",
@@ -522,20 +595,32 @@
       pushState(url, {});
     }
   }
+  async function goToLibrarrSettings() {
+    go("settings");
+    await tick();
+    const section = document.getElementById("librarr-settings");
+    if (!section) return;
+    section.scrollIntoView({
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+      block: "start",
+    });
+    section.focus({ preventScroll: true });
+  }
   function announceActionError(message: string) {
-    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+    if (formNotificationTimer) clearTimeout(formNotificationTimer);
+    formNotificationTimer = null;
     const id = ++optimisticNotificationId;
     formNotificationDismissed = true;
     optimisticNotification = { message, error: true, id };
-    optimisticNotificationTimer = setTimeout(() => {
-      if (optimisticNotification?.id !== id) return;
-      optimisticNotification = null;
-      formNotificationDismissed = true;
-      optimisticNotificationTimer = null;
-    }, FORM_NOTIFICATION_ERROR_DISMISS_MS);
+    optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
+    scheduleOptimisticNotificationDismiss();
   }
 
   function dismissNotification() {
+    if (formNotificationTimer) clearTimeout(formNotificationTimer);
+    formNotificationTimer = null;
     if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
     optimisticNotificationTimer = null;
     optimisticNotification = null;
@@ -631,7 +716,7 @@
   }
 
   function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks].find((item) => item.id === id);
+    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
@@ -918,6 +1003,45 @@
     }
   }
 
+  async function loadMoreDecisions() {
+    if (decisionsLoading || !decisionsHasMore) return;
+    decisionsLoading = true;
+    decisionsLoadError = "";
+    const offset = data.decisions.length + additionalDecisionBooks.length;
+    try {
+      const params = new URLSearchParams({
+        status: "decisions",
+        limit: String(DECISION_PAGE_SIZE),
+        offset: String(offset),
+      });
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Past decisions could not be loaded.");
+      }
+      const existing = new Set(
+        [...data.decisions, ...additionalDecisionBooks].map((book) => book.id),
+      );
+      additionalDecisionBooks = [
+        ...additionalDecisionBooks,
+        ...payload.items.filter((book) => !existing.has(book.id)),
+      ];
+      decisionsHasMoreOverride = payload.has_more === true;
+    } catch (error) {
+      decisionsLoadError = error instanceof Error
+        ? error.message
+        : "Past decisions could not be loaded.";
+    } finally {
+      decisionsLoading = false;
+    }
+  }
+
   function toggleDigestBook(id: number) {
     const next = new Set(selectedDigestIds);
     if (next.has(id)) next.delete(id);
@@ -947,7 +1071,12 @@
   }
 
   function formatSourceScan(value: string | null, status: string | null) {
-    if (status?.startsWith("error:")) return "Needs attention";
+    if (status?.startsWith("error:")) {
+      const detail = status.slice("error:".length).trim().replace(/\s+/g, " ");
+      if (!detail) return "Needs attention";
+      const clipped = detail.length > 140 ? `${detail.slice(0, 139)}…` : detail;
+      return `Needs attention: ${clipped}`;
+    }
     if (!value) return "Not scanned yet";
     const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
     const date = new Date(normalized);
@@ -1128,6 +1257,20 @@
     additionalDiscoverBooks = [];
     discoverHasMore = true;
     discoverLoadError = "";
+  });
+
+  $effect(() => {
+    const nextDecisions = data.decisions;
+    const nextHasMore = Boolean(data.decisions_has_more);
+    if (
+      previousDataDecisions === nextDecisions &&
+      previousDataDecisionsHasMore === nextHasMore
+    ) return;
+    previousDataDecisions = nextDecisions;
+    previousDataDecisionsHasMore = nextHasMore;
+    additionalDecisionBooks = [];
+    decisionsHasMoreOverride = null;
+    decisionsLoadError = "";
   });
 
   $effect(() => {
@@ -1523,7 +1666,13 @@
   <div
     class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
-    <div id="main-content" role="main" class="min-w-0 flex-1">
+    <main id="main-content" tabindex="-1" class="min-w-0 flex-1">
+      <div
+        class="sr-only"
+        role={formIsError ? "alert" : "status"}
+        aria-live={formIsError ? "assertive" : "polite"}
+        aria-atomic="true"
+      >{visibleNotification?.message ?? ""}</div>
       {#if visibleNotification}
         {#key visibleNotification.id ?? visibleNotification.message}
           <div
@@ -1533,8 +1682,21 @@
               in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
               out:fly={{ x: 16, duration: motionDuration(170) }}
               class={`pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
-              role={formIsError ? "alert" : "status"}
-              aria-atomic="true"
+              role="group"
+              aria-label={formIsError ? "Action error notification" : "Action success notification"}
+              onpointerenter={() => {
+                notificationPointerInside = true;
+                updateNotificationPause();
+              }}
+              onpointerleave={() => {
+                notificationPointerInside = false;
+                updateNotificationPause();
+              }}
+              onfocusin={() => {
+                notificationFocusInside = true;
+                updateNotificationPause();
+              }}
+              onfocusout={onNotificationFocusOut}
             >
               <span
                 aria-hidden="true"
@@ -1616,11 +1778,12 @@
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All ({allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length})</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later ({allBooks.filter((book) => book.status === "maybe_later").length})</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed ({allBooks.filter((book) => book.status === "rejected").length})</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
+            {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length} loaded decisions. Load more to include older books.</p>{/if}
           </section>
         {/if}
         {#if view !== "decisions" || decisionFilter !== "read"}
@@ -1695,9 +1858,9 @@
               <button
                 type="button"
                 class={`relative hidden h-full w-full self-stretch overflow-hidden preset-tonal-surface text-left before:pointer-events-none before:absolute before:inset-0 before:z-10 before:bg-gradient-to-t before:from-primary-950/30 before:via-transparent before:to-secondary-500/10 before:content-[''] sm:block`}
-                onclick={() => (detailsId = detailsId === book.id ? null : book.id)}
+                onclick={() => toggleRecommendationDetails(book.id)}
                 aria-label={`View details for ${book.title}`}
-                aria-expanded={detailsId === book.id}
+                aria-expanded={expandedRecommendationDetails.has(book.id)}
               >
                 <span class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400">
                   <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
@@ -1713,12 +1876,12 @@
                 <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
               </button>
               <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
-                <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
+              <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
-                  {#if book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
+                  {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
                       class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
@@ -1735,17 +1898,18 @@
                 </div>
                 <details
                   class="group/details text-base text-surface-700-300"
-                  open={detailsId === book.id}
+                  open={expandedRecommendationDetails.has(book.id)}
                   ontoggle={(event) => {
                     const open = (event.currentTarget as HTMLDetailsElement).open;
                     if (open) recordBookEvent(book.id, "detail_open");
-                    detailsId = open ? book.id : null;
+                    const isExpanded = expandedRecommendationDetails.has(book.id);
+                    if (open !== isExpanded) toggleRecommendationDetails(book.id);
                   }}
                 >
                   <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
                     <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
-                  {#if detailsId === book.id}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
+                  {#if expandedRecommendationDetails.has(book.id)}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
                       <p class="mt-2 leading-6">{book.reason}</p>
                       {#if book.synopsis}<div class="mt-4 border-l-2 border-secondary-500/50 pl-3">
                           <p class="text-xs font-semibold uppercase tracking-[0.16em] text-secondary-600-400">Book summary</p>
@@ -1783,29 +1947,22 @@
                         class="absolute bottom-full right-0 z-50 mb-2 w-56 border preset-filled-surface-50-950 p-3 text-left normal-case shadow-xl"
                       >
                         <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
-                        <form class="mt-3 flex flex-col gap-2" method="POST" action="?/markRead" use:enhance={setPending(`read-${book.id}`, optimisticRead)}>
-                          <ProfileField profileId={data.user?.profile_id} />
-                          <input type="hidden" name="id" value={book.id} />
-                          <label class="flex flex-col gap-1 text-xs font-medium text-surface-700-300" for={`read-rating-${book.id}`}>
-                            Your rating <span class="sr-only">for {book.title}</span>
-                            <select id={`read-rating-${book.id}`} name="rating" class="select select-sm min-h-10 w-full preset-tonal-surface">
-                              <option value="">No rating</option>
-                              {#each [5, 4, 3, 2, 1] as rating (rating)}<option value={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>{/each}
-                            </select>
-                          </label>
-                          <button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`read-${book.id}`)} aria-busy={isPending(`read-${book.id}`)}>
-                            {#if isPending(`read-${book.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<BookOpen size={14} />{/if} Mark as read
-                          </button>
-                        </form>
+                        <button
+                          type="button"
+                          class="btn btn-sm mt-3 min-h-10 w-full preset-filled-primary-500"
+                          onclick={() => openMarkRead(book)}
+                        ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
                   {:else if book.status === "saved"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    {#if book.status === "saved"}
+                    {#if librarrConnected}
+                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
                       <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={!librarrConnected || isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} {librarrConnected ? `Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist` : "Connect Librarr first"}</button>
+                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                       </form>
+                    {:else}
+                      <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
                       in:fly={{ y: 8, duration: motionDuration(180) }}
@@ -1835,9 +1992,21 @@
                 <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" ? "Shortlist a recommendation when one catches your eye." : filter ? "Try an author, title, or genre." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
               </div>
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
+              {#if view === "discover" && !filter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+                <ProfileField profileId={data.user?.profile_id} />
+                <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
+                  {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
+                </button>
+              </form>{/if}
             </div>{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex justify-center pt-1">
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
+            </div>{/if}
+          {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
+              {#if decisionsLoadError}<p class="text-sm text-error-600-400" role="alert">{decisionsLoadError}</p>{/if}
+              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
+                {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
+              </button>
             </div>{/if}
         </section>
         {:else}
@@ -2141,7 +2310,7 @@
                             <p class="mt-1 truncate text-sm text-surface-700-300">
                               {source.url}
                             </p>
-                            <span class="mt-1 block text-xs text-surface-600-400">
+                            <span class="mt-1 block break-words text-xs text-surface-600-400">
                               {#if source.lifecycle === "one_time"}
                                 One-time import · {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {:else}
@@ -2561,11 +2730,11 @@
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
-                    >Full history</span
+                    >Read-shelf history</span
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import your complete library, ratings, and read dates.
+                  Import the books on your Goodreads read shelf, with their ratings and read dates.
                 </p>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
@@ -2588,12 +2757,14 @@
                 >
               </form>
               <form
+                id="librarr-settings"
+                tabindex="-1"
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
                   delay: motionDelay(2),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
@@ -2614,8 +2785,8 @@
                   <span
                     class={`badge shrink-0 ${librarrConnected ? "preset-tonal-success" : "preset-tonal-surface"}`}
                     >{librarrConnected
-                      ? "Connected"
-                      : "Not connected"}</span
+                      ? "Configured"
+                      : "Not configured"}</span
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
@@ -3078,7 +3249,7 @@
           </div>
         {/if}
       </div>
-    </div>
+    </main>
   </div>
 
   <nav
@@ -3107,9 +3278,12 @@
       out:fade={{ duration: motionDuration(180) }}
       class="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-surface-950/75 p-4 backdrop-blur-md"
       role="presentation"
-      onclick={closeMarkRead}
+      onclick={(event) => {
+        if (event.target === event.currentTarget) closeMarkRead();
+      }}
     >
-      <section
+      <div
+        use:modalFocus
         role="dialog"
         aria-modal="true"
         aria-labelledby="mark-read-title"
@@ -3118,7 +3292,6 @@
         in:scale={{ duration: motionDuration(260), start: 0.94 }}
         out:scale={{ duration: motionDuration(170), start: 0.97 }}
         class="relative isolate w-full max-w-xl overflow-hidden rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
-        onclick={(event) => event.stopPropagation()}
       >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
@@ -3138,7 +3311,7 @@
             type="button"
             class="btn btn-icon btn-sm shrink-0 rounded-full preset-tonal-surface"
             aria-label="Close Mark Read dialog"
-            autofocus
+            data-modal-initial-focus
             onclick={closeMarkRead}
           ><X size={17} /></button>
         </div>
@@ -3190,7 +3363,7 @@
             <button type="button" class="btn min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
             <button
               type="submit"
-              class="btn min-h-11 rounded-xl bg-gradient-to-r from-primary-500 to-secondary-500 px-5 font-semibold text-white shadow-lg shadow-primary-950/30 transition hover:-translate-y-0.5 hover:shadow-xl disabled:translate-y-0 disabled:opacity-60"
+              class="btn min-h-11 preset-filled-primary-500"
               disabled={isPending(`shortlist-read-${markReadBook.id}`)}
               aria-busy={isPending(`shortlist-read-${markReadBook.id}`)}
             >
@@ -3198,7 +3371,7 @@
             </button>
           </div>
         </form>
-      </section>
+      </div>
     </div>
   {/if}
   {#if librarrSearchOpen}
@@ -3210,20 +3383,21 @@
       onclick={closeLibrarrSearch}
     >
       <dialog
+        use:modalFocus
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
         class="relative m-0 card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
+        aria-modal="true"
         onclick={(event) => event.stopPropagation()}
-        onkeydown={(event) => event.stopPropagation()}
       >
         <div
           class="flex items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium text-primary-600-400">
-              Connected Librarr
+              Librarr search
             </p>
             <h2
               id="librarr-search-title"
@@ -3255,6 +3429,7 @@
               aria-label="Search Librarr"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
                 class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
+                data-modal-initial-focus
                 bind:value={librarrQuery}
                 placeholder="Search title or author"
               /></label
