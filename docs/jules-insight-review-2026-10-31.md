@@ -92,7 +92,7 @@ idempotency and retention behavior without a bounded design would add risk.
 `rtk engine/.venv/bin/python -m pytest engine/tests -q`: **534 passed** in
 97.31s (two existing Starlette/httpx deprecation warnings). CI workflow YAML
 parsing and whitespace validation passed during the workflow edit. Web
-`rtk npm run check`: **0 errors and 0 warnings**; `rtk npm test`: **79 passed**;
+`rtk npm run check`: **0 errors and 0 warnings**; `rtk npm test`: **79 passed** before two final pagination cases; the updated endpoint suite passed all **6 tests**, including exact terminal pages;
 `npm run build` with `ORIGIN=http://127.0.0.1:54567`: passed; `git diff --check`:
 passed. A direct same-origin sign-in against the disposable production build
 also passed. The root agent owns final integration status.
@@ -104,9 +104,6 @@ Restoring a decision loaded on the second page also succeeded.
 
 ## Jules archive status
 
-All 52 original active insights were reviewed. At the last verified browser
-state, 10 had been archived and 42 remained active. Archiving the remainder
-was blocked by browser-control failures on the embedded Jules page (visible
-controls failed semantic, keyboard, and native activation). The user was asked
-to reopen the tab; the remaining items should be archived after control recovers.
-This archive status is separate from implementation and validation.
+All 52 original active insights were reviewed and archived after implementation
+or an explicit decision to decline the proposal. Browser control recovered when
+the user reopened the tab; all 42 outstanding archives were then completed.
