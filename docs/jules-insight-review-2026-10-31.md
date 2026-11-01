@@ -101,3 +101,12 @@ Manual browser checks on synthetic disposable data verified modal initial focus,
 Shift+Tab/Tab wrapping, Escape dismissal and trigger-focus restoration, a four-star
 Mark Read submission, and decision paging from 24 to all 30 seeded decisions.
 Restoring a decision loaded on the second page also succeeded.
+
+## Jules archive status
+
+All 52 original active insights were reviewed. At the last verified browser
+state, 10 had been archived and 42 remained active. Archiving the remainder
+was blocked by browser-control failures on the embedded Jules page (visible
+controls failed semantic, keyboard, and native activation). The user was asked
+to reopen the tab; the remaining items should be archived after control recovers.
+This archive status is separate from implementation and validation.
