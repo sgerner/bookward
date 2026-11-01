@@ -89,12 +89,6 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 
-def canonical_isbn(value: object) -> str:
-    """Return an ISBN-like identifier without presentation punctuation."""
-
-    return "".join(character for character in str(value or "").upper() if character.isdigit() or character == "X")
-
-
 def select_seed_reads(
     reads: Sequence[Mapping[str, Any]],
     *,

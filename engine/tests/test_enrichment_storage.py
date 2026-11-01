@@ -560,13 +560,13 @@ def test_read_identity_edit_invalidates_cache_without_changing_rating(database):
     ) is None
 
 
-def test_candidate_metadata_upgrade_is_versioned_and_field_auditable(database, monkeypatch):
+def test_verified_catalog_synopsis_replaces_an_initial_source_blurb(database, monkeypatch):
     with transaction() as con:
         candidate_id = con.execute(
             "INSERT INTO candidates(title,author,description,source_url,normalized_key) "
             "VALUES(?,?,?,?,?)",
             (
-                "Legacy catalog book", "A Writer", "The opening sentence.",
+                "Legacy catalog book", "A Writer", "Initial source blurb.",
                 "https://example.com/book", "legacy catalog book a writer",
             ),
         ).lastrowid
@@ -585,7 +585,7 @@ def test_candidate_metadata_upgrade_is_versioned_and_field_auditable(database, m
                 "provider": "openlibrary",
                 "provider_id": "/works/OL987W",
                 "kind": "synopsis",
-                "opening_sentence": "The opening sentence.",
+                "opening_sentence": "Different catalog opening sentence.",
                 "text": "The complete verified synopsis.",
             },
             "_metadata_provider": "openlibrary",

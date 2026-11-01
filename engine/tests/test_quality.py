@@ -11,6 +11,7 @@ from afterword_engine import covers
 from afterword_engine.covers import GOOGLE_BOOKS_SEARCH, OPEN_LIBRARY_SEARCH
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, rows, transaction
+from afterword_engine.isbn import normalize_isbn_identifier
 from afterword_engine.quality import (
     QUALITY_VERSION,
     audit_candidates,
@@ -59,6 +60,8 @@ def add_candidate(
 def test_isbn_validation_and_local_quality(database):
     assert canonical_isbn("978-0-06-112008-4") == "9780061120084"
     assert canonical_isbn("9780061120085") == ""
+    assert normalize_isbn_identifier("0-306-40615-2") == "0306406152"
+    assert normalize_isbn_identifier("9780061120085") == "9780061120085"
     assert "unknown_author" in local_flags({"title": "A Book", "author": "Unknown author"})
     assert "noise_title" in local_flags({"title": "Coming soon", "author": "A Writer"})
     assert _author_similarity("A Writer", "B Writer") < 0.65

@@ -20,26 +20,18 @@ from ..associations import (
     AssociationCache,
     OPEN_LIBRARY_LISTS_PROVIDER,
     RateLimiter,
-    canonical_isbn,
     record_association_request,
 )
 from ..config import settings
 from ..identity import ReadIdentityIndex, book_identity
-from ..isbn import isbn_parts
+from ..isbn import isbn_parts, normalize_isbn_identifier
 from ..security import resolve_public_target
+from .common import clean as _clean, title_key as _title_key
 
 
 OPEN_LIBRARY_BASE = "https://openlibrary.org"
 OPEN_LIBRARY_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
 _OPEN_LIBRARY_BOOK_KEY = re.compile(r"^/(works|books)/(OL\d+[WM])/?$", re.IGNORECASE)
-
-
-def _title_key(value: object) -> str:
-    return book_identity(str(value or ""), "").split("\x1f", 1)[0]
-
-
-def _clean(value: object, limit: int = 500) -> str:
-    return " ".join(str(value or "").split()).strip()[:limit]
 
 
 def _authors(value: object) -> list[str]:
@@ -258,7 +250,7 @@ class OpenLibraryListProvider:
         self._resolutions = 0
 
     async def _resolve_work(self, read: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
-        isbn = canonical_isbn(read.get("isbn"))
+        isbn = normalize_isbn_identifier(read.get("isbn"))
         params: dict[str, Any] = {
             "limit": 5,
             "fields": "key,title,author_name,isbn,isbn13,author_key",

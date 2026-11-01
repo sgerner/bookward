@@ -49,11 +49,11 @@ from afterword_engine.embeddings import get_embedder
 from afterword_engine.secrets import seal
 from afterword_engine.security import safe_error_message, validate_public_url, validate_service_url
 from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
+from afterword_engine.quality import has_candidate_quality_audit_candidates
 from afterword_engine.main import (
     SOURCE_SYNC_ERROR_RETRY_SECONDS,
     app,
     handle_job,
-    _needs_candidate_quality_audit,
     recommendation_list,
     score,
     source_sync_is_due,
@@ -139,12 +139,12 @@ def test_startup_quality_audit_ignores_rejected_legacy_candidates(database):
             (candidate_id,),
         )
 
-    assert _needs_candidate_quality_audit() is False
+    assert has_candidate_quality_audit_candidates() is False
 
     with transaction() as con:
         con.execute("UPDATE candidates SET status='new' WHERE id=?", (candidate_id,))
 
-    assert _needs_candidate_quality_audit() is True
+    assert has_candidate_quality_audit_candidates() is True
 
 
 def test_fresh_database_seeds_curated_sources(database):
@@ -1150,6 +1150,65 @@ def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
     assert len(connections) == 1
 
 
+def test_tracked_recommendations_reuses_a_supplied_database_connection(database, monkeypatch):
+    import afterword_engine.main as main_module
+
+    connections = []
+    original_connect = main_module.connect
+
+    def capture_connect():
+        connection = original_connect()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(main_module, "connect", capture_connect)
+    with main_module.connect() as connection:
+        values, run_id = main_module.tracked_recommendations(
+            connection=connection,
+            status="recommended",
+            limit=100,
+        )
+
+    assert run_id
+    assert isinstance(values, list)
+    assert len(connections) == 1
+
+
+def test_librarr_only_setting_update_skips_embedding_health(database, monkeypatch):
+    import afterword_engine.main as main_module
+
+    def reject_embedding_check(*_args, **_kwargs):
+        raise AssertionError("unchanged embedding settings should not be checked")
+
+    monkeypatch.setattr(main_module, "get_embedder", reject_embedding_check)
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.put("/api/settings", json={"librarr_media_type": "ebook"})
+
+    assert response.status_code == 200
+    assert response.json()["embedding"]["checked"] is False
+    assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
+
+
+def test_overview_bounds_decisions_and_reports_more(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        candidate_ids = [
+            item["id"]
+            for item in con.execute("SELECT id FROM candidates ORDER BY id LIMIT 2")
+        ]
+        con.executemany(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,'reject')",
+            [(candidate_id,) for candidate_id in candidate_ids],
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.get("/api/overview?decision_limit=1")
+
+    assert response.status_code == 200
+    assert len(response.json()["decisions"]) == 1
+    assert response.json()["decisions_has_more"] is True
+
+
 def test_settings_encrypt_and_preserve_api_keys(database):
     payload = {"embedding_backend":"local","embedding_model":"anything","embedding_url":"","embedding_api_key":"embedding-secret","librarr_url":"http://librarr:5050","librarr_api_key":"librarr-secret","librarr_media_type":"ebook"}
     with TestClient(app, headers=authenticated_headers()) as client:
@@ -1376,7 +1435,8 @@ def test_api_token_rejects_unbounded_and_wrong_prefix_candidates(database):
 
 def test_invalid_goodreads_rating_rolls_back(database):
     payload = b"Title,Author,My Rating\nValid,Writer,5\nBroken,Writer,not-a-number\n"
-    with pytest.raises(ValueError): import_goodreads_csv(payload)
+    with pytest.raises(ValueError, match="CSV row 3.*Broken.*No books were imported"):
+        import_goodreads_csv(payload)
     assert row("SELECT COUNT(*) count FROM reads WHERE source='goodreads_csv'")["count"] == 0
 
 def test_goodreads_only_imports_read_shelf(database):

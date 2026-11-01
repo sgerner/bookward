@@ -748,9 +748,11 @@ def test_unrated_manual_read_keeps_verified_isbn_for_aliases_imports_and_rescori
             (isbn13, marked_id, alias_id),
         )
 
-    assert {marked_id, alias_id} <= {
+    initially_visible_ids = {
         item["id"] for item in recommendation_list(status="recommended", limit=None)
     }
+    assert marked_id in initially_visible_ids
+    assert alias_id not in initially_visible_ids
     with TestClient(app, headers=authenticated_headers()) as client:
         response = client.post(f"/api/recommendations/{marked_id}/read", json={})
     assert response.status_code == 200
