@@ -70,6 +70,8 @@ def test_confident_interactions_adjust_and_reorder_live_recommendations():
         "max_score_adjustment": 2.0,
     }
     assert "saved, imported, or positively rated" in ranked[0]["explanation"][-1]
+    assert "subject solar myth" in ranked[0]["explanation"][-1]
+    assert "subject dark thriller" in ranked[1]["explanation"][-1]
 
 
 def test_weak_or_unobserved_signals_leave_champion_order_unchanged():
