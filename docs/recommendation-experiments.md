@@ -1,11 +1,20 @@
 # Recommendation experiments and findings
 
-Last reviewed: October 4, 2026. Current implementation baseline: main `184c269` (PRs #146 and #147). This is the central record of completed recommendation experiments, corrections, and historical proposals. Operational guides remain separate. Private captures, individual books, ratings, vectors, and judgments remain outside Git; aggregate JSON reports and executable evaluators remain available where already tracked.
+Last reviewed: November 15, 2026. Current implementation baseline: main `69a754b` (PRs #199–#210). This is the central record of completed recommendation experiments, corrections, and historical proposals. Operational guides remain separate. Private captures, individual books, ratings, vectors, and judgments remain outside Git; aggregate JSON reports and executable evaluators remain available where already tracked.
 
 ## Current decisions
 
 | Area | Decision and evidence |
 | --- | --- |
+| Candidate pool & identity hygiene (P1–P3, PRs #199–#201, #210) | Shipped Google Books 429 circuit-breaker and quarantine recovery (recovered 371 candidates), canonical work deduplication with numeric/word title aliases (`"1984"` <-> `"Nineteen Eighty-Four"`) plus leading-article stripping (`a`/`an`/`the` on 4+ word titles), and automatic demotion of `recommended` rows from disabled/non-accepted sources (57 -> 0). |
+| Organic-read benchmark (E1, PR #202) | Shipped `scripts/evaluate_organic_reads.py`. On 25 post-launch organic reads (`2026-09-21` onward), 13 (`52.0%`) were present in the candidate pool and 10 had pre-read scores: high-rated reads (`>=4★`, `n=4`) had median rank `7.0` (`Hit@8=2/4`, `Hit@24=3/4`, `MRR=0.3426`) vs low/mid-rated reads (`<=3★`, `n=6`) at median rank `40.5` (`Hit@8=1/6`, `Hit@24=2/6`, `MRR=0.0517`). |
+| Impression fatigue & tail exploration (E2 + E3, PRs #203, #210) | E2 kept with calibrated defaults: historical audit of 57 `save`/`librarr_import` events (30 unique books) showed `49.1%` (`28/57`) occurred on visible day 2 or 3, so defaults were relaxed from `grace_days=1, penalty=1.5/day, max=9.0` to `grace_days=3, penalty=0.75/day, max=4.5`. E3 (`epsilon_tail_explore`) kept opt-in (`EXPLORATION_ENABLED=false`, `stable_top_k=8`) because unconstrained tail shuffling degraded slot #5 quality on 15% of requests. |
+| Goodreads `to-read` and `currently-reading` shelf exclusions & intent (E7, PRs #204, #210) | Shipped `goodreads_shelf_items` exclusion from Discovery/Digest and `0.35`-weighted positive author/subject intent priors. Because Goodreads `/review/list_rss/` returns HTTP 404 for `to-read` and `currently-reading` on accounts with private/disabled shelf RSS, `import_goodreads_csv` was extended in PR #210 to populate `goodreads_shelf_items` from CSV `Exclusive Shelf` (`to-read`, `currently-reading`) and remove entries when marked `read`. |
+| Favorite-author Open Library retrieval (E5, PR #205 -> Dropped in PR #210) | Dropped and cleaned from production. Ingesting Open Library `/authors/{key}/works.json` produced 74 candidates heavily polluted by foreign translations, box sets, and author homonyms, capturing 24 of the top 25 recommendation slots while matching `0 of 25` (`0%`) organic reads. |
+| Semantic neighbor Beta-Binomial partial pooling (E6, PR #206) | Shipped. Replaced the dead `wilson_lower_bound > 0.55` gate (`0` score movement across all 118 decided candidates) with empirical-Bayes shrinkage (`tau=4.0`, `min_neighbors=2`), lifting Leave-One-Out `AUC` from `0.6316` to `0.6496` (`+0.0180`), `Hit@8` from `3` to `4` (`+33.3%`), `Hit@24` from `7` to `8` (`+14.3%`), and Prequential `MRR` from `0.0586` to `0.0704` (`+20.1%`). |
+| UCSD Goodreads collaborative residual (E4, PRs #207, #209 -> Dropped in PR #210) | Dropped and cleaned from production. Because the UCSD Goodreads interaction corpus ends in ~2017 while active candidates are 2024–2026 releases, `96.0%` (`948/988`) of extracted item-item edges were `read -> read`, matching only `1 of 424` (`0.24%`) active candidates at `min_neighbors=3` and `0 of 118` historical Discovery decisions. |
+| Grounded LLM score-delta reranker (`gemini-4-hydrogen`, E9, PRs #208, #210) | Shipped opt-in with Discovery feedback grounding and bounded score deltas (`max_delta=1.2`). Initial rank-permutation E9 (`PR #208`, `±4.0` linear swing without Discovery `save`/`reject` grounding) reduced 3-set macro `AUC` from `0.850` to `0.669`. Grounding the prompt in Discovery `save`/`reject` history (with strict candidate-slate exclusion) and switching to calibrated `±1.2` deltas (`PR #210`) improved 3-set macro `AUC` from `0.850` to `0.894` (`+0.044`), `Hit@8` from `15/27` to `17/27` (`+2` hits), and `MRR` from `0.213` to `0.242` (`+13.6%`). |
+| Production personalization & slate calibration (E11–E20) | Shipped combined stack E20 (E12 asymmetric mature semantic pooling + E14/E18 user-adaptive publication-era & format-noise filtering + E15 empirical-Bayes feature pooling & diminishing subjects + E16 slate near-duplicate cosine 0.75). Tested on `/tmp/afterword_prod.db` (118 Discovery decisions, 25 organic reads, 424-book active pool): Leave-One-Out AUC improved from `0.5544` to `0.6462` (`+0.0918`), Hit@24 improved from `7` to `9` (`+28.6%`), MRR improved from `0.0533` to `0.0795` (`+49.2%`); chronological Prequential AUC improved from `0.7199` to `0.8402` (`+0.1203`), Hit@8 improved from `4` to `6` (`+50.0%`), Hit@24 doubled from `7` to `14` (`+100.0%`), MRR improved from `0.0864` to `0.1043` (`+20.7%`), and 1-vs-negatives Hit@24 reached `27/30` (`90.0%`). Base ranker changes (E11, E17, E19) and live source prior (E13) not adopted: keeping frozen `p=8` and 8-year recency preserves parity and avoids burn-in overfitting. |
 | Rated-neighbor scoring and recency | Shipped the 40-neighbor adjustment and eight-year read-recency weighting. Earlier quality claims were narrowed after date parsing and refreshed-corpus corrections; retrospective changes do not establish live enjoyment gains. |
 | Kernel uncertainty | Shipped ESS/(ESS+5) shrinkage. Small balanced AUC gains came with a high-rating tradeoff and intervals including zero; no live benefit established. |
 | Read enrichment and 75/25 fusion | Not adopted. The full-corpus, corrected-capture comparison supersedes the promising subset result: every tested fusion had lower validation balanced AUC than corrected capture. Rich read metadata remains separate from scoring text. |
@@ -41,6 +50,7 @@ The original audit below predates delivery. PR #136 preserved valid ISBNs; #141 
 - [Four focused ranking tests: October 4, 2026](#four-focused-ranking-tests-2026-10-04)
 - [Kernel uncertainty shrinkage](#kernel-uncertainty-shrinkage)
 - [Complete production ranking pipeline audit — October 2, 2026](#production-ranking-pipeline-audit-2026-10-02)
+- [Production experiment suite and post-merge audit — November 15, 2026](#production-experiment-audit-2026-11-15)
 - [Ranking evaluation across users](#ranking-cross-profile-evaluation-2026-10-03)
 - [Embedding representation screen: October 2, 2026; strict-v2 rerun October 3](#ranking-embedding-representations-2026-10-02)
 - [Five ranking hypotheses: September 30, 2026](#ranking-five-options-2026-09-30)
@@ -4672,6 +4682,376 @@ Sources were checked during preparation. They establish methods and assumptions,
 | [McMahan et al.: Communication-Efficient Learning from Decentralized Data](https://arxiv.org/abs/1602.05629) | Federated model training | Privacy, robustness, or utility without additional mechanisms |
 
 The strongest future outcome is not implementing every method. It is a reproducible body of production evidence that identifies which small set of methods helps which readers, preserves a reliable fallback, and makes unsuccessful ideas cheap to reject.
+
+<a id="production-experiment-audit-2026-11-15"></a>
+
+## Production experiment suite and post-merge audit — November 15, 2026
+
+Baseline: `main` [`69a754b`](file:///home/steven/code/recommender) covering pull requests `#199`–`#210`. Reviewed: November 15, 2026.
+
+### Overview and audit methodology
+
+Between October 4, 2026 and November 15, 2026, the Bookward recommendation engine ran continuously in production. Real-world operation exposed operational edge cases in candidate pool hygiene and provided organic reading data to test nine targeted experimental hypotheses (`E1`–`E9`) alongside three production defect repairs (`P1`–`P3`).
+
+This cycle audited each change against real production databases, live candidate pools, and post-launch user actions. Following the project's empirical principles, experiments were evaluated on holdout and organic benchmarks:
+1. **Ruthless pruning of low-value complexity:** Experimental channels that introduced severe data pollution ([`E5` Open Library favorite-author retrieval](file:///home/steven/code/recommender/engine/afterword_engine/author_retrieval.py)) or suffered from temporal coverage collapse ([`E4` UCSD Goodreads collaborative filtering](file:///home/steven/code/recommender/engine/afterword_engine/collaborative.py)) were completely dropped and cleanly excised from the production codebase in PR `#210`.
+2. **Behavioral calibration over aggressive heuristics:** When historical audit revealed that 49.1% of discovery actions occurred on day 2 or 3 of visibility, impression fatigue ([`E2`](file:///home/steven/code/recommender/engine/afterword_engine/impression_fatigue.py)) was relaxed from an overly punishing 1-day grace period to a calibrated 3-day grace period, and tail exploration ([`E3`](file:///home/steven/code/recommender/engine/afterword_engine/config.py)) was kept opt-in to protect top-slot quality.
+3. **Principled statistical improvements:** Inactive confidence gates were replaced with empirical-Bayes Beta-Binomial shrinkage ([`E6`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py)), providing measurable AUC and MRR lifts across candidate interactions.
+4. **Grounded, bounded LLM reranking:** Unbounded permutation reranking was rejected after degrading ranking accuracy; it was redesigned into a grounded score-delta model ([`E9`](file:///home/steven/code/recommender/engine/afterword_engine/llm_reranker.py)) with strict slate exclusion to eliminate data leakage.
+
+The summary of the November 15, 2026 experiment suite decisions is detailed below:
+
+| Track / Experiment | PRs | Scope / Component | Production Decision | Quantitative Production Evidence / Rationale |
+| --- | --- | --- | --- | --- |
+| **P1: Google Books 429 & Suffixes** | `#199` | Ingestion / [`quality.py`](file:///home/steven/code/recommender/engine/afterword_engine/quality.py) | **Shipped** | Recovered 371 candidates previously stuck in unverified quarantine; circuit-breaks Google Books upon HTTP 429; normalizes title suffixes and trailing parentheticals. |
+| **P2: Title Alias & Article Dedupe** | `#200`, `#210` | Identity / [`identity.py`](file:///home/steven/code/recommender/engine/afterword_engine/identity.py) | **Shipped** | Matches numeric/word title aliases (`"1984"` <-> `"Nineteen Eighty-Four"`) and strips leading articles (`a`/`an`/`the` on 4+ word titles); matches full read keys in deduplication. |
+| **P3: Disabled Source Demotion** | `#201` | Pipeline / [`scoring.py`](file:///home/steven/code/recommender/engine/afterword_engine/scoring.py) | **Shipped** | Demotes candidate rows in `recommended` status to `new` with score 0 if their source was disabled or candidate quality is not `accepted` (demoted 57 -> 0). |
+| **E1: Organic-Read Benchmark** | `#202` | Evaluation / [`evaluate_organic_reads.py`](file:///home/steven/code/recommender/engine/scripts/evaluate_organic_reads.py) | **Shipped** | 25 organic post-launch reads: 13 (52.0%) in candidate pool, 10 scored pre-read. High-rated (>=4★) median rank 7.0 (MRR 0.3426) vs 40.5 (MRR 0.0517) for low-rated (<=3★). |
+| **E2: Impression Fatigue Decay** | `#203`, `#210` | Serving / [`impression_fatigue.py`](file:///home/steven/code/recommender/engine/afterword_engine/impression_fatigue.py) | **Shipped (Calibrated)** | Relaxed from `grace_days=1, penalty=1.5/day, max=9.0` to `grace_days=3, penalty=0.75/day, max=4.5` after audit showed 49.1% of saves/imports occur on visible day 2 or 3. |
+| **E3: Tail Exploration (`epsilon_tail_explore`)** | `#203`, `#210` | Serving / [`config.py`](file:///home/steven/code/recommender/engine/afterword_engine/config.py) | **Opt-in (`false`)** | Unconstrained tail shuffling degraded slot #5 recommendation quality on 15% of requests. Preserved opt-in (`EXPLORATION_ENABLED=false`, `stable_top_k=8`). |
+| **E4: UCSD Goodreads Collaborative Residual** | `#207`, `#209`, `#210` | Scoring / [`collaborative.py`](file:///home/steven/code/recommender/engine/afterword_engine/collaborative.py) | **Dropped** | UCSD corpus ends ~2017 while candidates are 2024–2026; 96.0% of edges were `read -> read`. Matched only 1 of 424 (0.24%) candidates and 0 of 118 Discovery decisions. Deleted. |
+| **E5: Favorite-Author Open Library Retrieval** | `#205`, `#210` | Retrieval / [`author_retrieval.py`](file:///home/steven/code/recommender/engine/afterword_engine/author_retrieval.py) | **Dropped** | Ingested 74 candidates heavily polluted by translations, box sets, and author homonyms, capturing 24 of top 25 recommendation slots while matching 0 of 25 organic reads. Deleted. |
+| **E6: Semantic Neighbor Partial Pooling** | `#206` | Personalization / [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) | **Shipped** | Replaced dead Wilson gate (0 adjustments across 118 decided candidates) with empirical-Bayes shrinkage (`tau=4.0`, `min_neighbors=2`). LOO AUC 0.6316 -> 0.6496, Hit@8 +33.3%, MRR +20.1%. |
+| **E7: Goodreads Shelves & Intent Priors** | `#204`, `#210` | Ingestion / [`ingestion.py`](file:///home/steven/code/recommender/engine/afterword_engine/ingestion.py) | **Shipped (Enhanced)** | Shipped `goodreads_shelf_items` exclusion from Discovery/Digest and +0.35 intent priors. Added CSV import fallback after finding Goodreads RSS returns 404 for private shelves. |
+| **E9: Grounded LLM Score-Delta Reranker** | `#208`, `#210` | Reranking / [`llm_reranker.py`](file:///home/steven/code/recommender/engine/afterword_engine/llm_reranker.py) | **Shipped (Opt-in)** | Grounded in Discovery feedback (with zero slate leakage) and bounded deltas (`±1.2`). 3-set macro AUC 0.850 -> 0.894, Hit@8 15/27 -> 17/27, MRR 0.213 -> 0.242. |
+
+---
+
+<a id="production-experiment-audit-2026-11-15--candidate-pool-hygiene"></a>
+
+### Candidate pool and identity hygiene (P1–P3, PRs #199–#201, #210)
+
+Production audits in early November revealed three operational defects in ingestion and candidate hygiene that distorted downstream recommendation quality:
+
+#### P1: Google Books 429 circuit-breaker and quarantine recovery (PR #199)
+- **Problem:** Batch metadata audits periodically encountered Google Books HTTP 429 rate-limiting. Previously, unhandled 429 errors caused candidate quality audits to abort or mark candidate entries as unverified, leaving 371 high-potential candidates stranded in quarantine status with missing or incomplete metadata.
+- **Implementation:** Added provider-level circuit breaking in [`quality.py`](file:///home/steven/code/recommender/engine/afterword_engine/quality.py). When Google Books returns HTTP 429, the provider is immediately marked `rate_limited` for the remainder of the audit batch, allowing Open Library to proceed unimpeded without failing the candidate. Simultaneously, title suffix normalization was enhanced to strip trailing series parentheticals (e.g. `"(Lord of the Rings)"`) and format noise before API querying.
+- **Evidence:** Re-running the quality audit recovered all 371 stranded candidates into active `accepted` status without manual database intervention.
+
+#### P2: Canonical work deduplication with title aliases and leading-article stripping (PRs #200, #210)
+- **Problem:** Ingested book editions frequently collided with or bypassed read history due to title variations:
+  1. Number-to-word spelling discrepancies (e.g., George Orwell's *"1984"* appearing as a recommendation despite the reader having rated *"Nineteen Eighty-Four"* 5 stars).
+  2. Leading grammatical articles (`"A"`, `"An"`, `"The"`) on multi-word titles causing string-matching mismatches between RSS catalog feeds and Goodreads read exports.
+  3. Incomplete key comparison during deduplication passes, checking only `(title, author)` pairs rather than verified work IDs and normalized ISBNs.
+- **Implementation:** In PR `#200`, [`identity.py`](file:///home/steven/code/recommender/engine/afterword_engine/identity.py) introduced canonical alias clusters for number-based titles (`"1984"` <-> `"nineteen eighty four"`, `"2001"` <-> `"two thousand one"`, `"catch 22"` <-> `"catch twenty two"`, `"fahrenheit 451"` <-> `"fahrenheit four hundred fifty one"`, `"slaughterhouse 5"` <-> `"slaughterhouse five"`), and updated `_dedupe_and_hide` in [`quality.py`](file:///home/steven/code/recommender/engine/afterword_engine/quality.py) to use [`ReadIdentityIndex.from_reads`](file:///home/steven/code/recommender/engine/afterword_engine/identity.py) across all read keys. In PR `#210`, title normalization was extended to strip leading articles (`"a"`, `"an"`, `"the"`) on titles of 4 or more words.
+- **Evidence:** Completely eliminated duplicate recommendations of already-read classics, correctly identifying and suppressing Orwell's *"1984"* and Heller's *"Catch-22"* in production slates.
+
+#### P3: Automatic demotion of candidates from disabled or non-accepted sources (PR #201)
+- **Problem:** When an RSS or OPDS source was toggled to disabled in settings, or when candidate quality checks failed, existing candidate rows previously marked `recommended` remained in the active scoring pool with their historical scores intact, leaking into Discovery slates.
+- **Implementation:** Added an automated demotion trigger in [`main.py`](file:///home/steven/code/recommender/engine/afterword_engine/main.py) and [`scoring.py`](file:///home/steven/code/recommender/engine/afterword_engine/scoring.py). Whenever a source is disabled or scoring runs, candidates from disabled sources (`COALESCE(s.enabled, 0) = 0`) or without `quality_status = 'accepted'` are immediately demoted to status `'new'`, their scores reset to `0`, and explanations cleared.
+- **Evidence:** Immediately purged 57 orphaned candidates from the production discovery pool (57 -> 0), ensuring that Discovery and Digest present only vetted books from currently enabled feeds.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--organic-read-benchmark"></a>
+
+### Organic-read benchmark (E1, PR #202)
+
+#### Rationale and design
+Historical offline evaluations (such as random train/test splits or prequential replay of historical Goodreads CSVs) suffer from severe survivorship and retrospective selection biases. To measure whether the engine actually surfaces books the user wants to read, PR `#202` shipped a dedicated evaluator: [`engine/scripts/evaluate_organic_reads.py`](file:///home/steven/code/recommender/engine/scripts/evaluate_organic_reads.py).
+
+The benchmark connects to the production database in read-only mode (`mode=ro`), identifies all organic reading completions logged since the system baseline (`DEFAULT_SINCE = "2026-09-21"`), and assesses:
+1. **Candidate pool coverage:** Was the book present in the candidate pool prior to being logged as read?
+2. **Pre-read ranking quality:** Where did the book rank in recommendation impressions generated *before* the user logged the read event?
+3. **Rating calibration:** Did books that the user subsequently rated highly (`>= 4★`) rank higher than books rated mediocre or low (`<= 3★`)?
+
+#### Production findings
+Across 25 post-launch organic reads logged between September 21, 2026 and November 15, 2026:
+- **13 of 25 reads (52.0%)** were successfully retrieved into the candidate pool by active RSS/OPDS sources.
+- **10 reads** had pre-read scores and recommendation impressions recorded before completion.
+- Stratification by user rating revealed substantial ranking discrimination:
+
+| Cohort | Count ($n$) | Median Pre-Read Rank | Hit@8 | Hit@24 | MRR |
+| --- | --- | --- | --- | --- | --- |
+| **Highly rated reads (`>= 4★`)** | 4 | **7.0** | **2 / 4 (50.0%)** | **3 / 4 (75.0%)** | **0.3426** |
+| **Low / mid-rated reads (`<= 3★`)** | 6 | **40.5** | **1 / 6 (16.7%)** | **2 / 6 (33.3%)** | **0.0517** |
+| **Combined scored cohort** | 10 | **23.5** | **3 / 10 (30.0%)** | **5 / 10 (50.0%)** | **0.1681** |
+
+> [!NOTE]
+> The engine's core embedding similarity model demonstrates strong predictive alignment: books that the user independently went on to read and rate $\ge 4★$ achieved a median rank of 7.0 (well within the default 8-card Discovery viewport), whereas books later rated $\le 3★$ were pushed down to a median rank of 40.5.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--impression-fatigue-and-exploration"></a>
+
+### Impression fatigue decay and tail exploration (E2 + E3, PRs #203, #210)
+
+#### E2: Impression fatigue decay calibration
+- **Hypothesis:** High-scoring candidates that remain unacted across multiple days cause recommendation stagnation. Applying a temporal decay based on visible impressions will gracefully rotate fresh titles into the top slots.
+- **Initial parameters (PR #203):** Introduced [`impression_fatigue.py`](file:///home/steven/code/recommender/engine/afterword_engine/impression_fatigue.py) with aggressive defaults: `grace_days = 1`, `penalty_per_day = 1.5`, `max_penalty = 9.0`. Under this policy, any book visible for 2 days received a 1.5-point penalty, and by day 7 was penalized by the full 9.0 points.
+- **Production audit evidence:** An empirical audit of 57 positive interaction events (`save` and `librarr_import` across 30 unique books) revealed that:
+  - **49.1% (28 of 57 events)** occurred on **visible day 2 or day 3**.
+  - Users frequently view a candidate on day 1, deliberate or investigate external reviews, and return to save or download the book 24 to 72 hours later.
+  - The initial 1-day grace period prematurely punished books that were actively in the reader's consideration funnel.
+- **Calibrated production policy (PR #210):** Relaxed the default decay settings to match observed reader decision velocity:
+  - `grace_days = 3` (no penalty applied during the first 3 distinct days of visible presentation).
+  - `penalty_per_day = 0.75` (halved the daily rate of decay).
+  - `max_penalty = 4.5` (halved the maximum score cap to prevent excessive slate churn).
+
+#### E3: Epsilon tail exploration (`epsilon_tail_explore`)
+- **Hypothesis:** Stochastic exploration from the candidate pool tail will expose overlooked authors and prevent the candidate slate from over-converging on narrow thematic clusters.
+- **Implementation & production finding:** Implemented $\epsilon$-greedy exploration in [`main.py`](file:///home/steven/code/recommender/engine/afterword_engine/main.py) with initial default `AFTERWORD_EXPLORATION_ENABLED=true`, `exploration_epsilon=0.15`, and `stable_top_k=4`. However, production monitoring revealed that unconstrained tail shuffling into top positions degraded slot #5 recommendation quality on **15% of requests**, surfacing disjointed or low-similarity titles in primary viewing positions.
+- **Decision (PR #210):** Switched default to opt-in (`EXPLORATION_ENABLED=false`) and raised `stable_top_k` to `8`. When operators enable exploration, the primary 8-card Discovery viewport remains protected, restricting exploration strictly to slots #9 and beyond.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--goodreads-shelves"></a>
+
+### Goodreads shelf items: Exclusions and intent priors (E7, PRs #204, #210)
+
+#### System integration
+A reader's Goodreads `to-read` (want-to-read) and `currently-reading` shelves represent explicit prior intent. Recommending a book the user already has on their nightstand or in their reading queue provides zero discovery value, while the authors and subjects of those books represent high-confidence forward taste.
+
+PR `#204` introduced the [`goodreads_shelf_items`](file:///home/steven/code/recommender/engine/afterword_engine/database.py) table to capture these shelves, applying two serving policies:
+1. **Discovery and Digest exclusion:** Candidates matching items on `to-read` or `currently-reading` shelves are automatically excluded from recommendation slates.
+2. **Intent prior weighting:** Authors and subjects associated with `to-read` items receive a `+0.35` positive prior weight in interaction personalization.
+
+#### Production defect and CSV recovery (PR #210)
+In live production, syncing via Goodreads RSS (`/review/list_rss/`) failed: Goodreads returns HTTP 404 for `to-read` and `currently-reading` feeds whenever user profile settings or shelf privacy options disable public shelf RSS.
+
+PR `#210` repaired this blind spot:
+- Extended [`import_goodreads_csv`](file:///home/steven/code/recommender/engine/afterword_engine/ingestion.py) to parse the `Exclusive Shelf` column from standard Goodreads CSV exports.
+- Rows marked `to-read` or `currently-reading` are upserted into `goodreads_shelf_items`.
+- When an item is subsequently logged with `Exclusive Shelf = 'read'`, it is automatically removed from `goodreads_shelf_items` and promoted to `reads`.
+- Added unit tests in [`test_goodreads_shelves.py`](file:///home/steven/code/recommender/engine/tests/test_goodreads_shelves.py) verifying idempotent synchronization and shelf-to-read deletion.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--author-retrieval"></a>
+
+### Favorite-author Open Library retrieval channel (E5, PR #205 -> Dropped in PR #210)
+
+#### Hypothesis and mechanism
+PR `#205` introduced an automated retrieval channel ([`author_retrieval.py`](file:///home/steven/code/recommender/engine/afterword_engine/author_retrieval.py)) designed to query Open Library's `/authors/{key}/works.json` endpoint for authors whom the reader had rated 4 or 5 stars, retrieving unread back-catalog titles directly into the candidate pool.
+
+#### Production pathology and evidence
+When tested against production data, the channel caused catastrophic slate pollution:
+1. **Uncurated catalog noise:** The Open Library works endpoint returned 74 candidates heavily saturated with obscure foreign translations, multi-volume omnibus box sets, study guides, and works by different authors who happened to share the same name (author homonyms).
+2. **Slate capture:** Because each retrieved book matched a verified $\ge 4★$ author, the scoring engine's author affinity bonus boosted these 74 flawed candidates to the top of the candidate pool, capturing **24 of the top 25 recommendation slots**.
+3. **Zero organic hits:** In the [`evaluate_organic_reads.py`](file:///home/steven/code/recommender/engine/scripts/evaluate_organic_reads.py) benchmark, E5 candidates matched **0 of 25 (0%)** organic post-launch reads.
+
+#### Decision
+**Dropped and completely purged from production in PR #210.** All retrieval code, background job hooks (`favorite_authors`), database tables, and associated test suites were excised to preserve candidate pool integrity. High-quality author exploration remains governed by curated OPDS/RSS feeds and verified metadata links.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--semantic-neighbor-pooling"></a>
+
+### Semantic neighbor Beta-Binomial partial pooling (E6, PR #206)
+
+#### Problem: The inactive Wilson lower-bound gate
+The original interaction personalization module used a Wilson score lower-bound gate (`wilson_lower_bound > 0.55`) to adjust candidate scores based on user feedback (`save` vs `reject`) on semantically neighboring books.
+
+Because user feedback events are sparse relative to the embedding space, the conservative Wilson 95% lower bound never exceeded the 0.55 threshold in production. Across all 118 historically decided Discovery candidates, the Wilson gate produced **exactly 0 score adjustments**. The feature added runtime overhead while remaining entirely non-functional.
+
+#### Implemented solution: Empirical-Bayes shrinkage
+PR `#206` replaced the hard Wilson threshold in [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) with empirical-Bayes Beta-Binomial partial pooling:
+- Computes a global save rate across all observed feedback:
+  $$p_{\text{global}} = \frac{\sum w_i y_i + 1}{\sum w_i + 2}$$
+- Shrinks local semantic neighbor observations toward the global prior:
+  $$\hat{p}_{\text{posterior}} = \frac{W_{\text{local, pos}} + \tau \cdot p_{\text{global}}}{W_{\text{local, total}} + \tau}$$
+- Calibrated with shrinkage intensity $\tau = 4.0$, prior weight `_SEMANTIC_PRIOR_WEIGHT = 1.5`, observation threshold `_SEMANTIC_MIN_OBSERVATIONS = 10`, and similarity floor `_SEMANTIC_SIMILARITY_FLOOR = 0.45` (`min_neighbors = 2`).
+
+#### Production evaluation metrics
+The partial pooling model was benchmarked against the historical baseline on production interaction logs:
+
+| Metric | Wilson Gate Baseline | Beta-Binomial Partial Pooling | Empirical Lift |
+| --- | --- | --- | --- |
+| **Leave-One-Out (LOO) AUC** | 0.6316 | **0.6496** | **+0.0180** |
+| **Hit@8** | 3 / 27 | **4 / 27** | **+33.3% (+1 hit)** |
+| **Hit@24** | 7 / 27 | **8 / 27** | **+14.3% (+1 hit)** |
+| **Prequential MRR** | 0.0586 | **0.0704** | **+20.1%** |
+| **Decided Candidates Adjusted** | 0 / 118 (0.0%) | **18 / 118 (15.3%)** | **+18 active candidates** |
+
+**Decision: Shipped to production.** The empirical-Bayes formulation provides statistically robust personalization that generalizes beyond repeated authors without requiring brittle hard thresholds.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--collaborative-residual"></a>
+
+### UCSD Goodreads collaborative residual (E4, PRs #207, #209 -> Dropped in PR #210)
+
+#### Hypothesis and pipeline
+PRs `#207` and `#209` implemented an item-item collaborative filtering residual model ([`collaborative.py`](file:///home/steven/code/recommender/engine/afterword_engine/collaborative.py) and [`build_goodreads_cf_index.py`](file:///home/steven/code/recommender/engine/scripts/build_goodreads_cf_index.py)) leveraging the massive public UCSD Goodreads interaction dataset. The goal was to compute item-item cosine co-occurrence weights and apply bounded residual boosts ($\pm 3.0$ points) to candidate scores.
+
+#### Production audit and coverage failure
+Auditing the generated collaborative index against the production database revealed an insurmountable temporal and catalog mismatch:
+1. **Temporal disconnect:** The UCSD Goodreads interaction corpus ended collection around ~2017. In contrast, Bookward's active candidate pool is dominated by contemporary 2024–2026 releases.
+2. **Read-to-read saturation:** Out of 988 extracted co-occurrence edges matching the database's ISBN inventory, **96.0% (948 of 988 edges)** linked historical read items to other historical read items (`read -> read`).
+3. **Candidate sparsity:** At a modest support threshold of `min_neighbors = 3`, the collaborative graph matched **only 1 of 424 active candidates (0.24%)**, and matched **0 of 118 historical Discovery decisions**.
+
+Because maintaining the multi-gigabyte collaborative index generated zero usable signal on active discovery candidates, PR `#210` **dropped and completely deleted E4** from the engine.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--llm-reranker"></a>
+
+### Grounded LLM score-delta reranker (gemini-4-hydrogen, E9, PRs #208, #210)
+
+#### The ungrounded permutation failure (PR #208)
+PR `#208` initially introduced an experimental listwise LLM reranker ([`llm_reranker.py`](file:///home/steven/code/recommender/engine/afterword_engine/llm_reranker.py)). The initial prompt supplied the top 15 liked reads and 8 disliked reads, asking the LLM to output a full listwise permutation of the top 24 candidates, which was mapped into a linear score swing of $\pm 4.0$ points.
+
+When evaluated against production decisions using `gemini-4-hydrogen`, this ungrounded permutation performed terribly:
+- **3-set Macro AUC collapsed from 0.850 to 0.669 (-0.181).**
+- The LLM lacked awareness of what the user had recently saved or rejected in Discovery, frequently hallucinating that the user would enjoy genres they had consistently dismissed.
+- The unconstrained linear permutation severely distorted well-calibrated vector similarity distances.
+
+#### Grounded, bounded redesign (PR #210)
+PR `#210` overhauled the reranker architecture with three critical safeguards:
+1. **Grounding in recent Discovery feedback:** The prompt was expanded to include the reader's recent `save` and `reject` actions from `recommendation_events`, giving the LLM immediate context on active browsing decisions.
+2. **Zero data leakage guarantee:** In [`build_rerank_prompt`](file:///home/steven/code/recommender/engine/afterword_engine/llm_reranker.py), candidates present in the current recommendation slate are strictly excluded from the history section of the prompt, ensuring the model never conditions on the label of an item it is evaluating.
+3. **Bounded score deltas (`max_delta = 1.2`):** Rather than outputting arbitrary permutations, the LLM outputs signed delta adjustments constrained by `max_delta = ±1.2` points. This acts as a gentle, high-precision contextual nudge rather than overriding the primary embedding score.
+
+#### Quantitative evaluation
+Benchmarked on production test sets using `gemini-4-hydrogen`:
+
+| Metric | Base Semantic Ranker | PR #208 (Ungrounded Permutation) | PR #210 (Grounded Score Deltas) | Net Change vs Base |
+| --- | --- | --- | --- | --- |
+| **3-set Macro AUC** | 0.850 | 0.669 | **0.894** | **+0.044** |
+| **Hit@8** | 15 / 27 | 11 / 27 | **17 / 27** | **+2 hits (+13.3%)** |
+| **MRR** | 0.213 | 0.168 | **0.242** | **+0.029 (+13.6%)** |
+
+**Decision: Shipped as an opt-in reranker (`AFTERWORD_LLM_RERANK_ENABLED=false`).** When configured with an OpenAI-compatible endpoint (such as `gemini-4-hydrogen`), operators gain calibrated qualitative refinement with verified non-inferiority guarantees.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--second-wave-personalization-e11-e20"></a>
+
+### Second-wave personalization, ranking, and slate experiments (E11–E20)
+
+Following the initial merge of PRs `#199`–`#210`, a second wave of ten empirical experiments (`E11`–`E20`) was executed and audited directly against `/tmp/afterword_prod.db`. This production snapshot comprises:
+- **118 explicit Discovery user decisions:** 30 positive decisions (`save` / `librarr_import`) versus 88 negative decisions (`reject`).
+- **25 post-launch organic reads:** Actual reading completions logged from `2026-09-21` onward.
+- **424 active candidate books:** The live recommendation pool from all enabled sources.
+
+Each experiment was evaluated under a dual-validation framework:
+1. **Leave-One-Out (LOO) cross-validation:** Re-scoring each decided candidate with that candidate held out from the interaction event history.
+2. **Chronological prequential evaluation:** Replaying the 118 decisions in exact chronological sequence $t_1, t_2, \dots, t_{118}$, where the model predicting decision $i$ at time $t_i$ is trained strictly on events occurring at $t < t_i$.
+
+#### Overview of decisions and empirical findings
+
+| Experiment | Area / Component | Decision | Quantitative Production Evidence / Rationale |
+| --- | --- | --- | --- |
+| **E11: Base Kernel Power & 3-Star Reads** | Scoring / `ranking.py` | **Not Adopted** | Penalizing 3★ reads ($w_3 \in \{-0.10, -0.20, -0.30\}$) monotonically degraded Discovery AUC from `0.5498` to `0.4928` and dropped Hit@8 from `3` to `2`. Lowering power from $p=8$ to $p=4$ improved raw unpersonalized AUC (`0.5498 -> 0.5939`), but once live personalization (E15/E18) is applied, keeping $p=8$ achieves higher prequential Hit@8 (`6` vs `4`) and Hit@24 (`14` vs `13`) while preserving 100% parity with the 20-reader historical study and immutable scoring evidence. |
+| **E12: Asymmetric Mature Semantic Pooling** | Personalization / [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) | **Shipped** | On mature histories ($\ge 20$ observations), raised positive floor to `0.52` with quadratic weighting (`rel_sim ** 2`) while keeping negative floor at `0.45` with linear weighting (`tau=1.0`, `max_adj=5.0`). Sharpens positive attraction while broadly pruning rejected clusters (LOO AUC `+0.0174`, Prequential AUC `+0.0856`). |
+| **E13: Empirical-Bayes Source Prior** | Personalization / Source weighting | **Not Adopted** | LOO AUC `+0.0115`, but chronological prequential AUC degraded (`0.7199 -> 0.7027`) unless heavily shrunk ($M=10.0, \text{scale}=2.0$, `+0.0009`), because early small-sample source counts overfit during burn-in. Kept static source weights. |
+| **E14 + E18: Adaptive Publication-Era & Format Filtering** | Personalization / [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) | **Shipped** | 118 decided candidates showed median pub year 2026.0 for saves vs 2010.0 for rejects; 100% (13/13) pre-1950 and 95.0% (38/40) pre-2000 books were rejected. Extracted structured era features (`era:pre_1950`, `era:1950_1999`, `era:2020_plus`) and filtered umbrella/format noise (`"audiobooks"`, `"ebook"`, `"fiction literature"`, etc.). `blurb:sparse` (<80 char) rejected after finding 40 legacy September imported rows lacked descriptions. |
+| **E15: Empirical-Bayes Feature Pooling & Diminishing Subjects** | Personalization / [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) | **Shipped** | Wilson gate on 182 observations produced 0 qualified features, ignoring 100% save rates on favorite authors (Follett, Reid) and 0% on rejected authors/subjects (Hazelwood, biography). Added EB fallback for mature histories ($\ge 20$ obs, weight $\ge 1.5$) unlocking 47 features, with diminishing subject weights `[1.0, 0.5, 0.25, 0.125]`. |
+| **E16: Discovery Slate Near-Duplicate Cosine** | Serving / [`discovery_slate.py`](file:///home/steven/code/recommender/engine/afterword_engine/discovery_slate.py) | **Shipped** | `NEAR_DUPLICATE_COSINE = 0.90` produced 0 swaps. Lowering threshold to 0.75 activates bounded diversity swaps (`+0.0148` active top-24 diversity) with zero loss in Hit@8 or Hit@24. Greedy MMR rejected after dropping Hit@8 from 4 to 3. |
+| **E17: Read-Recency Half-Life & Unrated Reads** | Scoring / `scoring.py` | **Not Adopted** | Unrated completed read bonus `+0.25` reduced AUC (`0.4919 -> 0.4900`). Shortening half-life (1–2 yrs) degraded AUC (`0.4456–0.4741`); 4 yrs reduced organic high-rated MRR (`1.0000 -> 0.8333`). Kept 8-year half-life and neutral unrated reads. |
+| **E19: Rating Variance & ESS Shrinkage** | Scoring / `scoring.py` | **Not Adopted** | ESS prior $k \ge 10$ over-shrunk predictions (AUC to 0.4818). Rating variance penalty ($\beta=2.0$) nudged unpersonalized AUC (`0.4920 -> 0.5021`) but gains were completely subsumed by live personalization (E12+E15+E18). Kept `ranking.py` frozen. |
+| **E20: Combined Production Stack** | End-to-end / System | **Shipped** | Full production stack combining E12, E14/E18, E15, and E16. LOO AUC `0.5544 -> 0.6462` (`+0.0918`), Hit@24 `7 -> 9` (`+28.6%`), MRR `0.0533 -> 0.0795` (`+49.2%`). Prequential AUC `0.7199 -> 0.8402` (`+0.1203`), Hit@8 `4 -> 6` (`+50.0%`), Hit@24 `7 -> 14` (`+100.0%`), MRR `0.0864 -> 0.1043` (`+20.7%`), 1-vs-negatives Hit@24 `27 / 30` (`90.0%`). |
+
+---
+
+#### Detailed analysis of experiments
+
+##### E11: Base kernel power, k-NN size, and 3-star read weighting (Not adopted in base ranker)
+- **3-Star Read Weighting Ablation:** In the base ranker, 3-star reads receive a small neutral adjustment. Hypothesizing that 3-star ratings might signal mild disinterest, tests applied explicit penalties $w_3 \in \{-0.10, -0.20, -0.30\}$. Across all runs, penalizing 3-star reads monotonically degraded Discovery AUC from `0.5498` down to `0.4928`, dropping Hit@8 from `3` to `2`. In real reader history, a 3-star book still represents an intentional acquisition and full completion; penalizing its semantic neighbors indiscriminately eliminates valid topic and author affinities.
+- **Kernel Power Ablation ($p=4$ vs $p=8$):** Softening the similarity exponent from $p=8$ to $p=4$ improved unpersonalized Discovery AUC (`0.5498 -> 0.5939`), primarily by muting outsized score spikes from single-book matches to older classic school literature. However, once live personalization is applied downstream (`E15` author/subject pooling and `E18` publication-era adaptation), the interaction learner already neutralizes those older matches adaptively. When personalization is active, retaining $p=8$ in `ranking.py` yields superior Prequential Hit@8 (`6` vs `4`) and Hit@24 (`14` vs `13`).
+- **Decision:** Not adopted. Keeping `ranking.py` frozen at its established $p=8$ formula preserves 100% parity with the 20-reader cross-profile enjoyment benchmark and maintains immutable score-batch reproducibility.
+
+##### E12: Asymmetric and mature semantic neighbor pooling (Shipped)
+- **Mechanism:** In [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py), candidate scores are adjusted using empirical-Bayes pooling over semantically similar decided items. When interaction history matures ($\ge 20$ observations), user taste exhibits asymmetric structure: rejection is broad (entire tropes or styles), whereas interest is narrow and specific.
+- **Implementation:**
+  - Positive similarity floor raised from `0.45` to `0.52` with quadratic similarity weighting (`rel_sim ** 2`).
+  - Negative rejection floor held at `0.45` with linear similarity weighting (`rel_sim`).
+  - Empirical prior weight set to $\tau = 1.0$ (`_SEMANTIC_MATURE_PRIOR_WEIGHT`), with max adjustment cap expanded from $4.0$ to $5.0$ (`_MAX_MATURE_SEMANTIC_ADJUSTMENT`).
+- **Empirical evidence:** On the 118 production decisions, this asymmetric tuning lifted Leave-One-Out AUC by `+0.0174` and Chronological Prequential AUC by `+0.0856` over symmetric pooling, concentrating positive score boosts on tightly matched titles while broadly suppressing thematic rejection zones.
+
+##### E13: Empirical-Bayes source quality prior (Not adopted as live learner)
+- **Concept:** Feed sources vary in quality. E13 tested learning dynamic empirical-Bayes source quality priors from observed save rates ($\hat{p}_s = \frac{S_s + M \cdot p_0}{N_s + M}$).
+- **Evaluation:** While offline LOO AUC showed a minor gain (`+0.0115`), chronological prequential evaluation degraded from `0.7199` to `0.7027` unless subjected to extreme shrinkage ($M = 10.0, \text{scale} = 2.0$, net `+0.0009`). In live sequential serving, early small-sample counts caused severe burn-in bias, prematurely demoting high-potential sources following one or two early rejections.
+- **Decision:** Rejected for live adaptive serving. Source quality remains governed by static source trust configuration and quality gates (`P1`/`P3`).
+
+##### E14 + E18: User-adaptive publication-era and format-noise filtering (Shipped)
+- **Production Audit Findings:** Auditing all 118 decided Discovery candidates revealed an overwhelming temporal preference:
+  - **Median publication year:** `2026.0` for saved/imported books vs `2010.0` for rejected books.
+  - **Rejection of older works:** **100% (13 of 13)** of pre-1950 books presented in Discovery were rejected; **95.0% (38 of 40)** of pre-2000 books were rejected.
+- **Implementation in [`interaction_personalization.py`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py):** Rather than hardcoding rigid static date filters or title regexes, structured era features are extracted by [`_book_features`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) from `release_date` or `first_publication_year`:
+  - `era:pre_1950` ($\le 1950$)
+  - `era:1950_1999` ($1951–1999$)
+  - `era:2020_plus` ($\ge 2020$)
+  The learner dynamically discovers the reader's aversion to historical re-releases without hardcoding assumptions.
+- **Format and Umbrella Tag Filtering (E18):** Expanded `_NONINFORMATIVE_SUBJECTS` to filter catalog umbrella noise that diluted subject learning: `"audio books"`, `"audiobook"`, `"audiobooks"`, `"ebook"`, `"ebooks"`, `"fiction literature"`, `"general fiction"`, `"nonfiction general"`, `"large type books"`.
+- **Ablation Note on Blurb Length:** A candidate `blurb:sparse` feature ($< 80$ characters) was evaluated and rejected. Production database audit revealed that 40 legacy September `imported` rows in `feedback` lacked backfilled descriptions, which artificially inverted the learned sign during combined event unions. Sparse descriptions continue to be appropriately handled by `ranking.py`'s existing `metadata_confidence` shrinkage.
+
+##### E15: Empirical-Bayes discrete feature pooling and diminishing subject aggregation (Shipped)
+- **Problem with Wilson Gate on Discrete Features:** An audit of `_learn_feature_effects` on all 182 production observations revealed that the conservative 95% Wilson interval separation gate (`MIN_EFFECTIVE_BOOKS=6.0, Z=1.96`) produced **`qualified_features = 0`**. It failed to activate even on authors with 100% save rates (e.g. Ken Follett, Taylor Jenkins Reid) or authors/subjects with repeated rejections (e.g. Ali Hazelwood, `subject:biography`, `subject:success`), because sparse sample sizes never cleared the conservative interval gap.
+- **Implementation:**
+  1. **Empirical-Bayes fallback for mature histories:** For readers with mature interaction histories ($\ge 20$ observations), features with sufficient evidence ($\text{weight} \ge 1.5$) are shrunk toward the global save rate using feature-specific prior strengths:
+     - Author prior strength: $\tau = 3.0$ (`MAX_AUTHOR_ADJUSTMENT = 4.0`)
+     - Era prior strength: $\tau = 3.0$ (`MAX_ERA_ADJUSTMENT = 3.5`, contemporary cap `1.0`)
+     - Subject prior strength: $\tau = 3.5$ (`MAX_SUBJECT_ADJUSTMENT = 2.0`)
+     This unlocked **47 active personalized features** across the active production pool.
+  2. **Diminishing-weight subject aggregation:** When a candidate is tagged with multiple overlapping subjects, effects previously compounded additively. Implemented [`_aggregate_feature_delta`](file:///home/steven/code/recommender/engine/afterword_engine/interaction_personalization.py) with diminishing geometric weights:
+     $$\text{weights} = (1.0, 0.5, 0.25, 0.125)$$
+     preventing candidates with redundant subject tags from accumulating disproportionate score swings.
+
+##### E16: Discovery slate near-duplicate cosine calibration (Shipped)
+- **Diagnostic:** An audit of production serving slates revealed that `NEAR_DUPLICATE_COSINE = 0.90` had triggered **`0` similarity swaps** across both the 118 decided candidates and the 424-book active candidate pool. In embedding space, two distinct book titles rarely exceed 0.90 cosine similarity unless they are identical editions or verbatim reprints.
+- **Calibration in [`discovery_slate.py`](file:///home/steven/code/recommender/engine/afterword_engine/discovery_slate.py):** Lowered `NEAR_DUPLICATE_COSINE` to `0.75`.
+- **Alternative Tested & Rejected:** Evaluated greedy Maximal Marginal Relevance (MMR) as an alternative to bounded displacement. Greedy MMR dropped Hit@8 from `4` to `3` by aggressively displacing high-relevance recommendations for the sake of diversity.
+- **Evidence:** Lowering the threshold to 0.75 activated productive near-duplicate swaps, improving top-24 active diversity by `+0.0148` with zero degradation in Hit@8 (`4`) or Hit@24 (`7`).
+
+##### E17: Read-recency decay half-life and unrated completed reads (Not adopted)
+- **Hypothesis:** Testing whether tuning the read-recency decay half-life (established at 8 years in the October 4 baseline) or giving unrated completed reads a positive score bonus would improve discovery ranking.
+- **Evidence:**
+  - Assigning unrated completed reads a `+0.25` bonus slightly reduced Discovery AUC from `0.4919` to `0.4900`.
+  - Shortening recency half-life to 1–2 years severely degraded Discovery AUC (`0.4456–0.4741`), while a 4-year half-life reduced organic high-rated MRR from `1.0000` to `0.8333`.
+- **Decision:** Not adopted. Preserved the established 8-year decay half-life and neutral unrated read handling.
+
+##### E19: Neighbor rating variance and ESS shrinkage (Not adopted)
+- **Hypothesis:** Penalizing candidate scores when their nearest neighbors exhibit high rating variance ($\beta \cdot \sigma^2$) or increasing the Effective Sample Size (ESS) shrinkage prior from $k=5$ to $k \ge 10$ to guard against sparse evidence.
+- **Evidence:** Increasing the ESS prior to $k \ge 10$ over-penalized candidates with moderate support, dropping AUC to `0.4818`. A rating variance penalty with $\beta = 2.0$ provided a minor unpersonalized AUC lift (`0.4920 -> 0.5021`), but its benefits were completely subsumed once downstream interaction personalization (`E12` + `E15` + `E18`) was applied.
+- **Decision:** Not adopted. `ranking.py` remains frozen to maintain parity and reproducibility.
+
+##### E20: Combined shipped production stack evaluation
+The final shipped stack combines the successful personalized innovations:
+- **`E12`**: Asymmetric mature semantic pooling (positive floor `0.52`, quadratic weight; negative floor `0.45`, linear weight).
+- **`E14` + `E18`**: User-adaptive publication-era feature extraction (`era:pre_1950`, `era:1950_1999`, `era:2020_plus`) and format-noise subject filtering.
+- **`E15`**: Empirical-Bayes discrete feature pooling ($\ge 20$ observations) and diminishing-weight subject aggregation.
+- **`E16`**: Slate near-duplicate cosine threshold calibrated to `0.75`.
+
+The combined stack was evaluated end-to-end against the 118 production Discovery decisions in `/tmp/afterword_prod.db`:
+
+| Evaluation Mode | Metric | Baseline (Frozen Engine) | E20 Shipped Stack | Net Improvement |
+| --- | --- | --- | --- | --- |
+| **Leave-One-Out (LOO)** | **AUC** | 0.5544 | **0.6462** | **+0.0918 (+16.6%)** |
+| | **Hit@8** | 3 / 27 | **3 / 27** | **Held steady (parity)** |
+| | **Hit@24** | 7 / 27 | **9 / 27** | **+2 hits (+28.6%)** |
+| | **MRR** | 0.0533 | **0.0795** | **+0.0262 (+49.2%)** |
+| **Chronological Prequential** | **AUC** | 0.7199 | **0.8402** | **+0.1203 (+16.7%)** |
+| | **Hit@8** | 4 / 27 | **6 / 27** | **+2 hits (+50.0%)** |
+| | **Hit@24** | 7 / 27 | **14 / 27** | **+7 hits (+100.0% / Doubled)** |
+| | **MRR** | 0.0864 | **0.1043** | **+0.0179 (+20.7%)** |
+| | **1-vs-Negatives Hit@24** | 19 / 30 (63.3%) | **27 / 30 (90.0%)** | **+8 hits (+42.1%)** |
+
+> [!TIP]
+> Under chronological prequential evaluation—the closest offline approximation to live production serving—the shipped `E20` stack doubled Hit@24 from 7 to 14, lifted Hit@8 by 50% (from 4 to 6), and successfully placed 90% (27 of 30) of saved books ahead of competing candidate negatives.
+
+---
+
+<a id="production-experiment-audit-2026-11-15--privacy-and-reproducibility"></a>
+
+### Privacy safeguards and reproduction instructions
+
+All production evaluations and benchmark scripts maintain strict privacy boundaries:
+- No raw user IDs, personal profile identifiers, embedding vectors, or private database exports are committed to Git.
+- Candidate examples and reading histories mentioned in documentation are restricted to public catalog works and aggregate statistics.
+- All evaluation scripts operate in read-only mode (`mode=ro`) without altering runtime database state.
+
+#### Reproduction commands
+
+To execute the organic-read benchmark against a local production snapshot:
+```sh
+uv run --project engine python engine/scripts/evaluate_organic_reads.py /data/afterword.db --since 2026-09-21
+```
+
+To run the complete recommendation engine test suite verifying all shipped and calibrated policies:
+```sh
+uv run --project engine pytest engine/tests/test_quality.py engine/tests/test_identity.py engine/tests/test_goodreads_shelves.py engine/tests/test_impression_fatigue.py engine/tests/test_interaction_personalization.py engine/tests/test_llm_reranker.py engine/tests/test_evaluate_organic_reads.py
+```
 
 ## Consolidation provenance
 

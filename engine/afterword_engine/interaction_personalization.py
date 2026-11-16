@@ -9,6 +9,7 @@ time, so a newly confident signal affects the next recommendation response.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, timezone
@@ -31,25 +32,47 @@ MIN_WEIGHTED_EVIDENCE = 4.5
 WILSON_Z = 1.96
 _EFFECTIVE_COUNT_EPSILON = 1e-9
 MAX_AUTHOR_ADJUSTMENT = 4.0
+MAX_ERA_ADJUSTMENT = 3.5
+MAX_CONTEMPORARY_ERA_ADJUSTMENT = 1.0
 MAX_SUBJECT_ADJUSTMENT = 2.0
 MAX_TOTAL_ADJUSTMENT = 8.0
 _MAX_SUBJECTS_PER_CANDIDATE = 4
+_SUBJECT_DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25, 0.125)
 _FEATURE_RATE_SCALE = 0.5
 _CONFIDENCE_GAP_SCALE = 0.15
+_MATURE_OBSERVATION_THRESHOLD = 20
+_EB_MIN_FEATURE_WEIGHT = 1.5
+_EB_AUTHOR_PRIOR_STRENGTH = 3.0
+_EB_ERA_PRIOR_STRENGTH = 3.0
+_EB_CONTEMPORARY_ERA_PRIOR_STRENGTH = 4.0
+_EB_SUBJECT_PRIOR_STRENGTH = 3.5
 _SEMANTIC_SIMILARITY_FLOOR = 0.45
+_SEMANTIC_POSITIVE_FLOOR = 0.52
 _SEMANTIC_PRIOR_WEIGHT = 1.5
+_SEMANTIC_MATURE_PRIOR_WEIGHT = 1.0
 _SEMANTIC_MIN_OBSERVATIONS = 10
 _MAX_SEMANTIC_ADJUSTMENT = 4.0
+_MAX_MATURE_SEMANTIC_ADJUSTMENT = 5.0
 _NONINFORMATIVE_SUBJECTS = {
+    "audio books",
+    "audiobook",
+    "audiobooks",
     "book",
     "books",
+    "ebook",
+    "ebooks",
     "fiction",
-    "nonfiction",
-    "literature",
+    "fiction general",
+    "fiction literature",
+    "general",
+    "general fiction",
+    "large type books",
     "literary",
+    "literature",
+    "nonfiction",
+    "nonfiction general",
     "novel",
     "novels",
-    "general",
 }
 
 
@@ -66,17 +89,17 @@ def load_interaction_events(
     """
     values: tuple[Any, ...] = (max(1, min(MAX_INTERACTION_EVENTS, int(limit))),)
     query = """
-        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,metadata
+        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,release_date,metadata
         FROM (
             SELECT e.id,e.candidate_id,e.event_type,e.value,e.occurred_at,
-                   c.title,c.author,c.genres,c.description,e.metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,e.metadata
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
             WHERE e.event_type IN ('save','reject','maybe_later','restore','read','librarr_import')
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
-                   c.title,c.author,c.genres,c.description,NULL AS metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,NULL AS metadata
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
             WHERE f.action IN ('save','reject','maybe_later','restore')
@@ -238,6 +261,19 @@ def _book_features(item: dict[str, Any]) -> set[str]:
         keys.add(key)
         if len([value for value in keys if value.startswith("subject:")]) >= _MAX_SUBJECTS_PER_CANDIDATE:
             break
+
+    raw_year = item.get("first_publication_year") or item.get("release_date")
+    if raw_year is not None:
+        match = re.match(r"^(\d{4})", str(raw_year).strip())
+        if match:
+            year = int(match.group(1))
+            if 1000 <= year <= 2100:
+                if year <= 1950:
+                    keys.add("era:pre_1950")
+                elif year < 2000:
+                    keys.add("era:1950_1999")
+                elif year >= 2020:
+                    keys.add("era:2020_plus")
     return keys
 
 
@@ -322,10 +358,24 @@ def _stats_from_sums(weight: float, positive: float, squared_weight: float):
     }
 
 
+def _feature_cap_and_prior(feature: str) -> tuple[float, float]:
+    if feature.startswith("author:"):
+        return MAX_AUTHOR_ADJUSTMENT, _EB_AUTHOR_PRIOR_STRENGTH
+    if feature == "era:2020_plus":
+        return MAX_CONTEMPORARY_ERA_ADJUSTMENT, _EB_CONTEMPORARY_ERA_PRIOR_STRENGTH
+    if feature.startswith("era:"):
+        return MAX_ERA_ADJUSTMENT, _EB_ERA_PRIOR_STRENGTH
+    return MAX_SUBJECT_ADJUSTMENT, _EB_SUBJECT_PRIOR_STRENGTH
+
+
 def _learn_feature_effects(observations: list[dict[str, Any]]):
-    """Return only preference differences supported by separated 95% intervals."""
+    """Return preference differences supported by Wilson intervals or mature EB shrinkage."""
 
     global_stats = _group_stats(observations)
+    if global_stats["weight"] < MIN_WEIGHTED_EVIDENCE:
+        return {}
+    global_rate = global_stats["rate"]
+    mature_history = len(observations) >= _MATURE_OBSERVATION_THRESHOLD
     grouped: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
     for observation in observations:
         weight = observation["weight"]
@@ -343,30 +393,37 @@ def _learn_feature_effects(observations: list[dict[str, Any]]):
             max(0.0, global_stats["positive"] - sums[1]),
             max(0.0, global_stats["squared_weight"] - sums[2]),
         )
+        cap, prior_strength = _feature_cap_and_prior(feature)
         if (
-            feature_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON < MIN_EFFECTIVE_BOOKS
-            or other_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON < MIN_EFFECTIVE_BOOKS
-            or feature_stats["weight"] < MIN_WEIGHTED_EVIDENCE
-            or other_stats["weight"] < MIN_WEIGHTED_EVIDENCE
+            feature_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON >= MIN_EFFECTIVE_BOOKS
+            and other_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON >= MIN_EFFECTIVE_BOOKS
+            and feature_stats["weight"] >= MIN_WEIGHTED_EVIDENCE
+            and other_stats["weight"] >= MIN_WEIGHTED_EVIDENCE
         ):
-            continue
+            feature_low, feature_high = feature_stats["interval"]
+            other_low, other_high = other_stats["interval"]
+            if feature_low > other_high:
+                sign = 1.0
+                interval_gap = feature_low - other_high
+            elif feature_high < other_low:
+                sign = -1.0
+                interval_gap = other_low - feature_high
+            else:
+                sign = 0.0
+                interval_gap = 0.0
+            if sign != 0.0:
+                difference = abs(feature_stats["rate"] - other_stats["rate"])
+                confidence = min(1.0, interval_gap / _CONFIDENCE_GAP_SCALE)
+                raw_strength = min(1.0, difference / _FEATURE_RATE_SCALE)
+                effects[feature] = sign * cap * raw_strength * confidence
+                continue
 
-        feature_low, feature_high = feature_stats["interval"]
-        other_low, other_high = other_stats["interval"]
-        if feature_low > other_high:
-            sign = 1.0
-            interval_gap = feature_low - other_high
-        elif feature_high < other_low:
-            sign = -1.0
-            interval_gap = other_low - feature_high
-        else:
-            continue
-
-        difference = abs(feature_stats["rate"] - other_stats["rate"])
-        confidence = min(1.0, interval_gap / _CONFIDENCE_GAP_SCALE)
-        raw_strength = min(1.0, difference / _FEATURE_RATE_SCALE)
-        cap = MAX_AUTHOR_ADJUSTMENT if feature.startswith("author:") else MAX_SUBJECT_ADJUSTMENT
-        effects[feature] = sign * cap * raw_strength * confidence
+        if mature_history and sums[0] >= _EB_MIN_FEATURE_WEIGHT:
+            shrunk_rate = (sums[1] + prior_strength * global_rate) / (sums[0] + prior_strength)
+            delta = shrunk_rate - global_rate
+            scaled = max(-cap, min(cap, cap * (delta / _FEATURE_RATE_SCALE)))
+            if abs(scaled) >= 0.05:
+                effects[feature] = scaled
     return effects
 
 
@@ -409,6 +466,7 @@ def _learn_semantic_adjustments(
     if total_weight < MIN_WEIGHTED_EVIDENCE:
         return {}, len(vector_observations)
     global_rate = float((base_weights @ labels + 1.0) / (total_weight + 2.0))
+    mature_semantics = len(vector_observations) >= _MATURE_OBSERVATION_THRESHOLD
     adjustments: dict[int, float] = {}
     for candidate in recommendations:
         if candidate.get("status") != "recommended":
@@ -427,28 +485,72 @@ def _learn_semantic_adjustments(
         if not norm:
             continue
         similarities = (reference @ (vector / norm)).astype(np.float64)
-        local = similarities >= _SEMANTIC_SIMILARITY_FLOOR
-        if not np.any(local):
-            continue
-        rel_sim = (similarities[local] - _SEMANTIC_SIMILARITY_FLOOR) / (
-            1.0 - _SEMANTIC_SIMILARITY_FLOOR
-        )
-        local_weights = base_weights[local] * rel_sim
-        w_tot = float(local_weights.sum())
+        if mature_semantics:
+            pos_local = (labels == 1.0) & (similarities >= _SEMANTIC_POSITIVE_FLOOR)
+            neg_local = (labels == 0.0) & (similarities >= _SEMANTIC_SIMILARITY_FLOOR)
+            local = pos_local | neg_local
+            if not np.any(local):
+                continue
+            local_weights = np.zeros_like(similarities)
+            if np.any(pos_local):
+                pos_rel = (similarities[pos_local] - _SEMANTIC_POSITIVE_FLOOR) / (
+                    1.0 - _SEMANTIC_POSITIVE_FLOOR
+                )
+                local_weights[pos_local] = base_weights[pos_local] * (pos_rel ** 2)
+            if np.any(neg_local):
+                neg_rel = (similarities[neg_local] - _SEMANTIC_SIMILARITY_FLOOR) / (
+                    1.0 - _SEMANTIC_SIMILARITY_FLOOR
+                )
+                local_weights[neg_local] = base_weights[neg_local] * neg_rel
+            w_tot = float(local_weights[local].sum())
+            w_pos = float(local_weights[local] @ labels[local])
+            prior_weight = _SEMANTIC_MATURE_PRIOR_WEIGHT
+            max_adj = _MAX_MATURE_SEMANTIC_ADJUSTMENT
+        else:
+            local = similarities >= _SEMANTIC_SIMILARITY_FLOOR
+            if not np.any(local):
+                continue
+            rel_sim = (similarities[local] - _SEMANTIC_SIMILARITY_FLOOR) / (
+                1.0 - _SEMANTIC_SIMILARITY_FLOOR
+            )
+            local_weights = base_weights[local] * rel_sim
+            w_tot = float(local_weights.sum())
+            w_pos = float(local_weights @ labels[local])
+            prior_weight = _SEMANTIC_PRIOR_WEIGHT
+            max_adj = _MAX_SEMANTIC_ADJUSTMENT
         if w_tot <= 0.0:
             continue
-        w_pos = float(local_weights @ labels[local])
-        posterior_rate = (w_pos + _SEMANTIC_PRIOR_WEIGHT * global_rate) / (
-            w_tot + _SEMANTIC_PRIOR_WEIGHT
+        posterior_rate = (w_pos + prior_weight * global_rate) / (
+            w_tot + prior_weight
         )
         delta = posterior_rate - global_rate
         scaled = max(
-            -_MAX_SEMANTIC_ADJUSTMENT,
-            min(_MAX_SEMANTIC_ADJUSTMENT, _MAX_SEMANTIC_ADJUSTMENT * (delta / _FEATURE_RATE_SCALE)),
+            -max_adj,
+            min(max_adj, max_adj * (delta / _FEATURE_RATE_SCALE)),
         )
         if abs(scaled) >= 0.05:
             adjustments[candidate_id] = scaled
     return adjustments, len(vector_observations)
+
+
+def _aggregate_feature_delta(feature_keys: set[str], effects: dict[str, float]) -> float:
+    delta = 0.0
+    subject_deltas: list[float] = []
+    for feature in feature_keys:
+        effect = effects.get(feature, 0.0)
+        if not effect:
+            continue
+        if feature.startswith("subject:"):
+            subject_deltas.append(effect)
+        else:
+            delta += effect
+    if subject_deltas:
+        subject_deltas.sort(key=abs, reverse=True)
+        delta += sum(
+            weight * value
+            for weight, value in zip(_SUBJECT_DIMINISHING_WEIGHTS, subject_deltas)
+        )
+    return delta
 
 
 def personalize_recommendations(
@@ -486,9 +588,7 @@ def personalize_recommendations(
             adjusted.append(item)
             continue
         feature_keys = _book_features(item)
-        delta = 0.0
-        for feature in feature_keys:
-            delta += effects.get(feature, 0.0)
+        delta = _aggregate_feature_delta(feature_keys, effects)
         try:
             candidate_id = int(item["id"])
         except (KeyError, TypeError, ValueError):
@@ -531,6 +631,8 @@ def personalize_recommendations(
                 feature = contributing[0]
                 if feature.startswith("author:"):
                     detail = f"author {item.get('author')}"
+                elif feature.startswith("era:"):
+                    detail = "publication era"
                 else:
                     detail = f"subject {feature.removeprefix('subject:')}"
                 message += f" ({detail})"

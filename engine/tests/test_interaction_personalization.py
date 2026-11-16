@@ -213,3 +213,80 @@ def test_semantic_neighbor_learning_generalizes_beyond_repeated_subjects():
     assert diagnostics["qualified_features"] == 0
     assert diagnostics["semantic_evidence_books"] == 12
     assert diagnostics["semantic_adjusted_candidates"] == 2
+
+
+def test_mature_history_learns_empirical_bayes_era_and_diminishing_subjects():
+    events = []
+    for index in range(10):
+        events.append(
+            {
+                **interaction(index + 1, "save", f"Unique save {index}"),
+                "release_date": "2025-05-01",
+                "genres": ["Time travel", "Speculative", "Audiobooks", "Fiction literature"],
+            }
+        )
+    for index in range(10):
+        events.append(
+            {
+                **interaction(index + 11, "reject", f"Unique reject {index}"),
+                "release_date": "1932-01-01",
+                "genres": [f"Unique reject {index}", "Audiobooks"],
+            }
+        )
+
+    candidates = [
+        {
+            **candidate(201, "Unseen genre", 50),
+            "release_date": "1925-01-01",
+            "genres": ["Audiobooks", "Fiction literature"],
+        },
+        {
+            **candidate(202, "Time travel", 50),
+            "release_date": "2026-01-01",
+            "genres": ["Time travel", "Speculative", "Audiobooks"],
+        },
+    ]
+
+    ranked, diagnostics = personalize_recommendations(candidates, events, now=NOW)
+
+    assert diagnostics["applied"] is True
+    assert diagnostics["observed_books"] == 20
+    assert [item["id"] for item in ranked] == [202, 201]
+    assert ranked[0]["score"] > 50
+    assert ranked[1]["score"] < 50
+    assert any("publication era" in text for text in ranked[1]["explanation"])
+
+
+def test_mature_semantic_pooling_uses_asymmetric_positive_floor():
+    events = []
+    vectors = {}
+    for index in range(10):
+        saved = interaction(index + 1, "save", f"Saved topic {index}")
+        rejected = interaction(index + 11, "reject", f"Rejected topic {index}")
+        events.extend((saved, rejected))
+        vectors[index + 1] = [1.0, 0.0]
+        vectors[index + 11] = [0.0, 1.0]
+
+    # Candidate 301 has cosine 0.48 with positive seeds (< 0.52 positive floor -> ignored)
+    # Candidate 302 has cosine 0.48 with negative seeds (>= 0.45 negative floor -> penalized)
+    candidates = [
+        candidate(301, "Unseen A", 50),
+        candidate(302, "Unseen B", 50),
+    ]
+    cand_vectors = {
+        301: [0.48, -0.877268],
+        302: [-0.877268, 0.48],
+    }
+
+    ranked, diagnostics = personalize_recommendations(
+        candidates,
+        events,
+        now=NOW,
+        interaction_vectors=vectors,
+        candidate_vectors=cand_vectors,
+    )
+
+    by_id = {item["id"]: item for item in ranked}
+    assert by_id[301]["score"] == 50
+    assert by_id[302]["score"] < 50
+    assert diagnostics["semantic_evidence_books"] == 20
