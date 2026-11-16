@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     impression_fatigue_grace_days: int = 1
     impression_fatigue_penalty_per_day: float = 1.5
     impression_fatigue_max_penalty: float = 9.0
+    collab_index_path: str = ""
     # A shared secret between the SvelteKit server and engine. Leave blank only
     # when both containers communicate on a private network.
     service_secret: str = ""
