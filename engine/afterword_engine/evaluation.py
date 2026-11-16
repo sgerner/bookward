@@ -277,12 +277,6 @@ def ips_ndcg_at_k(
     return sum(per_run) / len(per_run) if per_run else None
 
 
-# Short aliases make the metric layer convenient for callers and scripts.
-weighted_auc = ips_auc
-precision_at_k = ips_precision_at_k
-ndcg_at_k = ips_ndcg_at_k
-
-
 def _metric_bundle(rows: Sequence[Mapping[str, Any]], *, score_key: str, k: int) -> dict[str, Any]:
     usable = _weighted_rows(rows, score_key=score_key)
     labels = [label for _, _, label, _ in usable]
@@ -364,13 +358,6 @@ def cluster_bootstrap(
         "iterations": len(samples),
         "clusters": len(clusters),
     }
-
-
-def cluster_bootstrap_ci(*args: Any, **kwargs: Any) -> tuple[float | None, float | None]:
-    """Return just the lower/upper interval for integrations needing a tuple."""
-
-    result = cluster_bootstrap(*args, **kwargs)
-    return result["lower"], result["upper"]
 
 
 def temporal_split(

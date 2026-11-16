@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 import json
 import re
-import unicodedata
 import weakref
 from datetime import date, datetime, timezone
 from urllib.parse import urlencode, urlparse
@@ -23,7 +22,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
-from .identity import book_author_identity_key, book_catalog_title_identity_key
+from .identity import book_author_identity_key, book_catalog_title_identity_key, canonical_part
 from .isbn import canonical_isbn, isbn_parts
 from .subjects import normalize_subjects
 
@@ -317,13 +316,6 @@ async def _lookup_open_library(
     return str(record.get("cover_url", ""))
 
 
-def _identity_text(value: object) -> str:
-    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    return " ".join(
-        "".join(char if char.isalnum() else " " for char in value).split()
-    )
-
-
 def _normalized_title(value: object) -> str:
     return book_catalog_title_identity_key(value)
 
@@ -348,12 +340,12 @@ def _author_matches(wanted: str, candidates: object) -> bool:
         return False
     wanted_parts = [part.strip() for part in re.split(r"\s*(?:,|;|&|\band\b)\s*", wanted, flags=re.I) if part.strip()]
     for wanted_author in wanted_parts:
-        wanted_normalized = _identity_text(wanted_author)
+        wanted_normalized = canonical_part(wanted_author)
         wanted_tokens = wanted_normalized.split()
         if not wanted_tokens:
             continue
         for candidate in candidates:
-            candidate_normalized = _identity_text(candidate)
+            candidate_normalized = canonical_part(candidate)
             candidate_tokens = candidate_normalized.split()
             if not candidate_tokens:
                 continue
@@ -571,13 +563,6 @@ async def _lookup_open_library_record(
     trace["identifier_verified"] = verified
     best["_fetch_trace"] = trace
     return best
-
-
-async def _lookup_google_books(
-    title: str, author: str, client: httpx.AsyncClient | None = None
-) -> str:
-    record = await _lookup_google_books_record(title, author, client=client)
-    return str(record.get("cover_url", ""))
 
 
 async def _lookup_google_books_record(

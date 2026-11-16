@@ -44,6 +44,7 @@ from .covers import (
 )
 from .database import persist_metadata_field_provenance, private_setting, rows, transaction
 from .identity import (
+    canonical_part,
     ReadIdentityIndex,
     _title_without_format_suffix,
     book_identity,
@@ -74,14 +75,8 @@ def _text(value: object, limit: int) -> str:
     return " ".join(value.strip().split())[:limit]
 
 
-def _catalog_text(value: object) -> str:
-    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    chars = [char if char.isalnum() or char.isspace() else " " for char in value]
-    return " ".join("".join(chars).split())
-
-
 def _tokens(value: object) -> set[str]:
-    return set(_catalog_text(value).split())
+    return set(canonical_part(value).split())
 
 
 _TRAILING_PAREN = re.compile(r"\s*\([^()]{2,80}\)\s*$")
@@ -99,13 +94,13 @@ def _string_title_similarity(a: str, b: str) -> float:
 
 
 def _title_similarity(left: object, right: object) -> float:
-    a = _catalog_text(left)
-    b = _catalog_text(right)
+    a = canonical_part(left)
+    b = canonical_part(right)
     score = _string_title_similarity(a, b)
     if score == 1.0:
         return 1.0
-    stripped_a = _catalog_text(_title_without_format_suffix(left))
-    stripped_b = _catalog_text(_title_without_format_suffix(right))
+    stripped_a = canonical_part(_title_without_format_suffix(left))
+    stripped_b = canonical_part(_title_without_format_suffix(right))
     if stripped_a != a or stripped_b != b:
         score = max(score, _string_title_similarity(stripped_a, stripped_b))
     # Catalogs often append a parenthetical series name without a number,
@@ -113,16 +108,16 @@ def _title_similarity(left: object, right: object) -> float:
     raw_left = str(left or "").strip()
     raw_right = str(right or "").strip()
     if bool(_TRAILING_PAREN.search(raw_left)) != bool(_TRAILING_PAREN.search(raw_right)):
-        base_a = _catalog_text(_TRAILING_PAREN.sub("", raw_left))
-        base_b = _catalog_text(_TRAILING_PAREN.sub("", raw_right))
+        base_a = canonical_part(_TRAILING_PAREN.sub("", raw_left))
+        base_b = canonical_part(_TRAILING_PAREN.sub("", raw_right))
         if len(base_a.split()) >= 2 and len(base_b.split()) >= 2:
             score = max(score, _string_title_similarity(base_a, base_b))
     return score
 
 
 def _author_similarity(left: object, right: object) -> float:
-    a = _catalog_text(left)
-    b = _catalog_text(right)
+    a = canonical_part(left)
+    b = canonical_part(right)
     if not a or not b:
         return 0.0
     if a == b:
@@ -135,8 +130,8 @@ def _author_similarity(left: object, right: object) -> float:
     # Catalogs frequently omit middle initials or suffixes.  A matching
     # surname is useful evidence, but never enough to pass without a title
     # match because author names are not unique.
-    parts_a = _catalog_text(left).split()
-    parts_b = _catalog_text(right).split()
+    parts_a = canonical_part(left).split()
+    parts_b = canonical_part(right).split()
     surname_match = bool(shared) and parts_a[-1] == parts_b[-1]
     initial_match = surname_match and parts_a[0][:1] == parts_b[0][:1]
     # A surname alone is weak evidence ("A Writer" and "B Writer" are not
@@ -165,7 +160,7 @@ def local_flags(candidate: dict[str, Any]) -> list[str]:
         flags.append("missing_author")
     elif UNKNOWN_AUTHOR_RE.fullmatch(author):
         flags.append("unknown_author")
-    if title and author and _catalog_text(title) == _catalog_text(author):
+    if title and author and canonical_part(title) == canonical_part(author):
         flags.append("title_equals_author")
     if title and ("http://" in title.casefold() or "https://" in title.casefold()):
         flags.append("title_contains_url")
@@ -695,8 +690,8 @@ async def resolve_catalog_match(
 
     source_isbn13, source_isbn10 = isbn_parts(isbn13, isbn10, isbn)
     key = (
-        _catalog_text(title),
-        _catalog_text(author),
+        canonical_part(title),
+        canonical_part(author),
         source_isbn13,
         source_isbn10,
         bool(google_books_api_key),

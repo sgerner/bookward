@@ -124,5 +124,4 @@ def cosine(left, right):
     return float(np.dot(a, b) / (a_norm * b_norm))
 
 def vector_blob(vector): return np.asarray(vector, dtype=np.float32).tobytes()
-def blob_vector(blob): return np.frombuffer(blob, dtype=np.float32).tolist()
 def content_hash(text): return hashlib.sha256(text.encode()).hexdigest()

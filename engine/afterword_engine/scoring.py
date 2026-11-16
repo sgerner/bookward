@@ -7,7 +7,7 @@ import numpy as np
 
 from .database import rows, transaction, connect
 from .embeddings import get_embedder, content_hash, vector_blob
-from .ranking import rank_candidates
+from .ranking import normalized_vector_matrix as _normalized_vectors, rank_candidates
 from .identity import ReadIdentityIndex
 from .subjects import normalize_subjects
 SCORING_BATCH_SIZE = 256
@@ -163,26 +163,6 @@ def _provider_vector_values(vectors):
             raise ValueError("Embedding provider returned invalid or inconsistent vectors")
         validated.append(array.tolist())
     return validated, dimensions
-
-
-def _normalized_vectors(vectors):
-    if not vectors:
-        return np.empty((0, 0), dtype=np.float32)
-
-    try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            matrix = np.asarray(vectors, dtype=np.float64)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("Embedding vectors must contain numeric rows") from exc
-    if matrix.ndim != 2 or not matrix.shape[1]:
-        raise ValueError("Embedding vectors must be non-empty, equally sized rows")
-    if not np.isfinite(matrix).all():
-        raise ValueError("Embedding vectors must contain only finite values")
-    scales = np.max(np.abs(matrix), axis=1, keepdims=True)
-    scaled = np.divide(matrix, scales, out=np.zeros_like(matrix), where=scales != 0)
-    norms = np.linalg.norm(scaled, axis=1, keepdims=True)
-    normalized = np.divide(scaled, norms, out=np.zeros_like(scaled), where=norms != 0)
-    return normalized.astype(np.float32)
 
 
 def _max_cosine_similarities(vectors, references, default):

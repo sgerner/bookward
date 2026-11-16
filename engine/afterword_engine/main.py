@@ -2843,17 +2843,7 @@ def api_recommendations(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
-    with connect() as connection:
-        values, run_id = tracked_recommendations(
-            connection=connection,
-            status=status,
-            limit=limit,
-            offset=offset,
-        )
-    for item in values:
-        item["recommendation_run_id"] = run_id
-    response.headers["X-Bookward-Recommendation-Run"] = run_id
-    return values
+    return recommendations(response, status, limit, offset)
 
 
 @api_v1.post("/recommendations/bulk-feedback")
