@@ -44,6 +44,11 @@ services:
       AFTERWORD_EXPLORATION_EPSILON: ${EXPLORATION_EPSILON:-0.15}
       AFTERWORD_EXPLORATION_STABLE_TOP_K: ${EXPLORATION_STABLE_TOP_K:-4}
       AFTERWORD_COLLAB_INDEX_PATH: ${COLLAB_INDEX_PATH:-}
+      AFTERWORD_LLM_RERANK_ENABLED: ${LLM_RERANK_ENABLED:-false}
+      AFTERWORD_LLM_RERANK_API_URL: ${LLM_RERANK_API_URL:-https://api.openai.com/v1/chat/completions}
+      AFTERWORD_LLM_RERANK_API_KEY: ${LLM_RERANK_API_KEY:-}
+      AFTERWORD_LLM_RERANK_MODEL: ${LLM_RERANK_MODEL:-gpt-4o-mini}
+      AFTERWORD_LLM_RERANK_TOP_K: ${LLM_RERANK_TOP_K:-24}
     volumes: ["afterword-data:/data", "afterword-backups:/backups"]
     expose: ["8000"]
     extra_hosts: ["host.docker.internal:host-gateway"]
