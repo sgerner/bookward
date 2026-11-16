@@ -1311,12 +1311,16 @@ def tracked_recommendations(
                 if settings.llm_rerank_enabled and settings.llm_rerank_api_key.strip():
                     from .llm_reranker import rerank_with_llm_sync
 
-                    read_rows = [
-                        dict(r)
-                        for r in connection.execute(
-                            "SELECT title, author, rating FROM reads ORDER BY id"
-                        ).fetchall()
-                    ]
+                    read_rows = (
+                        [
+                            dict(r)
+                            for r in connection.execute(
+                                "SELECT title, author, rating FROM reads ORDER BY id"
+                            ).fetchall()
+                        ]
+                        if connection is not None
+                        else rows("SELECT title, author, rating FROM reads ORDER BY id")
+                    )
                     diversified, llm_diag = rerank_with_llm_sync(
                         read_rows,
                         diversified,
