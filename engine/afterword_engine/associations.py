@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from .database import normalize_key, row, rows, transaction
 from .identity import book_identity
+from .isbn import isbn_parts
 
 
 OPEN_LIBRARY_LISTS_PROVIDER = "openlibrary_lists"
@@ -320,16 +321,24 @@ def persist_associations(
                     continue
                 source_ids[provider] = int(source[0])
             key = normalize_key(title, author)
+            isbn13, isbn10 = isbn_parts(association.isbn)
             con.execute(
-                """INSERT INTO candidates(title,author,source_url,source_id,status,normalized_key)
-                VALUES(?,?,?,?,?,?)
-                ON CONFLICT(normalized_key) DO NOTHING""",
+                """INSERT INTO candidates(
+                    title,author,source_url,source_id,status,isbn13,isbn10,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(normalized_key) DO UPDATE SET
+                    isbn13=CASE WHEN candidates.isbn13='' AND excluded.isbn13!=''
+                        THEN excluded.isbn13 ELSE candidates.isbn13 END,
+                    isbn10=CASE WHEN candidates.isbn10='' AND excluded.isbn10!=''
+                        THEN excluded.isbn10 ELSE candidates.isbn10 END""",
                 (
                     title,
                     author,
                     association.source_url[:1000],
                     source_ids[provider],
                     "new",
+                    isbn13,
+                    isbn10,
                     key,
                 ),
             )

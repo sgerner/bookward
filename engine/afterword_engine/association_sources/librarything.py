@@ -25,7 +25,7 @@ from ..associations import (
     select_seed_reads,
 )
 from ..database import rows
-from ..identity import book_identity
+from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import normalize_isbn_identifier
 from ..security import resolve_public_target
 from .openlibrary import OpenLibraryClient
@@ -210,9 +210,7 @@ class LibraryThingProvider:
         return None
 
     async def collect(self, reads: Sequence[Mapping[str, Any]]) -> list[Association]:
-        read_identities = {
-            book_identity(read.get("title", ""), read.get("author", "")) for read in reads
-        }
+        read_identity_index = ReadIdentityIndex.from_reads(reads)
         seeds = select_seed_reads(
             reads,
             max_seeds=self.max_seeds,
@@ -269,7 +267,13 @@ class LibraryThingProvider:
             if resolved is None:
                 continue
             title, author, open_library_id = resolved
-            if book_identity(title, author) in read_identities:
+            candidate_identity = {
+                "title": title,
+                "author": author,
+                "isbn": candidate_isbn,
+                "openlibrary_work_id": open_library_id,
+            }
+            if read_identity_index.matches(candidate_identity):
                 continue
             recommendation_work = _clean(recommendation.get("work"), 100)
             fromworks = recommendation.get("fromworks")

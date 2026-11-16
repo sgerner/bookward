@@ -69,6 +69,9 @@ type Overview = {
     nyt_api_key_set?: boolean;
     goodreads_rss_url?: string;
     goodreads_rss_last_sync_at?: string;
+    goodreads_rss_last_status?: string;
+    goodreads_rss_last_attempt_at?: string;
+    goodreads_rss_last_error?: string;
     librarr_media_type: "ebook" | "audiobook";
     source_sync_interval_hours: number;
     digest: DigestSettings;
@@ -181,6 +184,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     profile: {
       goodreads_url: overview.settings.goodreads_rss_url ?? "",
       goodreads_rss_last_sync_at: overview.settings.goodreads_rss_last_sync_at ?? "",
+      goodreads_rss_last_status: overview.settings.goodreads_rss_last_status ?? "",
+      goodreads_rss_last_attempt_at: overview.settings.goodreads_rss_last_attempt_at ?? "",
+      goodreads_rss_last_error: overview.settings.goodreads_rss_last_error ?? "",
       default_source_enabled: builtIn?.enabled ?? 1,
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,

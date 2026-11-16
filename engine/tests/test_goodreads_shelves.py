@@ -3,10 +3,12 @@ from pathlib import Path
 import sqlite3
 import sys
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from afterword_engine.config import settings
 from afterword_engine.database import initialize
-from afterword_engine.ingestion import goodreads_shelf_rss_url, import_goodreads_shelves
+from afterword_engine.ingestion import goodreads_shelf_rss_url, import_goodreads_shelves, validate_goodreads_rss_url
 
 
 def test_goodreads_shelf_rss_url_rewrites_shelf_param() -> None:
@@ -19,6 +21,13 @@ def test_goodreads_shelf_rss_url_rewrites_shelf_param() -> None:
         goodreads_shelf_rss_url(read_url, "currently-reading")
         == "https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=currently-reading"
     )
+
+
+def test_goodreads_read_feed_uses_only_the_read_shelf() -> None:
+    url = "https://www.goodreads.com/review/list_rss/12345?key=secret"
+    assert validate_goodreads_rss_url(url) == f"{url}&shelf=read"
+    with pytest.raises(ValueError, match="read shelf"):
+        validate_goodreads_rss_url(f"{url}&shelf=read&shelf=to-read")
 
 
 def test_import_goodreads_shelves_stores_separately_from_reads(tmp_path: Path, monkeypatch) -> None:

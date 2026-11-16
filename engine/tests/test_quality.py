@@ -20,6 +20,7 @@ from afterword_engine.quality import (
     canonical_isbn,
     has_candidate_quality_audit_candidates,
     local_flags,
+    _dedupe_and_hide,
     _author_similarity,
 )
 
@@ -317,6 +318,36 @@ def test_audit_quarantines_unmatched_candidate_and_hides_it(database):
     from afterword_engine.main import recommendation_list
 
     assert candidate_id not in {item["id"] for item in recommendation_list(limit=None)}
+
+
+def test_quality_dedupes_accepted_rows_by_shared_work_and_isbn(database):
+    first = add_candidate("First Edition", "A Writer")
+    same_work = add_candidate("Second Edition", "A Writer")
+    same_isbn = add_candidate("Catalog Alias", "Another Author")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.7,"
+            "provider='openlibrary',work_id='/works/OL123W' WHERE candidate_id=?",
+            (first,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.9,"
+            "provider='openlibrary',work_id='/works/OL123W',isbn13='9780306406157' "
+            "WHERE candidate_id=?",
+            (same_work,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.8,"
+            "isbn13='9780306406157' WHERE candidate_id=?",
+            (same_isbn,),
+        )
+        con.execute("UPDATE candidates SET isbn13='9780306406157' WHERE id=?", (first,))
+        changed = _dedupe_and_hide(con)
+
+    assert changed == 2
+    assert row("SELECT status FROM candidates WHERE id=?", (first,))["status"] == "rejected"
+    assert row("SELECT status FROM candidates WHERE id=?", (same_work,))["status"] == "new"
+    assert row("SELECT status FROM candidates WHERE id=?", (same_isbn,))["status"] == "rejected"
 
 
 @respx.mock

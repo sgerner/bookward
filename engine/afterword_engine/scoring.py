@@ -107,10 +107,28 @@ async def cached_vectors(
         if cached_dimensions and dimensions not in cached_dimensions:
             raise ValueError("Embedding provider dimensions differ from valid cached vectors; rebuild the full cache")
         if persist:
+            cache_rows = []
             with transaction() as con:
                 for (index,item,_text,digest), vector in zip(missing,generated):
                     vectors[index] = vector
-                    con.execute("INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",(entity_type,item["id"],embedder.name,embedder.model,vector_blob(vector),len(vector),digest))
+                    cache_rows.append(
+                        (
+                            entity_type,
+                            item["id"],
+                            embedder.name,
+                            embedder.model,
+                            vector_blob(vector),
+                            len(vector),
+                            digest,
+                        )
+                    )
+                con.executemany(
+                    "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) "
+                    "DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,"
+                    "content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",
+                    cache_rows,
+                )
         else:
             for (index,_item,_text,_digest), vector in zip(missing,generated):
                 vectors[index] = vector

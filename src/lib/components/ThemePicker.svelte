@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { fade, fly, scale } from 'svelte/transition';
 	import { Check, Monitor, Moon, Palette, Sun, X } from '@lucide/svelte';
 	import {
@@ -27,6 +27,8 @@
 	let mode = $state<ThemeMode>(DEFAULT_MODE);
 	let appearanceOpen = $state(false);
 	let pickerRoot = $state<HTMLDivElement | null>(null);
+	let appearanceButton = $state<HTMLButtonElement | null>(null);
+	let closeButton = $state<HTMLButtonElement | null>(null);
 
 	async function chooseTheme(nextTheme: SkeletonThemeName) {
 		try {
@@ -45,8 +47,15 @@
 		applyTheme(theme, mode);
 	}
 
-	function closeAppearance() {
+	function closeAppearance(restoreFocus = true) {
 		appearanceOpen = false;
+		if (restoreFocus) appearanceButton?.focus();
+	}
+
+	async function openAppearance() {
+		appearanceOpen = true;
+		await tick();
+		closeButton?.focus();
 	}
 
 	function motionDuration(duration: number) {
@@ -69,17 +78,20 @@
 		void sync();
 		window.addEventListener('storage', sync);
 		const onKeydown = (event: KeyboardEvent) => {
-			if (event.key === 'Escape' && appearanceOpen) closeAppearance();
+			if (event.key === 'Escape' && appearanceOpen) {
+				event.stopPropagation();
+				closeAppearance();
+			}
 		};
 		const onPointerDown = (event: PointerEvent) => {
 			const target = event.target;
-			if (appearanceOpen && pickerRoot && target instanceof Node && !pickerRoot.contains(target)) closeAppearance();
+			if (appearanceOpen && pickerRoot && target instanceof Node && !pickerRoot.contains(target)) closeAppearance(false);
 		};
-		window.addEventListener('keydown', onKeydown);
+		window.addEventListener('keydown', onKeydown, true);
 		document.addEventListener('pointerdown', onPointerDown);
 		return () => {
 			window.removeEventListener('storage', sync);
-			window.removeEventListener('keydown', onKeydown);
+			window.removeEventListener('keydown', onKeydown, true);
 			document.removeEventListener('pointerdown', onPointerDown);
 		};
 	});
@@ -88,13 +100,15 @@
 
 <div bind:this={pickerRoot} class="relative">
 	<button
+		bind:this={appearanceButton}
 		type="button"
 		class={compact ? 'btn min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
 		aria-label="Choose appearance"
 		title="Choose appearance"
 		aria-expanded={appearanceOpen}
 		aria-controls="appearance-panel"
-		onclick={() => (appearanceOpen = !appearanceOpen)}
+		aria-haspopup="dialog"
+		onclick={() => appearanceOpen ? closeAppearance() : void openAppearance()}
 	>
 		<Palette size={18} strokeWidth={1.8} aria-hidden="true" />
 		{#if compact}<span>Appearance</span>{/if}
@@ -113,7 +127,7 @@
 					<h2 class="text-lg font-semibold">Appearance</h2>
 					<p class="mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
 				</div>
-				<button type="button" class="btn-icon btn-icon-sm preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={closeAppearance}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
+				<button bind:this={closeButton} type="button" class="btn-icon btn-icon-sm preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => closeAppearance()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
 			</div>
 
 			<fieldset class="min-w-0 space-y-2 border-0 p-0">

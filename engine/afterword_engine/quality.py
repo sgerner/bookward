@@ -1339,6 +1339,24 @@ def _dedupe_and_hide(con) -> int:
     """Reject read overlaps and active duplicates of saved/imported books."""
 
     changed = 0
+
+    def reject_candidates(candidate_ids, flag):
+        nonlocal changed
+        ids = sorted(set(int(candidate_id) for candidate_id in candidate_ids))
+        if not ids:
+            return
+        con.executemany(
+            "UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            ((candidate_id,) for candidate_id in ids),
+        )
+        encoded_flag = json.dumps([flag])
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,"
+            "updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
+            ((encoded_flag, candidate_id) for candidate_id in ids),
+        )
+        changed += len(ids)
+
     active = con.execute(
         """SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,
         q.work_id AS quality_work_id,q.provider AS quality_provider,
@@ -1355,14 +1373,7 @@ def _dedupe_and_hide(con) -> int:
         ).fetchall()
     )
     overlap = [item for item in active if read_index.matches(item)]
-    for item in overlap:
-        candidate_id = item["id"]
-        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
-        con.execute(
-            "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-            (json.dumps(["read_overlap"]), candidate_id),
-        )
-        changed += 1
+    reject_candidates((item["id"] for item in overlap), "read_overlap")
     overlap_ids = {item["id"] for item in overlap}
 
     shortlisted_keys = book_identity_match_index(
@@ -1380,39 +1391,35 @@ def _dedupe_and_hide(con) -> int:
         if item["id"] not in overlap_ids
         and book_row_identity_match_keys(item) & shortlisted_keys
     ]
-    for item in shortlisted_overlap:
-        candidate_id = item["id"]
-        con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
-        con.execute(
-            "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-            (json.dumps(["shortlisted_overlap"]), candidate_id),
-        )
-        changed += 1
+    reject_candidates((item["id"] for item in shortlisted_overlap), "shortlisted_overlap")
 
-    duplicate_groups = con.execute(
-        """SELECT book_identity(c.title,c.author) AS identity
+    accepted = con.execute(
+        """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
+        c.isbn13,c.isbn10,q.quality_score,q.work_id AS quality_work_id,
+        q.provider AS quality_provider,q.isbn13 AS quality_isbn13,
+        q.isbn10 AS quality_isbn10
         FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
-        WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'
-        GROUP BY book_identity(c.title,c.author) HAVING COUNT(*) > 1"""
+        WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'"""
     ).fetchall()
-    for group in duplicate_groups:
-        items = con.execute(
-            """SELECT c.id FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
-            WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'
-              AND book_identity(c.title,c.author)=?
-            ORDER BY q.quality_score DESC,
-                (length(c.description)>0) DESC,
-                (length(c.cover_url)>0) DESC,
-                c.score DESC,c.id ASC""",
-            (group[0],),
-        ).fetchall()
-        for item in items[1:]:
-            con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (item[0],))
-            con.execute(
-                "UPDATE candidate_quality SET quality_status='rejected',flags_json=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
-                (json.dumps(["duplicate_identity"]), item[0]),
-            )
-            changed += 1
+    ordered = sorted(
+        accepted,
+        key=lambda item: (
+            -float(item["quality_score"] or 0),
+            -int(bool(item["description"])),
+            -int(bool(item["cover_url"])),
+            -float(item["score"] or 0),
+            int(item["id"]),
+        ),
+    )
+    seen_keys = set()
+    duplicate_ids = []
+    for item in ordered:
+        keys = book_row_identity_match_keys(item)
+        if keys & seen_keys:
+            duplicate_ids.append(int(item["id"]))
+            continue
+        seen_keys.update(keys)
+    reject_candidates(duplicate_ids, "duplicate_identity")
     return changed
 
 

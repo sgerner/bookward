@@ -1,10 +1,21 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
 	import type { ActionData, PageData } from './$types';
-	import { ArrowRight, BookOpen, Check, KeyRound, Sparkles } from '@lucide/svelte';
+	import { ArrowRight, BookOpen, Check, KeyRound, RefreshCw, Sparkles } from '@lucide/svelte';
 	import bookwardMark from '#lib/assets/bookward-mark.svg';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
+	let submitting = $state(false);
+	const trackSubmission: SubmitFunction = () => {
+		submitting = true;
+		return async ({ update }) => {
+			try {
+				await update();
+			} finally {
+				submitting = false;
+			}
+		};
+	};
 </script>
 
 <svelte:head>
@@ -28,9 +39,9 @@
 
 			<div class="mt-20 max-w-2xl">
 				<span class="badge gap-2 preset-tonal-primary"><Sparkles size={14} /> A PERSONAL READING COMPANION</span>
-				<h2 id="welcome-title" class="mt-7 max-w-xl text-5xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 xl:text-6xl">
+				<p id="welcome-title" class="mt-7 max-w-xl text-5xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 xl:text-6xl">
 					Find your next favorite book.
-				</h2>
+				</p>
 				<p class="mt-6 max-w-lg text-lg leading-8 text-surface-700-300">
 					A thoughtful space for the books you love, the lists you trust, and the stories waiting for you.
 				</p>
@@ -79,7 +90,7 @@
 					<p id="setup-description" class="mt-3 text-base leading-7 text-surface-700-300">
 						Choose a username and password for the first administrator. Setup closes as soon as this account is created.
 					</p>
-					<form class="mt-8 grid gap-5" method="POST" action="?/setup" use:enhance aria-describedby="setup-description">
+					<form class="mt-8 grid gap-5" method="POST" action="?/setup" use:enhance={trackSubmission} aria-describedby="setup-description">
 						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
 							Username
 							<input class="input min-h-12 w-full" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="160" />
@@ -90,8 +101,8 @@
 							<span id="password-help" class="text-sm font-normal leading-6 text-surface-700-300">Use at least 12 characters.</span>
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit">
-							<span>Create administrator</span><ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
+							<span>{submitting ? 'Creating administrator…' : 'Create administrator'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
 					<p class="mt-6 border-t border-surface-300-700/40 pt-5 text-sm leading-6 text-surface-700-300">
@@ -101,7 +112,7 @@
 					<h1 id="login-title" class="text-3xl font-semibold tracking-tight text-surface-950-50 sm:text-4xl">Sign in</h1>
 					<p class="mt-3 text-base leading-7 text-surface-700-300">Your Bookward profile opens automatically after you sign in.</p>
 					{#if data.error}<p class="mt-5 rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{data.error}</p>{/if}
-					<form class="mt-8 grid gap-5" method="POST" action="?/login" use:enhance>
+					<form class="mt-8 grid gap-5" method="POST" action="?/login" use:enhance={trackSubmission}>
 						<input type="hidden" name="next" value={data.next} />
 						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
 							Username
@@ -112,8 +123,8 @@
 							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="current-password" required />
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit">
-							<span>Sign in</span><ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
+							<span>{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
 					{#if data.oidc_enabled}

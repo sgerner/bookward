@@ -754,28 +754,26 @@ def import_goodreads_csv(content: bytes):
     required = {"Title", "Author"}
     if not reader.fieldnames or not required.issubset(reader.fieldnames): raise ValueError("This does not look like a Goodreads export")
     count = 0
+    batches: list[tuple[str, list[tuple]]] = []
     try:
-        with transaction() as con:
-            for row_number, source_row in enumerate(reader, start=2):
-                if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
-                # DictReader uses None for fields omitted from a truncated row.
-                title = str(source_row.get("Title") or "").strip()[:500]
-                author = str(source_row.get("Author") or "").strip()[:300]
-                if not title or not author: continue
-                shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
-                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
-                if shelf in {"to-read", "currently-reading"}:
-                    added_at = _read_date_value(source_row.get("Date Added"))
-                    con.execute(
-                        "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                        "VALUES(?, ?, ?, ?, ?) "
-                        "ON CONFLICT(shelf, title, author) DO UPDATE SET "
-                        "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
-                        "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
-                        "updated_at=CURRENT_TIMESTAMP",
-                        (shelf, title, author, isbn, added_at),
-                    )
-                    continue
+        for row_number, source_row in enumerate(reader, start=2):
+            if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
+            # DictReader uses None for fields omitted from a truncated row.
+            title = str(source_row.get("Title") or "").strip()[:500]
+            author = str(source_row.get("Author") or "").strip()[:300]
+            if not title or not author: continue
+            shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+            isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+            if shelf in {"to-read", "currently-reading"}:
+                kind = "shelf"
+                values = (
+                    shelf,
+                    title,
+                    author,
+                    isbn,
+                    _read_date_value(source_row.get("Date Added")),
+                )
+            else:
                 if shelf and shelf != "read": continue
                 try:
                     rating = float(source_row.get("My Rating") or 0) or None
@@ -783,27 +781,50 @@ def import_goodreads_csv(content: bytes):
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be numeric and between 0 and 5. No books were imported.") from exc
                 if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be between 0 and 5. No books were imported.")
-                read_at = _read_date_value(source_row.get("Date Read"))
-                con.execute(
-                    "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
-                    (title, author),
-                )
-                con.execute(
-                    "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                    "VALUES(?,?,?,?,?,'goodreads_csv') "
-                    "ON CONFLICT(title,author) DO UPDATE SET "
-                    "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
-                    "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
-                    "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
-                    "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
-                    "AND excluded.isbn IS NOT reads.isbn THEN NULL "
-                    "ELSE reads.openlibrary_lookup_attempted_at END,"
-                    "isbn=COALESCE(excluded.isbn,reads.isbn)",
-                    (title, author, rating, read_at, isbn),
+                kind = "read"
+                values = (
+                    title,
+                    author,
+                    rating,
+                    _read_date_value(source_row.get("Date Read")),
+                    isbn,
                 )
                 count += 1
+            if not batches or batches[-1][0] != kind:
+                batches.append((kind, []))
+            batches[-1][1].append(values)
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
+    with transaction() as con:
+        for kind, values in batches:
+            if kind == "shelf":
+                con.executemany(
+                    "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
+                    "VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                    "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    values,
+                )
+                continue
+            con.executemany(
+                "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ((item[0], item[1]) for item in values),
+            )
+            con.executemany(
+                "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+                "VALUES(?,?,?,?,?,'goodreads_csv') "
+                "ON CONFLICT(title,author) DO UPDATE SET "
+                "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
+                "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
+                "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
+                "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
+                "AND excluded.isbn IS NOT reads.isbn THEN NULL "
+                "ELSE reads.openlibrary_lookup_attempted_at END,"
+                "isbn=COALESCE(excluded.isbn,reads.isbn)",
+                values,
+            )
     # Importing a history is also the point at which naturally supplied
     # ratings can become outcomes for recommendations shown earlier. Import
     # lazily to keep the ingestion module independent of the telemetry module
@@ -1131,7 +1152,7 @@ def _read_metadata_rows():
             m.metadata_provenance AS cached_metadata_provenance,
             m.metadata_checked_at
         FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id
-        WHERE r.rating IS NOT NULL AND TRIM(COALESCE(r.isbn,''))!=''
+        WHERE TRIM(COALESCE(r.isbn,''))!=''
         ORDER BY COALESCE(m.metadata_checked_at,'') ASC,r.id"""
     )
 
@@ -1398,7 +1419,7 @@ def _read_metadata_attempt_provenance(provenance, *, status, error_type=""):
 def read_metadata_refresh_remaining(
     retry_days: int = READ_METADATA_RETRY_DAYS,
 ) -> int:
-    """Count rated reads with a valid ISBN due for bounded enrichment."""
+    """Count ISBN-bearing reads due for bounded metadata enrichment."""
 
     retry_before = datetime.now(timezone.utc) - timedelta(days=max(1, int(retry_days)))
     return sum(
@@ -1552,6 +1573,7 @@ async def refresh_read_metadata(
     checked_at = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
     updated = 0
     lookup_failures = 0
+    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         for read in batch:
             read_isbn13, read_isbn10 = isbn_parts(read.get("isbn"))
@@ -1582,7 +1604,7 @@ async def refresh_read_metadata(
                         str(read.get("author") or ""),
                         isbn13=read_isbn13,
                         isbn10=read_isbn10,
-                        google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
+                        google_books_api_key=google_books_api_key,
                         client=client,
                     )
                     attempt_provenance = metadata.get("metadata_provenance", {})
@@ -1955,10 +1977,10 @@ def validate_goodreads_rss_url(url: str) -> str:
         or not parsed.path.startswith("/review/list_rss/")
     ):
         raise ValueError("Use a Goodreads read-shelf RSS URL")
-    shelf = parsed.params.get("shelf")
-    if shelf and shelf.casefold() != "read":
+    shelves = parsed.params.get_list("shelf")
+    if any(shelf and shelf.casefold() != "read" for shelf in shelves):
         raise ValueError("Use the Goodreads read shelf")
-    return str(parsed)
+    return str(parsed.copy_set_param("shelf", "read"))
 
 
 def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
@@ -1985,29 +2007,36 @@ async def import_goodreads_shelves(
             continue
         feed = feedparser.parse(content)
         entries = list(feed.entries[:500])
+        shelf_rows = []
+        for entry in entries:
+            title = str(entry.get("title", "")).strip()[:500]
+            author = str(
+                entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
+            ).strip()[:300]
+            if not title:
+                continue
+            isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+            shelf_rows.append(
+                (
+                    shelf,
+                    title,
+                    author,
+                    isbn,
+                    _read_date_value(entry.get("user_date_added")),
+                )
+            )
         with transaction() as con:
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
-            count = 0
-            for entry in entries:
-                title = str(entry.get("title", "")).strip()[:500]
-                author = str(
-                    entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
-                ).strip()[:300]
-                if not title:
-                    continue
-                isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
-                added_at = _read_date_value(entry.get("user_date_added"))
-                con.execute(
-                    "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                    "VALUES(?, ?, ?, ?, ?) "
-                    "ON CONFLICT(shelf, title, author) DO UPDATE SET "
-                    "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
-                    "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
-                    "updated_at=CURRENT_TIMESTAMP",
-                    (shelf, title, author, isbn, added_at),
-                )
-                count += 1
-            imported[shelf] = count
+            con.executemany(
+                "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                "updated_at=CURRENT_TIMESTAMP",
+                shelf_rows,
+            )
+            imported[shelf] = len(shelf_rows)
     return imported
 
 
@@ -2016,6 +2045,7 @@ async def import_goodreads_rss(url: str):
     content, _ = await fetch_bytes(url, allow_goodreads_http=True)
     feed = feedparser.parse(content)
     count = 0
+    read_rows = []
     with transaction() as con:
         for entry in feed.entries[:500]:
             title = str(entry.get("title", "")).strip()[:500]
@@ -2026,8 +2056,26 @@ async def import_goodreads_rss(url: str):
             except ValueError: rating = None
             if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5): rating = None
             read_at = _read_date_value(entry.get("user_read_at"))
-            con.execute("INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,'goodreads_rss') ON CONFLICT(title,author) DO UPDATE SET rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at)", (title, author, rating, read_at))
+            isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
+            read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        con.executemany(
+            "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+            ((item[0], item[1]) for item in read_rows),
+        )
+        con.executemany(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+            "VALUES(?,?,?,?,?,'goodreads_rss') "
+            "ON CONFLICT(title,author) DO UPDATE SET "
+            "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
+            "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
+            "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
+            "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
+            "AND excluded.isbn IS NOT reads.isbn THEN NULL "
+            "ELSE reads.openlibrary_lookup_attempted_at END,"
+            "isbn=COALESCE(excluded.isbn,reads.isbn)",
+            read_rows,
+        )
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
     return count
@@ -2499,6 +2547,7 @@ async def enrich_book_metadata(items):
         return []
     semaphore = asyncio.Semaphore(8)
     lookup_cache = {}
+    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
 
     async with metadata_client() as client:
         async def enrich(item):
@@ -2522,7 +2571,7 @@ async def enrich_book_metadata(items):
                     isbn13=isbn13,
                     isbn10=isbn10,
                     prefer_isbn_cover=bool(isbn13 or isbn10),
-                    google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
+                    google_books_api_key=google_books_api_key,
                     prefer_catalog_synopsis=bool(item.get("_prefer_catalog_synopsis")),
                 )
                 enriched = {**item, "cover_url": metadata["cover_url"]}

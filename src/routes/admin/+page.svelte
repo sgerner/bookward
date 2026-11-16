@@ -12,8 +12,7 @@
 	<a href="/" class="text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Manage accounts</h1>
 	<p class="mt-2 text-surface-700-300">Each account opens one private profile. Existing data stays with the original administrator profile.</p>
-	{#if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
-	{#if form?.error}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>{/if}
+	{#if form?.message && form.error}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>{:else if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
 	<section class="mt-8 rounded-2xl border border-surface-300-700 p-6">
 		<h2 class="text-xl font-semibold">Create an account</h2>
 		<p class="mt-1 text-sm text-surface-700-300">Share the temporary password privately. The new reader must set a personal password on first sign-in.</p>
@@ -31,15 +30,15 @@
 		{#each data.accounts as account}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
-					<div><h3 class="font-semibold">{account.display_name || account.username}</h3><p class="text-sm text-surface-700-300">{account.username} · {account.role} · {account.status}</p></div>
+					<div><h3 class="font-semibold">{account.display_name || account.username}</h3><p class="text-sm text-surface-700-300" aria-label={`${account.username}, ${account.role}, ${account.status}`}>{account.username} · {account.role} · {account.status}</p></div>
 					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
-						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit">{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
 				</div>
 				{#if account.id !== data.current_user_id}<form method="POST" action="?/resetPassword" use:enhance class="mt-4 flex flex-wrap items-end gap-3">
 					<ProfileField profileId={data.user?.profile_id} />
 					<input type="hidden" name="account_id" value={account.id} />
-					<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">Set password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" /></label>
-					<button class="btn btn-sm preset-tonal-surface" type="submit">Reset password</button>
+					<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">Set password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" aria-label={`Set password for ${account.display_name || account.username}`} /></label>
+					<button class="btn btn-sm preset-tonal-surface" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
 				</form>{/if}
 			</article>
 		{/each}

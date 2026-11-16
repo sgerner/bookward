@@ -1,10 +1,11 @@
-import { fail, redirect } from '@sveltejs/kit';
+import { fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
 type AuthMethods = { password_enabled: boolean; oidc_identities: IdentityInfo[] };
 type AuthConfig = { oidc_enabled: boolean };
+const fail = (status: number, data: { message: string }) => kitFail(status, { ...data, error: true as const });
 
 export const load: PageServerLoad = async ({ locals, url }) => {
 	if (!locals.user) throw redirect(303, '/login');

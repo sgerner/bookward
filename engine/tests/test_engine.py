@@ -119,7 +119,7 @@ def test_database_indexes_cover_recent_history_and_job_queue(database):
     assert indexes == {"idx_reads_recent", "idx_jobs_queue"}
     history_plan = rows(
         "EXPLAIN QUERY PLAN SELECT * FROM reads "
-        "ORDER BY COALESCE(read_at, created_at) DESC LIMIT 12"
+        "ORDER BY COALESCE(read_at, created_at) DESC,id DESC LIMIT 12"
     )
     queue_plan = rows(
         "EXPLAIN QUERY PLAN SELECT * FROM jobs "
@@ -913,6 +913,11 @@ def test_goodreads_reimports_preserve_known_read_date_when_feed_date_is_blank(da
         b'Book Id,Title,Author,My Rating,Date Read,ISBN13\n'
         b'2,RSS Read,Writer,4,2023/02/01,\n'
     )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author) "
+            "VALUES('to-read','RSS Read','Writer')"
+        )
 
     async def fetch_bytes(*_args, **_kwargs):
         return b"", "application/rss+xml"
@@ -923,12 +928,17 @@ def test_goodreads_reimports_preserve_known_read_date_when_feed_date_is_blank(da
             "author_name": "Writer",
             "user_rating": "4",
             "user_read_at": "not-a-date",
+            "isbn13": "9780306406157",
         }]
 
     monkeypatch.setattr(ingestion, "fetch_bytes", fetch_bytes)
     monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
     asyncio.run(import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read"))
     assert row("SELECT read_at FROM reads WHERE title='RSS Read'")["read_at"] == "2023/02/01"
+    assert row("SELECT isbn FROM reads WHERE title='RSS Read'")["isbn"] == "9780306406157"
+    assert row(
+        "SELECT COUNT(*) count FROM goodreads_shelf_items WHERE title='RSS Read'"
+    )["count"] == 0
 
 def test_local_cpu_scoring_runs_without_model_download(database):
     assert asyncio.run(score_all("local", "hashing-768")) == 4
@@ -1121,12 +1131,18 @@ def test_recommendations_filter_and_paginate_in_sql(database):
         assert len(page.json()) == 2
         assert all(item["status"] == "recommended" for item in page.json())
 
-        saved = client.get("/api/recommendations?status=saved&limit=1")
+        saved = client.get("/api/recommendations?status=saved")
         assert [item["id"] for item in saved.json()] == [1]
+        discover = client.get("/api/recommendations?status=recommended")
+        assert 2 in {item["id"] for item in discover.json()}
+
+        with transaction() as con:
+            con.execute("UPDATE candidates SET status='imported' WHERE id=2")
 
         overview = client.get("/api/overview?recommendation_limit=1")
         assert [item["status"] for item in overview.json()["recommendations"]] == [
             "recommended",
+            "imported",
             "saved",
         ]
 
@@ -1136,18 +1152,32 @@ def test_overview_payload_reuses_one_database_connection(database, monkeypatch):
 
     connections = []
     original_connect = main_module.connect
+    unsealed_values = []
+    original_unseal = main_module.unseal
+    statements = []
 
     def capture_connect():
         connection = original_connect()
+        connection.set_trace_callback(statements.append)
         connections.append(connection)
         return connection
 
+    def count_unseal(value):
+        unsealed_values.append(value)
+        return original_unseal(value)
+
     monkeypatch.setattr(main_module, "connect", capture_connect)
+    monkeypatch.setattr(main_module, "unseal", count_unseal)
     overview = main_module.overview_payload()
 
     assert len(overview["recommendations"]) == 4
     assert "api_tokens" in overview["settings"]
     assert len(connections) == 1
+    assert sum(query.strip() == "SELECT * FROM reads" for query in statements) == 1
+    assert sum("WHERE c.status IN ('saved','imported')" in query for query in statements) == 1
+    assert len(unsealed_values) == row(
+        "SELECT COUNT(*) count FROM settings WHERE secret=1"
+    )["count"]
 
 
 def test_tracked_recommendations_reuses_a_supplied_database_connection(database, monkeypatch):

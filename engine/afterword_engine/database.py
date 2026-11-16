@@ -977,6 +977,14 @@ MIGRATIONS = [
             ON goodreads_shelf_items(shelf, updated_at DESC);
         """,
     ),
+    (
+        25,
+        """
+        DROP INDEX IF EXISTS idx_reads_recent;
+        CREATE INDEX idx_reads_recent
+            ON reads(COALESCE(read_at, created_at) DESC, id DESC);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
