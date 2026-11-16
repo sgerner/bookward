@@ -1448,6 +1448,7 @@ def test_disabled_source_is_removed_from_discovery_and_scoring(database):
     with transaction() as con: con.execute("UPDATE sources SET enabled=0 WHERE is_default=1")
     assert recommendation_list() == []
     assert asyncio.run(score_all("local", "hashing-768")) == 0
+    assert row("SELECT COUNT(*) count FROM candidates WHERE status='recommended'")["count"] == 0
 
 def test_json_ld_graph_and_urls_are_normalized():
     payload = b'''<script type="application/ld+json">{"@graph":[{"@type":["Thing","Book"],"name":"Safe","author":[{"name":"Writer"}],"image":"javascript:alert(1)","url":"https://user:pass@books.example/safe","datePublished":"2027-03-04T00:00:00Z"}]}</script>'''
