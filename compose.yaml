@@ -43,6 +43,7 @@ services:
       AFTERWORD_EXPLORATION_ENABLED: ${EXPLORATION_ENABLED:-true}
       AFTERWORD_EXPLORATION_EPSILON: ${EXPLORATION_EPSILON:-0.15}
       AFTERWORD_EXPLORATION_STABLE_TOP_K: ${EXPLORATION_STABLE_TOP_K:-4}
+      AFTERWORD_COLLAB_INDEX_PATH: ${COLLAB_INDEX_PATH:-}
     volumes: ["afterword-data:/data", "afterword-backups:/backups"]
     expose: ["8000"]
     extra_hosts: ["host.docker.internal:host-gateway"]
