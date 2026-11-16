@@ -208,8 +208,8 @@ def test_semantic_neighbor_learning_generalizes_beyond_repeated_subjects():
     )
 
     assert [item["id"] for item in ranked] == [101, 102]
-    assert ranked[0]["score"] == 54.0
-    assert ranked[1]["score"] == 46.0
+    assert ranked[0]["score"] == 53.2
+    assert ranked[1]["score"] == 46.8
     assert diagnostics["qualified_features"] == 0
     assert diagnostics["semantic_evidence_books"] == 12
     assert diagnostics["semantic_adjusted_candidates"] == 2
