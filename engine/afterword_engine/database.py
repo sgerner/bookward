@@ -959,6 +959,24 @@ MIGRATIONS = [
         ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
         """,
     ),
+    (
+        24,
+        """
+        CREATE TABLE IF NOT EXISTS goodreads_shelf_items (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(shelf, title, author)
+        );
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_shelf
+            ON goodreads_shelf_items(shelf, updated_at DESC);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

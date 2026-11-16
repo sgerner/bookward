@@ -33,6 +33,7 @@ from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
     validate_goodreads_rss_url,
+    import_goodreads_shelves,
     normalize_source_filters,
     preview_source,
     candidate_metadata_refresh_remaining,
@@ -2172,6 +2173,7 @@ async def goodreads_csv(file: UploadFile = File(...)):
 
 async def _sync_goodreads_rss(url: str):
     count = await import_goodreads_rss(url)
+    shelves = await import_goodreads_shelves(url)
     synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with transaction() as con:
         con.execute(
@@ -2179,7 +2181,7 @@ async def _sync_goodreads_rss(url: str):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
             (synced_at,),
         )
-    return {"imported": count, "synced_at": synced_at}
+    return {"imported": count, "shelves": shelves, "synced_at": synced_at}
 
 
 @app.put("/api/settings/goodreads-rss")
