@@ -76,6 +76,9 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    _impression_precedes,
+    _read_label,
+    _read_time,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -186,7 +189,7 @@ def _mark_private_no_store(response: Response) -> None:
         response.headers["cache-control"] = "private, no-store"
 
 
-def source_sync_interval_hours():
+def source_sync_interval_hours(private=None):
     """Return the persisted permanent-source cadence in hours.
 
     ``0`` means manual-only. Keeping the value in SQLite makes the schedule
@@ -194,7 +197,9 @@ def source_sync_interval_hours():
     useful first-install default.
     """
 
-    raw = private_settings().get(
+    if private is None:
+        private = private_settings()
+    raw = private.get(
         "source_sync_interval_hours", str(settings.source_sync_interval_hours)
     )
     try:
@@ -1235,6 +1240,8 @@ def tracked_recommendations(
     offset: int = 0,
     connection=None,
     recommended_limit: int | None = None,
+    identity_context=None,
+    include_imported: bool = False,
 ):
     ranking_at = datetime.now(timezone.utc)
     base_pool = personalized_pool = final_pool = None
@@ -1259,7 +1266,12 @@ def tracked_recommendations(
             # a learned preference can promote a strong match from below the
             # unpersonalized page boundary.
             ranked = recommendation_list(
-                connection, status=status, limit=None, offset=0
+                connection,
+                status=status,
+                limit=None,
+                offset=0,
+                identity_context=identity_context,
+                include_imported=include_imported,
             )
             base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
@@ -1358,6 +1370,8 @@ def tracked_recommendations(
                 limit=limit,
                 offset=offset,
                 recommended_limit=recommended_limit,
+                identity_context=identity_context,
+                include_imported=include_imported,
             )
             learning_metadata = {
                 "mode": "base_ranker_fallback",
@@ -1380,6 +1394,8 @@ def tracked_recommendations(
             limit=limit,
             offset=offset,
             recommended_limit=recommended_limit,
+            identity_context=identity_context,
+            include_imported=include_imported,
         )
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
@@ -1445,13 +1461,19 @@ def overview_payload(
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
             for name in ("reads", "candidates", "sources")
         }
+        identity_context = _recommendation_identity_context(connection)
         recommendations, run_id = tracked_recommendations(
             connection=connection,
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
+            identity_context=identity_context,
+            include_imported=True,
         )
         decision_batch = recommendation_list(
-            connection, status="decisions", limit=decision_limit + 1
+            connection,
+            status="decisions",
+            limit=decision_limit + 1,
+            identity_context=identity_context,
         )
         decisions_has_more = len(decision_batch) > decision_limit
         decisions = decision_batch[:decision_limit]
@@ -1621,12 +1643,44 @@ async def reading_history_scores(
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise
 
+def _recommendation_identity_context(connection=None):
+    fetch = (
+        lambda sql, values=(): [dict(item) for item in connection.execute(sql, values).fetchall()]
+        if connection is not None
+        else rows(sql, values)
+    )
+    read_rows = fetch("SELECT * FROM reads")
+    try:
+        read_metadata_rows = fetch(
+            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+            "FROM read_metadata WHERE verified_work_id!=''"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: read_metadata" not in str(exc).casefold():
+            raise
+        read_metadata_rows = []
+    read_identity_rows = read_identity_rows_with_current_verified_work_ids(
+        read_rows, read_metadata_rows
+    )
+    read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
+    shortlist_rows = fetch(
+        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.status IN ('saved','imported')"
+    )
+    shortlisted_keys = book_identity_match_index(shortlist_rows)
+    return read_identity_index, shortlisted_keys
+
+
 def _recommendation_rows(
     connection=None,
     *,
     statuses: tuple[str, ...] | None = None,
     limit: int | None = 100,
     offset: int = 0,
+    identity_context=None,
+    include_imported: bool = False,
 ):
     decision_statuses = {"rejected", "maybe_later"}
     is_decision_archive = bool(statuses) and set(statuses).issubset(decision_statuses)
@@ -1671,42 +1725,21 @@ def _recommendation_rows(
         if connection is not None
         else rows(query, params)
     )
-    fetch = (
-        lambda sql, values=(): [dict(item) for item in connection.execute(sql, values).fetchall()]
-        if connection is not None
-        else rows(sql, values)
-    )
-    read_rows = fetch("SELECT * FROM reads")
-    try:
-        read_metadata_rows = fetch(
-            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
-            "FROM read_metadata WHERE verified_work_id!=''"
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table: read_metadata" not in str(exc).casefold():
-            raise
-        read_metadata_rows = []
-    read_identity_rows = read_identity_rows_with_current_verified_work_ids(
-        read_rows, read_metadata_rows
-    )
-    read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
-    shortlisted_keys = book_identity_match_index(
-        fetch(
-            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status IN ('saved','imported')"
-        )
-    )
+    if identity_context is None:
+        identity_context = _recommendation_identity_context(connection)
+    read_identity_index, shortlisted_keys = identity_context
     visible = []
     seen_recommendation_keys = set()
     for item in result:
         if item["status"] == "saved":
             visible.append(item)
             continue
-        if item["status"] == "imported":
-            continue
         keys = book_row_identity_match_keys(item)
+        if item["status"] == "imported":
+            if not include_imported:
+                continue
+            visible.append(item)
+            continue
         if read_identity_index.matches(item) or keys & shortlisted_keys:
             continue
         if item["status"] == "recommended" and keys & seen_recommendation_keys:
@@ -1725,16 +1758,25 @@ def recommendation_list(
     limit: int | None = 100,
     offset: int = 0,
     recommended_limit: int | None = None,
+    identity_context=None,
+    include_imported: bool = False,
 ):
+    if identity_context is None:
+        identity_context = _recommendation_identity_context(connection)
     if recommended_limit is not None and status is None and offset == 0:
         result = _recommendation_rows(
-            connection, statuses=("recommended",), limit=recommended_limit
+            connection,
+            statuses=("recommended",),
+            limit=recommended_limit,
+            identity_context=identity_context,
         )
         result.extend(
             _recommendation_rows(
                 connection,
                 statuses=("saved", "imported", "new"),
                 limit=None,
+                identity_context=identity_context,
+                include_imported=include_imported,
             )
         )
     else:
@@ -1744,7 +1786,12 @@ def recommendation_list(
             else None if not status or status == "all" else (status,)
         )
         result = _recommendation_rows(
-            connection, statuses=statuses, limit=limit, offset=offset
+            connection,
+            statuses=statuses,
+            limit=limit,
+            offset=offset,
+            identity_context=identity_context,
+            include_imported=include_imported,
         )
     for item in result:
         item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
@@ -1785,10 +1832,11 @@ def recommendations(
 
 def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=None):
     existing = con.execute(
-        "SELECT id,rating FROM reads WHERE title=? AND author=?",
+        "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
     saved_rating = rating if rating is not None else existing["rating"] if existing else None
+    read_at = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
         candidate["quality_isbn13"], candidate["quality_isbn10"]
@@ -1796,40 +1844,75 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     con.execute(
         "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
         "openlibrary_work_id,openlibrary_lookup_attempted_at) "
-        "VALUES(?,?,?,NULL,?,'manual',?,"
+        "VALUES(?,?,?,?,?,'manual',?,"
         "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
         "ON CONFLICT(title,author) DO UPDATE SET "
         "rating=COALESCE(excluded.rating,reads.rating),"
+        "read_at=COALESCE(reads.read_at,excluded.read_at),"
         "isbn=COALESCE(reads.isbn,excluded.isbn)",
         (
             candidate["title"],
             candidate["author"],
             rating,
+            read_at,
             isbn13 or None,
             openlibrary_work_id,
             openlibrary_work_id,
         ),
     )
     read = con.execute(
-        "SELECT id,rating FROM reads WHERE title=? AND author=?",
+        "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+        "FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
     if openlibrary_work_id:
         con.execute(
             "UPDATE reads SET openlibrary_work_id=?,"
-            "openlibrary_lookup_attempted_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND openlibrary_work_id=''",
+            "openlibrary_lookup_attempted_at=COALESCE(openlibrary_lookup_attempted_at,CURRENT_TIMESTAMP) "
+            "WHERE id=? AND COALESCE(openlibrary_work_id,'')=''",
             (openlibrary_work_id, read["id"]),
         )
+        read = con.execute(
+            "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+            "FROM reads WHERE id=?",
+            (read["id"],),
+        ).fetchone()
+    read_time, day_precision = _read_time(read["read_at"])
+    impression = None
+    if read_time is not None:
+        prior_impressions = con.execute(
+            "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
+            "FROM recommendation_impressions WHERE candidate_id=? "
+            "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+            (candidate["id"],),
+        ).fetchall()
+        impression = next(
+            (
+                item for item in prior_impressions
+                if _impression_precedes(item, read_time, day_precision)
+            ),
+            None,
+        )
+    label, label_kind, confidence = _read_label({"rating": saved_rating})
+    event_metadata = {
+        "read_source": str(read["source"] or "unknown")[:32],
+        "time_precision": "day" if day_precision else "timestamp",
+    }
     try:
         record_event_in_connection(
             con,
-            event_key=f"manual-read:{uuid.uuid4()}",
+            event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
             candidate_id=int(candidate["id"]),
             event_type="read",
             value=saved_rating,
             source="manual_read",
-            metadata={"session_id": session_id} if session_id else {},
+            run_id=str(impression["run_id"]) if impression is not None else None,
+            metadata=event_metadata,
+            occurred_at=read["read_at"] or read_at,
+            label=label if impression is not None else None,
+            label_kind=label_kind if impression is not None else None,
+            confidence=confidence if impression is not None else None,
+            read_id=int(read["id"]) if impression is not None else None,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1953,7 +2036,8 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,"
             "q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "COALESCE(NULLIF(q.isbn13,''),NULLIF(c.isbn13,''),'') quality_isbn13,"
+            "COALESCE(NULLIF(q.isbn10,''),NULLIF(c.isbn10,''),'') quality_isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.id=?",
             (candidate_id,),
@@ -1971,6 +2055,12 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
             (candidate_id,),
         )
 
+    read_work_identities_job_id = (
+        enqueue_job("read_work_identities", dedupe=True) if read["isbn"] else None
+    )
+    read_metadata_job_id = (
+        enqueue_job("read_metadata", dedupe=True) if read["isbn"] else None
+    )
     job_id = enqueue_job("score", dedupe=True)
     return {
         "id": candidate_id,
@@ -1978,6 +2068,8 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
         "status": "read",
         "rating": read["rating"],
         "job_id": job_id,
+        "read_work_identities_job_id": read_work_identities_job_id,
+        "read_metadata_job_id": read_metadata_job_id,
         "already_present": already_present,
     }
 
@@ -2626,8 +2718,9 @@ def private_settings(connection=None):
     }
 
 
-def safe_association_settings(connection=None):
-    private = private_settings(connection)
+def safe_association_settings(connection=None, private=None):
+    if private is None:
+        private = private_settings(connection)
     return {
         "openlibrary_enabled": private.get("association_openlibrary_enabled", "0") == "1",
         "openlibrary_contact": private.get(
@@ -2657,9 +2750,9 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "goodreads_rss_last_sync_at": private.get("goodreads_rss_last_sync_at", ""),
         "librarr_media_type": media_type,
         "nyt_api_key_set": bool(private.get("nyt_api_key")),
-        "source_sync_interval_hours": source_sync_interval_hours(),
+        "source_sync_interval_hours": source_sync_interval_hours(private),
         "digest": digest,
-        "associations": safe_association_settings(connection),
+        "associations": safe_association_settings(connection, private),
     }
     if include_api_tokens:
         result["api_tokens"] = api_token_list()

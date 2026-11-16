@@ -238,6 +238,32 @@ def test_persist_associations_is_evidence_only_and_idempotent(database):
     assert row("SELECT COUNT(*) count FROM association_evidence") ["count"] == 1
 
 
+def test_persist_association_copies_verified_isbn_to_candidate(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) "
+            "VALUES('ISBN Association','Writer',?,'new','isbn association writer')",
+            (source_id,),
+        )
+
+    evidence = Association(
+        provider="openlibrary_lists",
+        seed_read_id=1,
+        external_id="/works/OLISBNW",
+        title="ISBN Association",
+        author="Writer",
+        isbn="978-0-306-40615-7",
+    )
+    assert persist_associations([evidence]) == 1
+    assert row(
+        "SELECT isbn13,isbn10 FROM candidates WHERE normalized_key=?",
+        ("isbn association writer",),
+    ) == {"isbn13": "9780306406157", "isbn10": ""}
+
+
 def test_association_cache_is_bounded(database):
     cache = AssociationCache(max_entries=2)
     cache.put("test", "one", {"n": 1}, ttl_seconds=60)

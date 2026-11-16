@@ -141,6 +141,51 @@ def test_read_metadata_job_drains_batches_and_negative_caches_mismatches(databas
     assert all(len(item["source_payload"].encode("utf-8")) <= 8192 for item in provenance)
 
 
+def test_unrated_isbn_read_can_receive_verified_work_identity(database, monkeypatch):
+    title, author, isbn = "Unrated Catalog Work", "A Reader", "9780307474278"
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,NULL,?,'manual')",
+            (title, author, isbn),
+        ).lastrowid
+
+    result = _catalog_result(title, author, isbn)
+    work_id = "/works/OL123456W"
+    provenance = result["metadata_provenance"]
+    provenance["fields"] = {
+        field: {"provider": "openlibrary", "provider_id": work_id}
+        for field in ("description", "genres", "cover_url", "release_date")
+    }
+    provenance["fetch_trace"] = [{
+        "provider": "openlibrary",
+        "provider_id": work_id,
+        "query_kind": "isbn",
+        "status": "matched",
+        "identifier_verified": True,
+    }]
+    provenance["source_payloads"] = [{
+        "provider": "openlibrary",
+        "provider_id": work_id,
+        "payload": {
+            "title": title,
+            "authors": [author],
+            "identifiers": [isbn],
+        },
+    }]
+
+    async def resolve(*_args, **_kwargs):
+        return result
+
+    monkeypatch.setattr(ingestion, "resolve_book_metadata", resolve)
+    assert ingestion.read_metadata_refresh_remaining() == 1
+    outcome = asyncio.run(ingestion.refresh_read_metadata())
+    assert outcome["checked"] == 1
+    assert row(
+        "SELECT verified_work_id FROM read_metadata WHERE read_id=?", (read_id,)
+    )["verified_work_id"] == work_id
+    assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] is None
+
+
 @pytest.mark.parametrize(
     ("attempt_status", "trace_status", "stale_after"),
     [

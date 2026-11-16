@@ -72,14 +72,15 @@ def test_librarything_run_excludes_all_known_reads(database, monkeypatch):
         async def recommendations(self, _isbns, **_kwargs):
             return {"recommendations": [
                 {"work": str(i), "isbns": [isbn]} for i, isbn in enumerate(
-                    ("9782222222222", "9783333333333", "9784444444444"), start=1)
+                    ("9782222222222", "9780306406157", "9784444444444", "9785555555555"), start=1)
             ]}
 
     provider = LibraryThingProvider("fixture-key", client=FixtureClient())
     metadata = {
         "9782222222222": ("Disliked Book", "B Author", "/works/OL2W"),
-        "9783333333333": ("Unrated Book", "C Author", "/works/OL3W"),
-        "9784444444444": ("Unread Book", "D Author", "/works/OL4W"),
+        "9780306406157": ("ISBN Alias", "Different Author", "/works/OL3W"),
+        "9784444444444": ("Work Alias", "Different Author", "/works/OL4W"),
+        "9785555555555": ("Unread Book", "D Author", "/works/OL5W"),
     }
 
     async def resolve(isbn):
@@ -90,7 +91,10 @@ def test_librarything_run_excludes_all_known_reads(database, monkeypatch):
         {"id": 1, "title": "Loved Book", "author": "A Author", "rating": 5,
          "isbn": "9781111111111"},
         {"id": 2, "title": "Disliked Book", "author": "B Author", "rating": 1},
-        {"id": 3, "title": "Unrated Book", "author": "C Author", "rating": None},
+        {"id": 3, "title": "Another Read", "author": "C Author", "rating": None,
+         "isbn": "9780306406157"},
+        {"id": 4, "title": "A Different Read", "author": "E Author", "rating": None,
+         "openlibrary_work_id": "/works/OL4W"},
     ]
     result = asyncio.run(run_association_provider(provider, reads))
     assert result.seeds == 1

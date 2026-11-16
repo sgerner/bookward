@@ -504,6 +504,14 @@ def attribute_read_outcomes() -> dict[str, int]:
                 continue
             label, label_kind, confidence = _read_label(read)
             event_key = f"read:{int(read['id']):08d}"
+            manual_event_key = (
+                f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+            )
+            if con.execute(
+                "SELECT 1 FROM recommendation_events WHERE event_key=?",
+                (manual_event_key,),
+            ).fetchone():
+                event_key = manual_event_key
             metadata = {
                 "read_source": str(read.get("source") or "unknown")[:32],
                 "time_precision": "day" if day_precision else "timestamp",

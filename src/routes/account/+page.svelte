@@ -13,10 +13,17 @@
 	<h1 class="mt-6 text-3xl font-semibold">Account</h1>
 	<p class="mt-2 text-surface-700-300">Signed in as <strong>{data.user.display_name || data.user.username}</strong>. Your recommendations and reading lists are private to this profile.</p>
 	{#if data.forcePasswordChange}<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">Set a personal password before continuing. Your administrator supplied a temporary password for this first sign-in.</p>{/if}
-	{#if data.reauthenticationRequired}<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">For security, sign out and sign back in before linking single sign-on.</p>{/if}
-	{#if data.identityLinked}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">Single sign-on is linked to this profile.</p>{/if}
-	{#if data.linkError}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">The identity could not be linked. Check that the provider identity is not already linked to another account, then try again.</p>{/if}
-	{#if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
+	{#if form?.message && form.error}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>
+	{:else if form?.message}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>
+	{:else if data.reauthenticationRequired}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">For security, sign out and sign back in before linking single sign-on.</p>
+	{:else if data.linkError}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">The identity could not be linked. Check that the provider identity is not already linked to another account, then try again.</p>
+	{:else if data.identityLinked}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">Single sign-on is linked to this profile.</p>
+	{/if}
 	<section class="mt-8 rounded-2xl border border-surface-300-700 p-6">
 		<h2 class="text-xl font-semibold">Password</h2>
 		<p class="mt-1 text-sm text-surface-700-300">{data.methods.password_enabled ? 'Change your local password.' : 'Set a local password as another way to sign in.'}</p>
@@ -35,8 +42,15 @@
 				{#each data.methods.oidc_identities as identity}
 					<div class="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-100-800 p-3">
 						<div><p class="break-all font-medium">{identity.issuer}</p><p class="text-sm text-surface-700-300">{identity.email || 'Connected identity'}</p></div>
-						<form method="POST" action="?/unlink" use:enhance>
-							<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="id" value={identity.id} /><button class="btn btn-sm preset-tonal-error" type="submit">Disconnect</button></form>
+						<details>
+							<summary class="btn btn-sm cursor-pointer preset-tonal-error" aria-label={`Disconnect ${identity.email || identity.issuer} from this account`}>Disconnect</summary>
+							<form method="POST" action="?/unlink" use:enhance class="mt-2 grid max-w-xs justify-items-start gap-2">
+								<ProfileField profileId={data.user?.profile_id} />
+								<input type="hidden" name="id" value={identity.id} />
+								<p class="text-xs text-surface-700-300">You will need another sign-in method to access this profile.</p>
+								<button class="btn btn-sm preset-filled-error-500" type="submit" aria-label={`Confirm disconnect: ${identity.email || identity.issuer}`}>Confirm disconnect</button>
+							</form>
+						</details>
 					</div>
 				{/each}
 			</div>

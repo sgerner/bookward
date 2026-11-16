@@ -269,13 +269,10 @@ def test_manual_read_marks_candidate_read_and_learns_without_a_session(database)
         "SELECT title,author,rating,read_at,source FROM reads WHERE title=? AND author=?",
         ("Already Read", "A Reader"),
     )
-    assert read == {
-        "title": "Already Read",
-        "author": "A Reader",
-        "rating": 4.0,
-        "read_at": None,
-        "source": "manual",
-    }
+    assert (read["title"], read["author"], read["rating"], read["source"]) == (
+        "Already Read", "A Reader", 4.0, "manual"
+    )
+    assert read["read_at"]
     assert candidate_id not in {
         item["id"] for item in recommendation_list(status="recommended", limit=None)
     }
@@ -286,7 +283,10 @@ def test_manual_read_marks_candidate_read_and_learns_without_a_session(database)
     )
     assert event["event_type"] == "read"
     assert event["value"] == 4
-    assert json.loads(event["metadata"]) == {}
+    assert json.loads(event["metadata"]) == {
+        "read_source": "manual",
+        "time_precision": "timestamp",
+    }
     assert candidate_id in {
         event["candidate_id"] for event in load_interaction_events()
     }
@@ -603,6 +603,71 @@ def test_read_attribution_requires_prior_exposure_and_updates_rating(database):
     assert future_run
 
 
+def test_manual_mark_read_records_completion_time_and_attributes_exposure(database):
+    recommendations, _run_id = tracked_recommendations()
+    candidate = recommendations[0]
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.post(
+            f"/api/recommendations/{candidate['id']}/read", json={"rating": 5}
+        )
+
+    assert response.status_code == 200
+    read = row("SELECT id,read_at FROM reads WHERE title=? AND author=?", (
+        candidate["title"], candidate["author"]
+    ))
+    assert read["read_at"]
+    event = row(
+        "SELECT id,occurred_at FROM recommendation_events "
+        "WHERE candidate_id=? AND source='manual_read'",
+        (candidate["id"],),
+    )
+    outcome = row(
+        "SELECT read_id,label,label_kind FROM recommendation_outcomes WHERE event_id=?",
+        (event["id"],),
+    )
+    assert event["occurred_at"] == read["read_at"]
+    assert outcome == {
+        "read_id": read["id"],
+        "label": 1.0,
+        "label_kind": "rating_positive",
+    }
+
+
+def test_manual_mark_read_does_not_attribute_historical_completion_to_newer_exposure(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    with transaction() as con:
+        con.execute(
+            "UPDATE recommendation_impressions SET presented_at=? WHERE run_id=? AND candidate_id=?",
+            ("2099-01-01T12:00:00+00:00", run_id, candidate["id"]),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            (candidate["title"], candidate["author"], 5, "2001-01-01", "goodreads_csv"),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        response = client.post(f"/api/recommendations/{candidate['id']}/read", json={})
+
+    assert response.status_code == 200
+    event = row(
+        "SELECT id,run_id,occurred_at FROM recommendation_events "
+        "WHERE candidate_id=? AND source='manual_read'",
+        (candidate["id"],),
+    )
+    assert event["run_id"] is None
+    assert event["occurred_at"] == "2001-01-01"
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?",
+        (event["id"],),
+    )["count"] == 0
+    assert attribute_read_outcomes()["reads_attributed"] == 0
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_events WHERE event_key LIKE 'read:%'"
+    )["count"] == 0
+
+
 def _set_candidate_exposure_time(candidate_id: int, run_id: str, presented_at: str) -> None:
     with transaction() as con:
         con.execute(
@@ -743,7 +808,8 @@ def test_unrated_manual_read_keeps_verified_isbn_for_aliases_imports_and_rescori
             ("Hospitality: A New Approach", "Catalog Variant", source_id, "hospitality alias"),
         ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13=? "
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,"
+            "provider='openlibrary',work_id='/works/OL123456W' "
             "WHERE candidate_id IN (?,?)",
             (isbn13, marked_id, alias_id),
         )
@@ -758,9 +824,14 @@ def test_unrated_manual_read_keeps_verified_isbn_for_aliases_imports_and_rescori
     assert response.status_code == 200
     assert response.json()["rating"] is None
     assert row(
-        "SELECT isbn,rating,source FROM reads WHERE title=? AND author=?",
+        "SELECT isbn,rating,source,openlibrary_work_id FROM reads WHERE title=? AND author=?",
         ("Unreasonable Hospitality", "Will Guidara"),
-    ) == {"isbn": isbn13, "rating": None, "source": "manual"}
+    ) == {
+        "isbn": isbn13,
+        "rating": None,
+        "source": "manual",
+        "openlibrary_work_id": "/works/OL123456W",
+    }
     assert alias_id not in {
         item["id"] for item in recommendation_list(status="recommended", limit=None)
     }

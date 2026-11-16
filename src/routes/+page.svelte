@@ -90,6 +90,8 @@
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
   let filter = $state("");
+  let genreFilter = $state("");
+  let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
   let profileMenuRoot = $state<HTMLDivElement | null>(null);
   let profileMenuButton = $state<HTMLButtonElement | null>(null);
@@ -210,11 +212,14 @@
   ];
   function matchesBookFilter(book: PageBook) {
     const query = filter.trim().toLowerCase();
+    const selectedGenre = genreFilter.trim().toLowerCase();
     return (
-      !query ||
-      `${book.title} ${book.author} ${book.genres.join(" ")}`
-        .toLowerCase()
-        .includes(query)
+      (!query ||
+        `${book.title} ${book.author} ${book.genres.join(" ")}`
+          .toLowerCase()
+          .includes(query)) &&
+      (!selectedGenre ||
+        book.genres.some((genre) => genre.trim().toLowerCase() === selectedGenre))
     );
   }
   function sourceEnabled(source: { id: number; enabled: number }) {
@@ -234,8 +239,30 @@
       (book) => book.status === "recommended" && matchesBookFilter(book),
     ),
   );
-  const savedBooks = $derived(allBooks.filter((book) => book.status === "saved"));
-  const shortlistBooks = $derived(savedBooks);
+  const savedBooks = $derived(allBooks.filter((book) => book.status === "saved" || book.status === "imported"));
+  const shortlistTotalCount = $derived(savedBooks.length);
+  const shortlistBooks = $derived.by(() =>
+    savedBooks
+      .filter(matchesBookFilter)
+      .sort((left, right) => {
+        if (shortlistSort === "title") return left.title.localeCompare(right.title);
+        if (shortlistSort === "author") return left.author.localeCompare(right.author) || left.title.localeCompare(right.title);
+        return right.score - left.score || left.title.localeCompare(right.title);
+      }),
+  );
+  const genreFilterBooks = $derived(
+    activeView === "saved"
+      ? savedBooks
+      : activeView === "decisions"
+        ? decisionFilter === "read"
+          ? []
+          : allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status))
+        : allBooks.filter((book) => book.status === "recommended"),
+  );
+  const bookGenres = $derived(
+    [...new Set(genreFilterBooks.flatMap((book) => book.genres).map((genre) => genre.trim()).filter(Boolean))]
+      .sort((left, right) => left.localeCompare(right)),
+  );
   const decisionBooks = $derived(
     allBooks.filter(
       (book) =>
@@ -618,6 +645,16 @@
     scheduleOptimisticNotificationDismiss();
   }
 
+  function announceActionSuccess(message: string) {
+    if (formNotificationTimer) clearTimeout(formNotificationTimer);
+    formNotificationTimer = null;
+    const id = ++optimisticNotificationId;
+    formNotificationDismissed = true;
+    optimisticNotification = { message, error: false, id };
+    optimisticNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
+    scheduleOptimisticNotificationDismiss();
+  }
+
   function dismissNotification() {
     if (formNotificationTimer) clearTimeout(formNotificationTimer);
     formNotificationTimer = null;
@@ -662,7 +699,7 @@
       } catch {
         change = undefined;
       }
-      return async ({ update, result, formElement }) => {
+      return async ({ update, result }) => {
         const succeeded = result.type === "success" || result.type === "redirect";
         const rollback = () => {
           try {
@@ -674,7 +711,6 @@
         try {
           if (!succeeded) {
             rollback();
-            formElement.reset();
           }
           if (result.type === "error") {
             announceActionError(actionResultMessage(result));
@@ -694,7 +730,6 @@
           if (succeeded) change?.commit?.();
         } catch (error) {
           rollback();
-          formElement.reset();
           announceActionError(
             error instanceof Error
               ? error.message
@@ -1173,7 +1208,7 @@
     if (!librarrConnected) return;
     librarrSearchBook = book;
     librarrQuery = `${book.title} ${book.author}`.trim().slice(0, 200);
-    librarrMediaType = librarrMediaTypeOverride === "ebook" ? "ebook" : "audiobook";
+    librarrMediaType = configuredLibrarrMediaType;
     librarrResults = [];
     librarrSearchError = "";
     librarrSearchMessage = "";
@@ -1276,7 +1311,15 @@
   $effect(() => {
     activeView;
     filter;
+    genreFilter;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;
+  });
+
+  $effect(() => {
+    const selected = genreFilter.trim().toLowerCase();
+    if (selected && !bookGenres.some((genre) => genre.toLowerCase() === selected)) {
+      genreFilter = "";
+    }
   });
 
   // A delivery link can outlive its notification history. Keep that case
@@ -1410,6 +1453,7 @@
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
+        announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
         closeLibrarrSearch();
         await invalidateAll();
       }
@@ -1445,6 +1489,7 @@
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
       if (added) await invalidateAll();
     } else if (added) {
+      announceActionSuccess(`${added} high-confidence match${added === 1 ? "" : "es"} added to Librarr.`);
       closeLibrarrSearch();
       await invalidateAll();
     }
@@ -1462,6 +1507,11 @@
     const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && markReadBook) closeMarkRead();
       if (event.key === "Escape" && librarrSearchOpen) closeLibrarrSearch();
+      if (event.key === "Escape" && openReadMenuId !== null) {
+        const menuId = openReadMenuId;
+        openReadMenuId = null;
+        document.querySelector<HTMLButtonElement>(`[data-read-menu-trigger="${menuId}"]`)?.focus();
+      }
       if (event.key === "Escape" && profileMenuOpen) {
         profileMenuOpen = false;
         profileMenuButton?.focus();
@@ -1476,6 +1526,10 @@
         !profileMenuRoot.contains(target)
       ) {
         profileMenuOpen = false;
+      }
+      if (openReadMenuId !== null && target instanceof Node) {
+        const menuRoot = document.querySelector<HTMLElement>(`[data-read-menu-root="${openReadMenuId}"]`);
+        if (menuRoot && !menuRoot.contains(target)) openReadMenuId = null;
       }
     };
     window.addEventListener("popstate", onPopState);
@@ -1563,7 +1617,7 @@
 </script>
 
 <svelte:head>
-  <title>Bookward — your next great read</title>
+  <title>{activeView === "saved" ? "Shortlist · Bookward" : activeView === "decisions" && decisionFilter === "read" ? "Reading history · Bookward" : activeView === "decisions" ? "History · Bookward" : activeView === "sources" ? "Sources · Bookward" : activeView === "settings" ? "Settings · Bookward" : "Discover · Bookward"}</title>
   <meta
     name="description"
     content="Personal book recommendations from your Goodreads history and trusted upcoming-book lists."
@@ -1604,7 +1658,7 @@
             class={`btn btn-sm min-h-11 ${activeView === item.id ? "preset-filled-primary-500" : "preset-tonal-surface text-surface-700-300"}`}
             aria-current={activeView === item.id ? "page" : undefined}
             onclick={() => go(item.id)}
-            ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span></button
+            ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span>{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</button
       >{/each}
       </nav>
       <div class="ml-auto flex items-center gap-2">
@@ -1764,16 +1818,37 @@
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
-          {#if view !== "saved"}<div class="input flex min-h-11 w-full items-center gap-2 xl:max-w-sm">
-              <Search size={17} class="shrink-0 text-surface-600-400" />
-              <input
-                bind:value={filter}
-                class="input-ghost min-w-0 flex-1"
-                aria-label="Search books"
-                placeholder="Search books"
-              />
-              {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
-            </div>{/if}
+          <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
+              <div class="input flex min-h-11 w-full min-w-0 items-center gap-2 sm:flex-1">
+                <Search size={17} class="shrink-0 text-surface-600-400" />
+                <input
+                  bind:value={filter}
+                  class="input-ghost min-w-0 flex-1"
+                  aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
+                  placeholder={view === "saved" ? "Search shortlist" : "Search books"}
+                />
+                {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+              </div>
+              {#if bookGenres.length && !(view === "decisions" && decisionFilter === "read")}
+                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
+                  Genre
+                  <select class="select mt-1 min-h-11 w-full preset-tonal-surface" bind:value={genreFilter} aria-label={view === "saved" ? "Filter shortlist by genre" : "Filter books by genre"}>
+                    <option value="">All genres</option>
+                    {#each bookGenres as genre (genre)}<option value={genre}>{genre}</option>{/each}
+                  </select>
+                </label>
+              {/if}
+              {#if view === "saved"}
+                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
+                  Sort by
+                  <select class="select mt-1 min-h-11 w-full preset-tonal-surface" bind:value={shortlistSort} aria-label="Sort shortlist">
+                    <option value="score">Best match</option>
+                    <option value="title">Title A–Z</option>
+                    <option value="author">Author A–Z</option>
+                  </select>
+                </label>
+              {/if}
+          </div>
         </section>
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
@@ -1879,8 +1954,9 @@
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
+                  {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
-                  {#each book.genres.slice(0, 2) as genre (genre)}<span in:scale={{ duration: motionDuration(150) }} class="badge badge-sm preset-tonal-secondary">{genre}</span>{/each}
+                  {#each book.genres.slice(0, 2) as genre (genre)}<button in:scale={{ duration: motionDuration(150) }} type="button" class="badge badge-sm preset-tonal-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500" aria-label={`${genre} filter`} aria-pressed={genreFilter.toLowerCase() === genre.toLowerCase()} onclick={() => (genreFilter = genre)}>{genre}</button>{/each}
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
@@ -1919,10 +1995,10 @@
                 </details>
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -1932,11 +2008,12 @@
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
-                    <div class="relative z-50 ml-auto shrink-0">
+                    <div class="relative z-50 ml-auto shrink-0" data-read-menu-root={book.id}>
                       <button
                         type="button"
                         class="btn btn-icon btn-xs min-h-8 min-w-8 preset-tonal-surface"
                         aria-label={`More options for ${book.title}`}
+                        data-read-menu-trigger={book.id}
                         aria-expanded={openReadMenuId === book.id}
                         title="More options"
                         onclick={() => (openReadMenuId = openReadMenuId === book.id ? null : book.id)}
@@ -1950,16 +2027,17 @@
                         <button
                           type="button"
                           class="btn btn-sm mt-3 min-h-10 w-full preset-filled-primary-500"
+                          aria-label={`Mark Read: ${book.title} by ${book.author}`}
                           onclick={() => openMarkRead(book)}
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
                   {:else if book.status === "saved"}
                     {#if librarrConnected}
-                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
+                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
                       <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                       </form>
                     {:else}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
@@ -1968,18 +2046,27 @@
                       in:fly={{ y: 8, duration: motionDuration(180) }}
                       type="button"
                       class="btn btn-sm min-h-10 preset-filled-primary-500"
+                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
                     {#if book.status === "saved"}
                       <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                       </form>
                     {/if}
+                  {:else if book.status === "imported"}
+                    <button
+                      in:fly={{ y: 8, duration: motionDuration(180) }}
+                      type="button"
+                      class="btn btn-sm min-h-10 preset-filled-primary-500"
+                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
+                      onclick={() => openMarkRead(book)}
+                    ><Check size={15} /> Mark Read</button>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
                   {/if}
                 </div>
@@ -1988,11 +2075,11 @@
           {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
               <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
               <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" ? "Your shortlist is empty" : filter ? "No books match that search" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
-                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" ? "Shortlist a recommendation when one catches your eye." : filter ? "Try an author, title, or genre." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+                <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : filter || genreFilter ? "No books match these filters" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : view === "saved" ? "No shortlist books match these filters" : "You are all caught up"}</h2>
+                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : filter || genreFilter ? "Change the search or genre filter to see more books." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
               </div>
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
-              {#if view === "discover" && !filter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+              {#if view === "discover" && !filter && !genreFilter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
                 <ProfileField profileId={data.user?.profile_id} />
                 <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                   {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
@@ -2089,6 +2176,7 @@
                       <button
                         type="button"
                         class="flex min-h-9 w-full items-center gap-2 text-left text-sm font-medium text-primary-600-400"
+                        aria-label={`Show reading details for ${item.title} by ${item.author}`}
                         aria-expanded={expandedReadingDetails.includes(item.id)}
                         aria-controls={`reading-details-${item.id}`}
                         onclick={() => toggleReadingDetails(item.id)}
@@ -2219,9 +2307,20 @@
                       <button
                         type="button"
                         role="tab"
+                        id={`source-tab-${option.value}`}
+                        aria-controls="source-filter-panel"
                         aria-selected={sourceFilter === option.value}
+                        tabindex={sourceFilter === option.value ? 0 : -1}
                         class={`min-h-9 min-w-0 flex-1 break-words px-2 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
                         onclick={() => (sourceFilter = option.value)}
+                        onkeydown={(event) => {
+                          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+                          event.preventDefault();
+                          const current = sourceFilterOptions.findIndex((item) => item.value === option.value);
+                          const next = event.key === "Home" ? 0 : event.key === "End" ? sourceFilterOptions.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + sourceFilterOptions.length) % sourceFilterOptions.length;
+                          sourceFilter = sourceFilterOptions[next].value;
+                          document.getElementById(`source-tab-${sourceFilterOptions[next].value}`)?.focus();
+                        }}
                       >
                         {option.label}
                         <span class="ml-1 opacity-70">{option.count}</span>
@@ -2229,7 +2328,7 @@
                     {/each}
                   </div>
                 </div>
-                <div class="min-w-0 divide-y divide-surface-200-800">
+                <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -2408,8 +2507,9 @@
                         </div>{/each}
                     {:else}
                       <div class="border-b border-surface-200-800 px-1 py-5 text-sm text-surface-600-400">
-                        No one-time imports yet. Add a source when you want a
-                        single snapshot.
+                        {group.key === "permanent"
+                          ? "No permanent feeds yet. Add a source to scan it on your cadence."
+                          : "No one-time imports yet. Add a source when you want a single snapshot."}
                       </div>
                     {/if}
                   {/each}
@@ -2672,6 +2772,12 @@
                 {#if data.profile.goodreads_rss_last_sync_at}
                   <p class="mt-2 text-xs text-surface-600-400">
                     Last successful sync (UTC): {data.profile.goodreads_rss_last_sync_at}
+                  </p>
+                {/if}
+                {#if data.profile.goodreads_rss_last_status === "failed"}
+                  <p class="mt-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm leading-6" role="alert">
+                    Goodreads RSS sync failed{#if data.profile.goodreads_rss_last_attempt_at} on <time datetime={data.profile.goodreads_rss_last_attempt_at}>{data.profile.goodreads_rss_last_attempt_at}</time> UTC{/if}.
+                    {data.profile.goodreads_rss_last_error || "Try syncing the feed again."}
                   </p>
                 {/if}
                 <label
@@ -3042,13 +3148,15 @@
                           {#if token.revoked_at}
                             <span class="badge preset-tonal-error">Revoked</span>
                           {:else}
-                            <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)}>
-                              <ProfileField profileId={data.user?.profile_id} />
-                              <input type="hidden" name="id" value={token.id} />
-                              <button class="btn btn-sm min-h-9 preset-tonal-error" type="submit" disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>
-                                {#if isPending(`revoke-api-token-${token.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Trash2 size={14} />{/if} Revoke
-                              </button>
-                            </form>
+                            <details>
+                              <summary class="btn btn-sm min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
+                              <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)} class="mt-2 grid max-w-xs justify-items-start gap-2">
+                                <ProfileField profileId={data.user?.profile_id} />
+                                <input type="hidden" name="id" value={token.id} />
+                                <p class="text-xs text-surface-700-300">Apps using this token will lose access to Bookward.</p>
+                                <button class="btn btn-sm min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
+                              </form>
+                            </details>
                           {/if}
                         </li>
                       {/each}
@@ -3264,7 +3372,7 @@
         ><Icon
           size={19}
           strokeWidth={activeView === item.id ? 2.2 : 1.8}
-        /><span>{item.shortLabel}</span>{#if activeView === item.id}<span
+        /><span class="flex items-center gap-1">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
             in:scale={{ duration: motionDuration(150) }}
             out:fade={{ duration: motionDuration(90) }}
             class="absolute bottom-1 size-1 rounded-full preset-filled-primary-500"
@@ -3304,7 +3412,7 @@
             </span>
             <div class="min-w-0">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read</h2>
+              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -3426,11 +3534,11 @@
           >
             <label
               class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
-              aria-label="Search Librarr"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
                 class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
+                aria-label="Search Librarr by title or author"
                 placeholder="Search title or author"
               /></label
             >
@@ -3547,6 +3655,7 @@
                   <button
                     type="button"
                     class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
+                    aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}
                     aria-busy={librarrAddingKey === resultIdentity(result)}
