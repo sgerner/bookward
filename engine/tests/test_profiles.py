@@ -1,5 +1,6 @@
 from pathlib import Path
 import asyncio
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Thread
 
@@ -14,7 +15,7 @@ import respx
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from afterword_engine import backups, profiles
+from afterword_engine import backups, database, profiles
 from afterword_engine.api_tokens import generate_api_token, legacy_hash_api_token
 from afterword_engine.config import settings
 from afterword_engine.database import MIGRATIONS, connect, database_lock, initialize, transaction
@@ -446,6 +447,42 @@ def test_worker_fails_jobs_after_the_retry_limit(identity_store):
     assert job["status"] == "failed"
     assert job["error"] == "Job lease expired after maximum attempts"
     assert job["lease_token"] is None
+
+
+def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
+    identity_store, monkeypatch
+):
+    broken_profile = "a" * 32
+    broken_path = profile_database_path(broken_profile)
+    broken_path.parent.mkdir(parents=True, exist_ok=True)
+    broken_path.write_bytes(b"not a sqlite database")
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("healthy_profile_job")
+
+    original_initialize = database.initialize
+
+    def fail_one_profile(*, seed_demo=True):
+        if current_profile_id() == broken_profile:
+            raise database.sqlite3.DatabaseError("profile migration failed")
+        return original_initialize(seed_demo=seed_demo)
+
+    monkeypatch.setattr(database, "initialize", fail_one_profile)
+    monkeypatch.setattr(profiles, "profile_ids", lambda: [broken_profile, "legacy"])
+    stop = asyncio.Event()
+    handled = []
+
+    async def handler(kind):
+        handled.append(kind)
+        stop.set()
+        return {"ok": True}
+
+    asyncio.run(worker_loop(handler, stop))
+
+    with profile_scope("legacy"), connect() as con:
+        job = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+    assert handled == ["healthy_profile_job"]
+    assert job["status"] == "complete"
 
 
 def test_lease_reaper_preserves_a_lease_renewed_after_its_read(identity_store, monkeypatch):
@@ -985,6 +1022,11 @@ def test_oidc_login_routes_a_stable_identity_to_its_profile(identity_store, monk
             assert callback.status_code == 200
             assert callback.json()["account"]["must_change_password"] is False
             profile_ids.append(callback.json()["account"]["profile_id"])
+            if index == 0:
+                missing_profile_db = profile_database_path(profile_ids[0])
+                missing_profile_db.unlink()
+                for suffix in ("-wal", "-shm", "-journal"):
+                    Path(f"{missing_profile_db}{suffix}").unlink(missing_ok=True)
             replay = client.get(
                 "/auth/oidc/callback",
                 params={"code": code, "state": authorization["state"][0]},
@@ -994,6 +1036,8 @@ def test_oidc_login_routes_a_stable_identity_to_its_profile(identity_store, monk
 
     assert profile_ids[0] != "legacy"
     assert profile_ids[0] == profile_ids[1]
+    with profile_scope(profile_ids[0]), connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == len(MIGRATIONS)
 
 
 @pytest.mark.parametrize(
@@ -1157,6 +1201,83 @@ def test_identity_registry_restore_revokes_restored_sessions_and_tokens(identity
     assert profiles.authenticate_api_token(token_before_backup) is None
     assert profiles.authenticate_api_token(token_after_backup) is None
     assert profiles.account_by_id(later_reader["id"]) is None
+    safety_snapshots = [
+        item for item in backups.identity_backup_status()["backups"]
+        if item["id"] != snapshot["id"]
+    ]
+    assert safety_snapshots
+    assert (backups.auth_backup_directory() / f"{snapshot['id']}.sqlite3").is_file()
+    safety_path = backups.auth_backup_directory() / f"{safety_snapshots[0]['id']}.sqlite3"
+    with sqlite3.connect(safety_path) as con:
+        assert con.execute(
+            "SELECT 1 FROM accounts WHERE id=?", (later_reader["id"],)
+        ).fetchone() == (1,)
+
+
+def test_identity_backup_failure_is_persisted_in_status(identity_store, monkeypatch):
+    def fail_directory(_directory):
+        raise OSError("backup storage is unavailable")
+
+    monkeypatch.setattr(backups, "_ensure_private_directory", fail_directory)
+    with pytest.raises(OSError, match="backup storage is unavailable"):
+        backups.create_auth_backup()
+
+    status = backups.identity_backup_status()
+    assert status["last_attempt_at"]
+    assert status["last_error"] == "backup storage is unavailable"
+
+
+def test_identity_restore_rolls_back_after_replace_failure_and_keeps_selected_snapshot(
+    identity_store, monkeypatch
+):
+    reader = profiles.create_account("restore-safety-reader", "restore-safety-password-long")
+    selected = backups.create_auth_backup()
+    later_reader = profiles.create_account("restore-safety-later", "restore-safety-password-long")
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    replace_registry = backups._replace_auth_registry
+    calls = 0
+
+    def fail_after_first_rename(staged, live, on_replace=None):
+        nonlocal calls
+        calls += 1
+        replace_registry(staged, live, on_replace=on_replace)
+        if calls == 1:
+            raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr(backups, "_replace_auth_registry", fail_after_first_rename)
+    with pytest.raises(OSError, match="injected directory sync failure"):
+        backups.restore_auth_backup(selected["id"])
+
+    assert calls == 2
+    assert profiles.account_by_id(reader["id"]) is not None
+    assert profiles.account_by_id(later_reader["id"]) is not None
+    assert (backups.auth_backup_directory() / f"{selected['id']}.sqlite3").is_file()
+
+
+def test_identity_backup_status_is_admin_only_and_reports_metadata(identity_store):
+    backup = backups.create_auth_backup()
+    reader = profiles.create_account("backup-status-reader", "backup-status-password-long")
+    admin_session, _ = profiles.create_session(identity_store["id"])
+    reader_session, _ = profiles.create_session(reader["id"])
+
+    with TestClient(app) as client:
+        admin = client.get(
+            "/admin/auth-backups", headers={"x-bookward-session": admin_session}
+        )
+        regular = client.get(
+            "/admin/auth-backups", headers={"x-bookward-session": reader_session}
+        )
+        anonymous = client.get("/admin/auth-backups")
+
+    assert admin.status_code == 200
+    status = admin.json()
+    assert status["enabled"] is True
+    assert isinstance(status["interval_hours"], int)
+    assert status["last_success_at"]
+    assert any(item["id"] == backup["id"] for item in status["backups"])
+    assert all(set(item) == {"id", "created_at", "size_bytes"} for item in status["backups"])
+    assert regular.status_code == 403
+    assert anonymous.status_code == 401
 
 
 def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identity_store):

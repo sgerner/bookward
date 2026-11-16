@@ -24,6 +24,7 @@ from .backups import (
     backup_scheduler_loop,
     backup_status,
     create_backup,
+    identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
 )
@@ -113,7 +114,8 @@ import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
 SOURCE_SYNC_MAX_HOURS = 720
-SOURCE_SYNC_ERROR_RETRY_SECONDS = 300
+SOURCE_SYNC_ERROR_RETRY_SECONDS = 6 * 60 * 60
+GOODREADS_RSS_MAX_ATTEMPTS = 3
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 ENRICHMENT_RETRY_POLL_SECONDS = 300
@@ -209,36 +211,46 @@ def source_sync_interval_hours(private=None):
     return max(SOURCE_SYNC_MIN_HOURS, min(SOURCE_SYNC_MAX_HOURS, value))
 
 
-def source_sync_is_due():
-    """Whether at least one enabled permanent source needs a scheduled scan."""
+def source_sync_due_sources(now=None):
+    """Return only enabled permanent sources due for a scheduled scan."""
 
     interval = source_sync_interval_hours()
     if interval <= 0:
-        return False
-    now = datetime.now(timezone.utc)
+        return []
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     sources = rows(
-        "SELECT last_scanned_at,last_status FROM sources "
-        "WHERE enabled=1 AND kind NOT IN ('builtin','association') "
-        "AND lifecycle='permanent'"
+        "SELECT * FROM sources WHERE enabled=1 "
+        "AND kind NOT IN ('builtin','association') AND lifecycle='permanent'"
     )
+    due = []
     for source in sources:
         if not source["last_scanned_at"]:
-            return True
+            due.append(source)
+            continue
         try:
             last = datetime.fromisoformat(
                 str(source["last_scanned_at"]).replace(" ", "T").replace("Z", "+00:00")
             )
         except ValueError:
-            return True
+            due.append(source)
+            continue
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         if str(source["last_status"] or "").startswith("error:"):
             if now - last >= timedelta(seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS):
-                return True
+                due.append(source)
             continue
         if now - last >= timedelta(hours=interval):
-            return True
-    return False
+            due.append(source)
+    return due
+
+
+def source_sync_is_due():
+    """Whether at least one enabled permanent source needs a scheduled scan."""
+
+    return bool(source_sync_due_sources())
 
 
 def active_job(kind: str):
@@ -317,8 +329,12 @@ async def source_scheduler_loop(stop):
         for profile_id in identity_store.profile_ids():
             try:
                 with profile_scope(profile_id):
-                    if source_sync_is_due() and not active_job("sync"):
-                        enqueue_job("sync", dedupe=True)
+                    if (
+                        source_sync_is_due()
+                        and not active_job("sync")
+                        and not active_job("sync_due")
+                    ):
+                        enqueue_job("sync_due", dedupe=True)
                     if check_enrichment_retries:
                         _queue_due_enrichment_retries()
             except Exception:
@@ -353,7 +369,7 @@ async def digest_scheduler_loop(stop):
 
 
 def queue_goodreads_rss_if_due(current_time=None):
-    """Queue one persisted Goodreads feed sync per UTC night after 02:00."""
+    """Queue the nightly Goodreads feed sync and retry failures up to three times."""
 
     now = current_time or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -366,14 +382,23 @@ def queue_goodreads_rss_if_due(current_time=None):
 
     sync_date = now.date().isoformat()
     with transaction() as con:
-        claimed = con.execute(
-            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP "
-            "WHERE settings.value!=excluded.value",
+        scheduled = con.execute(
+            "SELECT id,status,attempts FROM jobs WHERE kind='goodreads_rss' "
+            "AND date(created_at)=? ORDER BY created_at DESC LIMIT 1",
             (sync_date,),
-        )
-        if claimed.rowcount == 0:
-            return None
+        ).fetchone()
+        if scheduled:
+            if scheduled["status"] in {"queued", "running", "complete"}:
+                return scheduled["id"] if scheduled["status"] != "complete" else None
+            if scheduled["status"] == "failed":
+                if int(scheduled["attempts"] or 0) >= GOODREADS_RSS_MAX_ATTEMPTS:
+                    return None
+                updated = con.execute(
+                    "UPDATE jobs SET status='queued',error=NULL,finished_at=NULL "
+                    "WHERE id=? AND status='failed' AND attempts<?",
+                    (scheduled["id"], GOODREADS_RSS_MAX_ATTEMPTS),
+                ).rowcount
+                return scheduled["id"] if updated else None
         active = con.execute(
             "SELECT id FROM jobs WHERE kind='goodreads_rss' "
             "AND status IN ('queued','running') LIMIT 1"
@@ -384,6 +409,11 @@ def queue_goodreads_rss_if_due(current_time=None):
         con.execute(
             "INSERT INTO jobs(id,kind,status) VALUES(?,'goodreads_rss','queued')",
             (job_id,),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+            (sync_date,),
         )
         return job_id
 
@@ -435,7 +465,7 @@ async def handle_job(kind: str):
         )
         return {**result, "score_job_id": score_job_id}
     if kind == "digest":
-        return await send_digest(config)
+        return await send_digest(config, automatic=True)
     if kind == "goodreads_rss":
         url = config.get("goodreads_rss_url", "").strip()
         if not url:
@@ -568,14 +598,19 @@ async def handle_job(kind: str):
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
         digest_job_id = queue_digest_if_due()
         return {"collected":collected,"metadata":metadata,"quality":quality,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
-    if kind == "sync":
+    if kind in {"sync", "sync_due"}:
         total = 0
         errors = []
-        sources = rows(
-            "SELECT * FROM sources WHERE enabled=1 "
-            "AND kind NOT IN ('builtin','association') "
-            "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
-        )
+        if kind == "sync_due":
+            sources = source_sync_due_sources()
+            if not sources:
+                return {"skipped": "not_due", "collected": 0, "errors": []}
+        else:
+            sources = rows(
+                "SELECT * FROM sources WHERE enabled=1 "
+                "AND kind NOT IN ('builtin','association') "
+                "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
+            )
         for source in sources:
             try:
                 total += await scan_source(source)
@@ -589,6 +624,8 @@ async def handle_job(kind: str):
                         (f"error:{message}", source["id"]),
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
+        if kind == "sync_due" and len(errors) == len(sources):
+            return {"collected": total, "errors": errors, "skipped": "all_sources_failed"}
         metadata = await refresh_missing_candidate_metadata()
         if candidate_metadata_refresh_remaining():
             enqueue_job("metadata", dedupe=True)
@@ -610,19 +647,27 @@ async def lifespan(app):
     identity_store.migrate_legacy_api_tokens(legacy_tokens)
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
-            with profile_scope(profile_id):
-                recover_interrupted_restore()
-            _ensure_profile_database(profile_id)
+            try:
+                with profile_scope(profile_id):
+                    recover_interrupted_restore()
+                _ensure_profile_database(profile_id)
+            except Exception:
+                # A broken profile must not prevent the rest of the installation
+                # from serving. Its worker retries initialization with backoff.
+                LOGGER.exception("Could not initialize profile %s during startup", profile_id)
     stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
-        with profile_scope(profile_id):
-            enqueue_job("metadata", dedupe=True)
-            if has_candidate_quality_audit_candidates():
-                enqueue_job("candidate_quality_recovery", dedupe=True)
-            enqueue_job("read_work_identities", dedupe=True)
-            enqueue_job("read_metadata", dedupe=True)
+        try:
+            with profile_scope(profile_id):
+                enqueue_job("metadata", dedupe=True)
+                if has_candidate_quality_audit_candidates():
+                    enqueue_job("candidate_quality_recovery", dedupe=True)
+                enqueue_job("read_work_identities", dedupe=True)
+                enqueue_job("read_metadata", dedupe=True)
+        except Exception:
+            LOGGER.exception("Could not queue startup work for profile %s", profile_id)
     yield
     stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
 
@@ -1043,9 +1088,13 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
             account = identity_store.create_oidc_account(issuer, subject, email, name)
         except PermissionError as exc:
             raise HTTPException(403, "This SSO account is disabled") from exc
-        _ensure_profile_database(account["profile_id"])
     if not account:
         raise HTTPException(403, "This SSO identity is not linked to a Bookward account")
+    try:
+        _ensure_profile_database(account["profile_id"])
+    except Exception as exc:
+        LOGGER.exception("Could not initialize OIDC profile %s", account["profile_id"])
+        raise HTTPException(503, "Your Bookward profile is temporarily unavailable. Please try again.") from exc
     raw, account = identity_store.create_session(account["id"])
     return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
 
@@ -1053,6 +1102,12 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
 @app.get("/api/backups")
 def get_backup_status():
     return backup_status()
+
+
+@app.get("/admin/auth-backups")
+def get_identity_backup_status(request: Request):
+    _require_admin(request)
+    return identity_backup_status()
 
 
 @app.post("/api/backups/create")
@@ -2283,15 +2338,37 @@ async def goodreads_csv(file: UploadFile = File(...)):
 
 
 async def _sync_goodreads_rss(url: str):
-    count = await import_goodreads_rss(url)
-    shelves = await import_goodreads_shelves(url)
+    try:
+        count = await import_goodreads_rss(url)
+        shelves = await import_goodreads_shelves(url)
+    except Exception as exc:
+        attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        message = safe_error_message(exc, limit=300)
+        with transaction() as con:
+            for key, value in (
+                ("goodreads_rss_last_status", "failed"),
+                ("goodreads_rss_last_attempt_at", attempted_at),
+                ("goodreads_rss_last_error", message),
+            ):
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                    (key, value),
+                )
+        raise
     synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with transaction() as con:
-        con.execute(
-            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_sync_at',?,0) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
-            (synced_at,),
-        )
+        for key, value in (
+            ("goodreads_rss_last_sync_at", synced_at),
+            ("goodreads_rss_last_status", "succeeded"),
+            ("goodreads_rss_last_attempt_at", synced_at),
+            ("goodreads_rss_last_error", ""),
+        ):
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
     return {"imported": count, "shelves": shelves, "synced_at": synced_at}
 
 
@@ -2748,6 +2825,9 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "librarr_api_key_set": bool(private.get("librarr_api_key")),
         "goodreads_rss_url": private.get("goodreads_rss_url", ""),
         "goodreads_rss_last_sync_at": private.get("goodreads_rss_last_sync_at", ""),
+        "goodreads_rss_last_status": private.get("goodreads_rss_last_status", ""),
+        "goodreads_rss_last_attempt_at": private.get("goodreads_rss_last_attempt_at", ""),
+        "goodreads_rss_last_error": private.get("goodreads_rss_last_error", ""),
         "librarr_media_type": media_type,
         "nyt_api_key_set": bool(private.get("nyt_api_key")),
         "source_sync_interval_hours": source_sync_interval_hours(private),

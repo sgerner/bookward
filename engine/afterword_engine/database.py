@@ -1325,6 +1325,22 @@ def persist_metadata_field_provenance(
         written += 1
     return written
 
+
+def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
+    """Execute complete SQL statements on the caller's active transaction."""
+
+    start = 0
+    for index, character in enumerate(script):
+        if character == ";" and sqlite3.complete_statement(script[start : index + 1]):
+            statement = script[start : index + 1].strip()
+            if statement:
+                con.execute(statement)
+            start = index + 1
+    pending = script[start:]
+    if pending.strip():
+        con.execute(pending)
+
+
 def initialize(*, seed_demo: bool = True):
     db_path = profile_database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1332,14 +1348,27 @@ def initialize(*, seed_demo: bool = True):
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
         for version, script in MIGRATIONS:
-            if version not in applied:
-                try:
-                    con.executescript(script)
-                except sqlite3.Error as exc:
-                    raise sqlite3.DatabaseError(
-                        f"Schema migration {version} failed: {exc}"
-                    ) from exc
-                con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+            if version in applied:
+                continue
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                already_applied = con.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version=?", (version,)
+                ).fetchone()
+                if already_applied:
+                    con.commit()
+                    continue
+                _execute_migration_script(con, script)
+                con.execute(
+                    "INSERT INTO schema_migrations(version) VALUES(?)", (version,)
+                )
+                con.commit()
+            except sqlite3.Error as exc:
+                if con.in_transaction:
+                    con.rollback()
+                raise sqlite3.DatabaseError(
+                    f"Schema migration {version} failed: {exc}"
+                ) from exc
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),

@@ -70,6 +70,19 @@ def test_backup_is_wal_safe_private_and_excludes_the_key(database):
     assert private_setting("backup_test_secret") == "keep this encrypted"
 
 
+def test_backup_failure_keeps_a_specific_safe_diagnostic(database, monkeypatch):
+    monkeypatch.setattr(
+        backups,
+        "_create_snapshot_unlocked",
+        lambda: (_ for _ in ()).throw(OSError("backup disk is full")),
+    )
+
+    with pytest.raises(backups.BackupError, match="backup disk is full"):
+        backups.create_backup()
+
+    assert backups.backup_status()["last_error"] == "Backup failed: backup disk is full"
+
+
 def test_restore_makes_a_safety_snapshot_and_recovers_all_rows(database):
     with transaction() as con:
         con.execute(

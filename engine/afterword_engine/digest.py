@@ -11,6 +11,7 @@ import asyncio
 import json
 import re
 import smtplib
+import sqlite3
 import ssl
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -22,12 +23,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .database import row, rows, transaction
-from .identity import book_identity_match_index, book_row_identity_match_keys
+from .identity import ReadIdentityIndex, book_row_identity_match_keys
+from .ingestion import read_identity_rows_with_current_verified_work_ids
 from .security import safe_error_message, validate_public_url
 
 
 CHANNELS = {"discord", "email"}
 SMTP_SECURITY = {"none", "starttls", "ssl"}
+MAX_DELIVERY_ATTEMPTS = 3
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
@@ -202,17 +205,36 @@ def digest_is_due(values: dict | None = None, at: datetime | None = None) -> boo
         return False
     # Failed providers are retried by the scheduler, but a short backoff keeps
     # a bad webhook or unavailable SMTP host from being hammered once a minute.
-    failed = row(
-        "SELECT updated_at FROM notification_deliveries WHERE period_key=? AND status='failed' ORDER BY updated_at DESC LIMIT 1",
-        (current_period,),
-    )
-    if failed and failed.get("updated_at"):
+    deliveries = {
+        item["channel"]: item
+        for item in rows(
+            "SELECT channel,status,updated_at,attempts FROM notification_deliveries "
+            "WHERE period_key=?",
+            (current_period,),
+        )
+    }
+    pending_channels = [
+        channel
+        for channel in config["channels"]
+        if deliveries.get(channel, {}).get("status") != "sent"
+        and int(deliveries.get(channel, {}).get("attempts") or 0)
+        < MAX_DELIVERY_ATTEMPTS
+    ]
+    if not pending_channels:
+        return False
+    eligible_failures = [
+        deliveries[channel]
+        for channel in pending_channels
+        if deliveries.get(channel, {}).get("status") == "failed"
+    ]
+    if any(failed.get("updated_at") for failed in eligible_failures):
         try:
-            updated = datetime.fromisoformat(str(failed["updated_at"]).replace(" ", "T").replace("Z", "+00:00"))
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=timezone.utc)
-            if at - updated < timedelta(minutes=15):
-                return False
+            for failed in eligible_failures:
+                updated = datetime.fromisoformat(str(failed["updated_at"]).replace(" ", "T").replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if at - updated < timedelta(minutes=15):
+                    return False
         except ValueError:
             pass
     return True
@@ -233,11 +255,38 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
         query += " AND NOT EXISTS (SELECT 1 FROM digest_items d WHERE d.candidate_id=c.id)"
     query += " ORDER BY c.score DESC, c.updated_at DESC, c.id DESC"
     result = rows(query, params)
-    read_keys = book_identity_match_index(rows("SELECT * FROM reads"))
-    result = [
-        item for item in result
-        if not book_row_identity_match_keys(item) & read_keys
-    ][: config["maximum_books"]]
+    read_rows = rows("SELECT * FROM reads")
+    try:
+        read_metadata = rows(
+            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+            "FROM read_metadata WHERE verified_work_id!=''"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: read_metadata" not in str(exc).casefold():
+            raise
+        read_metadata = []
+    read_index = ReadIdentityIndex.from_reads(
+        read_identity_rows_with_current_verified_work_ids(read_rows, read_metadata)
+    )
+    shortlist_index = ReadIdentityIndex.from_reads(
+        rows(
+            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.status IN ('saved','imported')"
+        )
+    )
+    selected = []
+    seen_keys = set()
+    for item in result:
+        keys = book_row_identity_match_keys(item)
+        if read_index.matches(item) or shortlist_index.matches(item) or keys & seen_keys:
+            continue
+        selected.append(item)
+        seen_keys.update(keys)
+        if len(selected) >= config["maximum_books"]:
+            break
+    result = selected
     for item in result:
         try:
             item["genres"] = json.loads(item.get("genres") or "[]")
@@ -383,7 +432,12 @@ def _mark_period_sent(key: str, candidate_ids: list[int]) -> None:
         )
 
 
-async def send_digest(values: dict | None = None, *, test_channel: str | None = None) -> dict:
+async def send_digest(
+    values: dict | None = None,
+    *,
+    test_channel: str | None = None,
+    automatic: bool = False,
+) -> dict:
     config = digest_config(values)
     channels = [test_channel] if test_channel else config["channels"]
     channels = [channel for channel in channels if channel in CHANNELS]
@@ -394,7 +448,7 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
     existing_deliveries = {
         item["channel"]: item
         for item in rows(
-            "SELECT channel,status,candidate_ids FROM notification_deliveries WHERE period_key=?",
+            "SELECT channel,status,candidate_ids,attempts FROM notification_deliveries WHERE period_key=?",
             (key,),
         )
     } if not test else {}
@@ -429,6 +483,11 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
             channel
             for channel in channels
             if existing_deliveries.get(channel, {}).get("status") != "sent"
+            and (
+                not automatic
+                or int(existing_deliveries.get(channel, {}).get("attempts") or 0)
+                < MAX_DELIVERY_ATTEMPTS
+            )
         ]
     if not test and not items:
         # The scheduler records the period even when the threshold produced no
@@ -450,11 +509,17 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
         ):
             _mark_period_sent(key, [int(item["id"]) for item in items])
             return {"status": "skipped", "reason": "already_delivered", "period": key, "items": len(items), "deliveries": []}
+        if automatic and any(
+            int(existing_deliveries.get(channel, {}).get("attempts") or 0)
+            >= MAX_DELIVERY_ATTEMPTS
+            for channel in configured_channels
+        ):
+            return {"status": "failed", "reason": "retry_limit_reached", "period": key, "items": len(items), "deliveries": []}
         return {"status": "skipped", "reason": "no_channels", "period": key, "items": len(items), "deliveries": []}
     candidate_ids = [int(item["id"]) for item in items]
     body = _lines(items, config, key, test)
     subject = "Bookward weekly digest test" if test else f"Bookward · {len(items)} new book recommendations"
-    deliveries = []
+    pending = []
     for channel in channels:
         if channel == "discord":
             payload = _discord_payload(items, config, key, test)
@@ -463,17 +528,25 @@ async def send_digest(values: dict | None = None, *, test_channel: str | None = 
             payload = {"subject": subject, "body": body}
             recipient = config["email_to"]
         delivery_id = _insert_delivery(key, channel, recipient, payload, candidate_ids)
+
+        pending.append((channel, payload, delivery_id))
+
+    async def deliver(channel, payload, delivery_id):
         try:
             if channel == "discord":
                 await _send_discord(config, payload)
             else:
                 await _send_email(config, subject, body)
             _delivery_result(delivery_id, True)
-            deliveries.append({"id": delivery_id, "channel": channel, "status": "sent"})
+            return {"id": delivery_id, "channel": channel, "status": "sent"}
         except Exception as exc:
             error = safe_error_message(exc)
             _delivery_result(delivery_id, False, error)
-            deliveries.append({"id": delivery_id, "channel": channel, "status": "failed", "error": error})
+            return {"id": delivery_id, "channel": channel, "status": "failed", "error": error}
+
+    deliveries = await asyncio.gather(
+        *(deliver(channel, payload, delivery_id) for channel, payload, delivery_id in pending)
+    )
     successful = {
         item["channel"]
         for item in deliveries

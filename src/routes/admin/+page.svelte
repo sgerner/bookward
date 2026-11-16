@@ -3,6 +3,11 @@
 	import ProfileField from '#lib/components/ProfileField.svelte';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
+	const backupTime = new Intl.DateTimeFormat('en', {
+		dateStyle: 'medium',
+		timeStyle: 'short',
+		timeZone: 'UTC'
+	});
 </script>
 
 <svelte:head><title>Manage accounts · Bookward</title></svelte:head>
@@ -42,5 +47,29 @@
 				</form>{/if}
 			</article>
 		{/each}
+	</section>
+	<section class="mt-8 card preset-tonal-surface p-6">
+		<h2 class="text-xl font-semibold">Account registry backups</h2>
+		{#if data.identityBackup}
+			{@const backup = data.identityBackup}
+			<p class="mt-2 text-sm text-surface-700-300">
+				{backup.enabled ? `Scheduled every ${backup.interval_hours} hours.` : 'Scheduled backups are off.'}
+				{backup.backups.length} snapshot{backup.backups.length === 1 ? '' : 's'} available.
+			</p>
+			{#if backup.last_success_at}
+				<p class="mt-2 text-sm">Last successful backup <time datetime={backup.last_success_at}>{backupTime.format(new Date(backup.last_success_at))} UTC</time></p>
+			{/if}
+			{#if backup.last_restore_at}
+				<p class="mt-2 text-sm">Last restore <time datetime={backup.last_restore_at}>{backupTime.format(new Date(backup.last_restore_at))} UTC</time></p>
+			{/if}
+			{#if backup.last_error}
+				<p class="mt-3 p-3 preset-tonal-error" role="alert">
+					{#if backup.last_attempt_at}<time datetime={backup.last_attempt_at}>{backupTime.format(new Date(backup.last_attempt_at))} UTC</time> · {/if}
+					{backup.last_error}
+				</p>
+			{/if}
+		{:else}
+			<p class="mt-2 text-sm text-surface-700-300">Backup status is unavailable.</p>
+		{/if}
 	</section>
 </main>

@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 from .database import MIGRATIONS, connect, database_lock, transaction
 from .secrets import installation_key, installation_key_path
+from .security import safe_error_message
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
@@ -25,6 +26,10 @@ BACKUP_INTERVAL_MAX_HOURS = 24 * 30
 BACKUP_RETENTION_MAX = 100
 LAST_ERROR_KEY = "backup_last_error"
 RESTORE_JOURNAL_NAME = ".bookward-restore-in-progress.json"
+AUTH_BACKUP_ERROR_KEY = "auth_backup_last_error"
+AUTH_BACKUP_ATTEMPT_KEY = "auth_backup_last_attempt_at"
+AUTH_BACKUP_SUCCESS_KEY = "auth_backup_last_success_at"
+AUTH_BACKUP_RESTORE_KEY = "auth_backup_last_restore_at"
 
 
 class BackupError(ValueError):
@@ -257,24 +262,129 @@ def auth_backup_is_due(now: datetime | None = None) -> bool:
     return current.astimezone(timezone.utc) - max(snapshots) >= timedelta(hours=interval)
 
 
-def create_auth_backup() -> dict:
+def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=None, error=None) -> None:
+    """Persist safe backup telemetry without making it part of profile data."""
+
+    from .profiles import auth_path
+
+    path = auth_path()
+    if not path.is_file():
+        return
+    values = {}
+    if attempted_at is not None:
+        values[AUTH_BACKUP_ATTEMPT_KEY] = attempted_at
+    if success_at is not None:
+        values[AUTH_BACKUP_SUCCESS_KEY] = success_at
+        values[AUTH_BACKUP_ERROR_KEY] = ""
+    if restore_at is not None:
+        values[AUTH_BACKUP_RESTORE_KEY] = restore_at
+        values[AUTH_BACKUP_ERROR_KEY] = ""
+    elif error is not None:
+        values[AUTH_BACKUP_ERROR_KEY] = safe_error_message(error, limit=300)
+    try:
+        con = sqlite3.connect(path, timeout=30)
+        try:
+            for key, value in values.items():
+                con.execute(
+                    "INSERT INTO auth_meta(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        LOGGER.exception("Could not persist identity-registry backup status")
+
+
+def identity_backup_status() -> dict:
+    """Return identity-registry backup metadata without exposing its contents."""
+
+    from .profiles import auth_path
+
+    state = {}
+    registry = auth_path()
+    try:
+        if registry.is_file():
+            con = sqlite3.connect(registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+            try:
+                state = dict(
+                    con.execute(
+                        "SELECT key,value FROM auth_meta WHERE key IN (?,?,?,?)",
+                        (
+                            AUTH_BACKUP_ERROR_KEY,
+                            AUTH_BACKUP_ATTEMPT_KEY,
+                            AUTH_BACKUP_SUCCESS_KEY,
+                            AUTH_BACKUP_RESTORE_KEY,
+                        ),
+                    ).fetchall()
+                )
+            finally:
+                con.close()
+    except sqlite3.Error:
+        state[AUTH_BACKUP_ERROR_KEY] = "Identity backup status is temporarily unavailable."
+
+    directory = auth_backup_directory()
+    backups = []
+    try:
+        if directory.is_dir():
+            for path in directory.iterdir():
+                if path.is_symlink() or not path.is_file() or not AUTH_BACKUP_ID.fullmatch(path.stem):
+                    continue
+                match = AUTH_BACKUP_ID.fullmatch(path.stem)
+                try:
+                    created = datetime.strptime(
+                        match.group(1), "%Y%m%dT%H%M%SZ"
+                    ).replace(tzinfo=timezone.utc)
+                    backups.append(
+                        {
+                            "id": path.stem,
+                            "created_at": created.isoformat(),
+                            "size_bytes": path.stat().st_size,
+                        }
+                    )
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        if not state.get(AUTH_BACKUP_ERROR_KEY):
+            state[AUTH_BACKUP_ERROR_KEY] = "Identity backup files are temporarily unavailable."
+    backups.sort(key=lambda item: item["created_at"], reverse=True)
+    return {
+        "enabled": backup_interval_hours() > 0,
+        "interval_hours": backup_interval_hours(),
+        "retention_count": backup_retention_count(),
+        "last_success_at": state.get(AUTH_BACKUP_SUCCESS_KEY)
+        or (backups[0]["created_at"] if backups else None),
+        "last_attempt_at": state.get(AUTH_BACKUP_ATTEMPT_KEY),
+        "last_restore_at": state.get(AUTH_BACKUP_RESTORE_KEY),
+        "last_error": state.get(AUTH_BACKUP_ERROR_KEY) or None,
+        "backups": backups,
+    }
+
+
+def create_auth_backup(*, prune: bool = True) -> dict:
     """Snapshot the account/profile registry alongside personal database backups."""
     from .profiles import auth_path
 
     source_path = auth_path()
     if not source_path.is_file():
         raise BackupError("The Bookward identity registry is not available for backup.")
+    attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _record_auth_backup_state(attempted_at=attempted_at)
     directory = auth_backup_directory()
-    _ensure_private_directory(directory)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_id = f"bookward-auth-{stamp}-{uuid.uuid4().hex[:8]}"
     destination = directory / f"{backup_id}.sqlite3"
-    descriptor, name = tempfile.mkstemp(prefix=".bookward-auth-", suffix=".tmp", dir=directory)
-    os.fchmod(descriptor, 0o600)
-    os.close(descriptor)
-    temporary = Path(name)
+    temporary = None
     source = target = None
     try:
+        _ensure_private_directory(directory)
+        descriptor, name = tempfile.mkstemp(prefix=".bookward-auth-", suffix=".tmp", dir=directory)
+        temporary = Path(name)
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
         source = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
         target = sqlite3.connect(temporary, timeout=30)
         source.backup(target)
@@ -284,6 +394,8 @@ def create_auth_backup() -> dict:
         target.commit()
         target.close(); target = None
         source.close(); source = None
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
         directory_fd = os.open(directory, os.O_RDONLY)
@@ -291,17 +403,25 @@ def create_auth_backup() -> dict:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-        retention = backup_retention_count()
-        snapshots = sorted(
-            (path for path in directory.iterdir() if path.is_file() and not path.is_symlink() and AUTH_BACKUP_ID.fullmatch(path.stem)),
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-        for old in snapshots[retention:]:
-            old.unlink(missing_ok=True)
-        return {"id": backup_id, "created_at": datetime.now(timezone.utc).isoformat(), "size_bytes": destination.stat().st_size}
-    except Exception:
-        temporary.unlink(missing_ok=True)
+        if prune:
+            retention = backup_retention_count()
+            snapshots = sorted(
+                (path for path in directory.iterdir() if path.is_file() and not path.is_symlink() and AUTH_BACKUP_ID.fullmatch(path.stem)),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for old in snapshots[retention:]:
+                old.unlink(missing_ok=True)
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _record_auth_backup_state(success_at=created_at)
+        return {"id": backup_id, "created_at": created_at, "size_bytes": destination.stat().st_size}
+    except Exception as exc:
+        _record_auth_backup_state(error=exc)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("Could not remove an incomplete identity-registry backup")
         raise
     finally:
         if target is not None:
@@ -310,8 +430,52 @@ def create_auth_backup() -> dict:
             source.close()
 
 
+def _validate_auth_snapshot(path: Path) -> None:
+    con = None
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        integrity = con.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():
+            raise BackupError("That identity-registry snapshot is damaged.")
+        tables = {
+            item[0]
+            for item in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        required = {"auth_meta", "profiles", "accounts", "oidc_identities", "auth_sessions", "api_tokens"}
+        if not required <= tables:
+            raise BackupError("That file is not a Bookward identity-registry backup.")
+    except BackupError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise BackupError("That identity-registry snapshot is damaged.") from exc
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
+    if live.is_file():
+        checkpoint = sqlite3.connect(live, timeout=30)
+        try:
+            result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if result and result[0] != 0:
+                raise BackupError("The active identity registry could not be safely closed for restore.")
+        finally:
+            checkpoint.close()
+    _remove_sidecars(live)
+    os.replace(staged, live)
+    if on_replace is not None:
+        on_replace()
+    os.chmod(live, 0o600)
+    directory_fd = os.open(live.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def restore_auth_backup(backup_id: str) -> dict:
-    """Restore the registry while revoking every restored session and API token.
+    """Restore a staged registry, retaining a pre-restore safety snapshot.
 
     This is an operator recovery action and must only run with the engine
     stopped. It is intentionally not exposed as a browser route.
@@ -322,21 +486,27 @@ def restore_auth_backup(backup_id: str) -> dict:
     path = directory / f"{backup_id}.sqlite3"
     if path.is_symlink() or not path.is_file() or path.resolve().parent != directory.resolve():
         raise BackupError("That identity-registry snapshot is unavailable.")
-    source = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
-        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or source.execute("PRAGMA foreign_key_check").fetchone():
-            raise BackupError("That identity-registry snapshot is damaged.")
-    finally:
-        source.close()
+    _validate_auth_snapshot(path)
     from .profiles import auth_path
+
     live = auth_path()
     live.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, name = tempfile.mkstemp(prefix=".bookward-auth-restore-", suffix=".sqlite3", dir=live.parent)
+    descriptor, name = tempfile.mkstemp(
+        prefix=".bookward-auth-restore-", suffix=".sqlite3", dir=live.parent
+    )
     os.fchmod(descriptor, 0o600)
     os.close(descriptor)
     staged = Path(name)
+    replaced = False
+    safety_backup = None
+
+    def mark_replaced():
+        nonlocal replaced
+        replaced = True
+
     try:
         shutil.copyfile(path, staged)
+        os.chmod(staged, 0o600)
         con = sqlite3.connect(staged, timeout=30)
         try:
             con.execute("PRAGMA foreign_keys=ON")
@@ -347,19 +517,37 @@ def restore_auth_backup(backup_id: str) -> dict:
             con.execute("DELETE FROM login_attempts")
             con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
             con.commit()
-            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            integrity = con.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():
                 raise BackupError("The restored identity registry failed integrity checks.")
         finally:
             con.close()
-        for suffix in ("-wal", "-shm", "-journal"):
-            Path(f"{live}{suffix}").unlink(missing_ok=True)
-        os.replace(staged, live)
-        os.chmod(live, 0o600)
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
+        # Protect the selected snapshot from retention pruning before taking
+        # the safety copy, and preserve the operator safety copy itself.
+        safety_backup = create_auth_backup(prune=False) if live.is_file() else None
+        _replace_auth_registry(staged, live, on_replace=mark_replaced)
+        _record_auth_backup_state(restore_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         return {"restored": True, "sessions_revoked": True, "api_tokens_revoked": True}
+    except Exception as exc:
+        if replaced and safety_backup:
+            safety_path = directory / f"{safety_backup['id']}.sqlite3"
+            rollback = None
+            try:
+                rollback = _copy_to_stage(safety_path, live.parent)
+                _replace_auth_registry(rollback, live)
+                rollback = None
+            except Exception:
+                LOGGER.exception("Failed to roll back an unsuccessful identity-registry restore")
+            finally:
+                if rollback is not None:
+                    rollback.unlink(missing_ok=True)
+        _record_auth_backup_state(error=exc)
+        raise
     finally:
         staged.unlink(missing_ok=True)
-        for suffix in ("-wal", "-shm", "-journal"):
-            Path(f"{staged}{suffix}").unlink(missing_ok=True)
+        _remove_sidecars(staged)
 
 
 def _create_snapshot_unlocked() -> Path:
@@ -457,12 +645,14 @@ def create_backup() -> dict:
             _set_last_error("")
             _prune_backups()
         return _backup_record(path)
-    except BackupError:
-        _set_last_error("Backup failed; check the engine logs for details.")
+    except BackupError as exc:
+        _set_last_error(f"Backup failed: {safe_error_message(exc, limit=240)}")
         raise
     except Exception as exc:
-        _set_last_error("Backup failed; check the engine logs for details.")
-        raise BackupError("Backup failed; check the engine logs for details.") from exc
+        detail = safe_error_message(exc, limit=200)
+        LOGGER.exception("Bookward backup failed")
+        _set_last_error(f"Backup failed: {detail}")
+        raise BackupError(f"Backup failed: {detail}") from exc
 
 
 def _validate_snapshot(path: Path) -> int:
@@ -734,30 +924,50 @@ def restore_backup(backup_id: str) -> dict:
             "safety_backup": _backup_record(safety_backup),
         }
     except BackupError as exc:
-        if replaced and safety_backup:
-            try:
-                with database_lock(live_path):
-                    rollback = _copy_to_stage(safety_backup, live_path.parent)
-                    _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
-                    _clear_restore_journal()
-            except Exception:
-                LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-        _set_last_error("Restore failed; the previous database remains active.")
+        rollback_failed = False
+        if replaced:
+            if safety_backup:
+                try:
+                    with database_lock(live_path):
+                        rollback = _copy_to_stage(safety_backup, live_path.parent)
+                        _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
+                        _clear_restore_journal()
+                except Exception:
+                    rollback_failed = True
+                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
+            else:
+                rollback_failed = True
+        detail = safe_error_message(exc, limit=200)
+        if rollback_failed:
+            message = f"Restore failed; automatic rollback did not complete. {detail}"
+        else:
+            message = f"Restore failed; the previous database remains active. {detail}"
+        _set_last_error(message)
+        if rollback_failed:
+            raise BackupError(message) from exc
         raise exc
     except Exception as exc:
         LOGGER.exception("Bookward restore failed")
-        if replaced and safety_backup:
-            try:
-                with database_lock(live_path):
-                    rollback = _copy_to_stage(safety_backup, live_path.parent)
-                    _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
-                    _clear_restore_journal()
-            except Exception:
-                LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-        _set_last_error("Restore failed; the previous database remains active.")
-        raise BackupError(
-            "Restore failed; the previous database remains active. Check the engine logs for details."
-        ) from exc
+        rollback_failed = False
+        if replaced:
+            if safety_backup:
+                try:
+                    with database_lock(live_path):
+                        rollback = _copy_to_stage(safety_backup, live_path.parent)
+                        _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
+                        _clear_restore_journal()
+                except Exception:
+                    rollback_failed = True
+                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
+            else:
+                rollback_failed = True
+        detail = safe_error_message(exc, limit=200)
+        if rollback_failed:
+            message = f"Restore failed; automatic rollback did not complete. {detail}"
+        else:
+            message = f"Restore failed; the previous database remains active. {detail}"
+        _set_last_error(message)
+        raise BackupError(message) from exc
     finally:
         if staged is not None:
             staged.unlink(missing_ok=True)
