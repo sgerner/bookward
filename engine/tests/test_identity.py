@@ -503,3 +503,31 @@ def test_scoring_filters_known_read_with_missing_author_before_embedding(databas
 
     assert asyncio.run(score_all(embedder=embedder)) == 0
     assert not any("Known Work Without Read Author" in text for text in embedder.texts)
+
+
+def test_read_identity_matches_canonical_number_title_aliases(database):
+    indexed = ReadIdentityIndex.from_reads([
+        {"title": "Nineteen Eighty-Four", "author": "George Orwell"},
+    ])
+    assert indexed.matches({"title": "1984", "author": "George Orwell"})
+    assert not indexed.matches({"title": "1984", "author": "Different Author"})
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES('Nineteen Eighty-Four','George Orwell',4,'test')"
+        )
+    alias_cid = add_candidate("1984", "George Orwell", score=95)
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (alias_cid,),
+        )
+    assert alias_cid not in {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+
+    from afterword_engine.quality import _dedupe_and_hide
+    with transaction() as con:
+        deduped = _dedupe_and_hide(con)
+        status = con.execute("SELECT status FROM candidates WHERE id=?", (alias_cid,)).fetchone()["status"]
+    assert deduped >= 1
+    assert status == "rejected"
