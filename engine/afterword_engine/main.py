@@ -2227,6 +2227,13 @@ def toggle_source(source_id:int):
             "WHERE id=?",
             (source_id,),
         )
+        if not became_enabled:
+            con.execute(
+                "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE source_id=? AND status='recommended'",
+                (source_id,),
+            )
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}
