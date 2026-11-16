@@ -56,6 +56,10 @@ from .librarr import (
     search as librarr_search,
 )
 from .exploration import epsilon_tail_explore
+from .impression_fatigue import (
+    apply_impression_fatigue,
+    load_unacted_visible_impression_counts,
+)
 from .digest import (
     digest_config,
     digest_is_due,
@@ -1280,6 +1284,20 @@ def tracked_recommendations(
                 interaction_vectors=interaction_vectors,
                 candidate_vectors=cached_vectors,
             )
+            if settings.impression_fatigue_enabled:
+                visible_day_counts = load_unacted_visible_impression_counts(
+                    connection,
+                    window_days=settings.impression_fatigue_window_days,
+                    now=ranking_at,
+                )
+                ranked, fatigue_diagnostics = apply_impression_fatigue(
+                    ranked,
+                    visible_day_counts,
+                    grace_days=settings.impression_fatigue_grace_days,
+                    penalty_per_day=settings.impression_fatigue_penalty_per_day,
+                    max_penalty=settings.impression_fatigue_max_penalty,
+                )
+                diagnostics["impression_fatigue"] = fatigue_diagnostics
             personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
             recommended = [
