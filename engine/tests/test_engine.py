@@ -3,6 +3,7 @@ import json
 import socket
 from datetime import datetime, timedelta, timezone
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from auth_helpers import authenticated_headers
 
 from afterword_engine.config import settings
+from afterword_engine import database as engine_database, main
 from afterword_engine.database import MIGRATIONS, initialize, normalize_key, row, rows, transaction
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
@@ -51,11 +53,15 @@ from afterword_engine.security import safe_error_message, validate_public_url, v
 from afterword_engine.api_tokens import hash_api_token, legacy_hash_api_token
 from afterword_engine.quality import has_candidate_quality_audit_candidates
 from afterword_engine.main import (
+    GOODREADS_RSS_MAX_ATTEMPTS,
     SOURCE_SYNC_ERROR_RETRY_SECONDS,
     app,
     handle_job,
+    queue_goodreads_rss_if_due,
     recommendation_list,
+    safe_settings,
     score,
+    source_sync_due_sources,
     source_sync_is_due,
     sync,
 )
@@ -849,7 +855,7 @@ def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monke
     assert "webhook-secret" not in json.dumps(result)
 
 
-def test_failed_permanent_source_retries_after_short_backoff(database, monkeypatch):
+def test_failed_permanent_source_retries_after_error_retry_floor(database, monkeypatch):
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=0")
         cursor = con.execute(
@@ -876,6 +882,82 @@ def test_failed_permanent_source_retries_after_short_backoff(database, monkeypat
             (retry_at.isoformat(), cursor.lastrowid),
         )
     assert source_sync_is_due() is True
+
+
+def test_scheduled_sync_retries_only_failed_sources_and_stops_after_all_fail(database, monkeypatch):
+    now = datetime.now(timezone.utc)
+    retry_at = now - timedelta(seconds=SOURCE_SYNC_ERROR_RETRY_SECONDS + 1)
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=0")
+        successful_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES('Recent source','https://example.com/recent',1,'permanent','ok',?)",
+            (now.isoformat(),),
+        ).lastrowid
+        failed_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES('Failed source','https://example.com/failed',1,'permanent','error:timeout',?)",
+            (retry_at.isoformat(),),
+        ).lastrowid
+    assert [source["id"] for source in source_sync_due_sources(now)] == [failed_id]
+
+    scanned = []
+
+    async def fail_source(source):
+        scanned.append(source["id"])
+        raise RuntimeError("feed unavailable")
+
+    monkeypatch.setattr("afterword_engine.main.scan_source", fail_source)
+    monkeypatch.setattr(
+        "afterword_engine.main.refresh_missing_candidate_metadata",
+        lambda: (_ for _ in ()).throw(AssertionError("failed scheduled sync must stop early")),
+    )
+    result = asyncio.run(handle_job("sync_due"))
+
+    assert scanned == [failed_id]
+    assert successful_id not in scanned
+    assert result["skipped"] == "all_sources_failed"
+    assert result["errors"][0]["id"] == failed_id
+
+
+def test_goodreads_rss_scheduler_retries_failed_daily_job_with_a_cap(database):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+            ("https://www.goodreads.com/review/list_rss/test",),
+        )
+    now = datetime.now(timezone.utc).replace(hour=3, minute=0, second=0, microsecond=0)
+    job_id = queue_goodreads_rss_if_due(now)
+    assert job_id
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='failed',attempts=1 WHERE id=?", (job_id,))
+
+    assert queue_goodreads_rss_if_due(now) == job_id
+    assert row("SELECT status,attempts FROM jobs WHERE id=?", (job_id,)) == {
+        "status": "queued",
+        "attempts": 1,
+    }
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='failed',attempts=? WHERE id=?", (GOODREADS_RSS_MAX_ATTEMPTS, job_id))
+
+    assert queue_goodreads_rss_if_due(now) is None
+    assert row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "failed"
+
+
+def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
+    async def fail(_url):
+        raise RuntimeError("feed unavailable")
+
+    monkeypatch.setattr("afterword_engine.main.import_goodreads_rss", fail)
+    with pytest.raises(RuntimeError, match="feed unavailable"):
+        asyncio.run(main._sync_goodreads_rss("https://www.goodreads.com/feed"))
+
+    configured = safe_settings(include_api_tokens=False)
+    assert configured["goodreads_rss_last_status"] == "failed"
+    assert configured["goodreads_rss_last_attempt_at"]
+    assert configured["goodreads_rss_last_error"] == "feed unavailable"
+    assert configured["goodreads_rss_last_sync_at"] == ""
 
 
 def test_goodreads_csv_import_is_idempotent(database):
@@ -2170,6 +2252,44 @@ def test_initialize_is_versioned_and_uses_actual_builtin_source_id(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens'"
     )["name"] == "api_tokens"
     assert row("SELECT source_id FROM candidates LIMIT 1")["source_id"] != 1
+
+
+def test_failed_migration_rolls_back_ddl_and_can_be_retried(tmp_path, monkeypatch):
+    settings.db = str(tmp_path / "rollback.db")
+    initialize(seed_demo=False)
+    version = max(item[0] for item in MIGRATIONS) + 1
+    monkeypatch.setattr(
+        engine_database,
+        "MIGRATIONS",
+        [*MIGRATIONS, (version, "CREATE TABLE migration_probe(value TEXT); SELECT * FROM missing_migration_table;")],
+    )
+
+    with pytest.raises(engine_database.sqlite3.DatabaseError, match=f"Schema migration {version} failed"):
+        initialize(seed_demo=False)
+    assert row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_probe'"
+    ) is None
+    assert row("SELECT 1 FROM schema_migrations WHERE version=?", (version,)) is None
+
+    monkeypatch.setattr(
+        engine_database,
+        "MIGRATIONS",
+        [*MIGRATIONS, (version, "CREATE TABLE migration_probe(value TEXT);")],
+    )
+    initialize(seed_demo=False)
+    assert row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_probe'"
+    ) is not None
+    assert row("SELECT 1 FROM schema_migrations WHERE version=?", (version,)) is not None
+
+
+def test_concurrent_initializers_recheck_migration_versions_under_lock(tmp_path):
+    settings.db = str(tmp_path / "concurrent-migrations.db")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(initialize, seed_demo=False) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
 
 
 def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):

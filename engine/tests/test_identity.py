@@ -169,6 +169,24 @@ def test_recommendation_and_digest_hide_unrated_reads_but_keep_saved(database):
     assert "New Book" in {item["title"] for item in digest}
 
 
+def test_digest_excludes_shortlisted_work_and_duplicate_recommendations(database):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+    add_candidate("Saved Work", "Writer", status="saved", score=60)
+    shortlisted_alias = add_candidate("Saved Work (Unabridged)", "Writer", score=100)
+    best_duplicate = add_candidate("New Work", "Writer", score=95)
+    lower_duplicate = add_candidate("New Work (Unabridged)", "Writer", score=90)
+    unique = add_candidate("Another Work", "Writer", score=85)
+
+    selected = _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    selected_ids = [item["id"] for item in selected]
+
+    assert shortlisted_alias not in selected_ids
+    assert best_duplicate in selected_ids
+    assert lower_duplicate not in selected_ids
+    assert unique in selected_ids
+
+
 def test_recommendation_filter_uses_only_current_provider_consistent_read_work_ids(database):
     work_ids = {
         "fresh": "/works/OL111W",

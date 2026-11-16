@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -7,7 +8,7 @@ import respx
 
 from afterword_engine import digest
 from afterword_engine.config import settings
-from afterword_engine.database import initialize, row
+from afterword_engine.database import initialize, row, transaction
 
 
 @pytest.mark.parametrize("zone", ["/etc/passwd", "../UTC", "America/../UTC"])
@@ -60,3 +61,80 @@ def test_removing_successful_channel_does_not_block_partial_delivery_retry(tmp_p
     assert result["status"] == "sent"
     assert calls == ["discord", "email", "email"]
     assert row("SELECT value FROM settings WHERE key='digest_last_period'")["value"] == result["period"]
+
+
+def test_automatic_digest_retries_are_capped_but_manual_run_can_recover(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "bounded-digest.db"))
+    initialize()
+
+    async def fail(*_args):
+        raise RuntimeError("temporary provider outage")
+
+    monkeypatch.setattr(digest, "_send_discord", fail)
+    values = {
+        "digest_enabled": "1",
+        "digest_channels": "discord",
+        "digest_minimum_score": 0,
+    }
+    for _ in range(digest.MAX_DELIVERY_ATTEMPTS):
+        assert asyncio.run(digest.send_digest(values, automatic=True))["status"] == "failed"
+    stopped = asyncio.run(digest.send_digest(values, automatic=True))
+    assert stopped["reason"] == "retry_limit_reached"
+    assert row("SELECT attempts FROM notification_deliveries")["attempts"] == digest.MAX_DELIVERY_ATTEMPTS
+
+    async def succeed(*_args):
+        return None
+
+    monkeypatch.setattr(digest, "_send_discord", succeed)
+    recovered = asyncio.run(digest.send_digest(values))
+    assert recovered["status"] == "sent"
+    assert row("SELECT attempts FROM notification_deliveries")["attempts"] == digest.MAX_DELIVERY_ATTEMPTS + 1
+
+
+def test_capped_channel_does_not_block_another_eligible_digest_channel(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "channel-retry.db"))
+    initialize()
+    now = datetime.now(timezone.utc)
+    key = digest.period_key(now, "UTC")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO notification_deliveries(id,period_key,channel,status,attempts,updated_at) "
+            "VALUES('capped-discord',?,'discord','failed',?,'2000-01-01 00:00:00')",
+            (key, digest.MAX_DELIVERY_ATTEMPTS),
+        )
+
+    assert digest.digest_is_due(
+        {
+            "digest_enabled": "1",
+            "digest_channels": "discord,email",
+            "digest_timezone": "UTC",
+            "digest_day": now.isoweekday(),
+            "digest_time": "00:00",
+        },
+        at=now,
+    )
+
+
+def test_digest_channels_are_delivered_concurrently(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "concurrent-digest.db"))
+    initialize()
+    started = set()
+    both_started = asyncio.Event()
+
+    async def wait_for_peer(channel):
+        started.add(channel)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+
+    monkeypatch.setattr(digest, "_send_discord", lambda *_args: wait_for_peer("discord"))
+    monkeypatch.setattr(digest, "_send_email", lambda *_args: wait_for_peer("email"))
+
+    result = asyncio.run(
+        digest.send_digest(
+            {"digest_enabled": "1", "digest_channels": "discord,email", "digest_minimum_score": 0}
+        )
+    )
+    assert started == {"discord", "email"}
+    assert result["status"] == "sent"
+    assert {item["status"] for item in result["deliveries"]} == {"sent"}

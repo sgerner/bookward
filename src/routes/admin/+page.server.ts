@@ -3,13 +3,25 @@ import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
 type Account = { id: string; profile_id: string; username: string; display_name: string; role: 'admin' | 'user'; status: 'active' | 'disabled' };
+type IdentityBackupStatus = {
+	enabled: boolean;
+	interval_hours: number;
+	last_success_at: string | null;
+	last_attempt_at: string | null;
+	last_error: string | null;
+	last_restore_at: string | null;
+	backups: Array<{ id: string; created_at: string; size_bytes: number }>;
+};
 const failure = (error: unknown) => fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Account operation failed.', error: true as const });
 
 export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) throw redirect(303, '/login');
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
-	const result = await engine<{ accounts: Account[] }>('/admin/accounts');
-	return { accounts: result.accounts, current_user_id: locals.user.id };
+	const [result, identityBackup] = await Promise.all([
+		engine<{ accounts: Account[] }>('/admin/accounts'),
+		engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
+	]);
+	return { accounts: result.accounts, current_user_id: locals.user.id, identityBackup };
 };
 
 export const actions: Actions = {
