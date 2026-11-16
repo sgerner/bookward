@@ -73,8 +73,16 @@ type Overview = {
     goodreads_rss_last_attempt_at?: string;
     goodreads_rss_last_error?: string;
     librarr_media_type: "ebook" | "audiobook";
+    google_books_api_key_set?: boolean;
     source_sync_interval_hours: number;
     digest: DigestSettings;
+    llm_rerank?: {
+      enabled: boolean;
+      provider: string;
+      api_url: string;
+      model: string;
+      api_key_set: boolean;
+    };
     api_tokens: Array<{
       id: number;
       name: string;
@@ -658,6 +666,57 @@ export const actions: Actions = {
         }),
       });
       return { message: "Embedding provider saved and checked." };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  configureGoogleBooks: async ({ request }) => {
+    const data = await request.formData();
+    const apiKey = String(data.get("apiKey") || "").trim();
+    const clear = data.get("clear") === "on";
+    try {
+      await engine("/api/settings/google-books", {
+        method: "PUT",
+        body: JSON.stringify({
+          api_key: apiKey || null,
+          clear,
+        }),
+      });
+      return {
+        message: clear
+          ? "Google Books API key cleared."
+          : "Google Books API key saved.",
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  configureLlmRerank: async ({ request }) => {
+    const data = await request.formData();
+    const enabled = data.get("enabled") === "on";
+    const provider = String(data.get("provider") || "").trim();
+    const apiUrl = String(data.get("apiUrl") || "").trim();
+    const model = String(data.get("model") || "").trim();
+    const apiKey = String(data.get("apiKey") || "").trim();
+    const clearApiKey = data.get("clearApiKey") === "on";
+    if (enabled && (!apiUrl || !model)) {
+      return fail(400, {
+        message: "Select or enter both an LLM API URL and model.",
+      });
+    }
+    try {
+      await engine("/api/settings/llm-rerank", {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled,
+          provider,
+          api_url: apiUrl,
+          model,
+          api_key: apiKey || null,
+          clear_api_key: clearApiKey,
+        }),
+      });
+      return { message: "LLM reranker settings saved." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
