@@ -22,11 +22,18 @@ def build_index(
     interactions_csv: Path,
     output_db: Path,
     *,
+    book_id_map_csv: Path | None = None,
     min_item_ratings: int = 20,
     top_k_neighbors: int = 40,
     max_users: int = 200_000,
 ) -> dict[str, int]:
     """Stream UCSD Goodreads books & interactions into a compact CF SQLite index."""
+    csv_to_book_id: dict[int, int] = {}
+    if book_id_map_csv is not None:
+        with open(book_id_map_csv, "rt", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                csv_to_book_id[int(row["book_id_csv"])] = int(row["book_id"])
+
     isbn_to_book: dict[str, int] = {}
     with gzip.open(books_json_gz, "rt", encoding="utf-8") as fh:
         for line in fh:
@@ -49,7 +56,8 @@ def build_index(
             uid = int(row["user_id"])
             if len(user_items) >= max_users and uid not in user_items:
                 continue
-            bid = int(row["book_id"])
+            raw_bid = int(row["book_id"])
+            bid = csv_to_book_id.get(raw_bid, raw_bid) if csv_to_book_id else raw_bid
             user_items[uid].append((bid, float(rating)))
             item_counts[bid] += 1
 
@@ -116,6 +124,7 @@ def main() -> None:
     parser.add_argument("books_json_gz", type=Path)
     parser.add_argument("interactions_csv", type=Path)
     parser.add_argument("output_db", type=Path)
+    parser.add_argument("--book-id-map", type=Path, default=None)
     parser.add_argument("--min-item-ratings", type=int, default=20)
     parser.add_argument("--top-k-neighbors", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=200_000)
@@ -124,6 +133,7 @@ def main() -> None:
         args.books_json_gz,
         args.interactions_csv,
         args.output_db,
+        book_id_map_csv=args.book_id_map,
         min_item_ratings=args.min_item_ratings,
         top_k_neighbors=args.top_k_neighbors,
         max_users=args.max_users,
