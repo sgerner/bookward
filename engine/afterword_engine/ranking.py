@@ -1,12 +1,11 @@
 """Pure, bounded recommendation ranking from read and candidate embeddings."""
 
-from datetime import date, datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Any, Sequence
 
 import numpy as np
 
 from .identity import book_identity
+from .read_dates import read_day as _read_day
 from .subjects import normalize_subjects
 
 
@@ -20,29 +19,7 @@ _RECENCY_TIMESCALE_YEARS = 8
 _RECENCY_SCORE_PER_STAR = 20
 
 
-def _read_day(value: object) -> date | None:
-    """Parse supported read dates as UTC days; leave unknown dates neutral."""
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, date):
-        return value
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            try:
-                parsed = datetime.strptime(value, "%Y/%m/%d")
-            except ValueError:
-                try:
-                    parsed = parsedate_to_datetime(value)
-                except (TypeError, ValueError, IndexError):
-                    return None
-    else:
-        return None
-    return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc).date()
-
-
-def _matrix(vectors: Sequence[Sequence[float]], dimensions: int | None = None) -> np.ndarray:
+def normalized_vector_matrix(vectors: Sequence[Sequence[float]], dimensions: int | None = None) -> np.ndarray:
     """Validate vectors and return row-normalized float32 vectors."""
     if len(vectors) == 0:
         return np.empty((0, dimensions or 0), dtype=np.float32)
@@ -121,9 +98,9 @@ def rank_candidates(
         raise ValueError("items and embedding vectors must have equal lengths")
     if not candidates:
         return []
-    read_matrix = _matrix(read_vectors)
+    read_matrix = normalized_vector_matrix(read_vectors)
     dimensions = read_matrix.shape[1]
-    candidate_matrix = _matrix(candidate_vectors, dimensions or None)
+    candidate_matrix = normalized_vector_matrix(candidate_vectors, dimensions or None)
     unique: dict[str, tuple[dict[str, Any], np.ndarray]] = {}
     for read, vector in zip(reads, read_matrix):
         if not 1 <= float(read.get("rating") or 0) <= 5:

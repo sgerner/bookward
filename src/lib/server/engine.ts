@@ -12,6 +12,12 @@ function internalHeaders(headers?: HeadersInit, accept = 'application/json') {
 }
 export class EngineError extends Error { constructor(message: string, readonly status: number) { super(message); } }
 
+export function engineStatus(error: unknown, passthroughStatus?: number): number {
+  return error instanceof EngineError && (error.status < 500 || error.status === passthroughStatus)
+    ? error.status
+    : 502;
+}
+
 export async function engine<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const headers = new Headers(init?.headers);

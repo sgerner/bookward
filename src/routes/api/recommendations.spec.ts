@@ -18,11 +18,9 @@ const recommendation = (id: number) => ({
   source_name: "A source",
 });
 
-vi.mock("#lib/server/engine.js", () => ({
+vi.mock("#lib/server/engine.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("#lib/server/engine.js")>(),
   engine: engineMock,
-  EngineError: class EngineError extends Error {
-    status = 502;
-  },
 }));
 
 import { GET } from "./recommendations/+server";

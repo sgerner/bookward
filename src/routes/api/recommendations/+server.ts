@@ -1,6 +1,6 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { EngineError, engine } from "#lib/server/engine.js";
+import { engineStatus, engine } from "#lib/server/engine.js";
 import { toPageBook, type Recommendation } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -17,7 +17,6 @@ const querySchema = z.object({
   offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
 });
 
-const engineStatus = (error: unknown) => error instanceof EngineError && error.status < 500 ? error.status : 502;
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Recommendations could not be loaded.";
 
 export const GET: RequestHandler = async ({ url }) => {

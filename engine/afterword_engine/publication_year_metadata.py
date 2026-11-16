@@ -8,8 +8,7 @@ values out of the publication-era feature.
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
-from datetime import date, datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import date
 import hashlib
 import json
 import re
@@ -18,6 +17,7 @@ from typing import Any
 from .database import normalize_key
 from .identity import book_openlibrary_work_id
 from .isbn import isbn_parts
+from .read_dates import read_day
 
 
 PUBLICATION_YEAR_FIELD = "first_publication_year"
@@ -61,27 +61,8 @@ def _read_identity_hash(read: Mapping[str, Any]) -> str:
 
 
 def _read_year(value: Any) -> int | None:
-    """Read the UTC year from the same date forms supported by history scoring."""
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, date):
-        return value.year
-    elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            try:
-                parsed = datetime.strptime(value, "%Y/%m/%d")
-            except ValueError:
-                try:
-                    parsed = parsedate_to_datetime(value)
-                except (TypeError, ValueError, AttributeError, IndexError):
-                    return None
-    else:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).year
+    day = read_day(value)
+    return day.year if day is not None else None
 
 
 def _explicit_payload_year(value: Any, source_field: Any) -> int | None:

@@ -11,16 +11,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import date
 import math
-import re
 import re
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 from .identity import book_identity
+from .read_dates import read_day as _day_value
 
 
 GAUSSIAN_BANDWIDTH_YEARS = 10.0
@@ -181,38 +180,6 @@ def _rating(row: Mapping[str, Any]) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) and 1.0 <= value <= 5.0 else None
-
-
-def _day_value(value: object) -> date | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, date):
-        return value
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            try:
-                return datetime.strptime(text, "%Y/%m/%d").date()
-            except ValueError:
-                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-                    try:
-                        parsed = parsedate_to_datetime(text)
-                    except (TypeError, ValueError, IndexError, OverflowError):
-                        return None
-                else:
-                    try:
-                        parsed = datetime.combine(date.fromisoformat(text), datetime.min.time(), tzinfo=timezone.utc)
-                    except ValueError:
-                        return None
-    else:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date()
 
 
 def _row_day(row: Mapping[str, Any]) -> date | None:

@@ -65,12 +65,6 @@ def canonical_part(value: object) -> str:
     return " ".join("".join(chars).split())
 
 
-def _canonical_part(value: object) -> str:
-    """Compatibility alias for internal identity callers."""
-
-    return canonical_part(value)
-
-
 def book_catalog_title_identity_key(value: object) -> str:
     """Return a full catalog title key after removing only known format suffixes.
 
@@ -83,7 +77,7 @@ def book_catalog_title_identity_key(value: object) -> str:
 
 
 def _canonical_author(value: object) -> str:
-    tokens = _canonical_part(value).split()
+    tokens = canonical_part(value).split()
     # Initials are equivalent with or without separators: R.F. Kuang and
     # R. F. Kuang both become "rf kuang".
     initials = []
@@ -121,11 +115,11 @@ def _title_match_keys(value: object) -> set[str]:
     """
 
     title = _title_without_format_suffix(value)
-    full = _canonical_part(title)
+    full = canonical_part(title)
     keys = {full} if full else set()
     parts = _TITLE_SEPARATOR.split(title, maxsplit=1)
     if len(parts) == 2:
-        prefix = _canonical_part(parts[0])
+        prefix = canonical_part(parts[0])
         subtitle = parts[1].strip()
         words = prefix.split()
         distinctive_two_word_title = (

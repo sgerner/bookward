@@ -21,7 +21,6 @@ from .covers import (
     is_weak_cover_url,
     metadata_client,
     resolve_book_metadata,
-    resolve_cover_url,
     resolve_openlibrary_work_metadata,
     safe_cover_url,
     wait_for_openlibrary_request_slot,
@@ -2493,40 +2492,6 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
     return items[: settings.source_max_items]
 
 
-async def enrich_cover_urls(items):
-    """Fill missing/unsafe artwork URLs without blocking source parsing.
-
-    Provider calls are bounded so a source with many books cannot create an
-    unbounded fan-out.  A provider outage is intentionally non-fatal: each
-    item receives a deterministic placeholder URL from ``resolve_cover_url``.
-    """
-
-    if not items:
-        return []
-    semaphore = asyncio.Semaphore(8)
-
-    async with metadata_client() as client:
-        async def enrich(item):
-            async with semaphore:
-                isbn13, isbn10 = isbn_parts_from_source(
-                    [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-                    item.get("source_url", ""),
-                )
-                cover = await resolve_cover_url(
-                    item["title"],
-                    item.get("author", "Unknown author"),
-                    item.get("cover_url", ""),
-                    item.get("source_url", ""),
-                    client=client,
-                    isbn13=isbn13,
-                    isbn10=isbn10,
-                    google_books_api_key=private_setting("association_google_books_api_key", "").strip(),
-                )
-                return {**item, "cover_url": cover}
-
-        return await asyncio.gather(*(enrich(item) for item in items))
-
-
 async def enrich_book_metadata(items):
     """Fill summaries and publication dates while preserving source metadata."""
 
@@ -3216,11 +3181,6 @@ async def refresh_missing_candidate_metadata():
             )
     return changed + normalized_catalog_dates
 
-
-async def refresh_missing_candidate_covers():
-    """Compatibility wrapper for callers that previously backfilled covers."""
-
-    return await refresh_missing_candidate_metadata()
 
 async def preview_source(url, filters=None):
     content_type, items = await _fetch_and_parse_source(url)

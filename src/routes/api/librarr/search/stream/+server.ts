@@ -1,11 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { EngineError, engineStream } from '#lib/server/engine.js';
+import { engineStatus, engineStream } from '#lib/server/engine.js';
 
-const engineStatus = (error: unknown) => {
-  if (!(error instanceof EngineError)) return 502;
-  return error.status < 500 || error.status === 501 ? error.status : 502;
-};
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Librarr search failed.';
 
 export const GET: RequestHandler = async ({ url, request }) => {
@@ -28,6 +24,6 @@ export const GET: RequestHandler = async ({ url, request }) => {
       }
     });
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return json({ message: errorMessage(error) }, { status: engineStatus(error, 501) });
   }
 };

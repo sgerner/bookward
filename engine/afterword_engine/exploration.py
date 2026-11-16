@@ -69,21 +69,3 @@ def epsilon_tail_explore(
         baseline_mass = 1.0 - epsilon if original_position == position else 0.0
         item["propensity"] = baseline_mass + uniform_mass
     return items[:stable_top_k] + sampled_tail
-
-
-def apply_epsilon_tail_exploration(
-    recommendations: Iterable[MutableMapping[str, Any]],
-    epsilon: float = 0.0,
-    *,
-    stable_top_k: int = DEFAULT_STABLE_TOP_K,
-    rng: random.Random | Any | None = None,
-) -> list[dict[str, Any]]:
-    """Compatibility-friendly alias for :func:`epsilon_tail_explore`."""
-
-    return epsilon_tail_explore(
-        recommendations,
-        epsilon=epsilon,
-        stable_top_k=stable_top_k,
-        rng=rng,
-    )
-

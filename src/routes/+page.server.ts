@@ -1,6 +1,6 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
-import { engine, EngineError } from "#lib/server/engine.js";
+import { engine, engineStatus } from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -204,8 +204,6 @@ const message = (error: unknown) =>
   error instanceof Error
     ? error.message
     : "The engine could not complete that request.";
-const status = (error: unknown) =>
-  error instanceof EngineError && error.status < 500 ? error.status : 502;
 const formText = (data: FormData, key: string) => String(data.get(key) ?? "").trim();
 const sourceGenreList = (value: FormDataEntryValue | null) => {
   const seen = new Set<string>();
@@ -238,7 +236,7 @@ export const actions: Actions = {
       );
       return { message: `Backup created at ${result.backup.created_at}.` };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   restoreBackup: async ({ request }) => {
@@ -254,7 +252,7 @@ export const actions: Actions = {
       }, 10 * 60_000);
       return { message: "Database restored. A safety backup of the previous database was created first." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   createApiToken: async ({ request }) => {
@@ -272,7 +270,7 @@ export const actions: Actions = {
         token: result.token,
       };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   revokeApiToken: async ({ request }) => {
@@ -285,7 +283,7 @@ export const actions: Actions = {
       });
       return { message: "API token revoked." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   decide: async ({ request }) => {
@@ -353,7 +351,7 @@ export const actions: Actions = {
       });
       return { message: "Decision undone." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   markRead: async ({ request }) => {
@@ -380,7 +378,7 @@ export const actions: Actions = {
           : `Marked Read and added to your history with a ${rating}-star rating.`,
       };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   source: async ({ request }) => {
@@ -422,7 +420,7 @@ export const actions: Actions = {
         message: `${lifecycle === "one_time" ? "One-time import" : "Permanent source"} added; its first scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`,
       };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureSourceFilters: async ({ request }) => {
@@ -437,7 +435,7 @@ export const actions: Actions = {
       });
       return { message: "Source filters updated; a fresh scan is queued." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   switchSourceToOneTime: async ({ request }) => {
@@ -450,7 +448,7 @@ export const actions: Actions = {
       });
       return { message: "Source changed to a one-time import." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   toggleSource: async ({ request }) => {
@@ -463,7 +461,7 @@ export const actions: Actions = {
       });
       return { message: "Source preference updated." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureSourceSchedule: async ({ request }) => {
@@ -490,7 +488,7 @@ export const actions: Actions = {
           : `every ${interval.data} hours`;
       return { message: `Permanent sources will be scanned ${label}.` };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   toggleDefault: async ({ request }) => {
@@ -504,7 +502,7 @@ export const actions: Actions = {
       });
       return { message: "Upcoming-book source updated." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   connectGoodreads: async ({ request }) => {
@@ -521,7 +519,7 @@ export const actions: Actions = {
         });
         return { message: "Goodreads RSS feed removed; nightly sync is off." };
       } catch (error) {
-        return fail(status(error), { message: message(error) });
+        return fail(engineStatus(error), { message: message(error) });
       }
     }
     const url = urlSchema.safeParse(value);
@@ -533,7 +531,7 @@ export const actions: Actions = {
         body: JSON.stringify({ url: url.data }),
       });
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
     try {
       const result = await engine<{ imported: number }>(
@@ -557,7 +555,7 @@ export const actions: Actions = {
       });
       return { message: "Goodreads RSS feed removed; nightly sync is off." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   importGoodreadsCsv: async ({ request }) => {
@@ -615,7 +613,7 @@ export const actions: Actions = {
         message: `Librarr connection saved for ${mediaType.data === "ebook" ? "ebooks" : "audiobooks"}.`,
       };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   importLibrar: async ({ request }) => {
@@ -655,7 +653,7 @@ export const actions: Actions = {
       });
       return { message: "Embedding provider saved and checked." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   rebuildEmbeddings: async () => {
@@ -811,7 +809,7 @@ export const actions: Actions = {
       });
       return { message: "Weekly digest settings saved." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   sendDigestTest: async ({ request }) => {
@@ -833,7 +831,7 @@ export const actions: Actions = {
         return { message: `${channel.data === "discord" ? "Discord" : "Email"} test is still running (${queued.job_id.slice(0, 8)}).` };
       return { message: `${channel.data === "discord" ? "Discord" : "Email"} test sent.` };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   runDigest: async () => {
@@ -849,7 +847,7 @@ export const actions: Actions = {
       if (deliveryError) return fail(502, { message: deliveryError });
       return { message: "Digest run queued; configured channels will receive it shortly." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   retryDigest: async ({ request }) => {
@@ -869,7 +867,7 @@ export const actions: Actions = {
         return { message: `Digest retry is still running (${queued.job_id.slice(0, 8)}).` };
       return { message: "Digest delivery retry queued." };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   shortlistBulk: async ({ request }) => {
@@ -902,7 +900,7 @@ export const actions: Actions = {
       );
       return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
     } catch (error) {
-      return fail(status(error), { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
 };
