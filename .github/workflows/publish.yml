@@ -41,6 +41,20 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine latest release
+        id: release
+        env:
+          RELEASE: ${{ github.ref_name }}
+        run: |
+          newest=$(git tag --sort=-version:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !seen++')
+          if [[ "$RELEASE" == "$newest" ]]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -52,16 +66,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract image metadata
-        id: metadata
+      - name: Extract web image metadata
+        id: web-metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: |
-            ghcr.io/${{ github.repository_owner }}/bookward
-            ghcr.io/${{ github.repository_owner }}/bookward-engine
+          images: ghcr.io/${{ github.repository_owner }}/bookward
+          flavor: latest=false
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=bookward
+
+      - name: Extract engine image metadata
+        id: engine-metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/bookward-engine
+          flavor: latest=false
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ steps.release.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=bookward-engine
 
       - name: Publish Bookward image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -69,8 +96,8 @@ jobs:
           context: .
           push: true
           sbom: true
-          tags: ghcr.io/${{ github.repository_owner }}/bookward:${{ github.ref_name }},ghcr.io/${{ github.repository_owner }}/bookward:latest
-          labels: ${{ steps.metadata.outputs.labels }}
+          tags: ${{ steps.web-metadata.outputs.tags }}
+          labels: ${{ steps.web-metadata.outputs.labels }}
           cache-from: type=gha,scope=publish-bookward
           cache-to: type=gha,mode=max,scope=publish-bookward
 
@@ -80,7 +107,7 @@ jobs:
           context: ./engine
           push: true
           sbom: true
-          tags: ghcr.io/${{ github.repository_owner }}/bookward-engine:${{ github.ref_name }},ghcr.io/${{ github.repository_owner }}/bookward-engine:latest
-          labels: ${{ steps.metadata.outputs.labels }}
+          tags: ${{ steps.engine-metadata.outputs.tags }}
+          labels: ${{ steps.engine-metadata.outputs.labels }}
           cache-from: type=gha,scope=publish-bookward-engine
           cache-to: type=gha,mode=max,scope=publish-bookward-engine
