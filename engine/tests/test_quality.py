@@ -409,3 +409,70 @@ def test_audit_rejects_malformed_candidate_without_catalog_request(database):
     quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
     assert quality["quality_status"] == "rejected"
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "rejected"
+
+
+@respx.mock
+def test_audit_circuit_breaks_google_books_rate_limit(database):
+    first_id = add_candidate("Unmatched One", "Author One")
+    second_id = add_candidate("Unmatched Two", "Author Two")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending' WHERE candidate_id IN (?,?)",
+            (first_id, second_id),
+        )
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    gb_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["audited"] == 2
+    assert result["quarantine"] == 2
+    assert len(gb_route.calls) == 1
+    for cid in (first_id, second_id):
+        flags = json.loads(row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))["flags_json"])
+        assert "catalog_provider_rate_limited" in flags
+
+
+@respx.mock
+def test_audit_matches_format_and_parenthetical_series_suffixes(database):
+    audiobook_id = add_candidate("Greenlights (Unabridged)", "Matthew McConaughey")
+    series_id = add_candidate("The Fellowship of the Ring (Lord of the Rings)", "J. R. R. Tolkien")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending' WHERE candidate_id IN (?,?)",
+            (audiobook_id, series_id),
+        )
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        if "Greenlights" in title:
+            return httpx.Response(200, json={"docs": [{"key": "/works/OLGREEN", "title": "Greenlights", "author_name": ["Matthew McConaughey"]}]})
+        if "Fellowship" in title:
+            return httpx.Response(200, json={"docs": [{"key": "/works/OLFOTR", "title": "The Fellowship of the Ring", "author_name": ["J. R. R. Tolkien"]}]})
+        return httpx.Response(200, json={"docs": []})
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 2
+    assert all("Unabridged" not in call.request.url.params.get("title", "") for call in ol_route.calls)
+
+
+def test_audit_skips_disabled_source_candidates(database):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES('Disabled','https://example.com/disabled',0,'permanent')"
+        )
+        disabled_source_id = con.execute("SELECT id FROM sources WHERE name='Disabled'").fetchone()[0]
+        cursor = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,status,normalized_key) VALUES(?,?,?,?,?,?)",
+            ("Disabled Book", "Some Author", "https://example.com/disabled/1", disabled_source_id, "new", "disabled-book-1"),
+        )
+        disabled_cid = cursor.lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, disabled_cid),
+        )
+
+    selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert disabled_cid not in selected_ids
