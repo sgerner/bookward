@@ -1946,6 +1946,56 @@ def validate_goodreads_rss_url(url: str) -> str:
     return str(parsed)
 
 
+def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
+    """Derive a Goodreads ``to-read`` or ``currently-reading`` RSS URL from the read-shelf URL."""
+    if shelf not in {"to-read", "currently-reading"}:
+        raise ValueError(f"Unsupported Goodreads shelf: {shelf}")
+    validated = validate_goodreads_rss_url(read_rss_url)
+    parsed = httpx.URL(validated)
+    return str(parsed.copy_set_param("shelf", shelf))
+
+
+async def import_goodreads_shelves(
+    read_rss_url: str,
+    shelves: tuple[str, ...] = ("to-read", "currently-reading"),
+) -> dict[str, int]:
+    """Import Goodreads non-read shelves separately from completed ``reads``."""
+    imported: dict[str, int] = {}
+    for shelf in shelves:
+        try:
+            shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
+            content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True)
+        except Exception:
+            imported[shelf] = 0
+            continue
+        feed = feedparser.parse(content)
+        entries = list(feed.entries[:500])
+        with transaction() as con:
+            con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
+            count = 0
+            for entry in entries:
+                title = str(entry.get("title", "")).strip()[:500]
+                author = str(
+                    entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
+                ).strip()[:300]
+                if not title:
+                    continue
+                isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+                added_at = _read_date_value(entry.get("user_date_added"))
+                con.execute(
+                    "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
+                    "VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                    "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (shelf, title, author, isbn, added_at),
+                )
+                count += 1
+            imported[shelf] = count
+    return imported
+
+
 async def import_goodreads_rss(url: str):
     url = validate_goodreads_rss_url(url)
     content, _ = await fetch_bytes(url, allow_goodreads_http=True)
