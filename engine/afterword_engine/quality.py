@@ -43,7 +43,12 @@ from .covers import (
     safe_cover_url,
 )
 from .database import persist_metadata_field_provenance, private_setting, rows, transaction
-from .identity import book_identity, book_identity_match_index, book_identity_match_keys
+from .identity import (
+    _title_without_format_suffix,
+    book_identity,
+    book_identity_match_index,
+    book_identity_match_keys,
+)
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
@@ -77,9 +82,10 @@ def _tokens(value: object) -> set[str]:
     return set(_catalog_text(value).split())
 
 
-def _title_similarity(left: object, right: object) -> float:
-    a = _catalog_text(left)
-    b = _catalog_text(right)
+_TRAILING_PAREN = re.compile(r"\s*\([^()]{2,80}\)\s*$")
+
+
+def _string_title_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     if a == b:
@@ -88,6 +94,28 @@ def _title_similarity(left: object, right: object) -> float:
     shared = token_a & token_b
     overlap = len(shared) / max(1, len(token_a | token_b))
     return max(overlap, SequenceMatcher(None, a, b).ratio())
+
+
+def _title_similarity(left: object, right: object) -> float:
+    a = _catalog_text(left)
+    b = _catalog_text(right)
+    score = _string_title_similarity(a, b)
+    if score == 1.0:
+        return 1.0
+    stripped_a = _catalog_text(_title_without_format_suffix(left))
+    stripped_b = _catalog_text(_title_without_format_suffix(right))
+    if stripped_a != a or stripped_b != b:
+        score = max(score, _string_title_similarity(stripped_a, stripped_b))
+    # Catalogs often append a parenthetical series name without a number,
+    # e.g. "The Fellowship of the Ring (Lord of the Rings)".
+    raw_left = str(left or "").strip()
+    raw_right = str(right or "").strip()
+    if bool(_TRAILING_PAREN.search(raw_left)) != bool(_TRAILING_PAREN.search(raw_right)):
+        base_a = _catalog_text(_TRAILING_PAREN.sub("", raw_left))
+        base_b = _catalog_text(_TRAILING_PAREN.sub("", raw_right))
+        if len(base_a.split()) >= 2 and len(base_b.split()) >= 2:
+            score = max(score, _string_title_similarity(base_a, base_b))
+    return score
 
 
 def _author_similarity(left: object, right: object) -> float:
@@ -271,8 +299,9 @@ async def _open_library_match(
     isbn: str = "",
     trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
+    query_title = _title_without_format_suffix(title) or title
     params = {
-        ("isbn" if isbn else "title"): isbn or title[:500],
+        ("isbn" if isbn else "title"): isbn or query_title[:500],
         **({} if isbn else {"author": author[:300]}),
         "limit": CATALOG_LIMIT,
         "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,edition_key",
@@ -402,8 +431,9 @@ async def _google_books_match(
     trace: list[dict[str, Any]] | None = None,
     google_books_api_key: str = "",
 ) -> dict[str, Any] | None:
+    query_title = _title_without_format_suffix(title) or title
     params = {
-        "q": f"isbn:{isbn}" if isbn else f"intitle:{title[:300]} inauthor:{author[:200]}",
+        "q": f"isbn:{isbn}" if isbn else f"intitle:{query_title[:300]} inauthor:{author[:200]}",
         "maxResults": CATALOG_LIMIT,
     }
     if google_books_api_key:
@@ -543,6 +573,7 @@ async def resolve_catalog_match(
     isbn: str = "",
     google_books_api_key: str = "",
     existing_fields_complete: bool = False,
+    rate_limited_providers: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve identity first, then choose metadata independently per field."""
 
@@ -571,12 +602,38 @@ async def resolve_catalog_match(
         fetch_trace: list[dict[str, Any]] = []
         matches: list[dict[str, Any]] = []
         query_isbn = source_isbn13 or source_isbn10
+
+        def _record_rate_limits():
+            if rate_limited_providers is None:
+                return
+            for trace in fetch_trace:
+                if trace.get("status") == "rate_limited" and trace.get("provider"):
+                    rate_limited_providers.add(str(trace["provider"]))
+
+        async def _call_provider(lookup_provider, *, isbn_arg: str = ""):
+            provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
+            if rate_limited_providers is not None and provider_name in rate_limited_providers:
+                fetch_trace.append(
+                    {
+                        "provider": provider_name,
+                        "fetched_at": _utc_now(),
+                        "query_kind": "isbn" if isbn_arg else "title_author",
+                        "status": "rate_limited",
+                        "http_status": 429,
+                        "skipped": True,
+                    }
+                )
+                return None
+            kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
+            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
+            _record_rate_limits()
+            return result
+
         if query_isbn:
             # Query both providers so a strong identity record with sparse
             # fields does not hide useful verified metadata from the other.
             for lookup_provider in (_open_library_match, _google_books_match):
-                kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
-                match = await lookup_provider(title, author, client, isbn=query_isbn, trace=fetch_trace, **kwargs)
+                match = await _call_provider(lookup_provider, isbn_arg=query_isbn)
                 if match:
                     matches.append(match)
 
@@ -602,8 +659,7 @@ async def resolve_catalog_match(
                 provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
                 if query_isbn and provider_name in unavailable_providers:
                     continue
-                kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
-                match = await lookup_provider(title, author, client, trace=fetch_trace, **kwargs)
+                match = await _call_provider(lookup_provider)
                 if match:
                     matches.append(match)
 
@@ -818,7 +874,11 @@ def _publication_date_kind(value: object) -> str:
 
 
 async def _audit_one(
-    candidate: dict[str, Any], client: httpx.AsyncClient, cache, google_books_api_key: str = ""
+    candidate: dict[str, Any],
+    client: httpx.AsyncClient,
+    cache,
+    google_books_api_key: str = "",
+    rate_limited_providers: set[str] | None = None,
 ):
     flags = local_flags(candidate)
     source_isbn13, source_isbn10 = isbn_parts_from_source(
@@ -843,6 +903,7 @@ async def _audit_one(
         isbn10=source_isbn10,
         google_books_api_key=google_books_api_key,
         existing_fields_complete=_candidate_fields_complete(candidate),
+        rate_limited_providers=rate_limited_providers,
     )
     if not match or match.get("provider_lookup_unavailable"):
         unavailable = bool(match and match.get("provider_lookup_unavailable"))
@@ -930,7 +991,9 @@ def candidate_quality_audit_candidates(
             "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
             "q.quality_status,q.audit_version,q.flags_json "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            f"WHERE c.status!='rejected' AND {predicate} ORDER BY c.id LIMIT ? OFFSET ?",
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
+            "ORDER BY c.id LIMIT ? OFFSET ?",
             (*params, page_size, offset),
         )
         if not page:
@@ -1233,11 +1296,18 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
 
     semaphore = asyncio.Semaphore(CATALOG_CONCURRENCY)
     cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]] = {}
+    rate_limited_providers: set[str] = set()
     google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         async def run(candidate):
             async with semaphore:
-                return await _audit_one(candidate, client, cache, google_books_api_key)
+                return await _audit_one(
+                    candidate,
+                    client,
+                    cache,
+                    google_books_api_key,
+                    rate_limited_providers=rate_limited_providers,
+                )
 
         results = await asyncio.gather(*(run(candidate) for candidate in candidates))
 
