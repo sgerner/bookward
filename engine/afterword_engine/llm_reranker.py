@@ -229,6 +229,18 @@ def apply_llm_rerank_order(
     }
 
 
+def _normalize_chat_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
+    cleaned = url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    if cleaned.endswith(("/v1", "/openai")):
+        return f"{cleaned}/chat/completions"
+    return cleaned
+
+
 async def rerank_with_llm(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -243,7 +255,7 @@ async def rerank_with_llm(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
+    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
@@ -291,7 +303,7 @@ def rerank_with_llm_sync(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
+    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta

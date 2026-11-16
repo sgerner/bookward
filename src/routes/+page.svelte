@@ -182,6 +182,22 @@
   let embeddingBackendOverride = $state<string | null>(null);
   let embeddingModelOverride = $state<string | null>(null);
   let embeddingUrlOverride = $state<string | null>(null);
+  type LlmCatalogProvider = {
+    id: string;
+    name: string;
+    api: string;
+    npm: string;
+    models: Array<{ id: string; name: string }>;
+  };
+  let llmCatalogProviders = $state<LlmCatalogProvider[]>([]);
+  let llmCatalogLoading = $state(false);
+  let llmCatalogError = $state("");
+  let llmProviderSearch = $state("");
+  let llmModelSearch = $state("");
+  let llmEnabledOverride = $state<boolean | null>(null);
+  let llmProviderOverride = $state<string | null>(null);
+  let llmApiUrlOverride = $state<string | null>(null);
+  let llmModelOverride = $state<string | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
   let bookStatusOverrides = $state<Record<number, string>>({});
   let profileHeaders = $derived({ "x-bookward-profile": data.user?.profile_id ?? "" });
@@ -356,6 +372,76 @@
   const embeddingUrl = $derived(
     embeddingUrlOverride ?? data.profile.embedding_url,
   );
+  const llmRerank = $derived(
+    data.profile.llm_rerank ?? {
+      enabled: false,
+      provider: "",
+      api_url: "https://api.openai.com/v1/chat/completions",
+      model: "gpt-4o-mini",
+      api_key_set: false,
+    },
+  );
+  const llmEnabled = $derived(llmEnabledOverride ?? llmRerank.enabled);
+  const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
+  const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
+  const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const filteredLlmProviders = $derived.by(() => {
+    const q = llmProviderSearch.trim().toLowerCase();
+    if (!q) return llmCatalogProviders;
+    return llmCatalogProviders.filter(
+      (p) =>
+        p.name.toLowerCase().includes(q) ||
+        p.id.toLowerCase().includes(q),
+    );
+  });
+  const selectedCatalogProvider = $derived(
+    llmCatalogProviders.find((p) => p.id === llmProvider) ?? null,
+  );
+  const filteredLlmModels = $derived.by(() => {
+    const models = selectedCatalogProvider?.models ?? [];
+    const q = llmModelSearch.trim().toLowerCase();
+    if (!q) return models;
+    return models.filter(
+      (m) =>
+        m.name.toLowerCase().includes(q) ||
+        m.id.toLowerCase().includes(q),
+    );
+  });
+
+  async function loadLlmCatalog() {
+    if (llmCatalogLoading) return;
+    llmCatalogLoading = true;
+    llmCatalogError = "";
+    try {
+      const response = await fetch("/api/llm/models");
+      const body = await response.json();
+      if (!response.ok) {
+        llmCatalogError = body?.message || "Could not load models.dev catalog.";
+        return;
+      }
+      llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
+    } catch (error) {
+      llmCatalogError =
+        error instanceof Error
+          ? error.message
+          : "Could not load models.dev catalog.";
+    } finally {
+      llmCatalogLoading = false;
+    }
+  }
+
+  function handleLlmProviderChange(providerId: string) {
+    llmProviderOverride = providerId;
+    llmModelSearch = "";
+    const match = llmCatalogProviders.find((p) => p.id === providerId);
+    if (!match) return;
+    if (match.api) {
+      llmApiUrlOverride = match.api;
+    }
+    if (match.models.length > 0) {
+      llmModelOverride = match.models[0].id;
+    }
+  }
   const apiTokens = $derived(
     data.profile.api_tokens.filter((token) => !revokedApiTokenIds.has(token.id)),
   );
@@ -3073,6 +3159,274 @@
                     >
                   </form>
                 </div>
+              </section>
+              <section
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><BookOpen size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Google Books API
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${data.profile.google_books_api_key_set ? "preset-tonal-success" : "preset-tonal-surface"}`}
+                    >{data.profile.google_books_api_key_set
+                      ? "Configured"
+                      : "Optional"}</span
+                  >
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Add a Google Books API key to prevent rate-limit throttling when verifying and enriching new book candidates.
+                  <a
+                    class="inline-flex items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
+                    href="https://developers.google.com/books/docs/v1/using"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >How to create a key <ExternalLink size={13} /></a
+                  >
+                </p>
+                <form
+                  class="mt-4 space-y-4"
+                  method="POST"
+                  action="?/configureGoogleBooks"
+                  use:enhance={setPending("google-books")}
+                >
+                  <ProfileField profileId={data.user?.profile_id} />
+                  <label class="block text-sm font-medium text-surface-800-200"
+                    >API key<input
+                      class="input mt-2"
+                      name="apiKey"
+                      type="password"
+                      placeholder={data.profile.google_books_api_key_set
+                        ? "Already configured · leave blank to keep"
+                        : "AIza…"}
+                    /></label
+                  >
+                  {#if data.profile.google_books_api_key_set}
+                    <label
+                      class="flex items-center gap-2 text-xs text-surface-700-300"
+                      ><input class="checkbox checkbox-sm" type="checkbox" name="clear" />
+                      Clear saved API key</label
+                    >
+                  {/if}
+                  <button
+                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    type="submit"
+                    disabled={isPending("google-books")}
+                    aria-busy={isPending("google-books")}
+                    >{#if isPending("google-books")}<RefreshCw
+                        size={16}
+                        class="animate-spin"
+                      />{:else}<Check size={16} />{/if} Save Google Books key</button
+                  >
+                </form>
+              </section>
+              <section
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
+                      ><Sparkles size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      LLM reranker
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${llmEnabled ? "preset-tonal-success" : "preset-tonal-surface"}`}
+                    >{llmEnabled ? "Enabled" : "Disabled"}</span
+                  >
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Optionally rerank top recommendations with an OpenAI-compatible LLM. Pick a provider and model from
+                  <a
+                    class="font-medium text-primary-600-400 underline underline-offset-2"
+                    href="https://models.dev"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >models.dev</a
+                  >
+                  or enter an endpoint directly.
+                </p>
+                <div class="mt-4 space-y-3 border border-surface-300-700/50 p-3">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
+                      >models.dev selector</span
+                    >
+                    <button
+                      type="button"
+                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                      onclick={() => void loadLlmCatalog()}
+                      disabled={llmCatalogLoading}
+                    >
+                      {#if llmCatalogLoading}<RefreshCw
+                          size={14}
+                          class="animate-spin"
+                        />{:else}<Search size={14} />{/if}
+                      {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
+                    </button>
+                  </div>
+                  {#if llmCatalogError}
+                    <p class="text-xs text-error-600-400" role="alert">{llmCatalogError}</p>
+                  {/if}
+                  {#if llmCatalogProviders.length > 0}
+                    <div class="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label class="block text-xs font-medium text-surface-700-300"
+                          >Filter provider<input
+                            class="input mt-1"
+                            type="search"
+                            bind:value={llmProviderSearch}
+                            placeholder="Search OpenAI, Google, Groq…"
+                          /></label
+                        >
+                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                          >Provider<select
+                            class="select mt-1"
+                            value={llmProvider}
+                            onchange={(event) =>
+                              handleLlmProviderChange(
+                                (event.currentTarget as HTMLSelectElement).value,
+                              )}
+                          >
+                            <option value="">Choose provider…</option>
+                            {#each filteredLlmProviders as provider (provider.id)}
+                              <option value={provider.id}
+                                >{provider.name} ({provider.models.length})</option
+                              >
+                            {/each}
+                          </select></label
+                        >
+                      </div>
+                      <div>
+                        <label class="block text-xs font-medium text-surface-700-300"
+                          >Filter model<input
+                            class="input mt-1"
+                            type="search"
+                            bind:value={llmModelSearch}
+                            placeholder="Search model ID or name…"
+                            disabled={!selectedCatalogProvider}
+                          /></label
+                        >
+                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                          >Model<select
+                            class="select mt-1"
+                            value={llmModel}
+                            disabled={!selectedCatalogProvider}
+                            onchange={(event) => {
+                              llmModelOverride = (
+                                event.currentTarget as HTMLSelectElement
+                              ).value;
+                            }}
+                          >
+                            <option value="">Choose model…</option>
+                            {#each filteredLlmModels as model (model.id)}
+                              <option value={model.id}
+                                >{model.name} ({model.id})</option
+                              >
+                            {/each}
+                          </select></label
+                        >
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+                <form
+                  class="mt-4 space-y-4"
+                  method="POST"
+                  action="?/configureLlmRerank"
+                  use:enhance={setPending("llm-rerank")}
+                >
+                  <ProfileField profileId={data.user?.profile_id} />
+                  <input type="hidden" name="provider" value={llmProvider} />
+                  <label
+                    class="flex items-center gap-3 text-sm font-medium text-surface-800-200"
+                    ><input
+                      class="checkbox"
+                      type="checkbox"
+                      name="enabled"
+                      checked={llmEnabled}
+                      onchange={(event) =>
+                        (llmEnabledOverride = (
+                          event.currentTarget as HTMLInputElement
+                        ).checked)}
+                    />
+                    Enable LLM reranking</label
+                  >
+                  <label class="block text-sm font-medium text-surface-800-200"
+                    >API URL<input
+                      class="input mt-2"
+                      name="apiUrl"
+                      type="url"
+                      value={llmApiUrl}
+                      oninput={(event) =>
+                        (llmApiUrlOverride = (
+                          event.currentTarget as HTMLInputElement
+                        ).value)}
+                      placeholder="https://api.openai.com/v1/chat/completions"
+                    /></label
+                  >
+                  <label class="block text-sm font-medium text-surface-800-200"
+                    >Model<input
+                      class="input mt-2"
+                      name="model"
+                      value={llmModel}
+                      oninput={(event) =>
+                        (llmModelOverride = (
+                          event.currentTarget as HTMLInputElement
+                        ).value)}
+                      placeholder="gpt-4o-mini"
+                    /></label
+                  >
+                  <label class="block text-sm font-medium text-surface-800-200"
+                    >API key<input
+                      class="input mt-2"
+                      name="apiKey"
+                      type="password"
+                      placeholder={llmRerank.api_key_set
+                        ? "Already configured · leave blank to keep"
+                        : "sk-…"}
+                    /></label
+                  >
+                  {#if llmRerank.api_key_set}
+                    <label
+                      class="flex items-center gap-2 text-xs text-surface-700-300"
+                      ><input class="checkbox checkbox-sm" type="checkbox" name="clearApiKey" />
+                      Clear saved LLM API key</label
+                    >
+                  {/if}
+                  <button
+                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    type="submit"
+                    disabled={isPending("llm-rerank")}
+                    aria-busy={isPending("llm-rerank")}
+                    >{#if isPending("llm-rerank")}<RefreshCw
+                        size={16}
+                        class="animate-spin"
+                      />{:else}<Check size={16} />{/if} Save LLM reranker</button
+                  >
+                </form>
               </section>
               <section
                 in:fly={{

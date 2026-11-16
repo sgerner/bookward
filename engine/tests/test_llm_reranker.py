@@ -109,3 +109,44 @@ def test_rerank_with_llm_sync_falls_back_when_unconfigured() -> None:
     res, diag = rerank_with_llm_sync([], candidates, api_key="")
     assert diag == {"applied": False, "reason": "not_configured"}
     assert [item["id"] for item in res] == [1, 2]
+
+
+def test_normalize_chat_url() -> None:
+    from afterword_engine.llm_reranker import _normalize_chat_url
+
+    assert _normalize_chat_url("https://api.openai.com/v1") == "https://api.openai.com/v1/chat/completions"
+    assert _normalize_chat_url("https://api.openai.com/v1/") == "https://api.openai.com/v1/chat/completions"
+    assert _normalize_chat_url("https://generativelanguage.googleapis.com/v1beta/openai") == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    assert _normalize_chat_url("https://api.openai.com/v1/chat/completions") == "https://api.openai.com/v1/chat/completions"
+
+
+def test_normalize_models_dev_catalog() -> None:
+    from afterword_engine.main import _normalize_models_dev_catalog
+
+    providers = _normalize_models_dev_catalog(
+        {
+            "google": {
+                "name": "Google",
+                "api": None,
+                "npm": "@ai-sdk/google",
+                "models": {
+                    "gemini-2.5-flash": {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
+                },
+            },
+            "sambanova": {
+                "name": "SambaNova",
+                "api": "https://api.sambanova.ai/v1",
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "Meta-Llama-3.3-70B": {"id": "Meta-Llama-3.3-70B", "name": "Llama 3.3 70B"},
+                },
+            },
+            "empty-provider": {
+                "name": "Empty",
+                "models": {},
+            },
+        }
+    )
+    assert [p["id"] for p in providers] == ["google", "sambanova"]
+    assert providers[0]["api"] == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    assert providers[1]["api"] == "https://api.sambanova.ai/v1/chat/completions"

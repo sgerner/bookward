@@ -1283,6 +1283,31 @@ class AssociationSettingsIn(BaseModel):
     google_books_api_key: str | None = Field(default=None, max_length=500)
 
 
+class GoogleBooksKeyIn(BaseModel):
+    api_key: str | None = Field(default=None, max_length=500)
+    clear: bool = False
+
+
+class LLMRerankSettingsIn(BaseModel):
+    enabled: bool = False
+    provider: str = Field(default="", max_length=120)
+    api_url: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    model: str = Field(default="", max_length=200)
+    clear_api_key: bool = False
+
+    def validate_values(self):
+        url = self.api_url.strip()
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                raise ValueError("LLM API URL must use HTTP or HTTPS")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
+        if self.enabled and (not url or not self.model.strip()):
+            raise ValueError("LLM reranking requires both an API URL and a model")
+
+
 def api_token_list():
     """Return token metadata without ever returning a token value."""
     return identity_store.list_profile_api_tokens(current_profile_id() or "legacy")
@@ -1297,6 +1322,7 @@ def tracked_recommendations(
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
+    private: dict | None = None,
 ):
     ranking_at = datetime.now(timezone.utc)
     base_pool = personalized_pool = final_pool = None
@@ -1375,7 +1401,8 @@ def tracked_recommendations(
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
                 )
-                if settings.llm_rerank_enabled and settings.llm_rerank_api_key.strip():
+                llm_cfg = effective_llm_rerank_settings(connection, private)
+                if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
                     from .llm_reranker import rerank_with_llm_sync
 
                     read_rows = (
@@ -1392,6 +1419,9 @@ def tracked_recommendations(
                         read_rows,
                         diversified,
                         interaction_events=interaction_events,
+                        api_url=llm_cfg["api_url"],
+                        api_key=llm_cfg["api_key"],
+                        model=llm_cfg["model"],
                     )
                     learning_metadata["llm_rerank"] = llm_diag
                 ranked = diversified + [
@@ -1517,12 +1547,14 @@ def overview_payload(
             for name in ("reads", "candidates", "sources")
         }
         identity_context = _recommendation_identity_context(connection)
+        private = private_settings(connection)
         recommendations, run_id = tracked_recommendations(
             connection=connection,
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
             identity_context=identity_context,
             include_imported=True,
+            private=private,
         )
         decision_batch = recommendation_list(
             connection,
@@ -1547,6 +1579,7 @@ def overview_payload(
             "settings": safe_settings(
                 include_api_tokens=include_api_tokens,
                 connection=connection,
+                private=private,
             ),
         }
 
@@ -2481,6 +2514,142 @@ def update_nyt_settings(payload: NYTApiKeyIn):
     return {"saved": True, "api_key_set": bool(api_key)}
 
 
+@app.put("/api/settings/google-books")
+def update_google_books_settings(payload: GoogleBooksKeyIn):
+    current = private_settings().get("association_google_books_api_key", "")
+    if payload.clear:
+        api_key = ""
+    elif payload.api_key is None or not payload.api_key.strip():
+        api_key = current
+    else:
+        api_key = payload.api_key.strip()
+    stored = seal(api_key) if api_key else ""
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,"
+            "updated_at=CURRENT_TIMESTAMP",
+            (stored,),
+        )
+    return {"saved": True, "google_books_api_key_set": bool(api_key)}
+
+
+@app.get("/api/settings/llm-rerank")
+def get_llm_rerank_settings():
+    return safe_llm_rerank_settings()
+
+
+@app.put("/api/settings/llm-rerank")
+def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
+    try:
+        payload.validate_values()
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc)) from exc
+    current = private_settings()
+    if payload.clear_api_key:
+        api_key = ""
+    elif payload.api_key is None or not payload.api_key.strip():
+        api_key = current.get("llm_rerank_api_key", "")
+    else:
+        api_key = payload.api_key.strip()
+    if payload.enabled and not (api_key or settings.llm_rerank_api_key.strip()):
+        raise HTTPException(400, "An API key is required when LLM reranking is enabled")
+    values = {
+        "llm_rerank_enabled": "1" if payload.enabled else "0",
+        "llm_rerank_provider": payload.provider.strip(),
+        "llm_rerank_api_url": payload.api_url.strip(),
+        "llm_rerank_model": payload.model.strip(),
+        "llm_rerank_api_key": api_key,
+    }
+    with transaction() as con:
+        for key, value in values.items():
+            secret = key == "llm_rerank_api_key"
+            stored = seal(value) if secret and value else value
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
+                (key, stored, 1 if secret else 0),
+            )
+    return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
+
+
+_MODELS_DEV_CACHE: dict[str, object] = {"expires_at": 0.0, "providers": []}
+_KNOWN_LLM_CHAT_URLS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "anthropic": "https://api.anthropic.com/v1/chat/completions",
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "mistral": "https://api.mistral.ai/v1/chat/completions",
+    "xai": "https://api.x.ai/v1/chat/completions",
+    "deepseek": "https://api.deepseek.com/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "togetherai": "https://api.together.xyz/v1/chat/completions",
+    "fireworks-ai": "https://api.fireworks.ai/inference/v1/chat/completions",
+}
+
+
+def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
+    providers: list[dict] = []
+    for provider_id, entry in (raw or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        raw_models = entry.get("models")
+        if not isinstance(raw_models, dict) or not raw_models:
+            continue
+        models = []
+        for model_id, meta in raw_models.items():
+            if not isinstance(meta, dict):
+                continue
+            resolved_id = str(meta.get("id") or model_id).strip()
+            if not resolved_id:
+                continue
+            models.append(
+                {
+                    "id": resolved_id,
+                    "name": str(meta.get("name") or resolved_id).strip(),
+                }
+            )
+        if not models:
+            continue
+        models.sort(key=lambda item: item["name"].casefold())
+        raw_api = str(entry.get("api") or "").strip().rstrip("/")
+        if raw_api and not raw_api.endswith("/chat/completions"):
+            if raw_api.endswith(("/v1", "/openai")):
+                raw_api = f"{raw_api}/chat/completions"
+        api_url = _KNOWN_LLM_CHAT_URLS.get(provider_id) or raw_api
+        providers.append(
+            {
+                "id": str(provider_id),
+                "name": str(entry.get("name") or provider_id).strip(),
+                "api": api_url,
+                "npm": str(entry.get("npm") or "").strip(),
+                "models": models,
+            }
+        )
+    providers.sort(key=lambda item: item["name"].casefold())
+    return providers
+
+
+@app.get("/api/llm/models")
+async def llm_models_catalog():
+    now = time.monotonic()
+    cached = _MODELS_DEV_CACHE.get("providers") or []
+    if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
+        return {"providers": cached, "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get("https://models.dev/api.json")
+            resp.raise_for_status()
+            providers = _normalize_models_dev_catalog(resp.json())
+        _MODELS_DEV_CACHE["providers"] = providers
+        _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
+        return {"providers": providers, "cached": False}
+    except Exception as exc:
+        if cached:
+            return {"providers": cached, "cached": True, "stale": True}
+        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+
+
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
     updates = []
@@ -2809,8 +2978,37 @@ def safe_association_settings(connection=None, private=None):
     }
 
 
-def safe_settings(*, include_api_tokens: bool = True, connection=None):
-    private = private_settings(connection)
+def effective_llm_rerank_settings(connection=None, private=None) -> dict:
+    if private is None:
+        private = private_settings(connection)
+    enabled = (
+        private["llm_rerank_enabled"] == "1"
+        if "llm_rerank_enabled" in private
+        else bool(settings.llm_rerank_enabled)
+    )
+    return {
+        "enabled": enabled,
+        "provider": private.get("llm_rerank_provider", ""),
+        "api_url": private.get("llm_rerank_api_url") or settings.llm_rerank_api_url,
+        "api_key": private.get("llm_rerank_api_key") or settings.llm_rerank_api_key,
+        "model": private.get("llm_rerank_model") or settings.llm_rerank_model,
+    }
+
+
+def safe_llm_rerank_settings(connection=None, private=None) -> dict:
+    effective = effective_llm_rerank_settings(connection, private)
+    return {
+        "enabled": effective["enabled"],
+        "provider": effective["provider"],
+        "api_url": effective["api_url"],
+        "model": effective["model"],
+        "api_key_set": bool(effective["api_key"].strip()),
+    }
+
+
+def safe_settings(*, include_api_tokens: bool = True, connection=None, private=None):
+    if private is None:
+        private = private_settings(connection)
     try:
         media_type = normalize_media_type(private.get("librarr_media_type"))
     except ValueError:
@@ -2830,9 +3028,11 @@ def safe_settings(*, include_api_tokens: bool = True, connection=None):
         "goodreads_rss_last_error": private.get("goodreads_rss_last_error", ""),
         "librarr_media_type": media_type,
         "nyt_api_key_set": bool(private.get("nyt_api_key")),
+        "google_books_api_key_set": bool(private.get("association_google_books_api_key")),
         "source_sync_interval_hours": source_sync_interval_hours(private),
         "digest": digest,
         "associations": safe_association_settings(connection, private),
+        "llm_rerank": safe_llm_rerank_settings(connection, private),
     }
     if include_api_tokens:
         result["api_tokens"] = api_token_list()
