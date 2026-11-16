@@ -128,3 +128,34 @@ def test_score_all_hides_currently_reading_and_boosts_to_read(tmp_path: Path, mo
     assert rows[0][1] == "recommended"
     assert "On your Goodreads to-read shelf" in rows[0][2]
     assert rows[1][1] == "hidden"
+
+
+def test_import_goodreads_csv_populates_and_clears_shelf_items(tmp_path: Path, monkeypatch) -> None:
+    from afterword_engine.ingestion import import_goodreads_csv
+
+    db_path = tmp_path / "csv_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    csv_data = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,0,,2026/01/10,to-read,=\"9780593135204\"\n"
+        "Piranesi,Susanna Clarke,0,,2026/02/01,currently-reading,=\"9781635575637\"\n"
+        "The Martian,Andy Weir,5,2025/05/01,2025/04/01,read,=\"9780804139021\"\n"
+    ).encode("utf-8")
+
+    count = import_goodreads_csv(csv_data)
+    assert count == 1
+
+    con = sqlite3.connect(db_path)
+    try:
+        shelves = con.execute(
+            "SELECT shelf, title, author, isbn FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert shelves == [
+        ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
+        ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+    ]

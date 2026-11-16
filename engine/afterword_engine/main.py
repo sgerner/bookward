@@ -438,14 +438,6 @@ async def handle_job(kind: str):
         result = await _sync_goodreads_rss(url)
         result["job_id"] = enqueue_job("score", dedupe=True)
         return result
-    if kind == "favorite_authors":
-        from .author_retrieval import ingest_favorite_author_works
-
-        result = await ingest_favorite_author_works()
-        if result.get("added", 0) > 0:
-            result["quality_job_id"] = enqueue_job("candidate_quality", dedupe=True)
-            result["score_job_id"] = enqueue_job("score", dedupe=True)
-        return result
     if kind in {"digest:manual", "digest:force"}:
         # Manual runs bypass the time window through the job kind; the same
         # idempotent candidate/channel rules still apply to avoid duplicates.
@@ -1326,7 +1318,9 @@ def tracked_recommendations(
                         ).fetchall()
                     ]
                     diversified, llm_diag = rerank_with_llm_sync(
-                        read_rows, diversified
+                        read_rows,
+                        diversified,
+                        interaction_events=interaction_events,
                     )
                     learning_metadata["llm_rerank"] = llm_diag
                 ranked = diversified + [

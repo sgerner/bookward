@@ -52,9 +52,9 @@ def apply_impression_fatigue(
     candidates: Sequence[dict[str, Any]],
     visible_day_counts: dict[int, int],
     *,
-    grace_days: int = 1,
-    penalty_per_day: float = 1.5,
-    max_penalty: float = 9.0,
+    grace_days: int = 3,
+    penalty_per_day: float = 0.75,
+    max_penalty: float = 4.5,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Apply bounded impression fatigue to ``recommended`` items and re-sort them."""
     if not candidates:
