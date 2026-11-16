@@ -779,8 +779,15 @@ async def resolve_catalog_match(
                 if match:
                     matches.append(match)
 
-        if not any(accepted(value) for value in matches) and (
-            rate_limited_providers is None or "apple_books" not in rate_limited_providers
+        primary_unavailable = any(
+            trace.get("provider") in {"openlibrary", "google_books"}
+            and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+            for trace in fetch_trace
+        )
+        if (
+            not any(accepted(value) for value in matches)
+            and (not query_isbn or primary_unavailable)
+            and (rate_limited_providers is None or "apple_books" not in rate_limited_providers)
         ):
             apple_match = await _apple_books_match(
                 title, author, client, media="ebook", trace=fetch_trace
@@ -800,7 +807,8 @@ async def resolve_catalog_match(
 
         if not matches:
             unavailable = any(
-                trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+                trace.get("provider") in {"openlibrary", "google_books"}
+                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
                 for trace in fetch_trace
             )
             if unavailable:
