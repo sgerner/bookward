@@ -290,27 +290,6 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         target.update(book_row_identity_match_keys(dict(srow)))
 
     ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
-    from .collaborative import load_collab_index, score_collaborative_residual
-    from .config import settings
-
-    collab_index = load_collab_index(settings.collab_index_path)
-    collab_adjustments: dict[int, float] = {}
-    if collab_index is not None:
-        try:
-            collab_adjustments = score_collaborative_residual(reads, candidates, collab_index)
-        finally:
-            collab_index.close()
-    for candidate in ranked:
-        adj = collab_adjustments.get(int(candidate["id"]), 0.0)
-        if adj:
-            candidate["score"] = round(max(0.0, min(100.0, float(candidate["score"]) + adj)), 1)
-            explanation = list(candidate.get("explanation") or [])
-            explanation.append(
-                "Boosted by collaborative reader patterns"
-                if adj > 0
-                else "Reduced by collaborative reader patterns"
-            )
-            candidate["explanation"] = explanation
     candidate_inputs_by_id = {int(item["id"]): item for item in candidates}
     batch_id = uuid.uuid4().hex
     captured_at = datetime.now(timezone.utc).isoformat()

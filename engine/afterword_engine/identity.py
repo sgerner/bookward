@@ -138,6 +138,9 @@ def _title_match_keys(value: object) -> set[str]:
             keys.add(prefix)
     for key in list(keys):
         keys.update(_TITLE_ALIASES.get(key, ()))
+        words = key.split()
+        if len(words) >= 4 and words[0] in {"a", "an", "the"}:
+            keys.add(" ".join(words[1:]))
     return keys
 
 

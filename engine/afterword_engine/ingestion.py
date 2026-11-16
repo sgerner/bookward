@@ -764,6 +764,19 @@ def import_goodreads_csv(content: bytes):
                 author = str(source_row.get("Author") or "").strip()[:300]
                 if not title or not author: continue
                 shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                if shelf in {"to-read", "currently-reading"}:
+                    added_at = _read_date_value(source_row.get("Date Added"))
+                    con.execute(
+                        "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
+                        "VALUES(?, ?, ?, ?, ?) "
+                        "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                        "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                        "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                        "updated_at=CURRENT_TIMESTAMP",
+                        (shelf, title, author, isbn, added_at),
+                    )
+                    continue
                 if shelf and shelf != "read": continue
                 try:
                     rating = float(source_row.get("My Rating") or 0) or None
@@ -772,7 +785,10 @@ def import_goodreads_csv(content: bytes):
                 if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be between 0 and 5. No books were imported.")
                 read_at = _read_date_value(source_row.get("Date Read"))
-                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                con.execute(
+                    "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                    (title, author),
+                )
                 con.execute(
                     "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
                     "VALUES(?,?,?,?,?,'goodreads_csv') "
