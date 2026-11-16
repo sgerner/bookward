@@ -37,8 +37,8 @@ _MAX_SUBJECTS_PER_CANDIDATE = 4
 _FEATURE_RATE_SCALE = 0.5
 _CONFIDENCE_GAP_SCALE = 0.15
 _SEMANTIC_SIMILARITY_FLOOR = 0.45
-_MIN_SEMANTIC_EFFECTIVE_BOOKS = 4.0
-_MIN_SEMANTIC_WEIGHT = 1.25
+_SEMANTIC_PRIOR_WEIGHT = 1.5
+_SEMANTIC_MIN_OBSERVATIONS = 10
 _MAX_SEMANTIC_ADJUSTMENT = 4.0
 _NONINFORMATIVE_SUBJECTS = {
     "book",
@@ -400,11 +400,15 @@ def _learn_semantic_adjustments(
     valid = np.linalg.norm(reference, axis=1) > 0
     reference = reference[valid]
     vector_observations = [item for item, keep in zip(vector_observations, valid) if keep]
-    if len(vector_observations) < 2:
+    if len(vector_observations) < _SEMANTIC_MIN_OBSERVATIONS:
         return {}, len(vector_observations)
 
     labels = np.asarray([item["label"] for item in vector_observations], dtype=np.float64)
     base_weights = np.asarray([item["weight"] for item in vector_observations], dtype=np.float64)
+    total_weight = float(base_weights.sum())
+    if total_weight < MIN_WEIGHTED_EVIDENCE:
+        return {}, len(vector_observations)
+    global_rate = float((base_weights @ labels + 1.0) / (total_weight + 2.0))
     adjustments: dict[int, float] = {}
     for candidate in recommendations:
         if candidate.get("status") != "recommended":
@@ -424,47 +428,26 @@ def _learn_semantic_adjustments(
             continue
         similarities = (reference @ (vector / norm)).astype(np.float64)
         local = similarities >= _SEMANTIC_SIMILARITY_FLOOR
-        if int(local.sum()) < _MIN_SEMANTIC_EFFECTIVE_BOOKS:
+        if not np.any(local):
             continue
-        local_weights = base_weights[local] * np.maximum(similarities[local], 0.0) ** 2
-        other_weights = base_weights[~local]
-        local_sum = float(local_weights.sum())
-        local_square_sum = float(local_weights @ local_weights)
-        other_sum = float(other_weights.sum())
-        other_square_sum = float(other_weights @ other_weights)
-        local_stats = _stats_from_sums(
-            local_sum,
-            float(local_weights @ labels[local]),
-            local_square_sum,
+        rel_sim = (similarities[local] - _SEMANTIC_SIMILARITY_FLOOR) / (
+            1.0 - _SEMANTIC_SIMILARITY_FLOOR
         )
-        other_stats = _stats_from_sums(
-            other_sum,
-            float(other_weights @ labels[~local]),
-            other_square_sum,
-        )
-        if (
-            local_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON < _MIN_SEMANTIC_EFFECTIVE_BOOKS
-            or other_stats["effective_n"] + _EFFECTIVE_COUNT_EPSILON < MIN_EFFECTIVE_BOOKS
-            or local_sum < _MIN_SEMANTIC_WEIGHT
-            or other_sum < MIN_WEIGHTED_EVIDENCE
-        ):
+        local_weights = base_weights[local] * rel_sim
+        w_tot = float(local_weights.sum())
+        if w_tot <= 0.0:
             continue
-        local_low, local_high = local_stats["interval"]
-        other_low, other_high = other_stats["interval"]
-        if local_low > other_high:
-            sign = 1.0
-            interval_gap = local_low - other_high
-        elif local_high < other_low:
-            sign = -1.0
-            interval_gap = other_low - local_high
-        else:
-            continue
-        difference = abs(local_stats["rate"] - other_stats["rate"])
-        confidence = min(1.0, interval_gap / _CONFIDENCE_GAP_SCALE)
-        strength = min(1.0, difference / _FEATURE_RATE_SCALE)
-        adjustments[candidate_id] = (
-            sign * _MAX_SEMANTIC_ADJUSTMENT * strength * confidence
+        w_pos = float(local_weights @ labels[local])
+        posterior_rate = (w_pos + _SEMANTIC_PRIOR_WEIGHT * global_rate) / (
+            w_tot + _SEMANTIC_PRIOR_WEIGHT
         )
+        delta = posterior_rate - global_rate
+        scaled = max(
+            -_MAX_SEMANTIC_ADJUSTMENT,
+            min(_MAX_SEMANTIC_ADJUSTMENT, _MAX_SEMANTIC_ADJUSTMENT * (delta / _FEATURE_RATE_SCALE)),
+        )
+        if abs(scaled) >= 0.05:
+            adjustments[candidate_id] = scaled
     return adjustments, len(vector_observations)
 
 
