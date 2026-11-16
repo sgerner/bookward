@@ -1316,6 +1316,19 @@ def tracked_recommendations(
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
                 )
+                if settings.llm_rerank_enabled and settings.llm_rerank_api_key.strip():
+                    from .llm_reranker import rerank_with_llm_sync
+
+                    read_rows = [
+                        dict(r)
+                        for r in connection.execute(
+                            "SELECT title, author, rating FROM reads ORDER BY id"
+                        ).fetchall()
+                    ]
+                    diversified, llm_diag = rerank_with_llm_sync(
+                        read_rows, diversified
+                    )
+                    learning_metadata["llm_rerank"] = llm_diag
                 ranked = diversified + [
                     item for item in ranked if item.get("status") != "recommended"
                 ]
