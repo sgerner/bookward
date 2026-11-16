@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     exploration_enabled: bool = False
     exploration_epsilon: float = 0.0
     exploration_stable_top_k: int = 4
+    impression_fatigue_enabled: bool = True
+    impression_fatigue_window_days: int = 21
+    impression_fatigue_grace_days: int = 1
+    impression_fatigue_penalty_per_day: float = 1.5
+    impression_fatigue_max_penalty: float = 9.0
     # A shared secret between the SvelteKit server and engine. Leave blank only
     # when both containers communicate on a private network.
     service_secret: str = ""
