@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     impression_fatigue_penalty_per_day: float = 1.5
     impression_fatigue_max_penalty: float = 9.0
     collab_index_path: str = ""
+    llm_rerank_enabled: bool = False
+    llm_rerank_api_url: str = "https://api.openai.com/v1/chat/completions"
+    llm_rerank_api_key: str = ""
+    llm_rerank_model: str = "gpt-4o-mini"
+    llm_rerank_top_k: int = 24
+    llm_rerank_timeout_seconds: float = 12.0
     # A shared secret between the SvelteKit server and engine. Leave blank only
     # when both containers communicate on a private network.
     service_secret: str = ""
