@@ -150,3 +150,49 @@ def test_normalize_models_dev_catalog() -> None:
     assert [p["id"] for p in providers] == ["google", "sambanova"]
     assert providers[0]["api"] == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     assert providers[1]["api"] == "https://api.sambanova.ai/v1/chat/completions"
+
+
+def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
+    import asyncio
+    import afterword_engine.main as main_module
+
+    calls = 0
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "openai": {
+                    "name": "OpenAI",
+                    "api": "https://api.openai.com/v1",
+                    "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url: str):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+    main_module._MODELS_DEV_CACHE["providers"] = []
+    main_module._MODELS_DEV_CACHE["expires_at"] = 0.0
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", FakeClient)
+
+    first = asyncio.run(main_module.llm_models_catalog())
+    second = asyncio.run(main_module.llm_models_catalog())
+    assert calls == 1
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert first["providers"][0]["id"] == "openai"
