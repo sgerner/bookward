@@ -17,17 +17,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from afterword_engine.collaborative import normalize_isbn
 
 
+def _load_target_isbns(afterword_db: Path) -> set[str]:
+    con = sqlite3.connect(f"file:{afterword_db.resolve()}?mode=ro", uri=True)
+    try:
+        isbns: set[str] = set()
+        for (raw,) in con.execute("SELECT isbn FROM reads WHERE COALESCE(isbn, '') != ''"):
+            code = normalize_isbn(raw)
+            if code:
+                isbns.add(code)
+        for row in con.execute("SELECT isbn13, isbn10 FROM candidates"):
+            for raw in row:
+                code = normalize_isbn(raw)
+                if code:
+                    isbns.add(code)
+        return isbns
+    finally:
+        con.close()
+
+
 def build_index(
     books_json_gz: Path,
     interactions_csv: Path,
     output_db: Path,
     *,
     book_id_map_csv: Path | None = None,
+    afterword_db: Path | None = None,
     min_item_ratings: int = 20,
     top_k_neighbors: int = 40,
     max_users: int = 200_000,
 ) -> dict[str, int]:
     """Stream UCSD Goodreads books & interactions into a compact CF SQLite index."""
+    target_isbns = _load_target_isbns(afterword_db) if afterword_db is not None else None
+
     csv_to_book_id: dict[int, int] = {}
     if book_id_map_csv is not None:
         with open(book_id_map_csv, "rt", encoding="utf-8") as fh:
@@ -41,10 +62,12 @@ def build_index(
             bid = int(row["book_id"])
             for field in ("isbn13", "isbn"):
                 code = normalize_isbn(row.get(field))
-                if code:
+                if code and (target_isbns is None or code in target_isbns):
                     isbn_to_book.setdefault(code, bid)
 
+    target_book_ids = set(isbn_to_book.values()) if target_isbns is not None else None
     user_items: dict[int, list[tuple[int, float]]] = collections.defaultdict(list)
+    seen_users: set[int] = set()
     item_counts: collections.Counter[int] = collections.Counter()
     opener = gzip.open if interactions_csv.suffix == ".gz" else open
     with opener(interactions_csv, "rt", encoding="utf-8") as fh:
@@ -54,10 +77,14 @@ def build_index(
             if rating <= 0:
                 continue
             uid = int(row["user_id"])
-            if len(user_items) >= max_users and uid not in user_items:
-                continue
+            if uid not in seen_users:
+                if len(seen_users) >= max_users:
+                    break
+                seen_users.add(uid)
             raw_bid = int(row["book_id"])
             bid = csv_to_book_id.get(raw_bid, raw_bid) if csv_to_book_id else raw_bid
+            if target_book_ids is not None and bid not in target_book_ids:
+                continue
             user_items[uid].append((bid, float(rating)))
             item_counts[bid] += 1
 
@@ -125,6 +152,7 @@ def main() -> None:
     parser.add_argument("interactions_csv", type=Path)
     parser.add_argument("output_db", type=Path)
     parser.add_argument("--book-id-map", type=Path, default=None)
+    parser.add_argument("--afterword-db", type=Path, default=None)
     parser.add_argument("--min-item-ratings", type=int, default=20)
     parser.add_argument("--top-k-neighbors", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=200_000)
@@ -134,6 +162,7 @@ def main() -> None:
         args.interactions_csv,
         args.output_db,
         book_id_map_csv=args.book_id_map,
+        afterword_db=args.afterword_db,
         min_item_ratings=args.min_item_ratings,
         top_k_neighbors=args.top_k_neighbors,
         max_users=args.max_users,
