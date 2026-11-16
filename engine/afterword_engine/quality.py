@@ -44,10 +44,11 @@ from .covers import (
 )
 from .database import persist_metadata_field_provenance, private_setting, rows, transaction
 from .identity import (
+    ReadIdentityIndex,
     _title_without_format_suffix,
     book_identity,
     book_identity_match_index,
-    book_identity_match_keys,
+    book_row_identity_match_keys,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
@@ -1202,17 +1203,21 @@ def _dedupe_and_hide(con) -> int:
 
     changed = 0
     active = con.execute(
-        """SELECT c.id,c.title,c.author FROM candidates c
+        """SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,
+        q.work_id AS quality_work_id,q.provider AS quality_provider,
+        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+        FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended')"""
     ).fetchall()
-    read_keys = book_identity_match_index(
-        con.execute("SELECT title,author FROM reads").fetchall()
+    read_index = ReadIdentityIndex.from_reads(
+        con.execute(
+            """SELECT r.title,r.author,r.isbn,r.openlibrary_work_id,
+            m.verified_work_id AS quality_work_id,m.identity_provider AS quality_provider
+            FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id"""
+        ).fetchall()
     )
-    overlap = [
-        item for item in active
-        if book_identity_match_keys(item["title"], item["author"]) & read_keys
-    ]
+    overlap = [item for item in active if read_index.matches(item)]
     for item in overlap:
         candidate_id = item["id"]
         con.execute("UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
@@ -1225,13 +1230,18 @@ def _dedupe_and_hide(con) -> int:
 
     shortlisted_keys = book_identity_match_index(
         con.execute(
-            "SELECT title,author FROM candidates WHERE status IN ('saved','imported')"
+            """SELECT c.title,c.author,c.isbn13,c.isbn10,
+            q.work_id AS quality_work_id,q.provider AS quality_provider,
+            q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+            FROM candidates c
+            LEFT JOIN candidate_quality q ON q.candidate_id=c.id
+            WHERE c.status IN ('saved','imported')"""
         ).fetchall()
     )
     shortlisted_overlap = [
         item for item in active
         if item["id"] not in overlap_ids
-        and book_identity_match_keys(item["title"], item["author"]) & shortlisted_keys
+        and book_row_identity_match_keys(item) & shortlisted_keys
     ]
     for item in shortlisted_overlap:
         candidate_id = item["id"]

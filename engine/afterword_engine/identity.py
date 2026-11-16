@@ -24,6 +24,18 @@ _NUMBERED_SERIES_SUBTITLE = re.compile(
     r"^(?:a|an|the)\s+(?:one|two|three|four|five|first|second|third|fourth|fifth)\b",
     re.IGNORECASE,
 )
+_TITLE_ALIAS_GROUPS = (
+    ("1984", "nineteen eighty four"),
+    ("2001", "two thousand one", "two thousand and one"),
+    ("catch 22", "catch twenty two"),
+    ("fahrenheit 451", "fahrenheit four hundred fifty one"),
+    ("slaughterhouse 5", "slaughterhouse five"),
+)
+_TITLE_ALIASES: dict[str, tuple[str, ...]] = {
+    alias: group
+    for group in _TITLE_ALIAS_GROUPS
+    for alias in group
+}
 
 
 def _row_value(item, key: str, default=""):
@@ -124,6 +136,8 @@ def _title_match_keys(value: object) -> set[str]:
         )
         if subtitle_shaped and (len(words) >= 3 or distinctive_two_word_title):
             keys.add(prefix)
+    for key in list(keys):
+        keys.update(_TITLE_ALIASES.get(key, ()))
     return keys
 
 
