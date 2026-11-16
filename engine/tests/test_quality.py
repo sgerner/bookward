@@ -13,6 +13,7 @@ from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, rows, transaction
 from afterword_engine.isbn import normalize_isbn_identifier
 from afterword_engine.quality import (
+    APPLE_BOOKS_SEARCH,
     QUALITY_VERSION,
     audit_candidates,
     candidate_quality_audit_candidates,
@@ -307,6 +308,7 @@ def test_audit_quarantines_unmatched_candidate_and_hides_it(database):
     candidate_id = add_candidate("No Catalog Match", "A Writer")
     respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
     respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
 
     asyncio.run(audit_candidates(only_pending=False))
     quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
@@ -476,3 +478,44 @@ def test_audit_skips_disabled_source_candidates(database):
 
     selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
     assert disabled_cid not in selected_ids
+
+
+@respx.mock
+def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited(database):
+    candidate_id = add_candidate("Find Me Where It Ends", "Cassandra Khaw")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, candidate_id),
+        )
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+    respx.get(APPLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 6758952748,
+                        "trackName": "Find Me Where It Ends",
+                        "artistName": "Cassandra Khaw",
+                        "description": "A haunting contemporary horror novel.",
+                        "genres": ["Horror", "Books", "Sci-Fi & Fantasy"],
+                        "releaseDate": "2026-10-06T07:00:00Z",
+                        "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Publication211/v4/8c/c0/68/test.jpg/100x100bb.jpg",
+                    }
+                ]
+            },
+        )
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    assert result["accepted"] == 1
+    assert quality["quality_status"] == "accepted"
+    assert quality["provider"] == "apple_books"
+    assert quality["provider_id"] == "6758952748"
+    assert candidate["release_date"] == "2026-10-06"
+    assert "600x600bb" in candidate["cover_url"]

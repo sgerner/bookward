@@ -54,6 +54,7 @@ from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
 QUALITY_VERSION = "candidate-quality-v4"
+APPLE_BOOKS_SEARCH = "https://itunes.apple.com/search"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 CATALOG_PROVIDER_RETRY_HOURS = 24
@@ -563,6 +564,120 @@ async def _google_books_match(
     return best
 
 
+async def _apple_books_match(
+    title: str,
+    author: str,
+    client: httpx.AsyncClient,
+    *,
+    isbn: str = "",
+    media: str = "ebook",
+    trace: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    if isbn:
+        return None
+    query_title = _title_without_format_suffix(title) or title
+    term = " ".join(part for part in (query_title[:200], author[:150]) if part).strip()
+    if not term:
+        return None
+    fetch_trace: dict[str, Any] = {
+        "provider": "apple_books",
+        "fetched_at": _utc_now(),
+        "query_kind": f"title_author_{media}",
+        "status": "request_error",
+    }
+    if trace is not None:
+        trace.append(fetch_trace)
+    try:
+        response = await client.get(
+            APPLE_BOOKS_SEARCH,
+            params={"media": media, "term": term, "limit": 5, "country": "us"},
+        )
+        fetch_trace["http_status"] = response.status_code
+        if response.is_error:
+            fetch_trace["status"] = "rate_limited" if response.status_code in {403, 429} else "http_error"
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            fetch_trace["status"] = "invalid_json"
+            return None
+    except Exception as exc:
+        fetch_trace["error_type"] = type(exc).__name__
+        return None
+
+    best: dict[str, Any] | None = None
+    matched_count = 0
+    for item in payload.get("results", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        track_id = str(item.get("trackId") or "").strip()
+        catalog_title = str(item.get("trackName") or "").strip()
+        catalog_author = str(item.get("artistName") or "").strip()
+        if not track_id or not catalog_title:
+            continue
+        description = _clean_metadata_text(item.get("description"))
+        description_kind = "synopsis" if description else ""
+        release_date, release_date_kind = _publication_date(item.get("releaseDate"))
+        raw_cover = str(item.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
+        cover = safe_cover_url(raw_cover)
+        genres = _catalog_genres(
+            [g for g in (item.get("genres") or []) if str(g).casefold() != "books"],
+            limit=METADATA_GENRE_LIMIT,
+        )
+        source_payload = {
+            "trackId": item.get("trackId"),
+            "trackName": _clean_metadata_text(catalog_title, 500),
+            "artistName": _clean_metadata_text(catalog_author, 300),
+            "description": description,
+            "genres": genres,
+            "releaseDate": _clean_metadata_text(item.get("releaseDate"), 40),
+            "artworkUrl100": raw_cover,
+            "media": media,
+        }
+        match = _provider_match(
+            provider="apple_books",
+            provider_id=track_id,
+            work_id="",
+            title=title,
+            author=author,
+            catalog_title=catalog_title,
+            catalog_author=catalog_author,
+            description=description,
+            description_kind=description_kind,
+            description_source_field="description" if description else "",
+            release_date=release_date or "",
+            release_date_kind=release_date_kind or "",
+            release_date_source_field="releaseDate" if release_date else "",
+            cover_url=cover,
+            genres=genres,
+            source_payload=source_payload,
+        )
+        matched_count += 1
+        if best is None or (
+            match["quality_score"],
+            match["description_kind"] == "synopsis",
+            match["description_content_quality_heuristic"],
+            len(match["genres"]),
+        ) > (
+            best["quality_score"],
+            best["description_kind"] == "synopsis",
+            best["description_content_quality_heuristic"],
+            len(best["genres"]),
+        ):
+            best = match
+    fetch_trace["matched_count"] = matched_count
+    if best:
+        fetch_trace["status"] = "matched"
+        fetch_trace["provider_id"] = best["provider_id"]
+        fetch_trace["available_fields"] = [
+            field for field in ("description", "genres", "cover_url", "release_date") if best.get(field)
+        ]
+        best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
+    else:
+        fetch_trace["status"] = "no_match"
+    return best
+
+
 async def resolve_catalog_match(
     title: str,
     author: str,
@@ -663,6 +778,25 @@ async def resolve_catalog_match(
                 match = await _call_provider(lookup_provider)
                 if match:
                     matches.append(match)
+
+        if not any(accepted(value) for value in matches) and (
+            rate_limited_providers is None or "apple_books" not in rate_limited_providers
+        ):
+            apple_match = await _apple_books_match(
+                title, author, client, media="ebook", trace=fetch_trace
+            )
+            _record_rate_limits()
+            if apple_match:
+                matches.append(apple_match)
+            if not accepted(apple_match) and (
+                rate_limited_providers is None or "apple_books" not in rate_limited_providers
+            ):
+                audio_match = await _apple_books_match(
+                    title, author, client, media="audiobook", trace=fetch_trace
+                )
+                _record_rate_limits()
+                if audio_match:
+                    matches.append(audio_match)
 
         if not matches:
             unavailable = any(
