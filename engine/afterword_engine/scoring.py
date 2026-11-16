@@ -291,6 +291,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
 
     ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
     from .collaborative import load_collab_index, score_collaborative_residual
+    from .config import settings
 
     collab_index = load_collab_index(settings.collab_index_path)
     collab_adjustments: dict[int, float] = {}
