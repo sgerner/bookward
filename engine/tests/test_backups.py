@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
@@ -9,11 +10,12 @@ from fastapi.testclient import TestClient
 from auth_helpers import authenticated_headers
 from cryptography.fernet import Fernet
 
-from afterword_engine import backups
+from afterword_engine import backups, profiles
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, private_setting, row, transaction
 from afterword_engine.main import app
 from afterword_engine.secrets import seal
+from afterword_engine.tenancy import current_profile_id
 
 
 @pytest.fixture()
@@ -267,6 +269,71 @@ def test_backup_scheduler_interval_and_retention(database, monkeypatch):
     assert len(backups.list_backups()) == 2
     monkeypatch.setattr(settings, "backup_interval_hours", 0)
     assert not backups.backup_is_due(datetime.now(timezone.utc) + timedelta(days=5))
+
+
+def test_upgrade_repairs_orphaned_quality_rows_and_backup_succeeds(database):
+    with sqlite3.connect(settings.db) as con:
+        con.execute("PRAGMA foreign_keys=OFF")
+        con.execute("DROP TRIGGER candidate_quality_after_delete")
+        con.execute("DELETE FROM schema_migrations WHERE version=26")
+        con.execute(
+            "INSERT INTO candidates(id,title,author,normalized_key) VALUES(?,?,?,?)",
+            (12345, "Retained candidate", "Author", "retained"),
+        )
+        con.execute("INSERT INTO candidate_quality(candidate_id) VALUES(12346)")
+        assert len(con.execute("PRAGMA foreign_key_check").fetchall()) == 1
+
+    initialize()
+    with sqlite3.connect(settings.db) as con:
+        assert con.execute("SELECT candidate_id FROM candidate_quality WHERE candidate_id=12345").fetchone() == (12345,)
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert backups.create_backup()["id"]
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute("PRAGMA foreign_keys=OFF")
+        con.execute("DELETE FROM candidates WHERE id=12345")
+        assert con.execute("SELECT candidate_id FROM candidate_quality WHERE candidate_id=12345").fetchone() is None
+
+
+def test_scheduler_delays_only_failed_backups(monkeypatch):
+    now = 0
+    registry_attempts = []
+    profile_attempts = []
+
+    def create_auth_backup():
+        registry_attempts.append(now)
+        raise backups.BackupError("test failure")
+
+    def create_backup():
+        profile_id = current_profile_id()
+        profile_attempts.append((profile_id, now))
+        if profile_id == "legacy":
+            raise backups.BackupError("test failure")
+
+    async def run_scheduler():
+        stop = asyncio.Event()
+
+        async def wait_for(wait, timeout):
+            nonlocal now
+            wait.close()
+            now += timeout
+            if now > 3665:
+                stop.set()
+            raise TimeoutError
+
+        monkeypatch.setattr(backups.asyncio, "wait_for", wait_for)
+        await backups.backup_scheduler_loop(stop)
+
+    monkeypatch.setattr(backups, "monotonic", lambda: now)
+    monkeypatch.setattr(backups, "auth_backup_is_due", lambda: True)
+    monkeypatch.setattr(backups, "backup_is_due", lambda: current_profile_id() == "legacy" or now == 65)
+    monkeypatch.setattr(backups, "create_auth_backup", create_auth_backup)
+    monkeypatch.setattr(backups, "create_backup", create_backup)
+    monkeypatch.setattr(profiles, "profile_ids", lambda: ["legacy", "other"])
+    asyncio.run(run_scheduler())
+
+    assert registry_attempts == [5, 3605]
+    assert profile_attempts == [("legacy", 5), ("other", 65), ("legacy", 3605)]
 
 
 def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(database):
