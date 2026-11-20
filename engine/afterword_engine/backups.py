@@ -11,6 +11,7 @@ import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
@@ -24,6 +25,7 @@ BACKUP_ID = re.compile(r"^bookward-(\d{8}T\d{6}Z)-([0-9a-f]{8})$")
 AUTH_BACKUP_ID = re.compile(r"^bookward-auth-(\d{8}T\d{6}Z)-([0-9a-f]{8})$")
 BACKUP_INTERVAL_MAX_HOURS = 24 * 30
 BACKUP_RETENTION_MAX = 100
+BACKUP_FAILURE_RETRY_SECONDS = 3600
 LAST_ERROR_KEY = "backup_last_error"
 RESTORE_JOURNAL_NAME = ".bookward-restore-in-progress.json"
 AUTH_BACKUP_ERROR_KEY = "auth_backup_last_error"
@@ -975,8 +977,10 @@ def restore_backup(backup_id: str) -> dict:
 
 
 async def backup_scheduler_loop(stop: asyncio.Event) -> None:
-    """Create hourly-polled backups without depending on host cron."""
+    """Check for due backups every minute and retry failures after an hour."""
 
+    auth_retry_at = 0.0
+    profile_retry_at: dict[str, float] = {}
     try:
         await asyncio.wait_for(stop.wait(), timeout=5)
     except TimeoutError:
@@ -985,16 +989,21 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         from .profiles import profile_ids
         from .tenancy import profile_scope
         try:
-            if auth_backup_is_due():
+            if monotonic() >= auth_retry_at and auth_backup_is_due():
                 await asyncio.to_thread(create_auth_backup)
         except Exception:
+            auth_retry_at = monotonic() + BACKUP_FAILURE_RETRY_SECONDS
             LOGGER.exception("Scheduled identity-registry backup failed")
         for profile_id in profile_ids():
+            if monotonic() < profile_retry_at.get(profile_id, 0):
+                continue
+            profile_retry_at.pop(profile_id, None)
             try:
                 with profile_scope(profile_id):
                     if backup_is_due():
                         await asyncio.to_thread(create_backup)
             except Exception:
+                profile_retry_at[profile_id] = monotonic() + BACKUP_FAILURE_RETRY_SECONDS
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:
             await asyncio.wait_for(stop.wait(), timeout=60)

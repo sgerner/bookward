@@ -402,7 +402,8 @@ MIGRATIONS = [
             work_id,isbn13,isbn10,title_match,author_match,audit_version,audited_at,
             created_at,updated_at,metadata_checked_at,metadata_provider,
             metadata_provider_id,0.5
-        FROM candidate_quality_before_metadata_confidence;
+        FROM candidate_quality_before_metadata_confidence AS quality
+        WHERE EXISTS (SELECT 1 FROM candidates WHERE id=quality.candidate_id);
         DROP TABLE candidate_quality_before_metadata_confidence;
         CREATE INDEX idx_candidate_quality_status
             ON candidate_quality(quality_status, quality_score DESC);
@@ -983,6 +984,21 @@ MIGRATIONS = [
         DROP INDEX IF EXISTS idx_reads_recent;
         CREATE INDEX idx_reads_recent
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
+        """,
+    ),
+    (
+        26,
+        """
+        DELETE FROM candidate_quality
+        WHERE NOT EXISTS (
+            SELECT 1 FROM candidates WHERE id=candidate_quality.candidate_id
+        );
+        -- Keep the derived row in sync for maintenance connections with foreign keys off.
+        CREATE TRIGGER IF NOT EXISTS candidate_quality_after_delete
+        AFTER DELETE ON candidates
+        BEGIN
+            DELETE FROM candidate_quality WHERE candidate_id=OLD.id;
+        END;
         """,
     ),
 ]
