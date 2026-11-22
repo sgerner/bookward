@@ -98,8 +98,7 @@ jobs:
           sbom: true
           tags: ${{ steps.web-metadata.outputs.tags }}
           labels: ${{ steps.web-metadata.outputs.labels }}
-          cache-from: type=gha,scope=publish-bookward
-          cache-to: type=gha,mode=max,scope=publish-bookward
+          cache-from: type=gha,scope=bookward
 
       - name: Publish engine image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -109,5 +108,4 @@ jobs:
           sbom: true
           tags: ${{ steps.engine-metadata.outputs.tags }}
           labels: ${{ steps.engine-metadata.outputs.labels }}
-          cache-from: type=gha,scope=publish-bookward-engine
-          cache-to: type=gha,mode=max,scope=publish-bookward-engine
+          cache-from: type=gha,scope=bookward-engine
