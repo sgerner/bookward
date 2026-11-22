@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -22,9 +22,12 @@ from .config import settings
 from .database import connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
+    RecoveryHoldError,
     backup_scheduler_loop,
     backup_status,
     create_backup,
+    dismiss_auth_recovery_hold,
+    dismiss_recovery_hold,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
@@ -1100,6 +1103,14 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
     return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
 
 
+class BackupCreateIn(BaseModel):
+    confirm_clear_hold: bool = False
+
+
+class RecoveryHoldDismissIn(BaseModel):
+    confirm: bool = False
+
+
 @app.get("/api/backups")
 def get_backup_status():
     return backup_status()
@@ -1111,13 +1122,46 @@ def get_identity_backup_status(request: Request):
     return identity_backup_status()
 
 
-@app.post("/api/backups/create")
-def make_backup():
+@app.post("/admin/auth-backups/recovery-hold/dismiss")
+def dismiss_identity_backup_hold(payload: RecoveryHoldDismissIn, request: Request):
+    _require_admin(request)
+    if not payload.confirm:
+        raise HTTPException(
+            400,
+            "Confirm keeping the current account registry before resuming scheduled backups.",
+        )
     try:
-        created = create_backup()
+        status = dismiss_auth_recovery_hold(confirm=True)
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"dismissed": True, "status": status}
+
+
+@app.post("/api/backups/create")
+def make_backup(payload: BackupCreateIn | None = Body(default=None)):
+    try:
+        created = create_backup(
+            confirm_clear_hold=bool(payload and payload.confirm_clear_hold)
+        )
+    except RecoveryHoldError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except BackupError as exc:
         raise HTTPException(500, str(exc)) from exc
     return {"backup": created, "status": backup_status()}
+
+
+@app.post("/api/backups/recovery-hold/dismiss")
+def dismiss_database_backup_hold(payload: RecoveryHoldDismissIn):
+    if not payload.confirm:
+        raise HTTPException(
+            400,
+            "Confirm keeping the current database before resuming scheduled backups.",
+        )
+    try:
+        status = dismiss_recovery_hold(confirm=True)
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"dismissed": True, "status": status}
 
 
 @app.post("/api/backups/{backup_id}/restore")

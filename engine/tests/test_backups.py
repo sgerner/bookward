@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
@@ -9,11 +10,12 @@ from fastapi.testclient import TestClient
 from auth_helpers import authenticated_headers
 from cryptography.fernet import Fernet
 
-from afterword_engine import backups
+from afterword_engine import backups, profiles
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, private_setting, row, transaction
-from afterword_engine.main import app
-from afterword_engine.secrets import seal
+from afterword_engine.main import app, lifespan
+from afterword_engine.secrets import installation_key_path, seal
+from afterword_engine.tenancy import profile_database_path, profile_scope
 
 
 @pytest.fixture()
@@ -299,3 +301,374 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
     assert restored.json()["restored_backup"] == backup["id"]
     assert row("SELECT 1 FROM reads WHERE title='API recovery'") is not None
     assert private_setting("api_recovery_secret") == "api secret"
+
+
+def _backdate_profile_snapshot(backup_id: str, target_time: datetime) -> str:
+    stamp = target_time.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = backup_id.rsplit("-", 1)[-1]
+    aged_id = f"bookward-{stamp}-{suffix}"
+    directory = backups.backup_directory()
+    old_db = directory / f"{backup_id}.sqlite3"
+    new_db = directory / f"{aged_id}.sqlite3"
+    old_db.rename(new_db)
+    old_key = directory / f"{backup_id}.secret.key"
+    if old_key.exists():
+        old_key.rename(directory / f"{aged_id}.secret.key")
+    return aged_id
+
+
+def _backdate_auth_snapshot(backup_id: str, target_time: datetime) -> str:
+    stamp = target_time.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = backup_id.rsplit("-", 1)[-1]
+    aged_id = f"bookward-auth-{stamp}-{suffix}"
+    directory = backups.auth_backup_directory()
+    (directory / f"{backup_id}.sqlite3").rename(directory / f"{aged_id}.sqlite3")
+    return aged_id
+
+
+def _wipe_live_data_volume(data_root: Path) -> None:
+    for item in list(data_root.iterdir()):
+        if item.name == "backups":
+            continue
+        if item.is_dir():
+            for nested in list(item.rglob("*")):
+                if nested.is_file() or nested.is_symlink():
+                    nested.unlink()
+            for nested in sorted(item.rglob("*"), reverse=True):
+                if nested.is_dir():
+                    nested.rmdir()
+            item.rmdir()
+        else:
+            item.unlink()
+
+
+@pytest.mark.parametrize("retention", [1, 7, 100])
+def test_fresh_volume_boot_with_25h_snapshots_pauses_scheduler_across_retention(
+    tmp_path: Path, monkeypatch, retention: int
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(settings, "backup_retention_count", retention)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    alice = profiles.create_account("alice", "alice-password-with-enough-length")
+
+    aged_at = datetime.now(timezone.utc) - timedelta(hours=25)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Owner real book", "Author", "test"),
+            )
+        legacy_snap = _backdate_profile_snapshot(
+            backups.create_backup()["id"], aged_at
+        )
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Alice real book", "Author", "test"),
+            )
+        alice_snap = _backdate_profile_snapshot(
+            backups.create_backup()["id"], aged_at
+        )
+
+    auth_snap = _backdate_auth_snapshot(backups.create_auth_backup()["id"], aged_at)
+
+    # Simulate starting on an empty /data mount before restoring auth.sqlite3.
+    _wipe_live_data_volume(tmp_path)
+
+    backups_root = (tmp_path / "backups").resolve()
+    real_connect = sqlite3.connect
+    opened_snapshots = []
+
+    def tracking_connect(database_arg, *args, **kwargs):
+        text = str(database_arg)
+        if str(backups_root) in text:
+            opened_snapshots.append(text)
+        return real_connect(database_arg, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    profiles.initialize_auth()
+    with profile_scope("legacy"):
+        initialize()
+    assert opened_snapshots == []
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+
+    assert backups.auth_recovery_hold_active() is True
+    assert backups.auth_backup_is_due() is False
+    with profile_scope("legacy"):
+        assert backups.recovery_hold_active() is True
+        assert backups.backup_is_due() is False
+        assert backups.backup_status()["next_backup_at"] is None
+        assert [item["id"] for item in backups.list_backups()] == [legacy_snap]
+
+    # Run backup_scheduler_loop through a live poll cycle and verify nothing is pruned.
+    real_wait_for = asyncio.wait_for
+
+    async def fast_scheduler_cycle():
+        stop = asyncio.Event()
+        waits = 0
+
+        async def quick_wait(coro, timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                coro.close()
+                raise TimeoutError
+            stop.set()
+            return await real_wait_for(coro, timeout=1)
+
+        monkeypatch.setattr(asyncio, "wait_for", quick_wait)
+        try:
+            await backups.backup_scheduler_loop(stop)
+        finally:
+            monkeypatch.setattr(asyncio, "wait_for", real_wait_for)
+
+    asyncio.run(fast_scheduler_cycle())
+
+    # Simulate repeated container restarts against the already-initialized /data volume.
+    profiles.initialize_auth()
+    with profile_scope("legacy"):
+        initialize()
+    assert backups.auth_backup_is_due() is False
+    with profile_scope("legacy"):
+        assert backups.backup_is_due() is False
+        assert [item["id"] for item in backups.list_backups()] == [legacy_snap]
+    with profile_scope(alice["profile_id"]):
+        assert [item["id"] for item in backups.list_backups()] == [alice_snap]
+    assert [
+        item["id"] for item in backups.identity_backup_status()["backups"]
+    ] == [auth_snap]
+
+
+def test_multi_profile_recovery_hold_restore_and_dismissal_preserve_retention_one(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    alice = profiles.create_account("alice", "alice-password-with-enough-length")
+    bob = profiles.create_account("bob", "bob-password-with-enough-length")
+
+    aged_at = datetime.now(timezone.utc) - timedelta(hours=25)
+    older_at = datetime.now(timezone.utc) - timedelta(hours=50)
+
+    monkeypatch.setattr(settings, "backup_retention_count", 7)
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Alice older snapshot", "Author", "test"),
+            )
+        alice_older = _backdate_profile_snapshot(
+            backups.create_backup()["id"], older_at
+        )
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Alice newest snapshot", "Author", "test"),
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+                ("alice_secret", seal("alice-secret-value")),
+            )
+        alice_newest = _backdate_profile_snapshot(
+            backups.create_backup()["id"], aged_at
+        )
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Bob surviving snapshot", "Author", "test"),
+            )
+        bob_snap = _backdate_profile_snapshot(
+            backups.create_backup()["id"], aged_at
+        )
+
+    auth_snap = _backdate_auth_snapshot(backups.create_auth_backup()["id"], aged_at)
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+
+    # Lose /data completely, restore auth registry offline, then boot profiles.
+    _wipe_live_data_volume(tmp_path)
+    auth_restore = backups.restore_auth_backup(auth_snap)
+    assert auth_restore["restored"] is True
+    assert backups.auth_recovery_hold_active() is False
+    assert (backups.auth_backup_directory() / f"{auth_snap}.sqlite3").is_file()
+    # Offline restore on empty /data must not let the 5s startup poll immediately prune auth_snap.
+    assert backups.auth_backup_is_due() is False
+    assert backups.auth_backup_is_due(
+        datetime.now(timezone.utc) + timedelta(hours=24, seconds=1)
+    ) is True
+
+    profiles.initialize_auth()
+    carol = profiles.create_account("carol", "carol-password-with-enough-length")
+    for pid in profiles.profile_ids():
+        with profile_scope(pid):
+            initialize(seed_demo=pid == "legacy")
+
+    # Carol has no prior snapshots, so scheduled backups work immediately without a hold.
+    with profile_scope(carol["profile_id"]):
+        assert backups.recovery_hold_active() is False
+        assert backups.backup_is_due() is True
+
+    # Alice sees newest pre-disaster snapshot at backups[0]; restore clears hold and keeps snapshot under retention=1.
+    with profile_scope(alice["profile_id"]):
+        alice_status = backups.backup_status()
+        assert alice_status["recovery_hold"] is True
+        assert [item["id"] for item in alice_status["backups"]] == [
+            alice_newest,
+            alice_older,
+        ]
+        restored = backups.restore_backup(alice_newest)
+        assert restored["restored_backup"] == alice_newest
+        assert backups.recovery_hold_active() is False
+        retained_ids = {item["id"] for item in backups.list_backups()}
+        assert alice_newest in retained_ids
+        assert restored["safety_backup"]["id"] in retained_ids
+        assert (
+            backups.backup_directory() / f"{alice_newest}.secret.key"
+        ).is_file()
+        assert private_setting("alice_secret") == "alice-secret-value"
+        assert (
+            row("SELECT 1 FROM reads WHERE title='Alice newest snapshot'")
+            is not None
+        )
+        assert backups.backup_is_due(
+            datetime.now(timezone.utc) + timedelta(hours=24, seconds=1)
+        ) is True
+
+    # Bob's hold remains active until Bob explicitly confirms dismissal or manual backup.
+    with profile_scope(bob["profile_id"]):
+        assert backups.recovery_hold_active() is True
+        assert backups.backup_is_due() is False
+        with pytest.raises(backups.RecoveryHoldError):
+            backups.create_backup()
+        with pytest.raises(backups.RecoveryHoldError):
+            backups.dismiss_recovery_hold(confirm=False)
+        assert backups.backup_status()["last_error"] is None
+        assert [item["id"] for item in backups.list_backups()] == [bob_snap]
+
+        dismissed = backups.dismiss_recovery_hold(confirm=True)
+        assert dismissed["recovery_hold"] is False
+        assert backups.backup_is_due() is True
+
+
+def test_recovery_hold_api_exposes_safe_metadata_and_requires_confirmation(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+                ("api_hold_secret", seal("top-secret-token")),
+            )
+        aged = _backdate_profile_snapshot(
+            backups.create_backup()["id"],
+            datetime.now(timezone.utc) - timedelta(hours=25),
+        )
+    aged_auth = _backdate_auth_snapshot(
+        backups.create_auth_backup()["id"],
+        datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+
+    _wipe_live_data_volume(tmp_path)
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin("new-admin", "new-admin-password-long")
+    reader = profiles.create_account("new-reader", "new-reader-password-long")
+    with profile_scope("legacy"):
+        initialize()
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+
+    admin_session, _ = profiles.create_session(admin["id"])
+    reader_session, _ = profiles.create_session(reader["id"])
+
+    client = TestClient(app)
+    admin_headers = {"x-bookward-session": admin_session}
+    reader_headers = {"x-bookward-session": reader_session}
+
+    profile_status = client.get("/api/backups", headers=admin_headers)
+    assert profile_status.status_code == 200
+    payload = profile_status.json()
+    assert payload["recovery_hold"] is True
+    assert payload["backups"][0]["id"] == aged
+    assert str(tmp_path) not in profile_status.text
+    assert "secret.key" not in profile_status.text
+    assert "top-secret-token" not in profile_status.text
+
+    blocked_create = client.post("/api/backups/create", json={}, headers=admin_headers)
+    assert blocked_create.status_code == 409
+    assert [item["id"] for item in backups.list_backups()] == [aged]
+
+    blocked_dismiss = client.post(
+        "/api/backups/recovery-hold/dismiss",
+        json={"confirm": False},
+        headers=admin_headers,
+    )
+    assert blocked_dismiss.status_code == 400
+
+    confirmed_create = client.post(
+        "/api/backups/create",
+        json={"confirm_clear_hold": True},
+        headers=admin_headers,
+    )
+    assert confirmed_create.status_code == 200
+    assert confirmed_create.json()["status"]["recovery_hold"] is False
+
+    auth_status = client.get("/admin/auth-backups", headers=admin_headers)
+    assert auth_status.status_code == 200
+    auth_payload = auth_status.json()
+    assert auth_payload["recovery_hold"] is True
+    assert auth_payload["backups"][0]["id"] == aged_auth
+    assert str(tmp_path) not in auth_status.text
+
+    assert (
+        client.post(
+            "/admin/auth-backups/recovery-hold/dismiss",
+            json={"confirm": True},
+            headers=reader_headers,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/admin/auth-backups/recovery-hold/dismiss",
+            json={"confirm": False},
+            headers=admin_headers,
+        ).status_code
+        == 400
+    )
+    dismissed_auth = client.post(
+        "/admin/auth-backups/recovery-hold/dismiss",
+        json={"confirm": True},
+        headers=admin_headers,
+    )
+    assert dismissed_auth.status_code == 200
+    assert dismissed_auth.json()["status"]["recovery_hold"] is False

@@ -25,15 +25,21 @@ AUTH_BACKUP_ID = re.compile(r"^bookward-auth-(\d{8}T\d{6}Z)-([0-9a-f]{8})$")
 BACKUP_INTERVAL_MAX_HOURS = 24 * 30
 BACKUP_RETENTION_MAX = 100
 LAST_ERROR_KEY = "backup_last_error"
+RECOVERY_HOLD_KEY = "backup_recovery_hold"
 RESTORE_JOURNAL_NAME = ".bookward-restore-in-progress.json"
 AUTH_BACKUP_ERROR_KEY = "auth_backup_last_error"
 AUTH_BACKUP_ATTEMPT_KEY = "auth_backup_last_attempt_at"
 AUTH_BACKUP_SUCCESS_KEY = "auth_backup_last_success_at"
 AUTH_BACKUP_RESTORE_KEY = "auth_backup_last_restore_at"
+AUTH_BACKUP_HOLD_KEY = "auth_backup_recovery_hold"
 
 
 class BackupError(ValueError):
     """A backup or restore could not be completed safely."""
+
+
+class RecoveryHoldError(BackupError):
+    """Clearing or overriding an active recovery hold requires confirmation."""
 
 
 def backup_directory() -> Path:
@@ -83,6 +89,33 @@ def _id_time(backup_id: str) -> datetime | None:
         )
     except ValueError:
         return None
+
+
+def _auth_id_time(backup_id: str) -> datetime | None:
+    match = AUTH_BACKUP_ID.fullmatch(backup_id)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def has_auth_backups() -> bool:
+    directory = auth_backup_directory()
+    if not directory.is_dir():
+        return False
+    try:
+        for path in directory.iterdir():
+            if path.is_symlink() or path.suffix != ".sqlite3":
+                continue
+            if _auth_id_time(path.stem) and path.is_file():
+                return True
+    except OSError:
+        LOGGER.exception("Could not inspect the identity-registry backup directory")
+    return False
 
 
 def _backup_path(backup_id: str) -> Path:
@@ -196,27 +229,112 @@ def _set_last_error(message: str) -> None:
         LOGGER.exception("Could not persist backup status")
 
 
-def backup_status() -> dict:
-    backups = list_backups()
-    last_error = None
+def _recovery_hold_value() -> str | None:
+    path = profile_database_path()
+    if not path.is_file():
+        return None
     try:
         with connect() as con:
             found = con.execute(
-                "SELECT value FROM settings WHERE key=?", (LAST_ERROR_KEY,)
+                "SELECT value FROM settings WHERE key=?", (RECOVERY_HOLD_KEY,)
             ).fetchone()
-            last_error = found["value"] if found else None
+            value = (found["value"] or "").strip() if found else ""
+            return value or None
+    except sqlite3.Error:
+        return None
+
+
+def recovery_hold_active() -> bool:
+    return bool(_recovery_hold_value())
+
+
+def dismiss_recovery_hold(*, confirm: bool = False) -> dict:
+    if not confirm:
+        raise RecoveryHoldError(
+            "Confirm keeping the current database before resuming scheduled backups."
+        )
+    with database_lock(profile_database_path()):
+        with transaction() as con:
+            con.execute("DELETE FROM settings WHERE key=?", (RECOVERY_HOLD_KEY,))
+    return backup_status()
+
+
+def _auth_recovery_hold_value() -> str | None:
+    from .profiles import auth_path
+
+    registry = auth_path()
+    if not registry.is_file():
+        return None
+    con = None
+    try:
+        con = sqlite3.connect(
+            registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30
+        )
+        found = con.execute(
+            "SELECT value FROM auth_meta WHERE key=?", (AUTH_BACKUP_HOLD_KEY,)
+        ).fetchone()
+        value = (found[0] or "").strip() if found else ""
+        return value or None
+    except sqlite3.Error:
+        LOGGER.exception("Could not read identity-registry recovery hold status")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def auth_recovery_hold_active() -> bool:
+    return bool(_auth_recovery_hold_value())
+
+
+def dismiss_auth_recovery_hold(*, confirm: bool = False) -> dict:
+    if not confirm:
+        raise RecoveryHoldError(
+            "Confirm keeping the current account registry before resuming scheduled backups."
+        )
+    from .profiles import auth_path
+
+    path = auth_path()
+    if not path.is_file():
+        raise BackupError("The Bookward identity registry is not available.")
+    con = sqlite3.connect(path, timeout=30)
+    try:
+        con.execute("DELETE FROM auth_meta WHERE key=?", (AUTH_BACKUP_HOLD_KEY,))
+        con.commit()
+    finally:
+        con.close()
+    return identity_backup_status()
+
+
+def backup_status() -> dict:
+    backups = list_backups()
+    last_error = None
+    hold_value = None
+    try:
+        with connect() as con:
+            stored = dict(
+                con.execute(
+                    "SELECT key,value FROM settings WHERE key IN (?,?)",
+                    (LAST_ERROR_KEY, RECOVERY_HOLD_KEY),
+                ).fetchall()
+            )
+            last_error = stored.get(LAST_ERROR_KEY) or None
+            hold_value = (stored.get(RECOVERY_HOLD_KEY) or "").strip() or None
     except sqlite3.Error:
         last_error = "Backup status is temporarily unavailable."
+    hold_active = bool(hold_value)
     interval = backup_interval_hours()
     last_success = backups[0]["created_at"] if backups else None
     next_backup = None
-    if interval and last_success:
+    if interval and last_success and not hold_active:
         parsed = datetime.fromisoformat(last_success)
         next_backup = (parsed + timedelta(hours=interval)).isoformat()
     return {
         "enabled": interval > 0,
         "interval_hours": interval,
         "retention_count": backup_retention_count(),
+        "recovery_hold": hold_active,
+        "recovery_hold_at": hold_value,
         "last_success_at": last_success,
         "last_error": last_error,
         "next_backup_at": next_backup,
@@ -227,6 +345,8 @@ def backup_status() -> dict:
 def backup_is_due(now: datetime | None = None) -> bool:
     interval = backup_interval_hours()
     if interval <= 0:
+        return False
+    if recovery_hold_active():
         return False
     backups = list_backups()
     if not backups:
@@ -242,24 +362,48 @@ def auth_backup_is_due(now: datetime | None = None) -> bool:
     interval = backup_interval_hours()
     if interval <= 0:
         return False
+    if auth_recovery_hold_active():
+        return False
     directory = auth_backup_directory()
     if not directory.is_dir():
         return True
     snapshots = []
     for path in directory.iterdir():
-        if path.is_symlink() or not path.is_file() or not AUTH_BACKUP_ID.fullmatch(path.stem):
+        if path.is_symlink() or path.suffix != ".sqlite3" or not path.is_file():
             continue
-        match = AUTH_BACKUP_ID.fullmatch(path.stem)
-        try:
-            snapshots.append(datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc))
-        except ValueError:
-            continue
+        created = _auth_id_time(path.stem)
+        if created is not None:
+            snapshots.append(created)
     if not snapshots:
         return True
+    latest = max(snapshots)
+    from .profiles import auth_path
+
+    registry = auth_path()
+    if registry.is_file():
+        con = None
+        try:
+            con = sqlite3.connect(
+                registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30
+            )
+            restored = con.execute(
+                "SELECT value FROM auth_meta WHERE key=?",
+                (AUTH_BACKUP_RESTORE_KEY,),
+            ).fetchone()
+            if restored and restored[0]:
+                restored_at = datetime.fromisoformat(restored[0])
+                if restored_at.tzinfo is None:
+                    restored_at = restored_at.replace(tzinfo=timezone.utc)
+                latest = max(latest, restored_at.astimezone(timezone.utc))
+        except (sqlite3.Error, ValueError):
+            pass
+        finally:
+            if con is not None:
+                con.close()
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    return current.astimezone(timezone.utc) - max(snapshots) >= timedelta(hours=interval)
+    return current.astimezone(timezone.utc) - latest >= timedelta(hours=interval)
 
 
 def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=None, error=None) -> None:
@@ -310,12 +454,13 @@ def identity_backup_status() -> dict:
             try:
                 state = dict(
                     con.execute(
-                        "SELECT key,value FROM auth_meta WHERE key IN (?,?,?,?)",
+                        "SELECT key,value FROM auth_meta WHERE key IN (?,?,?,?,?)",
                         (
                             AUTH_BACKUP_ERROR_KEY,
                             AUTH_BACKUP_ATTEMPT_KEY,
                             AUTH_BACKUP_SUCCESS_KEY,
                             AUTH_BACKUP_RESTORE_KEY,
+                            AUTH_BACKUP_HOLD_KEY,
                         ),
                     ).fetchall()
                 )
@@ -349,10 +494,13 @@ def identity_backup_status() -> dict:
         if not state.get(AUTH_BACKUP_ERROR_KEY):
             state[AUTH_BACKUP_ERROR_KEY] = "Identity backup files are temporarily unavailable."
     backups.sort(key=lambda item: item["created_at"], reverse=True)
+    hold_value = (state.get(AUTH_BACKUP_HOLD_KEY) or "").strip() or None
     return {
         "enabled": backup_interval_hours() > 0,
         "interval_hours": backup_interval_hours(),
         "retention_count": backup_retention_count(),
+        "recovery_hold": bool(hold_value),
+        "recovery_hold_at": hold_value,
         "last_success_at": state.get(AUTH_BACKUP_SUCCESS_KEY)
         or (backups[0]["created_at"] if backups else None),
         "last_attempt_at": state.get(AUTH_BACKUP_ATTEMPT_KEY),
@@ -515,7 +663,10 @@ def restore_auth_backup(backup_id: str) -> dict:
             con.execute("UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)")
             con.execute("DELETE FROM auth_transactions")
             con.execute("DELETE FROM login_attempts")
-            con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
+            con.execute(
+                "DELETE FROM auth_meta WHERE key IN ('setup_token_hash', ?)",
+                (AUTH_BACKUP_HOLD_KEY,),
+            )
             con.commit()
             integrity = con.execute("PRAGMA integrity_check").fetchone()
             if not integrity or integrity[0] != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():
@@ -618,10 +769,14 @@ def _backup_record(path: Path) -> dict:
     }
 
 
-def _prune_backups() -> None:
+def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
     retained = list_backups()
     retained_ids = {item["id"] for item in retained[: backup_retention_count()]}
+    if preserve_ids:
+        retained_ids.update(preserve_ids)
     for old in retained[backup_retention_count() :]:
+        if old["id"] in retained_ids:
+            continue
         try:
             path = _backup_path(old["id"])
             path.unlink()
@@ -638,13 +793,30 @@ def _prune_backups() -> None:
                 LOGGER.warning("Could not remove an orphaned Bookward key recovery file")
 
 
-def create_backup() -> dict:
+def create_backup(*, confirm_clear_hold: bool = False) -> dict:
+    if recovery_hold_active() and not confirm_clear_hold:
+        raise RecoveryHoldError(
+            "Scheduled backups are paused to protect existing snapshots. Restore a backup or confirm keeping the current database first."
+        )
     try:
         with database_lock(profile_database_path()):
+            if recovery_hold_active() and not confirm_clear_hold:
+                raise RecoveryHoldError(
+                    "Scheduled backups are paused to protect existing snapshots. Restore a backup or confirm keeping the current database first."
+                )
             path = _create_snapshot_unlocked()
-            _set_last_error("")
+            with transaction() as con:
+                con.execute("DELETE FROM settings WHERE key=?", (RECOVERY_HOLD_KEY,))
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value='',secret=0,"
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (LAST_ERROR_KEY, ""),
+                )
             _prune_backups()
         return _backup_record(path)
+    except RecoveryHoldError:
+        raise
     except BackupError as exc:
         _set_last_error(f"Backup failed: {safe_error_message(exc, limit=240)}")
         raise
@@ -915,10 +1087,13 @@ def restore_backup(backup_id: str) -> dict:
             _replace_live_database(staged, selected_key)
             staged = None
             with transaction() as con:
-                con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
+                con.execute(
+                    "DELETE FROM settings WHERE key IN (?,?)",
+                    (LAST_ERROR_KEY, RECOVERY_HOLD_KEY),
+                )
             _clear_restore_journal()
             replaced = False
-            _prune_backups()
+            _prune_backups(preserve_ids={backup_id, safety_backup.stem})
         return {
             "restored_backup": backup_id,
             "safety_backup": _backup_record(safety_backup),

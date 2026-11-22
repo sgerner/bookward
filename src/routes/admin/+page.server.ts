@@ -6,6 +6,9 @@ type Account = { id: string; profile_id: string; username: string; display_name:
 type IdentityBackupStatus = {
 	enabled: boolean;
 	interval_hours: number;
+	retention_count?: number;
+	recovery_hold: boolean;
+	recovery_hold_at?: string | null;
 	last_success_at: string | null;
 	last_attempt_at: string | null;
 	last_error: string | null;
@@ -17,10 +20,13 @@ const failure = (error: unknown) => fail(error instanceof EngineError ? error.st
 export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) throw redirect(303, '/login');
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
-	const [result, identityBackup] = await Promise.all([
+	const [result, rawIdentityBackup] = await Promise.all([
 		engine<{ accounts: Account[] }>('/admin/accounts'),
 		engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
 	]);
+	const identityBackup = rawIdentityBackup
+		? { ...rawIdentityBackup, recovery_hold: Boolean(rawIdentityBackup.recovery_hold) }
+		: null;
 	return { accounts: result.accounts, current_user_id: locals.user.id, identityBackup };
 };
 
@@ -52,6 +58,22 @@ export const actions: Actions = {
 		try {
 			await engine(`/admin/accounts/${encodeURIComponent(account_id)}/password`, { method: 'POST', body: JSON.stringify({ password }) });
 			return { message: 'Password reset; previous sessions were signed out.' };
+		} catch (error) { return failure(error); }
+	},
+	dismissIdentityHold: async ({ request }) => {
+		const form = await request.formData();
+		if (String(form.get('confirm') || '').trim() !== 'KEEP') {
+			return fail(400, {
+				message: 'Confirm keeping the current account registry before resuming scheduled backups.',
+				error: true as const
+			});
+		}
+		try {
+			await engine('/admin/auth-backups/recovery-hold/dismiss', {
+				method: 'POST',
+				body: JSON.stringify({ confirm: true })
+			});
+			return { message: 'Account-registry recovery hold dismissed. Scheduled backups have resumed.' };
 		} catch (error) { return failure(error); }
 	}
 };

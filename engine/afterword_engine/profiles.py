@@ -151,7 +151,16 @@ def validate_credentials(username: str, password: str) -> tuple[str, str]:
 
 def initialize_auth() -> None:
     """Create the identity store and establish the existing-data profile."""
+    path = auth_path()
+    was_missing = not path.is_file() or path.stat().st_size == 0
     with auth_connect() as con:
+        existing_tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        is_new_store = was_missing or "auth_meta" not in existing_tables
         con.executescript(AUTH_SCHEMA)
         account_columns = {row[1] for row in con.execute("PRAGMA table_info(accounts)")}
         if "must_change_password" not in account_columns:
@@ -181,6 +190,14 @@ def initialize_auth() -> None:
         # Older releases stored a setup-token digest here. First-admin setup
         # is now an atomic first-visitor claim, so remove any obsolete digest.
         con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
+        if is_new_store:
+            from . import backups
+
+            if backups.has_auth_backups():
+                con.execute(
+                    "INSERT OR IGNORE INTO auth_meta(key,value) VALUES(?,?)",
+                    (backups.AUTH_BACKUP_HOLD_KEY, iso(utc_now())),
+                )
 
 
 def setup_required() -> bool:

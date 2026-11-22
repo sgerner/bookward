@@ -45,3 +45,7 @@ def database_path_override(path: str | Path):
         yield
     finally:
         _database_override.reset(token)
+
+
+def has_database_path_override() -> bool:
+    return _database_override.get() is not None

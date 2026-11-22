@@ -15,7 +15,7 @@ from .covers import (
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path
+from .tenancy import has_database_path_override, profile_database_path
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
 
@@ -1343,8 +1343,20 @@ def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
 
 def initialize(*, seed_demo: bool = True):
     db_path = profile_database_path()
+    was_missing = not has_database_path_override() and (
+        not db_path.is_file() or db_path.stat().st_size == 0
+    )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with connect() as con:
+        existing_tables = {
+            item[0]
+            for item in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        is_new_store = not has_database_path_override() and (
+            was_missing or "schema_migrations" not in existing_tables
+        )
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
         for version, script in MIGRATIONS:
@@ -1446,6 +1458,15 @@ def initialize(*, seed_demo: bool = True):
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
+        if is_new_store:
+            from . import backups
+
+            if backups.list_backups():
+                hold_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                con.execute(
+                    "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
+                    (backups.RECOVERY_HOLD_KEY, hold_at),
+                )
     _restrict_database_files()
 
 def normalize_key(title: str, author: str):
