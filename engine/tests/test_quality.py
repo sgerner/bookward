@@ -548,5 +548,365 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["quality_status"] == "accepted"
     assert quality["provider"] == "apple_books"
     assert quality["provider_id"] == "6758952748"
+    assert quality["work_id"] == "6758952748"
+    assert "catalog_primary_unavailable" in json.loads(quality["flags_json"])
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_audit_matches_apple_books_audiobooks_and_filters_container_genres(database):
+    sci_fi_id = add_candidate("The Ministry of Time (Unabridged)", "Kaliane Bradley")
+    generic_genre_id = add_candidate("Orbital", "Samantha Harvey")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, sci_fi_id, generic_genre_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    def apple_handler(request):
+        media = request.url.params.get("media")
+        term = request.url.params.get("term", "")
+        if media == "ebook":
+            return httpx.Response(200, json={"results": []})
+        if "Ministry of Time" in term:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "wrapperType": "audiobook",
+                            "collectionId": 1729854123,
+                            "collectionName": "The Ministry of Time (Unabridged)",
+                            "artistName": "Kaliane Bradley",
+                            "description": "A time-travel romance and thriller.",
+                            "primaryGenreName": "Sci-Fi & Fantasy",
+                            "releaseDate": "2024-05-07T07:00:00Z",
+                            "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music112/v4/aa/bb/cc/cover.jpg/100x100bb.jpg",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "wrapperType": "audiobook",
+                        "collectionId": 1700009999,
+                        "collectionName": "Orbital",
+                        "artistName": "Samantha Harvey",
+                        "description": "Six astronauts orbit Earth over twenty-four hours.",
+                        "genres": ["Audiobooks", "Books"],
+                        "primaryGenreName": "Audiobooks",
+                        "releaseDate": "2023-11-09T08:00:00Z",
+                    }
+                ]
+            },
+        )
+
+    respx.get(APPLE_BOOKS_SEARCH).mock(side_effect=apple_handler)
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 2
+
+    sci_fi_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (sci_fi_id,))
+    sci_fi_candidate = row("SELECT * FROM candidates WHERE id=?", (sci_fi_id,))
+    assert sci_fi_quality["quality_status"] == "accepted"
+    assert sci_fi_quality["provider"] == "apple_books"
+    assert sci_fi_quality["provider_id"] == "1729854123"
+    assert sci_fi_quality["work_id"] == "1729854123"
+    assert json.loads(sci_fi_quality["flags_json"]) == []
+    assert json.loads(sci_fi_candidate["genres"]) == ["Sci-Fi & Fantasy"]
+    assert "600x600bb" in sci_fi_candidate["cover_url"]
+
+    generic_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (generic_genre_id,))
+    generic_candidate = row("SELECT * FROM candidates WHERE id=?", (generic_genre_id,))
+    assert generic_quality["work_id"] == "1700009999"
+    assert json.loads(generic_candidate["genres"]) == []
+
+
+@respx.mock
+def test_audit_dedupes_cross_feed_duplicates_sharing_apple_books_work_id(database):
+    ebook_feed_id = add_candidate("Glass Peninsula", "Maren Solis")
+    audio_feed_id = add_candidate("Glass Peninsula: Special Audio Edition", "Maren Solis")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, ebook_feed_id, audio_feed_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+    respx.get(APPLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "collectionId": 1888777666,
+                        "collectionName": "Glass Peninsula: Special Audio Edition",
+                        "artistName": "Maren Solis",
+                        "description": "An island mystery.",
+                        "primaryGenreName": "Mystery & Thrillers",
+                        "releaseDate": "2026-06-01T07:00:00Z",
+                    },
+                    {
+                        "trackId": 1888777666,
+                        "trackName": "Glass Peninsula",
+                        "artistName": "Maren Solis",
+                        "description": "An island mystery with full synopsis.",
+                        "genres": ["Mysteries & Thrillers", "Books"],
+                        "releaseDate": "2026-06-01T07:00:00Z",
+                    },
+                ]
+            },
+        )
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 2
+    assert result["deduped"] >= 1
+    statuses = [
+        row("SELECT status FROM candidates WHERE id=?", (cid,))["status"]
+        for cid in (ebook_feed_id, audio_feed_id)
+    ]
+    assert statuses.count("new") == 1
+    assert statuses.count("rejected") == 1
+
+
+@respx.mock
+def test_audit_skips_apple_books_when_isbn_present_during_primary_outage(database):
+    candidate_id = add_candidate(
+        "Unverified ISBN Candidate",
+        "Cassandra Khaw",
+        isbn13="9780307474278",
+        isbn10="0307474275",
+    )
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, candidate_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 6758952748,
+                        "trackName": "Unverified ISBN Candidate",
+                        "artistName": "Cassandra Khaw",
+                    }
+                ]
+            },
+        )
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert result["quarantine"] == 1
+    assert len(apple_route.calls) == 0
+    assert quality["quality_status"] == "quarantine"
+    assert "catalog_provider_unavailable" in json.loads(quality["flags_json"])
+
+
+@respx.mock
+def test_audit_classifies_apple_books_429_and_503_as_retryable_outages(database):
+    first_429_id = add_candidate("Apple Rate Limited One", "Author One")
+    second_429_id = add_candidate("Apple Rate Limited Two", "Author Two")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, first_429_id, second_429_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["quarantine"] == 2
+    assert len(apple_route.calls) == 1
+    for cid in (first_429_id, second_429_id):
+        flags = json.loads(row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))["flags_json"])
+        assert "catalog_provider_unavailable" in flags
+        assert "catalog_provider_rate_limited" in flags
+        assert "catalog_unmatched" not in flags
+
+    service_503_id = add_candidate("Apple Unavailable Three", "Author Three")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, service_503_id),
+        )
+    apple_route.mock(return_value=httpx.Response(503))
+
+    result_503 = asyncio.run(audit_candidates(only_pending=True))
+    assert result_503["audited"] == 1
+    assert result_503["quarantine"] == 1
+    flags_503 = json.loads(
+        row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (service_503_id,))["flags_json"]
+    )
+    assert flags_503 == ["catalog_provider_unavailable"]
+
+    assert candidate_quality_audit_candidates(limit=50) == []
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (first_429_id, second_429_id, service_503_id),
+        )
+    due_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert {first_429_id, second_429_id, service_503_id} <= due_ids
+
+
+@respx.mock
+def test_apple_books_outage_fallback_backfills_primary_identifiers_after_recovery(database):
+    backfill_id = add_candidate("Recoverable Primary Work", "Clara Vance")
+    apple_only_id = add_candidate("Apple Exclusive Audiobook", "Devon Hart")
+    legacy_apple_id = add_candidate("Legacy Empty Work ID", "Elena Rostova")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, backfill_id, apple_only_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='555444333',work_id='',audit_version=?,audited_at='2026-10-01T00:00:00+00:00' "
+            "WHERE candidate_id=?",
+            (QUALITY_VERSION, legacy_apple_id),
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    gb_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
+
+    def apple_initial(request):
+        term = request.url.params.get("term", "")
+        media = request.url.params.get("media", "")
+        if "Recoverable Primary Work" in term and media == "ebook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 111222333,
+                            "trackName": "Recoverable Primary Work",
+                            "artistName": "Clara Vance",
+                            "description": "Apple fallback description.",
+                            "genres": ["Fiction", "Books"],
+                            "releaseDate": "2026-04-14T07:00:00Z",
+                        }
+                    ]
+                },
+            )
+        if "Apple Exclusive Audiobook" in term and media == "audiobook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "collectionId": 999888777,
+                            "collectionName": "Apple Exclusive Audiobook",
+                            "artistName": "Devon Hart",
+                            "primaryGenreName": "Mystery & Thrillers",
+                        }
+                    ]
+                },
+            )
+        if "Legacy Empty Work ID" in term and media == "ebook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 555444333,
+                            "trackName": "Legacy Empty Work ID",
+                            "artistName": "Elena Rostova",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    respx.get(APPLE_BOOKS_SEARCH).mock(side_effect=apple_initial)
+
+    first_run = asyncio.run(audit_candidates(only_pending=True))
+    assert first_run["accepted"] == 3
+    for cid in (backfill_id, apple_only_id):
+        q_row = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert q_row["provider"] == "apple_books"
+        assert "catalog_primary_unavailable" in json.loads(q_row["flags_json"])
+
+    # Not eligible before CATALOG_PROVIDER_RETRY_HOURS.
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+    # Advance past retry window and bring Open Library / Google Books back online.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (backfill_id, apple_only_id, legacy_apple_id),
+        )
+
+    def ol_recovered(request):
+        title = request.url.params.get("title", "")
+        if "Recoverable Primary Work" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL987654W",
+                            "title": "Recoverable Primary Work",
+                            "author_name": ["Clara Vance"],
+                            "isbn": ["0307474275"],
+                            "first_publish_year": 2026,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"docs": []})
+
+    ol_route.mock(side_effect=ol_recovered)
+    gb_route.mock(return_value=httpx.Response(200, json={"items": []}))
+
+    due_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert {backfill_id, apple_only_id} <= due_ids
+
+    recovery_run = asyncio.run(audit_candidates(only_pending=True))
+    assert recovery_run["accepted"] >= 2
+
+    recovered_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (backfill_id,))
+    assert recovered_q["provider"] == "openlibrary"
+    assert recovered_q["work_id"] == "/works/OL987654W"
+    assert recovered_q["isbn13"] == "9780307474278"
+    assert recovered_q["isbn10"] == "0307474275"
+    assert json.loads(recovered_q["flags_json"]) == []
+
+    apple_only_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (apple_only_id,))
+    assert apple_only_q["provider"] == "apple_books"
+    assert apple_only_q["work_id"] == "999888777"
+    assert json.loads(apple_only_q["flags_json"]) == []
+
+    legacy_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (legacy_apple_id,))
+    assert legacy_q["work_id"] == "555444333"
+
+    # Even if audited_at is aged again, cleared flags and populated work_id prevent repeat lookups.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (backfill_id, apple_only_id, legacy_apple_id),
+        )
+    assert candidate_quality_audit_candidates(limit=50) == []
+

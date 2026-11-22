@@ -172,6 +172,8 @@ def _work_match_keys(item) -> set[tuple[str, str, str]]:
         _row_value(item, "quality_work_id"),
         _row_value(item, "work_id"),
         _row_value(item, "openlibrary_work_id"),
+        _row_value(item, "quality_provider_id"),
+        _row_value(item, "provider_id"),
     )
     raw = next((str(value).strip() for value in values if value), "")
     source_url = str(_row_value(item, "source_url") or "").strip()

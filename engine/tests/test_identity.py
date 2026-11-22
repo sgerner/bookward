@@ -11,6 +11,7 @@ from afterword_engine.identity import (
     book_identity,
     book_identity_match_index,
     book_identity_matches,
+    book_openlibrary_work_id,
     ReadIdentityIndex,
     book_row_identity_match_keys,
 )
@@ -141,6 +142,52 @@ def test_identity_index_matches_isbn_editions_and_provider_scoped_work_ids():
             "work_id": "OL123456W",
         }
     ) & read_keys
+
+    apple_keys = book_identity_match_index(
+        [
+            {
+                "title": "A Quiet Harbor",
+                "author": "Nora Bell",
+                "quality_work_id": "",
+                "quality_provider": "apple_books",
+                "quality_provider_id": "1729854123",
+            }
+        ]
+    )
+    assert book_row_identity_match_keys(
+        {
+            "title": "A Quiet Harbor: Collector's Edition",
+            "author": "Nora Bell",
+            "work_id": "",
+            "provider": "apple_books",
+            "provider_id": "1729854123",
+        }
+    ) & apple_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "Different Book",
+            "author": "Someone Else",
+            "quality_work_id": "1729854123",
+            "quality_provider": "google_books",
+        }
+    ) & apple_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "Different Book",
+            "author": "Someone Else",
+            "provider_id": "1729854123",
+        }
+    ) & apple_keys
+    assert (
+        book_openlibrary_work_id(
+            {
+                "quality_work_id": "1729854123",
+                "quality_provider": "apple_books",
+                "quality_provider_id": "1729854123",
+            }
+        )
+        == ""
+    )
 
 
 def test_recommendation_and_digest_hide_unrated_reads_but_keep_saved(database):
@@ -549,3 +596,60 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
         status = con.execute("SELECT status FROM candidates WHERE id=?", (alias_cid,)).fetchone()["status"]
     assert deduped >= 1
     assert status == "rejected"
+
+
+def test_serving_and_dedupe_match_apple_books_provider_id_when_work_id_empty(database):
+    from afterword_engine.quality import _dedupe_and_hide
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+
+    saved_id = add_candidate("Harbor Lights", "Nora Bell", status="saved", score=80)
+    shortlisted_dup_id = add_candidate(
+        "Harbor Lights: Special Audio Edition",
+        "Nora Bell",
+        status="recommended",
+        score=98,
+    )
+    high_id = add_candidate("Winter Orchard", "Maren Solis", status="recommended", score=95)
+    low_id = add_candidate(
+        "Winter Orchard: Book Club Edition",
+        "Maren Solis",
+        status="recommended",
+        score=88,
+    )
+
+    with transaction() as con:
+        for cid, pid in (
+            (saved_id, "777000111"),
+            (shortlisted_dup_id, "777000111"),
+            (high_id, "888000222"),
+            (low_id, "888000222"),
+        ):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.9,"
+                "provider='apple_books',provider_id=?,work_id='' WHERE candidate_id=?",
+                (pid, cid),
+            )
+
+    visible_ids = [item["id"] for item in recommendation_list(status="recommended", limit=None)]
+    assert visible_ids == [high_id]
+
+    digest_ids = [
+        item["id"]
+        for item in _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    ]
+    assert digest_ids == [high_id]
+
+    with transaction() as con:
+        deduped = _dedupe_and_hide(con)
+        statuses = {
+            cid: con.execute("SELECT status FROM candidates WHERE id=?", (cid,)).fetchone()["status"]
+            for cid in (saved_id, shortlisted_dup_id, high_id, low_id)
+        }
+    assert deduped == 2
+    assert statuses[saved_id] == "saved"
+    assert statuses[shortlisted_dup_id] == "rejected"
+    assert statuses[high_id] == "recommended"
+    assert statuses[low_id] == "rejected"
+
