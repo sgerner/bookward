@@ -43,6 +43,7 @@ from afterword_engine.associations import (  # noqa: E402
 )
 from afterword_engine.embeddings import content_hash  # noqa: E402
 from afterword_engine.identity import (  # noqa: E402
+    book_author_identity_key,
     book_identity,
     book_identity_matches,
     book_openlibrary_work_id,
@@ -579,11 +580,12 @@ def choose_seed_reads(
     selected: list[dict[str, Any]] = []
     seen_authors: Counter[str] = Counter()
     for _day, item in ordered:
-        author = book_identity("", item.get("author"))
-        if seen_authors[author] >= 2:
+        author = book_author_identity_key(item.get("author"))
+        if author and seen_authors[author] >= 2:
             continue
         selected.append(item)
-        seen_authors[author] += 1
+        if author:
+            seen_authors[author] += 1
         if len(selected) >= limit:
             break
     return selected
@@ -973,7 +975,7 @@ def _target_match_map(
 
 
 def _first_author_key(author: object) -> str:
-    return book_identity("", author)
+    return book_author_identity_key(author)
 
 
 def _publication_guard(work: Work, cutoff_day: date) -> str:

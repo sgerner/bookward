@@ -52,7 +52,7 @@ from afterword_engine.scoring import document
 from afterword_engine.subjects import normalize_subjects
 from evaluate_next_five import development_folds as frozen_development_folds
 from evaluate_ordinal_interests import BASE_NAMES, history_components
-from evaluate_ranking import load_corpus, prepare, read_time
+from evaluate_ranking import load_corpus, ndcg_at_k, prepare, read_time, tail_metrics_at_k
 
 QWEN_MODEL = "qwen3-embedding:4b"
 QWEN_DIGEST = "df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907"
@@ -511,14 +511,11 @@ def metric_set(ratings: np.ndarray, scores: np.ndarray) -> dict[str, Any]:
         "balanced_auc": (high_auc + low_auc) / 2 if high_auc is not None and low_auc is not None else None,
     }
     for k in (8, 20):
-        indexes = np.argsort(-scores, kind="stable")[:min(k, len(scores))]
-        discounts = 1 / np.log2(np.arange(2, len(indexes) + 2))
-        high_gain = high[indexes].astype(np.float64)
-        ideal = np.sort(high.astype(np.float64))[::-1][:len(indexes)]
-        ideal_dcg = float(ideal @ discounts)
-        output[f"favorite_precision_at_{k}"] = float(high_gain.mean()) if len(indexes) else None
-        output[f"disliked_fraction_at_{k}"] = float(low[indexes].mean()) if len(indexes) else None
-        output[f"ndcg_at_{k}"] = float(high_gain @ discounts / ideal_dcg) if ideal_dcg else None
+        _, fav_precision = tail_metrics_at_k(scores, high, k=k, lowest=False)
+        _, disliked_fraction = tail_metrics_at_k(scores, low, k=k, lowest=False)
+        output[f"favorite_precision_at_{k}"] = fav_precision
+        output[f"disliked_fraction_at_{k}"] = disliked_fraction
+        output[f"ndcg_at_{k}"] = ndcg_at_k(scores, high.astype(np.float64), k=k)
     return output
 
 
