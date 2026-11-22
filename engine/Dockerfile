@@ -1,13 +1,23 @@
-FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
+FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS build
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY build-requirements.lock ./
+RUN pip install --no-cache-dir --no-deps --require-hashes -r build-requirements.lock
+COPY pyproject.toml ./
+COPY afterword_engine ./afterword_engine
+RUN pip wheel --no-cache-dir --no-deps --no-build-isolation --no-index --wheel-dir /wheels .
+
+FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 AFTERWORD_DB=/data/afterword.db
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml uv.lock requirements.lock ./
+COPY requirements.lock ./
 RUN pip install --no-cache-dir --no-deps --require-hashes -r requirements.lock
-COPY afterword_engine ./afterword_engine
-RUN pip install --no-cache-dir --no-deps .
+COPY --from=build /wheels /wheels
+RUN pip install --no-cache-dir --no-deps --no-index --find-links /wheels bookward-engine \
+    && rm -rf /wheels
 RUN useradd --create-home --uid 10001 afterword \
     && mkdir -p /data /backups \
     && chown -R afterword:afterword /app /data /backups
