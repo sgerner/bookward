@@ -539,3 +539,131 @@ def test_full_serving_replay_matches_two_request_contexts(database, status, limi
         ]
     finally:
         settings.exploration_enabled = previous_exploration
+
+
+def test_decision_evidence_snapshots_profile_work_years_and_replays_reissue_era_scores(database):
+    import hashlib
+    from afterword_engine.decision_evidence import PROFILE_FIELDS
+    from afterword_engine.database import persist_metadata_field_provenance
+
+    assert {
+        "first_publication_year",
+        "publication_work_id",
+        "release_date",
+        "date_kind",
+    }.issubset(PROFILE_FIELDS)
+
+    def _seed_work(con, candidate_id: int, work_id: str, year: int, reissue_date: str):
+        sha = hashlib.sha256(f"{year}-01-01".encode("utf-8")).hexdigest()
+        con.execute(
+            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+            "quality_status=excluded.quality_status,provider=excluded.provider,provider_id=excluded.provider_id,work_id=excluded.work_id",
+            (candidate_id, "accepted", 0.95, "openlibrary", work_id, work_id, "test"),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            candidate_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "openlibrary",
+                            "provider_id": work_id,
+                            "kind": "year",
+                            "source_field": "first_publish_year",
+                            "value_sha256": sha,
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [{
+                        "provider": "openlibrary",
+                        "provider_id": work_id,
+                        "payload": {
+                            "key": work_id,
+                            "publication_date": str(year),
+                            "publication_date_source_field": "first_publish_year",
+                        },
+                    }],
+                }
+            },
+            default_provider="openlibrary",
+            default_provider_id=work_id,
+            default_confidence=0.95,
+        )
+        con.execute(
+            "UPDATE candidates SET release_date=?,date_kind='day' WHERE id=?",
+            (reissue_date, candidate_id),
+        )
+
+    previous_exploration = settings.exploration_enabled
+    settings.exploration_enabled = False
+    try:
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+            ).fetchone()[0]
+            con.execute("UPDATE candidates SET status='rejected'")
+            con.execute("DELETE FROM recommendation_events")
+            con.execute("DELETE FROM feedback")
+
+            for idx in range(10):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?,60,'saved',?,?)",
+                    (f"Modern Save {idx}", f"Modern Writer {idx}", json.dumps([f"Modern genre {idx}"]), "2025-04-01", "day", source_id, f"ev-mod-{idx}"),
+                ).lastrowid
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) VALUES(?,?,?,?,?)",
+                    (f"ev-save-{idx}", cid, "save", "2026-09-20T12:00:00+00:00", "ui"),
+                )
+            for idx in range(10):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?,60,'rejected',?,?)",
+                    (f"Classic Reject {idx}", f"Classic Writer {idx}", json.dumps([f"Classic genre {idx}"]), "1934-01-01", "year", source_id, f"ev-cls-{idx}"),
+                ).lastrowid
+                _seed_work(con, cid, f"/works/OL1934{idx:02d}W", 1934, "2023-12-25")
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) VALUES(?,?,?,?,?)",
+                    (f"ev-rej-{idx}", cid, "reject", "2026-09-20T12:00:00+00:00", "ui"),
+                )
+
+            reissue_cid = con.execute(
+                "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,75,'recommended',?,?)",
+                ("Evidence Reissue 1934", "Classic Novelist", json.dumps([]), "1934-01-01", "year", source_id, "ev-reissue-1934"),
+            ).lastrowid
+            _seed_work(con, reissue_cid, "/works/OL471579W", 1934, "2023-12-25")
+
+        with connect() as con:
+            served, run_id = tracked_recommendations(status="recommended", connection=con)
+        with connect() as con:
+            record = load_decision_evidence(con, run_id)
+
+        decision = record["decision"]
+        classic_profile_rows = [
+            item for item in decision["interaction_profile"]
+            if item["event_type"] == "reject"
+        ]
+        assert len(classic_profile_rows) == 10
+        assert all(item["first_publication_year"] == 1934 for item in classic_profile_rows)
+        assert all(str(item["publication_work_id"]).startswith("/works/OL1934") for item in classic_profile_rows)
+        assert all(item["release_date"] == "2023-12-25" for item in classic_profile_rows)
+        assert all(item["date_kind"] == "day" for item in classic_profile_rows)
+
+        ranking_at = datetime.fromisoformat(decision["request_context"]["ranking_at"])
+        replayed, _ = personalize_recommendations(
+            decision["pools"]["base"],
+            decision["interaction_profile"],
+            now=ranking_at,
+        )
+        assert [item["score"] for item in replayed] == [
+            item["score"] for item in decision["pools"]["personalized"]
+        ]
+        assert replayed[0]["id"] == reissue_cid
+        assert replayed[0]["score"] == served[0]["score"] < 75.0
+    finally:
+        settings.exploration_enabled = previous_exploration

@@ -947,6 +947,110 @@ def test_genre_filter_enriches_untagged_items_and_never_replaces_real_cover(data
     assert candidate["cover_url"] == "https://images.example.com/real.jpg"
 
 
+def test_scan_source_preserves_verified_release_date_and_provenance_hash_on_rescan(database, monkeypatch):
+    import hashlib
+    from afterword_engine.database import connect, persist_metadata_field_provenance
+    from afterword_engine.publication_year_metadata import attach_publication_years
+
+    title = "Murder on the Orient Express"
+    author = "Agatha Christie"
+    work_id = "/works/OL471579W"
+    verified_date = "1934-01-01"
+    expected_sha = hashlib.sha256(verified_date.encode("utf-8")).hexdigest()
+
+    async def fake_fetch(_url):
+        return "application/json", [{
+            "title": title,
+            "author": author,
+            "release_date": "2023-12-25",
+            "date_kind": "day",
+            "genres": ["Mystery"],
+        }]
+
+    async def passthrough(items):
+        return items
+
+    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", passthrough)
+
+    normalized_key = ingestion.normalize_key(title, author)
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,filters) VALUES(?,?,?)",
+            ("Mystery feed", "https://example.com/mystery", "{}"),
+        ).lastrowid
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,release_date,date_kind,genres,source_id,status,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (title, author, verified_date, "year", json.dumps(["Mystery"]), source_id, "recommended", normalized_key),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+            "quality_status=excluded.quality_status,provider=excluded.provider,provider_id=excluded.provider_id,work_id=excluded.work_id",
+            (candidate_id, "accepted", 0.96, "openlibrary", work_id, work_id, "test"),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            candidate_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "openlibrary",
+                            "provider_id": work_id,
+                            "kind": "year",
+                            "source_field": "first_publish_year",
+                            "value_sha256": expected_sha,
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [{
+                        "provider": "openlibrary",
+                        "provider_id": work_id,
+                        "payload": {
+                            "key": work_id,
+                            "title": title,
+                            "authors": [author],
+                            "publication_date": "1934",
+                            "publication_date_source_field": "first_publish_year",
+                        },
+                    }],
+                }
+            },
+            default_provider="openlibrary",
+            default_provider_id=work_id,
+            default_confidence=0.96,
+        )
+
+    assert asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source_id,)))) == 1
+
+    stored = row(
+        "SELECT id,release_date,date_kind FROM candidates WHERE id=?",
+        (candidate_id,),
+    )
+    assert stored["release_date"] == "1934-01-01"
+    assert stored["date_kind"] == "year"
+
+    prov_rows = rows(
+        "SELECT provider,provider_id,source_payload FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+        (candidate_id,),
+    )
+    assert len(prov_rows) == 1
+    assert prov_rows[0]["provider"] == "openlibrary"
+    assert json.loads(prov_rows[0]["source_payload"])["field_provenance"]["value_sha256"] == expected_sha
+
+    mutable = [dict(stored)]
+    with connect() as con:
+        attach_publication_years(con, [], mutable)
+    assert mutable[0]["first_publication_year"] == 1934
+    assert mutable[0]["publication_work_id"] == work_id
+
+
 def test_migration_adds_enrichment_storage_without_changing_existing_user_data(tmp_path):
     settings.db = str(tmp_path / "legacy-v17.db")
     con = sqlite3.connect(settings.db)

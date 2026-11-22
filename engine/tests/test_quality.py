@@ -550,3 +550,127 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["provider_id"] == "6758952748"
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_audit_replaces_unverified_source_dates_with_verified_openlibrary_work_dates(database):
+    from afterword_engine.database import connect, persist_metadata_field_provenance
+    from afterword_engine.publication_year_metadata import attach_publication_years
+
+    source_kind_id = add_candidate("Classic Reissue One", "Agatha Christie")
+    feed_prov_id = add_candidate("Classic Reissue Two", "Dorothy L. Sayers")
+    manual_id = add_candidate("Manual Classic", "Margery Allingham")
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET release_date='2023-12-25',date_kind='source' WHERE id=?",
+            (source_kind_id,),
+        )
+        con.execute(
+            "UPDATE candidates SET release_date='2023-12-25',date_kind='day' WHERE id=?",
+            (feed_prov_id,),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            feed_prov_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "source",
+                            "provider_id": str(source_id),
+                            "kind": "source_item",
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [],
+                }
+            },
+            default_provider="source",
+            default_provider_id=str(source_id),
+        )
+        con.execute(
+            "UPDATE candidates SET release_date='1999-01-01',date_kind='manual' WHERE id=?",
+            (manual_id,),
+        )
+
+    def openlibrary_side_effect(request):
+        title = request.url.params.get("title", "")
+        if "One" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL471579W",
+                "title": "Classic Reissue One",
+                "author_name": ["Agatha Christie"],
+                "first_publish_year": 1934,
+                "description": "Original 1934 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        if "Two" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL193500W",
+                "title": "Classic Reissue Two",
+                "author_name": ["Dorothy L. Sayers"],
+                "first_publish_date": "1935-10-01",
+                "description": "Original 1935 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        return httpx.Response(200, json={"docs": [{
+            "key": "/works/OL193600W",
+            "title": "Manual Classic",
+            "author_name": ["Margery Allingham"],
+            "first_publish_year": 1936,
+            "description": "Original 1936 mystery novel.",
+            "subject": ["Mystery"],
+        }]})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=openlibrary_side_effect)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(200, json={"items": [{
+            "id": "reissue-vol",
+            "volumeInfo": {
+                "title": "Classic Reissue One",
+                "authors": ["Agatha Christie"],
+                "publishedDate": "2023-12-25",
+            },
+        }]})
+    )
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    asyncio.run(audit_candidates(only_pending=False))
+
+    cand_one = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (source_kind_id,))
+    cand_two = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (feed_prov_id,))
+    cand_manual = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (manual_id,))
+
+    assert cand_one["release_date"] == "1934-01-01"
+    assert cand_one["date_kind"] == "year"
+    assert cand_two["release_date"] == "1935-10-01"
+    assert cand_two["date_kind"] == "day"
+    assert cand_manual["release_date"] == "1999-01-01"
+    assert cand_manual["date_kind"] == "manual"
+
+    for cid, expected_work, expected_field in (
+        (source_kind_id, "/works/OL471579W", "first_publish_year"),
+        (feed_prov_id, "/works/OL193500W", "first_publish_date"),
+    ):
+        prov_rows = rows(
+            "SELECT provider,provider_id,source_payload FROM metadata_field_provenance "
+            "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+            (cid,),
+        )
+        assert len(prov_rows) == 1
+        assert prov_rows[0]["provider"] == "openlibrary"
+        assert prov_rows[0]["provider_id"] == expected_work
+        payload = json.loads(prov_rows[0]["source_payload"])
+        assert payload["field_provenance"]["source_field"] == expected_field
+
+    items = [dict(cand_one), dict(cand_two)]
+    with connect() as con:
+        attach_publication_years(con, [], items)
+    assert items[0]["first_publication_year"] == 1934
+    assert items[0]["publication_work_id"] == "/works/OL471579W"
+    assert items[1]["first_publication_year"] == 1935
+    assert items[1]["publication_work_id"] == "/works/OL193500W"

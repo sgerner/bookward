@@ -989,7 +989,11 @@ async def resolve_book_metadata(
     date_rank = {"day": 3, "month": 2, "year": 1}
     date_record = max(
         (record for record in records if record.get("release_date")),
-        key=lambda record: date_rank.get(str(record.get("date_kind") or ""), 0),
+        key=lambda record: (
+            record.get("provider") == "openlibrary"
+            and record.get("release_date_source_field") in {"first_publish_date", "first_publish_year"},
+            date_rank.get(str(record.get("date_kind") or ""), 0),
+        ),
         default=None,
     )
     if needs_release_date and date_record:

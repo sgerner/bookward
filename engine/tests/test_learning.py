@@ -953,3 +953,195 @@ def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
     assert row(
         "SELECT isbn,rating,source FROM reads WHERE title='Finished Work' AND author='A Reader'"
     ) == {"isbn": "9780593418574", "rating": None, "source": "manual"}
+
+
+def test_tracked_recommendations_attaches_live_work_years_reuses_connection_and_preserves_event_ids(
+    database, monkeypatch
+):
+    import hashlib
+    import httpx
+    from afterword_engine import main as main_module
+    from afterword_engine.database import connect, persist_metadata_field_provenance
+
+    def _seed_verified_work_year(con, candidate_id: int, work_id: str, year: int, release_date: str):
+        sha = hashlib.sha256(f"{year}-01-01".encode("utf-8")).hexdigest()
+        con.execute(
+            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+            "quality_status=excluded.quality_status,provider=excluded.provider,provider_id=excluded.provider_id,work_id=excluded.work_id",
+            (candidate_id, "accepted", 0.95, "openlibrary", work_id, work_id, "test"),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            candidate_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "openlibrary",
+                            "provider_id": work_id,
+                            "kind": "year",
+                            "source_field": "first_publish_year",
+                            "value_sha256": sha,
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [{
+                        "provider": "openlibrary",
+                        "provider_id": work_id,
+                        "payload": {
+                            "key": work_id,
+                            "publication_date": str(year),
+                            "publication_date_source_field": "first_publish_year",
+                        },
+                    }],
+                }
+            },
+            default_provider="openlibrary",
+            default_provider_id=work_id,
+            default_confidence=0.95,
+        )
+        if release_date != f"{year}-01-01":
+            con.execute(
+                "UPDATE candidates SET release_date=?,date_kind='day' WHERE id=?",
+                (release_date, candidate_id),
+            )
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM recommendation_events")
+        con.execute("DELETE FROM feedback")
+
+        tie_candidate_id = None
+        for idx in range(10):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,60,'saved',?,?)",
+                (
+                    f"Contemporary Save {idx}",
+                    f"Modern Author {idx}",
+                    json.dumps([f"Unique modern {idx}"]),
+                    "2025-05-01",
+                    "day",
+                    source_id,
+                    f"contemporary-save-{idx}",
+                ),
+            ).lastrowid
+            con.execute(
+                "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET quality_status='accepted',provider='google_books',work_id=''",
+                (cid, "accepted", 0.9, "google_books", f"gb-{idx}", "", "test"),
+            )
+            if idx == 0:
+                tie_candidate_id = cid
+                # Same timestamp: reject first, then save with higher event id.
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) "
+                    "VALUES(?,?,?,?,?)",
+                    (f"tie-reject-{idx}", cid, "reject", "2026-09-20T12:00:00+00:00", "ui"),
+                )
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) "
+                    "VALUES(?,?,?,?,?)",
+                    (f"tie-save-{idx}", cid, "save", "2026-09-20T12:00:00+00:00", "ui"),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) "
+                    "VALUES(?,?,?,?,?)",
+                    (f"save-{idx}", cid, "save", "2026-09-20T12:00:00+00:00", "ui"),
+                )
+
+        for idx in range(10):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,60,'rejected',?,?)",
+                (
+                    f"Classic Reject {idx}",
+                    f"Classic Author {idx}",
+                    json.dumps([f"Unique classic {idx}"]),
+                    "1932-01-01",
+                    "year",
+                    source_id,
+                    f"classic-reject-{idx}",
+                ),
+            ).lastrowid
+            _seed_verified_work_year(con, cid, f"/works/OL1932{idx:02d}W", 1932, "2023-12-25")
+            con.execute(
+                "INSERT INTO recommendation_events(event_key,candidate_id,event_type,occurred_at,source) "
+                "VALUES(?,?,?,?,?)",
+                (f"reject-{idx}", cid, "reject", "2026-09-20T12:00:00+00:00", "ui"),
+            )
+
+        reissue_cid = con.execute(
+            "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+            "VALUES(?,?,?,?,?,75,'recommended',?,?)",
+            (
+                "1934 Novel 2023 Reissue",
+                "Classic Novelist",
+                json.dumps([]),
+                "1934-01-01",
+                "year",
+                source_id,
+                "reissue-1934-novel",
+            ),
+        ).lastrowid
+        _seed_verified_work_year(con, reissue_cid, "/works/OL193400W", 1934, "2023-12-25")
+
+        modern_cid = con.execute(
+            "INSERT INTO candidates(title,author,genres,release_date,date_kind,score,status,source_id,normalized_key) "
+            "VALUES(?,?,?,?,?,75,'recommended',?,?)",
+            (
+                "2025 Debut Novel",
+                "Contemporary Novelist",
+                json.dumps([]),
+                "2025-08-15",
+                "day",
+                source_id,
+                "modern-2025-debut",
+            ),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET quality_status='accepted',provider='apple_books',work_id=''",
+            (modern_cid, "accepted", 0.92, "apple_books", "apple-2025", "", "test"),
+        )
+
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live serving must make zero network calls")),
+    )
+
+    with connect() as con:
+        loaded_events = load_interaction_events(con)
+        tie_events = [e for e in loaded_events if e["candidate_id"] == tie_candidate_id]
+        assert len(tie_events) == 2
+        assert tie_events[0]["id"] != tie_events[1]["id"]
+        assert tie_events[0]["id"] != tie_candidate_id or tie_events[1]["id"] != tie_candidate_id
+        classic_events = [e for e in loaded_events if str(e.get("quality_work_id") or "").startswith("/works/OL1932")]
+        assert len(classic_events) == 10
+        assert all(e["date_kind"] == "day" for e in classic_events)
+
+        def fail_extra_connect():
+            raise AssertionError("tracked_recommendations must reuse the supplied SQLite connection")
+
+        monkeypatch.setattr(main_module, "connect", fail_extra_connect)
+        served, _run_id = tracked_recommendations(status="recommended", connection=con)
+
+    by_id = {item["id"]: item for item in served}
+    assert [item["id"] for item in served] == [modern_cid, reissue_cid]
+    assert by_id[reissue_cid]["first_publication_year"] == 1934
+    assert by_id[reissue_cid]["publication_work_id"] == "/works/OL193400W"
+    assert by_id[reissue_cid]["score"] < 75.0
+    assert any("publication era" in text for text in by_id[reissue_cid]["explanation"])
+
+    assert by_id[modern_cid]["first_publication_year"] is None
+    assert by_id[modern_cid]["publication_work_id"] is None
+    assert by_id[modern_cid]["score"] > 75.0
+    assert any("publication era" in text for text in by_id[modern_cid]["explanation"])

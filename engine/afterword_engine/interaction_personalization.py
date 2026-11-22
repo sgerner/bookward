@@ -89,19 +89,24 @@ def load_interaction_events(
     """
     values: tuple[Any, ...] = (max(1, min(MAX_INTERACTION_EVENTS, int(limit))),)
     query = """
-        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,release_date,metadata
+        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,
+               release_date,date_kind,quality_work_id,metadata
         FROM (
             SELECT e.id,e.candidate_id,e.event_type,e.value,e.occurred_at,
-                   c.title,c.author,c.genres,c.description,c.release_date,e.metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,c.date_kind,
+                   q.work_id AS quality_work_id,e.metadata
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
+            LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE e.event_type IN ('save','reject','maybe_later','restore','read','librarr_import')
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
-                   c.title,c.author,c.genres,c.description,c.release_date,NULL AS metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,c.date_kind,
+                   q.work_id AS quality_work_id,NULL AS metadata
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
+            LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE f.action IN ('save','reject','maybe_later','restore')
               AND NOT EXISTS (
                   SELECT 1 FROM recommendation_events e

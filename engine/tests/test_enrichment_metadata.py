@@ -763,7 +763,16 @@ def test_openlibrary_release_date_provenance_tracks_actual_source_field(
         assert payload["publication_date_source_field"] == source_field
 
 
-def test_quality_release_date_ranking_preserves_openlibrary_year_precision():
+@pytest.mark.parametrize(
+    ("ol_doc_fields", "expected_date", "expected_kind", "expected_source_field"),
+    [
+        ({"first_publish_year": 2010}, "2010-01-01", "year", "first_publish_year"),
+        ({"first_publish_date": "1934-05"}, "1934-05-01", "month", "first_publish_date"),
+    ],
+)
+def test_quality_release_date_ranking_preserves_openlibrary_year_precision(
+    ol_doc_fields, expected_date, expected_kind, expected_source_field
+):
     requested_isbn = "9780307474278"
 
     def handler(request):
@@ -775,7 +784,7 @@ def test_quality_release_date_ranking_preserves_openlibrary_year_precision():
                     "title": "Precision Book",
                     "author_name": ["A Writer"],
                     "isbn": [requested_isbn],
-                    "first_publish_year": 2010,
+                    **ol_doc_fields,
                     "description": "Open Library synopsis.",
                     "subject": ["Fiction"],
                     "cover_i": 123,
@@ -797,26 +806,131 @@ def test_quality_release_date_ranking_preserves_openlibrary_year_precision():
                     },
                 }]},
             )
+        if request.url.host == "itunes.apple.com":
+            return httpx.Response(
+                200,
+                json={"results": [{
+                    "trackId": 999111,
+                    "trackName": "Precision Book",
+                    "artistName": "A Writer",
+                    "releaseDate": "2023-12-25T08:00:00Z",
+                    "description": "Apple Books synopsis.",
+                    "genres": ["Fiction"],
+                    "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Publication/test.jpg/100x100bb.jpg",
+                }]},
+            )
         raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
 
     async def run():
         async with _provider_client(handler) as client:
-            return await resolve_catalog_match(
+            quality_match = await resolve_catalog_match(
                 "Precision Book",
                 "A Writer",
                 client=client,
                 cache={},
                 isbn13=requested_isbn,
-                existing_fields_complete=True,
+                existing_fields_complete=False,
             )
+            cover_match = await resolve_book_metadata(
+                "Precision Book",
+                "A Writer",
+                isbn13=requested_isbn,
+                client=client,
+            )
+            return quality_match, cover_match
 
-    match = asyncio.run(run())
+    match, cover_match = asyncio.run(run())
 
     assert match is not None
-    assert match["release_date"] == "2005-06-07"
+    assert match["release_date"] == expected_date
+    assert match["release_date_kind"] == expected_kind
+    assert match["release_date_provider"] == "openlibrary"
+    assert match["release_date_source_field"] == expected_source_field
+    assert match["metadata_provenance"]["fields"]["release_date"]["provider"] == "openlibrary"
+    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == expected_source_field
+
+    assert cover_match["release_date"] == expected_date
+    assert cover_match["date_kind"] == expected_kind
+    assert cover_match["release_date_provider"] == "openlibrary"
+    assert cover_match["release_date_source_field"] == expected_source_field
+    assert cover_match["metadata_provenance"]["fields"]["release_date"]["provider"] == "openlibrary"
+    assert cover_match["metadata_provenance"]["fields"]["release_date"]["source_field"] == expected_source_field
+
+
+def test_edition_release_dates_still_rank_by_precision_when_openlibrary_lacks_work_date():
+    requested_isbn = "9780307474278"
+
+    def handler(request):
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": "/works/OLNODATEW",
+                    "title": "Edition Date Book",
+                    "author_name": ["A Writer"],
+                    "isbn": [requested_isbn],
+                    "description": "",
+                    "subject": ["Fiction"],
+                }]},
+            )
+        if request.url.host == "www.googleapis.com":
+            is_isbn_query = "isbn:" in request.url.query.decode()
+            return httpx.Response(
+                200,
+                json={"items": [{
+                    "id": "google-year-edition" if is_isbn_query else "google-day-edition",
+                    "volumeInfo": {
+                        "title": "Edition Date Book",
+                        "authors": ["A Writer"],
+                        "industryIdentifiers": [{"type": "ISBN_13", "identifier": requested_isbn}],
+                        "publishedDate": "2024" if is_isbn_query else "2024-09-17",
+                        "description": "" if is_isbn_query else "Google Books full synopsis.",
+                        "categories": ["Fiction"],
+                    },
+                }]},
+            )
+        if request.url.host == "itunes.apple.com":
+            return httpx.Response(
+                200,
+                json={"results": [{
+                    "trackId": 444555,
+                    "trackName": "Edition Date Book",
+                    "artistName": "A Writer",
+                    "releaseDate": "2024-09-17T08:00:00Z",
+                    "description": "Apple Books synopsis.",
+                    "genres": ["Fiction"],
+                    "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Publication/ed.jpg/100x100bb.jpg",
+                }]},
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    async def run():
+        async with _provider_client(handler) as client:
+            quality_match = await resolve_catalog_match(
+                "Edition Date Book",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+                existing_fields_complete=False,
+            )
+            cover_match = await resolve_book_metadata(
+                "Edition Date Book",
+                "A Writer",
+                isbn13=requested_isbn,
+                client=client,
+            )
+            return quality_match, cover_match
+
+    match, cover_match = asyncio.run(run())
+
+    assert match is not None
+    assert match["release_date"] == "2024-09-17"
     assert match["release_date_kind"] == "day"
     assert match["release_date_provider"] == "google_books"
-    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == "publishedDate"
+    assert cover_match["release_date"] == "2024-09-17"
+    assert cover_match["date_kind"] == "day"
+    assert cover_match["release_date_provider"] in {"google_books", "apple_books"}
 
 
 def test_isbn_search_rejects_returned_identifiers_that_contradict_query():
