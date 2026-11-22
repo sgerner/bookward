@@ -19,7 +19,6 @@
 	},
 	"dependencies": {
 		"@skeletonlabs/skeleton": "5.0.4",
-		"@skeletonlabs/skeleton-svelte": "5.0.4",
 		"@lucide/svelte": "1.72.0",
 		"zod": "4.6.7"
 	},
