@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import connect, database_lock, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -309,6 +309,22 @@ def queue_digest_if_due():
     return None
 
 
+def _poll_source_schedule_for_profile(
+    profile_id: str, check_enrichment_retries: bool
+) -> None:
+    with profile_scope(profile_id), database_lock().try_shared() as acquired:
+        if not acquired:
+            return
+        if (
+            source_sync_is_due()
+            and not active_job("sync")
+            and not active_job("sync_due")
+        ):
+            enqueue_job("sync_due", dedupe=True)
+        if check_enrichment_retries:
+            _queue_due_enrichment_retries()
+
+
 async def source_scheduler_loop(stop):
     """Queue a single sync when permanent sources become due.
 
@@ -327,17 +343,20 @@ async def source_scheduler_loop(stop):
         check_enrichment_retries = current_monotonic >= next_enrichment_retry_check
         if check_enrichment_retries:
             next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Source scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    if (
-                        source_sync_is_due()
-                        and not active_job("sync")
-                        and not active_job("sync_due")
-                    ):
-                        enqueue_job("sync_due", dedupe=True)
-                    if check_enrichment_retries:
-                        _queue_due_enrichment_retries()
+                await asyncio.to_thread(
+                    _poll_source_schedule_for_profile,
+                    profile_id,
+                    check_enrichment_retries,
+                )
             except Exception:
                 # A transient profile database error must not stop schedules
                 # for other profiles or terminate the scheduler.
@@ -348,6 +367,14 @@ async def source_scheduler_loop(stop):
             pass
 
 
+def _poll_digest_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id), database_lock().try_shared() as acquired:
+        if not acquired:
+            return
+        if digest_is_due(private_settings()) and not active_job("digest"):
+            enqueue_job("digest", dedupe=True)
+
+
 async def digest_scheduler_loop(stop):
     """Queue the configured weekly digest without relying on host cron."""
 
@@ -356,11 +383,16 @@ async def digest_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Digest scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    if digest_is_due(private_settings()) and not active_job("digest"):
-                        enqueue_job("digest", dedupe=True)
+                await asyncio.to_thread(_poll_digest_schedule_for_profile, profile_id)
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
         try:
@@ -419,6 +451,13 @@ def queue_goodreads_rss_if_due(current_time=None):
         return job_id
 
 
+def _poll_goodreads_rss_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id), database_lock().try_shared() as acquired:
+        if not acquired:
+            return
+        queue_goodreads_rss_if_due()
+
+
 async def goodreads_rss_scheduler_loop(stop):
     """Queue the configured Goodreads feed each night without host cron."""
 
@@ -427,10 +466,18 @@ async def goodreads_rss_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Goodreads RSS scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    queue_goodreads_rss_if_due()
+                await asyncio.to_thread(
+                    _poll_goodreads_rss_schedule_for_profile, profile_id
+                )
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
         try:
@@ -1092,7 +1139,7 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
     if not account:
         raise HTTPException(403, "This SSO identity is not linked to a Bookward account")
     try:
-        _ensure_profile_database(account["profile_id"])
+        await asyncio.to_thread(_ensure_profile_database, account["profile_id"])
     except Exception as exc:
         LOGGER.exception("Could not initialize OIDC profile %s", account["profile_id"])
         raise HTTPException(503, "Your Bookward profile is temporarily unavailable. Please try again.") from exc
@@ -1635,18 +1682,15 @@ def reading_history():
     return items
 
 
-@app.get("/api/reading-history/scores")
-async def reading_history_scores(
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=20),
-):
-    """Rank a bounded slice of read books against the current reading profile."""
+def _load_reading_history_score_inputs(offset: int, limit: int):
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
+        if not items:
+            return [], [], {}, []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -1664,6 +1708,25 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+    return items, existing_candidates, config, rated_reads
+
+
+@app.get("/api/reading-history/scores")
+async def reading_history_scores(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=20),
+):
+    """Rank a bounded slice of read books against the current reading profile."""
+    items, existing_candidates, config, rated_reads = await asyncio.to_thread(
+        _load_reading_history_score_inputs, offset, limit
+    )
     if not items:
         return []
     candidates_by_identity = {}
@@ -1694,15 +1757,12 @@ async def reading_history_scores(
 
     try:
         if virtual_candidates:
-            config = private_settings()
-            embedder = get_embedder(
+            embedder = await asyncio.to_thread(
+                get_embedder,
                 config.get("embedding_backend"),
                 config.get("embedding_model"),
                 config.get("embedding_url"),
                 config.get("embedding_api_key"),
-            )
-            rated_reads = rows(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
             )
             read_vectors = await cached_vectors(embedder, "read", rated_reads)
             candidate_vectors = await cached_vectors(
@@ -1711,7 +1771,8 @@ async def reading_history_scores(
                 virtual_candidates,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
-            ranked = rank_candidates(
+            ranked = await asyncio.to_thread(
+                rank_candidates,
                 rated_reads,
                 read_vectors,
                 virtual_candidates,
@@ -2219,21 +2280,56 @@ def telemetry_events(payload: TelemetryBatchIn):
 def post_telemetry_events(payload: TelemetryBatchIn):
     return telemetry_events(payload)
 
-@app.post("/api/recommendations/{candidate_id}/import")
-async def import_librarr(candidate_id: int):
+def _prepare_librarr_import(candidate_id: int):
     candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
-    if not candidate: raise HTTPException(404, "Recommendation not found")
+    if not candidate:
+        raise HTTPException(404, "Recommendation not found")
     key = hashlib.sha256(f"{candidate_id}:{candidate['normalized_key']}".encode()).hexdigest()
     existing = row("SELECT * FROM librarr_imports WHERE idempotency_key=? AND status='complete'", (key,))
-    if existing: return {"id":candidate_id,"status":"imported","remote_id":existing["remote_id"],"duplicate":True}
-    if candidate["status"] != "saved": raise HTTPException(409, "Shortlist this book before importing it")
+    if existing:
+        return None, key, None, {"id": candidate_id, "status": "imported", "remote_id": existing["remote_id"], "duplicate": True}
+    if candidate["status"] != "saved":
+        raise HTTPException(409, "Shortlist this book before importing it")
     config = private_settings()
-    if not config.get("librarr_url") or not config.get("librarr_api_key"): raise HTTPException(409, "Connect Librarr first")
+    if not config.get("librarr_url") or not config.get("librarr_api_key"):
+        raise HTTPException(409, "Connect Librarr first")
     with transaction() as con:
-        attempt = con.execute("SELECT status FROM librarr_imports WHERE idempotency_key=?",(key,)).fetchone()
-        if attempt and attempt["status"] == "pending": raise HTTPException(409,"This book is already being imported")
-        if attempt: con.execute("UPDATE librarr_imports SET status='pending',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(key,))
-        else: con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status) VALUES(?,?,'pending')",(candidate_id,key))
+        attempt = con.execute("SELECT status FROM librarr_imports WHERE idempotency_key=?", (key,)).fetchone()
+        if attempt and attempt["status"] == "pending":
+            raise HTTPException(409, "This book is already being imported")
+        if attempt:
+            con.execute("UPDATE librarr_imports SET status='pending',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?", (key,))
+        else:
+            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status) VALUES(?,?,'pending')", (candidate_id, key))
+    return candidate, key, config, None
+
+
+def _complete_librarr_import(candidate_id: int, key: str, remote_id: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) "
+            "ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP",
+            (candidate_id, key, remote_id),
+        )
+        con.execute("UPDATE candidates SET status='imported' WHERE id=?", (candidate_id,))
+
+
+def _fail_librarr_import(key: str, message: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",
+            (message, key),
+        )
+
+
+@app.post("/api/recommendations/{candidate_id}/import")
+async def import_librarr(candidate_id: int):
+    candidate, key, config, duplicate = await asyncio.to_thread(
+        _prepare_librarr_import, candidate_id
+    )
+    if duplicate is not None:
+        return duplicate
+    assert candidate is not None and config is not None
     try:
         allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
         validate_service_url(config["librarr_url"], allowed)
@@ -2243,13 +2339,12 @@ async def import_librarr(candidate_id: int):
             response.raise_for_status()
             try: data = response.json()
             except ValueError: data = {}
-        with transaction() as con:
-            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
-            con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
-        return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
+        remote_id = str(data.get("id", "imported"))
+        await asyncio.to_thread(_complete_librarr_import, candidate_id, key, remote_id)
+        return {"id":candidate_id,"status":"imported","remote_id":remote_id}
     except (httpx.HTTPError, ValueError) as exc:
         message = safe_error_message(exc, limit=1000)
-        with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(message,key))
+        await asyncio.to_thread(_fail_librarr_import, key, message)
         raise HTTPException(502, f"Librarr request failed: {message}")
 
 
@@ -2257,7 +2352,8 @@ async def import_librarr(candidate_id: int):
 async def search_librarr(q: str = Query(min_length=2, max_length=200), media_type: str = Query(default="audiobook")):
     try:
         media = normalize_media_type(media_type)
-        config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
+        private = await asyncio.to_thread(private_settings)
+        config = {**private, "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
@@ -2274,7 +2370,8 @@ async def stream_librarr_search(
     upstream: httpx.Response | None = None
     try:
         media = normalize_media_type(media_type)
-        config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
+        private = await asyncio.to_thread(private_settings)
+        config = {**private, "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
@@ -2310,48 +2407,62 @@ class LibrarrDownloadIn(BaseModel):
     candidate_id: int | None = Field(default=None, gt=0)
 
 
+def _prepare_librarr_download(candidate_id: int | None):
+    candidate = row("SELECT id,status FROM candidates WHERE id=?", (candidate_id,)) if candidate_id else None
+    if candidate_id and not candidate:
+        raise HTTPException(404, "Recommendation not found")
+    return candidate, private_settings()
+
+
+def _record_librarr_download_candidate(candidate: dict) -> str:
+    status = candidate["status"]
+    if status == "saved":
+        with transaction() as con:
+            con.execute(
+                "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (candidate["id"],),
+            )
+        return "imported"
+    if status != "imported":
+        with transaction() as con:
+            con.execute(
+                "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (candidate["id"],),
+            )
+            feedback_id = con.execute(
+                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                (candidate["id"], "save"),
+            ).lastrowid
+            record_event_in_connection(
+                con,
+                event_key=f"feedback:{feedback_id}",
+                candidate_id=int(candidate["id"]),
+                event_type="save",
+                source="librarr",
+                label=1.0,
+                label_kind="explicit_feedback",
+                confidence=0.9,
+            )
+        return "saved"
+    return status
+
+
 @app.post("/api/librarr/download")
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
-        candidate = row("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)) if payload.candidate_id else None
-        if payload.candidate_id and not candidate:
-            raise HTTPException(404, "Recommendation not found")
+        candidate, private = await asyncio.to_thread(
+            _prepare_librarr_download, payload.candidate_id
+        )
         encoded = json.dumps(payload.result, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{media}:{encoded}".encode()).hexdigest()
-        config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
+        config = {**private, "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         result = await librarr_download(config, payload.result, media, key)
         response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
         if candidate:
-            status = candidate["status"]
-            if status == "saved":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
-                    )
-                status = "imported"
-            elif status != "imported":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
-                    )
-                    feedback_id = con.execute(
-                        "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                        (candidate["id"], "save"),
-                    ).lastrowid
-                    record_event_in_connection(
-                        con,
-                        event_key=f"feedback:{feedback_id}",
-                        candidate_id=int(candidate["id"]),
-                        event_type="save",
-                        source="librarr",
-                        label=1.0,
-                        label_kind="explicit_feedback",
-                        confidence=0.9,
-                    )
-                status = "saved"
+            status = await asyncio.to_thread(
+                _record_librarr_download_candidate, candidate
+            )
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
     except ValueError as exc:
@@ -2359,16 +2470,29 @@ async def download_librarr(payload: LibrarrDownloadIn):
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
+def _import_goodreads_csv_and_queue(raw: bytes) -> dict:
+    count = import_goodreads_csv(raw)
+    enqueue_job("read_work_identities", dedupe=True)
+    return {"imported": count, "job_id": enqueue_job("score", dedupe=True)}
+
 @app.post("/api/import/goodreads/csv")
 async def goodreads_csv(file: UploadFile = File(...)):
     content = bytearray()
     while chunk := await file.read(1024 * 1024):
         content.extend(chunk)
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
-    try: count = import_goodreads_csv(bytes(content))
+    try: return await asyncio.to_thread(_import_goodreads_csv_and_queue, bytes(content))
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    enqueue_job("read_work_identities", dedupe=True)
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+
+
+def _record_goodreads_rss_settings_pairs(pairs: tuple[tuple[str, str], ...]) -> None:
+    with transaction() as con:
+        for key, value in pairs:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
 
 
 async def _sync_goodreads_rss(url: str):
@@ -2378,31 +2502,25 @@ async def _sync_goodreads_rss(url: str):
     except Exception as exc:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         message = safe_error_message(exc, limit=300)
-        with transaction() as con:
-            for key, value in (
+        await asyncio.to_thread(
+            _record_goodreads_rss_settings_pairs,
+            (
                 ("goodreads_rss_last_status", "failed"),
                 ("goodreads_rss_last_attempt_at", attempted_at),
                 ("goodreads_rss_last_error", message),
-            ):
-                con.execute(
-                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
-                    (key, value),
-                )
+            ),
+        )
         raise
     synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with transaction() as con:
-        for key, value in (
+    await asyncio.to_thread(
+        _record_goodreads_rss_settings_pairs,
+        (
             ("goodreads_rss_last_sync_at", synced_at),
             ("goodreads_rss_last_status", "succeeded"),
             ("goodreads_rss_last_attempt_at", synced_at),
             ("goodreads_rss_last_error", ""),
-        ):
-            con.execute(
-                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
-                (key, value),
-            )
+        ),
+    )
     return {"imported": count, "shelves": shelves, "synced_at": synced_at}
 
 
@@ -2427,7 +2545,8 @@ def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
 async def goodreads_rss(payload: UrlIn):
     try: result = await _sync_goodreads_rss(str(payload.url))
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(400,safe_error_message(exc))
-    return {**result, "job_id": enqueue_job("score", dedupe=True)}
+    job_id = await asyncio.to_thread(enqueue_job, "score", dedupe=True)
+    return {**result, "job_id": job_id}
 
 @app.post("/api/sources/preview")
 async def source_preview(payload: SourcePreviewIn):
@@ -2820,17 +2939,17 @@ def retry_digest_delivery(delivery_id: str):
 
 @app.post("/api/sync")
 async def sync():
-    return {"job_id":enqueue_job("sync", dedupe=True)}
+    return {"job_id": await asyncio.to_thread(enqueue_job, "sync", dedupe=True)}
 
 @app.post("/api/score")
 async def score():
-    return {"job_id":enqueue_job("score", dedupe=True)}
+    return {"job_id": await asyncio.to_thread(enqueue_job, "score", dedupe=True)}
 
 @app.post("/api/candidates/audit")
 async def candidate_audit():
     """Queue a full catalog identity and quality audit."""
 
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    return {"job_id": await asyncio.to_thread(enqueue_job, "candidate_quality", dedupe=True)}
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
@@ -2838,7 +2957,7 @@ def candidate_quality():
 
 @app.post("/api/embeddings/rebuild")
 async def rebuild_embeddings():
-    return {"job_id":enqueue_job("rebuild_embeddings", dedupe=True)}
+    return {"job_id": await asyncio.to_thread(enqueue_job, "rebuild_embeddings", dedupe=True)}
 
 @app.get("/api/jobs/{job_id}")
 def job(job_id:str):
@@ -2915,14 +3034,24 @@ def run_associations(provider: str):
     return {"job_id": enqueue_job(f"association:{normalized}")}
 
 
+def _load_google_books_preview_inputs():
+    with connect() as connection:
+        config = private_settings(connection)
+        read_rows = [
+            dict(item)
+            for item in connection.execute("SELECT * FROM reads ORDER BY id").fetchall()
+        ]
+    return config, read_rows
+
+
 @app.post("/api/associations/google_books/preview")
 async def preview_google_book_associations():
     """Return ephemeral Google associations without writing provider content."""
 
-    config = private_settings()
+    config, read_rows = await asyncio.to_thread(_load_google_books_preview_inputs)
     provider = GoogleBooksAssociatedProvider(config.get("association_google_books_api_key", ""))
     try:
-        associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
+        associations = await provider.collect(read_rows)
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
     return {
@@ -3078,11 +3207,23 @@ def delete_api_token(token_id: int):
 def revoke_api_token(token_id: int):
     return _revoke_api_token(token_id)
 
+def _persist_engine_settings(values: dict[str, Any]) -> None:
+    with transaction() as con:
+        for key, value in values.items():
+            secret = key.endswith("api_key")
+            stored = seal(value) if secret and value else value
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
+                (key, stored, 1 if secret else 0),
+            )
+
+
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
     try: payload.validate_values()
     except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings()
+    current = await asyncio.to_thread(private_settings)
     current_values = {
         "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
         "embedding_model": current.get("embedding_model", settings.embedding_model),
@@ -3119,11 +3260,7 @@ async def update_settings(payload: EngineSettings):
         values["embedding_model"] = test.model
     else:
         health = {"ok": True, "checked": False, "model": values["embedding_model"]}
-    with transaction() as con:
-        for key,value in values.items():
-            secret = key.endswith("api_key")
-            stored = seal(value) if secret and value else value
-            con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
+    await asyncio.to_thread(_persist_engine_settings, values)
     return {"saved":True,"embedding":health}
 
 

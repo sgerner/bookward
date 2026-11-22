@@ -299,3 +299,272 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
     assert restored.json()["restored_backup"] == backup["id"]
     assert row("SELECT 1 FROM reads WHERE title='API recovery'") is not None
     assert private_setting("api_recovery_secret") == "api secret"
+
+
+def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_profile_waits(
+    database, monkeypatch
+):
+    import asyncio
+    from threading import Event
+
+    import httpx
+
+    from afterword_engine import profiles
+    from afterword_engine.database import database_lock
+    from afterword_engine.jobs import worker_loop
+    from afterword_engine.tenancy import profile_database_path, profile_scope
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    if profiles.account_count() == 0:
+        profiles.create_first_admin("backup-owner", "backup-owner-password-long")
+    alice = profiles.create_account("backup-alice", "backup-alice-password-long")
+    bob = profiles.create_account("backup-bob", "backup-bob-password-long")
+    alice_session, _ = profiles.create_session(alice["id"])
+    bob_session, _ = profiles.create_session(bob["id"])
+    alice_headers = {"x-bookward-session": alice_session}
+    bob_headers = {"x-bookward-session": bob_session}
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                ("Alice snapshot book", "Ursula K. Le Guin", 5, "test"),
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+                ("alice_secret", seal("alice-key-material")),
+            )
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                ("Bob independent book", "Octavia E. Butler", 5, "test"),
+            )
+
+    alice_path = profile_database_path(alice["profile_id"])
+    original_snapshot = backups._create_snapshot_unlocked
+    original_copy_to_stage = backups._copy_to_stage
+    original_replace_live = backups._replace_live_database
+
+    pause_backup = False
+    backup_entered = Event()
+    release_backup = Event()
+
+    def controlled_snapshot():
+        if pause_backup and profile_database_path() == alice_path:
+            backup_entered.set()
+            assert release_backup.wait(timeout=5)
+        return original_snapshot()
+
+    pause_staging = False
+    staging_entered = Event()
+    release_staging = Event()
+
+    def controlled_copy_to_stage(source, directory):
+        staged = original_copy_to_stage(source, directory)
+        if pause_staging and directory == alice_path.parent:
+            staging_entered.set()
+            assert release_staging.wait(timeout=5)
+        return staged
+
+    pause_cutover = False
+    cutover_entered = Event()
+    release_cutover = Event()
+
+    def controlled_replace_live(staged, key_source=None):
+        if pause_cutover and profile_database_path() == alice_path:
+            cutover_entered.set()
+            assert release_cutover.wait(timeout=5)
+        return original_replace_live(staged, key_source)
+
+    monkeypatch.setattr(backups, "_create_snapshot_unlocked", controlled_snapshot)
+    monkeypatch.setattr(backups, "_copy_to_stage", controlled_copy_to_stage)
+    monkeypatch.setattr(backups, "_replace_live_database", controlled_replace_live)
+
+    async def run_integration():
+        nonlocal pause_backup, pause_staging, pause_cutover
+        stop = asyncio.Event()
+        worker = asyncio.create_task(worker_loop(lambda _kind: asyncio.sleep(0), stop))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            try:
+                # 1. Shared-read backup on Alice must not block health, Bob, or Alice reads.
+                pause_backup = True
+                create_task = asyncio.create_task(
+                    client.post("/api/backups/create", json={}, headers=alice_headers)
+                )
+                assert await asyncio.to_thread(backup_entered.wait, 3)
+                assert not database_lock(alice_path).is_locked()
+
+                health_res, bob_overview, alice_overview, alice_scores = (
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            client.get("/api/health"),
+                            client.get("/api/overview", headers=bob_headers),
+                            client.get("/api/overview", headers=alice_headers),
+                            client.get(
+                                "/api/reading-history/scores", headers=alice_headers
+                            ),
+                        ),
+                        timeout=2,
+                    )
+                )
+                assert health_res.status_code == 200
+                assert health_res.json() == {"ok": True}
+                assert bob_overview.status_code == 200
+                assert alice_overview.status_code == 200
+                assert alice_scores.status_code == 200
+                assert len(alice_scores.json()) == 1
+
+                pause_backup = False
+                release_backup.set()
+                created = await asyncio.wait_for(create_task, timeout=5)
+                assert created.status_code == 200
+                backup_id = created.json()["backup"]["id"]
+
+                with profile_scope(alice["profile_id"]), transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                        ("Transient post-backup book", "Temporary Author", 4, "test"),
+                    )
+
+                # 2. Restore staging on Alice runs before acquiring the live profile lock,
+                #    then cutover holds the exclusive lock only for safety snapshot + swap.
+                pause_staging = True
+                pause_cutover = True
+                restore_task = asyncio.create_task(
+                    client.post(
+                        f"/api/backups/{backup_id}/restore",
+                        json={},
+                        headers=alice_headers,
+                    )
+                )
+                assert await asyncio.to_thread(staging_entered.wait, 3)
+                assert not database_lock(alice_path).is_locked()
+
+                staged_health, staged_bob, staged_alice = await asyncio.wait_for(
+                    asyncio.gather(
+                        client.get("/api/health"),
+                        client.get("/api/overview", headers=bob_headers),
+                        client.get("/api/overview", headers=alice_headers),
+                    ),
+                    timeout=2,
+                )
+                assert staged_health.status_code == 200
+                assert staged_bob.status_code == 200
+                assert staged_alice.status_code == 200
+
+                pause_staging = False
+                release_staging.set()
+                assert await asyncio.to_thread(cutover_entered.wait, 5)
+                assert database_lock(alice_path).is_locked()
+
+                # Start contended same-profile requests while exclusive cutover lock is held.
+                contended_scores = asyncio.create_task(
+                    client.get("/api/reading-history/scores", headers=alice_headers)
+                )
+                contended_overview = asyncio.create_task(
+                    client.get("/api/overview", headers=alice_headers)
+                )
+                # Let worker_loop complete a 0.5s poll while Alice is exclusively locked.
+                await asyncio.sleep(0.6)
+                assert not contended_scores.done()
+                assert not contended_overview.done()
+
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                cutover_health, cutover_bob_overview, cutover_bob_scores = (
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            client.get("/api/health"),
+                            client.get("/api/overview", headers=bob_headers),
+                            client.get(
+                                "/api/reading-history/scores", headers=bob_headers
+                            ),
+                        ),
+                        timeout=2,
+                    )
+                )
+                elapsed = loop.time() - started
+                assert elapsed < 2.0
+                assert cutover_health.status_code == 200
+                assert cutover_bob_overview.status_code == 200
+                assert cutover_bob_scores.status_code == 200
+                assert {
+                    item["title"] for item in cutover_bob_overview.json()["history"]
+                } == {"Bob independent book"}
+
+                pause_cutover = False
+                release_cutover.set()
+                restored_res, scores_res, overview_res = await asyncio.wait_for(
+                    asyncio.gather(restore_task, contended_scores, contended_overview),
+                    timeout=5,
+                )
+                assert restored_res.status_code == 200
+                assert scores_res.status_code == 200
+                assert len(scores_res.json()) == 1
+                assert overview_res.status_code == 200
+                assert {
+                    item["title"] for item in overview_res.json()["history"]
+                } == {"Alice snapshot book"}
+            finally:
+                release_backup.set()
+                release_staging.set()
+                release_cutover.set()
+                stop.set()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run_integration())
+    with profile_scope(alice["profile_id"]):
+        assert private_setting("alice_secret") == "alice-key-material"
+
+
+def test_concurrent_backups_and_restores_serialize_per_profile(database, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+            ("Serialized state", "Author", 5, "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("serialized_secret", seal("keep-sidecar-aligned")),
+        )
+    baseline = backups.create_backup()
+
+    monkeypatch.setattr(settings, "backup_retention_count", 6)
+
+    def run_mixed_op(index: int):
+        if index % 2 == 0:
+            return backups.create_backup()["id"]
+        return backups.restore_backup(baseline["id"])["restored_backup"]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(run_mixed_op, idx) for idx in range(4)]
+        for future in futures:
+            assert future.result(timeout=15)
+
+    monkeypatch.setattr(settings, "backup_retention_count", 2)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        prune_futures = [executor.submit(backups.create_backup) for _ in range(4)]
+        for future in prune_futures:
+            assert future.result(timeout=15)["id"]
+
+    retained = backups.list_backups()
+    assert len(retained) == 2
+    retained_ids = {item["id"] for item in retained}
+    backup_dir = database / "backups"
+    sidecar_ids = {
+        path.name.removesuffix(".secret.key")
+        for path in backup_dir.glob("bookward-*.secret.key")
+    }
+    assert sidecar_ids == retained_ids
+    assert private_setting("serialized_secret") == "keep-sidecar-aligned"

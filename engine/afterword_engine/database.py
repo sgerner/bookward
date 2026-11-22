@@ -1041,6 +1041,16 @@ class _ProfileDatabaseLock:
         self._connections = 0
         self._connections_by_thread: dict[int, int] = {}
 
+    def is_locked(self) -> bool:
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            return self._writer not in (None, owner) or (
+                bool(self._waiting_writers)
+                and self._writer != owner
+                and not owns_connection
+            )
+
     def acquire_connection(self) -> int:
         owner = threading.get_ident()
         with self._condition:
@@ -1071,6 +1081,35 @@ class _ProfileDatabaseLock:
             else:
                 self._connections_by_thread[owner] = count - 1
             self._condition.notify_all()
+
+    @contextmanager
+    def shared(self):
+        owner = self.acquire_connection()
+        try:
+            yield self
+        finally:
+            self.release_connection(owner)
+
+    @contextmanager
+    def try_shared(self):
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if self._writer not in (None, owner) or (
+                self._waiting_writers
+                and self._writer != owner
+                and not owns_connection
+            ):
+                yield False
+                return
+            self._connections += 1
+            self._connections_by_thread[owner] = (
+                self._connections_by_thread.get(owner, 0) + 1
+            )
+        try:
+            yield True
+        finally:
+            self.release_connection(owner)
 
     def acquire(self) -> None:
         owner = threading.get_ident()

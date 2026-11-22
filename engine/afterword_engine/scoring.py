@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -35,6 +36,40 @@ def document(item):
         if str(value or "").strip()
     )
 
+def _load_cached_embeddings(entity_type, backend, model, entity_ids):
+    cached_by_id = {}
+    # Keep the lookup bounded for large Goodreads imports while replacing the
+    # per-item connection/query loop with a small number of batch reads.
+    for start in range(0, len(entity_ids), 500):
+        batch_ids = entity_ids[start:start + 500]
+        if not batch_ids:
+            continue
+        placeholders = ",".join("?" for _ in batch_ids)
+        cached_by_id.update(
+            {
+                int(cached["entity_id"]): cached
+                for cached in rows(
+                    f"SELECT entity_id,vector,dimensions,content_hash FROM embeddings "
+                    f"WHERE entity_type=? AND backend=? AND model=? "
+                    f"AND entity_id IN ({placeholders})",
+                    (entity_type, backend, model, *batch_ids),
+                )
+            }
+        )
+    return cached_by_id
+
+
+def _persist_cached_embeddings(cache_rows):
+    with transaction() as con:
+        con.executemany(
+            "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) "
+            "DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,"
+            "content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",
+            cache_rows,
+        )
+
+
 async def cached_vectors(
     embedder,
     entity_type,
@@ -52,26 +87,18 @@ async def cached_vectors(
         raise ValueError("Expected embedding dimensions must be a positive integer")
     vectors, missing = [None] * len(items), []
 
-    cached_by_id = {}
     entity_ids = [item["id"] for item in items]
-    # Keep the lookup bounded for large Goodreads imports while replacing the
-    # per-item connection/query loop with a small number of batch reads.
-    for start in range(0, len(entity_ids), 500):
-        batch_ids = entity_ids[start:start + 500]
-        if not batch_ids:
-            continue
-        placeholders = ",".join("?" for _ in batch_ids)
-        cached_by_id.update(
-            {
-                int(cached["entity_id"]): cached
-                for cached in rows(
-                    f"SELECT entity_id,vector,dimensions,content_hash FROM embeddings "
-                    f"WHERE entity_type=? AND backend=? AND model=? "
-                    f"AND entity_id IN ({placeholders})",
-                    (entity_type, embedder.name, embedder.model, *batch_ids),
-                )
-            }
+    cached_by_id = (
+        await asyncio.to_thread(
+            _load_cached_embeddings,
+            entity_type,
+            embedder.name,
+            embedder.model,
+            entity_ids,
         )
+        if entity_ids
+        else {}
+    )
 
     cached_dimensions = set()
     for index, item in enumerate(items):
@@ -108,27 +135,20 @@ async def cached_vectors(
             raise ValueError("Embedding provider dimensions differ from valid cached vectors; rebuild the full cache")
         if persist:
             cache_rows = []
-            with transaction() as con:
-                for (index,item,_text,digest), vector in zip(missing,generated):
-                    vectors[index] = vector
-                    cache_rows.append(
-                        (
-                            entity_type,
-                            item["id"],
-                            embedder.name,
-                            embedder.model,
-                            vector_blob(vector),
-                            len(vector),
-                            digest,
-                        )
+            for (index,item,_text,digest), vector in zip(missing,generated):
+                vectors[index] = vector
+                cache_rows.append(
+                    (
+                        entity_type,
+                        item["id"],
+                        embedder.name,
+                        embedder.model,
+                        vector_blob(vector),
+                        len(vector),
+                        digest,
                     )
-                con.executemany(
-                    "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
-                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_type,entity_id,backend,model) "
-                    "DO UPDATE SET vector=excluded.vector,dimensions=excluded.dimensions,"
-                    "content_hash=excluded.content_hash,updated_at=CURRENT_TIMESTAMP",
-                    cache_rows,
                 )
+            await asyncio.to_thread(_persist_cached_embeddings, cache_rows)
         else:
             for (index,_item,_text,_digest), vector in zip(missing,generated):
                 vectors[index] = vector

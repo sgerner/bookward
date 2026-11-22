@@ -742,6 +742,105 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
         restore.result(timeout=2)
 
 
+def test_event_loop_timer_stays_responsive_during_exclusive_profile_lock(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_INITIAL_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_POLL_SECONDS", 0.1)
+    alice = profiles.create_account("timer-alice", "timer-alice-password-long")
+    bob = profiles.create_account("timer-bob", "timer-bob-password-long")
+    for account, kind in ((alice, "alice_job"), (bob, "bob_job")):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            enqueue_job(kind)
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def contended_alice_read():
+        with profile_scope(alice["profile_id"]), connect() as con:
+            return con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    from afterword_engine.main import (
+        digest_scheduler_loop,
+        goodreads_rss_scheduler_loop,
+        source_scheduler_loop,
+    )
+
+    handled: list[tuple[str | None, str]] = []
+    bob_done = asyncio.Event()
+    alice_done = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        owner = current_profile_id()
+        handled.append((owner, kind))
+        if kind == "bob_job":
+            bob_done.set()
+        elif kind == "alice_job":
+            alice_done.set()
+            stop.set()
+        return {"kind": kind}
+
+    async def run_scenario():
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        lock_thread.start()
+        assert await asyncio.to_thread(lock_acquired.wait, 2)
+
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        background_tasks = [
+            asyncio.create_task(worker_loop(handler, stop)),
+            asyncio.create_task(source_scheduler_loop(stop)),
+            asyncio.create_task(digest_scheduler_loop(stop)),
+            asyncio.create_task(goodreads_rss_scheduler_loop(stop)),
+            asyncio.create_task(backups.backup_scheduler_loop(stop)),
+        ]
+        probe_task = asyncio.create_task(timer_probe())
+        alice_read_task = asyncio.create_task(asyncio.to_thread(contended_alice_read))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Hold the exclusive lock across at least one full 0.5s worker poll.
+            await asyncio.sleep(0.65)
+            assert not alice_done.is_set()
+            assert not alice_read_task.done()
+            assert len(tick_durations) >= 10
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            # Locked profiles must skip without PROFILE_RETRY_SECONDS (60s) backoff.
+            await asyncio.wait_for(alice_done.wait(), timeout=2)
+            assert await asyncio.wait_for(alice_read_task, timeout=2) >= 1
+        finally:
+            release_lock.set()
+            measure_ticks = False
+            stop.set()
+            await asyncio.gather(probe_task, *background_tasks, return_exceptions=True)
+            await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_scenario())
+    assert [
+        item for item in handled if item[1] in {"bob_job", "alice_job"}
+    ] == [
+        (bob["profile_id"], "bob_job"),
+        (alice["profile_id"], "alice_job"),
+    ]
+
+
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):
     database_path = tmp_path / "upgrade.db"
     monkeypatch.setattr(settings, "db", str(database_path))

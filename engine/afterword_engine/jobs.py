@@ -83,9 +83,70 @@ def enqueue_job(kind: str, dedupe: bool = False):
         con.execute("INSERT INTO jobs(id,kind,status) VALUES(?,?,'queued')", (job_id, kind))
         return job_id
 
+def _poll_and_claim_job(
+    profile_id: str,
+    *,
+    need_init: bool,
+    need_reap: bool,
+) -> tuple[str, bool, bool, tuple[dict, str] | None]:
+    from .database import database_lock, initialize, row
+    from .tenancy import profile_scope
+
+    with profile_scope(profile_id), database_lock().try_shared() as acquired:
+        if not acquired:
+            return "locked", False, False, None
+        initialized = False
+        if need_init:
+            initialize(seed_demo=False)
+            initialized = True
+        reaped = False
+        if need_reap:
+            _reap_abandoned_jobs()
+            reaped = True
+        job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
+        if not job:
+            return "idle", initialized, reaped, None
+        lease_token = uuid.uuid4().hex
+        claimed_at = now()
+        with transaction() as con:
+            claimed = con.execute(
+                "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                "lease_token=?,attempts=attempts+1 "
+                "WHERE id=? AND status='queued'",
+                (claimed_at, claimed_at, lease_token, job["id"]),
+            ).rowcount
+        if not claimed:
+            return "idle", initialized, reaped, None
+        return "claimed", initialized, reaped, (job, lease_token)
+
+
+def _complete_job(profile_id: str, job_id: str, lease_token: str, result) -> None:
+    from .tenancy import profile_scope
+
+    encoded = json.dumps(result)
+    with profile_scope(profile_id), transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,"
+            "finished_at=?,heartbeat_at=NULL,lease_token=NULL "
+            "WHERE id=? AND status='running' AND lease_token=?",
+            (encoded, now(), job_id, lease_token),
+        )
+
+
+def _fail_job(profile_id: str, job_id: str, lease_token: str, exc: BaseException) -> None:
+    from .tenancy import profile_scope
+
+    error_text = safe_error_message(exc, limit=2000)
+    with profile_scope(profile_id), transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='failed',error=?,finished_at=?,"
+            "heartbeat_at=NULL,lease_token=NULL "
+            "WHERE id=? AND status='running' AND lease_token=?",
+            (error_text, now(), job_id, lease_token),
+        )
+
+
 async def worker_loop(handler, stop):
-    from .database import row
-    from .database import initialize
     from .profiles import profile_ids
     from .tenancy import profile_scope
     last_reaped_at: dict[str, float] = {}
@@ -93,64 +154,58 @@ async def worker_loop(handler, stop):
     profile_retry_after: dict[str, float] = {}
     while not stop.is_set():
         worked = False
-        for profile_id in profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(profile_ids)
+        except Exception:
+            LOGGER.exception("Worker could not enumerate active profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
             if stop.is_set():
                 break
             current = time.monotonic()
             if current < profile_retry_after.get(profile_id, 0):
                 continue
+            need_init = profile_id not in ready_profiles
+            need_reap = (
+                profile_id not in last_reaped_at
+                or current - last_reaped_at[profile_id] >= JOB_REAPER_SECONDS
+            )
             try:
-                with profile_scope(profile_id):
-                    if profile_id not in ready_profiles:
-                        initialize(seed_demo=False)
-                        ready_profiles.add(profile_id)
-                    if (
-                        profile_id not in last_reaped_at
-                        or current - last_reaped_at[profile_id] >= JOB_REAPER_SECONDS
-                    ):
-                        _reap_abandoned_jobs()
-                        last_reaped_at[profile_id] = current
-                    job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
-                    if not job:
-                        continue
-                    lease_token = uuid.uuid4().hex
-                    claimed_at = now()
-                    with transaction() as con:
-                        claimed = con.execute(
-                            "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
-                            "lease_token=?,attempts=attempts+1 "
-                            "WHERE id=? AND status='queued'",
-                            (claimed_at, claimed_at, lease_token, job["id"]),
-                        ).rowcount
-                    if not claimed:
-                        continue
-                    worked = True
-                    heartbeat_stop = Event()
-                    heartbeat = Thread(
-                        target=_heartbeat,
-                        args=(profile_id, job["id"], lease_token, heartbeat_stop),
-                        name=f"job-heartbeat-{job['id'][:8]}",
-                        daemon=True,
-                    )
-                    heartbeat.start()
-                    try:
+                state, initialized, reaped, claimed_job = await asyncio.to_thread(
+                    _poll_and_claim_job,
+                    profile_id,
+                    need_init=need_init,
+                    need_reap=need_reap,
+                )
+                if initialized:
+                    ready_profiles.add(profile_id)
+                if reaped:
+                    last_reaped_at[profile_id] = current
+                if state != "claimed" or claimed_job is None:
+                    continue
+                job, lease_token = claimed_job
+                worked = True
+                heartbeat_stop = Event()
+                heartbeat = Thread(
+                    target=_heartbeat,
+                    args=(profile_id, job["id"], lease_token, heartbeat_stop),
+                    name=f"job-heartbeat-{job['id'][:8]}",
+                    daemon=True,
+                )
+                heartbeat.start()
+                try:
+                    with profile_scope(profile_id):
                         result = await handler(job["kind"])
-                        with transaction() as con:
-                            con.execute(
-                                "UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
-                                "WHERE id=? AND status='running' AND lease_token=?",
-                                (json.dumps(result), now(), job["id"], lease_token),
-                            )
-                    except Exception as exc:
-                        with transaction() as con:
-                            con.execute(
-                                "UPDATE jobs SET status='failed',error=?,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
-                                "WHERE id=? AND status='running' AND lease_token=?",
-                                (safe_error_message(exc, limit=2000), now(), job["id"], lease_token),
-                            )
-                    finally:
-                        heartbeat_stop.set()
-                        await asyncio.to_thread(heartbeat.join)
+                    await asyncio.to_thread(
+                        _complete_job, profile_id, job["id"], lease_token, result
+                    )
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        _fail_job, profile_id, job["id"], lease_token, exc
+                    )
+                finally:
+                    heartbeat_stop.set()
+                    await asyncio.to_thread(heartbeat.join)
             except Exception:
                 ready_profiles.discard(profile_id)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
@@ -168,16 +223,20 @@ def _heartbeat(
 ) -> None:
     """Keep a live job leased so another worker cannot mistake it for a crash."""
 
+    from .database import database_lock
     from .tenancy import profile_scope
 
     while not stop.wait(JOB_HEARTBEAT_SECONDS):
         try:
-            with profile_scope(profile_id), transaction() as con:
-                updated = con.execute(
-                    "UPDATE jobs SET heartbeat_at=? "
-                    "WHERE id=? AND status='running' AND lease_token=?",
-                    (now(), job_id, lease_token),
-                ).rowcount
+            with profile_scope(profile_id), database_lock().try_shared() as acquired:
+                if not acquired:
+                    continue
+                with transaction() as con:
+                    updated = con.execute(
+                        "UPDATE jobs SET heartbeat_at=? "
+                        "WHERE id=? AND status='running' AND lease_token=?",
+                        (now(), job_id, lease_token),
+                    ).rowcount
         except Exception:
             LOGGER.exception("Could not renew lease for job %s", job_id)
             continue

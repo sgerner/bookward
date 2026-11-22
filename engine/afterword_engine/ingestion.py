@@ -1945,7 +1945,11 @@ def _clean_parsed_subjects(items):
 
 
 async def _fetch_and_parse_source(url):
-    request_url = _nyt_request_url(_apple_artwork_request_url(url))
+    apple_url = _apple_artwork_request_url(url)
+    if (urlparse(apple_url).hostname or "").casefold().rstrip(".") == "api.nytimes.com":
+        request_url = await asyncio.to_thread(_nyt_request_url, apple_url)
+    else:
+        request_url = apple_url
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
             content, content_type = await fetch_bytes(url, client=client)

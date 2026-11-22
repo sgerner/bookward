@@ -8,7 +8,10 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
+import weakref
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
@@ -34,6 +37,41 @@ AUTH_BACKUP_RESTORE_KEY = "auth_backup_last_restore_at"
 
 class BackupError(ValueError):
     """A backup or restore could not be completed safely."""
+
+
+class _ProfileBackupLock:
+    """Serialize backup, restore, key-sidecar, and retention work per profile."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
+
+    @contextmanager
+    def try_acquire(self):
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._lock.release()
+
+
+_BACKUP_LOCKS: weakref.WeakValueDictionary[str, _ProfileBackupLock] = (
+    weakref.WeakValueDictionary()
+)
+_BACKUP_LOCKS_GUARD = threading.Lock()
+
+
+def _profile_backup_lock(path: str | Path | None = None) -> _ProfileBackupLock:
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _BACKUP_LOCKS_GUARD:
+        return _BACKUP_LOCKS.setdefault(key, _ProfileBackupLock())
 
 
 def backup_directory() -> Path:
@@ -639,12 +677,15 @@ def _prune_backups() -> None:
 
 
 def create_backup() -> dict:
+    live_path = profile_database_path()
     try:
-        with database_lock(profile_database_path()):
-            path = _create_snapshot_unlocked()
+        with _profile_backup_lock(live_path):
+            with database_lock(live_path).shared():
+                path = _create_snapshot_unlocked()
             _set_last_error("")
+            record = _backup_record(path)
             _prune_backups()
-        return _backup_record(path)
+        return record
     except BackupError as exc:
         _set_last_error(f"Backup failed: {safe_error_message(exc, limit=240)}")
         raise
@@ -741,29 +782,35 @@ def recover_interrupted_restore() -> bool:
     journal = _restore_journal_path()
     if not journal.exists():
         return False
+    live_path = profile_database_path()
+    staged = None
     try:
-        payload = json.loads(journal.read_text())
-        safety_id = payload["safety_backup"]
-        safety_path = _backup_path(safety_id)
-        _validate_snapshot(safety_path)
-        safety_key = _restore_key_sidecar(safety_path)
-        _validate_snapshot_key(safety_path, safety_key)
-        with database_lock(profile_database_path()):
-            staged = _copy_to_stage(safety_path, profile_database_path().parent)
-            try:
+        with _profile_backup_lock(live_path):
+            if not journal.exists():
+                return False
+            payload = json.loads(journal.read_text())
+            safety_id = payload["safety_backup"]
+            safety_path = _backup_path(safety_id)
+            _validate_snapshot(safety_path)
+            safety_key = _restore_key_sidecar(safety_path)
+            _validate_snapshot_key(safety_path, safety_key)
+            live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            staged = _copy_to_stage(safety_path, live_path.parent)
+            with database_lock(live_path):
                 _replace_live_database(staged, safety_key)
-            except Exception:
-                staged.unlink(missing_ok=True)
-                _remove_sidecars(staged)
-                raise
-            _clear_restore_journal()
-            _set_last_error("An interrupted restore was rolled back to its safety backup.")
+                staged = None
+                _clear_restore_journal()
+                _set_last_error("An interrupted restore was rolled back to its safety backup.")
         return True
     except Exception as exc:
         LOGGER.exception("Could not recover an interrupted Bookward restore")
         raise BackupError(
             "An interrupted restore needs its safety backup and matching encryption key."
         ) from exc
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+            _remove_sidecars(staged)
 
 
 def _restore_key_sidecar(backup_path: Path) -> Path | None:
@@ -883,95 +930,130 @@ def _copy_to_stage(source: Path, directory: Path) -> Path:
         raise
 
 
+def _finalize_staged_database(staged: Path) -> None:
+    checkpoint = sqlite3.connect(staged, timeout=30)
+    try:
+        result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if result and result[0] != 0:
+            raise BackupError("The staged backup could not be prepared for restore.")
+    finally:
+        checkpoint.close()
+    _remove_sidecars(staged)
+
+
+def _rollback_failed_restore(live_path: Path, safety_backup: Path | None) -> bool:
+    if not safety_backup:
+        return True
+    rollback = None
+    try:
+        rollback_key = _restore_key_sidecar(safety_backup)
+        rollback = _copy_to_stage(safety_backup, live_path.parent)
+        with database_lock(live_path):
+            _replace_live_database(rollback, rollback_key)
+            rollback = None
+            _clear_restore_journal()
+        return False
+    except Exception:
+        LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
+        return True
+    finally:
+        if rollback is not None:
+            rollback.unlink(missing_ok=True)
+            _remove_sidecars(rollback)
+
+
 def restore_backup(backup_id: str) -> dict:
-    source = _backup_path(backup_id)
     selected_key = None
     safety_backup = None
+    safety_record = None
     staged = None
     replaced = False
     live_path = profile_database_path()
-    try:
-        with database_lock(live_path):
+    with _profile_backup_lock(live_path):
+        source = _backup_path(backup_id)
+        try:
             _validate_snapshot(source)
             selected_key = _restore_key_sidecar(source)
             _validate_snapshot_key(source, selected_key)
+            live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             staged = _copy_to_stage(source, live_path.parent)
 
             # Apply this release's migrations on the staged copy first. If
             # staging fails, neither the live database nor key is touched.
-            try:
-                from .database import initialize
-                from .tenancy import database_path_override
+            from .database import initialize
+            from .tenancy import database_path_override
 
-                with database_path_override(staged):
-                    initialize(seed_demo=False)
-            except Exception:
-                raise
+            with database_path_override(staged):
+                initialize(seed_demo=False)
+            _finalize_staged_database(staged)
             _validate_snapshot(staged)
 
-            safety_backup = _create_snapshot_unlocked()
-            _write_restore_journal(safety_backup, source)
-            replaced = True
-            _replace_live_database(staged, selected_key)
-            staged = None
-            with transaction() as con:
-                con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
-            _clear_restore_journal()
-            replaced = False
+            with database_lock(live_path):
+                safety_backup = _create_snapshot_unlocked()
+                _write_restore_journal(safety_backup, source)
+                replaced = True
+                _replace_live_database(staged, selected_key)
+                staged = None
+                with transaction() as con:
+                    con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
+                _clear_restore_journal()
+                replaced = False
+            safety_record = _backup_record(safety_backup)
             _prune_backups()
-        return {
-            "restored_backup": backup_id,
-            "safety_backup": _backup_record(safety_backup),
-        }
-    except BackupError as exc:
-        rollback_failed = False
-        if replaced:
-            if safety_backup:
-                try:
-                    with database_lock(live_path):
-                        rollback = _copy_to_stage(safety_backup, live_path.parent)
-                        _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
-                        _clear_restore_journal()
-                except Exception:
-                    rollback_failed = True
-                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
+            return {
+                "restored_backup": backup_id,
+                "safety_backup": safety_record,
+            }
+        except BackupError as exc:
+            rollback_failed = (
+                _rollback_failed_restore(live_path, safety_backup) if replaced else False
+            )
+            detail = safe_error_message(exc, limit=200)
+            if rollback_failed:
+                message = f"Restore failed; automatic rollback did not complete. {detail}"
             else:
-                rollback_failed = True
-        detail = safe_error_message(exc, limit=200)
-        if rollback_failed:
-            message = f"Restore failed; automatic rollback did not complete. {detail}"
-        else:
-            message = f"Restore failed; the previous database remains active. {detail}"
-        _set_last_error(message)
-        if rollback_failed:
+                message = f"Restore failed; the previous database remains active. {detail}"
+            _set_last_error(message)
+            if rollback_failed:
+                raise BackupError(message) from exc
+            raise exc
+        except Exception as exc:
+            LOGGER.exception("Bookward restore failed")
+            rollback_failed = (
+                _rollback_failed_restore(live_path, safety_backup) if replaced else False
+            )
+            detail = safe_error_message(exc, limit=200)
+            if rollback_failed:
+                message = f"Restore failed; automatic rollback did not complete. {detail}"
+            else:
+                message = f"Restore failed; the previous database remains active. {detail}"
+            _set_last_error(message)
             raise BackupError(message) from exc
-        raise exc
-    except Exception as exc:
-        LOGGER.exception("Bookward restore failed")
-        rollback_failed = False
-        if replaced:
-            if safety_backup:
-                try:
-                    with database_lock(live_path):
-                        rollback = _copy_to_stage(safety_backup, live_path.parent)
-                        _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
-                        _clear_restore_journal()
-                except Exception:
-                    rollback_failed = True
-                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-            else:
-                rollback_failed = True
-        detail = safe_error_message(exc, limit=200)
-        if rollback_failed:
-            message = f"Restore failed; automatic rollback did not complete. {detail}"
-        else:
-            message = f"Restore failed; the previous database remains active. {detail}"
-        _set_last_error(message)
-        raise BackupError(message) from exc
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
-            _remove_sidecars(staged)
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+                _remove_sidecars(staged)
+
+
+def _run_scheduled_auth_backup() -> dict | None:
+    if auth_backup_is_due():
+        return create_auth_backup()
+    return None
+
+
+def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
+    from .tenancy import profile_scope
+
+    with profile_scope(profile_id):
+        live_path = profile_database_path()
+        if database_lock(live_path).is_locked():
+            return None
+        with _profile_backup_lock(live_path).try_acquire() as acquired:
+            if not acquired:
+                return None
+            if database_lock(live_path).is_locked() or not backup_is_due():
+                return None
+            return create_backup()
 
 
 async def backup_scheduler_loop(stop: asyncio.Event) -> None:
@@ -983,17 +1065,21 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         pass
     while not stop.is_set():
         from .profiles import profile_ids
-        from .tenancy import profile_scope
+
         try:
-            if auth_backup_is_due():
-                await asyncio.to_thread(create_auth_backup)
+            await asyncio.to_thread(_run_scheduled_auth_backup)
         except Exception:
             LOGGER.exception("Scheduled identity-registry backup failed")
-        for profile_id in profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(profile_ids)
+        except Exception:
+            LOGGER.exception("Could not enumerate profiles for scheduled backups")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    if backup_is_due():
-                        await asyncio.to_thread(create_backup)
+                await asyncio.to_thread(_run_scheduled_profile_backup, profile_id)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:
