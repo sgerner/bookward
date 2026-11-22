@@ -1022,5 +1022,102 @@ describe("page actions", () => {
     });
   });
 
+  it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
 
+    const emptyForm = new FormData();
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: emptyForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: { message: "Choose a Goodreads CSV export.", error: true },
+    });
+
+    const oversizedForm = new FormData();
+    oversizedForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "goodreads.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: oversizedForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const streamErrorRequest = new Request("http://afterword.test", {
+      method: "POST",
+      // @ts-expect-error Node fetch requires half-duplex for streaming request bodies
+      duplex: "half",
+      headers: {
+        "x-bookward-profile": "alice-profile",
+        "content-type": "multipart/form-data; boundary=----bookward",
+      },
+      body: new ReadableStream({
+        start(controller) {
+          controller.error(Object.assign(new Error("Payload Too Large"), { status: 413 }));
+        },
+      }),
+    });
+    await expect(
+      actions.importGoodreadsCsv!({ request: streamErrorRequest } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "This does not look like a Goodreads export" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const invalidCsvForm = new FormData();
+    invalidCsvForm.set("file", new File(["bad,csv\n"], "bad.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: invalidCsvForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: { message: "This does not look like a Goodreads export", error: true },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "CSV is larger than 10 MB" }), {
+        status: 413,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const engine413Form = new FormData();
+    engine413Form.set("file", new File(["Title,Author\nDune,Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: engine413Form }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: "CSV is larger than 10 MB", error: true },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ imported: 3 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const validForm = new FormData();
+    validForm.set("file", new File(["Title,Author\nDune,Frank Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validForm }),
+      } as never),
+    ).resolves.toEqual({ message: "Imported 3 Goodreads books." });
+  });
 });
