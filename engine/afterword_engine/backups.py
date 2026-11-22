@@ -337,7 +337,11 @@ def _set_last_error(message: str) -> None:
     journal = _restore_journal_path()
     if _has_restore_journal(journal):
         if clean:
-            _record_restore_journal_error(clean, journal)
+            with _RESTORE_JOURNAL_ERRORS_GUARD:
+                _RESTORE_JOURNAL_ERRORS[str(journal)] = (
+                    _journal_fingerprint(journal),
+                    clean[:300],
+                )
         return
     try:
         with transaction() as con:
@@ -1221,16 +1225,19 @@ def restore_backup(backup_id: str) -> dict:
             replaced = True
             _replace_live_database(staged, selected_key)
             staged = None
-            with allow_restore_database_access(), transaction() as con:
-                con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
-            _clear_restore_journal()
+            with allow_restore_database_access():
+                with transaction() as con:
+                    con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
+                _clear_restore_journal()
             replaced = False
             _prune_backups()
         return {
             "restored_backup": backup_id,
             "safety_backup": _backup_record(safety_backup),
         }
-    except BackupError as exc:
+    except Exception as exc:
+        if not isinstance(exc, BackupError):
+            LOGGER.exception("Bookward restore failed")
         rollback_failed = False
         if replaced:
             if safety_backup:
@@ -1260,43 +1267,11 @@ def restore_backup(backup_id: str) -> dict:
         else:
             message = f"Restore failed; the previous database remains active. {detail}"
         _set_last_error(message)
-        if rollback_failed:
+        if rollback_failed or not isinstance(exc, BackupError):
             raise BackupError(message) from exc
         if detail != str(exc):
             raise BackupError(detail) from exc
         raise exc
-    except Exception as exc:
-        LOGGER.exception("Bookward restore failed")
-        rollback_failed = False
-        if replaced:
-            if safety_backup:
-                rollback = None
-                try:
-                    with database_lock(live_path):
-                        rollback = _copy_to_stage(safety_backup, live_path.parent)
-                        _replace_live_database(
-                            rollback,
-                            _restore_key_sidecar(safety_backup),
-                            rollback=True,
-                        )
-                        rollback = None
-                        _clear_restore_journal()
-                except Exception:
-                    rollback_failed = True
-                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-                finally:
-                    if rollback is not None:
-                        rollback.unlink(missing_ok=True)
-                        _remove_sidecars(rollback)
-            else:
-                rollback_failed = True
-        detail = _safe_backup_detail(exc, limit=200)
-        if rollback_failed:
-            message = f"Restore failed; automatic rollback did not complete. {detail}"
-        else:
-            message = f"Restore failed; the previous database remains active. {detail}"
-        _set_last_error(message)
-        raise BackupError(message) from exc
     finally:
         if staged is not None:
             staged.unlink(missing_ok=True)
