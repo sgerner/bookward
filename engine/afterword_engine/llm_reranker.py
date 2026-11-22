@@ -6,7 +6,8 @@ import json
 import logging
 import re
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
