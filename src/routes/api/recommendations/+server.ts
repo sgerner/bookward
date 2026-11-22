@@ -8,6 +8,7 @@ const querySchema = z.object({
   status: z.enum([
     "recommended",
     "saved",
+    "imported",
     "all",
     "decisions",
     "rejected",
