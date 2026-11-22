@@ -236,3 +236,99 @@ def test_conflicting_verified_work_years_fail_closed(database):
         attach_publication_years(con, [], [candidate])
 
     assert candidate["first_publication_year"] is None
+
+
+def test_attaches_verified_openlibrary_work_year_when_google_books_wins_provider(database):
+    work_id = "/works/OL777W"
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()[0]
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,release_date,normalized_key,source_id) "
+            "VALUES(?,?,?,?,?)",
+            ("The Left Hand of Darkness", "Ursula K. Le Guin", "2019-03-05", "left hand darkness leguin", source_id),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',"
+            "provider_id='gb-vol-lhod',work_id='',openlibrary_work_id=? WHERE candidate_id=?",
+            (work_id, candidate_id),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance("
+            "entity_type,entity_id,field,provider,provider_id,source_payload) "
+            "VALUES('candidate',?,'release_date','google_books','gb-vol-lhod',?)",
+            (
+                candidate_id,
+                json.dumps(
+                    {
+                        "field": "release_date",
+                        "field_provenance": {
+                            "provider": "google_books",
+                            "provider_id": "gb-vol-lhod",
+                            "source_field": "publishedDate",
+                            "value_sha256": _hash("2019-03-05"),
+                        },
+                        "payload": {
+                            "id": "gb-vol-lhod",
+                            "publication_date": "2019-03-05",
+                            "publication_date_source_field": "publishedDate",
+                        },
+                    }
+                ),
+            ),
+        )
+        _insert_ledger(
+            con,
+            "candidate",
+            candidate_id,
+            "release_date",
+            work_id,
+            "1969",
+            "first_publish_year",
+        )
+
+        edition_only_id = con.execute(
+            "INSERT INTO candidates(title,author,release_date,normalized_key,source_id) "
+            "VALUES(?,?,?,?,?)",
+            ("Edition Only Google Candidate", "Ursula K. Le Guin", "2019-03-05", "edition only google candidate", source_id),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',"
+            "provider_id='gb-vol-ed',work_id='',openlibrary_work_id='/works/OL778W' WHERE candidate_id=?",
+            (edition_only_id,),
+        )
+        _insert_ledger(
+            con,
+            "candidate",
+            edition_only_id,
+            "release_date",
+            "/works/OL999W",
+            "1969",
+            "first_publish_year",
+        )
+
+        candidates = [
+            {
+                "id": int(candidate_id),
+                "quality_provider": "google_books",
+                "quality_work_id": "",
+                "quality_openlibrary_work_id": work_id,
+                "release_date": "2019-03-05",
+            },
+            {
+                "id": int(edition_only_id),
+                "quality_provider": "google_books",
+                "quality_work_id": "",
+                "quality_openlibrary_work_id": "/works/OL778W",
+                "release_date": "2019-03-05",
+            },
+        ]
+
+        attach_publication_years(con, [], candidates)
+
+    assert candidates[0]["first_publication_year"] == 1969
+    assert candidates[0]["publication_work_id"] == work_id
+    assert candidates[1]["first_publication_year"] is None
+    assert candidates[1]["publication_work_id"] is None
+

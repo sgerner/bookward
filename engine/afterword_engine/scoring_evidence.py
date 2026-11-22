@@ -50,8 +50,8 @@ IDENTITY_READ_FIELDS = (
 CANDIDATE_FIELDS = (
     "id", "title", "author", "description", "genres", "status", "score",
     "source_id", "source_name", "source_weight", "quality_status",
-    "quality_score", "catalog_confidence", "quality_work_id",
-    "quality_provider", "quality_isbn13", "quality_isbn10", "score_batch_id",
+    "quality_score", "catalog_confidence", "quality_openlibrary_work_id", "quality_work_id",
+    "quality_provider", "quality_isbn13", "quality_isbn10", "quality_isbn_verified", "score_batch_id",
     "first_publication_year", "publication_work_id",
 )
 

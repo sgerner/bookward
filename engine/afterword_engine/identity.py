@@ -19,6 +19,10 @@ _AUTHOR_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v", "vi"}
 _OPEN_LIBRARY_WORK = re.compile(
     r"(?:^|/)works/(OL\d+W)(?:\.json)?(?:[/?#]|$)", re.IGNORECASE
 )
+_OPEN_LIBRARY_BARE_WORK = re.compile(r"^(OL\d+W)$", re.IGNORECASE)
+_OPEN_LIBRARY_EDITION = re.compile(
+    r"(?:^|/)books/[^/?#]+(?:\.json)?(?:[/?#]|$)|^OL\d+M$", re.IGNORECASE
+)
 _ARTICLE_LED_SUBTITLE = re.compile(r"^(?:a|an|the)\b", re.IGNORECASE)
 _NUMBERED_SERIES_SUBTITLE = re.compile(
     r"^(?:a|an|the)\s+(?:one|two|three|four|five|first|second|third|fourth|fifth)\b",
@@ -146,8 +150,6 @@ def _isbn_match_keys(item) -> set[tuple[str, str]]:
         "isbn",
         "isbn10",
         "isbn13",
-        "quality_isbn10",
-        "quality_isbn13",
     ):
         value = _row_value(item, field)
         if not value:
@@ -157,47 +159,90 @@ def _isbn_match_keys(item) -> set[tuple[str, str]]:
             # isbn_parts maps a valid ISBN-10 to its ISBN-13 equivalent, so
             # both representations share one key without relying on titles.
             keys.add(("isbn", isbn13))
+    verified_flag = _row_value(item, "quality_isbn_verified", None)
+    if verified_flag is None:
+        verified_flag = _row_value(item, "isbn_verified", False)
+    if bool(verified_flag):
+        for field in ("quality_isbn10", "quality_isbn13"):
+            value = _row_value(item, field)
+            if not value:
+                continue
+            isbn13, _isbn10 = isbn_parts(value)
+            if isbn13:
+                keys.add(("isbn", isbn13))
     return keys
 
 
+def _extract_openlibrary_work_token(value: object, *, allow_bare: bool = False) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    target = urlparse(raw).path if raw.startswith(("http://", "https://")) else raw
+    if _OPEN_LIBRARY_EDITION.search(target):
+        return ""
+    match = _OPEN_LIBRARY_WORK.search(target)
+    if match:
+        return match.group(1).upper()
+    if allow_bare:
+        bare = _OPEN_LIBRARY_BARE_WORK.fullmatch(target)
+        if bare:
+            return bare.group(1).upper()
+    return ""
+
+
 def _work_match_keys(item) -> set[tuple[str, str, str]]:
-    """Return provider-scoped work IDs, ignoring opaque unscoped identifiers.
+    """Return provider-scoped work IDs, ignoring editions and unscoped IDs.
 
     Work IDs only match when both rows identify the same catalog provider. An
     Open Library work URL is self-identifying; other IDs need an explicit
     provider so unrelated providers cannot collide on short opaque IDs.
     """
 
-    values = (
-        _row_value(item, "quality_work_id"),
-        _row_value(item, "work_id"),
-        _row_value(item, "openlibrary_work_id"),
-    )
-    raw = next((str(value).strip() for value in values if value), "")
-    source_url = str(_row_value(item, "source_url") or "").strip()
-    if not raw and _OPEN_LIBRARY_WORK.search(source_url):
-        raw = source_url
-    if not raw:
-        return set()
+    keys: set[tuple[str, str, str]] = set()
+    for field in ("openlibrary_work_id", "quality_openlibrary_work_id"):
+        token = _extract_openlibrary_work_token(_row_value(item, field), allow_bare=True)
+        if token:
+            keys.add(("work", "openlibrary", token))
 
-    match = _OPEN_LIBRARY_WORK.search(raw)
     provider = str(
         _row_value(item, "quality_provider")
         or _row_value(item, "work_id_provider")
         or _row_value(item, "provider")
         or ""
     ).strip().casefold().replace(" ", "_")
-    if match:
-        provider, identifier = "openlibrary", match.group(1).upper()
-    else:
+
+    for field in ("quality_work_id", "work_id"):
+        raw = str(_row_value(item, field) or "").strip()
+        if not raw or _OPEN_LIBRARY_EDITION.search(raw):
+            continue
+        token = _extract_openlibrary_work_token(raw, allow_bare=False)
+        if token:
+            keys.add(("work", "openlibrary", token))
+            continue
         identifier = raw
         if raw.startswith(("http://", "https://")):
             parsed = urlparse(raw)
             identifier = parsed.path.rstrip("/") or parsed.netloc
         identifier = identifier.strip().rstrip("/")
-        if not provider or not identifier:
-            return set()
-    return {("work", provider, identifier)}
+        if not identifier or _OPEN_LIBRARY_EDITION.search(identifier):
+            continue
+        if provider == "openlibrary":
+            bare = _OPEN_LIBRARY_BARE_WORK.fullmatch(identifier)
+            if bare:
+                keys.add(("work", "openlibrary", bare.group(1).upper()))
+            else:
+                keys.add(("work", "openlibrary", identifier))
+            continue
+        if provider:
+            keys.add(("work", provider, identifier))
+
+    source_token = _extract_openlibrary_work_token(
+        _row_value(item, "source_url"), allow_bare=False
+    )
+    if source_token:
+        keys.add(("work", "openlibrary", source_token))
+
+    return keys
 
 
 def book_row_identity_match_keys(item) -> set[tuple[str, ...]]:
@@ -216,9 +261,27 @@ def book_row_identity_match_keys(item) -> set[tuple[str, ...]]:
 def book_openlibrary_work_id(item) -> str:
     """Return a normalized Open Library work URL when the row has one."""
 
-    for kind, provider, identifier in _work_match_keys(item):
-        if kind == "work" and provider == "openlibrary":
-            return f"/works/{identifier}"
+    for field in ("openlibrary_work_id", "quality_openlibrary_work_id"):
+        token = _extract_openlibrary_work_token(_row_value(item, field), allow_bare=True)
+        if token:
+            return f"/works/{token}"
+    provider = str(
+        _row_value(item, "quality_provider")
+        or _row_value(item, "work_id_provider")
+        or _row_value(item, "provider")
+        or ""
+    ).strip().casefold().replace(" ", "_")
+    for field in ("quality_work_id", "work_id"):
+        token = _extract_openlibrary_work_token(
+            _row_value(item, field), allow_bare=(provider == "openlibrary")
+        )
+        if token:
+            return f"/works/{token}"
+    source_token = _extract_openlibrary_work_token(
+        _row_value(item, "source_url"), allow_bare=False
+    )
+    if source_token:
+        return f"/works/{source_token}"
     return ""
 
 

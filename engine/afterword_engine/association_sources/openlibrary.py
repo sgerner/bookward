@@ -32,6 +32,8 @@ from .common import clean as _clean, title_key as _title_key
 OPEN_LIBRARY_BASE = "https://openlibrary.org"
 OPEN_LIBRARY_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
 _OPEN_LIBRARY_BOOK_KEY = re.compile(r"^/(works|books)/(OL\d+[WM])/?$", re.IGNORECASE)
+_OPEN_LIBRARY_WORK_KEY = re.compile(r"^/works/(OL\d+W)/?$", re.IGNORECASE)
+_OPEN_LIBRARY_EDITION_KEY = re.compile(r"^/books/(OL\d+M)/?$", re.IGNORECASE)
 
 
 def _authors(value: object) -> list[str]:
@@ -79,22 +81,62 @@ def _entry_isbn(entry: Mapping[str, Any]) -> str:
     return isbn13 or isbn10
 
 
-def _external_key(entry: Mapping[str, Any]) -> str:
-    for key in ("work_key", "key", "work", "edition_key", "url"):
+def _openlibrary_work_key(value: object) -> str:
+    """Return a canonical ``/works/OL...W`` key, rejecting editions and lists."""
+
+    normalized = _openlibrary_book_key(value)
+    return normalized if _OPEN_LIBRARY_WORK_KEY.fullmatch(normalized) else ""
+
+
+def _openlibrary_edition_key(value: object) -> str:
+    """Return a canonical ``/books/OL...M`` edition key when present."""
+
+    normalized = _openlibrary_book_key(value)
+    return normalized if _OPEN_LIBRARY_EDITION_KEY.fullmatch(normalized) else ""
+
+
+def _entry_work_and_edition(entry: Mapping[str, Any]) -> tuple[str, str, bool]:
+    """Extract work and edition keys, flagging multi-work omnibus editions."""
+
+    work_key = ""
+    edition_key = ""
+    for key in ("work_key", "work", "key", "url"):
         value = entry.get(key)
         if isinstance(value, Mapping):
             value = value.get("key") or value.get("url")
         if isinstance(value, list):
             value = value[0] if value else ""
-        normalized = _openlibrary_book_key(value)
-        if normalized:
-            return normalized
-    for work in entry.get("works", []) if isinstance(entry.get("works"), list) else []:
-        if isinstance(work, Mapping):
-            normalized = _openlibrary_book_key(work.get("key"))
-            if normalized:
-                return normalized
-    return ""
+        normalized_work = _openlibrary_work_key(value)
+        if normalized_work:
+            work_key = normalized_work
+            break
+    for key in ("edition_key", "key", "url"):
+        value = entry.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("key") or value.get("url")
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        normalized_edition = _openlibrary_edition_key(value)
+        if normalized_edition:
+            edition_key = normalized_edition
+            break
+    works_field = entry.get("works")
+    if isinstance(works_field, list):
+        work_ids = {
+            _openlibrary_work_key(work.get("key") if isinstance(work, Mapping) else work)
+            for work in works_field
+        }
+        work_ids.discard("")
+        if len(work_ids) > 1:
+            return "", edition_key, True
+        if len(work_ids) == 1 and not work_key:
+            work_key = next(iter(work_ids))
+    return work_key, edition_key, False
+
+
+def _external_key(entry: Mapping[str, Any]) -> str:
+    work_key, _edition_key, multi_work = _entry_work_and_edition(entry)
+    return "" if multi_work else work_key
 
 
 def _openlibrary_book_key(value: object) -> str:
@@ -281,17 +323,41 @@ class OpenLibraryListProvider:
         self, entry: Mapping[str, Any]
     ) -> tuple[str, str, str, str] | None:
         title = _clean(entry.get("title"), 500)
+        authors = _entry_authors(entry)
+        work_key, edition_key, multi_work = _entry_work_and_edition(entry)
+        if multi_work:
+            return None
+        if not title and not edition_key:
+            return None
+        candidate_isbn = _entry_isbn(entry)
+        if edition_key and not work_key and self._resolutions < self.max_resolutions:
+            self._resolutions += 1
+            try:
+                edition_payload = await self.client.get_json(f"{edition_key}.json", {})
+            except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+                edition_payload = None
+            if isinstance(edition_payload, Mapping):
+                ed_work_key, _ed_edition_key, ed_multi_work = _entry_work_and_edition(
+                    edition_payload
+                )
+                if ed_multi_work:
+                    return None
+                if ed_work_key:
+                    work_key = ed_work_key
+                if not title:
+                    title = _clean(edition_payload.get("title"), 500)
+                if not authors:
+                    authors = _entry_authors(edition_payload)
+                if not candidate_isbn:
+                    candidate_isbn = _entry_isbn(edition_payload)
         if not title:
             return None
-        authors = _entry_authors(entry)
-        book_key = _external_key(entry)
-        candidate_isbn = _entry_isbn(entry)
-        if (not authors or not book_key) and self._resolutions < self.max_resolutions:
+        if (not authors or not work_key) and self._resolutions < self.max_resolutions:
             self._resolutions += 1
             params: dict[str, Any] = {
                 "title": title[:300],
                 "limit": 5,
-                "fields": "key,title,author_name,isbn,isbn13",
+                "fields": "key,title,author_name,isbn,isbn13,edition_key",
             }
             if authors:
                 params["author"] = authors[0][:200]
@@ -301,24 +367,36 @@ class OpenLibraryListProvider:
             )
             docs = payload.get("docs", []) if isinstance(payload, Mapping) else []
             wanted = _title_key(title)
+            edition_token = edition_key.rsplit("/", 1)[-1].upper() if edition_key else ""
             for doc in docs if isinstance(docs, list) else []:
-                if not isinstance(doc, Mapping) or _title_key(doc.get("title")) != wanted:
+                if not isinstance(doc, Mapping):
+                    continue
+                raw_editions = doc.get("edition_key")
+                doc_editions = (
+                    {str(item).strip().upper() for item in raw_editions if item}
+                    if isinstance(raw_editions, list)
+                    else set()
+                )
+                edition_matches = bool(edition_token and edition_token in doc_editions)
+                title_matches = bool(wanted and _title_key(doc.get("title")) == wanted)
+                if not edition_matches and not title_matches:
                     continue
                 resolved_authors = _authors(doc.get("author_name"))
-                if authors and not any(
+                if not edition_matches and authors and not any(
                     _title_key(author) == _title_key(resolved_author)
                     for author in authors
                     for resolved_author in resolved_authors
                 ):
                     continue
-                book_key = book_key or _external_key(doc)
-                candidate_isbn = candidate_isbn or _entry_isbn(doc)
+                doc_work_key = _external_key(doc)
+                if doc_work_key:
+                    work_key = work_key or doc_work_key
                 if not authors and resolved_authors:
                     authors = resolved_authors
-                if book_key:
+                if work_key and authors:
                     break
         author = authors[0] if authors else "Unknown author"
-        return title, author, book_key, candidate_isbn
+        return title, author, work_key, candidate_isbn
 
     async def _list_entries(self, list_url: str) -> list[Mapping[str, Any]]:
         path = list_url
@@ -381,8 +459,9 @@ class OpenLibraryListProvider:
                         candidate_identity = {
                             "title": title,
                             "author": author,
+                            "openlibrary_work_id": book_key,
                             "quality_work_id": book_key,
-                            "quality_provider": "openlibrary",
+                            "quality_provider": "openlibrary" if book_key else "",
                             "isbn": candidate_isbn,
                         }
                         if read_identity_index.matches(candidate_identity):

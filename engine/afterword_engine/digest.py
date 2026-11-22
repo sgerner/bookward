@@ -243,9 +243,12 @@ def digest_is_due(values: dict | None = None, at: datetime | None = None) -> boo
 def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     params: list = [config["minimum_score"]]
     query = (
-        "SELECT c.*, s.name AS source_name,q.work_id quality_work_id,"
+        "SELECT c.*, s.name AS source_name,"
+        "q.openlibrary_work_id quality_openlibrary_work_id,"
+        "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
-        "q.isbn10 quality_isbn10 FROM candidates c "
+        "q.isbn10 quality_isbn10,"
+        "COALESCE(q.isbn_verified,0) quality_isbn_verified FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status='recommended' AND q.quality_status='accepted' "
@@ -270,8 +273,10 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     )
     shortlist_index = ReadIdentityIndex.from_reads(
         rows(
-            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "SELECT c.*,q.openlibrary_work_id quality_openlibrary_work_id,"
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+            "COALESCE(q.isbn_verified,0) quality_isbn_verified "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.status IN ('saved','imported')"
         )

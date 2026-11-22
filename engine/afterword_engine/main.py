@@ -108,7 +108,7 @@ from .identity import (
     book_openlibrary_work_id,
     book_row_identity_match_keys,
 )
-from .isbn import isbn_parts
+from .isbn import isbn_parts, isbn_parts_from_source
 from . import profiles as identity_store
 from .tenancy import current_profile_id, profile_scope
 import jwt
@@ -1753,8 +1753,10 @@ def _recommendation_identity_context(connection=None):
     )
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlist_rows = fetch(
-        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "SELECT c.*,q.openlibrary_work_id quality_openlibrary_work_id,"
+        "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+        "COALESCE(q.isbn_verified,0) quality_isbn_verified "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
     )
@@ -1799,9 +1801,11 @@ def _recommendation_rows(
             params.extend(statuses)
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
+        "q.openlibrary_work_id quality_openlibrary_work_id,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
-        "q.isbn10 quality_isbn10 "
+        "q.isbn10 quality_isbn10,"
+        "COALESCE(q.isbn_verified,0) quality_isbn_verified "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
@@ -1920,15 +1924,27 @@ def recommendations(
 
 
 def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=None):
+    candidate_map = dict(candidate)
     existing = con.execute(
         "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
-        (candidate["title"], candidate["author"]),
+        (candidate_map["title"], candidate_map["author"]),
     ).fetchone()
     saved_rating = rating if rating is not None else existing["rating"] if existing else None
     read_at = datetime.now(timezone.utc).isoformat()
-    openlibrary_work_id = book_openlibrary_work_id(candidate)
+    openlibrary_work_id = book_openlibrary_work_id(candidate_map)
+    verified_quality_isbns = (
+        [candidate_map.get("quality_isbn13"), candidate_map.get("quality_isbn10")]
+        if candidate_map.get("quality_isbn_verified")
+        else []
+    )
+    source_isbn13, source_isbn10 = isbn_parts_from_source(
+        [candidate_map.get("isbn13"), candidate_map.get("isbn10")],
+        candidate_map.get("source_url", ""),
+    )
     isbn13, _isbn10 = isbn_parts(
-        candidate["quality_isbn13"], candidate["quality_isbn10"]
+        source_isbn13,
+        source_isbn10,
+        verified_quality_isbns,
     )
     con.execute(
         "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
@@ -2123,10 +2139,11 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
 def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
     with transaction() as con:
         candidate = con.execute(
-            "SELECT c.id,c.title,c.author,c.source_url,"
+            "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
+            "q.openlibrary_work_id quality_openlibrary_work_id,"
             "q.work_id quality_work_id,q.provider quality_provider,"
-            "COALESCE(NULLIF(q.isbn13,''),NULLIF(c.isbn13,''),'') quality_isbn13,"
-            "COALESCE(NULLIF(q.isbn10,''),NULLIF(c.isbn10,''),'') quality_isbn10 "
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+            "COALESCE(q.isbn_verified,0) quality_isbn_verified "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.id=?",
             (candidate_id,),

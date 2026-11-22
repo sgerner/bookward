@@ -940,8 +940,10 @@ async def refresh_read_work_identities(
 
     reads = rows("SELECT * FROM reads ORDER BY id")
     candidates = rows(
-        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "SELECT c.*,q.openlibrary_work_id quality_openlibrary_work_id,"
+        "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+        "COALESCE(q.isbn_verified,0) quality_isbn_verified "
         "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
         "JOIN sources s ON s.id=c.source_id "
         "WHERE c.status IN ('new','recommended') "
@@ -2232,9 +2234,19 @@ def _merge_book_item(items, item, source_url):
             continue
         existing_precision = {"year": 1, "month": 2, "day": 3}.get(existing.get("date_kind", ""), 0)
         incoming_precision = {"year": 1, "month": 2, "day": 3}.get(normalized.get("date_kind", ""), 0)
-        for field in ("description", "cover_url", "isbn13", "isbn10"):
+        for field in ("description", "cover_url"):
             if not existing.get(field) and normalized.get(field):
                 existing[field] = normalized[field]
+        merged_isbn13, merged_isbn10 = isbn_parts(
+            existing.get("isbn13"),
+            existing.get("isbn10"),
+            normalized.get("isbn13"),
+            normalized.get("isbn10"),
+        )
+        if merged_isbn13:
+            existing["isbn13"] = merged_isbn13
+        if merged_isbn10:
+            existing["isbn10"] = merged_isbn10
         if normalized.get("release_date") and (
             not existing.get("release_date") or incoming_precision > existing_precision
         ):
@@ -2447,7 +2459,13 @@ def _parse_generic_heading_pairs(soup, source_url):
             continue
         if metadata and metadata.name == heading.name and heading.name in ("h1", "h2", "h3"):
             continue
-        author = _generic_author_from_line(metadata.get_text(" ", strip=True) if metadata else "")
+        metadata_text = metadata.get_text(" ", strip=True) if metadata else ""
+        heading_isbns = re.findall(
+            r"\bISBN(?:-\d+)?\s*[:#]?\s*([0-9Xx][0-9Xx -]{8,17})",
+            metadata_text,
+            re.I,
+        )
+        author = _generic_author_from_line(metadata_text)
         if not title or not author:
             continue
         href = link.get("href", "") if link else ""
@@ -2455,16 +2473,19 @@ def _parse_generic_heading_pairs(soup, source_url):
         description = _clean_text(description_node, 4000) if description_node and description_node.name == "p" else ""
         _merge_book_item(
             items,
-            {
-                "title": title,
-                "author": author,
-                "description": description,
-                "cover_url": _generic_container_cover(book_container, source_url),
-                "source_url": metadata_url(urljoin(source_url, href), source_url),
-                "release_date": None,
-                "date_kind": "",
-                "genres": [],
-            },
+            _with_source_isbn(
+                {
+                    "title": title,
+                    "author": author,
+                    "description": description,
+                    "cover_url": _generic_container_cover(book_container, source_url),
+                    "source_url": metadata_url(urljoin(source_url, href), source_url),
+                    "release_date": None,
+                    "date_kind": "",
+                    "genres": [],
+                },
+                heading_isbns,
+            ),
             source_url,
         )
         if len(items) >= settings.source_max_items:
@@ -2903,8 +2924,18 @@ async def enrich_penguin_random_house_items(items):
                     and not is_weak_cover_url(detail[field])
                 ):
                     enriched[field] = detail[field]
-                elif field not in ("description", "cover_url") and not enriched.get(field) and detail.get(field):
+                elif field not in ("description", "cover_url", "isbn13", "isbn10") and not enriched.get(field) and detail.get(field):
                     enriched[field] = detail[field]
+            merged_isbn13, merged_isbn10 = isbn_parts(
+                enriched.get("isbn13"),
+                enriched.get("isbn10"),
+                detail.get("isbn13"),
+                detail.get("isbn10"),
+            )
+            if merged_isbn13:
+                enriched["isbn13"] = merged_isbn13
+            if merged_isbn10:
+                enriched["isbn10"] = merged_isbn10
             enriched["genres"] = normalize_subjects(
                 normalize_subjects(enriched.get("genres", []), limit=METADATA_GENRE_LIMIT)
                 + normalize_subjects(detail.get("genres", []), limit=METADATA_GENRE_LIMIT),
@@ -3077,8 +3108,9 @@ async def refresh_missing_candidate_metadata():
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
-        "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
-        "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
+        "c.isbn13 AS candidate_isbn13,c.isbn10 AS candidate_isbn10,"
+        "CASE WHEN COALESCE(q.isbn_verified,0)=1 THEN COALESCE(q.isbn13,'') ELSE '' END AS quality_isbn13,"
+        "CASE WHEN COALESCE(q.isbn_verified,0)=1 THEN COALESCE(q.isbn10,'') ELSE '' END AS quality_isbn10,"
         "q.provider AS _expected_provider,q.provider_id AS _expected_provider_id,"
         "q.metadata_provider AS _legacy_metadata_provider,"
         "q.metadata_provider_id AS _legacy_metadata_provider_id,"
@@ -3112,7 +3144,18 @@ async def refresh_missing_candidate_metadata():
         return normalized_catalog_dates
     inputs = []
     for candidate in candidates:
-        item = {**candidate, "genres": _stored_genre_values(candidate.get("genres"))}
+        resolved_isbn13, resolved_isbn10 = isbn_parts(
+            candidate.get("candidate_isbn13"),
+            candidate.get("candidate_isbn10"),
+            candidate.get("quality_isbn13"),
+            candidate.get("quality_isbn10"),
+        )
+        item = {
+            **candidate,
+            "isbn13": resolved_isbn13,
+            "isbn10": resolved_isbn10,
+            "genres": _stored_genre_values(candidate.get("genres")),
+        }
         has_legacy_description = bool(
             candidate.get("description")
             and candidate.get("_legacy_metadata_provider")
@@ -3286,16 +3329,18 @@ async def scan_source(source):
             continue
         placeholders = ",".join("?" for _ in key_batch)
         for candidate in rows(
-            "SELECT c.normalized_key,"
-            "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10 "
+            "SELECT c.normalized_key,c.isbn13 AS candidate_isbn13,c.isbn10 AS candidate_isbn10,"
+            "CASE WHEN COALESCE(q.isbn_verified,0)=1 THEN COALESCE(q.isbn13,'') ELSE '' END AS quality_isbn13,"
+            "CASE WHEN COALESCE(q.isbn_verified,0)=1 THEN COALESCE(q.isbn10,'') ELSE '' END AS quality_isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             f"WHERE c.normalized_key IN ({placeholders})",
             tuple(key_batch),
         ):
-            known_isbns[candidate["normalized_key"]] = (
-                candidate.get("isbn13", ""),
-                candidate.get("isbn10", ""),
+            known_isbns[candidate["normalized_key"]] = isbn_parts(
+                candidate.get("candidate_isbn13", ""),
+                candidate.get("candidate_isbn10", ""),
+                candidate.get("quality_isbn13", ""),
+                candidate.get("quality_isbn10", ""),
             )
     for item_index, item in enumerate(possible):
         known_isbn13, known_isbn10 = known_isbns.get(
@@ -3377,6 +3422,11 @@ async def scan_source(source):
                 "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
+            stored_isbn13, stored_isbn10 = (
+                isbn_parts(existing["isbn13"], existing["isbn10"], isbn13, isbn10)
+                if existing
+                else (isbn13, isbn10)
+            )
             genres = normalize_subjects(
                 _stored_genre_values(existing["genres"] if existing else [])
                 + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
@@ -3391,9 +3441,9 @@ async def scan_source(source):
             release_date=COALESCE(excluded.release_date, release_date),
             date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
             genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
-            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
-            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
+            isbn13=excluded.isbn13,
+            isbn10=excluded.isbn10,
+            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, stored_isbn13, stored_isbn10, key))
             candidate = con.execute(
                 "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
                 (key,),
@@ -3461,18 +3511,34 @@ async def scan_source(source):
                         field,
                         item,
                     )
-            if candidate and (isbn13 or isbn10):
-                con.execute(
-                    """UPDATE candidate_quality SET
-                        isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
-                        isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE candidate_id=?""",
-                    (isbn13, isbn10, candidate["id"]),
-                )
+            if candidate and (stored_isbn13 or stored_isbn10):
+                quality_row = con.execute(
+                    "SELECT isbn13,isbn10,COALESCE(isbn_verified,0) AS isbn_verified "
+                    "FROM candidate_quality WHERE candidate_id=?",
+                    (candidate["id"],),
+                ).fetchone()
+                if quality_row is not None:
+                    if quality_row["isbn_verified"]:
+                        q_isbn13, q_isbn10 = isbn_parts(
+                            quality_row["isbn13"],
+                            quality_row["isbn10"],
+                            stored_isbn13,
+                            stored_isbn10,
+                        )
+                    else:
+                        q_isbn13, q_isbn10 = stored_isbn13, stored_isbn10
+                    con.execute(
+                        """UPDATE candidate_quality SET
+                            isbn13=?,
+                            isbn10=?,
+                            isbn_verified=1,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE candidate_id=?""",
+                        (q_isbn13, q_isbn10, candidate["id"]),
+                    )
             isbn_added = bool(
-                (isbn13 and not (existing["isbn13"] if existing else ""))
-                or (isbn10 and not (existing["isbn10"] if existing else ""))
+                (stored_isbn13 and not (existing["isbn13"] if existing else ""))
+                or (stored_isbn10 and not (existing["isbn10"] if existing else ""))
             )
             if existing and isbn_added:
                 # A newly discovered ISBN is evidence for a retry, not proof

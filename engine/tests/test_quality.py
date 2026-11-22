@@ -219,7 +219,7 @@ def test_provider_unavailable_quarantine_retries_after_backoff(database):
 
 
 def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
-    assert QUALITY_VERSION == "candidate-quality-v4"
+    assert QUALITY_VERSION == "candidate-quality-v5"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
@@ -332,13 +332,14 @@ def test_quality_dedupes_accepted_rows_by_shared_work_and_isbn(database):
         )
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.9,"
-            "provider='openlibrary',work_id='/works/OL123W',isbn13='9780306406157' "
+            "provider='openlibrary',work_id='/works/OL123W',isbn13='9780306406157',"
+            "isbn_verified=1 "
             "WHERE candidate_id=?",
             (same_work,),
         )
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.8,"
-            "isbn13='9780306406157' WHERE candidate_id=?",
+            "isbn13='9780306406157',isbn_verified=1 WHERE candidate_id=?",
             (same_isbn,),
         )
         con.execute("UPDATE candidates SET isbn13='9780306406157' WHERE id=?", (first,))
@@ -550,3 +551,241 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["provider_id"] == "6758952748"
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_google_books_override_preserves_openlibrary_work_id_and_year_provenance(database):
+    from afterword_engine.database import connect
+    from afterword_engine.publication_year_metadata import attach_publication_years
+
+    candidate_id = add_candidate("The Dispossessed", "Ursula K. Le Guin")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, candidate_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OL59863W",
+                        "title": "The Dispossessed",
+                        "author_name": ["Ursula Le Guin"],
+                        "first_publish_year": 1974,
+                        "isbn": ["9780060512750"],
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "gb-vol-dispossessed",
+                        "volumeInfo": {
+                            "title": "The Dispossessed",
+                            "authors": ["Ursula K. Le Guin"],
+                            "description": "A physicist travels between twin worlds in search of a unified theory of time.",
+                            "publishedDate": "2014-10-14",
+                            "categories": ["Science Fiction"],
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": "9780061054884"},
+                            ],
+                            "imageLinks": {
+                                "thumbnail": "https://books.google.com/books/content?id=gb-vol-dispossessed"
+                            },
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 1
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert quality["provider"] == "google_books"
+    assert quality["provider_id"] == "gb-vol-dispossessed"
+    assert quality["work_id"] == ""
+    assert quality["openlibrary_work_id"] == "/works/OL59863W"
+    assert quality["isbn_verified"] == 0
+
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    assert candidate["release_date"] == "2014-10-14"
+
+    projected = [
+        {
+            **candidate,
+            "quality_openlibrary_work_id": quality["openlibrary_work_id"],
+            "quality_work_id": quality["work_id"],
+            "quality_provider": quality["provider"],
+        }
+    ]
+    with connect() as con:
+        attach_publication_years(con, [], projected)
+    assert projected[0]["first_publication_year"] == 1974
+    assert projected[0]["publication_work_id"] == "/works/OL59863W"
+
+
+@respx.mock
+def test_unverified_title_search_box_set_isbn_keeps_unread_sequels_eligible(database):
+    box_set_isbn = "9780345538376"
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,5,?,'goodreads_csv')",
+            ("A Game of Thrones", "George R. R. Martin", box_set_isbn),
+        )
+
+    unread_sequel_id = add_candidate("A Clash of Kings", "George R. R. Martin")
+    second_sequel_id = add_candidate("A Storm of Swords", "George R. R. Martin")
+    verified_duplicate_id = add_candidate(
+        "A Game of Thrones (Box Set Edition)",
+        "George R. R. Martin",
+        isbn13=box_set_isbn,
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? "
+            "WHERE candidate_id IN (?,?,?)",
+            (QUALITY_VERSION, unread_sequel_id, second_sequel_id, verified_duplicate_id),
+        )
+
+    def ol_handler(request):
+        isbn = request.url.params.get("isbn", "")
+        title = request.url.params.get("title", "")
+        if isbn == box_set_isbn:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL257943W",
+                            "title": "A Game of Thrones",
+                            "author_name": ["George R. R. Martin"],
+                            "isbn": [box_set_isbn],
+                        }
+                    ]
+                },
+            )
+        if "Clash" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL257942W",
+                            "title": "A Clash of Kings",
+                            "author_name": ["George R. R. Martin"],
+                            "isbn": [box_set_isbn],
+                        }
+                    ]
+                },
+            )
+        if "Storm" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL257958W",
+                            "title": "A Storm of Swords",
+                            "author_name": ["George R. R. Martin"],
+                            "isbn": [box_set_isbn],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"docs": []})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    asyncio.run(audit_candidates(only_pending=True))
+
+    clash_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (unread_sequel_id,))
+    storm_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (second_sequel_id,))
+    dup_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (verified_duplicate_id,))
+    assert clash_q["isbn13"] == box_set_isbn
+    assert clash_q["isbn_verified"] == 0
+    assert clash_q["quality_status"] == "accepted"
+    assert storm_q["isbn13"] == box_set_isbn
+    assert storm_q["isbn_verified"] == 0
+    assert storm_q["quality_status"] == "accepted"
+    assert row("SELECT status FROM candidates WHERE id=?", (unread_sequel_id,))["status"] == "new"
+    assert row("SELECT status FROM candidates WHERE id=?", (second_sequel_id,))["status"] == "new"
+
+    assert dup_q["isbn_verified"] == 1
+    assert dup_q["quality_status"] == "rejected"
+    assert "read_overlap" in json.loads(dup_q["flags_json"])
+    assert row("SELECT status FROM candidates WHERE id=?", (verified_duplicate_id,))["status"] == "rejected"
+
+
+@respx.mock
+def test_isbn_parts_and_audit_reject_cross_edition_isbn_pairing(database):
+    from afterword_engine.isbn import isbn_parts
+
+    assert isbn_parts(["9780143127550", "0307474275"]) == ("9780143127550", "")
+    assert isbn_parts(["9780143127550", "0143127551"]) == ("9780143127550", "0143127551")
+
+    candidate_id = add_candidate("Station Eleven", "Emily St. John Mandel", isbn13="9780804172448")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, candidate_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OL17078986W",
+                        "title": "Station Eleven",
+                        "author_name": ["Emily St. John Mandel"],
+                        "isbn": ["9780804172448", "0307474275"],
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    asyncio.run(audit_candidates(only_pending=True))
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert quality["isbn13"] == "9780804172448"
+    assert quality["isbn10"] == ""
+    assert quality["isbn_verified"] == 1
+
+
+def test_bounded_v5_recovery_selects_legacy_google_books_without_openlibrary_work_id(database):
+    legacy_google = add_candidate("Legacy Google Match", "A Writer")
+    legacy_ol_complete = add_candidate("Legacy OpenLibrary Match", "A Writer")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='google_books',provider_id='gb-legacy',work_id='',openlibrary_work_id='' "
+            "WHERE candidate_id=?",
+            (legacy_google,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OL999W',work_id='/works/OL999W',"
+            "openlibrary_work_id='/works/OL999W' WHERE candidate_id=?",
+            (legacy_ol_complete,),
+        )
+
+    selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert legacy_google in selected_ids
+    assert legacy_ol_complete not in selected_ids
+

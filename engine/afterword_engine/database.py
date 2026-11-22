@@ -13,7 +13,7 @@ from .covers import (
     is_weak_cover_url,
 )
 from .identity import book_identity, book_identity_matches
-from .isbn import isbn_parts_from_amazon_url
+from .isbn import isbn_parts, isbn_parts_from_amazon_url
 from .secrets import unseal
 from .tenancy import profile_database_path
 
@@ -985,6 +985,168 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        ALTER TABLE candidate_quality ADD COLUMN openlibrary_work_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE candidate_quality ADD COLUMN isbn_verified INTEGER NOT NULL DEFAULT 0
+            CHECK(isbn_verified IN (0, 1));
+        CREATE INDEX IF NOT EXISTS idx_candidate_quality_openlibrary_work_id
+            ON candidate_quality(openlibrary_work_id);
+
+        UPDATE candidate_quality
+        SET openlibrary_work_id = CASE
+            WHEN INSTR(UPPER(TRIM(work_id)), '/WORKS/') > 0 THEN (
+                SELECT CASE
+                    WHEN tok GLOB 'OL[0-9]*W'
+                         AND SUBSTR(tok, 3, LENGTH(tok) - 3) NOT GLOB '*[^0-9]*'
+                         AND (
+                             after_w = ''
+                             OR SUBSTR(after_w, 1, 1) IN ('/', '?', '#')
+                             OR (
+                                 SUBSTR(after_w, 1, 5) = '.JSON'
+                                 AND (LENGTH(after_w) = 5 OR SUBSTR(after_w, 6, 1) IN ('/', '?', '#'))
+                             )
+                         )
+                    THEN '/works/' || tok
+                    ELSE ''
+                END
+                FROM (
+                    SELECT
+                        CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, 1, INSTR(tail, 'W')) ELSE '' END AS tok,
+                        CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, INSTR(tail, 'W') + 1) ELSE '' END AS after_w
+                    FROM (
+                        SELECT SUBSTR(
+                            UPPER(TRIM(candidate_quality.work_id)),
+                            INSTR(UPPER(TRIM(candidate_quality.work_id)), '/WORKS/') + 7
+                        ) AS tail
+                    )
+                )
+            )
+            WHEN LOWER(TRIM(provider)) = 'openlibrary'
+                 AND UPPER(TRIM(work_id)) GLOB 'OL[0-9]*W'
+                 AND SUBSTR(UPPER(TRIM(work_id)), 3, LENGTH(TRIM(work_id)) - 3) NOT GLOB '*[^0-9]*'
+            THEN '/works/' || UPPER(TRIM(work_id))
+            ELSE ''
+        END
+        WHERE TRIM(work_id) != '';
+
+        UPDATE candidate_quality
+        SET openlibrary_work_id = COALESCE((
+            SELECT CASE
+                WHEN tok GLOB 'OL[0-9]*W'
+                     AND SUBSTR(tok, 3, LENGTH(tok) - 3) NOT GLOB '*[^0-9]*'
+                     AND (
+                         after_w = ''
+                         OR SUBSTR(after_w, 1, 1) IN ('/', '?', '#')
+                         OR (
+                             SUBSTR(after_w, 1, 5) = '.JSON'
+                             AND (LENGTH(after_w) = 5 OR SUBSTR(after_w, 6, 1) IN ('/', '?', '#'))
+                         )
+                     )
+                THEN '/works/' || tok
+                ELSE ''
+            END
+            FROM (
+                SELECT
+                    CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, 1, INSTR(tail, 'W')) ELSE '' END AS tok,
+                    CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, INSTR(tail, 'W') + 1) ELSE '' END AS after_w
+                FROM (
+                    SELECT SUBSTR(
+                        UPPER(TRIM(c.source_url)),
+                        INSTR(UPPER(TRIM(c.source_url)), '/WORKS/') + 7
+                    ) AS tail
+                    FROM candidates c
+                    WHERE c.id = candidate_quality.candidate_id
+                      AND INSTR(UPPER(COALESCE(c.source_url, '')), '/WORKS/') > 0
+                )
+            )
+        ), '')
+        WHERE openlibrary_work_id = ''
+          AND EXISTS (
+              SELECT 1 FROM candidates c
+              WHERE c.id = candidate_quality.candidate_id
+                AND INSTR(UPPER(COALESCE(c.source_url, '')), '/WORKS/') > 0
+          );
+
+        UPDATE candidate_quality
+        SET work_id = CASE
+            WHEN LOWER(TRIM(provider)) IN ('openlibrary', '')
+                 AND openlibrary_work_id != ''
+                 AND (
+                     INSTR(UPPER(TRIM(work_id)), '/WORKS/') > 0
+                     OR (
+                         UPPER(TRIM(work_id)) GLOB 'OL[0-9]*W'
+                         AND SUBSTR(UPPER(TRIM(work_id)), 3, LENGTH(TRIM(work_id)) - 3) NOT GLOB '*[^0-9]*'
+                     )
+                 )
+            THEN openlibrary_work_id
+            ELSE ''
+        END
+        WHERE work_id != '';
+
+        UPDATE candidates
+        SET isbn10 = ''
+        WHERE isbn13 != '' AND isbn10 != ''
+          AND NOT (
+              LENGTH(isbn13) = 13 AND LENGTH(isbn10) = 10
+              AND SUBSTR(isbn13, 1, 3) = '978'
+              AND SUBSTR(isbn13, 4, 9) = SUBSTR(isbn10, 1, 9)
+          );
+
+        UPDATE candidate_quality
+        SET isbn10 = ''
+        WHERE isbn13 != '' AND isbn10 != ''
+          AND NOT (
+              LENGTH(isbn13) = 13 AND LENGTH(isbn10) = 10
+              AND SUBSTR(isbn13, 1, 3) = '978'
+              AND SUBSTR(isbn13, 4, 9) = SUBSTR(isbn10, 1, 9)
+          );
+
+        UPDATE candidate_quality
+        SET isbn_verified = 1
+        WHERE EXISTS (
+            SELECT 1 FROM candidates c
+            WHERE c.id = candidate_quality.candidate_id
+              AND (
+                  (c.isbn13 != '' AND candidate_quality.isbn13 = c.isbn13)
+                  OR (c.isbn10 != '' AND candidate_quality.isbn10 = c.isbn10)
+              )
+        );
+
+        CREATE TEMP TABLE _migration_26_requeue AS
+        SELECT c.id AS candidate_id
+        FROM candidates c
+        JOIN candidate_quality q ON q.candidate_id = c.id
+        WHERE c.status = 'rejected'
+          AND COALESCE(c.isbn13, '') = ''
+          AND COALESCE(c.isbn10, '') = ''
+          AND q.quality_status = 'rejected'
+          AND (
+              q.flags_json LIKE '%"read_overlap"%'
+              OR q.flags_json LIKE '%"duplicate_identity"%'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = c.id AND f.action = 'reject'
+          );
+
+        UPDATE candidates
+        SET status = 'new', updated_at = CURRENT_TIMESTAMP
+        WHERE id IN (SELECT candidate_id FROM _migration_26_requeue);
+
+        UPDATE candidate_quality
+        SET quality_status = 'pending',
+            flags_json = '[]',
+            isbn13 = '',
+            isbn10 = '',
+            isbn_verified = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE candidate_id IN (SELECT candidate_id FROM _migration_26_requeue);
+
+        DROP TABLE _migration_26_requeue;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1209,8 +1371,9 @@ def _backfill_source_isbns(con):
         isbn13, isbn10 = isbn_parts_from_amazon_url(candidate["source_url"])
         if not isbn13 and not isbn10:
             continue
-        next_isbn13 = candidate["isbn13"] or isbn13
-        next_isbn10 = candidate["isbn10"] or isbn10
+        next_isbn13, next_isbn10 = isbn_parts(
+            candidate["isbn13"], candidate["isbn10"], isbn13, isbn10
+        )
         con.execute(
             "UPDATE candidates SET isbn13=?,isbn10=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (next_isbn13, next_isbn10, candidate["id"]),
@@ -1221,10 +1384,20 @@ def _backfill_source_isbns(con):
         con.execute(
             """UPDATE candidate_quality SET
                 isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
-                isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                isbn10=CASE WHEN isbn13='' AND isbn10='' THEN ?
+                            WHEN isbn10='' AND isbn13=? THEN ?
+                            ELSE isbn10 END,
+                isbn_verified=CASE WHEN isbn13='' OR isbn13=? THEN 1 ELSE isbn_verified END,
                 updated_at=CURRENT_TIMESTAMP
             WHERE candidate_id=? AND quality_status IN ('pending','quarantine')""",
-            (next_isbn13, next_isbn10, candidate["id"]),
+            (
+                next_isbn13,
+                next_isbn10,
+                next_isbn13,
+                next_isbn10,
+                next_isbn13,
+                candidate["id"],
+            ),
         )
 
 @contextmanager

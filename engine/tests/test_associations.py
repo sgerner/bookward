@@ -358,3 +358,117 @@ def test_provider_receives_reads_beyond_runner_seed_limit(database):
     result = asyncio.run(run_association_provider(RecordingProvider(), reads, persist=False))
     assert result.seeds == 25
     assert result.edges == result.persisted == 0
+
+
+def test_openlibrary_list_provider_resolves_editions_skips_omnibus_and_dedupes_work_edges():
+    class EditionFixtureClient:
+        async def get_json(self, path, params=None):
+            if path == "/search.json":
+                title = (params or {}).get("title", "")
+                if title == "Seed Book":
+                    return {
+                        "docs": [
+                            {
+                                "key": "/works/OL1W",
+                                "title": "Seed Book",
+                                "author_name": ["Seed Author"],
+                            }
+                        ]
+                    }
+                if title == "Authorless Work":
+                    return {
+                        "docs": [
+                            {
+                                "key": "/works/OL50W",
+                                "title": "Authorless Work",
+                                "author_name": ["Resolved Author"],
+                                "isbn": ["9780345538376"],
+                            }
+                        ]
+                    }
+                return {"docs": []}
+            if path == "/works/OL1W/lists.json":
+                return {
+                    "entries": [
+                        {
+                            "url": "/people/reader/lists/OL9L",
+                            "name": "Curated Works",
+                            "seed_count": 5,
+                        }
+                    ]
+                }
+            if path == "/people/reader/lists/OL9L/seeds.json":
+                return {
+                    "entries": [
+                        {
+                            "key": "/books/OL10M",
+                            "title": "Translated Read Edition",
+                            "authors": [{"name": "Read Author"}],
+                        },
+                        {
+                            "key": "/books/OL20M",
+                            "title": "Target Work (Paperback Edition)",
+                            "authors": [{"name": "Target Author"}],
+                        },
+                        {
+                            "key": "/works/OL20W",
+                            "title": "Target Work",
+                            "authors": [{"name": "Target Author"}],
+                        },
+                        {
+                            "key": "/books/OL30M",
+                            "title": "Three Novels Omnibus",
+                            "authors": [{"name": "Omnibus Author"}],
+                        },
+                        {
+                            "key": "/works/OL50W",
+                            "title": "Authorless Work",
+                        },
+                    ]
+                }
+            if path == "/books/OL10M.json":
+                return {"works": [{"key": "/works/OL99W"}]}
+            if path == "/books/OL20M.json":
+                return {"works": [{"key": "/works/OL20W"}]}
+            if path == "/books/OL30M.json":
+                return {"works": [{"key": "/works/OL31W"}, {"key": "/works/OL32W"}]}
+            raise AssertionError(f"unexpected Open Library path: {path}")
+
+    provider = OpenLibraryListProvider(
+        client=EditionFixtureClient(),
+        max_seeds=1,
+        max_lists_per_seed=1,
+        max_resolutions=10,
+    )
+    reads = [
+        {"id": 1, "title": "Seed Book", "author": "Seed Author", "rating": 5},
+        {
+            "id": 2,
+            "title": "English Read Title",
+            "author": "Read Author",
+            "rating": 4,
+            "openlibrary_work_id": "/works/OL99W",
+        },
+    ]
+
+    associations = asyncio.run(provider.collect(reads))
+    assert [
+        (item.external_id, item.title, item.author, item.source_url, item.isbn)
+        for item in associations
+    ] == [
+        (
+            "/works/OL20W",
+            "Target Work (Paperback Edition)",
+            "Target Author",
+            "https://openlibrary.org/works/OL20W",
+            "",
+        ),
+        (
+            "/works/OL50W",
+            "Authorless Work",
+            "Resolved Author",
+            "https://openlibrary.org/works/OL50W",
+            "",
+        ),
+    ]
+

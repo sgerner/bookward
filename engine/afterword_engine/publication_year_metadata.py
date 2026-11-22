@@ -185,18 +185,41 @@ def _fetch_read_metadata(db, read_ids: Sequence[int]):
 
 def _fetch_candidate_quality(db, candidate_ids: Sequence[int]):
     found: dict[int, dict[str, Any]] = {}
+    columns = {
+        str(item[1])
+        for item in db.execute("PRAGMA table_info(candidate_quality)").fetchall()
+    }
+    select_columns = (
+        "candidate_id,quality_status,provider,work_id,openlibrary_work_id"
+        if "openlibrary_work_id" in columns
+        else "candidate_id,quality_status,provider,work_id"
+    )
     for start in range(0, len(candidate_ids), _QUERY_BATCH_SIZE):
         batch = candidate_ids[start : start + _QUERY_BATCH_SIZE]
         if not batch:
             continue
         marks = ",".join("?" for _ in batch)
         rows = db.execute(
-            "SELECT candidate_id,quality_status,provider,work_id "
+            f"SELECT {select_columns} "
             "FROM candidate_quality WHERE candidate_id IN (" + marks + ")",
             tuple(batch),
         ).fetchall()
         found.update({int(row["candidate_id"]): dict(row) for row in rows})
     return found
+
+
+def _candidate_openlibrary_work_id(quality: Mapping[str, Any] | None) -> str:
+    if not isinstance(quality, Mapping):
+        return ""
+    explicit_work_id = _strict_work_id(quality.get("openlibrary_work_id"))
+    legacy_work_id = (
+        _strict_work_id(quality.get("work_id"))
+        if quality.get("provider") == "openlibrary"
+        else ""
+    )
+    if explicit_work_id and legacy_work_id and explicit_work_id != legacy_work_id:
+        return ""
+    return explicit_work_id or legacy_work_id
 
 
 def _entity_ids(items: Sequence[Mapping[str, Any]]) -> list[int]:
@@ -249,14 +272,18 @@ def _verified_candidate_year(
 ) -> int | None:
     if not isinstance(quality, Mapping) or quality.get("quality_status") != "accepted":
         return None
-    if quality.get("provider") != "openlibrary":
-        return None
-    work_id = _strict_work_id(quality.get("work_id"))
+    work_id = _candidate_openlibrary_work_id(quality)
     if not work_id:
         return None
+    for field in ("quality_openlibrary_work_id", "openlibrary_work_id"):
+        passed_openlibrary_work_id = candidate.get(field)
+        if passed_openlibrary_work_id and _strict_work_id(passed_openlibrary_work_id) != work_id:
+            return None
     passed_work_id = candidate.get("quality_work_id")
-    if passed_work_id and _strict_work_id(passed_work_id) != work_id:
-        return None
+    if passed_work_id:
+        passed_provider = str(candidate.get("quality_provider") or quality.get("provider") or "")
+        if passed_provider in {"", "openlibrary"} and _strict_work_id(passed_work_id) != work_id:
+            return None
 
     years = set(_ledger_payload_years(ledger_rows, work_id))
     for ledger in ledger_rows:
@@ -334,6 +361,6 @@ def attach_publication_years(
             candidate_ledger.get(candidate_id, ()),
         )
         if candidate[PUBLICATION_YEAR_FIELD] is not None:
-            candidate["publication_work_id"] = _strict_work_id(
-                candidate_quality[candidate_id].get("work_id")
+            candidate["publication_work_id"] = _candidate_openlibrary_work_id(
+                candidate_quality[candidate_id]
             )

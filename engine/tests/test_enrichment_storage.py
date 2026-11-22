@@ -981,3 +981,223 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
         item["name"] for item in rows("PRAGMA table_info(read_metadata)")
     }
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
+
+
+def test_migration_26_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+    settings.db = str(tmp_path / "legacy-v25.db")
+    con = sqlite3.connect(settings.db)
+    con.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    for version, script in MIGRATIONS:
+        if version >= 26:
+            break
+        con.executescript(script)
+        con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+
+    source_id = con.execute(
+        "INSERT INTO sources(name,url) VALUES('Test Feed','https://example.com/feed')"
+    ).lastrowid
+
+    def insert_legacy(title, *, status="new", source_url="", c_isbn13="", q_status="accepted", provider="openlibrary", work_id="", q_isbn13="", q_isbn10="", flags="[]"):
+        cid = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,status,isbn13,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (title, "Writer", source_url, source_id, status, c_isbn13, title.lower().replace(" ", "-")),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status=?,provider=?,work_id=?,isbn13=?,isbn10=?,flags_json=?,audit_version='candidate-quality-v4' "
+            "WHERE candidate_id=?",
+            (q_status, provider, work_id, q_isbn13, q_isbn10, flags, cid),
+        )
+        return cid
+
+    ol_verified = insert_legacy(
+        "OL Verified Work",
+        c_isbn13="9780307474278",
+        work_id="/works/OL100W",
+        q_isbn13="9780307474278",
+    )
+    gb_with_source_work = insert_legacy(
+        "Google With Source Work",
+        source_url="https://openlibrary.org/works/OL200W/Book_Title",
+        provider="google_books",
+        work_id="gb-volume-42",
+        q_isbn13="9780143127550",
+        q_isbn10="0307474275",
+    )
+    ol_edition = insert_legacy(
+        "OL Edition Key",
+        provider="openlibrary",
+        work_id="/books/OL300M",
+    )
+    requeued_overlap = insert_legacy(
+        "False Box Set Read Overlap",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    requeued_dup = insert_legacy(
+        "False Duplicate Identity",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["duplicate_identity"]',
+    )
+    source_isbn_overlap = insert_legacy(
+        "True Source ISBN Overlap",
+        status="rejected",
+        c_isbn13="9780307474278",
+        q_status="rejected",
+        q_isbn13="9780307474278",
+        flags='["read_overlap"]',
+    )
+    user_rejected = insert_legacy(
+        "User Explicitly Rejected",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    con.execute(
+        "INSERT INTO feedback(candidate_id,action) VALUES(?,'reject')",
+        (user_rejected,),
+    )
+    saved_row = insert_legacy("Saved Shortlist Book", status="saved", q_isbn13="9780345538376")
+    imported_row = insert_legacy("Imported Book", status="imported", q_isbn13="9780345538376")
+    read_row = insert_legacy("Completed Read Book", status="read", q_isbn13="9780345538376")
+    con.commit()
+    con.close()
+
+    initialize(seed_demo=False)
+
+    assert row("SELECT version FROM schema_migrations WHERE version=26") == {"version": 26}
+    assert row(
+        "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (ol_verified,),
+    ) == {
+        "openlibrary_work_id": "/works/OL100W",
+        "work_id": "/works/OL100W",
+        "isbn_verified": 1,
+    }
+    assert row(
+        "SELECT openlibrary_work_id,work_id,isbn13,isbn10,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (gb_with_source_work,),
+    ) == {
+        "openlibrary_work_id": "/works/OL200W",
+        "work_id": "",
+        "isbn13": "9780143127550",
+        "isbn10": "",
+        "isbn_verified": 0,
+    }
+    assert row(
+        "SELECT openlibrary_work_id,work_id FROM candidate_quality WHERE candidate_id=?",
+        (ol_edition,),
+    ) == {"openlibrary_work_id": "", "work_id": ""}
+
+    for cid in (requeued_overlap, requeued_dup):
+        assert row("SELECT status FROM candidates WHERE id=?", (cid,)) == {"status": "new"}
+        assert row(
+            "SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?",
+            (cid,),
+        ) == {"quality_status": "pending", "flags_json": "[]"}
+
+    assert row("SELECT status FROM candidates WHERE id=?", (source_isbn_overlap,)) == {"status": "rejected"}
+    assert row("SELECT status FROM candidates WHERE id=?", (user_rejected,)) == {"status": "rejected"}
+    assert row("SELECT status FROM candidates WHERE id=?", (saved_row,)) == {"status": "saved"}
+    assert row("SELECT status FROM candidates WHERE id=?", (imported_row,)) == {"status": "imported"}
+    assert row("SELECT status FROM candidates WHERE id=?", (read_row,)) == {"status": "read"}
+
+
+def test_publishers_weekly_heading_isbn_and_rescan_ignore_unverified_quality_isbn(database, monkeypatch):
+    pw_html = (
+        b"<article>"
+        b"<h3><a href='/9780143127550'>Station Eleven</a></h3>"
+        b"<h4>By Emily Mandel. Knopf, $26.95 (336p) ISBN 978-0-14-312755-0</h4>"
+        b"<p>A traveling symphony crosses a post-pandemic landscape.</p>"
+        b"</article>"
+    )
+    parsed = ingestion.parse_book_items(pw_html, "text/html", "https://www.publishersweekly.com/pw/reviews")
+    assert len(parsed) == 1
+    assert parsed[0]["title"] == "Station Eleven"
+    assert parsed[0]["author"] == "Emily Mandel"
+    assert parsed[0]["isbn13"] == "9780143127550"
+
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url) VALUES('PW Feed','https://www.publishersweekly.com/pw/reviews')"
+        ).lastrowid
+        key = ingestion.normalize_key("Station Eleven", "Emily Mandel")
+        cid = con.execute(
+            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
+            ("Station Eleven", "Emily Mandel", source_id, "new", key),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13='9780345538376',isbn_verified=0 "
+            "WHERE candidate_id=?",
+            (cid,),
+        )
+
+    async def fake_fetch(_url):
+        return "text/html", parsed
+
+    async def passthrough(items):
+        return items
+
+    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", passthrough)
+
+    assert asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source_id,)))) == 1
+    assert row("SELECT isbn13 FROM candidates WHERE id=?", (cid,)) == {"isbn13": "9780143127550"}
+    assert row(
+        "SELECT isbn13,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (cid,),
+    ) == {"isbn13": "9780143127550", "isbn_verified": 1}
+
+
+def test_mark_recommendation_read_prefers_candidate_isbn_and_ignores_unverified_quality_isbn(database):
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+
+    headers = authenticated_headers()
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        unverified_cid = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Unverified Catalog ISBN Book','Author One',90,'recommended',?,'unverified-cat-isbn')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',"
+            "work_id='',openlibrary_work_id='/works/OL555W',isbn13='9780345538376',isbn_verified=0 "
+            "WHERE candidate_id=?",
+            (unverified_cid,),
+        )
+        preferred_cid = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
+            "VALUES('Source ISBN Wins Book','Author Two',88,'recommended',?,'9780143127550','source-isbn-wins')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13='9780307474278',isbn_verified=1 "
+            "WHERE candidate_id=?",
+            (preferred_cid,),
+        )
+
+    with TestClient(engine_main.app, headers=headers) as client:
+        r1 = client.post(f"/api/recommendations/{unverified_cid}/read", json={"rating": 4})
+        r2 = client.post(f"/api/recommendations/{preferred_cid}/read", json={"rating": 5})
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+    assert row(
+        "SELECT isbn,openlibrary_work_id FROM reads WHERE title='Unverified Catalog ISBN Book'"
+    ) == {"isbn": None, "openlibrary_work_id": "/works/OL555W"}
+    assert row(
+        "SELECT isbn FROM reads WHERE title='Source ISBN Wins Book'"
+    ) == {"isbn": "9780143127550"}
+

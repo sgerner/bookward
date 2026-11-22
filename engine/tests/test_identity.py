@@ -549,3 +549,58 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
         status = con.execute("SELECT status FROM candidates WHERE id=?", (alias_cid,)).fetchone()["status"]
     assert deduped >= 1
     assert status == "rejected"
+
+
+def test_work_match_keys_collect_across_fields_and_reject_openlibrary_editions():
+    candidate = {
+        "title": "Different Title",
+        "author": "Different Author",
+        "openlibrary_work_id": "OL101W",
+        "quality_openlibrary_work_id": "/works/OL202W",
+        "quality_work_id": "gb-volume-999",
+        "quality_provider": "google_books",
+        "work_id": "/works/OL303W",
+        "source_url": "https://openlibrary.org/works/OL404W/Some_Book?edition=key%3A/books/OL999M",
+    }
+    keys = book_row_identity_match_keys(candidate)
+    assert ("work", "openlibrary", "OL101W") in keys
+    assert ("work", "openlibrary", "OL202W") in keys
+    assert ("work", "openlibrary", "OL303W") in keys
+    assert ("work", "openlibrary", "OL404W") in keys
+
+    edition_row = {
+        "title": "Edition Only",
+        "author": "Some Author",
+        "openlibrary_work_id": "/books/OL7353617M",
+        "quality_openlibrary_work_id": "OL7353617M",
+        "quality_work_id": "/books/OL7353617M",
+        "quality_provider": "openlibrary",
+        "work_id": "https://openlibrary.org/books/OL7353617M/Title",
+        "source_url": "https://openlibrary.org/books/OL7353617M/Title",
+    }
+    edition_work_keys = {
+        key for key in book_row_identity_match_keys(edition_row) if key[0] == "work"
+    }
+    assert edition_work_keys == set()
+
+
+def test_isbn_match_keys_ignore_unverified_quality_isbns():
+    read_keys = book_identity_match_index(
+        [{"title": "Read Book", "author": "Read Author", "isbn": "9780345538376"}]
+    )
+
+    unverified_candidate = {
+        "title": "Unread Sequel",
+        "author": "Read Author",
+        "quality_isbn13": "9780345538376",
+        "quality_isbn10": "0345538374",
+        "quality_isbn_verified": 0,
+    }
+    assert not (book_row_identity_match_keys(unverified_candidate) & read_keys)
+
+    verified_candidate = {
+        **unverified_candidate,
+        "quality_isbn_verified": 1,
+    }
+    assert book_row_identity_match_keys(verified_candidate) & read_keys
+

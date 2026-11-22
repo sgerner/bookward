@@ -49,11 +49,12 @@ def canonical_isbn(value: object) -> str:
 
 
 def isbn_parts(*values: object) -> tuple[str, str]:
-    """Return the first valid ISBN-13 and ISBN-10 represented by ``values``.
+    """Return the first valid ISBN-13 and equivalent ISBN-10 from ``values``.
 
     ISBN-10 values also supply their equivalent ISBN-13 so callers can use a
     single stable lookup key while retaining the source's original edition
-    identifier.
+    identifier. A 10-digit ISBN is paired with an already-selected 13-digit
+    ISBN only when both identifiers represent the exact same book edition.
     """
 
     isbn13 = ""
@@ -65,9 +66,11 @@ def isbn_parts(*values: object) -> tuple[str, str]:
             pending[0:0] = list(value)
             continue
         raw = normalize_isbn_identifier(value)
-        if len(raw) == 10 and not isbn10 and canonical_isbn(raw):
-            isbn10 = raw.upper()
-            isbn13 = isbn13 or canonical_isbn(raw)
+        if len(raw) == 10 and not isbn10:
+            equivalent_isbn13 = canonical_isbn(raw)
+            if equivalent_isbn13 and (not isbn13 or equivalent_isbn13 == isbn13):
+                isbn10 = raw.upper()
+                isbn13 = isbn13 or equivalent_isbn13
         elif len(raw) == 13 and not isbn13 and canonical_isbn(raw):
             isbn13 = raw
     return isbn13, isbn10
@@ -113,4 +116,4 @@ def isbn_parts_from_source(values: object = (), source_url: object = "") -> tupl
 
     isbn13, isbn10 = isbn_parts(values)
     url_isbn13, url_isbn10 = isbn_parts_from_amazon_url(source_url)
-    return isbn13 or url_isbn13, isbn10 or url_isbn10
+    return isbn_parts(isbn13, isbn10, url_isbn13, url_isbn10)
