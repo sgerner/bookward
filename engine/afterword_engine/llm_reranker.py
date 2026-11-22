@@ -824,108 +824,6 @@ def _extract_response_payload(parsed: Any) -> tuple[str, list[dict[str, Any]]]:
     return "rankings", []
 
 
-async def rerank_with_llm(
-    reads: Sequence[dict[str, Any]],
-    candidates: Sequence[dict[str, Any]],
-    *,
-    interaction_events: Sequence[dict[str, Any]] | None = None,
-    profile_id: str | None = None,
-    api_url: str | None = None,
-    api_key: str | None = None,
-    model: str | None = None,
-    top_k: int | None = None,
-    max_delta: float | None = None,
-    timeout_seconds: float | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
-    url, key = _resolve_credentials(api_url, api_key)
-    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
-    k = top_k if top_k is not None else settings.llm_rerank_top_k
-    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
-    timeout = _bounded_timeout(timeout_seconds)
-
-    if not key or not url or not chosen_model or len(candidates) < 2:
-        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
-
-    messages, _payload, evidence_count = _build_rerank_prompt_data(
-        reads,
-        candidates,
-        interaction_events=interaction_events,
-        top_k=k,
-        max_delta=delta,
-    )
-    if evidence_count == 0:
-        return [dict(c) for c in candidates], {
-            "applied": False,
-            "adjusted_count": 0,
-            "reason": "insufficient_evidence",
-        }
-
-    scope = _profile_cache_scope(profile_id)
-    cache_key = _build_cache_key(
-        profile_scope=scope,
-        url=url,
-        model=chosen_model,
-        top_k=k,
-        max_delta=delta,
-        messages=messages,
-        candidates=candidates,
-        reads=reads,
-        interaction_events=interaction_events,
-    )
-    cached_hit = _cache_get(scope, cache_key)
-    if cached_hit is not None:
-        kind, payload_items = cached_hit
-        return _apply_parsed_payload(
-            candidates, kind, payload_items, top_k=k, max_delta=delta, cached=True
-        )
-
-    request_body = {
-        "model": chosen_model,
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
-        "messages": messages,
-    }
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-    try:
-        validate_public_url(url)
-        current_url = url
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=False, trust_env=False
-        ) as client:
-            response = None
-            for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-                response = await client.post(current_url, headers=headers, json=request_body)
-                if 300 <= response.status_code < 400:
-                    current_url = _validate_redirect_target(
-                        url,
-                        response.status_code,
-                        response.headers.get("location", "").strip(),
-                    )
-                    continue
-                break
-            else:
-                raise ValueError("Too many redirects from LLM endpoint")
-            assert response is not None
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            kind, payload_items = _extract_response_payload(parsed)
-            reranked, diag = _apply_parsed_payload(
-                candidates, kind, payload_items, top_k=k, max_delta=delta, cached=False
-            )
-            if diag.get("applied"):
-                _cache_put(scope, cache_key, kind, payload_items)
-            return reranked, diag
-    except Exception as exc:
-        LOGGER.warning(
-            "LLM reranker failed; falling back to base order: %s",
-            safe_error_message(exc),
-        )
-        return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
-
-
 def rerank_with_llm_sync(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -939,7 +837,7 @@ def rerank_with_llm_sync(
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
+    """Call the configured OpenAI-compatible LLM endpoint synchronously and rerank top-K candidates."""
     url, key = _resolve_credentials(api_url, api_key)
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
     k = top_k if top_k is not None else settings.llm_rerank_top_k

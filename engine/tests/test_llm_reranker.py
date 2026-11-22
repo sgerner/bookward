@@ -1113,11 +1113,12 @@ def test_held_out_loo_and_chronological_replay_non_inferiority_across_profiles()
                     assert report["reranked"]["auc"] >= report["base"]["auc"]
 
 
-def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monkeypatch) -> None:
-    import asyncio
+def test_rerank_with_llm_sync_caches_clamps_timeout_and_disables_redirects(monkeypatch) -> None:
     import socket
     import afterword_engine.llm_reranker as reranker_module
-    from afterword_engine.llm_reranker import clear_llm_rerank_cache, rerank_with_llm
+    from afterword_engine.llm_reranker import clear_llm_rerank_cache, rerank_with_llm_sync
+
+    assert not hasattr(reranker_module, "rerank_with_llm")
 
     clear_llm_rerank_cache()
     monkeypatch.setattr(
@@ -1128,18 +1129,18 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
 
     calls: list[dict] = []
 
-    class FakeAsyncClient:
+    class FakeSyncClient:
         def __init__(self, *args, **kwargs) -> None:
             self.timeout = kwargs.get("timeout")
             self.follow_redirects = kwargs.get("follow_redirects")
 
-        async def __aenter__(self):
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *args) -> None:
+        def __exit__(self, *args) -> None:
             return None
 
-        async def post(self, url: str, *, headers: dict, json: dict):
+        def post(self, url: str, *, headers: dict, json: dict):
             calls.append({"url": url, "timeout": self.timeout, "follow_redirects": self.follow_redirects})
 
             class Resp:
@@ -1157,7 +1158,7 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
                                     "content": globals()["json"].dumps(
                                         {
                                             "adjustments": [
-                                                {"id": 2, "delta": 0.85, "reason": "Async match"},
+                                                {"id": 2, "delta": 0.85, "reason": "Sync match"},
                                                 {"id": 1, "delta": 0.0, "reason": "No op"},
                                             ]
                                         }
@@ -1169,7 +1170,7 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
 
             return Resp()
 
-    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(reranker_module.httpx, "Client", FakeSyncClient)
 
     reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
     candidates = [
@@ -1177,16 +1178,14 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
         {"id": 2, "title": "Second", "author": "B", "score": 79.5, "explanation": ["Base"]},
     ]
 
-    r1, d1 = asyncio.run(
-        rerank_with_llm(
-            reads,
-            candidates,
-            profile_id="async-prof",
-            api_url="https://api.openai.com/v1/chat/completions",
-            api_key="sk-async",
-            model="gpt-4o-mini",
-            timeout_seconds=99.0,  # Clamped to <= 15.0s
-        )
+    r1, d1 = rerank_with_llm_sync(
+        reads,
+        candidates,
+        profile_id="sync-prof",
+        api_url="https://api.openai.com/v1/chat/completions",
+        api_key="sk-sync",
+        model="gpt-4o-mini",
+        timeout_seconds=99.0,  # Clamped to <= 15.0s
     )
     assert d1["applied"] is True
     assert d1["cached"] is False
@@ -1194,15 +1193,13 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
     assert calls[0]["timeout"] <= 15.0
     assert calls[0]["follow_redirects"] is False
 
-    r2, d2 = asyncio.run(
-        rerank_with_llm(
-            reads,
-            candidates,
-            profile_id="async-prof",
-            api_url="https://api.openai.com/v1/chat/completions",
-            api_key="sk-async",
-            model="gpt-4o-mini",
-        )
+    r2, d2 = rerank_with_llm_sync(
+        reads,
+        candidates,
+        profile_id="sync-prof",
+        api_url="https://api.openai.com/v1/chat/completions",
+        api_key="sk-sync",
+        model="gpt-4o-mini",
     )
     assert d2["applied"] is True
     assert d2["cached"] is True
