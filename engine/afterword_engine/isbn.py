@@ -77,6 +77,13 @@ _AMAZON_PRODUCT_RE = re.compile(
     r"/(?:dp|gp/(?:product|aw/d|aw/dp))/([^/?#]+)",
     re.IGNORECASE,
 )
+_PUBLISHERS_WEEKLY_HOSTS = frozenset(
+    {"publishersweekly.com", "www.publishersweekly.com"}
+)
+_PUBLISHERS_WEEKLY_REVIEW_RE = re.compile(
+    r"^/(?:(?:pw/)?reviews?/(?:[^/?#]+/)?)?([0-9Xx][0-9Xx-]{8,16})(?:\.html)?/?$",
+    re.IGNORECASE,
+)
 
 
 def isbn_parts_from_amazon_url(value: object) -> tuple[str, str]:
@@ -108,9 +115,48 @@ def isbn_parts_from_amazon_url(value: object) -> tuple[str, str]:
     return "", ""
 
 
+def isbn_parts_from_publishers_weekly_url(value: object) -> tuple[str, str]:
+    """Recover a checksum-valid ISBN from an allowlisted Publishers Weekly review URL."""
+
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return "", ""
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return "", ""
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in _PUBLISHERS_WEEKLY_HOSTS:
+        return "", ""
+    path = unquote(parsed.path)
+    match = _PUBLISHERS_WEEKLY_REVIEW_RE.match(path)
+    if match:
+        isbn13, isbn10 = isbn_parts(match.group(1))
+        if isbn13 or isbn10:
+            return isbn13, isbn10
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    for key, values in query.items():
+        if key.casefold() not in {"isbn", "isbn13", "isbn10"}:
+            continue
+        for candidate in values:
+            isbn13, isbn10 = isbn_parts(candidate)
+            if isbn13 or isbn10:
+                return isbn13, isbn10
+    return "", ""
+
+
 def isbn_parts_from_source(values: object = (), source_url: object = "") -> tuple[str, str]:
-    """Normalize payload ISBN fields, falling back to an Amazon URL."""
+    """Normalize payload ISBN fields, falling back to allowlisted book URLs."""
 
     isbn13, isbn10 = isbn_parts(values)
-    url_isbn13, url_isbn10 = isbn_parts_from_amazon_url(source_url)
-    return isbn13 or url_isbn13, isbn10 or url_isbn10
+    if isbn13 and isbn10:
+        return isbn13, isbn10
+    for extractor in (
+        isbn_parts_from_amazon_url,
+        isbn_parts_from_publishers_weekly_url,
+    ):
+        url_isbn13, url_isbn10 = extractor(source_url)
+        isbn13 = isbn13 or url_isbn13
+        isbn10 = isbn10 or url_isbn10
+        if isbn13 and isbn10:
+            break
+    return isbn13, isbn10

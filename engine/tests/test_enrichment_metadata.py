@@ -7,6 +7,7 @@ import pytest
 
 from afterword_engine import covers
 from afterword_engine import ingestion
+from afterword_engine.config import settings
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -15,6 +16,8 @@ from afterword_engine.covers import (
     resolve_book_metadata,
     resolve_openlibrary_work_metadata,
 )
+from afterword_engine.database import initialize, normalize_key, row, rows, transaction
+from afterword_engine.isbn import isbn_parts_from_source
 from afterword_engine.quality import _audit_one, resolve_catalog_match
 
 
@@ -170,6 +173,347 @@ def test_penguin_random_house_description_rejects_nonproduct_urls_without_fetch(
         "isbn13": "9780306406157",
     }))
     assert result == {}
+
+
+def test_publishers_weekly_grid_parser_scopes_covers_skips_cta_and_recovers_isbns():
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    markup = """<table>
+      <tr>
+        <td class="starredreview-grid">
+          <a href="/9780306406157"><img src="/cover/9780306406157"></a>
+          <h3><a href="/9780306406157">First Starred Book</a></h3>
+          <h4>Ada Writer. Press One, $28 (320p) ISBN 978-0-306-40615-7</h4>
+          <p><a href="/9780306406157">Complete Review &#187;</a></p>
+        </td>
+        <td class="starredreview-grid">
+          <a href="/0061120081"><img src="/cover/0061120081"></a>
+          <h3><a href="/0061120081">Second Starred Book</a></h3>
+          <h4>By Grace Author</h4>
+          <p><a href="/0061120081">Read Full Review &raquo;</a></p>
+        </td>
+      </tr>
+      <tr>
+        <td class="starredreview-grid">
+          <img src="/cover/row2-left.jpg">
+          <h3><a href="/books/left">Row Two Left</a></h3>
+          <h4>By Left Writer</h4>
+          <p>Complete Review »</p>
+        </td>
+        <td class="starredreview-grid">
+          <h3><a href="/9780306406150">Row Two Missing Cover</a></h3>
+          <h4>Right Writer. Press Two, $26 ISBN 978-0-306-40615-0</h4>
+          <p><a href="/9780306406150">Complete Review »</a></p>
+        </td>
+      </tr>
+      <tr>
+        <td><img src="/cover/single-row.jpg"></td>
+        <td class="starredreview-grid">
+          <h3><a href="/books/single-row">Single Row Fallback</a></h3>
+          <h4>Solo Writer. Press Three, $24 (240p) ISBN 0-306-40615-2</h4>
+          <p>A crisp literary mystery. <a href="/books/single-row">Complete Review »</a></p>
+        </td>
+      </tr>
+    </table>""".encode("utf-8")
+
+    items = ingestion.parse_book_items(markup, "text/html", source_url)
+    by_title = {item["title"]: item for item in items}
+
+    assert set(by_title) == {
+        "First Starred Book",
+        "Second Starred Book",
+        "Row Two Left",
+        "Row Two Missing Cover",
+        "Single Row Fallback",
+    }
+    assert by_title["First Starred Book"]["cover_url"] == "https://www.publishersweekly.com/cover/9780306406157"
+    assert by_title["First Starred Book"]["description"] == ""
+    assert by_title["First Starred Book"]["isbn13"] == "9780306406157"
+
+    assert by_title["Second Starred Book"]["cover_url"] == "https://www.publishersweekly.com/cover/0061120081"
+    assert by_title["Second Starred Book"]["description"] == ""
+    assert by_title["Second Starred Book"]["isbn13"] == "9780061120084"
+    assert by_title["Second Starred Book"]["isbn10"] == "0061120081"
+
+    assert by_title["Row Two Left"]["cover_url"] == "https://www.publishersweekly.com/cover/row2-left.jpg"
+    assert by_title["Row Two Missing Cover"]["cover_url"] == ""
+    assert "isbn13" not in by_title["Row Two Missing Cover"]
+    assert "isbn10" not in by_title["Row Two Missing Cover"]
+
+    assert by_title["Single Row Fallback"]["cover_url"] == "https://www.publishersweekly.com/cover/single-row.jpg"
+    assert by_title["Single Row Fallback"]["description"] == "A crisp literary mystery."
+    assert by_title["Single Row Fallback"]["isbn13"] == "9780306406157"
+    assert by_title["Single Row Fallback"]["isbn10"] == "0306406152"
+
+    assert isbn_parts_from_source((), "https://publishersweekly.com/978-0-306-40615-7") == ("9780306406157", "")
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/pw/by-topic/industry-news/article/9780306406157.html") == ("", "")
+    assert isbn_parts_from_source((), "https://publishersweekly.com.evil.example/9780306406157") == ("", "")
+    assert isbn_parts_from_source((), "https://example.com/9780306406157") == ("", "")
+
+
+def test_publishers_weekly_cta_skip_allows_catalog_synopsis_and_keeps_curated_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "pw-cta.db"))
+    initialize(seed_demo=False)
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    markup = """<table><tr>
+      <td class="starredreview-grid">
+        <img src="/cover/cta.jpg">
+        <h3><a href="/9780306406157">CTA Starred Novel</a></h3>
+        <h4>Ada Writer. Press One, $28 ISBN 978-0-306-40615-7</h4>
+        <p><a href="/9780306406157">Complete Review »</a></p>
+      </td>
+      <td class="starredreview-grid">
+        <img src="/cover/curated.jpg">
+        <h3><a href="/0061120081">Curated Starred Novel</a></h3>
+        <h4>Grace Author. Press Two, $27 ISBN 0-06-112008-1</h4>
+        <p>Editorial review excerpt kept intact.</p>
+      </td>
+    </tr></table>""".encode("utf-8")
+
+    async def fake_fetch(_url, client=None):
+        return markup, "text/html"
+
+    def provider_handler(request):
+        if request.url.host == "openlibrary.org":
+            isbn_param = request.url.params.get("isbn", "")
+            title = "CTA Starred Novel" if isbn_param == "9780306406157" else "Curated Starred Novel"
+            author = "Ada Writer" if isbn_param == "9780306406157" else "Grace Author"
+            work_key = "/works/OLCTA1W" if isbn_param == "9780306406157" else "/works/OLCUR1W"
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": work_key,
+                    "title": title,
+                    "author_name": [author],
+                    "isbn": [isbn_param] if isbn_param else [],
+                    "description": f"Catalog synopsis for {title}.",
+                    "subject": ["Literary fiction"],
+                    "first_publish_year": 2026,
+                }]},
+            )
+        return httpx.Response(200, json={"items": []})
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(provider_handler))
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    assert asyncio.run(ingestion.scan_source(source)) == 2
+
+    cta_candidate = row("SELECT id,description,isbn13 FROM candidates WHERE title='CTA Starred Novel'")
+    curated_candidate = row("SELECT id,description,isbn13 FROM candidates WHERE title='Curated Starred Novel'")
+    assert cta_candidate["description"] == "Catalog synopsis for CTA Starred Novel."
+    assert cta_candidate["isbn13"] == "9780306406157"
+    assert curated_candidate["description"] == "Editorial review excerpt kept intact."
+    assert curated_candidate["isbn13"] == "9780061120084"
+
+    cta_provenance = row(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (cta_candidate["id"],),
+    )
+    curated_provenance = row(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (curated_candidate["id"],),
+    )
+    assert cta_provenance["provider"] == "openlibrary"
+    assert curated_provenance["provider"] == "source"
+
+
+def test_scan_source_chunks_all_incomplete_items_and_hydrates_stored_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "batch-scan.db"))
+    initialize(seed_demo=False)
+    batch_size = ingestion.SOURCE_METADATA_ENRICHMENT_BATCH_SIZE
+    total_incomplete = batch_size * 2 + 5
+
+    prh_url = "https://www.penguinrandomhouse.com/books/new-releases/"
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET filters=? WHERE url=?",
+            (json.dumps({"include_genres": ["science fiction"]}), prh_url),
+        )
+        source_id = con.execute("SELECT id FROM sources WHERE url=?", (prh_url,)).fetchone()[0]
+        for index in range(2):
+            title = f"Stored Complete {index}"
+            con.execute(
+                """INSERT INTO candidates(
+                    title,author,description,cover_url,release_date,date_kind,genres,isbn13,source_url,source_id,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    "Known Writer",
+                    "Stored synopsis.",
+                    f"https://covers.openlibrary.org/b/id/{900 + index}-L.jpg",
+                    "2026-05-01",
+                    "day",
+                    json.dumps(["Science fiction"]),
+                    _isbn13_with_prefix(900 + index),
+                    f"https://www.penguinrandomhouse.com/books/{900 + index}/stored/",
+                    source_id,
+                    normalize_key(title, "Known Writer"),
+                ),
+            )
+
+    feed_items = [
+        {
+            "title": f"Stored Complete {index}",
+            "author": "Known Writer",
+            "description": "",
+            "cover_url": f"https://images.penguinrandomhouse.com/cover/{900 + index}",
+            "source_url": f"https://www.penguinrandomhouse.com/books/{900 + index}/stored/",
+            "release_date": "2026-05-01",
+            "date_kind": "day",
+            "genres": [],
+        }
+        for index in range(2)
+    ] + [
+        {
+            "title": f"Release {index}",
+            "author": "Feed Writer",
+            "description": "",
+            "cover_url": f"https://images.penguinrandomhouse.com/cover/{index}",
+            "source_url": f"https://www.penguinrandomhouse.com/books/{1000 + index}/release-{index}/",
+            "release_date": "2026-06-01",
+            "date_kind": "day",
+            "genres": [],
+        }
+        for index in range(total_incomplete)
+    ]
+
+    prh_batches = []
+    catalog_batches = []
+
+    async def fake_fetch(_url):
+        return "text/html", [dict(item) for item in feed_items]
+
+    async def fake_prh_enrich(items):
+        prh_batches.append([item["title"] for item in items])
+        return [
+            {
+                **item,
+                "description": f"Publisher synopsis for {item['title']}.",
+                "isbn13": _isbn13_with_prefix(2000 + offset),
+            }
+            for offset, item in enumerate(items)
+        ]
+
+    async def fake_catalog_enrich(items):
+        catalog_batches.append([item["title"] for item in items])
+        return [{**item, "genres": ["Science fiction"]} for item in items]
+
+    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", fake_prh_enrich)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", fake_catalog_enrich)
+
+    source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    collected = asyncio.run(ingestion.scan_source(source))
+    assert collected == total_incomplete + 2
+    assert [len(batch) for batch in prh_batches] == [batch_size, batch_size, 5]
+    assert [len(batch) for batch in catalog_batches] == [batch_size, batch_size, 5]
+    enriched_titles = {title for batch in catalog_batches for title in batch}
+    assert "Stored Complete 0" not in enriched_titles
+    assert "Stored Complete 1" not in enriched_titles
+    assert f"Release {total_incomplete - 1}" in enriched_titles
+    stored_cover = row("SELECT cover_url FROM candidates WHERE title='Stored Complete 0'")["cover_url"]
+    assert stored_cover == "https://covers.openlibrary.org/b/id/900-L.jpg"
+
+    # Warm rescan: previously enriched candidates hydrate from SQLite; only new incomplete item is enriched.
+    prh_batches.clear()
+    catalog_batches.clear()
+    feed_items.append({
+        "title": "Brand New Release",
+        "author": "Feed Writer",
+        "description": "",
+        "cover_url": "https://images.penguinrandomhouse.com/cover/new",
+        "source_url": "https://www.penguinrandomhouse.com/books/5000/brand-new-release/",
+        "release_date": "2026-07-01",
+        "date_kind": "day",
+        "genres": [],
+    })
+    second_collected = asyncio.run(ingestion.scan_source(source))
+    assert second_collected == total_incomplete + 3
+    assert prh_batches == [["Brand New Release"]]
+    assert catalog_batches == [["Brand New Release"]]
+
+
+def test_refresh_missing_candidate_metadata_retries_penguin_random_house_product_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "prh-refresh.db"))
+    initialize(seed_demo=False)
+    product_url = "https://www.penguinrandomhouse.com/books/777/retry-work-by-ada-writer"
+    expected_isbn = "9780306406157"
+
+    with transaction() as con:
+        source_id = row(
+            "SELECT id FROM sources WHERE url='https://www.penguinrandomhouse.com/books/new-releases/'"
+        )["id"]
+        candidate_id = con.execute(
+            """INSERT INTO candidates(
+                title,author,description,cover_url,release_date,date_kind,genres,source_url,source_id,normalized_key
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "Retry Work",
+                "Ada Writer",
+                "",
+                "https://images.penguinrandomhouse.com/cover/777",
+                "2026-08-01",
+                "day",
+                "[]",
+                product_url,
+                source_id,
+                normalize_key("Retry Work", "Ada Writer"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    product_html = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "Book",
+        "name": "Retry Work",
+        "author": {"@type": "Person", "name": "Ada Writer"},
+        "isbn": expected_isbn,
+        "genre": ["Science fiction"],
+    }).encode()
+    page = (
+        b'<html><head><meta name="Tealium" data-book-title="Retry Work" '
+        b'data-book-authors="Ada Writer" data-book-isbn="9780306406157">'
+        b'<script type="application/ld+json">'
+        + product_html
+        + b'</script></head><body><div id="book-description-copy">'
+        b'<div class="copy-height">Recovered publisher synopsis after retry.</div>'
+        b'</div></body></html>'
+    )
+
+    async def fake_fetch(url, client=None):
+        assert url == product_url
+        return page, "text/html"
+
+    def empty_catalog_handler(request):
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(200, json={"docs": []})
+        return httpx.Response(200, json={"items": []})
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(empty_catalog_handler))
+
+    assert asyncio.run(ingestion.refresh_missing_candidate_metadata()) == 1
+    candidate = row("SELECT description,isbn13,genres FROM candidates WHERE id=?", (candidate_id,))
+    quality = row(
+        "SELECT metadata_provider,metadata_provider_id,isbn13 FROM candidate_quality WHERE candidate_id=?",
+        (candidate_id,),
+    )
+    provenance = row(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (candidate_id,),
+    )
+    assert candidate["description"] == "Recovered publisher synopsis after retry."
+    assert candidate["isbn13"] == expected_isbn
+    assert json.loads(candidate["genres"]) == ["Science fiction"]
+    assert quality["metadata_provider"] == "penguinrandomhouse"
+    assert quality["metadata_provider_id"] == product_url
+    assert quality["isbn13"] == expected_isbn
+    assert provenance == {"provider": "penguinrandomhouse", "provider_id": product_url}
 
 
 def test_source_description_is_preserved_and_legacy_opening_upgrade_is_exact_record_only():

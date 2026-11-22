@@ -2319,13 +2319,53 @@ def _generic_container_cover(container, source_url):
     return ""
 
 
+def _container_has_cover_candidate(container):
+    if not container:
+        return False
+    attributes = (
+        "data-lazy-src",
+        "data-src",
+        "data-original",
+        "data-srcset",
+        "src",
+        "srcset",
+        "content",
+    )
+    for node in container.select(
+        "img, [itemprop='image'], meta[property='og:image'], meta[name='twitter:image']"
+    ):
+        for attribute in attributes:
+            image = node.get(attribute)
+            if not image:
+                continue
+            if "srcset" in attribute:
+                image = image.split(",", 1)[0].strip().split(" ", 1)[0]
+            if image and not image.startswith("data:"):
+                return True
+    return False
+
+
 def _generic_card_container(heading):
     for ancestor in heading.parents:
         if not ancestor or ancestor.name in ("body", "html"):
             break
+        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
+        if ancestor.name == "td" and "starredreview-grid" in classes:
+            row_node = ancestor.find_parent("tr")
+            shares_row = bool(
+                row_node
+                and (
+                    len(row_node.select("td.starredreview-grid")) > 1
+                    or any(
+                        cell is not ancestor and cell.select_one("h1, h2, h3, h4")
+                        for cell in row_node.find_all(["td", "th"], recursive=False)
+                    )
+                )
+            )
+            if _container_has_cover_candidate(ancestor) or shares_row:
+                return ancestor
         if ancestor.name == "tr" and ancestor.select_one("td.starredreview-grid"):
             return ancestor
-        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
         itemtype = str(ancestor.get("itemtype") or "").casefold()
         if ancestor.name in ("article", "li") or "book" in itemtype or classes.intersection(
             {"book", "book-card", "book-item", "book-listing", "book-blurb", "card", "listing"}
@@ -2402,26 +2442,66 @@ def _parse_generic_book_cards(soup, source_url):
     return items
 
 
-def _generic_author_from_line(value):
+_GENERIC_CTA_PARAGRAPH_RE = re.compile(
+    r"(?:(?:read|see|view)\s+(?:the\s+)?)?"
+    r"(?:(?:complete|full|entire)\s+(?:review|article|story)|review|more|read\s+more|"
+    r"continue(?:\s+reading)?|more\s+info(?:rmation)?|learn\s+more|details|full\s+synopsis)"
+    r"[\s.!?:;»›→>…-]*",
+    re.I,
+)
+_GENERIC_METADATA_ISBN_TOKEN_RE = re.compile(
+    r"(?:97[89](?:[-\s]?[0-9]){10}|(?:[0-9][-\s]?){9}[0-9Xx])\b"
+)
+
+
+def _is_generic_cta_paragraph(value):
+    text = _clean_text(value, 200)
+    return bool(text and _GENERIC_CTA_PARAGRAPH_RE.fullmatch(text))
+
+
+def _generic_heading_pair_description(node):
+    if not node or node.name != "p":
+        return ""
+    description = _clean_text(node, 4000)
+    if not description or _is_generic_cta_paragraph(description):
+        return ""
+    links = node.find_all("a")
+    if links:
+        trailing_cta = _clean_text(links[-1], 200)
+        if _is_generic_cta_paragraph(trailing_cta) and description.endswith(trailing_cta):
+            description = description[: -len(trailing_cta)].strip()
+    return description
+
+
+def _generic_metadata_from_line(value):
     text = _clean_text(value, 600)
     if not text:
-        return ""
+        return "", ""
     leading_by = bool(re.match(r"^(?:by|written\s+by|author)\s+", text, re.I))
     text = re.sub(r"^(?:by|written\s+by|author)\s*:?[\s]+", "", text, flags=re.I).strip()
-    isbn_match = re.search(r"\bISBN(?:-\d+)?\s*[:#]?\s*[0-9Xx][0-9Xx -]{8,17}", text, re.I)
+    isbn_match = re.search(r"\bISBN(?:-\d+)?\s*[:#]?\s*([0-9Xx][0-9Xx -]{8,17})", text, re.I)
     if isbn_match:
-        text = text[: isbn_match.start()].strip(" .,-")
+        token_match = _GENERIC_METADATA_ISBN_TOKEN_RE.search(text[isbn_match.start(1) :])
+        raw_isbn = token_match.group(0) if token_match else isbn_match.group(1)
+        isbn13, isbn10 = isbn_parts(raw_isbn)
+        isbn = isbn10 or isbn13
+        text = text[: isbn_match.start()].strip(" .,-(;:")
         price_match = re.search(r"\s[$€£]\s*[\d,.]+", text)
         if price_match:
-            text = text[: price_match.start()].strip(" .,-")
+            text = text[: price_match.start()].strip(" .,-(;:")
         parts = re.split(r"\.\s+", text, maxsplit=1)
-        return _clean_text(parts[0], 300) if parts else ""
+        return (_clean_text(parts[0], 300) if parts else ""), isbn
     parenthesized = re.fullmatch(r"(.+?)\s+\([^()]+\)", text)
     if parenthesized:
-        return _clean_text(parenthesized.group(1), 300)
+        return _clean_text(parenthesized.group(1), 300), ""
     if leading_by and text:
-        return _clean_text(text, 300)
-    return ""
+        return _clean_text(text, 300), ""
+    return "", ""
+
+
+def _generic_author_from_line(value):
+    author, _ = _generic_metadata_from_line(value)
+    return author
 
 
 def _parse_generic_heading_pairs(soup, source_url):
@@ -2447,12 +2527,12 @@ def _parse_generic_heading_pairs(soup, source_url):
             continue
         if metadata and metadata.name == heading.name and heading.name in ("h1", "h2", "h3"):
             continue
-        author = _generic_author_from_line(metadata.get_text(" ", strip=True) if metadata else "")
+        author, isbn = _generic_metadata_from_line(metadata.get_text(" ", strip=True) if metadata else "")
         if not title or not author:
             continue
         href = link.get("href", "") if link else ""
         description_node = metadata.find_next_sibling() if metadata else None
-        description = _clean_text(description_node, 4000) if description_node and description_node.name == "p" else ""
+        description = _generic_heading_pair_description(description_node)
         _merge_book_item(
             items,
             {
@@ -2461,6 +2541,7 @@ def _parse_generic_heading_pairs(soup, source_url):
                 "description": description,
                 "cover_url": _generic_container_cover(book_container, source_url),
                 "source_url": metadata_url(urljoin(source_url, href), source_url),
+                "isbn": isbn,
                 "release_date": None,
                 "date_kind": "",
                 "genres": [],
@@ -2810,9 +2891,10 @@ async def enrich_penguin_random_house_items(items):
             record["normalized_key"]: {
                 "description": record.get("description", ""),
                 "cover_url": record.get("cover_url", ""),
+                "genres": record.get("genres", "[]"),
             }
             for record in rows(
-                "SELECT normalized_key,description,cover_url FROM candidates "
+                "SELECT normalized_key,description,cover_url,genres FROM candidates "
                 f"WHERE normalized_key IN ({placeholders})",
                 tuple(book_keys),
             )
@@ -2829,7 +2911,11 @@ async def enrich_penguin_random_house_items(items):
             cover and not is_weak_cover_url(cover)
             for cover in (item.get("cover_url"), existing.get("cover_url"))
         )
-        return description_missing, not has_cover
+        has_genres = bool(
+            _stored_genre_values(item.get("genres"))
+            or _stored_genre_values(existing.get("genres"))
+        )
+        return description_missing, not has_cover, not has_genres
 
     linked_items = [
         item
@@ -2852,8 +2938,8 @@ async def enrich_penguin_random_house_items(items):
 
         async def enrich(item):
             key = normalize_key(item.get("title", ""), item.get("author", ""))
-            need_description, need_cover = missing_detail_fields(item)
-            if not need_description and not need_cover:
+            need_description, need_cover, need_genres = missing_detail_fields(item)
+            if not need_description and not need_cover and not need_genres:
                 return item
             url = str(item.get("source_url") or "")
             if not _penguin_random_house_book_url(url):
@@ -3128,7 +3214,8 @@ async def refresh_missing_candidate_metadata():
             item["_expected_provider_id"] = candidate.get("_legacy_metadata_provider_id") or ""
             item["_prefer_catalog_synopsis"] = True
         inputs.append(item)
-    enriched = await enrich_book_metadata(inputs)
+    publisher_inputs = await enrich_penguin_random_house_items(inputs)
+    enriched = await enrich_book_metadata(_clean_parsed_subjects(publisher_inputs))
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
@@ -3151,12 +3238,22 @@ async def refresh_missing_candidate_metadata():
             cover_url = item.get("cover_url", "")
             release_date = item.get("release_date") or None
             date_kind = item.get("date_kind") or previous.get("date_kind") or "unknown"
+            isbn13, isbn10 = isbn_parts_from_source(
+                [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+                item.get("source_url", ""),
+            )
             previous_genres = _stored_genre_values(previous.get("genres", []))
             item_genres = normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT)
             genres = normalize_subjects(previous_genres + item_genres, limit=METADATA_GENRE_LIMIT)
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             metadata_provider = str(item.get("_metadata_provider", "") or "")
             metadata_provider_id = str(item.get("_metadata_provider_id", "") or "")
+            description_provider = str(
+                item.get("_description_provider") or metadata_provider or ""
+            )
+            description_provider_id = str(
+                item.get("_description_provider_id") or metadata_provider_id or ""
+            )
             cover_changed = bool(
                 cover_url
                 and not is_weak_cover_url(cover_url)
@@ -3178,6 +3275,8 @@ async def refresh_missing_candidate_metadata():
                 release_date=COALESCE(release_date, ?),
                 date_kind=CASE WHEN release_date IS NULL AND ? IS NOT NULL THEN ? ELSE date_kind END,
                 genres=CASE WHEN ?!='[]' THEN ? ELSE genres END,
+                isbn13=CASE WHEN isbn13='' AND ?!='' THEN ? ELSE isbn13 END,
+                isbn10=CASE WHEN isbn10='' AND ?!='' THEN ? ELSE isbn10 END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (
                     description,
@@ -3190,6 +3289,10 @@ async def refresh_missing_candidate_metadata():
                     date_kind,
                     genres_json,
                     genres_json,
+                    isbn13,
+                    isbn13,
+                    isbn10,
+                    isbn10,
                     item["id"],
                 ),
             )
@@ -3214,21 +3317,38 @@ async def refresh_missing_candidate_metadata():
                 """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,
                     metadata_provider=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider END,
                     metadata_provider_id=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider_id END,
+                    isbn13=CASE WHEN isbn13='' AND ?!='' THEN ? ELSE isbn13 END,
+                    isbn10=CASE WHEN isbn10='' AND ?!='' THEN ? ELSE isbn10 END,
                     updated_at=CURRENT_TIMESTAMP
                     WHERE candidate_id=? AND quality_status='accepted'""",
                 (
                     datetime.now(timezone.utc).isoformat(timespec="microseconds"),
                     METADATA_NORMALIZATION_VERSION,
                     int(description_changed),
-                    metadata_provider,
-                    metadata_provider,
+                    description_provider,
+                    description_provider,
                     int(description_changed),
-                    metadata_provider_id,
-                    metadata_provider_id,
+                    description_provider_id,
+                    description_provider_id,
+                    isbn13,
+                    isbn13,
+                    isbn10,
+                    isbn10,
                     item["id"],
                 )
             )
     return changed + normalized_catalog_dates
+
+
+def _scan_item_needs_enrichment(item):
+    cover_url = str(item.get("cover_url") or "")
+    has_cover = bool(cover_url and not is_weak_cover_url(cover_url))
+    return not (
+        _clean_text(item.get("description"), 4000)
+        and has_cover
+        and str(item.get("release_date") or "").strip()
+        and _stored_genre_values(item.get("genres"))
+    )
 
 
 async def preview_source(url, filters=None):
@@ -3270,39 +3390,45 @@ async def scan_source(source):
     else:
         possible = filter_source_items(cleaned, configured_filters)
 
-    # A prior scan or quality pass may already know an ISBN even when the
-    # current feed item omits it. Carry that identifier into catalog cover
-    # verification before deciding whether the source image is trustworthy.
+    # A prior scan or quality pass may already know identifiers and catalog
+    # fields that the current feed omits. Hydrate stored metadata first so warm
+    # scans only enrich genuinely incomplete items.
     possible_keys = list(
         dict.fromkeys(
             normalize_key(item["title"], item.get("author", "Unknown author"))
             for item in possible
         )
     )
-    known_isbns = {}
+    stored_candidates = {}
     for start in range(0, len(possible_keys), 400):
         key_batch = possible_keys[start : start + 400]
         if not key_batch:
             continue
         placeholders = ",".join("?" for _ in key_batch)
         for candidate in rows(
-            "SELECT c.normalized_key,"
+            "SELECT c.normalized_key,c.description,c.cover_url,c.release_date,c.date_kind,c.genres,"
             "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
             "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             f"WHERE c.normalized_key IN ({placeholders})",
             tuple(key_batch),
         ):
-            known_isbns[candidate["normalized_key"]] = (
-                candidate.get("isbn13", ""),
-                candidate.get("isbn10", ""),
-            )
+            stored_candidates[candidate["normalized_key"]] = candidate
     for item_index, item in enumerate(possible):
-        known_isbn13, known_isbn10 = known_isbns.get(
+        item["_scan_enrichment_id"] = item_index
+        item["_source_provided_fields"] = [
+            field for field in ("description", "cover_url", "release_date", "genres")
+            if item.get(field)
+        ]
+        item["_source_provider_id"] = str(source["id"])
+        stored = stored_candidates.get(
             normalize_key(item["title"], item.get("author", "Unknown author")),
-            ("", ""),
+            {},
         )
-        known_isbn13, known_isbn10 = isbn_parts(known_isbn13, known_isbn10)
+        known_isbn13, known_isbn10 = isbn_parts(
+            stored.get("isbn13", ""),
+            stored.get("isbn10", ""),
+        )
         source_isbn13, source_isbn10 = isbn_parts_from_source(
             [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
             item.get("source_url", source["url"]),
@@ -3328,12 +3454,25 @@ async def scan_source(source):
             item["isbn13"] = isbn13
         if isbn10:
             item["isbn10"] = isbn10
-        item["_scan_enrichment_id"] = item_index
-        item["_source_provided_fields"] = [
-            field for field in ("description", "cover_url", "release_date", "genres")
-            if item.get(field)
-        ]
-        item["_source_provider_id"] = str(source["id"])
+        if not _clean_text(item.get("description"), 4000) and _clean_text(stored.get("description"), 4000):
+            item["description"] = stored["description"]
+        if not item.get("release_date") and stored.get("release_date"):
+            item["release_date"] = stored["release_date"]
+            if not item.get("date_kind") and stored.get("date_kind"):
+                item["date_kind"] = stored["date_kind"]
+        stored_genres = _stored_genre_values(stored.get("genres", []))
+        if stored_genres:
+            item["genres"] = normalize_subjects(
+                stored_genres + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
+                limit=METADATA_GENRE_LIMIT,
+            )
+        stored_cover = str(stored.get("cover_url") or "")
+        if stored_cover and not is_weak_cover_url(stored_cover) and (
+            not item.get("cover_url")
+            or is_weak_cover_url(item.get("cover_url"))
+            or not _scan_item_needs_enrichment({**item, "cover_url": stored_cover})
+        ):
+            item["cover_url"] = stored_cover
 
     def enrichment_priority(item):
         isbn13, isbn10 = isbn_parts_from_source(
@@ -3347,16 +3486,18 @@ async def scan_source(source):
             bool(source_cover),
         )
 
-    enrichment_pool = sorted(possible, key=enrichment_priority)
-    publisher_batch = await enrich_penguin_random_house_items(
-        enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+    enrichment_pool = sorted(
+        (item for item in possible if _scan_item_needs_enrichment(item)),
+        key=enrichment_priority,
     )
-    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
-    enriched_by_id = {
-        item["_scan_enrichment_id"]: item
-        for item in enriched_batch
-        if "_scan_enrichment_id" in item
-    }
+    enriched_by_id = {}
+    for start in range(0, len(enrichment_pool), SOURCE_METADATA_ENRICHMENT_BATCH_SIZE):
+        batch = enrichment_pool[start : start + SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+        publisher_batch = await enrich_penguin_random_house_items(batch)
+        enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
+        for item in enriched_batch:
+            if "_scan_enrichment_id" in item:
+                enriched_by_id[item["_scan_enrichment_id"]] = item
     items = [
         enriched_by_id.get(item.get("_scan_enrichment_id"), item)
         for item in possible

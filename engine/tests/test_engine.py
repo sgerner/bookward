@@ -413,6 +413,7 @@ def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pair
             "description": "A collection of fantastic stories.",
             "cover_url": "",
             "source_url": "https://publisher.example/books/call-and-response",
+            "isbn13": "9781966503149",
             "release_date": None,
             "date_kind": "",
             "genres": [],
