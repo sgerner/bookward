@@ -330,11 +330,15 @@ uv run --project engine python -m compileall -q engine/afterword_engine
 # First-run web/engine integration, with isolated temporary data (requires the web build)
 uv run --project engine python scripts/community_smoke.py
 
-# Container smoke build
-docker compose build
+# Optional container validation and disposable container smoke check
+docker compose --profile ollama -f compose.yaml config --quiet
+docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
+docker compose -p bookward-smoke up --build -d
+BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
+docker compose -p bookward-smoke down -v
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests. The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests. The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
 
 ## Contributing
 

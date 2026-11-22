@@ -1,16 +1,21 @@
 """Smoke-test the built web app and engine against disposable data.
 
-Run after npm run build:
+Run locally after npm run build:
     uv run --project engine python scripts/community_smoke.py
+
+Or against an already-running disposable stack:
+    BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
 """
 
-import os
 from html.parser import HTMLParser
+import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -40,7 +45,71 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def parse_smoke_url(raw_url: str) -> tuple[str, str]:
+    cleaned = raw_url.strip()
+    parsed = urlsplit(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"BOOKWARD_SMOKE_URL must be an http(s) URL, got {raw_url!r}")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return cleaned.rstrip("/"), origin
+
+
+def run_smoke_checks(base_url: str, origin: str, processes=()):
+    scheme = urlsplit(origin).scheme or "http"
+    with httpx.Client(
+        base_url=base_url,
+        timeout=15,
+        headers={"accept": "text/html", "x-forwarded-proto": scheme},
+    ) as client:
+        for _ in range(100):
+            if any(process.poll() is not None for process in processes):
+                raise RuntimeError("A smoke-test service exited before startup")
+            try:
+                if client.get("/login").status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(.1)
+        else:
+            raise RuntimeError("Smoke-test services did not become ready")
+        assert client.get("/").status_code == 303
+        response = client.post("/login?/setup", data={"username": "smoke-reader",
+            "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
+        assert response.status_code == 303, (response.status_code, response.text[:200])
+        assert "bookward_session" in client.cookies
+        profile_id = None
+        for path in ["/", "/?view=sources", "/?view=settings", "/account", "/admin"]:
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.status_code)
+            assert response.headers["cache-control"] == "private, no-store"
+            forms = FormBindings()
+            forms.feed(response.text)
+            for form in forms.forms:
+                if form["method"] == "post":
+                    assert form["profile"], (path, "POST form missing server-rendered profile binding")
+                    profile_id = profile_id or form["profile"]
+                    assert form["profile"] == profile_id, (path, "inconsistent profile binding")
+        assert client.post("/auth/logout", data={"__profile_id": "wrong"},
+            headers={"origin": origin}).status_code == 409
+        assert client.get("/api/v1/recommendations").status_code == 401
+        assert profile_id
+        assert client.post("/auth/logout", data={"__profile_id": profile_id},
+            headers={"origin": origin}).status_code == 303
+        assert client.get("/").status_code == 303
+        response = client.post("/login?/login", data={"username": "smoke-reader",
+            "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
+        assert response.status_code == 303
+        assert client.get("/").status_code == 200
+        print("PASS: setup, sign-in/out, authenticated views, SSR form bindings, stale-profile guard, API authentication")
+
+
 def main():
+    external_url = os.environ.get("BOOKWARD_SMOKE_URL", "").strip()
+    if external_url:
+        base_url, origin = parse_smoke_url(external_url)
+        run_smoke_checks(base_url, origin)
+        return
+
     root = Path(__file__).resolve().parents[1]
     engine_port, web_port = free_port(), free_port()
     origin = f"http://127.0.0.1:{web_port}"
@@ -57,54 +126,21 @@ def main():
                    PROTOCOL_HEADER="x-forwarded-proto")
         processes = []
         with tempfile.TemporaryFile(mode="w+") as logs:
+            failed = False
             try:
                 processes.append(subprocess.Popen([
                     str(root / "engine/.venv/bin/python"), "-m", "uvicorn",
-                    "afterword_engine.main:app", "--app-dir", "engine", "--host", "127.0.0.1",
-                    "--port", str(engine_port),
-                ], cwd=root, env=env, stdout=logs, stderr=logs))
-                processes.append(subprocess.Popen(["node", "build"], cwd=root, env=env, stdout=logs, stderr=logs))
-                with httpx.Client(base_url=origin, timeout=15, headers={"accept": "text/html", "x-forwarded-proto": "http"}) as client:
-                    for _ in range(100):
-                        if any(process.poll() is not None for process in processes):
-                            raise RuntimeError("A smoke-test service exited before startup")
-                        try:
-                            if client.get("/login").status_code == 200:
-                                break
-                        except httpx.HTTPError:
-                            pass
-                        time.sleep(.1)
-                    else:
-                        raise RuntimeError("Smoke-test services did not become ready")
-                    assert client.get("/").status_code == 303
-                    response = client.post("/login?/setup", data={"username": "smoke-reader",
-                        "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
-                    assert response.status_code == 303, (response.status_code, response.text[:200])
-                    assert "bookward_session" in client.cookies
-                    profile_id = None
-                    for path in ["/", "/?view=sources", "/?view=settings", "/account", "/admin"]:
-                        response = client.get(path)
-                        assert response.status_code == 200, (path, response.status_code)
-                        assert response.headers["cache-control"] == "private, no-store"
-                        forms = FormBindings()
-                        forms.feed(response.text)
-                        for form in forms.forms:
-                            if form["method"] == "post":
-                                assert form["profile"], (path, "POST form missing server-rendered profile binding")
-                                profile_id = profile_id or form["profile"]
-                                assert form["profile"] == profile_id, (path, "inconsistent profile binding")
-                    assert client.post("/auth/logout", data={"__profile_id": "wrong"},
-                        headers={"origin": origin}).status_code == 409
-                    assert client.get("/api/v1/recommendations").status_code == 401
-                    assert profile_id
-                    assert client.post("/auth/logout", data={"__profile_id": profile_id},
-                        headers={"origin": origin}).status_code == 303
-                    assert client.get("/").status_code == 303
-                    response = client.post("/login?/login", data={"username": "smoke-reader",
-                        "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
-                    assert response.status_code == 303
-                    assert client.get("/").status_code == 200
-                    print("PASS: setup, sign-in/out, authenticated views, SSR form bindings, stale-profile guard, API authentication")
+                    "afterword_engine.main:app", "--app-dir", str(root / "engine"),
+                    "--host", "127.0.0.1", "--port", str(engine_port),
+                ], cwd=directory, env=env, stdout=logs, stderr=logs))
+                processes.append(subprocess.Popen(
+                    ["node", str(root / "build")],
+                    cwd=directory, env=env, stdout=logs, stderr=logs,
+                ))
+                run_smoke_checks(origin, origin, processes=processes)
+            except BaseException:
+                failed = True
+                raise
             finally:
                 for process in processes:
                     process.terminate()
@@ -114,6 +150,9 @@ def main():
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+                if failed:
+                    logs.seek(0)
+                    sys.stderr.write(logs.read())
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ RUN apt-get update \
 COPY pyproject.toml uv.lock requirements.lock ./
 RUN pip install --no-cache-dir --no-deps --require-hashes -r requirements.lock
 COPY afterword_engine ./afterword_engine
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps . && pip check
 RUN useradd --create-home --uid 10001 afterword \
     && mkdir -p /data /backups \
     && chown -R afterword:afterword /app /data /backups

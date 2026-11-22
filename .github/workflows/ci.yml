@@ -112,19 +112,24 @@ jobs:
           cache-dependency-glob: engine/uv.lock
       - name: Install dependencies
         run: |
-          npm ci
-          uv sync --project engine --extra dev --frozen
+          npm ci --omit=dev
+          uv sync --project engine --no-dev --frozen
       - name: Verify fresh-install web and engine flows
-        run: uv run --project engine python scripts/community_smoke.py
+        run: uv run --project engine --no-dev --frozen python scripts/community_smoke.py
 
   containers:
     name: Container builds
-    needs: [web, engine, smoke]
+    needs: [web, engine]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Compose configurations
+        run: |
+          docker compose --profile ollama -f compose.yaml config --quiet
+          docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -134,6 +139,7 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: bookward:ci
           cache-from: type=gha,scope=bookward
           cache-to: type=gha,mode=max,scope=bookward
@@ -143,6 +149,74 @@ jobs:
         with:
           context: ./engine
           push: false
+          load: true
           tags: bookward-engine:ci
           cache-from: type=gha,scope=bookward-engine
           cache-to: type=gha,mode=max,scope=bookward-engine
+
+      - name: Boot and smoke-test containers
+        run: |
+          docker image inspect bookward:ci bookward-engine:ci >/dev/null
+          docker network create bookward-smoke
+          docker run -d \
+            --name bookward-smoke-engine \
+            --network bookward-smoke \
+            --network-alias engine \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=15 \
+            -e AFTERWORD_SERVICE_SECRET=isolated-smoke-service \
+            -e AFTERWORD_PUBLIC_URL=http://127.0.0.1:3000 \
+            -e AFTERWORD_BACKUP_INTERVAL_HOURS=0 \
+            -e AFTERWORD_SOURCE_SYNC_INTERVAL_HOURS=0 \
+            -e AFTERWORD_EMBEDDING_BACKEND=local \
+            -e AFTERWORD_EMBEDDING_MODEL=hashing-768 \
+            bookward-engine:ci
+          for _ in $(seq 1 30); do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' bookward-smoke-engine)
+            if [[ "$status" == "healthy" ]]; then
+              break
+            fi
+            if [[ "$status" == "unhealthy" ]] || [[ "$(docker inspect --format '{{.State.Running}}' bookward-smoke-engine)" != "true" ]]; then
+              echo "Engine container failed health check (status=$status)" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' bookward-smoke-engine)" != "healthy" ]]; then
+            echo "Engine container did not become healthy in time" >&2
+            exit 1
+          fi
+          test "$(docker exec bookward-smoke-engine id -un)" = "afterword"
+          docker exec bookward-smoke-engine python -c "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health')) == {'ok': True}"
+          docker run -d \
+            --name bookward-smoke-web \
+            --network bookward-smoke \
+            -p 127.0.0.1:3000:3000 \
+            -e ORIGIN=http://127.0.0.1:3000 \
+            -e ENGINE_URL=http://engine:8000 \
+            -e ENGINE_SERVICE_SECRET=isolated-smoke-service \
+            -e OIDC_AUTO_LOGIN=false \
+            bookward:ci
+          docker run --rm \
+            --network host \
+            -e BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 \
+            -v "$PWD/scripts/community_smoke.py:/tmp/community_smoke.py:ro" \
+            bookward-engine:ci \
+            python /tmp/community_smoke.py
+          test "$(docker exec bookward-smoke-web id -un)" = "node"
+
+      - name: Print container logs on failure
+        if: failure()
+        run: |
+          docker ps -a || true
+          echo "=== bookward-smoke-engine logs ==="
+          docker logs bookward-smoke-engine || true
+          echo "=== bookward-smoke-web logs ==="
+          docker logs bookward-smoke-web || true
+
+      - name: Clean up smoke containers
+        if: always()
+        run: |
+          docker rm -fv bookward-smoke-web bookward-smoke-engine >/dev/null 2>&1 || true
+          docker network rm bookward-smoke >/dev/null 2>&1 || true
