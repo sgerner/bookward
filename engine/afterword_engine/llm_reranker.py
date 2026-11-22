@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from typing import Any, Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -21,6 +21,9 @@ DEFAULT_OLLAMA_URL = "http://ollama:11434"
 DEFAULT_CLOUD_LLM_URL = "https://api.openai.com/v1/chat/completions"
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", flags=re.DOTALL | re.IGNORECASE)
+_SAFE_AUTHORITY_HOST_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?|\[[0-9a-f:]+\])")
+_SAFE_OPTIONAL_PATH_RE = re.compile(r"(?:/[A-Za-z0-9._/-]*)?")
+_SAFE_ENDPOINT_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
 
 
 def build_rerank_prompt(
@@ -255,17 +258,104 @@ def llm_rerank_allowed_hosts(raw: str | None = None) -> set[str]:
     }
 
 
-def validate_llm_rerank_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+def _validate_and_split_llm_origin(
+    url: str, allowed_hosts: set[str] | None = None
+) -> tuple[str, str, str, str]:
     cleaned = str(url or "").strip()
     if not cleaned:
         raise ValueError("LLM API URL is required")
+    if "\\" in cleaned or any(ord(ch) < 33 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError("LLM API URL contains invalid characters")
     parsed = urlparse(cleaned)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if parsed.scheme == "https":
+        scheme = "https"
+    elif parsed.scheme == "http":
+        scheme = "http"
+    else:
         raise ValueError("LLM API URL must use HTTP or HTTPS")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+    if not parsed.hostname:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+    if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
         raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
+    try:
+        port_num = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid port in LLM API URL") from exc
+
+    port_str = ""
+    if port_num is not None:
+        if not (1 <= port_num <= 65535):
+            raise ValueError("Invalid port in LLM API URL")
+        port_str = str(int(port_num))
+        if not port_str.isdigit():
+            raise ValueError("Invalid port in LLM API URL")
+
+    raw_path = parsed.path or ""
+    unquoted_path = unquote(raw_path)
+    if (
+        "%" in raw_path
+        or "\\" in unquoted_path
+        or ".." in raw_path.split("/")
+        or ".." in unquoted_path.split("/")
+        or not _SAFE_OPTIONAL_PATH_RE.fullmatch(raw_path)
+    ):
+        raise ValueError("LLM API URL contains an invalid path")
+
     hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
-    return validate_service_url(cleaned, hosts)
+    raw_host = parsed.hostname.lower().rstrip(".")
+    matched_allowed = next((allowed for allowed in hosts if allowed == raw_host), None)
+    effective_host = matched_allowed if matched_allowed is not None else raw_host
+    authority_host = (
+        f"[{effective_host}]"
+        if ":" in effective_host and not effective_host.startswith("[")
+        else effective_host
+    )
+    if not _SAFE_AUTHORITY_HOST_RE.fullmatch(authority_host):
+        raise ValueError("Invalid host in LLM API URL")
+
+    authority = f"{authority_host}:{port_str}" if port_str else authority_host
+    validate_service_url(f"{scheme}://{authority}{raw_path}", hosts)
+    return scheme, authority_host, port_str, raw_path
+
+
+def validate_llm_rerank_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+    scheme, authority_host, port_str, raw_path = _validate_and_split_llm_origin(
+        url, allowed_hosts
+    )
+    authority = f"{authority_host}:{port_str}" if port_str else authority_host
+    return f"{scheme}://{authority}{raw_path}"
+
+
+def _build_validated_llm_target_url(
+    url: str,
+    *,
+    mode: str,
+    endpoint: str,
+    allowed_hosts: set[str] | None = None,
+) -> str:
+    scheme, authority_host, port_str, raw_path = _validate_and_split_llm_origin(
+        url, allowed_hosts
+    )
+    authority = f"{authority_host}:{port_str}" if port_str else authority_host
+    canonical_input = f"{scheme}://{authority}{raw_path}"
+    if mode == "ollama":
+        base_path = urlparse(_normalize_ollama_base_url(canonical_input)).path.rstrip("/")
+        suffix = "/api/tags" if endpoint == "models" else "/api/chat"
+        endpoint_path = f"{base_path}{suffix}" if base_path else suffix
+    elif endpoint == "models":
+        endpoint_path = urlparse(_normalize_openai_models_url(canonical_input)).path
+    else:
+        endpoint_path = urlparse(_normalize_chat_url(canonical_input)).path
+
+    if (
+        ".." in endpoint_path.split("/")
+        or not _SAFE_ENDPOINT_PATH_RE.fullmatch(endpoint_path)
+    ):
+        raise ValueError("Invalid endpoint path in LLM API URL")
+
+    if port_str:
+        return f"{scheme}://{authority_host}:{port_str}{endpoint_path}"
+    return f"{scheme}://{authority_host}{endpoint_path}"
 
 
 def _normalize_ollama_base_url(url: str) -> str:
@@ -407,7 +497,12 @@ async def _request_llm_completion_async(
     timeout: float,
     allowed_hosts: set[str] | None = None,
 ) -> str:
-    validate_llm_rerank_url(api_url, allowed_hosts)
+    target_url = _build_validated_llm_target_url(
+        api_url,
+        mode=mode,
+        endpoint="chat",
+        allowed_hosts=allowed_hosts,
+    )
     headers = _build_headers(api_key, include_content_type=True)
     async with httpx.AsyncClient(
         timeout=timeout,
@@ -415,7 +510,6 @@ async def _request_llm_completion_async(
         trust_env=False,
     ) as client:
         if mode == "ollama":
-            target_url = f"{_normalize_ollama_base_url(api_url)}/api/chat"
             strict_body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -430,7 +524,6 @@ async def _request_llm_completion_async(
                 "options": {"temperature": 0.0},
             }
         else:
-            target_url = _normalize_chat_url(api_url)
             strict_body = {
                 "model": model,
                 "temperature": 0.0,
@@ -460,7 +553,12 @@ def _request_llm_completion_sync(
     timeout: float,
     allowed_hosts: set[str] | None = None,
 ) -> str:
-    validate_llm_rerank_url(api_url, allowed_hosts)
+    target_url = _build_validated_llm_target_url(
+        api_url,
+        mode=mode,
+        endpoint="chat",
+        allowed_hosts=allowed_hosts,
+    )
     headers = _build_headers(api_key, include_content_type=True)
     with httpx.Client(
         timeout=timeout,
@@ -468,7 +566,6 @@ def _request_llm_completion_sync(
         trust_env=False,
     ) as client:
         if mode == "ollama":
-            target_url = f"{_normalize_ollama_base_url(api_url)}/api/chat"
             strict_body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -483,7 +580,6 @@ def _request_llm_completion_sync(
                 "options": {"temperature": 0.0},
             }
         else:
-            target_url = _normalize_chat_url(api_url)
             strict_body = {
                 "model": model,
                 "temperature": 0.0,
@@ -610,12 +706,11 @@ async def discover_local_llm_models(
     raw_url = api_url.strip() or (DEFAULT_OLLAMA_URL if resolved_mode == "ollama" else "")
     if not raw_url:
         raise ValueError("Enter an endpoint URL to load models")
-    validate_llm_rerank_url(raw_url, allowed_hosts)
-
-    target_url = (
-        f"{_normalize_ollama_base_url(raw_url)}/api/tags"
-        if resolved_mode == "ollama"
-        else _normalize_openai_models_url(raw_url)
+    target_url = _build_validated_llm_target_url(
+        raw_url,
+        mode=resolved_mode,
+        endpoint="models",
+        allowed_hosts=allowed_hosts,
     )
     headers = _build_headers(api_key, include_content_type=False)
     async with httpx.AsyncClient(

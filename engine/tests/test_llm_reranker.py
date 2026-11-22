@@ -755,3 +755,67 @@ def test_existing_cloud_setup_with_encrypted_key_loads_reranks_and_clears(
             assert cleared.status_code == 200
             assert cleared.json()["llm_rerank"]["enabled"] is False
             assert cleared.json()["llm_rerank"]["api_key_set"] is False
+
+
+def test_validated_llm_target_url_rejects_traversal_and_canonicalizes_components() -> None:
+    import pytest
+    from afterword_engine.llm_reranker import (
+        _build_validated_llm_target_url,
+        validate_llm_rerank_url,
+    )
+
+    allowed = {"ollama", "vllm"}
+    assert (
+        _build_validated_llm_target_url(
+            "http://OLLAMA.:11434/api/chat",
+            mode="ollama",
+            endpoint="models",
+            allowed_hosts=allowed,
+        )
+        == "http://ollama:11434/api/tags"
+    )
+    assert (
+        _build_validated_llm_target_url(
+            "http://ollama:11434/proxy/v1",
+            mode="ollama",
+            endpoint="chat",
+            allowed_hosts=allowed,
+        )
+        == "http://ollama:11434/proxy/api/chat"
+    )
+    assert (
+        _build_validated_llm_target_url(
+            "http://vllm:8000",
+            mode="openai-compatible",
+            endpoint="chat",
+            allowed_hosts=allowed,
+        )
+        == "http://vllm:8000/v1/chat/completions"
+    )
+    assert (
+        _build_validated_llm_target_url(
+            "http://vllm:8000/v1/chat/completions",
+            mode="openai-compatible",
+            endpoint="models",
+            allowed_hosts=allowed,
+        )
+        == "http://vllm:8000/v1/models"
+    )
+
+    malformed_urls = [
+        "http://ollama:11434/../../admin",
+        "http://ollama:11434/%2e%2e/admin",
+        "http://ollama:11434\\@127.0.0.1",
+        "http://user:secret@ollama:11434",
+        "http://ollama:11434/v1?redirect=http://127.0.0.1",
+        "http://ollama:11434/v1#frag",
+        "http://ollama:99999/v1",
+    ]
+    for bad in malformed_urls:
+        with pytest.raises(ValueError):
+            validate_llm_rerank_url(bad, allowed)
+        with pytest.raises(ValueError):
+            _build_validated_llm_target_url(
+                bad, mode="ollama", endpoint="chat", allowed_hosts=allowed
+            )
+
