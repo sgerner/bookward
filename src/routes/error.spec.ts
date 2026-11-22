@@ -35,12 +35,20 @@ describe('+error.svelte', () => {
 		expect(body).not.toContain('evil.example');
 	});
 
-	it('preserves distinct 404 and 503 recovery copy', () => {
+	it('preserves distinct 404, 413, and 503 recovery copy', () => {
 		pageState.status = 404;
 		pageState.error = { status: 404, message: 'Not Found' };
 		const missing = render(ErrorPage);
 		expect(missing.body).toContain('Page not found');
 		expect(missing.body).toContain('Go to Bookward');
+
+		pageState.status = 413;
+		pageState.error = { status: 413, message: 'Payload Too Large' };
+		const oversized = render(ErrorPage);
+		expect(oversized.body).toContain('File too large');
+		expect(oversized.body).toContain('10 MB');
+		expect(oversized.body).toContain('Back to Settings');
+		expect(oversized.body).toContain('/?view=settings');
 
 		pageState.status = 503;
 		pageState.error = { status: 503, message: 'Service Unavailable' };

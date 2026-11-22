@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import httpx
 

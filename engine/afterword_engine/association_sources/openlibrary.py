@@ -8,9 +8,10 @@ only and do not change the visible recommendation score.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx

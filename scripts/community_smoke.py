@@ -115,7 +115,7 @@ def main(
                    AFTERWORD_PUBLIC_URL=origin, ENGINE_SERVICE_SECRET="isolated-smoke-service",
                    ENGINE_URL=f"http://127.0.0.1:{engine_port}", ORIGIN="",
                    HOST="127.0.0.1", PORT=str(web_port), OIDC_AUTO_LOGIN="false",
-                   PYTHONUNBUFFERED="1")
+                   BODY_SIZE_LIMIT="12M", PYTHONUNBUFFERED="1")
         env.pop("PROTOCOL_HEADER", None)
         env.pop("HOST_HEADER", None)
         default_engine_cmd = [
@@ -211,7 +211,72 @@ def main(
                 )
                 assert response.status_code == 303
                 assert client.get("/").status_code == 200
-                print("PASS: setup, sign-in/out, authenticated views, SSR form bindings, stale-profile guard, API authentication")
+                action_headers = {
+                    "origin": origin,
+                    "accept": "application/json",
+                    "x-sveltekit-action": "true",
+                }
+                review_padding = "r" * 10_500
+                csv_rows = [
+                    "Book Id,Title,Author,Exclusive Shelf,My Rating,Date Read,My Review"
+                ] + [
+                    f'{idx},"Smoke Book {idx}",Smoke Author,read,5,2026/01/02,"{review_padding}"'
+                    for idx in range(1, 61)
+                ]
+                csv_600kb = ("\n".join(csv_rows) + "\n").encode("utf-8")
+                assert len(csv_600kb) > 600_000
+                csv_ok = client.post(
+                    "/?/importGoodreadsCsv",
+                    data={"__profile_id": profile_id},
+                    files={"file": ("goodreads_library_export.csv", csv_600kb, "text/csv")},
+                    headers=action_headers,
+                )
+                assert csv_ok.status_code == 200, (csv_ok.status_code, csv_ok.text[:200])
+                assert csv_ok.json()["type"] == "success"
+
+                bad_csv = client.post(
+                    "/?/importGoodreadsCsv",
+                    data={"__profile_id": profile_id},
+                    files={"file": ("bad.csv", b"not,goodreads\n1,2\n", "text/csv")},
+                    headers=action_headers,
+                )
+                assert bad_csv.status_code == 400, (bad_csv.status_code, bad_csv.text[:200])
+                assert bad_csv.json()["type"] == "failure"
+
+                over_10mb_csv = b"Title,Author\n" + (b"x" * 10_050_000)
+                over_10mb = client.post(
+                    "/?/importGoodreadsCsv",
+                    data={"__profile_id": profile_id},
+                    files={"file": ("oversized-10m.csv", over_10mb_csv, "text/csv")},
+                    headers=action_headers,
+                )
+                assert over_10mb.status_code == 413, (over_10mb.status_code, over_10mb.text[:200])
+                assert over_10mb.json()["type"] == "failure"
+                assert "10 MB" in over_10mb.text
+
+                over_body_limit = b"Title,Author\n" + (b"x" * 13_000_000)
+                over_body_json = client.post(
+                    "/?/importGoodreadsCsv",
+                    data={"__profile_id": profile_id},
+                    files={"file": ("oversized-13m.csv", over_body_limit, "text/csv")},
+                    headers=action_headers,
+                )
+                assert over_body_json.status_code == 413, (over_body_json.status_code, over_body_json.text[:200])
+                over_body_payload = over_body_json.json()
+                assert "10 MB" in over_body_payload["detail"]
+                assert over_body_payload["message"] == over_body_payload["detail"]
+
+                over_body_html = client.post(
+                    "/?/importGoodreadsCsv",
+                    data={"__profile_id": profile_id},
+                    files={"file": ("oversized-13m.csv", over_body_limit, "text/csv")},
+                    headers={"origin": origin},
+                )
+                assert over_body_html.status_code == 413, (over_body_html.status_code, over_body_html.text[:200])
+                assert "text/html" in over_body_html.headers.get("content-type", "")
+                assert "10 MB" in over_body_html.text
+
+                print("PASS: setup, sign-in/out, authenticated views, SSR form bindings, stale-profile guard, CSV uploads, API authentication")
         except BaseException:
             failed = True
             raise
