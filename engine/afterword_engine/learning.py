@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -27,7 +28,7 @@ from .decision_evidence import (
     purge_recommendation_evidence,
     build_decision_evidence,
 )
-from .identity import book_identity
+from .identity import book_row_identity_match_keys
 
 
 LOGGER = logging.getLogger(__name__)
@@ -255,7 +256,18 @@ def _record_outcome(
         and existing["label_kind"] == label_kind
         and float(existing["confidence"]) == float(confidence)
     ):
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE event_id=? AND impression_id!=?",
+            (event_id, impression_id),
+        )
         return "unchanged"
+    superseded = (
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE event_id=? AND impression_id!=?",
+            (event_id, impression_id),
+        ).rowcount
+        > 0
+    )
     con.execute(
         "INSERT INTO recommendation_outcomes(impression_id,event_id,read_id,label,label_kind,confidence,attributed_at) "
         "VALUES(?,?,?,?,?,?,?) ON CONFLICT(impression_id,event_id) DO UPDATE SET "
@@ -271,7 +283,7 @@ def _record_outcome(
             attributed_at or utc_now(),
         ),
     )
-    return "updated" if existing else "created"
+    return "updated" if (existing or superseded) else "created"
 
 
 def record_event_in_connection(
@@ -313,7 +325,12 @@ def record_event_in_connection(
     ).fetchone()
     read_value_changed = False
     if existing:
-        if not _existing_event_matches(
+        is_reattributed_read_import = (
+            source == "read_import"
+            and event_type == "read"
+            and existing["event_type"] == "read"
+        )
+        if not is_reattributed_read_import and not _existing_event_matches(
             existing,
             run_id=run_id,
             candidate_id=candidate_id,
@@ -324,10 +341,15 @@ def record_event_in_connection(
             raise ValueError("Event key was already used for a different event")
         event_id = int(existing["id"])
         duplicate = True
-        if event_type == "read" and existing["value"] != value:
+        if event_type == "read" and (
+            existing["value"] != value
+            or existing["run_id"] != run_id
+            or int(existing["candidate_id"]) != int(candidate_id)
+            or existing["metadata"] != encoded_metadata
+        ):
             con.execute(
-                "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
-                (value, timestamp, event_id),
+                "UPDATE recommendation_events SET run_id=?,candidate_id=?,value=?,occurred_at=?,metadata=? WHERE id=?",
+                (run_id, candidate_id, value, timestamp, encoded_metadata, event_id),
             )
             read_value_changed = True
     else:
@@ -465,6 +487,14 @@ def _read_label(read: dict[str, Any]):
     return 0.5, "rating_neutral", 0.25
 
 
+def _impression_sort_key(impression) -> tuple[datetime, int]:
+    raw_time = impression["visible_at"] or impression["presented_at"]
+    parsed, _ = _read_time(raw_time)
+    if parsed is None:
+        parsed = datetime.min.replace(tzinfo=timezone.utc)
+    return (parsed, int(impression["id"]))
+
+
 def attribute_read_outcomes() -> dict[str, int]:
     """Join imported reads to the latest preceding recommendation exposure.
 
@@ -474,15 +504,50 @@ def attribute_read_outcomes() -> dict[str, int]:
     time, not evidence of when the book was read.
     """
 
+    from .ingestion import read_identity_rows_with_current_verified_work_ids
+
     scanned = created = updated = attributed = 0
     with transaction() as con:
-        reads = [dict(item) for item in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
-        candidates = [dict(item) for item in con.execute("SELECT id,title,author FROM candidates").fetchall()]
-        by_identity = {book_identity(item["title"], item["author"]): item for item in candidates}
+        read_rows = [dict(item) for item in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
+        try:
+            read_metadata_rows = [
+                dict(item)
+                for item in con.execute(
+                    "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                    "FROM read_metadata WHERE verified_work_id!=''"
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError as exc:
+            if "no such table: read_metadata" not in str(exc).casefold():
+                raise
+            read_metadata_rows = []
+        reads = read_identity_rows_with_current_verified_work_ids(
+            read_rows, read_metadata_rows
+        )
+        candidates = [
+            dict(item)
+            for item in con.execute(
+                "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
+                "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
+                "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
+                "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
+                "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10 "
+                "FROM candidates c "
+                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                "ORDER BY c.id"
+            ).fetchall()
+        ]
+        by_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for item in candidates:
+            for key in book_row_identity_match_keys(item):
+                by_match_key.setdefault(key, []).append(item)
         for read in reads:
             scanned += 1
-            candidate = by_identity.get(book_identity(read["title"], read["author"]))
-            if not candidate:
+            matched_candidates: dict[int, dict[str, Any]] = {}
+            for key in book_row_identity_match_keys(read):
+                for item in by_match_key.get(key, ()):
+                    matched_candidates[int(item["id"])] = item
+            if not matched_candidates:
                 continue
             read_time, day_precision = _read_time(read.get("read_at"))
             source = str(read.get("source") or "").strip().casefold()
@@ -490,18 +555,30 @@ def attribute_read_outcomes() -> dict[str, int]:
                 read_time, day_precision = _read_time(read.get("created_at"))
             if read_time is None:
                 continue
-            impression_rows = con.execute(
-                "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-                "FROM recommendation_impressions WHERE candidate_id=? "
-                "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-                (candidate["id"],),
-            ).fetchall()
-            impression = next(
-                (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
-                None,
-            )
-            if impression is None:
+            selected_candidate = None
+            impression = None
+            best_sort_key: tuple[datetime, int] | None = None
+            for candidate in matched_candidates.values():
+                impression_rows = con.execute(
+                    "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
+                    "FROM recommendation_impressions WHERE candidate_id=? "
+                    "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+                    (candidate["id"],),
+                ).fetchall()
+                candidate_impression = next(
+                    (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
+                    None,
+                )
+                if candidate_impression is None:
+                    continue
+                sort_key = _impression_sort_key(candidate_impression)
+                if best_sort_key is None or sort_key > best_sort_key:
+                    best_sort_key = sort_key
+                    selected_candidate = candidate
+                    impression = candidate_impression
+            if impression is None or selected_candidate is None:
                 continue
+            candidate = selected_candidate
             label, label_kind, confidence = _read_label(read)
             event_key = f"read:{int(read['id']):08d}"
             manual_event_key = (

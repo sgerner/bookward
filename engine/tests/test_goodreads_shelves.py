@@ -168,3 +168,109 @@ def test_import_goodreads_csv_populates_and_clears_shelf_items(tmp_path: Path, m
         ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
         ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
     ]
+
+
+def test_import_goodreads_csv_stores_and_updates_additional_authors_preserving_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine.ingestion import _read_metadata_identity_hash, import_goodreads_csv
+    from afterword_engine.scoring import score_all
+
+    db_path = tmp_path / "csv_coauthors.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    initial_csv = (
+        "Title,Author,Additional Authors,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Good Omens,Neil Gaiman,,4,2025/05/01,2025/04/01,read,=\"9780060853983\"\n"
+        "This Is How You Lose the Time War,Amal El-Mohtar,,0,,2026/01/10,to-read,=\"9781534431003\"\n"
+        "The Talisman,Stephen King,,0,,2026/02/01,currently-reading,=\"9781982115524\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(initial_csv) == 1
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute(
+            "UPDATE reads SET openlibrary_work_id='/works/OL262458W' WHERE title='Good Omens'"
+        )
+        read_row = dict(con.execute("SELECT * FROM reads WHERE title='Good Omens'").fetchone())
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+            "identity_provider_id,identity_hash,description) VALUES(?,?,?,?,?,?)",
+            (
+                read_row["id"],
+                "/works/OL262458W",
+                "openlibrary",
+                "/works/OL262458W",
+                _read_metadata_identity_hash(read_row),
+                "Cached synopsis that must survive additional_authors updates.",
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    updated_csv = (
+        "Title,Author,Additional Authors,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Good Omens,Neil Gaiman,Terry Pratchett,5,2025/05/01,2025/04/01,read,=\"9780060853983\"\n"
+        "This Is How You Lose the Time War,Amal El-Mohtar,Max Gladstone,0,,2026/01/10,to-read,=\"9781534431003\"\n"
+        "The Talisman,Stephen King,Peter Straub,0,,2026/02/01,currently-reading,=\"9781982115524\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(updated_csv) == 1
+
+    con = sqlite3.connect(db_path)
+    try:
+        reads = con.execute(
+            "SELECT title, author, additional_authors, rating, openlibrary_work_id FROM reads"
+        ).fetchall()
+        cached_meta = con.execute(
+            "SELECT verified_work_id, description FROM read_metadata"
+        ).fetchall()
+        shelves = con.execute(
+            "SELECT shelf, title, author, additional_authors FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+        con.execute(
+            "INSERT OR IGNORE INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'List', 'https://example.com', 'rss', 1)"
+        )
+        for cid, title, author in [
+            (20, "This Is How You Lose the Time War", "Max Gladstone"),
+            (21, "The Talisman", "Peter Straub"),
+        ]:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, normalized_key) "
+                "VALUES(?, 999, ?, ?, 'new', ?)",
+                (cid, title, author, f"{title.lower()}|{author.lower()}"),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    assert reads == [
+        ("Good Omens", "Neil Gaiman", "Terry Pratchett", 5.0, "/works/OL262458W")
+    ]
+    assert cached_meta == [
+        ("/works/OL262458W", "Cached synopsis that must survive additional_authors updates.")
+    ]
+    assert shelves == [
+        ("currently-reading", "The Talisman", "Stephen King", "Peter Straub"),
+        ("to-read", "This Is How You Lose the Time War", "Amal El-Mohtar", "Max Gladstone"),
+    ]
+
+    asyncio.run(score_all())
+    con = sqlite3.connect(db_path)
+    try:
+        scored = con.execute(
+            "SELECT id, status, explanation FROM candidates WHERE id IN (20, 21) ORDER BY id"
+        ).fetchall()
+    finally:
+        con.close()
+    assert scored[0][1] == "recommended"
+    assert "On your Goodreads to-read shelf" in scored[0][2]
+    assert scored[1][1] == "hidden"

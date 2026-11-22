@@ -549,3 +549,159 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
         status = con.execute("SELECT status FROM candidates WHERE id=?", (alias_cid,)).fetchone()["status"]
     assert deduped >= 1
     assert status == "rejected"
+
+
+def test_read_identity_index_matches_coauthors_subtitles_and_series_variants():
+    cases = [
+        (
+            {"title": "Good Omens", "author": "Neil Gaiman", "additional_authors": "Terry Pratchett"},
+            {"title": "Good Omens", "author": "Terry Pratchett & Neil Gaiman"},
+        ),
+        (
+            {"title": "Good Omens", "author": "Neil Gaiman", "additional_authors": "Terry Pratchett"},
+            {"title": "Good Omens", "author": "Terry Pratchett"},
+        ),
+        (
+            {"title": "This Is How You Lose the Time War", "author": "Amal El-Mohtar"},
+            {"title": "This Is How You Lose the Time War", "author": "Amal El-Mohtar and Max Gladstone"},
+        ),
+        (
+            {"title": "The Talisman", "author": "Stephen King, Peter Straub"},
+            {"title": "The Talisman", "author": "Peter Straub"},
+        ),
+        (
+            {"title": "Piranesi", "author": "Susanna Clarke"},
+            {"title": "Piranesi: A Novel", "author": "Susanna Clarke"},
+        ),
+        (
+            {"title": "Station Eleven: A Novel", "author": "Emily St. John Mandel"},
+            {"title": "Station Eleven", "author": "Emily St. John Mandel"},
+        ),
+        (
+            {"title": "Educated", "author": "Tara Westover"},
+            {"title": "Educated: A Memoir", "author": "Tara Westover"},
+        ),
+        (
+            {"title": "Dune", "author": "Frank Herbert"},
+            {"title": "Dune: Deluxe Edition", "author": "Frank Herbert"},
+        ),
+        (
+            {"title": "Red Rising", "author": "Pierce Brown"},
+            {"title": "Red Rising (Red Rising)", "author": "Pierce Brown"},
+        ),
+        (
+            {"title": "Leviathan Wakes", "author": "James S. A. Corey"},
+            {"title": "Leviathan Wakes (The Expanse, Book One)", "author": "James S. A. Corey"},
+        ),
+        (
+            {"title": "Leviathan Wakes", "author": "James S. A. Corey"},
+            {"title": "Leviathan Wakes: The Expanse, Book One", "author": "James S. A. Corey"},
+        ),
+    ]
+    for read_row, candidate_row in cases:
+        indexed = ReadIdentityIndex.from_reads([read_row])
+        assert indexed.matches(candidate_row), f"Expected match for {read_row} vs {candidate_row}"
+
+    # Guardrails: sequels, omnibuses, generational suffixes, and inverted names remain distinct.
+    dune_index = ReadIdentityIndex.from_reads([{"title": "Dune", "author": "Frank Herbert"}])
+    assert not dune_index.matches({"title": "Dune: Messiah", "author": "Frank Herbert"})
+    assert not dune_index.matches({"title": "Dune: Messiah: Deluxe Edition", "author": "Frank Herbert"})
+    messiah_index = ReadIdentityIndex.from_reads([{"title": "Dune: Messiah", "author": "Frank Herbert"}])
+    assert messiah_index.matches({"title": "Dune: Messiah: Deluxe Edition", "author": "Frank Herbert"})
+
+    omnibus_index = ReadIdentityIndex.from_reads([{"title": "Tales", "author": "Author"}])
+    assert not omnibus_index.matches({"title": "Tales (Tales, #1-3)", "author": "Author"})
+    assert not omnibus_index.matches({"title": "Tales (Books One-Three)", "author": "Author"})
+    assert not omnibus_index.matches({"title": "Tales: Three Stories", "author": "Author"})
+
+    suffix_index = ReadIdentityIndex.from_reads([
+        {"title": "Shared Title", "author": "Kurt Vonnegut, Jr."},
+        {"title": "Suffix Only", "author": "III"},
+    ])
+    assert not suffix_index.matches({"title": "Shared Title", "author": "Walter M. Miller, Jr."})
+    assert not suffix_index.matches({"title": "Suffix Only", "author": "Real Author, III"})
+    assert not suffix_index.matches({"title": "Suffix Only", "author": "III"})
+
+    inverted_index = ReadIdentityIndex.from_reads([
+        {"title": "Homecoming", "author": "Atkinson, Kate"},
+    ])
+    assert not inverted_index.matches({"title": "Homecoming", "author": "Morton, Kate"})
+
+
+def test_serving_scoring_quality_and_digest_exclude_coauthor_subtitle_and_series_reads(database):
+    from afterword_engine.quality import _dedupe_and_hide
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,additional_authors,rating,source) VALUES(?,?,?,5,'goodreads_csv')",
+            ("Good Omens", "Neil Gaiman", "Terry Pratchett"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("Red Rising", "Pierce Brown"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("Dune", "Frank Herbert"),
+        )
+
+    coauthor_cid = add_candidate("Good Omens", "Terry Pratchett & Neil Gaiman", score=98)
+    subtitle_cid = add_candidate("Piranesi: A Novel", "Susanna Clarke", score=97)
+    repeated_series_cid = add_candidate("Red Rising (Red Rising)", "Pierce Brown", score=96)
+    word_series_cid = add_candidate("Dune (Dune Chronicles, Book One)", "Frank Herbert", score=95)
+    sequel_cid = add_candidate("Dune: Messiah", "Frank Herbert", score=94)
+
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            [
+                (coauthor_cid,),
+                (subtitle_cid,),
+                (repeated_series_cid,),
+                (word_series_cid,),
+                (sequel_cid,),
+            ],
+        )
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert visible_ids == {sequel_cid}
+
+    digest_ids = {
+        item["id"]
+        for item in _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    }
+    assert digest_ids == {sequel_cid}
+
+    class FakeEmbedder:
+        name, model = "test", "multi-key-exclusion"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+    assert asyncio.run(score_all(embedder=embedder)) == 1
+    assert any("Dune: Messiah" in text for text in embedder.texts)
+    assert not any("Terry Pratchett & Neil Gaiman" in text for text in embedder.texts)
+    assert not any("Piranesi: A Novel" in text for text in embedder.texts)
+    assert not any("Red Rising (Red Rising)" in text for text in embedder.texts)
+
+    with transaction() as con:
+        _dedupe_and_hide(con)
+        statuses = dict(
+            con.execute(
+                "SELECT id,status FROM candidates WHERE id IN (?,?,?,?,?)",
+                (coauthor_cid, subtitle_cid, repeated_series_cid, word_series_cid, sequel_cid),
+            ).fetchall()
+        )
+    assert statuses == {
+        coauthor_cid: "rejected",
+        subtitle_cid: "rejected",
+        repeated_series_cid: "rejected",
+        word_series_cid: "rejected",
+        sequel_cid: "recommended",
+    }

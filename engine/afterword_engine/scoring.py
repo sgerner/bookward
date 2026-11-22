@@ -279,7 +279,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     from .identity import book_row_identity_match_keys
     with connect() as con:
         shelf_rows = con.execute(
-            "SELECT shelf, title, author, isbn, openlibrary_work_id FROM goodreads_shelf_items"
+            "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id FROM goodreads_shelf_items"
         ).fetchall()
     to_read_keys: set[str] = set()
     currently_reading_keys: set[str] = set()

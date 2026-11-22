@@ -985,6 +985,13 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        ALTER TABLE reads ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
+        ALTER TABLE goodreads_shelf_items ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
