@@ -20,6 +20,8 @@ from pathlib import Path
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.hmac import HMAC
 
 from .api_tokens import (
     TOKEN_MAX_LENGTH,
@@ -287,9 +289,9 @@ def is_valid_api_token_format(token: str | None) -> bool:
 
 
 def _token_cache_key(token: str) -> str:
-    return hmac.new(
-        auth_registry_key(), token.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    mac = HMAC(auth_registry_key(), hashes.SHA256())
+    mac.update(token.encode("utf-8"))
+    return mac.finalize().hex()
 
 
 def has_cached_api_token(token: str | None) -> bool:

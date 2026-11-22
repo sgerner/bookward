@@ -1366,9 +1366,10 @@ def test_auth_registry_key_caches_disk_secret_and_refreshes_on_env_or_file_chang
 def test_api_token_digest_cache_is_bounded_hmac_keyed_and_excludes_invalid_tokens(
     identity_store, monkeypatch
 ):
-    import hashlib
-    import hmac
     import statistics
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.hmac import HMAC
     from afterword_engine.api_tokens import hash_api_token
     from afterword_engine.secrets import auth_registry_key
 
@@ -1396,13 +1397,18 @@ def test_api_token_digest_cache_is_bounded_hmac_keyed_and_excludes_invalid_token
     assert profiles.authenticate_api_token(token_a)["id"] == created_a["id"]
     assert derivations == 1
 
-    expected_hmac_key = hmac.new(
-        auth_registry_key(), token_a.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    expected_mac = HMAC(auth_registry_key(), hashes.SHA256())
+    expected_mac.update(token_a.encode("utf-8"))
+    expected_hmac_key = expected_mac.finalize().hex()
     assert list(profiles._VERIFIED_TOKEN_DIGESTS.keys()) == [expected_hmac_key]
     cached_entry = profiles._VERIFIED_TOKEN_DIGESTS[expected_hmac_key]
     assert token_a not in profiles._VERIFIED_TOKEN_DIGESTS
     assert token_a not in repr(cached_entry)
+
+    # Rotating the installation signing secret changes the derived HMAC cache key.
+    with monkeypatch.context() as m:
+        m.setenv("AFTERWORD_SECRET_KEY", Fernet.generate_key().decode())
+        assert profiles._token_cache_key(token_a) != expected_hmac_key
 
     # Repeat authentications hit the cache in < 5 ms median without PBKDF2 hashing.
     latencies_ms = []
