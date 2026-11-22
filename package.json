@@ -39,5 +39,5 @@
 	"overrides": {
 		"cookie": "2.0.1"
 	},
-	"allowScripts": ["esbuild"]
+	"allowScripts": {}
 }
