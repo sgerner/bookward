@@ -3,7 +3,14 @@ import re
 import socket
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
-BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata.google.internal"}
+BLOCKED_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+    "instance-data",
+}
 _ERROR_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 
 
