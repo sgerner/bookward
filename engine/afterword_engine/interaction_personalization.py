@@ -13,8 +13,9 @@ import re
 import sqlite3
 import unicodedata
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 

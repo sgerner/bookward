@@ -9,11 +9,12 @@ Google volume metadata or raw responses to SQLite.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 import re
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
