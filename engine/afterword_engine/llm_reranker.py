@@ -727,75 +727,6 @@ async def probe_llm_reranker(
     return {"ok": True, "checked": True, "model": chosen_model}
 
 
-async def rerank_with_llm(
-    reads: Sequence[dict[str, Any]],
-    candidates: Sequence[dict[str, Any]],
-    *,
-    interaction_events: Sequence[dict[str, Any]] | None = None,
-    api_url: str | None = None,
-    api_key: str | None = None,
-    model: str | None = None,
-    top_k: int | None = None,
-    max_delta: float | None = None,
-    timeout_seconds: float | None = None,
-    allowed_hosts: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
-    key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    raw_url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
-    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
-    k = top_k if top_k is not None else settings.llm_rerank_top_k
-    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
-    timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
-
-    if not key or not raw_url or not chosen_model or len(candidates) < 2:
-        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
-
-    try:
-        target_url, host_headers, extensions = _prepare_llm_request_target(
-            raw_url, allowed_hosts=allowed_hosts
-        )
-        messages = build_rerank_prompt(
-            reads, candidates, interaction_events=interaction_events, top_k=k
-        )
-        extra_kwargs: dict[str, Any] = {"extensions": extensions} if extensions else {}
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.post(
-                target_url,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                    **host_headers,
-                },
-                json={
-                    "model": chosen_model,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-                **extra_kwargs,
-            )
-            parsed = _extract_response_content(response)
-            reranked, diag, cache_entry = _parse_rerank_payload(
-                candidates, parsed, top_k=k, max_delta=delta
-            )
-            if cache_entry is not None:
-                diag = {**diag, "_cache_payload": cache_entry}
-            return reranked, diag
-    except Exception as exc:
-        err = sanitize_llm_error(exc, api_key=key)
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", err)
-        return [dict(c) for c in candidates], {
-            "applied": False,
-            "reason": "fallback",
-            "error": err,
-        }
-
-
 def rerank_with_llm_sync(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -810,7 +741,7 @@ def rerank_with_llm_sync(
     allowed_hosts: set[str] | None = None,
     prebuilt_messages: Sequence[dict[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
+    """Call the configured OpenAI-compatible LLM endpoint synchronously and rerank top-K candidates."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
     raw_url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()

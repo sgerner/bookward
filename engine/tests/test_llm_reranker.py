@@ -205,7 +205,7 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
     import pytest
     import afterword_engine.llm_reranker as reranker_module
     from afterword_engine.config import Settings, settings
-    from afterword_engine.llm_reranker import rerank_with_llm, validate_llm_api_url
+    from afterword_engine.llm_reranker import probe_llm_reranker, validate_llm_api_url
     from afterword_engine.main import LLMRerankSettingsIn
 
     assert Settings().llm_rerank_timeout_seconds == 8.0
@@ -252,18 +252,16 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
         assert sync_diag["applied"] is False
         assert sync_diag["reason"] == "fallback"
         assert "sk-secret-key" not in sync_diag.get("error", "")
-        async_items, async_diag = asyncio.run(
-            rerank_with_llm(
-                [],
-                candidates,
-                api_url=blocked,
-                api_key="sk-secret-key",
-                model="gpt-4o-mini",
-            )
-        )
-        assert async_diag["applied"] is False
         assert [item["id"] for item in sync_items] == [1, 2]
-        assert [item["id"] for item in async_items] == [1, 2]
+        with pytest.raises(ValueError) as exc_info:
+            asyncio.run(
+                probe_llm_reranker(
+                    api_url=blocked,
+                    api_key="sk-secret-key",
+                    model="gpt-4o-mini",
+                )
+            )
+        assert "sk-secret-key" not in str(exc_info.value)
     assert http_called is False
 
     # Allowlisting an internal host permits it and configures httpx safely while still blocking redirects.
