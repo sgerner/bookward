@@ -16,6 +16,23 @@ export type Recommendation = {
   source_name: string | null;
 };
 
+export type PageBook = {
+  id: number;
+  recommendation_run_id: string;
+  title: string;
+  author: string;
+  cover_url: string;
+  source_url: string;
+  published_on: string | null;
+  published_kind: string;
+  genres: string[];
+  score: number;
+  metadata_confidence: number | null;
+  synopsis: string;
+  reason: string;
+  status: string;
+};
+
 const publicUrl = (value: string) => {
   try {
     const parsed = new URL(value);
@@ -25,16 +42,21 @@ const publicUrl = (value: string) => {
   }
 };
 
-export function toPageBook(book: Recommendation) {
+export function toPageBook(book: Recommendation): PageBook {
   return {
-    ...book,
+    id: book.id,
     recommendation_run_id: book.recommendation_run_id ?? "",
+    title: book.title,
+    author: book.author,
     cover_url: publicUrl(book.cover_url),
     source_url: publicUrl(book.source_url),
     published_on: book.release_date,
     published_kind: book.date_kind,
+    genres: book.genres,
+    score: book.score,
+    metadata_confidence: book.metadata_confidence ?? null,
     synopsis: book.description,
     reason: book.explanation.join(" · "),
-    source_type: "engine" as const,
+    status: book.status,
   };
 }
