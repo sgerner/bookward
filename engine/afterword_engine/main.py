@@ -24,6 +24,7 @@ from .backups import (
     BackupError,
     backup_scheduler_loop,
     backup_status,
+    compact_database,
     create_backup,
     identity_backup_status,
     recover_interrupted_restore,
@@ -1120,6 +1121,14 @@ def make_backup():
     return {"backup": created, "status": backup_status()}
 
 
+@app.post("/api/backups/compact")
+def compact_database_storage():
+    try:
+        return compact_database()
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/backups/{backup_id}/restore")
 def restore_database_backup(backup_id: str):
     try:
@@ -1483,6 +1492,7 @@ def tracked_recommendations(
             identity_context=identity_context,
             include_imported=include_imported,
         )
+        return recommendations, ""
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -1517,7 +1527,7 @@ def tracked_recommendations(
         decision_evidence = {
             "schema_version": 1,
             "capture_status": "incomplete",
-            "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
+            "reason": "base_ranker_fallback",
             "captured_at": ranking_at.isoformat(),
         }
     run_id = create_recommendation_run(
@@ -1709,6 +1719,7 @@ async def reading_history_scores(
                 embedder,
                 "read_candidate",
                 virtual_candidates,
+                persist=False,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
@@ -1915,7 +1926,8 @@ def recommendations(
         )
     for item in values:
         item["recommendation_run_id"] = run_id
-    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    if run_id:
+        response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
 

@@ -36,11 +36,17 @@ candidate inputs/outputs, 15,000 vectors, 8,192 dimensions per vector, 64 MiB
 of vector bytes, and 16 MiB of serialized evidence. Both serving and scoring
 evidence share a profile-wide 512 MiB logical budget that includes payloads,
 deduplicated vector bytes, reference rows, exposure/event/outcome data, and
-scoring-batch read links. If a cap or budget is reached, scoring still writes
-its score outputs and a small `incomplete` batch marker when possible; the
-normal recommendation request still serves and marks its run snapshot
-incomplete only when that snapshot cannot fit. SQLite page, index, and WAL
-overhead is outside this approximate logical-payload budget.
+scoring-batch read links. When a new capture or scheduled maintenance sees
+usage cross the 80 percent high watermark of that 512 MiB quota, Bookward
+rotates unreferenced scoring batches and the oldest run-linked evidence down
+to 65 percent of quota while preserving active `candidates.score_batch_id`
+batches, retained run score-batch links, `recommendation_events`, `feedback`,
+and `recommendation_outcomes`. If a single capture or budget check still cannot
+fit within 512 MiB, scoring writes its score outputs and a small `incomplete`
+batch marker when possible; the normal recommendation request still serves and
+marks its run snapshot incomplete only when that snapshot cannot fit. SQLite
+page, index, and WAL overhead is outside this approximate logical-payload
+budget.
 
 An intentional deletion must remove every archived copy that contains the
 deleted identity. Run snapshots keep normalized links to every referenced

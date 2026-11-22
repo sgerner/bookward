@@ -1081,6 +1081,20 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  function formatStorageSize(bytes: number | undefined) {
+    const safe = Math.max(0, Number(bytes ?? 0));
+    if (safe === 0) return "0 KB";
+    if (safe < 1024 * 1024) return `${Math.max(1, Math.round(safe / 1024))} KB`;
+    if (safe < 1024 * 1024 * 1024) return `${(safe / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(safe / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function evidencePercent(usedBytes: number | undefined, quotaBytes: number | undefined) {
+    const quota = Math.max(1, Number(quotaBytes ?? 512 * 1024 * 1024));
+    const used = Math.max(0, Number(usedBytes ?? 0));
+    return Math.min(100, Math.round((used / quota) * 100));
+  }
+
   async function loadMoreDiscover() {
     if (discoverLoading) return;
     if (discoverVisibleCount < filteredBooks.length) {
@@ -2778,6 +2792,74 @@
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
                   Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
                 </p>
+
+                <div class="mb-5 grid gap-4 border border-surface-300-700/50 p-4 sm:grid-cols-3">
+                  <div>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Live database</span>
+                      <span class={`badge text-xs ${data.backupStatus.auto_vacuum_mode === "incremental" ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                        {data.backupStatus.auto_vacuum_mode === "incremental" ? "Incremental vacuum" : "Legacy layout"}
+                      </span>
+                    </div>
+                    <p class="mt-1 text-xl font-semibold text-surface-950-50">
+                      {formatStorageSize(data.backupStatus.live_size_bytes ?? data.backupStatus.database_size_bytes)}
+                    </p>
+                    <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                      {#if (data.backupStatus.reclaimable_bytes ?? 0) > 0}
+                        {formatStorageSize(data.backupStatus.reclaimable_bytes)} reclaimable free pages
+                      {:else}
+                        No uncompacted free pages
+                      {/if}
+                      {#if data.backupStatus.backups.length}
+                        · {formatStorageSize(data.backupStatus.backup_total_size_bytes)} across {data.backupStatus.backups.length} {data.backupStatus.backups.length === 1 ? "snapshot" : "snapshots"}
+                      {/if}
+                    </p>
+                  </div>
+
+                  <div>
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Evidence quota</span>
+                      <span class={`badge text-xs ${data.backupStatus.evidence_status === "exceeded" ? "preset-tonal-error" : data.backupStatus.evidence_status === "warning" ? "preset-tonal-warning" : "preset-tonal-success"}`}>
+                        {data.backupStatus.evidence_status === "exceeded"
+                          ? "Quota reached"
+                          : data.backupStatus.evidence_status === "warning"
+                            ? "Rotating soon"
+                            : "Healthy"}
+                      </span>
+                    </div>
+                    <p class="mt-1 text-sm font-medium text-surface-950-50">
+                      {formatStorageSize(data.backupStatus.evidence_used_bytes)} <span class="font-normal text-surface-600-400">of {formatStorageSize(data.backupStatus.evidence_quota_bytes ?? 512 * 1024 * 1024)}</span>
+                    </p>
+                    <div
+                      class="mt-2 h-2 w-full overflow-hidden bg-surface-200-800"
+                      role="progressbar"
+                      aria-label="Replay evidence quota usage"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}
+                    >
+                      <div
+                        class={`h-full transition-all ${data.backupStatus.evidence_status === "exceeded" ? "bg-error-500" : data.backupStatus.evidence_status === "warning" ? "bg-warning-500" : "bg-primary-500"}`}
+                        style={`width: ${evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}%`}
+                      ></div>
+                    </div>
+                    <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                      Auto-rotates oldest unreferenced snapshots above 80% down to 65%.
+                    </p>
+                  </div>
+
+                  <div class="flex flex-col justify-between gap-3">
+                    <p class="text-xs leading-5 text-surface-700-300">
+                      Prune stale telemetry, orphaned embeddings, and expired logs, then reclaim free SQLite pages online.
+                    </p>
+                    <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                        <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
+                      </button>
+                    </form>
+                  </div>
+                </div>
 
                 <div class="grid gap-5 lg:grid-cols-2">
                   <div>

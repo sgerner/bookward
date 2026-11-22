@@ -506,5 +506,81 @@ describe("page actions", () => {
     });
   });
 
+  it("exposes database storage and evidence quota metrics and compacts storage online", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const backupStatus = {
+      enabled: true,
+      interval_hours: 24,
+      retention_count: 7,
+      last_success_at: "2026-11-21T00:00:00+00:00",
+      last_error: null,
+      next_backup_at: "2026-11-22T00:00:00+00:00",
+      backups: [],
+      live_size_bytes: 12 * 1024 * 1024,
+      reclaimable_bytes: 2 * 1024 * 1024,
+      auto_vacuum_mode: "incremental",
+      evidence_used_bytes: 64 * 1024 * 1024,
+      evidence_quota_bytes: 512 * 1024 * 1024,
+      evidence_status: "healthy",
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (String(input).includes("/api/backups/compact")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              reclaimed_bytes: 2 * 1024 * 1024,
+              after_bytes: 10 * 1024 * 1024,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(backupStatus), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
+    const loaded = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as { backupStatus: typeof backupStatus };
+    expect(loaded.backupStatus.live_size_bytes).toBe(12 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_used_bytes).toBe(64 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_status).toBe("healthy");
+
+    const compactResult = await actions.compactStorage!({} as never);
+    expect(compactResult).toEqual({
+      message: "Storage compacted; reclaimed 2.0 MB. Live database: 10.0 MB.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/compact",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });
