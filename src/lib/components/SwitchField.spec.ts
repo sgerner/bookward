@@ -19,6 +19,7 @@ describe("server-rendered SwitchField", () => {
     expect(body).toContain('id="digest-discord"');
     expect(body).toContain('role="switch"');
     expect(body).toMatch(/<input[^>]*class="sr-only"[^>]*role="switch"/);
+    expect(body).toMatch(/<input[^>]*class="sr-only"[^>]*role="switch"/);
     expect(body).toContain('name="channels"');
     expect(body).toContain('value="discord"');
     expect(body).toContain('aria-describedby="digest-discord-description"');
