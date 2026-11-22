@@ -15,7 +15,7 @@ from .covers import (
 from .identity import book_identity, book_identity_matches
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path
+from .tenancy import profile_database_path, restore_fence_bypassed
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
 
@@ -1161,6 +1161,14 @@ class _LockedConnection(sqlite3.Connection):
 
 def connect():
     db_path = profile_database_path()
+    if not restore_fence_bypassed():
+        from .backups import _restore_journal_path
+
+        journal = _restore_journal_path()
+        if journal.exists() or journal.is_symlink():
+            raise sqlite3.OperationalError(
+                "Profile database is unavailable until interrupted restore recovery completes."
+            )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if db_path.parent.name == "profiles":
         try:

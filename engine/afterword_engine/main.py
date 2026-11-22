@@ -22,6 +22,7 @@ from .config import settings
 from .database import connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
+    _safe_backup_detail,
     backup_scheduler_loop,
     backup_status,
     create_backup,
@@ -151,7 +152,10 @@ class AccountPasswordIn(BaseModel):
 
 def _ensure_profile_database(profile_id: str):
     with profile_scope(profile_id):
+        recover_interrupted_restore()
         initialize(seed_demo=profile_id == "legacy")
+        if profile_id == "legacy":
+            identity_store.migrate_legacy_api_tokens()
 
 
 def _principal(request):
@@ -641,25 +645,29 @@ async def handle_job(kind: str):
 @asynccontextmanager
 async def lifespan(app):
     identity_store.initialize_auth()
-    with profile_scope("legacy"):
-        recover_interrupted_restore()
-        initialize()
-        legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
-    identity_store.migrate_legacy_api_tokens(legacy_tokens)
-    for profile_id in identity_store.profile_ids():
-        if profile_id != "legacy":
-            try:
-                with profile_scope(profile_id):
-                    recover_interrupted_restore()
-                _ensure_profile_database(profile_id)
-            except Exception:
-                # A broken profile must not prevent the rest of the installation
-                # from serving. Its worker retries initialization with backoff.
-                LOGGER.exception("Could not initialize profile %s during startup", profile_id)
+    startup_profiles = [
+        "legacy",
+        *[
+            profile_id
+            for profile_id in identity_store.profile_ids()
+            if profile_id != "legacy"
+        ],
+    ]
+    ready_profiles: set[str] = set()
+    for profile_id in startup_profiles:
+        try:
+            _ensure_profile_database(profile_id)
+            ready_profiles.add(profile_id)
+        except Exception:
+            # A broken profile must not prevent the rest of the installation
+            # from serving. Its worker and HTTP middleware retry recovery.
+            LOGGER.exception("Could not initialize profile %s during startup", profile_id)
     stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
+        if profile_id not in ready_profiles:
+            continue
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
@@ -684,6 +692,13 @@ app.add_middleware(
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
+
+
+def _recover_profile_for_request(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        recovered = recover_interrupted_restore()
+    if recovered:
+        _ensure_profile_database(profile_id)
 
 
 @app.middleware("http")
@@ -729,6 +744,13 @@ async def authenticate_engine_request(request: Request, call_next):
             )
         candidate = bearer or api_key
         token = identity_store.authenticate_api_token(candidate)
+        if not token and candidate and not identity_store.legacy_api_tokens_migrated():
+            try:
+                await asyncio.to_thread(_ensure_profile_database, "legacy")
+            except Exception:
+                LOGGER.exception("Could not recover legacy profile before API token lookup")
+            else:
+                token = identity_store.authenticate_api_token(candidate)
         if not token:
             return JSONResponse(
                 {"detail": "A valid API token is required"},
@@ -737,6 +759,18 @@ async def authenticate_engine_request(request: Request, call_next):
             )
         request.state.api_token = token
         request.state.account = {"profile_id": token["profile_id"], "role": "user", "id": "api-token"}
+        try:
+            await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+        except Exception as exc:
+            LOGGER.exception(
+                "Profile %s is unavailable during API request recovery",
+                token["profile_id"],
+            )
+            return JSONResponse(
+                {"detail": safe_error_message(_safe_backup_detail(exc))},
+                status_code=503,
+                headers={"cache-control": "private, no-store"},
+            )
         with profile_scope(token["profile_id"]):
             response = await call_next(request)
         _mark_private_no_store(response)
@@ -756,6 +790,25 @@ async def authenticate_engine_request(request: Request, call_next):
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
+    bypass_fence = (
+        path.startswith("/auth/")
+        or path.startswith("/admin/")
+        or (request.method == "GET" and path == "/api/backups")
+    )
+    if not path.startswith("/auth/") and not path.startswith("/admin/"):
+        try:
+            await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except Exception as exc:
+            if not bypass_fence:
+                LOGGER.exception(
+                    "Profile %s is unavailable during request recovery",
+                    account["profile_id"],
+                )
+                return JSONResponse(
+                    {"detail": safe_error_message(_safe_backup_detail(exc))},
+                    status_code=503,
+                    headers={"cache-control": "private, no-store"},
+                )
     with profile_scope(account["profile_id"]):
         response = await call_next(request)
     _mark_private_no_store(response)
@@ -793,6 +846,8 @@ def initial_admin_setup(payload: InitialAdminIn):
         return {"session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600, "account": account}
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
+    except (BackupError, sqlite3.Error, OSError) as exc:
+        raise HTTPException(503, safe_error_message(_safe_backup_detail(exc))) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -897,7 +952,10 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
         # Disabled profiles are excluded from startup/background work. Apply
         # any migrations accumulated while this account was disabled before
         # making its data available to a new session.
-        _ensure_profile_database(found["profile_id"])
+        try:
+            _ensure_profile_database(found["profile_id"])
+        except (BackupError, sqlite3.Error, OSError) as exc:
+            raise HTTPException(503, safe_error_message(_safe_backup_detail(exc))) from exc
     try:
         identity_store.set_account_status(account_id, status)
     except ValueError as exc:

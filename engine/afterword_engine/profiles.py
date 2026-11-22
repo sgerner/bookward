@@ -636,9 +636,37 @@ def authenticate_api_token(token: str):
         return dict(found)
 
 
-def migrate_legacy_api_tokens(legacy_rows: list[dict]):
+def legacy_api_tokens_migrated() -> bool:
     with auth_connect() as con:
-        if con.execute("SELECT 1 FROM auth_meta WHERE key='legacy_api_tokens_migrated'").fetchone():
+        return (
+            con.execute(
+                "SELECT 1 FROM auth_meta WHERE key='legacy_api_tokens_migrated'"
+            ).fetchone()
+            is not None
+        )
+
+
+def migrate_legacy_api_tokens(legacy_rows: list[dict] | None = None):
+    from .backups import _restore_journal_path
+    from .database import rows
+    from .tenancy import profile_scope
+
+    with profile_scope("legacy"):
+        journal = _restore_journal_path()
+        if journal.exists() or journal.is_symlink():
+            return
+        if legacy_api_tokens_migrated():
+            return
+        if legacy_rows is None:
+            legacy_rows = rows(
+                "SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens"
+            )
+    with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute(
+            "SELECT 1 FROM auth_meta WHERE key='legacy_api_tokens_migrated'"
+        ).fetchone():
+            con.rollback()
             return
         for token in legacy_rows:
             con.execute(
@@ -650,6 +678,7 @@ def migrate_legacy_api_tokens(legacy_rows: list[dict]):
                 ),
             )
         con.execute("INSERT INTO auth_meta(key,value) VALUES('legacy_api_tokens_migrated','1')")
+        con.commit()
 
 
 def account_count() -> int:
