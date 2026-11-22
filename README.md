@@ -325,6 +325,9 @@ npm run build
 
 # Engine
 uv sync --project engine --extra dev --frozen
+uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
+uv export --project engine --locked --only-group build --format requirements.txt --no-annotate --no-header | diff -u engine/build-requirements.lock -
+uv run --project engine python -c 'import pathlib, tomllib; d = tomllib.loads(pathlib.Path("engine/pyproject.toml").read_text(encoding="utf-8")); req, grp = d["build-system"]["requires"], d["dependency-groups"]["build"]; assert req == grp, f"build-system.requires ({req}) != dependency-groups.build ({grp})"'
 uv run --project engine pytest -q engine/tests
 uv run --project engine python -m compileall -q engine/afterword_engine
 
