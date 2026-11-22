@@ -393,6 +393,6 @@ The URL must be reachable from the engine process, not just from your browser. U
 
 ## Automation and releases
 
-Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly.
+Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, Docker, Docker Compose, and GitHub Actions dependencies weekly.
 
 Pushing a tag matching `vMAJOR.MINOR.PATCH` runs the complete CI checks before publishing the Bookward and engine images to GitHub Container Registry as the version tag. Only the highest numeric release tag also publishes `latest`. Manual publishing must also select a version tag; branches cannot overwrite release images.

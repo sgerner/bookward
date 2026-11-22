@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "./+page.server";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("page actions", () => {
   it("keeps the Settings view compatible with an engine before the token migration", async () => {
@@ -438,6 +441,301 @@ describe("page actions", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://127.0.0.1:8000/api/jobs/job-123",
     );
+  });
+
+  it("returns 502 when an embedding rebuild job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Embedder unreachable.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Connection refused"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedder unreachable.", error: true },
+    });
+
+    const secondPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedding rebuild failed.", error: true },
+    });
+
+    await expect(actions.rebuildEmbeddings!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Connection refused", error: true },
+    });
+  });
+
+  it("stops polling an embedding rebuild after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/embeddings/rebuild")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "job-1234567890" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Embedding rebuild is still running (job-1234).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
+  it("queues a sync job and waits for completion", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"errors":[]}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sync",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/sync-123",
+    );
+  });
+
+  it("reports singular and plural source error counts when a sync completes with errors", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out", "404 Not Found"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const singlePromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(singlePromise).resolves.toEqual({
+      message: "Sources refreshed with 1 source needing attention.",
+    });
+
+    const multiPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(multiPromise).resolves.toEqual({
+      message: "Sources refreshed with 2 sources needing attention.",
+    });
+  });
+
+  it("ignores malformed JSON in a completed sync job result", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-bad-json" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: "{not-valid-json",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(pending).resolves.toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+  });
+
+  it("returns 502 when a sync job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Database locked.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Sync unreachable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Database locked.", error: true },
+    });
+
+    const secondPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Recommendation refresh failed.", error: true },
+    });
+
+    await expect(actions.runSync!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Sync unreachable", error: true },
+    });
+  });
+
+  it("stops polling a sync job after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/sync")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "sync-123456" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Refresh is still running (sync-123).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
   });
 
   it("persists digest timing and channel settings without sending blank secrets", async () => {
