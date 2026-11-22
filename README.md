@@ -340,7 +340,7 @@ uv run --project engine python scripts/community_smoke.py
 docker compose build
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`AFTERWORD_ENABLE_BACKGROUND_LOOPS=false`), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
 
 ## Contributing
 
