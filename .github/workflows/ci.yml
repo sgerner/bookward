@@ -29,7 +29,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Type and Svelte checks
         run: npm run check
@@ -64,7 +64,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: engine/uv.lock
@@ -73,7 +73,10 @@ jobs:
         run: uv sync --project engine --extra dev --frozen
 
       - name: Verify container dependency export
-        run: uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
+        run: |
+          uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
+          uv export --project engine --locked --only-group build --format requirements.txt --no-annotate --no-header | diff -u engine/build-requirements.lock -
+          uv run --project engine python -c 'import pathlib, tomllib; d = tomllib.loads(pathlib.Path("engine/pyproject.toml").read_text(encoding="utf-8")); req, grp = d["build-system"]["requires"], d["dependency-groups"]["build"]; assert req == grp, f"build-system.requires ({req}) != dependency-groups.build ({grp})"'
 
       - name: Engine tests
         run: uv run --project engine pytest -q engine/tests
@@ -106,13 +109,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Set up uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: engine/uv.lock
       - name: Install dependencies
         run: |
-          npm ci
+          npm ci --ignore-scripts
           uv sync --project engine --extra dev --frozen
       - name: Verify fresh-install web and engine flows
         run: uv run --project engine python scripts/community_smoke.py

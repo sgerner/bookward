@@ -15,10 +15,11 @@ import math
 import os
 import re
 import zlib
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlsplit
 
 import numpy as np
