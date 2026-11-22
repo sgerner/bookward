@@ -192,6 +192,8 @@ npm ci
 uv sync --project engine --extra dev --frozen
 ~~~
 
+`.npmrc` blocks npm install scripts during `npm ci`, so `.svelte-kit` types are synced when you run `npm run dev`, `npm run check`, or `npm run build`.
+
 If you do not use `uv`, create a virtual environment and install the engine package directly:
 
 ~~~
@@ -324,6 +326,9 @@ npm run build
 
 # Engine
 uv sync --project engine --extra dev --frozen
+uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
+uv export --project engine --locked --only-group build --format requirements.txt --no-annotate --no-header | diff -u engine/build-requirements.lock -
+uv run --project engine python -c 'import pathlib, tomllib; d = tomllib.loads(pathlib.Path("engine/pyproject.toml").read_text(encoding="utf-8")); req, grp = d["build-system"]["requires"], d["dependency-groups"]["build"]; assert req == grp, f"build-system.requires ({req}) != dependency-groups.build ({grp})"'
 uv run --project engine pytest -q engine/tests
 uv run --project engine python -m compileall -q engine/afterword_engine
 
@@ -334,7 +339,7 @@ uv run --project engine python scripts/community_smoke.py
 docker compose build
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests. The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
 
 ## Contributing
 
@@ -390,6 +395,6 @@ The URL must be reachable from the engine process, not just from your browser. U
 
 ## Automation and releases
 
-Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, and GitHub Actions dependencies weekly.
+Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds with npm install scripts blocked via `.npmrc` and `--ignore-scripts`. Dependabot checks npm, Python, Docker, Docker Compose, and GitHub Actions dependencies weekly, and `npm test` fails if unreviewed Linux install scripts enter `package-lock.json`.
 
 Pushing a tag matching `vMAJOR.MINOR.PATCH` runs the complete CI checks before publishing the Bookward and engine images to GitHub Container Registry as the version tag. Only the highest numeric release tag also publishes `latest`. Manual publishing must also select a version tag; branches cannot overwrite release images.
