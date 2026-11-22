@@ -25,7 +25,17 @@ from .covers import (
     safe_cover_url,
     wait_for_openlibrary_request_slot,
 )
-from .database import normalize_key, persist_metadata_field_provenance, private_setting, row, rows, transaction
+from .database import (
+    demote_orphaned_recommended_candidates,
+    normalize_key,
+    persist_metadata_field_provenance,
+    private_setting,
+    recompute_candidate_sources,
+    row,
+    rows,
+    transaction,
+    upsert_candidate_source,
+)
 from .identity import (
     book_author_identity_key,
     book_catalog_title_identity_key,
@@ -945,7 +955,7 @@ async def refresh_read_work_identities(
         "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
         "JOIN sources s ON s.id=c.source_id "
         "WHERE c.status IN ('new','recommended') "
-        "AND q.quality_status='accepted' AND s.enabled=1"
+        "AND q.quality_status='accepted' AND s.enabled=1 AND s.kind!='association'"
     )
 
     candidates_by_author: dict[str, list[tuple[dict, set]]] = {}
@@ -3399,6 +3409,12 @@ async def scan_source(source):
                 (key,),
             ).fetchone()
             if candidate:
+                upsert_candidate_source(
+                    con,
+                    int(candidate["id"]),
+                    int(source["id"]),
+                    str(item.get("source_url", source["url"]) or ""),
+                )
                 description_added = bool(
                     item.get("description")
                     and not (existing["description"] if existing else "")
@@ -3484,14 +3500,81 @@ async def scan_source(source):
                     WHERE candidate_id=? AND quality_status='quarantine'""",
                     (candidate["id"],),
                 )
+        stale_ids: list[int] = []
         if seen:
-            placeholders = ",".join("?" for _ in seen)
-            con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
+            unique_seen = list(dict.fromkeys(seen))
+            placeholders = ",".join("?" for _ in unique_seen)
+            stale_ids = [
+                int(item["id"])
+                for item in con.execute(
+                    f"""SELECT c.id FROM candidates c
+                    WHERE (
+                        EXISTS (
+                            SELECT 1 FROM candidate_sources cs
+                            WHERE cs.candidate_id=c.id AND cs.source_id=?
+                        )
+                        OR c.source_id=?
+                    )
+                    AND c.normalized_key NOT IN ({placeholders})""",
+                    (source["id"], source["id"], *unique_seen),
+                ).fetchall()
+            ]
         elif raw_count:
-            con.execute(
-                "DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended')",
-                (source["id"],),
-            )
+            stale_ids = [
+                int(item["id"])
+                for item in con.execute(
+                    """SELECT c.id FROM candidates c
+                    WHERE EXISTS (
+                        SELECT 1 FROM candidate_sources cs
+                        WHERE cs.candidate_id=c.id AND cs.source_id=?
+                    )
+                    OR c.source_id=?""",
+                    (source["id"], source["id"]),
+                ).fetchall()
+            ]
+        if stale_ids:
+            for start in range(0, len(stale_ids), 500):
+                batch = stale_ids[start : start + 500]
+                id_marks = ",".join("?" for _ in batch)
+                con.execute(
+                    f"DELETE FROM candidate_sources WHERE source_id=? AND candidate_id IN ({id_marks})",
+                    (source["id"], *batch),
+                )
+                con.execute(
+                    f"""DELETE FROM candidates
+                    WHERE id IN ({id_marks})
+                      AND status IN ('new', 'recommended')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM feedback f WHERE f.candidate_id=candidates.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM librarr_imports li WHERE li.candidate_id=candidates.id
+                      )""",
+                    batch,
+                )
+                con.execute(
+                    f"""UPDATE candidates
+                    SET source_id=NULL, status='new', score=0, explanation='[]',
+                        score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({id_marks})
+                      AND status IN ('new', 'recommended')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
+                      )""",
+                    batch,
+                )
+            recompute_candidate_sources(con, stale_ids)
+            demote_orphaned_recommended_candidates(con, stale_ids)
+            if con.execute(
+                "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
+                "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
+            ).fetchone():
+                from .quality import recover_duplicate_identity_candidates
+
+                recover_duplicate_identity_candidates(con)
         # An empty response can be a transient block page, parser mismatch,
         # or upstream outage. It is not safe to interpret it as proof that a
         # source no longer contains any books, so retain existing candidates.

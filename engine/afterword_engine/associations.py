@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .database import normalize_key, row, rows, transaction
+from .database import normalize_key, row, rows, transaction, upsert_candidate_source
 from .identity import book_identity
 from .isbn import isbn_parts
 
@@ -348,6 +348,12 @@ def persist_associations(
             if candidate is None:
                 continue
             candidate_id = int(candidate[0])
+            upsert_candidate_source(
+                con,
+                candidate_id,
+                source_ids[provider],
+                association.source_url[:1000],
+            )
             if (
                 provider == OPEN_LIBRARY_LISTS_PROVIDER
                 and _is_openlibrary_list_url(candidate["source_url"])

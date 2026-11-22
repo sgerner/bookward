@@ -249,7 +249,7 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
         "LEFT JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status='recommended' AND q.quality_status='accepted' "
-        "AND c.score>=? AND COALESCE(s.enabled, 1)=1 "
+        "AND c.score>=? AND COALESCE(s.enabled, 1)=1 AND COALESCE(s.kind, '')!='association' "
     )
     if not include_seen and config["only_new"]:
         query += " AND NOT EXISTS (SELECT 1 FROM digest_items d WHERE d.candidate_id=c.id)"

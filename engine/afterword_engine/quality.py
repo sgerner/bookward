@@ -1130,7 +1130,7 @@ def candidate_quality_audit_candidates(
             "q.quality_status,q.audit_version,q.flags_json "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "LEFT JOIN sources s ON s.id=c.source_id "
-            f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
+            f"WHERE c.status!='rejected' AND ((COALESCE(s.enabled,1)=1 AND COALESCE(s.kind,'')!='association') OR c.status IN ('saved','imported')) AND {predicate} "
             "ORDER BY c.id LIMIT ? OFFSET ?",
             (*params, page_size, offset),
         )
@@ -1335,6 +1335,122 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     return bool(selected_fields)
 
 
+def _is_duplicate_identity_flag_only(flags_json: object) -> bool:
+    try:
+        parsed = json.loads(str(flags_json or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, list) and parsed == ["duplicate_identity"]
+
+
+def recover_duplicate_identity_candidates(
+    con,
+    *,
+    read_index: ReadIdentityIndex | None = None,
+    shortlisted_keys: set[str] | None = None,
+) -> int:
+    """Re-open non-user-rejected duplicate_identity siblings on enabled sources."""
+
+    recoverable = [
+        item
+        for item in con.execute(
+            """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
+            c.isbn13,c.isbn10,q.quality_score,q.flags_json,
+            q.work_id AS quality_work_id,q.provider AS quality_provider,
+            q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+            FROM candidates c
+            JOIN candidate_quality q ON q.candidate_id=c.id
+            JOIN sources s ON s.id=c.source_id
+            WHERE c.status='rejected'
+              AND q.quality_status='rejected'
+              AND q.flags_json LIKE '%duplicate_identity%'
+              AND s.enabled=1
+              AND s.kind!='association'
+              AND COALESCE((
+                  SELECT f.action FROM feedback f
+                  WHERE f.candidate_id=c.id AND f.undone_at IS NULL
+                  ORDER BY f.id DESC LIMIT 1
+              ), '')!='reject'"""
+        ).fetchall()
+        if _is_duplicate_identity_flag_only(item["flags_json"])
+    ]
+    if not recoverable:
+        return 0
+
+    if read_index is None:
+        read_index = ReadIdentityIndex.from_reads(
+            con.execute(
+                """SELECT r.title,r.author,r.isbn,r.openlibrary_work_id,
+                m.verified_work_id AS quality_work_id,m.identity_provider AS quality_provider
+                FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id"""
+            ).fetchall()
+        )
+    if shortlisted_keys is None:
+        shortlisted_keys = book_identity_match_index(
+            con.execute(
+                """SELECT c.title,c.author,c.isbn13,c.isbn10,
+                q.work_id AS quality_work_id,q.provider AS quality_provider,
+                q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+                FROM candidates c
+                LEFT JOIN candidate_quality q ON q.candidate_id=c.id
+                WHERE c.status IN ('saved','imported')"""
+            ).fetchall()
+        )
+
+    enabled_winner_keys = book_identity_match_index(
+        con.execute(
+            """SELECT c.title,c.author,c.isbn13,c.isbn10,
+            q.work_id AS quality_work_id,q.provider AS quality_provider,
+            q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+            FROM candidates c
+            JOIN candidate_quality q ON q.candidate_id=c.id
+            JOIN sources s ON s.id=c.source_id
+            WHERE c.status IN ('new','recommended')
+              AND q.quality_status='accepted'
+              AND s.enabled=1
+              AND s.kind!='association'"""
+        ).fetchall()
+    )
+
+    ordered_recoverable = sorted(
+        recoverable,
+        key=lambda item: (
+            -float(item["quality_score"] or 0),
+            -int(bool(item["description"])),
+            -int(bool(item["cover_url"])),
+            -float(item["score"] or 0),
+            int(item["id"]),
+        ),
+    )
+    reopen_ids: list[int] = []
+    reopened_keys: set[str] = set()
+    for item in ordered_recoverable:
+        keys = book_row_identity_match_keys(item)
+        if (
+            read_index.matches(item)
+            or (keys & shortlisted_keys)
+            or (keys & enabled_winner_keys)
+        ):
+            continue
+        reopen_ids.append(int(item["id"]))
+        enabled_winner_keys.update(keys)
+        reopened_keys.update(keys)
+
+    if not reopen_ids:
+        return 0
+
+    con.executemany(
+        "UPDATE candidates SET status='new',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        ((candidate_id,) for candidate_id in reopen_ids),
+    )
+    con.executemany(
+        "UPDATE candidate_quality SET quality_status='accepted',flags_json='[]',"
+        "updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?",
+        ((candidate_id,) for candidate_id in reopen_ids),
+    )
+    return len(reopen_ids)
+
+
 def _dedupe_and_hide(con) -> int:
     """Reject read overlaps and active duplicates of saved/imported books."""
 
@@ -1393,17 +1509,28 @@ def _dedupe_and_hide(con) -> int:
     ]
     reject_candidates((item["id"] for item in shortlisted_overlap), "shortlisted_overlap")
 
+    changed += recover_duplicate_identity_candidates(
+        con,
+        read_index=read_index,
+        shortlisted_keys=shortlisted_keys,
+    )
+
     accepted = con.execute(
         """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
-        c.isbn13,c.isbn10,q.quality_score,q.work_id AS quality_work_id,
+        c.isbn13,c.isbn10,
+        CASE WHEN s.enabled=1 AND s.kind!='association' THEN 1 ELSE 0 END AS source_enabled,
+        q.quality_score,q.work_id AS quality_work_id,
         q.provider AS quality_provider,q.isbn13 AS quality_isbn13,
         q.isbn10 AS quality_isbn10
-        FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
+        FROM candidates c
+        JOIN candidate_quality q ON q.candidate_id=c.id
+        LEFT JOIN sources s ON s.id=c.source_id
         WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'"""
     ).fetchall()
     ordered = sorted(
         accepted,
         key=lambda item: (
+            -int(item["source_enabled"] or 0),
             -float(item["quality_score"] or 0),
             -int(bool(item["description"])),
             -int(bool(item["cover_url"])),

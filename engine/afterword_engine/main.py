@@ -19,7 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import (
+    connect,
+    demote_orphaned_recommended_candidates,
+    initialize,
+    normalize_key,
+    recompute_candidate_sources,
+    row,
+    rows,
+    transaction,
+)
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -97,6 +106,7 @@ from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
+    _dedupe_and_hide,
     audit_candidates,
     has_candidate_quality_audit_candidates,
     quality_summary,
@@ -1779,7 +1789,7 @@ def _recommendation_rows(
         clauses = [
             "c.status NOT IN ('rejected','maybe_later')",
             "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
-            "(c.status IN ('saved','imported') OR s.enabled=1)",
+            "(c.status IN ('saved','imported') OR (s.enabled=1 AND s.kind!='association'))",
         ]
     params: list[object] = []
     if statuses:
@@ -2469,13 +2479,14 @@ def toggle_source(source_id:int):
             "WHERE id=?",
             (source_id,),
         )
+        recompute_candidate_sources(con, source_id=source_id)
         if not became_enabled:
-            con.execute(
-                "UPDATE candidates SET status='new', score=0, explanation='[]', "
-                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE source_id=? AND status='recommended'",
-                (source_id,),
-            )
+            demote_orphaned_recommended_candidates(con, source_id=source_id)
+        if con.execute(
+            "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
+            "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
+        ).fetchone():
+            _dedupe_and_hide(con)
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}

@@ -985,6 +985,148 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_sources (
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            source_url TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(candidate_id, source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_sources_source
+            ON candidate_sources(source_id, candidate_id);
+        INSERT OR IGNORE INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        SELECT
+            c.id,
+            c.source_id,
+            c.source_url,
+            COALESCE(c.created_at, CURRENT_TIMESTAMP),
+            COALESCE(c.updated_at, c.created_at, CURRENT_TIMESTAMP)
+        FROM candidates c
+        WHERE c.source_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = c.source_id);
+        INSERT OR IGNORE INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        SELECT
+            ae.candidate_id,
+            s.id,
+            MAX(ae.source_url),
+            COALESCE(MIN(ae.fetched_at), CURRENT_TIMESTAMP),
+            COALESCE(MAX(ae.fetched_at), CURRENT_TIMESTAMP)
+        FROM association_evidence ae
+        JOIN candidates c ON c.id = ae.candidate_id
+        JOIN sources s ON s.url = 'association://' || ae.provider AND s.kind = 'association'
+        GROUP BY ae.candidate_id, s.id;
+        UPDATE candidates
+        SET source_id = (
+            SELECT cs.source_id
+            FROM candidate_sources cs
+            JOIN sources s ON s.id = cs.source_id
+            WHERE cs.candidate_id = candidates.id
+            ORDER BY
+                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                s.weight DESC,
+                s.id ASC
+            LIMIT 1
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id = candidates.id
+        );
+        CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_insert
+        AFTER INSERT ON candidates
+        WHEN NEW.source_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
+        BEGIN
+            INSERT INTO candidate_sources(
+                candidate_id, source_id, source_url, first_seen_at, last_seen_at
+            )
+            VALUES (
+                NEW.id,
+                NEW.source_id,
+                NEW.source_url,
+                COALESCE(NEW.created_at, CURRENT_TIMESTAMP),
+                COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+            )
+            ON CONFLICT(candidate_id, source_id) DO NOTHING;
+        END;
+        CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_source_reassign
+        AFTER UPDATE OF source_id ON candidates
+        WHEN NEW.source_id IS NOT NULL
+          AND NEW.source_id IS NOT OLD.source_id
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
+          AND NOT EXISTS (
+              SELECT 1 FROM candidate_sources cs
+              WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
+          )
+        BEGIN
+            DELETE FROM candidate_sources
+            WHERE candidate_id = NEW.id
+              AND OLD.source_id IS NOT NULL
+              AND source_id = OLD.source_id
+              AND (SELECT COUNT(*) FROM candidate_sources WHERE candidate_id = NEW.id) = 1;
+            INSERT INTO candidate_sources(
+                candidate_id, source_id, source_url, first_seen_at, last_seen_at
+            )
+            VALUES (
+                NEW.id,
+                NEW.source_id,
+                NEW.source_url,
+                COALESCE(NEW.created_at, CURRENT_TIMESTAMP),
+                COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+            )
+            ON CONFLICT(candidate_id, source_id) DO NOTHING;
+        END;
+        CREATE TRIGGER IF NOT EXISTS candidates_sync_source_after_source_update
+        AFTER UPDATE OF enabled, weight, kind ON sources
+        WHEN OLD.enabled IS NOT NEW.enabled
+          OR OLD.weight IS NOT NEW.weight
+          OR OLD.kind IS NOT NEW.kind
+        BEGIN
+            UPDATE candidates
+            SET source_id = COALESCE(
+                (
+                    SELECT cs.source_id
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                    WHERE cs.candidate_id = candidates.id
+                    ORDER BY
+                        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                        s.weight DESC,
+                        s.id ASC
+                    LIMIT 1
+                ),
+                candidates.source_id
+            ),
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT candidate_id FROM candidate_sources WHERE source_id = NEW.id
+            )
+            AND source_id IS NOT COALESCE(
+                (
+                    SELECT cs.source_id
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                    WHERE cs.candidate_id = candidates.id
+                    ORDER BY
+                        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                        s.weight DESC,
+                        s.id ASC
+                    LIMIT 1
+                ),
+                candidates.source_id
+            );
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1347,6 +1489,7 @@ def initialize(*, seed_demo: bool = True):
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
+        applied_now: set[int] = set()
         for version, script in MIGRATIONS:
             if version in applied:
                 continue
@@ -1363,6 +1506,7 @@ def initialize(*, seed_demo: bool = True):
                     "INSERT INTO schema_migrations(version) VALUES(?)", (version,)
                 )
                 con.commit()
+                applied_now.add(version)
             except sqlite3.Error as exc:
                 if con.in_transaction:
                     con.rollback()
@@ -1446,7 +1590,153 @@ def initialize(*, seed_demo: bool = True):
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
+        recompute_candidate_sources(con)
+        if 26 in applied_now or con.execute(
+            "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
+            "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
+        ).fetchone():
+            from .quality import _dedupe_and_hide
+
+            _dedupe_and_hide(con)
     _restrict_database_files()
+
+
+_PRIMARY_SOURCE_SUBQUERY = """(
+    SELECT cs.source_id
+    FROM candidate_sources cs
+    JOIN sources s ON s.id = cs.source_id
+    WHERE cs.candidate_id = candidates.id
+    ORDER BY
+        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+        s.weight DESC,
+        s.id ASC
+    LIMIT 1
+)"""
+
+
+def recompute_candidate_sources(
+    con: sqlite3.Connection,
+    candidate_ids=None,
+    *,
+    source_id: int | None = None,
+) -> int:
+    """Materialize primary candidates.source_id from candidate_sources."""
+
+    resolved = f"COALESCE({_PRIMARY_SOURCE_SUBQUERY}, candidates.source_id)"
+    if candidate_ids is not None:
+        ids = sorted({int(cid) for cid in candidate_ids})
+        if not ids:
+            return 0
+        updated = 0
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            marks = ",".join("?" for _ in batch)
+            updated += con.execute(
+                f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
+                f"WHERE id IN ({marks}) AND source_id IS NOT {resolved}",
+                batch,
+            ).rowcount
+        return max(0, updated)
+    if source_id is not None:
+        return max(
+            0,
+            con.execute(
+                f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
+                f"WHERE (id IN (SELECT candidate_id FROM candidate_sources WHERE source_id=?) OR source_id=?) "
+                f"AND source_id IS NOT {resolved}",
+                (int(source_id), int(source_id)),
+            ).rowcount,
+        )
+    return max(
+        0,
+        con.execute(
+            f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
+            f"WHERE source_id IS NOT {resolved}"
+        ).rowcount,
+    )
+
+
+def upsert_candidate_source(
+    con: sqlite3.Connection,
+    candidate_id: int,
+    source_id: int,
+    source_url: str = "",
+) -> int | None:
+    """Record or refresh discovery membership and materialize primary attribution."""
+
+    cid = int(candidate_id)
+    sid = int(source_id)
+    url = str(source_url or "")[:1000]
+    con.execute(
+        """INSERT INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(candidate_id, source_id) DO UPDATE SET
+            source_url = CASE
+                WHEN length(excluded.source_url) > 0 THEN excluded.source_url
+                ELSE candidate_sources.source_url
+            END,
+            last_seen_at = CURRENT_TIMESTAMP""",
+        (cid, sid, url),
+    )
+    recompute_candidate_sources(con, (cid,))
+    found = con.execute(
+        "SELECT source_id FROM candidates WHERE id=?", (cid,)
+    ).fetchone()
+    return int(found["source_id"]) if found and found["source_id"] is not None else None
+
+
+def demote_orphaned_recommended_candidates(
+    con: sqlite3.Connection,
+    candidate_ids=None,
+    *,
+    source_id: int | None = None,
+) -> int:
+    """Reset recommended rows that lack any remaining enabled non-association owner."""
+
+    no_enabled_owner = (
+        "NOT EXISTS ("
+        "SELECT 1 FROM sources s "
+        "WHERE s.id = candidates.source_id AND s.enabled = 1 AND s.kind != 'association'"
+        ")"
+    )
+    if candidate_ids is not None:
+        ids = sorted({int(cid) for cid in candidate_ids})
+        if not ids:
+            return 0
+        demoted = 0
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            marks = ",".join("?" for _ in batch)
+            demoted += con.execute(
+                "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+                f"WHERE id IN ({marks}) AND status='recommended' AND {no_enabled_owner}",
+                batch,
+            ).rowcount
+        return max(0, demoted)
+    if source_id is not None:
+        return max(
+            0,
+            con.execute(
+                "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='recommended' "
+                "AND (id IN (SELECT candidate_id FROM candidate_sources WHERE source_id=?) OR source_id=?) "
+                f"AND {no_enabled_owner}",
+                (int(source_id), int(source_id)),
+            ).rowcount,
+        )
+    return max(
+        0,
+        con.execute(
+            "UPDATE candidates SET status='new', score=0, explanation='[]', "
+            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+            f"WHERE status='recommended' AND {no_enabled_owner}"
+        ).rowcount,
+    )
 
 def normalize_key(title: str, author: str):
     import re
