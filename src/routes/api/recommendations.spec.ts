@@ -29,8 +29,25 @@ import { GET } from "./recommendations/+server";
 
 afterEach(() => vi.clearAllMocks());
 
+const PAGE_BOOK_KEYS = [
+  "author",
+  "cover_url",
+  "genres",
+  "id",
+  "metadata_confidence",
+  "published_kind",
+  "published_on",
+  "reason",
+  "recommendation_run_id",
+  "score",
+  "source_url",
+  "status",
+  "synopsis",
+  "title",
+];
+
 describe("recommendations endpoint", () => {
-  it("loads the exact requested page without lookahead and maps the response for the browser", async () => {
+  it("loads the exact requested page without lookahead and maps explicit UI fields for the browser", async () => {
     engineWithHeadersMock.mockResolvedValue({
       data: [
         {
@@ -40,6 +57,7 @@ describe("recommendations endpoint", () => {
           description: "A description",
           cover_url: "https://covers.example/book.jpg",
           source_url: "https://books.example/book",
+          source_id: 3,
           release_date: "2026-10-01",
           date_kind: "day",
           genres: ["Fantasy"],
@@ -47,7 +65,17 @@ describe("recommendations endpoint", () => {
           explanation: ["A good match"],
           status: "recommended",
           recommendation_run_id: "run-page-2",
+          normalized_key: "a-book::a-writer",
+          created_at: "2026-09-01 00:00:00",
+          updated_at: "2026-09-02 00:00:00",
+          isbn13: "9780000000007",
+          isbn10: "0000000007",
+          score_batch_id: "batch-7",
           source_name: "A source",
+          quality_work_id: "/works/OL7W",
+          quality_provider: "openlibrary",
+          quality_isbn13: "9780000000007",
+          quality_isbn10: "0000000007",
         },
       ],
       headers: new Headers({
@@ -61,6 +89,7 @@ describe("recommendations endpoint", () => {
         "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=24",
       ),
     } as never);
+    const payload = await response.json();
 
     expect(response.status).toBe(200);
     expect(engineWithHeadersMock).toHaveBeenCalledWith(
@@ -68,18 +97,79 @@ describe("recommendations endpoint", () => {
     );
     expect(response.headers.get("X-Bookward-Has-More")).toBe("false");
     expect(response.headers.get("X-Bookward-Recommendation-Run")).toBe("run-page-2");
-    expect(await response.json()).toEqual({
+    expect(Object.keys(payload.items[0]).sort()).toEqual(PAGE_BOOK_KEYS);
+    expect(payload).toEqual({
       items: [
-        expect.objectContaining({
+        {
           id: 7,
+          recommendation_run_id: "run-page-2",
+          title: "A Book",
+          author: "A Writer",
           cover_url: "https://covers.example/book.jpg",
           source_url: "https://books.example/book",
-          reason: "A good match",
           published_on: "2026-10-01",
-          recommendation_run_id: "run-page-2",
-        }),
+          published_kind: "day",
+          genres: ["Fantasy"],
+          score: 91,
+          metadata_confidence: null,
+          synopsis: "A description",
+          reason: "A good match",
+          status: "recommended",
+        },
       ],
       has_more: false,
+    });
+  });
+
+  it("sanitizes non-HTTP URLs and joins multiple explanation items", async () => {
+    engineWithHeadersMock.mockResolvedValue({
+      data: [
+        {
+          id: 11,
+          recommendation_run_id: "run-abcd1234",
+          title: "Unsafe Link Book",
+          author: "A Writer",
+          description: "Summary text",
+          cover_url: "javascript:alert(1)",
+          source_url: "ftp://files.example/book",
+          release_date: null,
+          date_kind: "unknown",
+          genres: ["Mystery"],
+          score: 77,
+          metadata_confidence: 0.52,
+          explanation: ["Similar to a 5-star read", "Trusted source"],
+          status: "recommended",
+          source_name: "A source",
+        },
+      ],
+      headers: new Headers({
+        "x-bookward-has-more": "false",
+        "x-bookward-recommendation-run": "run-abcd1234",
+      }),
+    });
+
+    const response = await GET({
+      url: new URL("http://bookward.test/api/recommendations?status=recommended&limit=1"),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(Object.keys(payload.items[0]).sort()).toEqual(PAGE_BOOK_KEYS);
+    expect(payload.items[0]).toEqual({
+      id: 11,
+      recommendation_run_id: "run-abcd1234",
+      title: "Unsafe Link Book",
+      author: "A Writer",
+      cover_url: "",
+      source_url: "",
+      published_on: null,
+      published_kind: "unknown",
+      genres: ["Mystery"],
+      score: 77,
+      metadata_confidence: 0.52,
+      synopsis: "Summary text",
+      reason: "Similar to a 5-star read · Trusted source",
+      status: "recommended",
     });
   });
 
