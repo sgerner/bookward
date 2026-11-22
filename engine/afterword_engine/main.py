@@ -1246,6 +1246,15 @@ class BulkFeedbackIn(BaseModel):
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
+class BulkUndoItemIn(BaseModel):
+    id: int = Field(gt=0)
+    decision_id: int = Field(gt=0)
+
+
+class BulkUndoFeedbackIn(BaseModel):
+    decisions: list[BulkUndoItemIn] = Field(min_length=1, max_length=100)
+
+
 class ApiTokenCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
@@ -2047,76 +2056,86 @@ def feedback(candidate_id: int, payload: FeedbackIn):
         "id": candidate_id,
         "status": status,
     }
-    if payload.action in {"save", "reject", "maybe_later"}:
+    if payload.action in {"save", "reject", "maybe_later"} or (
+        payload.action == "restore" and previous_status and previous_status != "read"
+    ):
         result["decision_id"] = int(feedback_id)
     return result
+
+
+def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
+    decision = con.execute(
+        "SELECT id,action,previous_status,undone_at FROM feedback "
+        "WHERE id=? AND candidate_id=?",
+        (decision_id, candidate_id),
+    ).fetchone()
+    if (
+        not decision
+        or not decision["previous_status"]
+        or decision["previous_status"] == "read"
+    ):
+        raise HTTPException(404, "Undo is no longer available")
+    if decision["undone_at"]:
+        raise HTTPException(409, "This decision has already been undone")
+    if decision["action"] not in {"save", "reject", "maybe_later", "restore"}:
+        raise HTTPException(404, "Undo is no longer available")
+    latest = con.execute(
+        "SELECT id FROM feedback WHERE candidate_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (candidate_id,),
+    ).fetchone()
+    if not latest or int(latest["id"]) != decision_id:
+        raise HTTPException(409, "Only the latest decision can be undone")
+    current = con.execute(
+        "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+    ).fetchone()
+    if not current:
+        raise HTTPException(404, "Recommendation not found")
+    expected_status = {
+        "save": "saved",
+        "reject": "rejected",
+        "maybe_later": "maybe_later",
+        "restore": "recommended",
+    }[decision["action"]]
+    if current["status"] != expected_status:
+        raise HTTPException(409, "The recommendation changed after this decision")
+    previous_status = str(decision["previous_status"])
+    con.execute(
+        "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (previous_status, candidate_id),
+    )
+    con.execute(
+        "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
+        (decision_id,),
+    )
+    con.execute(
+        "DELETE FROM recommendation_outcomes WHERE event_id=("
+        "SELECT id FROM recommendation_events WHERE event_key=?)",
+        (f"feedback:{decision_id}",),
+    )
+    compensation = (
+        "save" if previous_status in {"saved", "imported"}
+        else "reject" if previous_status == "rejected"
+        else "maybe_later" if previous_status == "maybe_later"
+        else "restore"
+    )
+    try:
+        record_event_in_connection(
+            con,
+            event_key=f"undo-feedback:{decision_id}",
+            candidate_id=candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": candidate_id, "status": previous_status}
 
 
 @app.post("/api/recommendations/{candidate_id}/undo")
 def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
     with transaction() as con:
-        decision = con.execute(
-            "SELECT id,action,previous_status,undone_at FROM feedback "
-            "WHERE id=? AND candidate_id=?",
-            (payload.decision_id, candidate_id),
-        ).fetchone()
-        if not decision or not decision["previous_status"]:
-            raise HTTPException(404, "Undo is no longer available")
-        if decision["undone_at"]:
-            raise HTTPException(409, "This decision has already been undone")
-        if decision["action"] not in {"save", "reject", "maybe_later"}:
-            raise HTTPException(404, "Undo is no longer available")
-        latest = con.execute(
-            "SELECT id FROM feedback WHERE candidate_id=? "
-            "ORDER BY id DESC LIMIT 1",
-            (candidate_id,),
-        ).fetchone()
-        if not latest or int(latest["id"]) != payload.decision_id:
-            raise HTTPException(409, "Only the latest decision can be undone")
-        current = con.execute(
-            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
-        ).fetchone()
-        if not current:
-            raise HTTPException(404, "Recommendation not found")
-        expected_status = {
-            "save": "saved",
-            "reject": "rejected",
-            "maybe_later": "maybe_later",
-            "restore": "recommended",
-        }[decision["action"]]
-        if current["status"] != expected_status:
-            raise HTTPException(409, "The recommendation changed after this decision")
-        previous_status = str(decision["previous_status"])
-        con.execute(
-            "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (previous_status, candidate_id),
-        )
-        con.execute(
-            "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
-            (payload.decision_id,),
-        )
-        con.execute(
-            "DELETE FROM recommendation_outcomes WHERE event_id=("
-            "SELECT id FROM recommendation_events WHERE event_key=?)",
-            (f"feedback:{payload.decision_id}",),
-        )
-        compensation = (
-            "save" if previous_status in {"saved", "imported"}
-            else "reject" if previous_status == "rejected"
-            else "maybe_later" if previous_status == "maybe_later"
-            else "restore"
-        )
-        try:
-            record_event_in_connection(
-                con,
-                event_key=f"undo-feedback:{payload.decision_id}",
-                candidate_id=candidate_id,
-                event_type=compensation,
-                source="ui_undo",
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    return {"id": candidate_id, "status": previous_status}
+        return _undo_feedback_in_connection(con, candidate_id, payload.decision_id)
 
 
 @app.post("/api/recommendations/{candidate_id}/read")
@@ -2167,17 +2186,23 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
 def bulk_feedback(payload: BulkFeedbackIn):
     status = {"save": "saved", "reject": "rejected", "restore": "recommended"}[payload.action]
     ids = list(dict.fromkeys(payload.ids))
+    decisions = []
     with transaction() as con:
         placeholders = ",".join("?" for _ in ids)
         found = {
-            int(item["id"])
-            for item in con.execute(f"SELECT id FROM candidates WHERE id IN ({placeholders})", ids).fetchall()
+            int(item["id"]): str(item["status"])
+            for item in con.execute(
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+            ).fetchall()
         }
-        for candidate_id in found:
+        for candidate_id in ids:
+            if candidate_id not in found:
+                continue
+            previous_status = found[candidate_id]
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
             feedback_id = con.execute(
-                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                (candidate_id, payload.action),
+                "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
+                (candidate_id, payload.action, previous_status),
             ).lastrowid
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
@@ -2194,7 +2219,27 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-    return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
+            if payload.action in {"save", "reject"} or (
+                payload.action == "restore" and previous_status and previous_status != "read"
+            ):
+                decisions.append({"id": candidate_id, "decision_id": int(feedback_id)})
+    return {
+        "updated": len(found),
+        "skipped": len(ids) - len(found),
+        "status": status,
+        "ids": sorted(found),
+        "decisions": decisions,
+    }
+
+
+@app.post("/api/recommendations/bulk-undo")
+def bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    items = list(dict.fromkeys((item.id, item.decision_id) for item in payload.decisions))
+    restored = []
+    with transaction() as con:
+        for candidate_id, decision_id in items:
+            restored.append(_undo_feedback_in_connection(con, candidate_id, decision_id))
+    return {"undone": len(restored), "items": restored}
 
 
 def telemetry_events(payload: TelemetryBatchIn):
@@ -3223,6 +3268,11 @@ def api_recommendations(
 @api_v1.post("/recommendations/bulk-feedback")
 def api_bulk_feedback(payload: BulkFeedbackIn):
     return bulk_feedback(payload)
+
+
+@api_v1.post("/recommendations/bulk-undo")
+def api_bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    return bulk_undo_feedback(payload)
 
 
 @api_v1.post("/recommendations/{candidate_id}/feedback")

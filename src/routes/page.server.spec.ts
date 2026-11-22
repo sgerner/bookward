@@ -285,6 +285,91 @@ describe("page actions", () => {
     );
   });
 
+  it("exposes a restore Undo token when returning a book to Discover", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, status: "recommended", decision_id: 61 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "recommended");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 61,
+      id: 9,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+    });
+  });
+
+  it("routes multi-item Undo requests to bulk-undo and propagates 409 conflicts", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ undone: 2 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Only the latest decision can be undone" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.append("id", "7");
+    body.append("decision_id", "21");
+    body.append("id", "8");
+    body.append("decision_id", "22");
+    const result = await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Decisions undone." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/bulk-undo",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+      }),
+    );
+
+    const conflict = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: boolean } };
+    expect(conflict.status).toBe(409);
+    expect(conflict.data).toEqual({
+      message: "Only the latest decision can be undone",
+      error: true,
+    });
+
+    const invalid = new FormData();
+    invalid.append("id", "7");
+    invalid.append("id", "8");
+    invalid.append("decision_id", "21");
+    const badRequest = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalid }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(badRequest.status).toBe(400);
+  });
+
   it("does not save a custom source when preview finds no books", async () => {
     const fetchMock = vi
       .fn()
@@ -503,6 +588,45 @@ describe("page actions", () => {
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
       ids: [7, 8],
       action: "save",
+    });
+  });
+
+  it("forwards a shared run_id and returns batch undo tokens for shortlistBulk", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          updated: 2,
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("run_id", "run-digest-1");
+    body.append("ids", "7");
+    body.append("ids", "8");
+    const result = await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "2 books added to your shortlist.",
+      undo_decisions: [
+        { id: 7, decision_id: 21 },
+        { id: 8, decision_id: 22 },
+      ],
+      undo_label: "shortlisting 2 books",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+      run_id: "run-digest-1",
     });
   });
 
