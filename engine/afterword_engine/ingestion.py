@@ -15,6 +15,7 @@ import httpx
 from bs4 import BeautifulSoup
 from .config import settings
 from .covers import (
+    CatalogCircuitBreaker,
     METADATA_GENRE_LIMIT,
     METADATA_NORMALIZATION_VERSION,
     _publication_date,
@@ -1573,6 +1574,7 @@ async def refresh_read_metadata(
     checked_at = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
     updated = 0
     lookup_failures = 0
+    rate_limited_providers = CatalogCircuitBreaker()
     google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         for read in batch:
@@ -1606,6 +1608,7 @@ async def refresh_read_metadata(
                         isbn10=read_isbn10,
                         google_books_api_key=google_books_api_key,
                         client=client,
+                        rate_limited_providers=rate_limited_providers,
                     )
                     attempt_provenance = metadata.get("metadata_provenance", {})
                 metadata, identity_evidence, verified_work_id = _verified_read_metadata(metadata, read)
@@ -2547,6 +2550,7 @@ async def enrich_book_metadata(items):
         return []
     semaphore = asyncio.Semaphore(8)
     lookup_cache = {}
+    rate_limited_providers = CatalogCircuitBreaker()
     google_books_api_key = private_setting("association_google_books_api_key", "").strip()
 
     async with metadata_client() as client:
@@ -2573,6 +2577,7 @@ async def enrich_book_metadata(items):
                     prefer_isbn_cover=bool(isbn13 or isbn10),
                     google_books_api_key=google_books_api_key,
                     prefer_catalog_synopsis=bool(item.get("_prefer_catalog_synopsis")),
+                    rate_limited_providers=rate_limited_providers,
                 )
                 enriched = {**item, "cover_url": metadata["cover_url"]}
                 if isbn13:

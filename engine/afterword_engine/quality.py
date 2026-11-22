@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from .covers import (
+    CatalogCircuitBreaker,
     GOOGLE_BOOKS_SEARCH,
     METADATA_GENRE_LIMIT,
     METADATA_NORMALIZATION_VERSION,
@@ -37,6 +38,8 @@ from .covers import (
     _openlibrary_request,
     _publication_date,
     _query_isbn_matches,
+    _run_with_provider_circuit_breaker,
+    _skipped_rate_limited_trace,
     _utc_now,
     is_weak_cover_url,
     metadata_client,
@@ -60,6 +63,7 @@ CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 CATALOG_PROVIDER_RETRY_HOURS = 24
 QUALITY_AUDIT_BATCH_SIZE = 50
+_PROVIDER_ORDER = {"openlibrary": 0, "google_books": 1, "apple_books": 2}
 UNKNOWN_AUTHOR_RE = re.compile(
     r"^(?:unknown(?:\s+author)?|n/?a|none|null|various(?:\s+authors?)?|anonymous|staff)$",
     re.IGNORECASE,
@@ -723,30 +727,43 @@ async def resolve_catalog_match(
 
         async def _call_provider(lookup_provider, *, isbn_arg: str = ""):
             provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
-            if rate_limited_providers is not None and provider_name in rate_limited_providers:
-                fetch_trace.append(
-                    {
-                        "provider": provider_name,
-                        "fetched_at": _utc_now(),
-                        "query_kind": "isbn" if isbn_arg else "title_author",
-                        "status": "rate_limited",
-                        "http_status": 429,
-                        "skipped": True,
-                    }
-                )
-                return None
+            query_kind = "isbn" if isbn_arg else "title_author"
             kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
-            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
-            _record_rate_limits()
-            return result
+
+            async def _invoke():
+                provider_traces: list[dict[str, Any]] = []
+                result = await lookup_provider(
+                    title, author, client, isbn=isbn_arg, trace=provider_traces, **kwargs
+                )
+                return result, provider_traces
+
+            return await _run_with_provider_circuit_breaker(
+                rate_limited_providers,
+                provider_name,
+                probe_first=provider_name == "google_books",
+                call_fn=_invoke,
+                is_rate_limited_fn=lambda outcome: any(
+                    trace.get("status") == "rate_limited" for trace in outcome[1]
+                ),
+                on_skip_fn=lambda: (
+                    None,
+                    [_skipped_rate_limited_trace(provider_name, query_kind)],
+                ),
+            )
 
         if query_isbn:
-            # Query both providers so a strong identity record with sparse
-            # fields does not hide useful verified metadata from the other.
-            for lookup_provider in (_open_library_match, _google_books_match):
-                match = await _call_provider(lookup_provider, isbn_arg=query_isbn)
+            # Query both providers concurrently so a strong identity record with
+            # sparse fields does not hide useful verified metadata from the
+            # other and Open Library's 1 req/s lock never stalls Google Books.
+            stage1_results = await asyncio.gather(
+                _call_provider(_open_library_match, isbn_arg=query_isbn),
+                _call_provider(_google_books_match, isbn_arg=query_isbn),
+            )
+            for match, provider_traces in stage1_results:
+                fetch_trace.extend(provider_traces)
                 if match:
                     matches.append(match)
+            _record_rate_limits()
 
         def has_full_field_coverage(values: list[dict[str, Any]]) -> bool:
             return (
@@ -766,13 +783,24 @@ async def resolve_catalog_match(
                 if trace.get("query_kind") == "isbn"
                 and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
             }
-            for lookup_provider in (_open_library_match, _google_books_match):
-                provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
-                if query_isbn and provider_name in unavailable_providers:
-                    continue
-                match = await _call_provider(lookup_provider)
-                if match:
-                    matches.append(match)
+            stage2_providers = [
+                lookup_provider
+                for lookup_provider in (_open_library_match, _google_books_match)
+                if not (
+                    query_isbn
+                    and ("openlibrary" if lookup_provider is _open_library_match else "google_books")
+                    in unavailable_providers
+                )
+            ]
+            if stage2_providers:
+                stage2_results = await asyncio.gather(
+                    *(_call_provider(lookup_provider) for lookup_provider in stage2_providers)
+                )
+                for match, provider_traces in stage2_results:
+                    fetch_trace.extend(provider_traces)
+                    if match:
+                        matches.append(match)
+                _record_rate_limits()
 
         primary_unavailable = any(
             trace.get("provider") in {"openlibrary", "google_books"}
@@ -849,7 +877,10 @@ async def resolve_catalog_match(
             ) if prior else None
             if prior is None or rank > prior_rank:
                 by_record[record_key] = match
-        records = list(by_record.values())
+        records = sorted(
+            by_record.values(),
+            key=lambda record: _PROVIDER_ORDER.get(str(record.get("provider") or ""), 99),
+        )
         verified_records = [record for record in records if accepted(record)]
         identity_record = max(records, key=lambda record: record["quality_score"])
         metadata_records = verified_records or []
@@ -1450,7 +1481,7 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
 
     semaphore = asyncio.Semaphore(CATALOG_CONCURRENCY)
     cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]] = {}
-    rate_limited_providers: set[str] = set()
+    rate_limited_providers: set[str] = CatalogCircuitBreaker()
     google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         async def run(candidate):

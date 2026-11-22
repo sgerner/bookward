@@ -550,3 +550,63 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["provider_id"] == "6758952748"
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_concurrent_audit_probes_google_books_once_and_queries_apple_after_primaries(database):
+    api_key = "secret-google-audit-key"
+    candidate_ids = [
+        add_candidate(f"Concurrent Unmatched {index}", f"Author {index}")
+        for index in range(10)
+    ]
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1)",
+            (api_key,),
+        )
+        placeholders = ",".join("?" for _ in candidate_ids)
+        con.execute(
+            f"UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN ({placeholders})",
+            (QUALITY_VERSION, *candidate_ids),
+        )
+
+    completed_primaries: dict[str, set[str]] = {}
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        completed_primaries.setdefault(title, set()).add("openlibrary")
+        return httpx.Response(200, json={"docs": []})
+
+    def gb_handler(request):
+        q = request.url.params.get("q", "")
+        for index in range(10):
+            title = f"Concurrent Unmatched {index}"
+            if title in q:
+                completed_primaries.setdefault(title, set()).add("google_books")
+        return httpx.Response(429, json={"error": {"message": "quota exceeded"}})
+
+    def apple_handler(request):
+        term = request.url.params.get("term", "")
+        matched_title = next(
+            (f"Concurrent Unmatched {i}" for i in range(10) if f"Concurrent Unmatched {i}" in term),
+            "",
+        )
+        assert "openlibrary" in completed_primaries.get(matched_title, set())
+        return httpx.Response(200, json={"results": []})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    gb_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(side_effect=gb_handler)
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(side_effect=apple_handler)
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["audited"] == 10
+    assert result["quarantine"] == 10
+    assert len(gb_route.calls) == 1
+    assert apple_route.called
+    for cid in candidate_ids:
+        row_data = row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        flags = json.loads(row_data["flags_json"])
+        assert "catalog_provider_rate_limited" in flags
+        assert api_key not in row_data["flags_json"]
+

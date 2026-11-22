@@ -1656,6 +1656,91 @@ def test_metadata_enrichment_reuses_duplicate_provider_lookups():
 
 
 @respx.mock
+def test_metadata_enrichment_dedupes_both_providers_and_circuit_breaks_google_429(database, monkeypatch):
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr("afterword_engine.covers._openlibrary_rate_sleep", no_wait)
+    api_key = "secret-google-enrich-key"
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1)",
+            (api_key,),
+        )
+    ol_dup = respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLDUP1W",
+                        "title": "Duplicate Book",
+                        "author_name": ["Same Author"],
+                        "first_publish_year": 2005,
+                        "subject": ["Literary fiction"],
+                    }
+                ]
+            },
+        )
+    )
+    gb_dup = respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "gb-dup-1",
+                        "volumeInfo": {
+                            "title": "Duplicate Book",
+                            "authors": ["Same Author"],
+                            "description": "Shared Google synopsis.",
+                        },
+                    }
+                ]
+            },
+        )
+    )
+    dup_items = [
+        {"title": "Duplicate Book", "author": "Same Author"}
+        for _ in range(4)
+    ]
+    dup_enriched = asyncio.run(enrich_book_metadata(dup_items))
+    assert ol_dup.call_count == 1
+    assert gb_dup.call_count == 1
+    assert all(item["description"] == "Shared Google synopsis." for item in dup_enriched)
+
+    respx.reset()
+    ol_batch = respx.get(OPEN_LIBRARY_SEARCH).mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OLBATCH{req.url.params.get('title', '').split()[-1]}W",
+                        "title": req.url.params.get("title", ""),
+                        "author_name": ["Batch Author"],
+                        "description": "Open Library synopsis.",
+                    }
+                ]
+            },
+        )
+    )
+    gb_batch = respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+    batch_items = [
+        {"title": f"Batch Book {index}", "author": "Batch Author"}
+        for index in range(10)
+    ]
+    batch_enriched = asyncio.run(enrich_book_metadata(batch_items))
+    assert ol_batch.call_count == 10
+    assert gb_batch.call_count == 1
+    for item in batch_enriched:
+        assert item["description"] == "Open Library synopsis."
+        provenance_json = json.dumps(item["_metadata_provenance"], sort_keys=True)
+        assert api_key not in provenance_json
+        assert "key=" not in provenance_json
+
+
+@respx.mock
 def test_metadata_rejects_wrong_author_and_falls_back_to_verified_google_record():
     open_library = respx.get(OPEN_LIBRARY_SEARCH).mock(
         return_value=httpx.Response(
