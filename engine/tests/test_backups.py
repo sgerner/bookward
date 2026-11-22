@@ -550,3 +550,40 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
     assert restored.json()["restored_backup"] == backup["id"]
     assert row("SELECT 1 FROM reads WHERE title='API recovery'") is not None
     assert private_setting("api_recovery_secret") == "api secret"
+
+
+def test_public_backup_error_message_blocks_arbitrary_exception_exposure(
+    database, monkeypatch
+):
+    assert (
+        backups.public_backup_error_message(
+            RuntimeError("internal stack secret detail")
+        )
+        == "Your Bookward profile is temporarily unavailable. Please try again."
+    )
+    assert (
+        backups.public_backup_error_message(
+            PermissionError(13, "Permission denied", str(database / "secret.key"))
+        )
+        == "Interrupted restore recovery failed: Permission denied"
+    )
+
+    headers = authenticated_headers()
+    journal_path = backups._restore_journal_path()
+    journal_path.write_text('{"safety_backup": "bookward-20260101T000000Z-deadbeef"}', encoding="utf-8")
+    journal_path.chmod(0o600)
+    try:
+        monkeypatch.setattr(
+            "afterword_engine.main.recover_interrupted_restore",
+            lambda: (_ for _ in ()).throw(RuntimeError("unexpected internal traceback detail")),
+        )
+        client = TestClient(app, headers=headers)
+        resp = client.get("/api/overview")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == (
+            "Your Bookward profile is temporarily unavailable. Please try again."
+        )
+        assert "unexpected internal traceback detail" not in resp.text
+    finally:
+        journal_path.unlink(missing_ok=True)
+

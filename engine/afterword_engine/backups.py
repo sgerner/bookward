@@ -1,6 +1,7 @@
 """Private, WAL-safe SQLite backups and guarded in-place recovery."""
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -45,10 +46,97 @@ _FERNET_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}=(?![A-Za-z0-9_
 _KEY_FILENAME_RE = re.compile(r"(?i)\b(?:\.?[a-z0-9_-]+\.)?secret\.key\b")
 _RESTORE_JOURNAL_ERRORS: dict[str, tuple[tuple[int, int] | None, str]] = {}
 _RESTORE_JOURNAL_ERRORS_GUARD = threading.Lock()
+_PUBLIC_ERRNO_MESSAGES: tuple[tuple[int, str], ...] = (
+    (errno.EACCES, "Permission denied"),
+    (errno.EPERM, "Operation not permitted"),
+    (errno.ENOSPC, "No space left on device"),
+    (errno.EROFS, "Read-only file system"),
+    (errno.ENOENT, "No such file or directory"),
+    (errno.EEXIST, "File exists"),
+    (errno.EBUSY, "Device or resource busy"),
+    (errno.EIO, "Input/output error"),
+    (errno.EMFILE, "Too many open files"),
+    (errno.ENFILE, "Too many open files in system"),
+)
+_PUBLIC_RECOVERY_MESSAGES: tuple[str, ...] = (
+    "The backup directory permissions could not be secured.",
+    "Choose a valid Bookward backup.",
+    "That backup is no longer available.",
+    "Backup cannot run while an interrupted restore is awaiting recovery.",
+    "The Bookward database is not available for backup.",
+    "SQLite could not verify the completed backup.",
+    "The database has unresolved references; backup stopped.",
+    "The completed backup name is invalid.",
+    "This file is not a valid Bookward database backup.",
+    "This backup contains unresolved database references.",
+    "This file is not a Bookward database backup.",
+    "This backup has no Bookward schema version.",
+    "This backup was made by a newer Bookward version. Upgrade Bookward before restoring it.",
+    "This file is not a readable Bookward database backup.",
+    "The interrupted restore journal is invalid.",
+    "The interrupted restore journal could not be read.",
+    *(
+        f"The interrupted restore journal could not be read: {detail}"
+        for _, detail in _PUBLIC_ERRNO_MESSAGES
+    ),
+    "The interrupted restore journal is corrupted.",
+    "The interrupted restore journal is missing its safety backup reference.",
+    "This backup has no generated encryption key. Restore it with the original data volume or configured key.",
+    "This backup's generated encryption key is invalid.",
+    "The encryption key for this backup is missing or does not match its stored secrets.",
+    "The active database path is invalid.",
+    "The active database could not be safely closed for restore.",
+    "An interrupted restore is awaiting recovery.",
+    "An interrupted restore was rolled back to its safety backup.",
+    "Interrupted restore recovery failed.",
+    *(
+        f"Interrupted restore recovery failed: {detail}"
+        for _, detail in _PUBLIC_ERRNO_MESSAGES
+    ),
+    "Restore failed; automatic rollback did not complete.",
+    "Restore failed; automatic rollback did not complete. The active database could not be safely closed for restore.",
+    *(
+        f"Restore failed; automatic rollback did not complete. {detail}"
+        for _, detail in _PUBLIC_ERRNO_MESSAGES
+    ),
+)
 
 
 class BackupError(ValueError):
     """A backup or restore could not be completed safely."""
+
+
+def _public_errno_detail(error_code: object) -> str | None:
+    if not isinstance(error_code, int):
+        return None
+    for code, detail in _PUBLIC_ERRNO_MESSAGES:
+        if error_code == code:
+            return detail
+    return None
+
+
+def public_backup_error_message(
+    error: object,
+    *,
+    default: str = "Your Bookward profile is temporarily unavailable. Please try again.",
+) -> str:
+    """Map backup or recovery errors to curated public constants."""
+
+    if isinstance(error, (BackupError, str)):
+        candidate = _safe_backup_detail(error, limit=300)
+        for allowed in _PUBLIC_RECOVERY_MESSAGES:
+            if candidate == allowed:
+                return allowed
+    if isinstance(error, BaseException):
+        for target in (error, error.__cause__):
+            if isinstance(target, OSError):
+                detail = _public_errno_detail(getattr(target, "errno", None))
+                if detail is not None:
+                    expected = f"Interrupted restore recovery failed: {detail}"
+                    for allowed in _PUBLIC_RECOVERY_MESSAGES:
+                        if allowed == expected:
+                            return allowed
+    return default
 
 
 def _safe_backup_detail(error, *, limit: int = 240) -> str:
@@ -82,9 +170,11 @@ def _journal_fingerprint(journal: Path) -> tuple[int, int] | None:
     return (info.st_mtime_ns, info.st_size)
 
 
-def _record_restore_journal_error(message: str, journal: Path | None = None) -> None:
+def _record_restore_journal_error(message: object, journal: Path | None = None) -> None:
     target = journal if journal is not None else _restore_journal_path()
-    clean = _safe_backup_detail(message, limit=300)
+    clean = public_backup_error_message(
+        message, default="Interrupted restore recovery failed."
+    )
     with _RESTORE_JOURNAL_ERRORS_GUARD:
         _RESTORE_JOURNAL_ERRORS[str(target)] = (_journal_fingerprint(target), clean)
 
@@ -272,9 +362,11 @@ def _restore_journal_status_error(journal: Path) -> str:
         safety_key = _restore_key_sidecar(safety_path)
         _validate_snapshot_key(safety_path, safety_key)
     except BackupError as exc:
-        return _safe_backup_detail(exc, limit=300)
-    except Exception as exc:
-        return f"Interrupted restore recovery failed: {_safe_backup_detail(exc, limit=200)}"
+        return public_backup_error_message(
+            exc, default="Interrupted restore recovery failed."
+        )
+    except Exception:
+        return "Interrupted restore recovery failed."
     if recorded is not None and recorded[0] == fingerprint and recorded[1]:
         return recorded[1]
     if recorded is not None and recorded[1]:
@@ -295,11 +387,7 @@ def backup_status() -> dict:
                     "SELECT value FROM settings WHERE key=?", (LAST_ERROR_KEY,)
                 ).fetchone()
                 last_error = found["value"] if found else None
-        except OSError as exc:
-            last_error = (
-                f"Backup status is temporarily unavailable: {_safe_backup_detail(exc, limit=200)}"
-            )
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             last_error = "Backup status is temporarily unavailable."
     interval = backup_interval_hours()
     last_success = backups[0]["created_at"] if backups else None
@@ -874,9 +962,12 @@ def _read_restore_journal_ids(journal: Path) -> tuple[str, str | None]:
     try:
         raw = journal.read_text(encoding="utf-8")
     except OSError as exc:
-        raise BackupError(
-            f"The interrupted restore journal could not be read: {_safe_backup_detail(exc, limit=200)}"
-        ) from exc
+        errno_detail = _public_errno_detail(getattr(exc, "errno", None))
+        if errno_detail is not None:
+            raise BackupError(
+                f"The interrupted restore journal could not be read: {errno_detail}"
+            ) from exc
+        raise BackupError("The interrupted restore journal could not be read.") from exc
     except UnicodeDecodeError as exc:
         raise BackupError("The interrupted restore journal is corrupted.") from exc
     try:
@@ -930,7 +1021,7 @@ def recover_interrupted_restore() -> bool:
     except BackupError as exc:
         LOGGER.exception("Could not recover an interrupted Bookward restore")
         clean = _safe_backup_detail(exc, limit=300)
-        _record_restore_journal_error(clean, journal)
+        _record_restore_journal_error(exc, journal)
         if clean != str(exc):
             raise BackupError(clean) from exc
         raise
@@ -938,7 +1029,7 @@ def recover_interrupted_restore() -> bool:
         LOGGER.exception("Could not recover an interrupted Bookward restore")
         detail = _safe_backup_detail(exc, limit=200)
         message = f"Interrupted restore recovery failed: {detail}"
-        _record_restore_journal_error(message, journal)
+        _record_restore_journal_error(exc, journal)
         raise BackupError(message) from exc
 
 

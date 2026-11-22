@@ -22,11 +22,11 @@ from .config import settings
 from .database import connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
-    _safe_backup_detail,
     backup_scheduler_loop,
     backup_status,
     create_backup,
     identity_backup_status,
+    public_backup_error_message,
     recover_interrupted_restore,
     restore_backup,
 )
@@ -763,11 +763,10 @@ async def authenticate_engine_request(request: Request, call_next):
             await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
         except Exception as exc:
             LOGGER.exception(
-                "Profile %s is unavailable during API request recovery",
-                token["profile_id"],
+                "Authenticated profile is unavailable during API request recovery"
             )
             return JSONResponse(
-                {"detail": safe_error_message(_safe_backup_detail(exc))},
+                {"detail": public_backup_error_message(exc)},
                 status_code=503,
                 headers={"cache-control": "private, no-store"},
             )
@@ -805,7 +804,7 @@ async def authenticate_engine_request(request: Request, call_next):
                     account["profile_id"],
                 )
                 return JSONResponse(
-                    {"detail": safe_error_message(_safe_backup_detail(exc))},
+                    {"detail": public_backup_error_message(exc)},
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
@@ -847,7 +846,7 @@ def initial_admin_setup(payload: InitialAdminIn):
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     except (BackupError, sqlite3.Error, OSError) as exc:
-        raise HTTPException(503, safe_error_message(_safe_backup_detail(exc))) from exc
+        raise HTTPException(503, public_backup_error_message(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -955,7 +954,7 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
         try:
             _ensure_profile_database(found["profile_id"])
         except (BackupError, sqlite3.Error, OSError) as exc:
-            raise HTTPException(503, safe_error_message(_safe_backup_detail(exc))) from exc
+            raise HTTPException(503, public_backup_error_message(exc)) from exc
     try:
         identity_store.set_account_status(account_id, status)
     except ValueError as exc:
