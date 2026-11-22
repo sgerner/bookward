@@ -78,6 +78,7 @@ type Overview = {
     digest: DigestSettings;
     llm_rerank?: {
       enabled: boolean;
+      mode?: "cloud" | "ollama" | "openai-compatible";
       provider: string;
       api_url: string;
       model: string;
@@ -694,8 +695,19 @@ export const actions: Actions = {
   configureLlmRerank: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
+    const modeResult = z
+      .enum(["cloud", "ollama", "openai-compatible"])
+      .safeParse(String(data.get("mode") || "cloud").trim().toLowerCase());
+    if (!modeResult.success) {
+      return fail(400, {
+        message: "Choose a valid LLM reranker mode.",
+      });
+    }
+    const mode = modeResult.data;
     const provider = String(data.get("provider") || "").trim();
-    const apiUrl = String(data.get("apiUrl") || "").trim();
+    const rawApiUrl = String(data.get("apiUrl") || "").trim();
+    const apiUrl =
+      mode === "ollama" && !rawApiUrl ? "http://ollama:11434" : rawApiUrl;
     const model = String(data.get("model") || "").trim();
     const apiKey = String(data.get("apiKey") || "").trim();
     const clearApiKey = data.get("clearApiKey") === "on";
@@ -709,6 +721,7 @@ export const actions: Actions = {
         method: "PUT",
         body: JSON.stringify({
           enabled,
+          mode,
           provider,
           api_url: apiUrl,
           model,
@@ -716,7 +729,11 @@ export const actions: Actions = {
           clear_api_key: clearApiKey,
         }),
       });
-      return { message: "LLM reranker settings saved." };
+      return {
+        message: enabled
+          ? "LLM reranker verified and saved."
+          : "LLM reranker settings saved.",
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }

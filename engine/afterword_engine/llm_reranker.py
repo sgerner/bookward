@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import httpx
 
 from .config import settings
+from .security import validate_service_url
 
 LOGGER = logging.getLogger(__name__)
+
+LLM_RERANK_MODES = ("cloud", "ollama", "openai-compatible")
+DEFAULT_OLLAMA_URL = "http://ollama:11434"
+DEFAULT_CLOUD_LLM_URL = "https://api.openai.com/v1/chat/completions"
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", flags=re.DOTALL | re.IGNORECASE)
 
 
 def build_rerank_prompt(
@@ -229,6 +239,55 @@ def apply_llm_rerank_order(
     }
 
 
+def normalize_llm_rerank_mode(value: str | None) -> str:
+    mode = str(value or "cloud").strip().lower()
+    if mode not in LLM_RERANK_MODES:
+        raise ValueError(f"Unsupported LLM reranker mode: {mode}")
+    return mode
+
+
+def llm_rerank_allowed_hosts(raw: str | None = None) -> set[str]:
+    source = settings.llm_rerank_allowed_hosts if raw is None else raw
+    return {
+        host.strip().lower().rstrip(".")
+        for host in str(source or "").split(",")
+        if host.strip()
+    }
+
+
+def validate_llm_rerank_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        raise ValueError("LLM API URL is required")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
+    hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    return validate_service_url(cleaned, hosts)
+
+
+def _normalize_ollama_base_url(url: str) -> str:
+    """Normalize an Ollama server URL to its base origin without trailing API paths."""
+    cleaned = url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    for suffix in (
+        "/api/chat",
+        "/api/tags",
+        "/api/generate",
+        "/v1/chat/completions",
+        "/v1/models",
+        "/api",
+        "/v1",
+    ):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+            break
+    return cleaned
+
+
 def _normalize_chat_url(url: str) -> str:
     """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
     cleaned = url.strip().rstrip("/")
@@ -238,7 +297,367 @@ def _normalize_chat_url(url: str) -> str:
         return cleaned
     if cleaned.endswith(("/v1", "/openai")):
         return f"{cleaned}/chat/completions"
+    parsed = urlparse(cleaned)
+    if parsed.scheme in {"http", "https"} and parsed.netloc and parsed.path in {"", "/"}:
+        return f"{cleaned}/v1/chat/completions"
     return cleaned
+
+
+def _normalize_openai_models_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base or chat URL to its models discovery endpoint."""
+    cleaned = url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/models"):
+        return cleaned
+    if cleaned.endswith("/chat/completions"):
+        return f"{cleaned[: -len('/chat/completions')]}/models"
+    if cleaned.endswith(("/v1", "/openai")):
+        return f"{cleaned}/models"
+    return f"{cleaned}/v1/models"
+
+
+def extract_llm_json(content: str) -> dict[str, Any]:
+    """Parse strict JSON or extract a JSON object when local models omit strict schema flags."""
+    text = str(content or "").strip()
+    if not text:
+        raise ValueError("LLM returned an empty response")
+
+    candidates_to_parse = [text]
+    stripped_think = _THINK_TAG_RE.sub("", text).strip()
+    if stripped_think and stripped_think != text:
+        candidates_to_parse.append(stripped_think)
+
+    for candidate in list(candidates_to_parse):
+        for match in _CODE_FENCE_RE.finditer(candidate):
+            fenced = match.group(1).strip()
+            if fenced:
+                candidates_to_parse.append(fenced)
+
+    for candidate in candidates_to_parse:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except (TypeError, ValueError):
+            continue
+
+    scan_target = stripped_think or text
+    decoder = json.JSONDecoder()
+    fallback_dict: dict[str, Any] | None = None
+    pos = 0
+    while True:
+        brace = scan_target.find("{", pos)
+        if brace == -1:
+            break
+        try:
+            obj, _ = decoder.raw_decode(scan_target, brace)
+            if isinstance(obj, dict):
+                if "adjustments" in obj or "rankings" in obj:
+                    return obj
+                if fallback_dict is None:
+                    fallback_dict = obj
+        except ValueError:
+            pass
+        pos = brace + 1
+
+    if fallback_dict is not None:
+        return fallback_dict
+    raise ValueError("LLM response did not contain a valid JSON object")
+
+
+def _build_headers(api_key: str, *, include_content_type: bool = True) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    else:
+        headers["Accept"] = "application/json"
+    cleaned_key = api_key.strip()
+    if cleaned_key:
+        headers["Authorization"] = f"Bearer {cleaned_key}"
+    return headers
+
+
+def _extract_completion_text(payload: Any, mode: str) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("LLM endpoint returned a non-object JSON payload")
+    if mode == "ollama":
+        message = payload.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
+        if isinstance(payload.get("response"), str):
+            return payload["response"]
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"]
+    raise ValueError("LLM endpoint response did not include message content")
+
+
+async def _request_llm_completion_async(
+    *,
+    mode: str,
+    api_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float,
+    allowed_hosts: set[str] | None = None,
+) -> str:
+    validate_llm_rerank_url(api_url, allowed_hosts)
+    headers = _build_headers(api_key, include_content_type=True)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        if mode == "ollama":
+            target_url = f"{_normalize_ollama_base_url(api_url)}/api/chat"
+            strict_body: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.0},
+            }
+            plain_body: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.0},
+            }
+        else:
+            target_url = _normalize_chat_url(api_url)
+            strict_body = {
+                "model": model,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+                "messages": messages,
+            }
+            plain_body = {
+                "model": model,
+                "temperature": 0.0,
+                "messages": messages,
+            }
+
+        response = await client.post(target_url, headers=headers, json=strict_body)
+        if response.status_code in {400, 422}:
+            response = await client.post(target_url, headers=headers, json=plain_body)
+        response.raise_for_status()
+        return _extract_completion_text(response.json(), mode)
+
+
+def _request_llm_completion_sync(
+    *,
+    mode: str,
+    api_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float,
+    allowed_hosts: set[str] | None = None,
+) -> str:
+    validate_llm_rerank_url(api_url, allowed_hosts)
+    headers = _build_headers(api_key, include_content_type=True)
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        if mode == "ollama":
+            target_url = f"{_normalize_ollama_base_url(api_url)}/api/chat"
+            strict_body: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.0},
+            }
+            plain_body: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.0},
+            }
+        else:
+            target_url = _normalize_chat_url(api_url)
+            strict_body = {
+                "model": model,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+                "messages": messages,
+            }
+            plain_body = {
+                "model": model,
+                "temperature": 0.0,
+                "messages": messages,
+            }
+
+        response = client.post(target_url, headers=headers, json=strict_body)
+        if response.status_code in {400, 422}:
+            response = client.post(target_url, headers=headers, json=plain_body)
+        response.raise_for_status()
+        return _extract_completion_text(response.json(), mode)
+
+
+def _apply_parsed_rerank(
+    candidates: Sequence[dict[str, Any]],
+    parsed: dict[str, Any],
+    *,
+    top_k: int,
+    max_delta: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if isinstance(parsed.get("adjustments"), list):
+        return apply_llm_rerank_adjustments(
+            candidates, parsed["adjustments"], top_k=top_k, max_delta=max_delta
+        )
+    if isinstance(parsed.get("rankings"), list):
+        return apply_llm_rerank_order(
+            candidates, parsed["rankings"], top_k=top_k, max_nudge=max_delta
+        )
+    return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
+
+
+def _resolve_rerank_runtime(
+    *,
+    mode: str | None,
+    api_url: str | None,
+    api_key: str | None,
+    model: str | None,
+) -> tuple[str, str, str, str]:
+    resolved_mode = normalize_llm_rerank_mode(
+        mode if mode is not None else settings.llm_rerank_mode
+    )
+    key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
+    raw_url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
+    if resolved_mode == "ollama" and (
+        not raw_url or (api_url is None and raw_url == DEFAULT_CLOUD_LLM_URL)
+    ):
+        raw_url = DEFAULT_OLLAMA_URL
+    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
+    return resolved_mode, raw_url, key, chosen_model
+
+
+async def verify_llm_reranker(
+    *,
+    mode: str,
+    api_url: str,
+    api_key: str = "",
+    model: str,
+    timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
+) -> dict[str, Any]:
+    """Verify endpoint allowlist, connectivity, and JSON parsing before saving active reranker changes."""
+    resolved_mode = normalize_llm_rerank_mode(mode)
+    raw_url = api_url.strip() or (DEFAULT_OLLAMA_URL if resolved_mode == "ollama" else "")
+    chosen_model = model.strip()
+    if not raw_url or not chosen_model:
+        raise ValueError("LLM reranking requires both an API URL and a model")
+    validate_llm_rerank_url(raw_url, allowed_hosts)
+    if resolved_mode == "cloud" and not api_key.strip():
+        raise ValueError("An API key is required when cloud LLM reranking is enabled")
+
+    probe_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are verifying connectivity for a book recommendation reranker. "
+                'Return JSON only: {"adjustments": [{"id": 1, "delta": 0.0, "reason": "ok"}]}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": '{"candidates": [{"id": 1, "title": "Connectivity Probe", "base_score": 80.0}]}',
+        },
+    ]
+    timeout = timeout_seconds if timeout_seconds is not None else min(15.0, settings.llm_rerank_timeout_seconds)
+    started = time.perf_counter()
+    content = await _request_llm_completion_async(
+        mode=resolved_mode,
+        api_url=raw_url,
+        api_key=api_key,
+        model=chosen_model,
+        messages=probe_messages,
+        timeout=timeout,
+        allowed_hosts=allowed_hosts,
+    )
+    parsed = extract_llm_json(content)
+    if "adjustments" in parsed and not isinstance(parsed["adjustments"], list):
+        raise ValueError("LLM response field 'adjustments' must be a JSON list")
+    return {
+        "ok": True,
+        "mode": resolved_mode,
+        "model": chosen_model,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+    }
+
+
+async def discover_local_llm_models(
+    *,
+    mode: str,
+    api_url: str,
+    api_key: str = "",
+    timeout_seconds: float = 10.0,
+    allowed_hosts: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Discover installed models from an allowlisted Ollama or OpenAI-compatible server."""
+    resolved_mode = normalize_llm_rerank_mode(mode)
+    if resolved_mode not in {"ollama", "openai-compatible"}:
+        raise ValueError("Local model discovery is supported for ollama and openai-compatible modes")
+    raw_url = api_url.strip() or (DEFAULT_OLLAMA_URL if resolved_mode == "ollama" else "")
+    if not raw_url:
+        raise ValueError("Enter an endpoint URL to load models")
+    validate_llm_rerank_url(raw_url, allowed_hosts)
+
+    target_url = (
+        f"{_normalize_ollama_base_url(raw_url)}/api/tags"
+        if resolved_mode == "ollama"
+        else _normalize_openai_models_url(raw_url)
+    )
+    headers = _build_headers(api_key, include_content_type=False)
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        response = await client.get(target_url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise ValueError("Model discovery endpoint returned an invalid JSON payload")
+
+    raw_items = (
+        payload.get("models")
+        if resolved_mode == "ollama"
+        else (payload.get("data") if isinstance(payload.get("data"), list) else payload.get("models"))
+    )
+    if not isinstance(raw_items, list):
+        raise ValueError("Model discovery endpoint did not return a model list")
+
+    seen: set[str] = set()
+    discovered: list[dict[str, str]] = []
+    for entry in raw_items:
+        if isinstance(entry, str):
+            model_id = entry.strip()
+            model_name = model_id
+        elif isinstance(entry, dict):
+            model_id = str(
+                entry.get("id") or entry.get("model") or entry.get("name") or ""
+            ).strip()
+            model_name = str(entry.get("name") or model_id).strip()
+        else:
+            continue
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        discovered.append({"id": model_id, "name": model_name or model_id})
+
+    discovered.sort(key=lambda item: item["name"].casefold())
+    return discovered
 
 
 async def rerank_with_llm(
@@ -246,6 +665,7 @@ async def rerank_with_llm(
     candidates: Sequence[dict[str, Any]],
     *,
     interaction_events: Sequence[dict[str, Any]] | None = None,
+    mode: str | None = None,
     api_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
@@ -253,37 +673,35 @@ async def rerank_with_llm(
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
-    key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
-    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
+    """Call the configured Ollama, OpenAI-compatible, or cloud LLM endpoint and rerank top-K candidates."""
+    try:
+        resolved_mode, url, key, chosen_model = _resolve_rerank_runtime(
+            mode=mode, api_url=api_url, api_key=api_key, model=model
+        )
+    except ValueError as exc:
+        LOGGER.warning("Invalid LLM reranker mode; falling back to base order: %s", exc)
+        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
+
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
     timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
 
-    if not key or not url or not chosen_model or len(candidates) < 2:
+    requires_key = resolved_mode == "cloud"
+    if (requires_key and not key) or not url or not chosen_model or len(candidates) < 2:
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
     messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": chosen_model,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
-                return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
-            rankings = parsed.get("rankings") or []
-            return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
+        content = await _request_llm_completion_async(
+            mode=resolved_mode,
+            api_url=url,
+            api_key=key,
+            model=chosen_model,
+            messages=messages,
+            timeout=timeout,
+        )
+        parsed = extract_llm_json(content)
+        return _apply_parsed_rerank(candidates, parsed, top_k=k, max_delta=delta)
     except Exception as exc:
         LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
         return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
@@ -294,6 +712,7 @@ def rerank_with_llm_sync(
     candidates: Sequence[dict[str, Any]],
     *,
     interaction_events: Sequence[dict[str, Any]] | None = None,
+    mode: str | None = None,
     api_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
@@ -302,36 +721,34 @@ def rerank_with_llm_sync(
     timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
-    key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
-    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
+    try:
+        resolved_mode, url, key, chosen_model = _resolve_rerank_runtime(
+            mode=mode, api_url=api_url, api_key=api_key, model=model
+        )
+    except ValueError as exc:
+        LOGGER.warning("Invalid LLM reranker mode; falling back to base order: %s", exc)
+        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
+
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
     timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
 
-    if not key or not url or not chosen_model or len(candidates) < 2:
+    requires_key = resolved_mode == "cloud"
+    if (requires_key and not key) or not url or not chosen_model or len(candidates) < 2:
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
     messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": chosen_model,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
-                return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
-            rankings = parsed.get("rankings") or []
-            return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
+        content = _request_llm_completion_sync(
+            mode=resolved_mode,
+            api_url=url,
+            api_key=key,
+            model=chosen_model,
+            messages=messages,
+            timeout=timeout,
+        )
+        parsed = extract_llm_json(content)
+        return _apply_parsed_rerank(candidates, parsed, top_k=k, max_delta=delta)
     except Exception as exc:
         LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
         return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}

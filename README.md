@@ -309,6 +309,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `BACKUP_RETENTION_COUNT` | Number of newest automatic and manual snapshots to retain. Defaults to 7. |
 | `BACKUP_DIR` | Optional backup path inside the engine container; mount it persistently when set. Defaults to `/backups`, on its own `afterword-backups` Docker volume. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
+| `LLM_RERANK_ALLOWED_HOSTS` | Comma-separated private hostnames allowed for local Ollama or OpenAI-compatible LLM reranking and model discovery (defaults to `ollama`). |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 

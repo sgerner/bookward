@@ -47,6 +47,14 @@ from .ingestion import (
     scan_source,
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
+from .llm_reranker import (
+    DEFAULT_CLOUD_LLM_URL,
+    DEFAULT_OLLAMA_URL,
+    discover_local_llm_models,
+    normalize_llm_rerank_mode,
+    validate_llm_rerank_url,
+    verify_llm_reranker,
+)
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
 from .ranking import rank_candidates
@@ -1291,22 +1299,52 @@ class GoogleBooksKeyIn(BaseModel):
 
 class LLMRerankSettingsIn(BaseModel):
     enabled: bool = False
+    mode: str = Field(default="", max_length=40)
     provider: str = Field(default="", max_length=120)
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
     model: str = Field(default="", max_length=200)
     clear_api_key: bool = False
 
-    def validate_values(self):
+    def resolved_mode(self, fallback: str = "cloud") -> str:
+        raw = self.mode.strip()
+        if not raw:
+            provider = self.provider.strip().lower()
+            if provider in {"ollama", "openai-compatible"}:
+                raw = provider
+            else:
+                raw = fallback
+        return normalize_llm_rerank_mode(raw)
+
+    def resolved_api_url(self, mode: str) -> str:
         url = self.api_url.strip()
+        if not url and mode == "ollama":
+            return DEFAULT_OLLAMA_URL
+        return url
+
+    def validate_values(self, fallback_mode: str = "cloud") -> tuple[str, str]:
+        mode = self.resolved_mode(fallback_mode)
+        url = self.resolved_api_url(mode)
         if url:
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"}:
-                raise ValueError("LLM API URL must use HTTP or HTTPS")
-            if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
+            validate_llm_rerank_url(url)
         if self.enabled and (not url or not self.model.strip()):
             raise ValueError("LLM reranking requires both an API URL and a model")
+        return mode, url
+
+
+class LLMRerankTestIn(BaseModel):
+    mode: str = Field(default="ollama", max_length=40)
+    api_url: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    model: str = Field(default="", max_length=200)
+    use_saved_key: bool = True
+
+
+class LLMModelsDiscoverIn(BaseModel):
+    mode: str = Field(default="cloud", max_length=40)
+    api_url: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    use_saved_key: bool = True
 
 
 def api_token_list():
@@ -1403,7 +1441,16 @@ def tracked_recommendations(
                     recommended, cached_vectors
                 )
                 llm_cfg = effective_llm_rerank_settings(connection, private)
-                if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
+                rerank_ready = bool(
+                    llm_cfg["enabled"]
+                    and llm_cfg["api_url"].strip()
+                    and llm_cfg["model"].strip()
+                    and (
+                        llm_cfg["mode"] in {"ollama", "openai-compatible"}
+                        or llm_cfg["api_key"].strip()
+                    )
+                )
+                if rerank_ready:
                     from .llm_reranker import rerank_with_llm_sync
 
                     read_rows = (
@@ -1420,6 +1467,7 @@ def tracked_recommendations(
                         read_rows,
                         diversified,
                         interaction_events=interaction_events,
+                        mode=llm_cfg["mode"],
                         api_url=llm_cfg["api_url"],
                         api_key=llm_cfg["api_key"],
                         model=llm_cfg["model"],
@@ -2541,27 +2589,53 @@ def get_llm_rerank_settings():
 
 
 @app.put("/api/settings/llm-rerank")
-def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
+async def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
+    current = private_settings()
+    existing_effective = effective_llm_rerank_settings(private=current)
     try:
-        payload.validate_values()
+        mode, resolved_url = payload.validate_values(existing_effective["mode"])
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    current = private_settings()
     if payload.clear_api_key:
         api_key = ""
+        persist_api_key = True
     elif payload.api_key is None or not payload.api_key.strip():
-        api_key = current.get("llm_rerank_api_key", "")
+        api_key = existing_effective["api_key"]
+        persist_api_key = "llm_rerank_api_key" in current
     else:
         api_key = payload.api_key.strip()
-    if payload.enabled and not (api_key or settings.llm_rerank_api_key.strip()):
-        raise HTTPException(400, "An API key is required when LLM reranking is enabled")
+        persist_api_key = True
+    if payload.enabled and mode == "cloud" and not api_key.strip():
+        raise HTTPException(400, "An API key is required when cloud LLM reranking is enabled")
+    health: dict[str, Any] = {"ok": True, "checked": False, "mode": mode, "model": payload.model.strip()}
+    if payload.enabled:
+        try:
+            health = await verify_llm_reranker(
+                mode=mode,
+                api_url=resolved_url,
+                api_key=api_key,
+                model=payload.model.strip(),
+            )
+            health["checked"] = True
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                f"LLM reranker check failed: {safe_error_message(exc)}",
+            ) from exc
+    provider_value = payload.provider.strip()
+    if mode == "ollama" and not provider_value:
+        provider_value = "ollama"
+    elif mode == "openai-compatible" and not provider_value:
+        provider_value = "openai-compatible"
     values = {
         "llm_rerank_enabled": "1" if payload.enabled else "0",
-        "llm_rerank_provider": payload.provider.strip(),
-        "llm_rerank_api_url": payload.api_url.strip(),
+        "llm_rerank_mode": mode,
+        "llm_rerank_provider": provider_value,
+        "llm_rerank_api_url": resolved_url,
         "llm_rerank_model": payload.model.strip(),
-        "llm_rerank_api_key": api_key,
     }
+    if persist_api_key:
+        values["llm_rerank_api_key"] = api_key
     with transaction() as con:
         for key, value in values.items():
             secret = key == "llm_rerank_api_key"
@@ -2571,7 +2645,36 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
+    return {"saved": True, "llm_rerank": safe_llm_rerank_settings(), "health": health}
+
+
+@app.post("/api/llm/test")
+async def test_llm_rerank_settings(payload: LLMRerankTestIn):
+    existing = effective_llm_rerank_settings()
+    try:
+        mode = normalize_llm_rerank_mode(payload.mode or existing["mode"])
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc)) from exc
+    api_url = payload.api_url.strip()
+    if not api_url:
+        api_url = DEFAULT_OLLAMA_URL if mode == "ollama" else existing["api_url"]
+    api_key = (
+        payload.api_key.strip()
+        if payload.api_key and payload.api_key.strip()
+        else (existing["api_key"] if payload.use_saved_key else "")
+    )
+    try:
+        health = await verify_llm_reranker(
+            mode=mode,
+            api_url=api_url,
+            api_key=api_key,
+            model=payload.model.strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, f"LLM reranker check failed: {safe_error_message(exc)}") from exc
+    return health
 
 
 _MODELS_DEV_CACHE: dict[str, object] = {"expires_at": 0.0, "providers": []}
@@ -2631,14 +2734,58 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
     return providers
 
 
-@app.get("/api/llm/models")
-async def llm_models_catalog():
+async def _resolve_llm_models_response(
+    *,
+    mode: str,
+    api_url: str = "",
+    api_key: str = "",
+    use_saved_key: bool = False,
+) -> dict[str, Any]:
+    try:
+        resolved_mode = normalize_llm_rerank_mode(mode or "cloud")
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc)) from exc
+
+    if resolved_mode in {"ollama", "openai-compatible"}:
+        existing = effective_llm_rerank_settings()
+        target_url = api_url.strip()
+        if not target_url:
+            if existing["mode"] == resolved_mode and existing["api_url"].strip():
+                target_url = existing["api_url"].strip()
+            elif resolved_mode == "ollama":
+                target_url = DEFAULT_OLLAMA_URL
+        resolved_key = api_key.strip() or (
+            existing["api_key"] if use_saved_key else ""
+        )
+        try:
+            models = await discover_local_llm_models(
+                mode=resolved_mode,
+                api_url=target_url,
+                api_key=resolved_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                f"Unable to fetch models from {resolved_mode} endpoint: {safe_error_message(exc)}",
+            ) from exc
+        return {
+            "mode": resolved_mode,
+            "api_url": target_url,
+            "models": models,
+        }
+
     now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
             resp = await client.get("https://models.dev/api.json")
             resp.raise_for_status()
             providers = _normalize_models_dev_catalog(resp.json())
@@ -2648,7 +2795,32 @@ async def llm_models_catalog():
     except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
+
+
+@app.get("/api/llm/models")
+async def llm_models_catalog(
+    mode: str = "cloud",
+    api_url: str = "",
+    use_saved_key: bool = False,
+):
+    return await _resolve_llm_models_response(
+        mode=mode,
+        api_url=api_url,
+        use_saved_key=use_saved_key,
+    )
+
+
+@app.post("/api/llm/models")
+async def discover_llm_models(payload: LLMModelsDiscoverIn):
+    return await _resolve_llm_models_response(
+        mode=payload.mode,
+        api_url=payload.api_url,
+        api_key=(payload.api_key or "").strip(),
+        use_saved_key=payload.use_saved_key,
+    )
 
 
 @app.put("/api/sources/{source_id}")
@@ -2987,11 +3159,29 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
         if "llm_rerank_enabled" in private
         else bool(settings.llm_rerank_enabled)
     )
+    raw_mode = (private.get("llm_rerank_mode") or settings.llm_rerank_mode or "cloud").strip().lower()
+    try:
+        mode = normalize_llm_rerank_mode(raw_mode)
+    except ValueError:
+        mode = "cloud"
+    saved_url = private.get("llm_rerank_api_url", "").strip()
+    if saved_url:
+        api_url = saved_url
+    elif mode == "ollama" and settings.llm_rerank_api_url == DEFAULT_CLOUD_LLM_URL:
+        api_url = DEFAULT_OLLAMA_URL
+    else:
+        api_url = settings.llm_rerank_api_url
+    api_key = (
+        private["llm_rerank_api_key"]
+        if "llm_rerank_api_key" in private
+        else settings.llm_rerank_api_key
+    )
     return {
         "enabled": enabled,
+        "mode": mode,
         "provider": private.get("llm_rerank_provider", ""),
-        "api_url": private.get("llm_rerank_api_url") or settings.llm_rerank_api_url,
-        "api_key": private.get("llm_rerank_api_key") or settings.llm_rerank_api_key,
+        "api_url": api_url,
+        "api_key": api_key,
         "model": private.get("llm_rerank_model") or settings.llm_rerank_model,
     }
 
@@ -3000,6 +3190,7 @@ def safe_llm_rerank_settings(connection=None, private=None) -> dict:
     effective = effective_llm_rerank_settings(connection, private)
     return {
         "enabled": effective["enabled"],
+        "mode": effective["mode"],
         "provider": effective["provider"],
         "api_url": effective["api_url"],
         "model": effective["model"],
