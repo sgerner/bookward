@@ -128,6 +128,9 @@
 		class?: string;
 		children: Snippet;
 	} = $props();
+	const maxHeightClass = $derived(
+		className.includes('max-h-') ? '' : 'max-h-[calc(100dvh-2rem)]',
+	);
 </script>
 
 {#if open}
@@ -138,7 +141,7 @@
 		aria-labelledby={ariaLabelledby}
 		aria-describedby={ariaDescribedby}
 		tabindex="-1"
-		class={`m-auto max-h-[calc(100dvh-2rem)] min-w-0 overflow-x-hidden overflow-y-auto backdrop:bg-surface-950/75 backdrop:backdrop-blur-sm ${className}`.trim()}
+		class={`m-auto ${maxHeightClass} min-w-0 overflow-x-hidden overflow-y-auto backdrop:bg-surface-950/75 backdrop:backdrop-blur-sm ${className}`.replace(/\s+/g, ' ').trim()}
 	>
 		{@render children()}
 	</dialog>

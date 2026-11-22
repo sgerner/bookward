@@ -13,3 +13,14 @@ npm-debug.log*
 **/*.sqlite
 **/*.sqlite3
 **/secret.key
+engine
+docs
+scripts
+.github
+.vscode
+.gitignore
+.stitch.json
+*.md
+compose*.yaml
+Dockerfile*
+.dockerignore
