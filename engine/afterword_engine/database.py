@@ -985,6 +985,50 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            openlibrary_lookup_attempted_at TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source, title, author)
+        );
+        INSERT INTO goodreads_shelf_items_v2(
+            shelf, source, title, author, isbn, openlibrary_work_id, added_at, updated_at
+        )
+        SELECT shelf, 'goodreads_csv', title, author, isbn, openlibrary_work_id, added_at, updated_at
+        FROM (
+            SELECT shelf, title, author, isbn, openlibrary_work_id, added_at, updated_at
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            shelf=excluded.shelf,
+            isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn),
+            openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id),
+            added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
+            updated_at=excluded.updated_at;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
+        DROP TABLE goodreads_shelf_items;
+        ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items;
+        CREATE INDEX idx_goodreads_shelf_items_shelf
+            ON goodreads_shelf_items(shelf, updated_at DESC);
+        CREATE INDEX idx_goodreads_shelf_items_source_shelf
+            ON goodreads_shelf_items(source, shelf);
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1445,6 +1489,10 @@ def initialize(*, seed_demo: bool = True):
                     con.execute("UPDATE candidates SET source_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (source_value, current["id"]))
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
+        con.execute(
+            "UPDATE candidates SET status='new',score=0,explanation='[]',"
+            "score_batch_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='hidden'"
+        )
         _backfill_source_isbns(con)
     _restrict_database_files()
 

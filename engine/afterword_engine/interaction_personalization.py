@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
 import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
 from .config import settings
 from .database import rows
 from .embeddings import content_hash
-from .identity import book_identity
+from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
 from .scoring import document
 from .subjects import normalize_subjects
 
@@ -53,6 +54,9 @@ _SEMANTIC_MATURE_PRIOR_WEIGHT = 1.0
 _SEMANTIC_MIN_OBSERVATIONS = 10
 _MAX_SEMANTIC_ADJUSTMENT = 4.0
 _MAX_MATURE_SEMANTIC_ADJUSTMENT = 5.0
+SHELF_INTENT_PRIOR = 0.35
+SHELF_PRIOR_EVENT_TYPE = "goodreads_to_read"
+_MAX_GATE_OBSERVATIONS = 200
 _NONINFORMATIVE_SUBJECTS = {
     "audio books",
     "audiobook",
@@ -89,19 +93,28 @@ def load_interaction_events(
     """
     values: tuple[Any, ...] = (max(1, min(MAX_INTERACTION_EVENTS, int(limit))),)
     query = """
-        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,release_date,metadata
+        SELECT id,candidate_id,event_type,value,occurred_at,title,author,genres,description,release_date,
+               base_score,metadata_confidence,metadata
         FROM (
             SELECT e.id,e.candidate_id,e.event_type,e.value,e.occurred_at,
-                   c.title,c.author,c.genres,c.description,c.release_date,e.metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,
+                   c.score AS base_score,
+                   COALESCE(q.metadata_confidence, 1.0) AS metadata_confidence,
+                   e.metadata
             FROM recommendation_events e
             JOIN candidates c ON c.id=e.candidate_id
+            LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE e.event_type IN ('save','reject','maybe_later','restore','read','librarr_import')
             UNION ALL
             SELECT 1000000000+f.id AS id,f.candidate_id,f.action AS event_type,
                    NULL AS value,f.created_at AS occurred_at,
-                   c.title,c.author,c.genres,c.description,c.release_date,NULL AS metadata
+                   c.title,c.author,c.genres,c.description,c.release_date,
+                   c.score AS base_score,
+                   COALESCE(q.metadata_confidence, 1.0) AS metadata_confidence,
+                   NULL AS metadata
             FROM feedback f
             JOIN candidates c ON c.id=f.candidate_id
+            LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE f.action IN ('save','reject','maybe_later','restore')
               AND NOT EXISTS (
                   SELECT 1 FROM recommendation_events e
@@ -114,6 +127,110 @@ def load_interaction_events(
     if connection is not None:
         return [dict(item) for item in connection.execute(query, values).fetchall()]
     return rows(query, values)
+
+
+def load_shelf_intent_priors(connection=None) -> list[dict[str, Any]]:
+    """Load active Goodreads ``to-read`` shelf items with local catalog genres."""
+
+    fetch = (
+        (lambda sql, params=(): [dict(item) for item in connection.execute(sql, params).fetchall()])
+        if connection is not None
+        else rows
+    )
+    try:
+        shelf_rows = fetch(
+            "SELECT id,shelf,source,title,author,isbn,openlibrary_work_id,added_at,updated_at "
+            "FROM goodreads_shelf_items WHERE shelf='to-read' "
+            "ORDER BY updated_at DESC,id DESC LIMIT 2000"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: goodreads_shelf_items" in str(exc).casefold():
+            return []
+        raise
+
+    if not shelf_rows:
+        return []
+
+    read_rows = fetch(
+        "SELECT id,title,author,isbn,openlibrary_work_id FROM reads"
+    )
+    read_index = ReadIdentityIndex.from_reads(read_rows)
+    active_rows = [item for item in shelf_rows if not read_index.matches(item)]
+    if not active_rows:
+        return []
+
+    catalog_rows = fetch(
+        "SELECT c.title,c.author,c.isbn13,c.isbn10,c.genres,"
+        "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.genres NOT IN ('', '[]') "
+        "ORDER BY c.updated_at DESC,c.id DESC"
+    )
+    genres_by_key: dict[tuple[str, ...], str] = {}
+    for catalog_item in catalog_rows:
+        raw_genres = catalog_item.get("genres")
+        if not raw_genres or raw_genres == "[]":
+            continue
+        for match_key in book_row_identity_match_keys(catalog_item):
+            genres_by_key.setdefault(match_key, raw_genres)
+
+    priors: list[dict[str, Any]] = []
+    seen_identities: set[str] = set()
+    for item in active_rows:
+        identity = book_identity(item.get("title", ""), item.get("author", ""))
+        if identity == "\x1f" or identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        matched_genres: object = item.get("genres") or "[]"
+        if matched_genres in ("", "[]", []):
+            for match_key in book_row_identity_match_keys(item):
+                if match_key in genres_by_key:
+                    matched_genres = genres_by_key[match_key]
+                    break
+        priors.append(
+            {
+                "id": int(item.get("id") or len(priors) + 1),
+                "shelf": "to-read",
+                "source": item.get("source") or "goodreads_csv",
+                "title": item.get("title") or "",
+                "author": item.get("author") or "",
+                "isbn": item.get("isbn"),
+                "openlibrary_work_id": item.get("openlibrary_work_id"),
+                "added_at": item.get("added_at"),
+                "updated_at": item.get("updated_at"),
+                "genres": matched_genres,
+            }
+        )
+    return priors
+
+
+def shelf_prior_profile_events(shelf_items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Serialize ``to-read`` shelf items for deterministic decision-evidence replay."""
+
+    serialized: list[dict[str, Any]] = []
+    for index, item in enumerate(shelf_items, start=1):
+        shelf = str(item.get("shelf") or "to-read").strip().casefold()
+        if shelf != "to-read":
+            continue
+        try:
+            raw_id = int(item.get("id") or index)
+        except (TypeError, ValueError):
+            raw_id = index
+        serialized.append(
+            {
+                "id": -abs(raw_id or index),
+                "candidate_id": None,
+                "event_type": SHELF_PRIOR_EVENT_TYPE,
+                "value": SHELF_INTENT_PRIOR,
+                "occurred_at": item.get("added_at") or item.get("occurred_at") or item.get("updated_at"),
+                "title": str(item.get("title") or ""),
+                "author": str(item.get("author") or ""),
+                "genres": item.get("genres", "[]"),
+                "description": "",
+            }
+        )
+    return serialized
 
 
 def load_cached_candidate_vectors(items, connection=None) -> dict[int, np.ndarray]:
@@ -553,6 +670,460 @@ def _aggregate_feature_delta(feature_keys: set[str], effects: dict[str, float]) 
     return delta
 
 
+def _shelf_prior_features(item: Mapping[str, Any]) -> set[str]:
+    return {
+        feature
+        for feature in _book_features(dict(item))
+        if feature.startswith(("author:", "subject:"))
+    }
+
+
+def _extract_shelf_items(
+    events_list: list[dict[str, Any]],
+    shelf_items: Iterable[Mapping[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    explicit_events: list[dict[str, Any]] = []
+    combined_shelf: list[dict[str, Any]] = []
+    for event in events_list:
+        event_type = str(event.get("event_type") or "").strip().casefold()
+        if event_type == SHELF_PRIOR_EVENT_TYPE:
+            combined_shelf.append(dict(event, shelf="to-read"))
+        else:
+            explicit_events.append(event)
+    if shelf_items is not None:
+        for item in shelf_items:
+            shelf = str(item.get("shelf") or "to-read").strip().casefold()
+            if shelf == "to-read":
+                combined_shelf.append(dict(item))
+    return explicit_events, combined_shelf
+
+
+def _learn_shelf_prior_effects(
+    observations: list[dict[str, Any]],
+    explicit_events: list[dict[str, Any]],
+    shelf_items: list[dict[str, Any]],
+    *,
+    explicit_effects: dict[str, float] | None = None,
+    as_of: datetime | None = None,
+) -> dict[str, float]:
+    """Return bounded +0.35 author/subject priors without overriding explicit signals."""
+
+    if not shelf_items:
+        return {}
+
+    explicit_identities: set[str] = set()
+    explicit_match_keys: set[tuple[str, ...]] = set()
+    for event in explicit_events:
+        event_type = str(event.get("event_type") or "").strip().casefold()
+        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
+            continue
+        identity = book_identity(event.get("title", ""), event.get("author", ""))
+        if identity != "\x1f":
+            explicit_identities.add(identity)
+        explicit_match_keys.update(book_row_identity_match_keys(event))
+
+    learned_explicit = (
+        explicit_effects
+        if explicit_effects is not None
+        else _learn_feature_effects(observations)
+    )
+    explicit_negative_features = {
+        feature
+        for obs in observations
+        if obs.get("label") == 0.0
+        for feature in obs.get("features", ())
+    }
+
+    shelf_features: set[str] = set()
+    seen_shelf_identities: set[str] = set()
+    for item in shelf_items:
+        shelf = str(item.get("shelf") or "to-read").strip().casefold()
+        if shelf != "to-read":
+            continue
+        if as_of is not None:
+            added_dt = _parse_datetime(item.get("added_at") or item.get("occurred_at"))
+            if added_dt is not None and added_dt > as_of:
+                continue
+        identity = book_identity(item.get("title", ""), item.get("author", ""))
+        if identity == "\x1f" or identity in seen_shelf_identities:
+            continue
+        item_keys = book_row_identity_match_keys(item)
+        if identity in explicit_identities or (item_keys & explicit_match_keys):
+            continue
+        seen_shelf_identities.add(identity)
+        shelf_features.update(_shelf_prior_features(item))
+
+    effects: dict[str, float] = {}
+    for feature in shelf_features:
+        if feature in learned_explicit or feature in explicit_negative_features:
+            continue
+        effects[feature] = SHELF_INTENT_PRIOR
+    return effects
+
+
+def _aggregate_shelf_prior_delta(
+    feature_keys: set[str],
+    shelf_effects: dict[str, float],
+) -> float:
+    if not shelf_effects:
+        return 0.0
+    author_delta = min(
+        SHELF_INTENT_PRIOR,
+        sum(
+            shelf_effects[feature]
+            for feature in feature_keys
+            if feature.startswith("author:") and feature in shelf_effects
+        ),
+    )
+    subject_values = sorted(
+        (
+            shelf_effects[feature]
+            for feature in feature_keys
+            if feature.startswith("subject:") and feature in shelf_effects
+        ),
+        reverse=True,
+    )
+    subject_delta = min(
+        SHELF_INTENT_PRIOR,
+        sum(
+            weight * value
+            for weight, value in zip(_SUBJECT_DIMINISHING_WEIGHTS, subject_values)
+        ),
+    )
+    return author_delta + subject_delta
+
+
+def _pairwise_auc(
+    scores: list[float],
+    labels: list[float],
+    weights: list[float],
+) -> float | None:
+    positives = [
+        (score, weight)
+        for score, label, weight in zip(scores, labels, weights)
+        if label == 1.0 and weight > 0
+    ]
+    negatives = [
+        (score, weight)
+        for score, label, weight in zip(scores, labels, weights)
+        if label == 0.0 and weight > 0
+    ]
+    if not positives or not negatives:
+        return None
+    denominator = sum(
+        pos_w * neg_w for _, pos_w in positives for _, neg_w in negatives
+    )
+    if denominator <= 0:
+        return None
+    numerator = 0.0
+    for pos_score, pos_w in positives:
+        for neg_score, neg_w in negatives:
+            pair_w = pos_w * neg_w
+            if pos_score > neg_score + 1e-12:
+                numerator += pair_w
+            elif abs(pos_score - neg_score) <= 1e-12:
+                numerator += 0.5 * pair_w
+    return numerator / denominator
+
+
+def _score_single_candidate_for_benchmark(
+    candidate: dict[str, Any],
+    train_events: list[dict[str, Any]],
+    shelf_items: list[dict[str, Any]],
+    *,
+    eval_time: datetime,
+    interaction_vectors: dict[int, np.ndarray] | None,
+    with_shelf_priors: bool,
+    as_of: datetime | None = None,
+) -> float:
+    observations = _latest_observations(
+        train_events,
+        now=eval_time,
+        interaction_vectors=interaction_vectors,
+    )
+    explicit_effects = _learn_feature_effects(observations)
+    candidate_id = int(candidate.get("id") or 0)
+    cand_vectors = (
+        {candidate_id: interaction_vectors[candidate_id]}
+        if interaction_vectors and candidate_id in interaction_vectors
+        else None
+    )
+    semantic_adjustments, _ = _learn_semantic_adjustments(
+        observations, [candidate], cand_vectors
+    )
+    feature_keys = _book_features(candidate)
+    explicit_delta = _aggregate_feature_delta(feature_keys, explicit_effects)
+    semantic_delta = semantic_adjustments.get(candidate_id, 0.0)
+    shelf_delta = 0.0
+    if with_shelf_priors:
+        shelf_effects = _learn_shelf_prior_effects(
+            observations,
+            train_events,
+            shelf_items,
+            explicit_effects=explicit_effects,
+            as_of=as_of,
+        )
+        if explicit_delta >= 0.0 and (explicit_delta + semantic_delta) >= 0.0:
+            shelf_delta = _aggregate_shelf_prior_delta(feature_keys, shelf_effects)
+    delta = max(
+        -MAX_TOTAL_ADJUSTMENT,
+        min(MAX_TOTAL_ADJUSTMENT, explicit_delta + semantic_delta + shelf_delta),
+    )
+    confidence_scale = max(0.0, min(1.0, float(candidate.get("metadata_confidence", 1.0))))
+    delta *= confidence_scale
+    base_score = float(candidate.get("score") or 50.0)
+    if abs(delta) >= 0.05:
+        return round(max(0.0, min(100.0, base_score + delta)), 1)
+    return round(base_score, 1)
+
+
+def evaluate_shelf_prior_gate(
+    events: Iterable[Mapping[str, Any]],
+    shelf_items: Iterable[Mapping[str, Any]] | None = None,
+    *,
+    now: datetime | None = None,
+    interaction_vectors: dict[int, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Evaluate 0.35 Goodreads ``to-read`` priors on held-out LOO and Prequential AUC.
+
+    Returns ``passed=True`` only when both held-out Leave-One-Out AUC and
+    chronological Prequential AUC are conclusive and non-regressing relative to
+    the explicit-only learner; abstains (``passed=False, abstained=True``) when
+    inconclusive or regressing.
+    """
+
+    current_time = now or datetime.now(timezone.utc)
+    current_time = current_time.replace(tzinfo=current_time.tzinfo or timezone.utc).astimezone(timezone.utc)
+    raw_events = [dict(item) for item in events]
+    explicit_events, combined_shelf = _extract_shelf_items(raw_events, shelf_items)
+    if not combined_shelf:
+        return {
+            "status": "inconclusive",
+            "passed": False,
+            "abstained": True,
+            "reason": "no_shelf_priors",
+            "evaluated_books": 0,
+            "evaluated_pairs": 0,
+            "loo_baseline_auc": None,
+            "loo_challenger_auc": None,
+            "prequential_baseline_auc": None,
+            "prequential_challenger_auc": None,
+        }
+
+    ordered = sorted(explicit_events, key=_event_order)
+    latest_by_identity: dict[str, dict[str, Any]] = {}
+    for index, event in enumerate(ordered, start=1):
+        event_type = str(event.get("event_type") or "").strip().casefold()
+        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
+            continue
+        identity = book_identity(event.get("title", ""), event.get("author", ""))
+        if identity == "\x1f":
+            continue
+        label, reliability = _event_label(event)
+        occurred = _parse_datetime(event.get("occurred_at"))
+        raw_score = event.get("base_score", event.get("score"))
+        if raw_score is None:
+            base_score = 50.0
+        else:
+            try:
+                base_score = float(raw_score)
+            except (TypeError, ValueError):
+                return {
+                    "status": "inconclusive",
+                    "passed": False,
+                    "abstained": True,
+                    "reason": "invalid_scores",
+                    "evaluated_books": 0,
+                    "evaluated_pairs": 0,
+                    "loo_baseline_auc": None,
+                    "loo_challenger_auc": None,
+                    "prequential_baseline_auc": None,
+                    "prequential_challenger_auc": None,
+                }
+            if not math.isfinite(base_score):
+                return {
+                    "status": "inconclusive",
+                    "passed": False,
+                    "abstained": True,
+                    "reason": "invalid_scores",
+                    "evaluated_books": 0,
+                    "evaluated_pairs": 0,
+                    "loo_baseline_auc": None,
+                    "loo_challenger_auc": None,
+                    "prequential_baseline_auc": None,
+                    "prequential_challenger_auc": None,
+                }
+        try:
+            meta_conf = float(event.get("metadata_confidence", 1.0))
+        except (TypeError, ValueError):
+            meta_conf = 1.0
+        if not math.isfinite(meta_conf):
+            meta_conf = 1.0
+        try:
+            candidate_id = int(event.get("candidate_id") or index)
+        except (TypeError, ValueError):
+            candidate_id = index
+        latest_by_identity[identity] = {
+            "identity": identity,
+            "order_key": _event_order(event),
+            "occurred_at": occurred,
+            "label": label,
+            "reliability": reliability,
+            "candidate": {
+                "id": candidate_id,
+                "status": "recommended",
+                "title": event.get("title", ""),
+                "author": event.get("author", ""),
+                "genres": event.get("genres", "[]"),
+                "description": event.get("description", ""),
+                "release_date": event.get("release_date"),
+                "first_publication_year": event.get("first_publication_year"),
+                "score": base_score,
+                "metadata_confidence": meta_conf,
+            },
+        }
+
+    labeled = [
+        item
+        for item in latest_by_identity.values()
+        if item["label"] in {0.0, 1.0} and item["reliability"] > 0.0
+    ]
+    labeled.sort(key=lambda item: item["order_key"])
+    if len(labeled) > _MAX_GATE_OBSERVATIONS:
+        labeled = labeled[-_MAX_GATE_OBSERVATIONS:]
+
+    positives = sum(1 for item in labeled if item["label"] == 1.0)
+    negatives = sum(1 for item in labeled if item["label"] == 0.0)
+    if positives == 0 or negatives == 0:
+        return {
+            "status": "inconclusive",
+            "passed": False,
+            "abstained": True,
+            "reason": "insufficient_labeled_pairs",
+            "evaluated_books": len(labeled),
+            "evaluated_pairs": 0,
+            "loo_baseline_auc": None,
+            "loo_challenger_auc": None,
+            "prequential_baseline_auc": None,
+            "prequential_challenger_auc": None,
+        }
+
+    labels = [float(item["label"]) for item in labeled]
+    weights = [float(item["reliability"]) for item in labeled]
+
+    loo_base_scores: list[float] = []
+    loo_chal_scores: list[float] = []
+    preq_base_scores: list[float] = []
+    preq_chal_scores: list[float] = []
+
+    events_with_identity = [
+        (
+            book_identity(ev.get("title", ""), ev.get("author", "")),
+            _event_order(ev),
+            ev,
+        )
+        for ev in ordered
+    ]
+
+    for target in labeled:
+        target_identity = target["identity"]
+        target_order = target["order_key"]
+        target_candidate = target["candidate"]
+        step_time = target["occurred_at"] or current_time
+
+        loo_train = [
+            ev for ident, _ord, ev in events_with_identity if ident != target_identity
+        ]
+        loo_base_scores.append(
+            _score_single_candidate_for_benchmark(
+                target_candidate,
+                loo_train,
+                combined_shelf,
+                eval_time=current_time,
+                interaction_vectors=interaction_vectors,
+                with_shelf_priors=False,
+            )
+        )
+        loo_chal_scores.append(
+            _score_single_candidate_for_benchmark(
+                target_candidate,
+                loo_train,
+                combined_shelf,
+                eval_time=current_time,
+                interaction_vectors=interaction_vectors,
+                with_shelf_priors=True,
+            )
+        )
+
+        preq_train = [
+            ev
+            for ident, ev_order, ev in events_with_identity
+            if ident != target_identity and ev_order < target_order
+        ]
+        preq_base_scores.append(
+            _score_single_candidate_for_benchmark(
+                target_candidate,
+                preq_train,
+                combined_shelf,
+                eval_time=step_time,
+                interaction_vectors=interaction_vectors,
+                with_shelf_priors=False,
+                as_of=step_time,
+            )
+        )
+        preq_chal_scores.append(
+            _score_single_candidate_for_benchmark(
+                target_candidate,
+                preq_train,
+                combined_shelf,
+                eval_time=step_time,
+                interaction_vectors=interaction_vectors,
+                with_shelf_priors=True,
+                as_of=step_time,
+            )
+        )
+
+    loo_base_auc = _pairwise_auc(loo_base_scores, labels, weights)
+    loo_chal_auc = _pairwise_auc(loo_chal_scores, labels, weights)
+    preq_base_auc = _pairwise_auc(preq_base_scores, labels, weights)
+    preq_chal_auc = _pairwise_auc(preq_chal_scores, labels, weights)
+    if (
+        loo_base_auc is None
+        or loo_chal_auc is None
+        or preq_base_auc is None
+        or preq_chal_auc is None
+    ):
+        return {
+            "status": "inconclusive",
+            "passed": False,
+            "abstained": True,
+            "reason": "inconclusive_auc",
+            "evaluated_books": len(labeled),
+            "evaluated_pairs": positives * negatives,
+            "loo_baseline_auc": loo_base_auc,
+            "loo_challenger_auc": loo_chal_auc,
+            "prequential_baseline_auc": preq_base_auc,
+            "prequential_challenger_auc": preq_chal_auc,
+        }
+
+    passed = (
+        loo_chal_auc >= loo_base_auc - 1e-12
+        and preq_chal_auc >= preq_base_auc - 1e-12
+    )
+    return {
+        "status": "passed" if passed else "regressed",
+        "passed": passed,
+        "abstained": not passed,
+        "reason": "non_regression" if passed else "benchmark_regression",
+        "evaluated_books": len(labeled),
+        "evaluated_pairs": positives * negatives,
+        "loo_baseline_auc": round(loo_base_auc, 6),
+        "loo_challenger_auc": round(loo_chal_auc, 6),
+        "prequential_baseline_auc": round(preq_base_auc, 6),
+        "prequential_challenger_auc": round(preq_chal_auc, 6),
+    }
+
+
 def personalize_recommendations(
     recommendations: list[dict[str, Any]],
     events: Iterable[dict[str, Any]],
@@ -560,6 +1131,8 @@ def personalize_recommendations(
     now: datetime | None = None,
     interaction_vectors: dict[int, np.ndarray] | None = None,
     candidate_vectors: dict[int, np.ndarray] | None = None,
+    shelf_items: Iterable[Mapping[str, Any]] | None = None,
+    gate_mode: str = "auto",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Apply bounded live score adjustments and return aggregate diagnostics.
 
@@ -569,12 +1142,37 @@ def personalize_recommendations(
 
     current_time = now or datetime.now(timezone.utc)
     current_time = current_time.replace(tzinfo=current_time.tzinfo or timezone.utc).astimezone(timezone.utc)
+    raw_events = [dict(item) for item in events]
+    explicit_events, combined_shelf = _extract_shelf_items(raw_events, shelf_items)
     observations = _latest_observations(
-        events,
+        explicit_events,
         now=current_time,
         interaction_vectors=interaction_vectors,
     )
     effects = _learn_feature_effects(observations)
+    shelf_effects: dict[str, float] = {}
+    if combined_shelf and gate_mode != "off":
+        candidate_shelf_effects = _learn_shelf_prior_effects(
+            observations,
+            explicit_events,
+            combined_shelf,
+            explicit_effects=effects,
+        )
+        if candidate_shelf_effects:
+            has_pos = any(item.get("label") == 1.0 for item in observations)
+            has_neg = any(item.get("label") == 0.0 for item in observations)
+            if gate_mode == "strict" or (has_pos and has_neg):
+                gate = evaluate_shelf_prior_gate(
+                    explicit_events,
+                    combined_shelf,
+                    now=current_time,
+                    interaction_vectors=interaction_vectors,
+                )
+                if gate["passed"]:
+                    shelf_effects = candidate_shelf_effects
+            else:
+                shelf_effects = candidate_shelf_effects
+
     semantic_adjustments, semantic_evidence_books = _learn_semantic_adjustments(
         observations, recommendations, candidate_vectors
     )
@@ -588,13 +1186,16 @@ def personalize_recommendations(
             adjusted.append(item)
             continue
         feature_keys = _book_features(item)
-        delta = _aggregate_feature_delta(feature_keys, effects)
+        explicit_delta = _aggregate_feature_delta(feature_keys, effects)
         try:
             candidate_id = int(item["id"])
         except (KeyError, TypeError, ValueError):
             candidate_id = 0
         semantic_delta = semantic_adjustments.get(candidate_id, 0.0)
-        delta += semantic_delta
+        shelf_delta = 0.0
+        if shelf_effects and explicit_delta >= 0.0 and (explicit_delta + semantic_delta) >= 0.0:
+            shelf_delta = _aggregate_shelf_prior_delta(feature_keys, shelf_effects)
+        delta = explicit_delta + semantic_delta + shelf_delta
         delta = max(-MAX_TOTAL_ADJUSTMENT, min(MAX_TOTAL_ADJUSTMENT, delta))
         try:
             metadata_confidence = float(item.get("metadata_confidence"))
@@ -615,27 +1216,51 @@ def personalize_recommendations(
             explanation = item.get("explanation")
             if not isinstance(explanation, list):
                 explanation = []
-            message = (
-                "Raised using your saved, imported, or positively rated books"
-                if delta > 0
-                else "Lowered using books you rejected or rated poorly"
-            )
-            # Name a contributing feature only when its learned effect agrees
-            # with the actual movement; semantic-only changes retain the
-            # general explanation rather than inventing a seed-book match.
-            contributing = sorted(
-                (feature for feature in feature_keys if effects.get(feature, 0.0) * delta > 0),
-                key=lambda feature: (-abs(effects[feature]), feature),
-            )
-            if contributing:
-                feature = contributing[0]
-                if feature.startswith("author:"):
-                    detail = f"author {item.get('author')}"
-                elif feature.startswith("era:"):
-                    detail = "publication era"
-                else:
-                    detail = f"subject {feature.removeprefix('subject:')}"
-                message += f" ({detail})"
+            explicit_total_scaled = (explicit_delta + semantic_delta) * confidence_scale
+            shelf_scaled = shelf_delta * confidence_scale
+            if delta > 0 and explicit_total_scaled < 0.05 and shelf_scaled >= 0.05:
+                message = "Raised using your Goodreads to-read shelf"
+                shelf_contributing = sorted(
+                    (
+                        feature
+                        for feature in feature_keys
+                        if shelf_effects.get(feature, 0.0) > 0
+                    ),
+                    key=lambda feature: (
+                        0 if feature.startswith("author:") else 1,
+                        -abs(shelf_effects[feature]),
+                        feature,
+                    ),
+                )
+                if shelf_contributing:
+                    feature = shelf_contributing[0]
+                    if feature.startswith("author:"):
+                        detail = f"author {item.get('author')}"
+                    else:
+                        detail = f"subject {feature.removeprefix('subject:')}"
+                    message += f" ({detail})"
+            else:
+                message = (
+                    "Raised using your saved, imported, or positively rated books"
+                    if delta > 0
+                    else "Lowered using books you rejected or rated poorly"
+                )
+                # Name a contributing feature only when its learned effect agrees
+                # with the actual movement; semantic-only changes retain the
+                # general explanation rather than inventing a seed-book match.
+                contributing = sorted(
+                    (feature for feature in feature_keys if effects.get(feature, 0.0) * delta > 0),
+                    key=lambda feature: (-abs(effects[feature]), feature),
+                )
+                if contributing:
+                    feature = contributing[0]
+                    if feature.startswith("author:"):
+                        detail = f"author {item.get('author')}"
+                    elif feature.startswith("era:"):
+                        detail = "publication era"
+                    else:
+                        detail = f"subject {feature.removeprefix('subject:')}"
+                    message += f" ({detail})"
             if message not in explanation:
                 item["explanation"] = [*explanation, message]
             adjusted_count += 1
@@ -648,7 +1273,7 @@ def personalize_recommendations(
     diagnostics = {
         "applied": adjusted_count > 0,
         "observed_books": len(observations),
-        "qualified_features": len(effects),
+        "qualified_features": len(effects) + len(shelf_effects),
         "semantic_evidence_books": semantic_evidence_books,
         "semantic_adjusted_candidates": semantic_adjusted_count,
         "adjusted_candidates": adjusted_count,

@@ -32,8 +32,10 @@ from .backups import (
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from .ingestion import (
+    enrich_shelf_rows_with_work_ids,
     import_goodreads_csv,
     import_goodreads_rss,
+    prune_completed_shelf_items_in_connection,
     validate_goodreads_rss_url,
     import_goodreads_shelves,
     normalize_source_filters,
@@ -85,7 +87,9 @@ from .learning import (
 from .interaction_personalization import (
     load_interaction_events,
     load_cached_candidate_vectors,
+    load_shelf_intent_priors,
     personalize_recommendations,
+    shelf_prior_profile_events,
 )
 from .discovery_slate import (
     diversify_discovery_slate,
@@ -665,6 +669,14 @@ async def lifespan(app):
                 enqueue_job("metadata", dedupe=True)
                 if has_candidate_quality_audit_candidates():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
+                elif row(
+                    "SELECT 1 FROM candidates c "
+                    "JOIN sources s ON s.id=c.source_id "
+                    "JOIN candidate_quality q ON q.candidate_id=c.id "
+                    "WHERE c.status='new' AND q.quality_status='accepted' AND s.enabled=1 "
+                    "LIMIT 1"
+                ):
+                    enqueue_job("score", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
         except Exception:
@@ -1328,6 +1340,7 @@ def tracked_recommendations(
     ranking_at = datetime.now(timezone.utc)
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
+    shelf_prior_items = []
     cached_vectors = {}
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata = {
@@ -1357,6 +1370,7 @@ def tracked_recommendations(
             )
             base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
+            shelf_prior_items = load_shelf_intent_priors(connection)
             # The event primary key orders actions; cached vectors are keyed by
             # candidate id. Normalize only the cache inputs so learner event
             # ordering and latest-event semantics keep their original ids.
@@ -1378,6 +1392,7 @@ def tracked_recommendations(
                 now=ranking_at,
                 interaction_vectors=interaction_vectors,
                 candidate_vectors=cached_vectors,
+                shelf_items=shelf_prior_items,
             )
             if settings.impression_fatigue_enabled:
                 visible_day_counts = load_unacted_visible_impression_counts(
@@ -1493,12 +1508,17 @@ def tracked_recommendations(
             stable_top_k=settings.exploration_stable_top_k,
         )
     if base_pool is not None and personalized_pool is not None and final_pool is not None:
+        evidence_events = (
+            [*interaction_events, *shelf_prior_profile_events(shelf_prior_items)]
+            if shelf_prior_items
+            else interaction_events
+        )
         decision_evidence = build_decision_evidence(
             connection,
             base_pool=base_pool,
             personalized_pool=personalized_pool,
             final_pool=final_pool,
-            interaction_events=interaction_events,
+            interaction_events=evidence_events,
             cached_vectors=cached_vectors,
             ranking_metadata=learning_metadata,
             discovery_slate_metadata=discovery_metadata,
@@ -1605,33 +1625,114 @@ def overview(
 def reading_history():
     """Return the read list without waiting for current-profile scoring."""
     with connect() as connection:
-        items = [dict(item) for item in connection.execute(
-            "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
-        ).fetchall()]
-        existing_scores = []
-        candidate_keys = list(dict.fromkeys(
-            normalize_key(item["title"], item["author"]) for item in items
-        ))
-        for start in range(0, len(candidate_keys), 500):
-            key_batch = candidate_keys[start:start + 500]
-            placeholders = ",".join("?" for _ in key_batch)
-            existing_scores.extend(connection.execute(
-                "SELECT title,author,score FROM candidates "
-                f"WHERE status!='new' AND normalized_key IN ({placeholders}) "
-                "ORDER BY updated_at DESC,id DESC",
-                key_batch,
-            ).fetchall())
-    scores = {}
-    for candidate in existing_scores:
-        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-        scores.setdefault(key, candidate["score"])
-    for item in items:
-        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
-        item["rank_score"] = scores.get(key)
-        item["algorithm_score"] = None
-        item["algorithm_explanation"] = []
-        item["metadata_confidence"] = None
+        fetch = lambda sql, values=(): [
+            dict(item) for item in connection.execute(sql, values).fetchall()
+        ]
+        raw_items = fetch(
+            "SELECT id,title,author,rating,read_at,source,created_at,isbn,openlibrary_work_id "
+            "FROM reads ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
+        )
+        try:
+            read_metadata_rows = fetch(
+                "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                "FROM read_metadata WHERE verified_work_id!=''"
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table: read_metadata" not in str(exc).casefold():
+                raise
+            read_metadata_rows = []
+        scored_candidates = fetch(
+            "SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,c.score,"
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.status NOT IN ('new','hidden') AND c.score > 0 "
+            "ORDER BY c.updated_at DESC,c.id DESC"
+        )
+        try:
+            impression_rows = fetch(
+                "SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,ri.score,"
+                "q.work_id quality_work_id,q.provider quality_provider,"
+                "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+                "FROM recommendation_impressions ri "
+                "JOIN candidates c ON c.id=ri.candidate_id "
+                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                "WHERE ri.score > 0 "
+                "ORDER BY COALESCE(ri.visible_at,ri.presented_at) DESC,ri.id DESC"
+            )
+        except sqlite3.OperationalError:
+            impression_rows = []
+        verified_reads = enrich_shelf_rows_with_work_ids(
+            fetch,
+            read_identity_rows_with_current_verified_work_ids(raw_items, read_metadata_rows),
+            read_rows=raw_items,
+        )
+
+    exact_scores: dict[tuple[str, str], float] = {}
+    identity_scores: dict[tuple[str, ...], float] = {}
+    for candidate in scored_candidates:
+        score = float(candidate["score"])
+        exact_key = (
+            str(candidate["title"]).strip().casefold(),
+            str(candidate["author"]).strip().casefold(),
+        )
+        exact_scores.setdefault(exact_key, score)
+        for match_key in book_row_identity_match_keys(candidate):
+            identity_scores.setdefault(match_key, score)
+
+    exact_impression_scores: dict[tuple[str, str], float] = {}
+    identity_impression_scores: dict[tuple[str, ...], float] = {}
+    seen_impression_candidates: set[int] = set()
+    for imp in impression_rows:
+        cid = int(imp["id"])
+        if cid in seen_impression_candidates:
+            continue
+        seen_impression_candidates.add(cid)
+        score = float(imp["score"])
+        exact_key = (
+            str(imp["title"]).strip().casefold(),
+            str(imp["author"]).strip().casefold(),
+        )
+        exact_impression_scores.setdefault(exact_key, score)
+        for match_key in book_row_identity_match_keys(imp):
+            identity_impression_scores.setdefault(match_key, score)
+
+    verified_by_id = {int(item["id"]): item for item in verified_reads}
+    items = []
+    for raw in raw_items:
+        exact_key = (
+            str(raw["title"]).strip().casefold(),
+            str(raw["author"]).strip().casefold(),
+        )
+        rank_score = exact_scores.get(exact_key)
+        projected = verified_by_id.get(int(raw["id"]), raw)
+        if rank_score is None:
+            for match_key in book_row_identity_match_keys(projected):
+                if match_key in identity_scores:
+                    rank_score = identity_scores[match_key]
+                    break
+        if rank_score is None:
+            rank_score = exact_impression_scores.get(exact_key)
+        if rank_score is None:
+            for match_key in book_row_identity_match_keys(projected):
+                if match_key in identity_impression_scores:
+                    rank_score = identity_impression_scores[match_key]
+                    break
+        items.append(
+            {
+                "id": raw["id"],
+                "title": raw["title"],
+                "author": raw["author"],
+                "rating": raw["rating"],
+                "read_at": raw["read_at"],
+                "source": raw["source"],
+                "created_at": raw["created_at"],
+                "rank_score": rank_score,
+                "algorithm_score": None,
+                "algorithm_explanation": [],
+                "metadata_confidence": None,
+            }
+        )
     return items
 
 
@@ -1759,7 +1860,21 @@ def _recommendation_identity_context(connection=None):
         "WHERE c.status IN ('saved','imported')"
     )
     shortlisted_keys = book_identity_match_index(shortlist_rows)
-    return read_identity_index, shortlisted_keys
+    try:
+        shelf_rows = fetch(
+            "SELECT id,shelf,source,title,author,isbn,openlibrary_work_id "
+            "FROM goodreads_shelf_items"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: goodreads_shelf_items" not in str(exc).casefold():
+            raise
+        shelf_rows = []
+    shelf_identity_index = ReadIdentityIndex.from_reads(
+        enrich_shelf_rows_with_work_ids(
+            fetch, shelf_rows, read_rows=read_identity_rows
+        )
+    )
+    return read_identity_index, shortlisted_keys, shelf_identity_index
 
 
 def _recommendation_rows(
@@ -1777,7 +1892,7 @@ def _recommendation_rows(
         clauses = []
     else:
         clauses = [
-            "c.status NOT IN ('rejected','maybe_later')",
+            "c.status NOT IN ('rejected','maybe_later','hidden')",
             "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
             "(c.status IN ('saved','imported') OR s.enabled=1)",
         ]
@@ -1816,10 +1931,16 @@ def _recommendation_rows(
     )
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
-    read_identity_index, shortlisted_keys = identity_context
+    if len(identity_context) == 3:
+        read_identity_index, shortlisted_keys, shelf_identity_index = identity_context
+    else:
+        read_identity_index, shortlisted_keys = identity_context
+        shelf_identity_index = ReadIdentityIndex.from_reads(())
     visible = []
     seen_recommendation_keys = set()
     for item in result:
+        if item["status"] == "hidden":
+            continue
         if item["status"] == "saved":
             visible.append(item)
             continue
@@ -1830,6 +1951,8 @@ def _recommendation_rows(
             visible.append(item)
             continue
         if read_identity_index.matches(item) or keys & shortlisted_keys:
+            continue
+        if not is_decision_archive and shelf_identity_index.matches(item):
             continue
         if item["status"] == "recommended" and keys & seen_recommendation_keys:
             continue
@@ -1966,6 +2089,17 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             "FROM reads WHERE id=?",
             (read["id"],),
         ).fetchone()
+    prune_completed_shelf_items_in_connection(
+        con,
+        [
+            dict(candidate),
+            {
+                **dict(read),
+                "title": candidate["title"],
+                "author": candidate["author"],
+            },
+        ],
+    )
     read_time, day_precision = _read_time(read["read_at"])
     impression = None
     if read_time is not None:
@@ -2123,7 +2257,7 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
 def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
     with transaction() as con:
         candidate = con.execute(
-            "SELECT c.id,c.title,c.author,c.source_url,"
+            "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
             "q.work_id quality_work_id,q.provider quality_provider,"
             "COALESCE(NULLIF(q.isbn13,''),NULLIF(c.isbn13,''),'') quality_isbn13,"
             "COALESCE(NULLIF(q.isbn10,''),NULLIF(c.isbn10,''),'') quality_isbn10 "
@@ -2415,11 +2549,40 @@ def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     with transaction() as con:
+        existing_row = con.execute(
+            "SELECT value,secret FROM settings WHERE key='goodreads_rss_url'"
+        ).fetchone()
+        previous_url = ""
+        if existing_row and existing_row["value"]:
+            try:
+                previous_url = (
+                    unseal(existing_row["value"])
+                    if existing_row["secret"]
+                    else str(existing_row["value"])
+                ).strip()
+            except Exception:
+                previous_url = ""
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,updated_at=CURRENT_TIMESTAMP",
             (seal(url) if url else "",),
         )
+        if not url or (previous_url and previous_url != url):
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE source='goodreads_rss'"
+            )
+            if not url:
+                for key, value in (
+                    ("goodreads_rss_last_sync_at", ""),
+                    ("goodreads_rss_last_status", ""),
+                    ("goodreads_rss_last_attempt_at", ""),
+                    ("goodreads_rss_last_error", ""),
+                ):
+                    con.execute(
+                        "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                        (key, value),
+                    )
     return {"saved": True, "configured": bool(url)}
 
 

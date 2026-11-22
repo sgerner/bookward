@@ -1,14 +1,35 @@
 import asyncio
+import json
 from pathlib import Path
 import sqlite3
 import sys
 
+from fastapi.testclient import TestClient
+import httpx
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auth_helpers import authenticated_headers
 from afterword_engine.config import settings
-from afterword_engine.database import initialize
-from afterword_engine.ingestion import goodreads_shelf_rss_url, import_goodreads_shelves, validate_goodreads_rss_url
+from afterword_engine.database import (
+    MIGRATIONS,
+    _execute_migration_script,
+    initialize,
+    normalize_key,
+)
+from afterword_engine.digest import digest_preview
+from afterword_engine.ingestion import (
+    goodreads_shelf_rss_url,
+    import_goodreads_csv,
+    import_goodreads_rss,
+    import_goodreads_shelves,
+    validate_goodreads_rss_url,
+)
+from afterword_engine.learning import create_recommendation_run
+from afterword_engine.main import app
+from afterword_engine.scoring import score_all
+from afterword_engine.tenancy import profile_scope
 
 
 def test_goodreads_shelf_rss_url_rewrites_shelf_param() -> None:
@@ -69,21 +90,21 @@ def test_import_goodreads_shelves_stores_separately_from_reads(tmp_path: Path, m
     try:
         reads_count = con.execute("SELECT COUNT(*) FROM reads").fetchone()[0]
         shelf_rows = con.execute(
-            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf"
+            "SELECT shelf, source, title, author FROM goodreads_shelf_items ORDER BY shelf"
         ).fetchall()
     finally:
         con.close()
 
     assert reads_count == 0
     assert shelf_rows == [
-        ("currently-reading", "Piranesi", "Susanna Clarke"),
-        ("to-read", "Project Hail Mary", "Andy Weir"),
+        ("currently-reading", "goodreads_rss", "Piranesi", "Susanna Clarke"),
+        ("to-read", "goodreads_rss", "Project Hail Mary", "Andy Weir"),
     ]
 
 
-def test_score_all_hides_currently_reading_and_boosts_to_read(tmp_path: Path, monkeypatch) -> None:
-    from afterword_engine.scoring import score_all
-
+def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_recovers_hidden_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
     db_path = tmp_path / "score_shelves.db"
     monkeypatch.setattr(settings, "db", str(db_path))
     initialize(seed_demo=False)
@@ -98,22 +119,15 @@ def test_score_all_hides_currently_reading_and_boosts_to_read(tmp_path: Path, mo
             "INSERT INTO reads(title, author, rating, source) "
             "VALUES('The Martian', 'Andy Weir', 5, 'goodreads_rss')"
         )
-        con.execute(
-            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
-            "VALUES('to-read', 'Project Hail Mary', 'Andy Weir')"
-        )
-        con.execute(
-            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
-            "VALUES('currently-reading', 'Piranesi', 'Susanna Clarke')"
-        )
-        for cid, title, author in [
-            (10, "Project Hail Mary", "Andy Weir"),
-            (11, "Piranesi", "Susanna Clarke"),
+        for cid, title, author, status in [
+            (10, "Project Hail Mary", "Andy Weir", "new"),
+            (11, "Piranesi", "Susanna Clarke", "new"),
+            (12, "Artemis", "Andy Weir", "hidden"),
         ]:
             con.execute(
-                "INSERT INTO candidates(id, source_id, title, author, status, normalized_key) "
-                "VALUES(?, 999, ?, ?, 'new', ?)",
-                (cid, title, author, f"{title.lower()}|{author.lower()}"),
+                "INSERT INTO candidates(id, source_id, title, author, status, score, normalized_key) "
+                "VALUES(?, 999, ?, ?, ?, 0, ?)",
+                (cid, title, author, status, normalize_key(title, author)),
             )
             con.execute(
                 "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 "
@@ -124,47 +138,569 @@ def test_score_all_hides_currently_reading_and_boosts_to_read(tmp_path: Path, mo
     finally:
         con.close()
 
+    # First score pass without any shelf rows establishes pure baseline scores.
+    asyncio.run(score_all())
+    con = sqlite3.connect(db_path)
+    try:
+        baseline = {
+            cid: (status, score, json.loads(explanation))
+            for cid, status, score, explanation in con.execute(
+                "SELECT id, status, score, explanation FROM candidates WHERE id IN (10, 11, 12) ORDER BY id"
+            ).fetchall()
+        }
+        # Now populate both Goodreads shelves and mark candidate 12 hidden again
+        # to verify score_all neither hides currently-reading nor adds a +10 bonus,
+        # while recovering stranded hidden rows.
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Project Hail Mary', 'Andy Weir')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Piranesi', 'Susanna Clarke')"
+        )
+        con.execute(
+            "UPDATE candidates SET status='hidden', score=0, explanation='[]' WHERE id=12"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert baseline[12][0] == "recommended"
+    assert baseline[12][1] > 0
+
     asyncio.run(score_all())
 
     con = sqlite3.connect(db_path)
     try:
-        rows = con.execute(
-            "SELECT id, status, explanation FROM candidates WHERE id IN (10, 11) ORDER BY id"
+        with_shelves = {
+            cid: (status, score, json.loads(explanation))
+            for cid, status, score, explanation in con.execute(
+                "SELECT id, status, score, explanation FROM candidates WHERE id IN (10, 11, 12) ORDER BY id"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+
+    for cid in (10, 11, 12):
+        assert with_shelves[cid][0] == "recommended"
+        assert with_shelves[cid][1] == baseline[cid][1]
+        assert with_shelves[cid][1] > 0
+        assert "On your Goodreads to-read shelf" not in with_shelves[cid][2]
+
+
+def test_migration_26_and_startup_recover_hidden_rows_dedupe_shelves_and_preserve_profile_isolation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root_db = tmp_path / "afterword.db"
+    monkeypatch.setattr(settings, "db", str(root_db))
+
+    profile_a_id = "a" * 32
+    profile_b_id = "b" * 32
+    profile_a_db = tmp_path / "profiles" / f"{profile_a_id}.sqlite3"
+    profile_b_db = tmp_path / "profiles" / f"{profile_b_id}.sqlite3"
+    profile_a_db.parent.mkdir(parents=True, exist_ok=True)
+
+    # Construct a genuine schema-v25 database for profile_a with dual-shelf
+    # stale rows and a stranded status='hidden' candidate.
+    con = sqlite3.connect(profile_a_db)
+    try:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version >= 26:
+                continue
+            _execute_migration_script(con, script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        con.execute(
+            "INSERT INTO sources(id, name, url, kind, enabled) VALUES(999, 'Feed', 'https://example.com/rss', 'rss', 1)"
+        )
+        con.execute(
+            "INSERT INTO reads(title, author, rating, source) VALUES('The Martian', 'Andy Weir', 5, 'goodreads_csv')"
+        )
+        con.execute(
+            "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
+            "VALUES(50, 999, 'Piranesi', 'Susanna Clarke', 'hidden', 0, '[]', ?)",
+            (normalize_key("Piranesi", "Susanna Clarke"),),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 WHERE candidate_id=50"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, updated_at) "
+            "VALUES('currently-reading', 'Piranesi', 'Susanna Clarke', '9781635575637', '2026-01-01 00:00:00')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, updated_at) "
+            "VALUES('to-read', 'Piranesi', 'Susanna Clarke', NULL, '2026-02-01 00:00:00')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with profile_scope(profile_b_id):
+        initialize(seed_demo=False)
+        con_b = sqlite3.connect(profile_b_db)
+        try:
+            con_b.execute(
+                "INSERT INTO goodreads_shelf_items(shelf, source, title, author) "
+                "VALUES('currently-reading', 'goodreads_csv', 'Isolated Book', 'Other Author')"
+            )
+            con_b.commit()
+        finally:
+            con_b.close()
+
+    with profile_scope(profile_a_id):
+        initialize(seed_demo=False)
+        con_a = sqlite3.connect(profile_a_db)
+        try:
+            migrated_shelves = con_a.execute(
+                "SELECT shelf, source, title, author, isbn FROM goodreads_shelf_items"
+            ).fetchall()
+            recovered_status = con_a.execute(
+                "SELECT status, score FROM candidates WHERE id=50"
+            ).fetchone()
+        finally:
+            con_a.close()
+
+        assert migrated_shelves == [
+            ("to-read", "goodreads_csv", "Piranesi", "Susanna Clarke", "9781635575637")
+        ]
+        assert recovered_status == ("new", 0)
+
+        asyncio.run(score_all())
+        con_a = sqlite3.connect(profile_a_db)
+        try:
+            rescored = con_a.execute(
+                "SELECT status, score FROM candidates WHERE id=50"
+            ).fetchone()
+        finally:
+            con_a.close()
+        assert rescored[0] == "recommended"
+        assert rescored[1] > 0
+
+    # Profile B remains completely isolated.
+    con_b = sqlite3.connect(profile_b_db)
+    try:
+        b_shelves = con_b.execute(
+            "SELECT shelf, source, title, author FROM goodreads_shelf_items"
+        ).fetchall()
+    finally:
+        con_b.close()
+    assert b_shelves == [("currently-reading", "goodreads_csv", "Isolated Book", "Other Author")]
+
+
+def test_discovery_and_digest_exclude_shelves_across_editions_while_shortlist_and_impressions_stay_clean(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "serving_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'Curated', 'https://example.com/feed', 'rss', 1)"
+        )
+        # Shelf items:
+        # 1. Exact currently-reading match
+        # 2. Base title on to-read matching a subtitled candidate
+        # 3. UK edition ISBN matching an Open Library work via verified read/catalog work_id
+        # 4. Title that user ALSO explicitly saved to Shortlist in Bookward
+        # 5. Title that user ALSO imported to Librarr in Bookward
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, source, title, author, isbn, openlibrary_work_id) "
+            "VALUES(?, 'goodreads_csv', ?, ?, ?, ?)",
+            [
+                ("currently-reading", "Piranesi", "Susanna Clarke", None, None),
+                ("currently-reading", "Stranded Hidden Candidate", "Some Author", None, None),
+                ("to-read", "Project Hail Mary", "Andy Weir", None, None),
+                ("to-read", "UK Edition Queue Title", "Kazuo Ishiguro", "9780571364886", "/works/OL21636499W"),
+                ("to-read", "Shortlisted Favorite", "Emily St. John Mandel", None, None),
+                ("currently-reading", "Imported Waitlist Book", "N. K. Jemisin", None, None),
+            ],
+        )
+        candidates = [
+            # Suppressed: currently-reading exact match
+            (101, "Piranesi", "Susanna Clarke", "recommended", 88.0, "", ""),
+            # Suppressed: to-read subtitle variant (previously promoted from 73 -> 83 into Digest!)
+            (102, "Project Hail Mary: A Novel", "Andy Weir", "recommended", 85.0, "", ""),
+            # Suppressed: cross-edition Open Library work_id match
+            (103, "Klara and the Sun", "Kazuo Ishiguro", "recommended", 87.0, "/works/OL21636499W", "openlibrary"),
+            # Visible on Shortlist despite being on Goodreads to-read
+            (104, "Shortlisted Favorite", "Emily St. John Mandel", "saved", 84.0, "", ""),
+            # Visible in overview (include_imported=True) despite being on currently-reading
+            (105, "Imported Waitlist Book", "N. K. Jemisin", "imported", 83.0, "", ""),
+            # Never served: legacy hidden status at score=0
+            (106, "Stranded Hidden Candidate", "Some Author", "hidden", 0.0, "", ""),
+            # Served in Discovery and Digest: novel book
+            (107, "The Ministry of Time", "Kaliane Bradley", "recommended", 86.0, "/works/OL999999W", "openlibrary"),
+        ]
+        for cid, title, author, status, score, work_id, provider in candidates:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
+                "VALUES(?, 999, ?, ?, ?, ?, '[\"Strong match\"]', ?)",
+                (cid, title, author, status, score, normalize_key(title, author)),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0, "
+                "work_id=?, provider=? WHERE candidate_id=?",
+                (work_id, provider, cid),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        # Also inject a raw runtime hidden row after lifespan startup to verify
+        # serving queries defensively exclude both recovered unscored rows (106)
+        # and any raw status='hidden' rows (108).
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
+                "VALUES(108, 999, 'Runtime Hidden Candidate', 'Other Author', 'hidden', 0.0, '[\"Hidden\"]', ?)",
+                (normalize_key("Runtime Hidden Candidate", "Other Author"),),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 "
+                "WHERE candidate_id=108"
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        rec_res = client.get("/api/recommendations")
+        assert rec_res.status_code == 200
+        rec_items = rec_res.json()
+        assert [item["id"] for item in rec_items] == [107, 104]
+        assert all(item["status"] != "hidden" for item in rec_items)
+
+        rec_only_res = client.get("/api/recommendations", params={"status": "recommended"})
+        assert rec_only_res.status_code == 200
+        assert [item["id"] for item in rec_only_res.json()] == [107]
+
+        saved_res = client.get("/api/recommendations", params={"status": "saved"})
+        assert saved_res.status_code == 200
+        assert [item["id"] for item in saved_res.json()] == [104]
+
+        overview_res = client.get("/api/overview")
+        assert overview_res.status_code == 200
+        overview_ids = {item["id"] for item in overview_res.json()["recommendations"]}
+        assert overview_ids == {107, 104, 105}
+
+    preview = digest_preview({"minimum_score": 80, "maximum_books": 10, "only_new": True})
+    assert [item["id"] for item in preview["items"]] == [107]
+
+    # Direct defensive check on create_recommendation_run with a hidden item.
+    direct_run_id = create_recommendation_run(
+        [
+            {"id": 108, "status": "hidden", "score": 0.0},
+            {"id": 107, "status": "recommended", "score": 86.0},
+        ]
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        logged_impressions = con.execute(
+            "SELECT candidate_id, score FROM recommendation_impressions ORDER BY id"
+        ).fetchall()
+        direct_impressions = con.execute(
+            "SELECT candidate_id, score FROM recommendation_impressions WHERE run_id=?",
+            (direct_run_id,),
         ).fetchall()
     finally:
         con.close()
 
-    assert rows[0][1] == "recommended"
-    assert "On your Goodreads to-read shelf" in rows[0][2]
-    assert rows[1][1] == "hidden"
+    logged_ids = {cid for cid, _ in logged_impressions}
+    assert logged_ids.isdisjoint({101, 102, 103, 106, 108})
+    assert all(score > 0 for _, score in logged_impressions)
+    assert direct_impressions == [(107, 86.0)]
 
 
-def test_import_goodreads_csv_populates_and_clears_shelf_items(tmp_path: Path, monkeypatch) -> None:
-    from afterword_engine.ingestion import import_goodreads_csv
+def test_pausing_currently_reading_restores_discovery_and_completion_preserves_reading_history_rank_score(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "lifecycle_history.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
 
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'List', 'https://example.com/list', 'rss', 1)"
+        )
+        con.execute(
+            "INSERT INTO reads(title, author, rating, source) "
+            "VALUES('The Martian', 'Andy Weir', 5, 'goodreads_csv')"
+        )
+        for cid, title, author, isbn13 in [
+            (201, "Project Hail Mary", "Andy Weir", "9780593135204"),
+            (202, "Piranesi", "Susanna Clarke", "9781635575637"),
+        ]:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, isbn13, status, normalized_key) "
+                "VALUES(?, 999, ?, ?, ?, 'new', ?)",
+                (cid, title, author, isbn13, normalize_key(title, author)),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0, isbn13=? "
+                "WHERE candidate_id=?",
+                (isbn13, cid),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    # Reader puts both books on currently-reading via CSV, then scores.
+    initial_csv = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,0,,2026/01/10,currently-reading,=\"9780593135204\"\n"
+        "Piranesi,Susanna Clarke,0,,2026/02/01,currently-reading,=\"9781635575637\"\n"
+    ).encode("utf-8")
+    import_goodreads_csv(initial_csv)
+    asyncio.run(score_all())
+
+    con = sqlite3.connect(db_path)
+    try:
+        stored_scores = dict(
+            con.execute("SELECT id, score FROM candidates WHERE id IN (201, 202)").fetchall()
+        )
+    finally:
+        con.close()
+    assert stored_scores[201] > 0
+    assert stored_scores[202] > 0
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        # Both are dynamically excluded while on currently-reading.
+        assert client.get("/api/recommendations").json() == []
+
+        # Reader pauses/removes Project Hail Mary from currently-reading in a revised CSV.
+        paused_csv = (
+            "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+            "Piranesi,Susanna Clarke,0,,2026/02/01,currently-reading,=\"9781635575637\"\n"
+        ).encode("utf-8")
+        import_goodreads_csv(paused_csv)
+
+        # Project Hail Mary is immediately eligible again at its computed score!
+        restored_recs = client.get("/api/recommendations").json()
+        assert [item["id"] for item in restored_recs] == [201]
+        assert restored_recs[0]["score"] == stored_scores[201]
+
+        # Reader finishes Project Hail Mary manually in Bookward and finishes Piranesi
+        # via Goodreads CSV with a subtitle variant.
+        mark_res = client.post("/api/recommendations/201/read", json={"rating": 5})
+        assert mark_res.status_code == 200
+
+        finished_csv = (
+            "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+            "Piranesi: Special Anniversary Edition,Susanna Clarke,5,2026/03/01,2026/02/01,read,=\"9781635575637\"\n"
+        ).encode("utf-8")
+        import_goodreads_csv(finished_csv)
+
+        history = client.get("/api/reading-history").json()
+        by_title = {item["title"]: item for item in history}
+        assert by_title["Project Hail Mary"]["rank_score"] == stored_scores[201]
+        assert by_title["Piranesi: Special Anniversary Edition"]["rank_score"] == stored_scores[202]
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining_shelves = con.execute("SELECT COUNT(*) FROM goodreads_shelf_items").fetchone()[0]
+    finally:
+        con.close()
+    assert remaining_shelves == 0
+
+
+def test_import_goodreads_csv_populates_replaces_and_prunes_shelf_items_across_editions(
+    tmp_path: Path, monkeypatch
+) -> None:
     db_path = tmp_path / "csv_shelves.db"
     monkeypatch.setattr(settings, "db", str(db_path))
     initialize(seed_demo=False)
 
-    csv_data = (
+    # Seed an accepted Open Library candidate mapping UK & US editions to one work,
+    # plus an existing RSS shelf item to verify cross-source completion pruning.
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'OL', 'https://openlibrary.org', 'rss', 1)"
+        )
+        con.execute(
+            "INSERT INTO candidates(id, source_id, title, author, isbn13, status, normalized_key) "
+            "VALUES(301, 999, 'Children of Time', 'Adrian Tchaikovsky', '9780316452502', 'recommended', ?)",
+            (normalize_key("Children of Time", "Adrian Tchaikovsky"),),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted', provider='openlibrary', "
+            "work_id='/works/OL17352669W', isbn13='9780316452502' WHERE candidate_id=301"
+        )
+        con.execute(
+            "INSERT INTO candidates(id, source_id, title, author, isbn13, status, normalized_key) "
+            "VALUES(302, 999, 'Children of Time (UK)', 'Adrian Tchaikovsky', '9781447273288', 'recommended', ?)",
+            (normalize_key("Children of Time (UK)", "Adrian Tchaikovsky"),),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted', provider='openlibrary', "
+            "work_id='/works/OL17352669W', isbn13='9781447273288' WHERE candidate_id=302"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, source, title, author, isbn) "
+            "VALUES('to-read', 'goodreads_rss', 'Dune', 'Frank Herbert', '9780441172719')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    csv_first = (
         "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
-        "Project Hail Mary,Andy Weir,0,,2026/01/10,to-read,=\"9780593135204\"\n"
-        "Piranesi,Susanna Clarke,0,,2026/02/01,currently-reading,=\"9781635575637\"\n"
+        "Project Hail Mary,Andy Weir,0,,2026/01/10,currently-reading,=\"9780593135204\"\n"
+        "Piranesi,Susanna Clarke,0,,2026/02/01,to-read,=\"9781635575637\"\n"
+        "Children of Time,Adrian Tchaikovsky,0,,2026/02/05,to-read,=\"9781447273288\"\n"
         "The Martian,Andy Weir,5,2025/05/01,2025/04/01,read,=\"9780804139021\"\n"
     ).encode("utf-8")
 
-    count = import_goodreads_csv(csv_data)
-    assert count == 1
+    assert import_goodreads_csv(csv_first) == 1
+
+    # Second CSV:
+    # - Moves Project Hail Mary from currently-reading -> to-read (must leave 1 row, not 2!)
+    # - Deletes Piranesi from queue entirely (must be removed!)
+    # - Marks US edition of Children of Time as read under a different edition title (must prune UK shelf row via work_id!)
+    # - Marks Dune: Deluxe Edition as read (must prune RSS Dune row via subtitle/ISBN!)
+    csv_second = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,0,,2026/01/10,to-read,=\"9780593135204\"\n"
+        "Children of Time: US Hardcover,Adrian Tchaikovsky,5,2026/03/10,2026/02/05,read,=\"9780316452502\"\n"
+        "Dune: Deluxe Edition,Frank Herbert,5,2026/03/12,2026/01/01,read,=\"9780441172719\"\n"
+    ).encode("utf-8")
+
+    assert import_goodreads_csv(csv_second) == 2
 
     con = sqlite3.connect(db_path)
     try:
         shelves = con.execute(
-            "SELECT shelf, title, author, isbn FROM goodreads_shelf_items ORDER BY shelf"
+            "SELECT shelf, source, title, author, isbn FROM goodreads_shelf_items ORDER BY source, shelf, title"
         ).fetchall()
     finally:
         con.close()
 
     assert shelves == [
-        ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
-        ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+        ("to-read", "goodreads_csv", "Project Hail Mary", "Andy Weir", "9780593135204"),
+    ]
+
+
+def test_rss_private_404_clears_stale_rss_preserving_csv_and_disconnect_clears_rss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "rss_lifecycle.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    # 1. Import CSV fallback shelf row.
+    csv_payload = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "CSV Fallback Book,Ursula K. Le Guin,0,,2026/01/05,to-read,=\"9780441478125\"\n"
+    ).encode("utf-8")
+    import_goodreads_csv(csv_payload)
+
+    rss_url = "https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read"
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>RSS Queued Book</title>
+        <author_name>Octavia E. Butler</author_name>
+        <isbn13>9780446675505</isbn13>
+      </item>
+    </channel></rss>"""
+    reading_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>RSS Nightstand Book</title>
+        <author_name>Ted Chiang</author_name>
+      </item>
+    </channel></rss>"""
+
+    async def initial_fetch(url: str, **kwargs):
+        if "shelf=to-read" in url:
+            return to_read_xml, "application/xml"
+        if "shelf=currently-reading" in url:
+            return reading_xml, "application/xml"
+        raise AssertionError(url)
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", initial_fetch)
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 1,
+        "currently-reading": 1,
+    }
+
+    # 2. Next RSS sync gets HTTP 404 on private to-read feed while currently-reading stays 200.
+    async def private_to_read_fetch(url: str, **kwargs):
+        if "shelf=to-read" in url:
+            req = httpx.Request("GET", url)
+            resp = httpx.Response(404, request=req)
+            raise httpx.HTTPStatusError("404 Not Found", request=req, response=resp)
+        if "shelf=currently-reading" in url:
+            return reading_xml, "application/xml"
+        raise AssertionError(url)
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", private_to_read_fetch)
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 0,
+        "currently-reading": 1,
+    }
+
+    con = sqlite3.connect(db_path)
+    try:
+        after_404 = con.execute(
+            "SELECT shelf, source, title FROM goodreads_shelf_items ORDER BY source, shelf"
+        ).fetchall()
+    finally:
+        con.close()
+    assert after_404 == [
+        ("to-read", "goodreads_csv", "CSV Fallback Book"),
+        ("currently-reading", "goodreads_rss", "RSS Nightstand Book"),
+    ]
+
+    # 3. RSS read import with subtitle variant prunes matching shelf item across sources.
+    read_feed_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>RSS Nightstand Book: Stories of Your Life</title>
+        <author_name>Ted Chiang</author_name>
+        <user_rating>5</user_rating>
+      </item>
+    </channel></rss>"""
+
+    async def read_fetch(url: str, **kwargs):
+        return read_feed_xml, "application/xml"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", read_fetch)
+    assert asyncio.run(import_goodreads_rss(rss_url)) == 1
+
+    # Re-add an RSS shelf item, connect RSS in settings, then disconnect RSS (url="")
+    # and verify RSS shelf rows are removed while CSV fallback rows remain.
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", initial_fetch)
+    asyncio.run(import_goodreads_shelves(rss_url))
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        save_res = client.put("/api/settings/goodreads-rss", json={"url": rss_url})
+        assert save_res.status_code == 200
+        assert save_res.json() == {"saved": True, "configured": True}
+
+        disconnect_res = client.put("/api/settings/goodreads-rss", json={"url": ""})
+        assert disconnect_res.status_code == 200
+        assert disconnect_res.json() == {"saved": True, "configured": False}
+
+    con = sqlite3.connect(db_path)
+    try:
+        after_disconnect = con.execute(
+            "SELECT shelf, source, title FROM goodreads_shelf_items ORDER BY source, shelf"
+        ).fetchall()
+    finally:
+        con.close()
+    assert after_disconnect == [
+        ("to-read", "goodreads_csv", "CSV Fallback Book"),
     ]
