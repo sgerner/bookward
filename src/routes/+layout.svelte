@@ -3,12 +3,16 @@
 	import { onMount } from 'svelte';
 	import type { LayoutProps } from './$types';
 	import favicon from '#lib/assets/favicon.svg';
+	import {
+		handleLogoutSubmit,
+		handleProfileMessage,
+		syncActiveProfile,
+	} from '#lib/profile-sync.js';
 	import { initAppearance } from '#lib/theme.js';
 
 	let { children, data }: LayoutProps = $props();
 	let profileChannel: BroadcastChannel | null = null;
-	function storedProfile() { try { return localStorage.getItem('bookward-active-profile'); } catch { return null; } }
-	function saveProfile(value: string) { try { localStorage.setItem('bookward-active-profile', value); } catch { /* Profile checks still run through the server session. */ } }
+	const browserStorage = () => (typeof localStorage !== 'undefined' ? localStorage : null);
 
 	onMount(() => {
 		const cleanupAppearance = initAppearance();
@@ -16,8 +20,12 @@
 		profileChannel = channel;
 		const profileId = () => data.user?.profile_id ?? null;
 		const onProfile = (event: MessageEvent<{ type?: string; profile_id?: string }>) => {
-			if (event.data?.type === 'logout') window.setTimeout(() => window.location.replace('/login'), 800);
-			else if (event.data?.type === 'profile' && event.data.profile_id !== profileId()) window.location.replace('/');
+			handleProfileMessage(event.data, {
+				currentProfileId: profileId(),
+				storage: browserStorage(),
+				replaceLocation: (url) => window.location.replace(url),
+				schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+			});
 		};
 		channel?.addEventListener('message', onProfile);
 		const addProfileToForm = (event: Event) => {
@@ -28,15 +36,22 @@
 			event.target.append(field);
 		};
 		const broadcastLogout = (event: Event) => {
-			if (event.target instanceof HTMLFormElement && event.target.action.includes('/auth/logout')) channel?.postMessage({ type: 'logout' });
+			if (event.target instanceof HTMLFormElement) {
+				handleLogoutSubmit(
+					event.target.getAttribute('action') || event.target.action,
+					browserStorage(),
+					channel
+				);
+			}
 		};
 		document.addEventListener('submit', addProfileToForm, true);
 		document.addEventListener('submit', broadcastLogout, true);
-		const current = profileId();
-		if (current) {
-			saveProfile(current);
-			channel?.postMessage({ type: 'profile', profile_id: current });
-		}
+		syncActiveProfile(profileId(), {
+			storage: browserStorage(),
+			channel,
+			replaceLocation: (url) => window.location.replace(url),
+			checkStoredMismatch: false,
+		});
 		return () => {
 			cleanupAppearance();
 			channel?.removeEventListener('message', onProfile);
@@ -46,12 +61,14 @@
 		};
 	});
 	$effect(() => {
-		const current = data.user?.profile_id;
-		if (!current || typeof localStorage === 'undefined') return;
-		const stored = storedProfile();
-		if (stored && stored !== current) window.location.replace('/');
-		saveProfile(current);
-		profileChannel?.postMessage({ type: 'profile', profile_id: current });
+		const storage = browserStorage();
+		if (!storage) return;
+		syncActiveProfile(data.user?.profile_id, {
+			storage,
+			channel: profileChannel,
+			replaceLocation: (url) => window.location.replace(url),
+			checkStoredMismatch: true,
+		});
 	});
 </script>
 

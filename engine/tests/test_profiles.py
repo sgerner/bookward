@@ -1307,3 +1307,139 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
         applied = {row[0] for row in con.execute("SELECT version FROM schema_migrations")}
     assert {"previous_status", "undone_at"} <= columns
     assert feedback_migration in applied
+
+
+def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(identity_store):
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "enroll-subject-1", "sso@example.test", "SSO Reader"
+    )
+    existing_local = profiles.create_account("taken-name", "taken-reader-password-long")
+    assert sso_reader["has_local_username"] is False
+    assert existing_local["has_local_username"] is True
+
+    admin_session, _ = profiles.create_session(identity_store["id"])
+    sso_session, _ = profiles.create_session(sso_reader["id"])
+
+    with TestClient(app) as client:
+        me = client.get("/auth/me", headers={"x-bookward-session": sso_session})
+        assert me.status_code == 200
+        assert me.json()["has_local_username"] is False
+
+        methods = client.get("/auth/identities", headers={"x-bookward-session": sso_session})
+        assert methods.status_code == 200
+        assert methods.json()["has_local_username"] is False
+        assert methods.json()["password_enabled"] is False
+        identity_id = methods.json()["oidc_identities"][0]["id"]
+
+        admin_list = client.get("/admin/accounts", headers={"x-bookward-session": admin_session})
+        assert admin_list.status_code == 200
+        sso_entry = next(item for item in admin_list.json()["accounts"] if item["id"] == sso_reader["id"])
+        assert sso_entry["has_local_username"] is False
+
+        # Sole SSO identity cannot be unlinked before local username + password exist.
+        unlink_without_password = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": sso_session},
+        )
+        assert unlink_without_password.status_code == 400
+
+        # Simulate a legacy row that had password_hash set while still owning an oidc: surrogate username.
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE accounts SET password_hash=? WHERE id=?",
+                (profiles.PASSWORD_HASHER.hash("legacy-unusable-password-long"), sso_reader["id"]),
+            )
+        assert profiles.authenticate_local(sso_reader["username"], "legacy-unusable-password-long") is None
+        unlink_with_surrogate_username = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": sso_session},
+        )
+        assert unlink_with_surrogate_username.status_code == 400
+
+        # Enrolling local credentials requires a recent session (within 10 minutes).
+        stale_session, _ = profiles.create_session(sso_reader["id"])
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE auth_sessions SET created_at='2000-01-01T00:00:00+00:00' WHERE account_id=? AND token_hash!=?",
+                (sso_reader["id"], ""),
+            )
+        stale_attempt = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": stale_session},
+            json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+        )
+        assert stale_attempt.status_code == 401
+
+        fresh_session, _ = profiles.create_session(sso_reader["id"])
+        missing_username = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": fresh_session},
+            json={"new_password": "chosen-reader-password-long"},
+        )
+        assert missing_username.status_code == 400
+
+        reserved_prefix = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": fresh_session},
+            json={"username": "OIDC:spoofed", "new_password": "chosen-reader-password-long"},
+        )
+        assert reserved_prefix.status_code == 400
+
+        duplicate_username = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": fresh_session},
+            json={"username": "Taken-Name", "new_password": "chosen-reader-password-long"},
+        )
+        assert duplicate_username.status_code == 409
+
+        enrolled = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": fresh_session},
+            json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+        )
+        assert enrolled.status_code == 200
+        assert enrolled.json()["username"] == "chosen-reader"
+        assert enrolled.json()["has_local_username"] is True
+        rotated_session = enrolled.json()["session_token"]
+
+        unlinked = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": rotated_session},
+        )
+        assert unlinked.status_code == 200
+
+        local_login = client.post(
+            "/auth/login",
+            json={"username": "chosen-reader", "password": "chosen-reader-password-long"},
+        )
+        assert local_login.status_code == 200
+        assert local_login.json()["account"]["profile_id"] == sso_reader["profile_id"]
+
+
+def test_admin_password_reset_blocks_sso_only_accounts_and_rejects_reserved_usernames(identity_store):
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "admin-reset-subject", "sso-admin@example.test", "SSO Managed"
+    )
+    admin_session, _ = profiles.create_session(identity_store["id"])
+
+    with TestClient(app, headers={"x-bookward-session": admin_session}) as client:
+        reserved_create = client.post(
+            "/admin/accounts",
+            json={
+                "username": "oidc:manual",
+                "password": "temporary-password-123",
+                "display_name": "Reserved",
+                "role": "user",
+            },
+        )
+        assert reserved_create.status_code == 400
+
+        blocked_reset = client.post(
+            f"/admin/accounts/{sso_reader['id']}/password",
+            json={"password": "temporary-password-123"},
+        )
+        assert blocked_reset.status_code == 400
+
+    reloaded = profiles.account_by_id(sso_reader["id"])
+    assert reloaded["must_change_password"] is False
+

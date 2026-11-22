@@ -134,6 +134,7 @@ class InitialAdminIn(LocalLoginIn):
 
 
 class PasswordChangeIn(BaseModel):
+    username: str | None = Field(default=None, max_length=160)
     current_password: str = Field(default="", max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
 
@@ -800,7 +801,10 @@ def initial_admin_setup(payload: InitialAdminIn):
 @app.get("/auth/me")
 def auth_me(request: Request):
     account = _principal(request)
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")}
+    return {
+        **{key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")},
+        "has_local_username": identity_store.has_local_username(account.get("username")),
+    }
 
 
 @app.post("/auth/logout")
@@ -813,7 +817,8 @@ def auth_logout(request: Request):
 def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
-    if methods["password_enabled"]:
+    local_username = identity_store.has_local_username(account.get("username"))
+    if methods["password_enabled"] and local_username:
         verified = identity_store.authenticate_local(
             account["username"], payload.current_password,
             request.client.host if request.client else "unknown",
@@ -822,14 +827,32 @@ def change_password(payload: PasswordChangeIn, request: Request):
             raise HTTPException(401, "Current password is incorrect")
     else:
         _require_recent_authentication(account)
-    identity_store.update_password(account["id"], payload.new_password)
-    raw, _ = identity_store.create_session(account["id"])
-    return {"changed": True, "session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600}
+    try:
+        identity_store.update_password(account["id"], payload.new_password, payload.username)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "That username is already in use") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    raw, updated = identity_store.create_session(account["id"])
+    return {
+        "changed": True,
+        "session_token": raw,
+        "max_age": identity_store.SESSION_IDLE_HOURS * 3600,
+        "username": updated["username"],
+        "has_local_username": updated["has_local_username"],
+    }
 
 
 @app.get("/auth/identities")
 def auth_identities(request: Request):
-    return identity_store.auth_methods(_principal(request)["id"])
+    account = _principal(request)
+    methods = identity_store.auth_methods(account["id"])
+    return {
+        **methods,
+        "has_local_username": identity_store.has_local_username(account.get("username")),
+    }
 
 
 @app.delete("/auth/identities/{identity_id}")
@@ -846,7 +869,12 @@ def auth_unlink_identity(identity_id: int, request: Request):
 @app.get("/admin/accounts")
 def admin_accounts(request: Request):
     _require_admin(request)
-    return {"accounts": identity_store.accounts_list()}
+    return {
+        "accounts": [
+            {**item, "has_local_username": identity_store.has_local_username(item.get("username"))}
+            for item in identity_store.accounts_list()
+        ]
+    }
 
 
 @app.post("/admin/accounts")
@@ -866,7 +894,10 @@ def admin_create_account(payload: AccountCreateIn, request: Request):
         identity_store.set_account_status(account["id"], "disabled")
         LOGGER.exception("Could not initialize profile database for account %s", account["id"])
         raise HTTPException(500, "The account was created but its profile could not be initialized") from exc
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")}
+    return {
+        **{key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")},
+        "has_local_username": identity_store.has_local_username(account.get("username")),
+    }
 
 
 @app.post("/admin/accounts/{account_id}/password")

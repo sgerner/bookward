@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
+	import AccountHeader from '#lib/components/AccountHeader.svelte';
 	import ProfileField from '#lib/components/ProfileField.svelte';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -13,6 +14,7 @@
 <svelte:head><title>Manage accounts · Bookward</title></svelte:head>
 
 <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
+<AccountHeader user={data.user} />
 <main id="main-content" tabindex="-1" class="mx-auto max-w-4xl px-4 py-10 sm:px-6">
 	<a href="/" class="text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Manage accounts</h1>
@@ -25,7 +27,11 @@
 			<ProfileField profileId={data.user?.profile_id} />
 			<label class="grid gap-2 text-sm font-medium">Username<input class="input" name="username" autocomplete="off" maxlength="160" required /></label>
 			<label class="grid gap-2 text-sm font-medium">Display name<input class="input" name="display_name" maxlength="160" /></label>
-			<label class="grid gap-2 text-sm font-medium">Temporary password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" /></label>
+			<label class="grid gap-2 text-sm font-medium">
+				Temporary password
+				<input class="input" type="password" name="password" minlength="12" maxlength="1024" required autocomplete="new-password" aria-describedby="create-account-password-hint" />
+				<span id="create-account-password-hint" class="text-xs font-normal text-surface-700-300">Use 12 to 1024 characters.</span>
+			</label>
 			<label class="grid gap-2 text-sm font-medium">Role<select class="select" name="role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
 			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Create profile</button>
 		</form>
@@ -33,18 +39,38 @@
 	<section class="mt-8 grid gap-4">
 		<h2 class="text-xl font-semibold">Accounts</h2>
 		{#each data.accounts as account}
+			{@const hasLocalUsername = account.has_local_username ?? !account.username.trim().toLowerCase().startsWith('oidc:')}
+			{@const loginLabel = hasLocalUsername ? account.username : 'SSO-only'}
+			{@const headingLabel = account.display_name || loginLabel}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
-					<div><h3 class="font-semibold">{account.display_name || account.username}</h3><p class="text-sm text-surface-700-300" aria-label={`${account.username}, ${account.role}, ${account.status}`}>{account.username} · {account.role} · {account.status}</p></div>
+					<div><h3 class="font-semibold">{headingLabel}</h3><p class="text-sm text-surface-700-300" aria-label={`${loginLabel}, ${account.role}, ${account.status}`}>{loginLabel} · {account.role} · {account.status}</p></div>
 					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
-						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${headingLabel}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
 				</div>
-				{#if account.id !== data.current_user_id}<form method="POST" action="?/resetPassword" use:enhance class="mt-4 flex flex-wrap items-end gap-3">
-					<ProfileField profileId={data.user?.profile_id} />
-					<input type="hidden" name="account_id" value={account.id} />
-					<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">Set password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" aria-label={`Set password for ${account.display_name || account.username}`} /></label>
-					<button class="btn btn-sm preset-tonal-surface" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
-				</form>{/if}
+				{#if account.id !== data.current_user_id}
+					{#if hasLocalUsername}
+						<form method="POST" action="?/resetPassword" use:enhance class="mt-4 flex flex-wrap items-end gap-3">
+							<ProfileField profileId={data.user?.profile_id} />
+							<input type="hidden" name="account_id" value={account.id} />
+							<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">
+								Set password
+								<input class="input" type="password" name="password" minlength="12" maxlength="1024" required autocomplete="new-password" aria-label={`Set password for ${headingLabel}`} aria-describedby={`reset-password-hint-${account.id}`} />
+								<span id={`reset-password-hint-${account.id}`} class="text-xs font-normal text-surface-700-300">Use 12 to 1024 characters.</span>
+							</label>
+							<button class="btn btn-sm min-h-11 preset-tonal-surface" type="submit" aria-label={`Reset password for ${headingLabel}`}>Reset password</button>
+						</form>
+					{:else}
+						<div class="mt-4 flex flex-wrap items-end gap-3">
+							<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium text-surface-700-300">
+								Set password
+								<input class="input" type="password" disabled aria-label={`Set password unavailable for SSO-only account ${headingLabel}`} aria-describedby={`sso-only-reset-hint-${account.id}`} />
+								<span id={`sso-only-reset-hint-${account.id}`} class="text-xs font-normal text-surface-700-300">SSO-only — local password reset is unavailable until this reader sets a username in Account settings.</span>
+							</label>
+							<button class="btn btn-sm min-h-11 preset-tonal-surface" type="button" disabled aria-label={`Reset password unavailable for ${headingLabel}`}>Reset password</button>
+						</div>
+					{/if}
+				{/if}
 			</article>
 		{/each}
 	</section>
