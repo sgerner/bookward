@@ -83,6 +83,17 @@ describe('SwitchControl primitive', () => {
 		expect(tertiary.body).toContain('preset-filled-tertiary-500');
 		expect(tertiary.body).toContain('<input type="hidden" name="channels" value="email"');
 
+		const disabled = render(SwitchControl, {
+			props: {
+				name: 'enabled',
+				checked: true,
+				disabled: true,
+				ariaLabel: 'Enable weekly digest',
+			},
+		});
+		expect(disabled.body).toContain('aria-checked="true"');
+		expect(disabled.body).toContain('<input type="hidden" name="enabled" value="on" disabled');
+
 		expect(nextSwitchChecked(false)).toBe(true);
 		expect(nextSwitchChecked(true)).toBe(false);
 	});

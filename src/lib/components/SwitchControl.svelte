@@ -42,7 +42,7 @@
 </script>
 
 {#if checked && name}
-	<input type="hidden" {name} {value} />
+	<input type="hidden" {name} {value} disabled={disabled} />
 {/if}
 <button
 	{id}
