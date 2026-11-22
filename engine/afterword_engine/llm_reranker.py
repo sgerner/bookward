@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import httpx
 
 from .config import settings
-from .http_bounds import stream_json_async, stream_json_sync
+from .http_bounds import stream_json_sync
 from .security import safe_error_message
 
 LOGGER = logging.getLogger(__name__)
@@ -243,57 +244,6 @@ def _normalize_chat_url(url: str) -> str:
     return cleaned
 
 
-async def rerank_with_llm(
-    reads: Sequence[dict[str, Any]],
-    candidates: Sequence[dict[str, Any]],
-    *,
-    interaction_events: Sequence[dict[str, Any]] | None = None,
-    api_url: str | None = None,
-    api_key: str | None = None,
-    model: str | None = None,
-    top_k: int | None = None,
-    max_delta: float | None = None,
-    timeout_seconds: float | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
-    key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
-    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
-    k = top_k if top_k is not None else settings.llm_rerank_top_k
-    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
-    timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
-
-    if not key or not url or not chosen_model or len(candidates) < 2:
-        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
-
-    messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            _response, payload = await stream_json_async(
-                client,
-                "POST",
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": chosen_model,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-                max_bytes=settings.llm_rerank_max_bytes,
-                size_error="LLM reranker response is too large",
-            )
-            content = payload["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
-                return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
-            rankings = parsed.get("rankings") or []
-            return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
-    except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", safe_error_message(exc))
-        return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
-
-
 def rerank_with_llm_sync(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -306,7 +256,7 @@ def rerank_with_llm_sync(
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
+    """Call the configured OpenAI-compatible LLM endpoint synchronously and rerank top-K candidates."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
     url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()

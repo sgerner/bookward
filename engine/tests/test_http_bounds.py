@@ -1,9 +1,9 @@
 import asyncio
+from collections.abc import Iterator
 import gzip
 import json
 from pathlib import Path
 import socket
-from typing import Iterator
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -483,31 +483,13 @@ def test_embeddings_rerankers_oidc_and_discord_enforce_byte_caps(database, monke
     assert oversized_embed.chunks_yielded == 3
     assert oversized_embed.closed is True
 
-    # 2. Async and sync LLM rerankers abort oversized streams and fall back cleanly.
+    # 2. Sync LLM reranker aborts oversized streams and falls back cleanly.
     monkeypatch.setattr(settings, "llm_rerank_max_bytes", 150_000)
-    async_llm_stream = CountingAsyncStream(b"c" * 60_000, 10)
     sync_llm_stream = CountingSyncStream(b"c" * 60_000, 10)
     candidates = [
         {"id": 1, "title": "First", "author": "A", "score": 90.0},
         {"id": 2, "title": "Second", "author": "B", "score": 85.0},
     ]
-
-    respx.post("https://llm.example.test/v1/chat/completions").mock(
-        return_value=httpx.Response(200, headers={"content-type": "application/json"}, stream=async_llm_stream)
-    )
-    reranked_async, diag_async = asyncio.run(
-        llm_reranker.rerank_with_llm(
-            [],
-            candidates,
-            api_url="https://llm.example.test/v1",
-            api_key="sk-test",
-            model="gpt-4o-mini",
-        )
-    )
-    assert diag_async == {"applied": False, "reason": "fallback"}
-    assert [c["id"] for c in reranked_async] == [1, 2]
-    assert async_llm_stream.chunks_yielded == 3
-    assert async_llm_stream.closed is True
 
     respx.post("https://llm-sync.example.test/v1/chat/completions").mock(
         return_value=httpx.Response(200, headers={"content-type": "application/json"}, stream=sync_llm_stream)
