@@ -643,7 +643,6 @@ def _build_cache_key(
     *,
     profile_scope: str,
     url: str,
-    api_key: str,
     model: str,
     top_k: int,
     max_delta: float,
@@ -652,7 +651,6 @@ def _build_cache_key(
     reads: Sequence[Mapping[str, Any]],
     interaction_events: Sequence[Mapping[str, Any]] | None,
 ) -> str:
-    key_digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
     slate_fp = [
         (
             _safe_int(c.get("id"), -1),
@@ -686,7 +684,6 @@ def _build_cache_key(
     material = {
         "profile_scope": profile_scope,
         "url": url,
-        "key_digest": key_digest,
         "model": model,
         "top_k": int(top_k),
         "max_delta": round(float(max_delta), 4),
@@ -867,7 +864,6 @@ async def rerank_with_llm(
     cache_key = _build_cache_key(
         profile_scope=scope,
         url=url,
-        api_key=key,
         model=chosen_model,
         top_k=k,
         max_delta=delta,
@@ -970,7 +966,6 @@ def rerank_with_llm_sync(
     cache_key = _build_cache_key(
         profile_scope=scope,
         url=url,
-        api_key=key,
         model=chosen_model,
         top_k=k,
         max_delta=delta,

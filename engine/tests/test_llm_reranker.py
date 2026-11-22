@@ -1210,3 +1210,34 @@ def test_async_rerank_with_llm_caches_clamps_timeout_and_rejects_redirects(monke
     assert [c["id"] for c in r2] == [2, 1]
 
 
+def test_cache_key_excludes_sensitive_api_key_material() -> None:
+    import inspect
+    from afterword_engine.llm_reranker import _build_cache_key, build_rerank_prompt
+
+    sig = inspect.signature(_build_cache_key)
+    assert "api_key" not in sig.parameters
+
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 1, "title": "First", "author": "A", "score": 80.0},
+        {"id": 2, "title": "Second", "author": "B", "score": 79.0},
+    ]
+    messages = build_rerank_prompt(reads, candidates, top_k=24, max_delta=1.2)
+    base_kwargs = dict(
+        profile_scope="profile:alpha",
+        url="https://api.openai.com/v1/chat/completions",
+        model="gpt-4o-mini",
+        top_k=24,
+        max_delta=1.2,
+        messages=messages,
+        candidates=candidates,
+        reads=reads,
+        interaction_events=None,
+    )
+    k1 = _build_cache_key(**base_kwargs)
+    assert k1 == _build_cache_key(**base_kwargs)
+    assert k1 != _build_cache_key(**{**base_kwargs, "profile_scope": "profile:beta"})
+    assert k1 != _build_cache_key(**{**base_kwargs, "model": "gpt-4.1-mini"})
+    assert k1 != _build_cache_key(
+        **{**base_kwargs, "url": "https://api.groq.com/openai/v1/chat/completions"}
+    )
