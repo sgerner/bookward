@@ -1575,6 +1575,319 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("https://tracking.example/cover.jpg", "https://books.example/list") == ""
     assert fallback_cover_url("A Book", "An Author").startswith("https://placehold.co/")
 
+
+def test_cover_and_source_url_helpers_deduplicate_parses_and_preserve_edge_cases(monkeypatch):
+    import afterword_engine.covers as covers_module
+
+    # Credentials, uppercase/trailing-dot hosts, subdomains, and fragment stripping
+    assert safe_cover_url("https://user:pass@covers.openlibrary.org/b/id/42-L.jpg") == ""
+    assert (
+        safe_cover_url("https://COVERS.OPENLIBRARY.ORG./b/id/42-L.jpg#preview")
+        == "https://covers.openlibrary.org./b/id/42-L.jpg"
+    )
+    assert (
+        safe_cover_url("https://is1-ssl.MZSTATIC.com/image/thumb/cover.jpg#")
+        == "https://is1-ssl.mzstatic.com/image/thumb/cover.jpg"
+    )
+    assert (
+        safe_cover_url(
+            "https://BOOKS.EXAMPLE./art/cover.jpg#top",
+            "https://books.example/list",
+        )
+        == "https://books.example./art/cover.jpg"
+    )
+
+    # Weak covers fall back to placeholder_cover_url
+    expected_placeholder = covers_module.placeholder_cover_url("A Book", "An Author")
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg",
+            "https://openlibrary.org/works/OL1W",
+        )
+        == expected_placeholder
+    )
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://placehold.co/640x960?text=Old",
+            "https://books.example/list",
+        )
+        == expected_placeholder
+    )
+
+    # Known CDN cover without '#' parses supplied once and skips source_url + copy_with
+    httpx_calls = []
+    real_httpx_url = covers_module.httpx.URL
+
+    def counting_httpx_url(value, *args, **kwargs):
+        httpx_calls.append(value)
+        return real_httpx_url(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", counting_httpx_url)
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/id/42-L.jpg",
+            "https://books.example/list",
+        )
+        == "https://covers.openlibrary.org/b/id/42-L.jpg"
+    )
+    assert httpx_calls == ["https://covers.openlibrary.org/b/id/42-L.jpg"]
+
+    # canonical_book_source_url parses source_url once and promotes Open Library list links when work ID exists
+    urlparse_calls = []
+    real_urlparse = covers_module.urlparse
+
+    def counting_urlparse(value, *args, **kwargs):
+        urlparse_calls.append(value)
+        return real_urlparse(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module, "urlparse", counting_urlparse)
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://www.openlibrary.org./people/reader/lists/OL2L",
+            item={"quality_work_id": "/works/OL99W", "quality_provider": "openlibrary"},
+        )
+        == "https://openlibrary.org/works/OL99W"
+    )
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://openlibrary.org/people/reader/lists/OL2L",
+            item={"quality_work_id": "", "quality_provider": ""},
+        )
+        == "https://openlibrary.org/search?title=A+Book&author=A+Writer"
+    )
+    assert len(urlparse_calls) == 2
+
+
+def test_tracked_recommendations_defers_url_formatting_until_after_pagination(database, monkeypatch):
+    import afterword_engine.covers as covers_module
+    import afterword_engine.main as main_module
+    from afterword_engine.decision_evidence import load_decision_evidence
+
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+        con.execute("DELETE FROM candidate_quality")
+        source_id = con.execute("SELECT id FROM sources WHERE enabled=1 LIMIT 1").fetchone()["id"]
+        special_cases = [
+            (
+                "Top Promoted List Book",
+                "Writer One",
+                "https://covers.openlibrary.org/b/id/501-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL10L",
+                "recommended",
+                99.0,
+                "/works/OL501W",
+            ),
+            (
+                "Top Unpromoted List Book",
+                "Writer Two",
+                "https://covers.openlibrary.org/b/isbn/9780000000002-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL11L",
+                "recommended",
+                98.0,
+                "",
+            ),
+            (
+                "Top Fragment Publisher Book",
+                "Writer Three",
+                "https://BOOKS.EXAMPLE./covers/three.jpg#hero",
+                "https://books.example/list/three",
+                "recommended",
+                97.0,
+                "",
+            ),
+            (
+                "Top ISBN Search Book",
+                "Writer Four",
+                "https://placehold.co/600x900",
+                "https://openlibrary.org/isbn/9780000000004",
+                "recommended",
+                96.0,
+                "",
+            ),
+        ]
+        for idx in range(196):
+            special_cases.append(
+                (
+                    f"Pool Tail Book {idx}",
+                    f"Tail Author {idx}",
+                    f"https://covers.openlibrary.org/b/id/{1000 + idx}-L.jpg",
+                    f"https://openlibrary.org/people/reader/lists/OL{1000 + idx}L",
+                    "recommended",
+                    round(90.0 - idx * 0.1, 3),
+                    "",
+                )
+            )
+        special_cases.extend(
+            [
+                (
+                    "Saved Weak Cover Book",
+                    "Saved Author",
+                    "https://covers.openlibrary.org/b/isbn/9780000000099-L.jpg",
+                    "https://openlibrary.org/isbn/9780000000099",
+                    "saved",
+                    85.0,
+                    "",
+                ),
+                (
+                    "Rejected List Book",
+                    "Rejected Author",
+                    "https://covers.openlibrary.org/b/id/900-L.jpg#frag",
+                    "https://openlibrary.org/people/reader/lists/OL900L",
+                    "rejected",
+                    40.0,
+                    "/works/OL900W",
+                ),
+            ]
+        )
+        for title, author, cover_url, source_url, status, score_val, work_id in special_cases:
+            cur = con.execute(
+                """INSERT INTO candidates(
+                    title,author,description,cover_url,source_url,source_id,
+                    release_date,date_kind,genres,score,explanation,status,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    author,
+                    f"Summary for {title}",
+                    cover_url,
+                    source_url,
+                    source_id,
+                    "2026-02-01",
+                    "day",
+                    json.dumps(["Fiction"]),
+                    score_val,
+                    json.dumps(["Matched"]),
+                    status,
+                    normalize_key(title, author),
+                ),
+            )
+            con.execute(
+                """INSERT OR REPLACE INTO candidate_quality(
+                    candidate_id,quality_status,quality_score,audit_version,metadata_version,work_id,provider
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    cur.lastrowid,
+                    "accepted",
+                    1.0,
+                    "builtin-curated-v1",
+                    "catalog-metadata-v1",
+                    work_id,
+                    "openlibrary" if work_id else "",
+                ),
+            )
+            if status == "rejected":
+                con.execute(
+                    "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                    (cur.lastrowid, "reject"),
+                )
+
+    unformatted = recommendation_list(status="recommended", limit=4, format_urls=False)
+    assert unformatted[0]["genres"] == ["Fiction"]
+    assert unformatted[0]["explanation"] == ["Matched"]
+    assert unformatted[0]["source_url"] == "https://openlibrary.org/people/reader/lists/OL10L"
+
+    httpx_calls = 0
+    urlparse_calls = 0
+    real_httpx_url = covers_module.httpx.URL
+    real_covers_urlparse = covers_module.urlparse
+    real_main_urlparse = main_module.urlparse
+
+    def count_httpx_url(*args, **kwargs):
+        nonlocal httpx_calls
+        httpx_calls += 1
+        return real_httpx_url(*args, **kwargs)
+
+    def count_covers_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_covers_urlparse(*args, **kwargs)
+
+    def count_main_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_main_urlparse(*args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", count_httpx_url)
+    monkeypatch.setattr(covers_module, "urlparse", count_covers_urlparse)
+    monkeypatch.setattr(main_module, "urlparse", count_main_urlparse)
+
+    served, run_id = main_module.tracked_recommendations(status="recommended", limit=8, offset=0)
+    assert len(served) == 8
+    # Only the 8 served recommendations are URL-formatted (8 source URLs; 8 covers + 1 source-host check)
+    assert urlparse_calls == 8
+    assert httpx_calls == 9
+
+    assert served[0]["cover_url"] == "https://covers.openlibrary.org/b/id/501-L.jpg"
+    assert served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert served[1]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[1]["source_url"]
+        == "https://openlibrary.org/search?title=Top+Unpromoted+List+Book&author=Writer+Two"
+    )
+    assert served[2]["cover_url"] == "https://books.example./covers/three.jpg"
+    assert served[2]["source_url"] == "https://books.example/list/three"
+    assert served[3]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[3]["source_url"]
+        == "https://openlibrary.org/search?title=Top+ISBN+Search+Book&author=Writer+Four"
+    )
+
+    with main_module.connect() as con:
+        evidence = load_decision_evidence(con, run_id)
+    assert evidence is not None and evidence["capture_status"] == "complete"
+    assert len(evidence["decision"]["pools"]["base"]) == 200
+    assert len(evidence["decision"]["pools"]["final"]) == 200
+    assert "cover_url" not in evidence["decision"]["pools"]["final"][0]
+    assert "source_url" not in evidence["decision"]["pools"]["final"][0]
+    assert len(evidence["served_exposures"]) == 8
+    exposure_snapshot = json.loads(evidence["served_exposures"][0]["candidate_snapshot_json"])
+    assert "cover_url" not in exposure_snapshot
+    assert "source_url" not in exposure_snapshot
+
+    # Non-personalized path (can_personalize is False) still formats URLs for the returned slice
+    saved_items, _ = main_module.tracked_recommendations(status="saved", limit=8, offset=0)
+    assert len(saved_items) == 1
+    assert saved_items[0]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        saved_items[0]["source_url"]
+        == "https://openlibrary.org/search?title=Saved+Weak+Cover+Book&author=Saved+Author"
+    )
+
+    decisions = recommendation_list(status="decisions", limit=8)
+    assert len(decisions) == 1
+    assert decisions[0]["cover_url"] == "https://covers.openlibrary.org/b/id/900-L.jpg"
+    assert decisions[0]["source_url"] == "https://openlibrary.org/works/OL900W"
+
+    # Overview path (status=None, recommended_limit=4) formats only 4 recommended + 1 saved
+    httpx_calls = 0
+    urlparse_calls = 0
+    overview_slice, _ = main_module.tracked_recommendations(limit=24, recommended_limit=4)
+    assert len(overview_slice) == 5
+    assert urlparse_calls == 5
+
+    # Personalization failure fallback still formats URLs for the returned slice
+    def broken_personalize(*_args, **_kwargs):
+        raise RuntimeError("simulated personalization failure")
+
+    monkeypatch.setattr(main_module, "personalize_recommendations", broken_personalize)
+    httpx_calls = 0
+    urlparse_calls = 0
+    fallback_served, _ = main_module.tracked_recommendations(status="recommended", limit=4, offset=0)
+    assert len(fallback_served) == 4
+    assert urlparse_calls == 4
+    assert fallback_served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert fallback_served[2]["cover_url"] == "https://books.example./covers/three.jpg"
+
 @respx.mock
 def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
     route = respx.get(OPEN_LIBRARY_SEARCH).mock(
