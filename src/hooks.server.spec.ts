@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { authorized, handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
+import { handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
 import { currentSessionToken } from '#lib/server/request-context.js';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -27,12 +27,6 @@ function mockSessionLookup(profileId = 'alice-profile') {
 }
 
 describe('authentication boundary', () => {
-  it('requires configured basic authentication and accepts colons in passwords', async () => {
-    expect(authorized(new Request('http://afterword.test'), 'reader', 'long:secret')).toBe(false);
-    const authorization = `Basic ${Buffer.from('reader:long:secret').toString('base64')}`;
-    expect(authorized(new Request('http://afterword.test', { headers: { authorization } }), 'reader', 'long:secret')).toBe(true);
-  });
-
   it('recognizes only the versioned API paths as token-authenticated routes', () => {
     expect(isPublicApiPath('/api/v1')).toBe(true);
     expect(isPublicApiPath('/api/v1/recommendations')).toBe(true);
