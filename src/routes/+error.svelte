@@ -16,7 +16,7 @@
 
 <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
 <main id="main-content" tabindex="-1" in:fly={{ y: 18, duration: motionDuration(320) }} class="mx-auto grid min-h-dvh max-w-xl content-center gap-6 px-6 py-12">
-  <a href="/" class="flex w-fit items-center gap-3 rounded-xl text-xl font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary-500"><span in:scale={{ duration: motionDuration(180) }} class="grid size-11 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"><img src={bookwardMark} alt="" class="size-full object-cover" aria-hidden="true" /></span>Bookward</a>
+  <a href="/" class="flex w-fit items-center gap-3 rounded-xl text-xl font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary-500"><span in:scale={{ duration: motionDuration(180) }} class="grid size-11 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"><img src={bookwardMark} alt="" width="128" height="128" class="size-full object-cover" aria-hidden="true" /></span>Bookward</a>
   <div in:scale={{ duration: motionDuration(280) }} class="card preset-tonal-surface space-y-5 p-6 sm:p-10">
     <span in:fly={{ x: -8, duration: motionDuration(180) }} class="badge preset-tonal-warning">{page.status}</span>
     <h1 class="h2">{page.status === 403 ? 'Request blocked' : page.status === 503 ? 'A short intermission' : page.status === 404 ? 'Page not found' : page.status === 413 ? 'File too large' : 'Something went wrong'}</h1>
