@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { compile } from '@tailwindcss/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 	import {
 	DEFAULT_MODE,
@@ -85,7 +86,7 @@ describe('theme preferences', () => {
 
 	afterEach(() => vi.unstubAllGlobals());
 
-	it('keeps the picker catalog in sync with every installed Skeleton theme', () => {
+	it('keeps the picker catalog in sync with every installed Skeleton theme', async () => {
 		const installed = readdirSync(join(process.cwd(), 'node_modules/@skeletonlabs/skeleton/src/themes'))
 			.filter((file) => file.endsWith('.css'))
 			.map((file) => file.replace(/\.css$/, ''))
@@ -95,9 +96,11 @@ describe('theme preferences', () => {
 		expect(pickerThemes).toEqual(installed);
 		expect(new Set(pickerThemes).size).toBe(pickerThemes.length);
 
-		const stylesheet = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
+		const stylesheetPath = join(process.cwd(), 'src/routes/layout.css');
+		const stylesheet = readFileSync(stylesheetPath, 'utf8');
 		expect(stylesheet).toContain(`@import '@skeletonlabs/skeleton/themes/${DEFAULT_THEME}'`);
 		expect(stylesheet).toContain(`@import './theme-calibration.css'`);
+		expect(stylesheet).not.toContain('@skeletonlabs/skeleton-svelte');
 		const cerberusCss = readFileSync(
 			join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${DEFAULT_THEME}.css`),
 			'utf8',
@@ -119,6 +122,15 @@ describe('theme preferences', () => {
 			expect(stylesheet).not.toContain(`@import '@skeletonlabs/skeleton/themes/${theme}'`);
 			expect(criticalCalibration).not.toContain(`:root[data-theme="${theme}"]`);
 		}
+
+		const compiler = await compile(stylesheet, {
+			base: dirname(stylesheetPath),
+			from: stylesheetPath,
+			onDependency: () => undefined,
+		});
+		const compiled = compiler.build([]);
+		expect(compiled).toContain(`[data-theme="${DEFAULT_THEME}"]`);
+		expect(compiled).not.toContain('[data-scope=');
 	});
 
 	it('calibrates every Skeleton palette and :root fallback to WCAG 2.2 G18 4.5:1 across light and dark modes', () => {
