@@ -37,6 +37,7 @@ type Overview = {
     explanation: string[];
     status: string;
     source_name: string | null;
+    recommendation_run_id?: string;
   }>;
   decisions?: Overview["recommendations"];
   decisions_has_more?: boolean;
@@ -135,8 +136,23 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     next_backup_at: null,
     backups: [],
   };
+  const viewParam = url.searchParams.get("view");
+  const isDiscover =
+    !viewParam ||
+    !["saved", "decisions", "sources", "settings"].includes(viewParam);
+  let digestPeriod = url.searchParams.get("digest_period");
+  const validDigestPeriod =
+    digestPeriod && /^\d{4}-W\d{2}$/.test(digestPeriod) ? digestPeriod : null;
+  const overviewParams = new URLSearchParams({
+    recommendation_limit: "24",
+    decision_limit: "24",
+  });
+  if (!isDiscover) overviewParams.set("track_run", "false");
+  if (isDiscover && validDigestPeriod) {
+    overviewParams.set("digest_period", validDigestPeriod);
+  }
   const overviewRequest = engine<Overview>(
-    "/api/overview?recommendation_limit=24&decision_limit=24",
+    `/api/overview?${overviewParams.toString()}`,
   );
   const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
     () => fallbackBackupStatus,
@@ -151,7 +167,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
-  let digestPeriod = url.searchParams.get("digest_period");
   let digestReviewIds: number[] = [];
   if (digestPeriod) {
     try {
@@ -175,7 +190,12 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     books: overview.recommendations.map((book) =>
       toPageBook({
         ...book,
-        recommendation_run_id: overview.recommendation_run_id ?? "",
+        recommendation_run_id:
+          typeof book.recommendation_run_id === "string"
+            ? book.recommendation_run_id
+            : book.status === "recommended"
+              ? (overview.recommendation_run_id ?? "")
+              : "",
       }),
     ),
     decisions: (overview.decisions ?? []).map((book) =>
@@ -507,7 +527,7 @@ export const actions: Actions = {
   },
   toggleDefault: async ({ request }) => {
     try {
-      const overview = await engine<Overview>("/api/overview");
+      const overview = await engine<Overview>("/api/overview?track_run=false");
       const source = overview.sources.find((item) => item.is_default);
       if (!source) return fail(404, { message: "Default source not found." });
       await engine(`/api/sources/${source.id}/toggle`, {
@@ -606,7 +626,7 @@ export const actions: Actions = {
         message: "Enter a valid Librarr URL, API key, and media type.",
       });
     try {
-      const overview = await engine<Overview>("/api/overview");
+      const overview = await engine<Overview>("/api/overview?track_run=false");
       if (!key.data && !overview.settings.librarr_api_key_set)
         return fail(400, {
           message: "Enter a Librarr API key for the first connection.",
@@ -652,7 +672,7 @@ export const actions: Actions = {
     if (!backend.success || !model.success)
       return fail(400, { message: "Choose an embedding backend and model." });
     try {
-      const overview = await engine<Overview>("/api/overview");
+      const overview = await engine<Overview>("/api/overview?track_run=false");
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({

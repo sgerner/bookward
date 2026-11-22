@@ -164,4 +164,63 @@ describe("recommendations endpoint", () => {
     );
     expect(payload.has_more).toBe(true);
   });
+
+  it("attaches paginated Discover slices to an active session run with impression_limit", async () => {
+    engineMock.mockResolvedValue([
+      {
+        ...recommendation(25),
+        status: "recommended",
+        recommendation_run_id: "run-session-42",
+      },
+      {
+        ...recommendation(26),
+        status: "recommended",
+        recommendation_run_id: "run-session-42",
+      },
+      {
+        ...recommendation(27),
+        status: "recommended",
+        recommendation_run_id: "",
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=2&offset=24&run_id=run-session-42",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=recommended&limit=3&offset=24&run_id=run-session-42&impression_limit=2",
+    );
+    expect(payload.recommendation_run_id).toBe("run-session-42");
+    expect(payload.has_more).toBe(true);
+    expect(payload.items).toHaveLength(2);
+    expect(payload.items[0].recommendation_run_id).toBe("run-session-42");
+  });
+
+  it("passes impression_limit and surfaces recommendation_run_id when start_run=1 is requested", async () => {
+    engineMock.mockResolvedValue([
+      {
+        ...recommendation(1),
+        status: "recommended",
+        recommendation_run_id: "run-started-99",
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=24&offset=0&start_run=1",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=recommended&limit=25&offset=0&impression_limit=24",
+    );
+    expect(payload.recommendation_run_id).toBe("run-started-99");
+  });
 });

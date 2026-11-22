@@ -14,7 +14,7 @@ import math
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .database import transaction
 from .decision_evidence import (
@@ -111,6 +111,7 @@ def create_recommendation_run(
     ranking_metadata: dict[str, Any] | None = None,
     discovery_slate_metadata: dict[str, Any] | None = None,
     decision_evidence: dict[str, Any] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> str:
     """Persist a ranked response and return its opaque run identifier.
 
@@ -121,6 +122,15 @@ def create_recommendation_run(
     if session_id:
         _validate_identifier(session_id, "session identifier")
     items = list(recommendations)
+    resolved_ranks = (
+        [int(rank) for rank in ranks]
+        if ranks is not None
+        else list(range(1, len(items) + 1))
+    )
+    if len(resolved_ranks) != len(items):
+        raise ValueError("Recommendation ranks must match recommendation count")
+    if any(rank <= 0 for rank in resolved_ranks):
+        raise ValueError("Recommendation ranks must be positive")
     run_id = str(uuid.uuid4())
     metadata = {"status": status or "all"}
     if limit is not None:
@@ -144,7 +154,7 @@ def create_recommendation_run(
                 now,
             ),
         )
-        for rank, item in enumerate(items, 1):
+        for rank, item in zip(resolved_ranks, items):
             try:
                 propensity = float(item.get("propensity", 1.0))
             except (TypeError, ValueError) as exc:
@@ -154,7 +164,7 @@ def create_recommendation_run(
             con.execute(
                 "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
+                (run_id, int(item["id"]), int(rank), float(item.get("score") or 0), propensity, now),
             )
         try:
             con.execute("SAVEPOINT archive_served_exposures")
@@ -163,6 +173,7 @@ def create_recommendation_run(
                 run_id=run_id,
                 recommendations=items,
                 presented_at=now,
+                ranks=resolved_ranks,
             )
             con.execute("RELEASE SAVEPOINT archive_served_exposures")
         except Exception:
@@ -179,6 +190,82 @@ def create_recommendation_run(
                 con.execute("RELEASE SAVEPOINT persist_decision_evidence")
                 LOGGER.warning("Recommendation decision evidence persistence failed")
     return run_id
+
+
+def append_recommendation_run_impressions(
+    run_id: str,
+    recommendations: Iterable[dict[str, Any]],
+    *,
+    ranks: Sequence[int] | None = None,
+) -> bool:
+    """Append newly served pagination candidates to an existing recommendation run."""
+
+    _validate_identifier(run_id, "recommendation run")
+    items = list(recommendations)
+    if ranks is not None and len(ranks) != len(items):
+        raise ValueError("Recommendation ranks must match recommendation count")
+    now = utc_now()
+    with transaction() as con:
+        run_row = con.execute(
+            "SELECT id FROM recommendation_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if run_row is None:
+            return False
+        if not items:
+            return True
+        existing = con.execute(
+            "SELECT candidate_id,rank FROM recommendation_impressions WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        existing_ids = {int(row["candidate_id"]) for row in existing}
+        next_rank = max((int(row["rank"]) for row in existing), default=0) + 1
+        new_items: list[dict[str, Any]] = []
+        new_ranks: list[int] = []
+        for idx, item in enumerate(items):
+            candidate_id = int(item["id"])
+            if candidate_id in existing_ids:
+                continue
+            rank = int(ranks[idx]) if ranks is not None else next_rank
+            if rank <= 0:
+                raise ValueError("Recommendation ranks must be positive")
+            if ranks is None:
+                next_rank += 1
+            try:
+                propensity = float(item.get("propensity", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Recommendation propensity must be numeric") from exc
+            if not math.isfinite(propensity) or not 0 < propensity <= 1:
+                raise ValueError("Recommendation propensity must be between 0 and 1")
+            con.execute(
+                "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (run_id, candidate_id, rank, float(item.get("score") or 0), propensity, now),
+            )
+            existing_ids.add(candidate_id)
+            new_items.append(item)
+            new_ranks.append(rank)
+        if new_items:
+            con.execute(
+                "UPDATE recommendation_runs SET candidate_count=("
+                "SELECT COUNT(*) FROM recommendation_impressions WHERE run_id=?) WHERE id=?",
+                (run_id, run_id),
+            )
+            try:
+                con.execute("SAVEPOINT archive_served_exposures")
+                archive_served_exposures(
+                    con,
+                    run_id=run_id,
+                    recommendations=new_items,
+                    presented_at=now,
+                    ranks=new_ranks,
+                )
+                con.execute("RELEASE SAVEPOINT archive_served_exposures")
+            except Exception:
+                con.execute("ROLLBACK TO SAVEPOINT archive_served_exposures")
+                con.execute("RELEASE SAVEPOINT archive_served_exposures")
+                LOGGER.warning("Recommendation exposure archive failed; serving telemetry continues")
+    return True
 
 
 def _candidate_exists(con, candidate_id: int) -> bool:

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { applyAction, deserialize, enhance, type SubmitFunction } from "$app/forms";
-  import { invalidateAll, pushState } from "$app/navigation";
+  import { pushState } from "$app/navigation";
   import { page } from "$app/state";
   import { onMount, tick, untrack } from "svelte";
   import { flip } from "svelte/animate";
@@ -83,6 +83,10 @@
     rollback?: () => void;
   };
   type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
+  type PendingOptions = {
+    localOnly?: boolean;
+    refreshDiscoverIfOffView?: boolean;
+  };
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
@@ -103,9 +107,29 @@
   const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
+  const initialViewIsDiscover =
+    readView(page.url.searchParams.get("view")) === "discover";
+  let activeRunIdOverride = $state<string | null>(null);
+  const activeRunId = $derived(
+    activeRunIdOverride ?? (data.recommendation_run_id ?? ""),
+  );
+  let discoverSessionInitializedOverride = $state(initialViewIsDiscover);
+  const discoverSessionInitialized = $derived(
+    discoverSessionInitializedOverride || Boolean(data.recommendation_run_id),
+  );
+  let discoverSessionStarting = false;
+  let clientDiscoverBooks = $state<PageBook[] | null>(null);
+  let discoverLoadedCountOverride = $state<number | null>(null);
+  const discoverLoadedCount = $derived(
+    discoverLoadedCountOverride ??
+      data.books.filter((book) => book.status === "recommended").length,
+  );
   let additionalDiscoverBooks = $state<PageBook[]>([]);
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let discoverHasMore = $state(true);
+  let discoverHasMoreOverride = $state<boolean | null>(null);
+  const discoverHasMore = $derived(
+    discoverHasMoreOverride ?? (discoverLoadedCount >= 24),
+  );
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
   let decisionsHasMoreOverride = $state<boolean | null>(null);
@@ -127,6 +151,7 @@
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
+  let previousDataRunId = "";
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
   let pendingActions = $state(new Set<string>());
@@ -200,6 +225,11 @@
   let llmModelOverride = $state<string | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
   let bookStatusOverrides = $state<Record<number, string>>({});
+  let previousBookStatuses = $state<Record<number, string>>({});
+  let localReadBookIds = $state(new Set<number>());
+  let localRecentReads = $state<
+    Array<{ id: number; title: string; author: string; rating: number | null }>
+  >([]);
   let profileHeaders = $derived({ "x-bookward-profile": data.user?.profile_id ?? "" });
   const telemetry = createTelemetryClient();
   $effect(() => telemetry.setProfileId(data.user?.profile_id));
@@ -241,11 +271,35 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
-  const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
+  const baseBooks = $derived.by(() => {
+    if (!clientDiscoverBooks) return data.books;
+    const discoverIds = new Set(clientDiscoverBooks.map((book) => book.id));
+    return [
+      ...clientDiscoverBooks,
+      ...data.books.filter(
+        (book) => book.status !== "recommended" && !discoverIds.has(book.id),
+      ),
+    ];
+  });
+  const allBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const merged: PageBook[] = [];
+    for (const book of [
+      ...baseBooks,
+      ...additionalDiscoverBooks,
+      ...data.decisions,
+      ...additionalDecisionBooks,
+    ]) {
+      if (seen.has(book.id)) continue;
+      seen.add(book.id);
       const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
+      merged.push(status === undefined ? book : { ...book, status });
+    }
+    return merged;
+  });
+  const effectiveReadCount = $derived(data.readCount + localReadBookIds.size);
+  const recentHistory = $derived(
+    [...localRecentReads, ...data.history].slice(0, 12),
   );
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
@@ -461,8 +515,12 @@
     digestMode &&
       (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
   );
+  const isActivePeriodDigestReview = $derived(
+    activeView === "discover" && digestVisible && data.digestReview.requested,
+  );
   const hasMoreDiscoverBooks = $derived(
     activeView === "discover" &&
+      !isActivePeriodDigestReview &&
       (visibleBooks.length < filteredBooks.length || discoverHasMore),
   );
   const activeSourceCount = $derived(
@@ -776,14 +834,18 @@
   function setPending(
     key: string,
     optimistic?: OptimisticFactory,
+    options?: PendingOptions,
   ): SubmitFunction {
-    return ({ formData }) => {
+    return async ({ formData }) => {
       withPending(key, true);
       let change: OptimisticChange | void;
       try {
         change = optimistic?.(formData);
       } catch {
         change = undefined;
+      }
+      if (options?.localOnly) {
+        await telemetry.flush();
       }
       return async ({ update, result }) => {
         const succeeded = result.type === "success" || result.type === "redirect";
@@ -802,7 +864,12 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          await update();
+          optimisticNotification = null;
+          if (options?.localOnly) {
+            await update({ reset: false, refreshAll: false, navigate: false });
+          } else {
+            await update({ reset: succeeded, navigate: false });
+          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -813,7 +880,12 @@
             readingHistory = [];
             readingHistoryState = "idle";
           }
-          if (succeeded) change?.commit?.();
+          if (succeeded) {
+            change?.commit?.();
+            if (options?.refreshDiscoverIfOffView && activeView !== "discover") {
+              await startOrRefreshDiscoverRun(true);
+            }
+          }
         } catch (error) {
           rollback();
           announceActionError(
@@ -829,20 +901,27 @@
   }
 
   function setPendingDigestBulk(): SubmitFunction {
-    return setPending("shortlist-bulk", optimisticShortlistBulk);
+    return setPending("shortlist-bulk", optimisticShortlistBulk, {
+      localOnly: true,
+    });
   }
 
   function isPending(key: string) {
     return pendingActions.has(key);
   }
 
-  function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
+  function optimisticBookStatus(
+    id: number,
+    status: string,
+    keepCommitted = true,
+  ): OptimisticChange | void {
+    const book = allBooks.find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
+        if (keepCommitted) return;
         if (bookStatusOverrides[id] !== status) return;
         const next = { ...bookStatusOverrides };
         delete next[id];
@@ -861,9 +940,35 @@
   function optimisticDecision(formData: FormData) {
     const id = Number(formData.get("id"));
     const status = String(formData.get("status") ?? "");
-    return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
-      ? optimisticBookStatus(id, status)
-      : undefined;
+    if (
+      !Number.isInteger(id) ||
+      !["saved", "rejected", "maybe_later", "recommended"].includes(status)
+    ) {
+      return undefined;
+    }
+    const currentStatus = allBooks.find((item) => item.id === id)?.status;
+    const previousRecorded = previousBookStatuses[id];
+    if (currentStatus) {
+      previousBookStatuses = { ...previousBookStatuses, [id]: currentStatus };
+    }
+    const change = optimisticBookStatus(id, status);
+    return {
+      commit: () => change?.commit?.(),
+      rollback: () => {
+        change?.rollback?.();
+        const next = { ...previousBookStatuses };
+        if (previousRecorded === undefined) delete next[id];
+        else next[id] = previousRecorded;
+        previousBookStatuses = next;
+      },
+    };
+  }
+
+  function optimisticUndo(formData: FormData) {
+    const id = Number(formData.get("id"));
+    if (!Number.isInteger(id)) return undefined;
+    const restoredStatus = previousBookStatuses[id] ?? "recommended";
+    return optimisticBookStatus(id, restoredStatus);
   }
 
   function optimisticRead(formData: FormData) {
@@ -872,10 +977,39 @@
   }
 
   function optimisticShortlistRead(formData: FormData) {
+    const id = Number(formData.get("id"));
+    const rawRating = String(formData.get("rating") ?? "").trim();
+    const rating = rawRating ? Number(rawRating) : null;
+    const targetBook = allBooks.find((item) => item.id === id) ?? markReadBook;
     const change = optimisticRead(formData);
     return {
       commit: () => {
         change?.commit?.();
+        if (Number.isInteger(id) && targetBook) {
+          const alreadyInHistory = data.history.some(
+            (item) =>
+              item.title.toLowerCase() === targetBook.title.toLowerCase() &&
+              item.author.toLowerCase() === targetBook.author.toLowerCase(),
+          );
+          if (!alreadyInHistory && !localReadBookIds.has(id)) {
+            localReadBookIds = new Set([...localReadBookIds, id]);
+          }
+          localRecentReads = [
+            {
+              id: -Date.now() - id,
+              title: targetBook.title,
+              author: targetBook.author,
+              rating: rating && Number.isFinite(rating) ? rating : null,
+            },
+            ...localRecentReads.filter(
+              (item) =>
+                !(
+                  item.title.toLowerCase() === targetBook.title.toLowerCase() &&
+                  item.author.toLowerCase() === targetBook.author.toLowerCase()
+                ),
+            ),
+          ];
+        }
         closeMarkRead();
       },
       rollback: () => change?.rollback?.(),
@@ -1081,6 +1215,53 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  async function startOrRefreshDiscoverRun(forceNew = false) {
+    if (discoverSessionStarting) return;
+    if (!forceNew && (activeRunId || discoverSessionInitialized)) return;
+    discoverSessionStarting = true;
+    discoverLoadError = "";
+    try {
+      const params = new URLSearchParams({
+        status: "recommended",
+        limit: "24",
+        offset: "0",
+        start_run: "1",
+      });
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        recommendation_run_id?: string;
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Recommendations could not be loaded.");
+      }
+      const nextRunId =
+        payload.recommendation_run_id ||
+        payload.items.find((item) => item.recommendation_run_id)?.recommendation_run_id ||
+        "";
+      clientDiscoverBooks = payload.items;
+      additionalDiscoverBooks = [];
+      discoverLoadedCountOverride = payload.items.length;
+      discoverHasMoreOverride = payload.has_more === true;
+      discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      if (forceNew) {
+        bookStatusOverrides = {};
+        previousBookStatuses = {};
+      }
+      activeRunIdOverride = nextRunId;
+      discoverSessionInitializedOverride = true;
+    } catch (error) {
+      discoverLoadError =
+        error instanceof Error ? error.message : "Recommendations could not be loaded.";
+    } finally {
+      discoverSessionStarting = false;
+    }
+  }
+
   async function loadMoreDiscover() {
     if (discoverLoading) return;
     if (discoverVisibleCount < filteredBooks.length) {
@@ -1094,29 +1275,45 @@
 
     discoverLoading = true;
     discoverLoadError = "";
-    const offset = allBooks.filter((book) => book.status === "recommended").length;
+    const offset = discoverLoadedCount;
     try {
       const params = new URLSearchParams({
         status: "recommended",
         limit: String(DISCOVER_PAGE_SIZE),
         offset: String(offset),
       });
+      if (activeRunId.length >= 8) {
+        params.set("run_id", activeRunId);
+      } else {
+        params.set("start_run", "1");
+      }
       const response = await fetch(`/api/recommendations?${params.toString()}`, { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: PageBook[];
         has_more?: boolean;
+        recommendation_run_id?: string;
         message?: string;
       };
       if (!response.ok || !Array.isArray(payload.items)) {
         throw new Error(payload.message || "Recommendations could not be loaded.");
       }
+      if (payload.recommendation_run_id && !activeRunId) {
+        activeRunIdOverride = payload.recommendation_run_id;
+        discoverSessionInitializedOverride = true;
+      }
+      discoverLoadedCountOverride = discoverLoadedCount + payload.items.length;
+      const priorFilteredCount = filteredBooks.length;
       const existing = new Set(allBooks.map((book) => book.id));
+      const newItems = payload.items.filter((book) => !existing.has(book.id));
       additionalDiscoverBooks = [
         ...additionalDiscoverBooks,
-        ...payload.items.filter((book) => !existing.has(book.id)),
+        ...newItems,
       ];
-      discoverHasMore = payload.has_more === true;
-      discoverVisibleCount += DISCOVER_PAGE_SIZE;
+      discoverHasMoreOverride = payload.has_more === true;
+      discoverVisibleCount = Math.max(
+        discoverVisibleCount + DISCOVER_PAGE_SIZE,
+        priorFilteredCount + newItems.length,
+      );
     } catch (error) {
       discoverLoadError = error instanceof Error ? error.message : "Recommendations could not be loaded.";
     } finally {
@@ -1303,6 +1500,7 @@
     void searchLibrarr();
   }
   function openMarkRead(book: PageBook) {
+    openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
   }
@@ -1320,8 +1518,13 @@
     candidateId: number,
     eventType: "visible" | "detail_open" | "source_open" | "librarr_search" | "librarr_import",
     metadata: Record<string, unknown> = {},
+    explicitRunId?: string,
   ) {
-    const runId = String(allBooks.find((book) => book.id === candidateId)?.recommendation_run_id || "");
+    const runId = String(
+      explicitRunId ??
+        allBooks.find((book) => book.id === candidateId)?.recommendation_run_id ??
+        "",
+    );
     telemetry.enqueue({
       candidate_id: candidateId,
       event_type: eventType,
@@ -1332,29 +1535,65 @@
 
   function trackRecommendation(
     node: HTMLElement,
-    detail: { candidateId: number },
+    detail: { candidateId: number; runId: string; active: boolean },
   ) {
-    let sent = false;
-    const markVisible = () => {
-      if (sent) return;
-      sent = true;
-      recordBookEvent(detail.candidateId, "visible");
+    let current = detail;
+    let sentRunId = "";
+    let observer: IntersectionObserver | undefined;
+
+    const disconnect = () => {
       observer?.disconnect();
+      observer = undefined;
     };
-    const observer =
-      typeof IntersectionObserver === "undefined"
-        ? undefined
-        : new IntersectionObserver(
-            (entries) => {
-              if (entries.some((entry) => entry.isIntersecting)) markVisible();
-            },
-            { threshold: 0.25 },
-          );
-    if (observer) observer.observe(node);
-    else markVisible();
+
+    const markVisible = () => {
+      if (!current.active || current.runId.length < 8) return;
+      if (sentRunId === current.runId) return;
+      sentRunId = current.runId;
+      recordBookEvent(current.candidateId, "visible", {}, current.runId);
+      disconnect();
+    };
+
+    const observe = () => {
+      disconnect();
+      if (
+        !current.active ||
+        current.runId.length < 8 ||
+        sentRunId === current.runId
+      ) {
+        return;
+      }
+      if (typeof IntersectionObserver === "undefined") {
+        markVisible();
+        return;
+      }
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) markVisible();
+        },
+        { threshold: 0.25 },
+      );
+      observer.observe(node);
+    };
+
+    observe();
+
     return {
+      update(next: { candidateId: number; runId: string; active: boolean }) {
+        const changed =
+          next.candidateId !== current.candidateId ||
+          next.runId !== current.runId ||
+          next.active !== current.active;
+        if (next.candidateId !== current.candidateId) {
+          sentRunId = "";
+        }
+        current = next;
+        if (changed) {
+          observe();
+        }
+      },
       destroy() {
-        observer?.disconnect();
+        disconnect();
       },
     };
   }
@@ -1373,11 +1612,50 @@
 
   $effect(() => {
     const nextBooks = data.books;
+    const nextRunId = data.recommendation_run_id ?? "";
     if (previousDataBooks === nextBooks) return;
+    const previousBooksSnapshot = previousDataBooks;
+    const priorRunId = previousDataRunId;
     previousDataBooks = nextBooks;
+    previousDataRunId = nextRunId;
+    if (previousBooksSnapshot === null) {
+      return;
+    }
+    if (!nextRunId) {
+      // A non-Discover reload (such as saving Settings) uses track_run=false.
+      // Preserve any active Discover session run and pagination slices.
+      const preservedRunId = activeRunIdOverride ?? priorRunId;
+      if (preservedRunId) {
+        activeRunIdOverride = preservedRunId;
+        discoverSessionInitializedOverride = true;
+        if (!clientDiscoverBooks) {
+          const priorRecommended = previousBooksSnapshot.filter(
+            (book) => book.status === "recommended",
+          );
+          clientDiscoverBooks = priorRecommended;
+          discoverLoadedCountOverride =
+            discoverLoadedCountOverride ?? priorRecommended.length;
+        }
+      }
+      return;
+    }
+    activeRunIdOverride = null;
+    discoverSessionInitializedOverride = true;
+    clientDiscoverBooks = null;
     additionalDiscoverBooks = [];
-    discoverHasMore = true;
+    bookStatusOverrides = {};
+    previousBookStatuses = {};
+    localReadBookIds = new Set();
+    localRecentReads = [];
+    discoverLoadedCountOverride = null;
+    discoverHasMoreOverride = null;
     discoverLoadError = "";
+  });
+
+  $effect(() => {
+    if (activeView === "discover" && !activeRunId && !discoverSessionInitialized) {
+      void startOrRefreshDiscoverRun(false);
+    }
   });
 
   $effect(() => {
@@ -1536,12 +1814,17 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
+      if (librarrSearchBook) {
+        recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
+        bookStatusOverrides = {
+          ...bookStatusOverrides,
+          [librarrSearchBook.id]: "imported",
+        };
+      }
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
         closeLibrarrSearch();
-        await invalidateAll();
       }
       return true;
     } catch (error) {
@@ -1573,11 +1856,9 @@
     if (failed) {
       librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
-      if (added) await invalidateAll();
     } else if (added) {
       announceActionSuccess(`${added} high-confidence match${added === 1 ? "" : "es"} added to Librarr.`);
       closeLibrarrSearch();
-      await invalidateAll();
     }
   }
 
@@ -1663,6 +1944,7 @@
               });
               const change = optimisticBookStatus(id, "saved");
               try {
+                await telemetry.flush();
                 const response = await fetch("?/decide", {
                   method: "POST",
                   headers: {
@@ -1672,9 +1954,16 @@
                   },
                   body,
                 });
-                if (!response.ok) throw new Error("Could not shortlist that book.");
-                await applyAction(deserialize(await response.text()));
-                await invalidateAll();
+                const actionResult = deserialize(await response.text());
+                if (
+                  !response.ok ||
+                  actionResult.type === "failure" ||
+                  actionResult.type === "error"
+                ) {
+                  throw new Error(actionResultMessage(actionResult));
+                }
+                optimisticNotification = null;
+                await applyAction(actionResult);
                 change?.commit?.();
                 go("saved");
                 return { id, status: "saved" };
@@ -1751,7 +2040,7 @@
         {#if activeView === "discover" || activeView === "saved"}<form
             method="POST"
             action="?/runSync"
-            use:enhance={setPending("sync")}
+            use:enhance={setPending("sync", undefined, { refreshDiscoverIfOffView: true })}
             in:fade={{ duration: motionDuration(180) }}
             out:fade={{ duration: motionDuration(120) }}
           >
@@ -1863,7 +2152,7 @@
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`, optimisticUndo, { localOnly: true })}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={visibleNotification.id} />
@@ -1897,9 +2186,10 @@
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
 
+        {@const isPeriodDigestReview = view === "discover" && digestVisible && data.digestReview.requested}
         {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : view === "saved" ? shortlistBooks : decisionBooks}
-        {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
-        {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
+        {@const viewVisibleBooks = view === "discover" && !isPeriodDigestReview ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
+        {@const viewHasMoreDiscoverBooks = view === "discover" && !isPeriodDigestReview && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
@@ -1942,7 +2232,7 @@
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({effectiveReadCount})</button>
             </div>
             {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length} loaded decisions. Load more to include older books.</p>{/if}
           </section>
@@ -1964,8 +2254,10 @@
             <div class="flex flex-wrap gap-2 sm:shrink-0">
               <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
               {#if selectedDigestCount > 0}
+                {@const bulkRunId = activeRunId && [...selectedDigestIds].every((id) => allBooks.find((book) => book.id === id)?.recommendation_run_id === activeRunId) ? activeRunId : ""}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  <input type="hidden" name="run_id" value={bulkRunId} />
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -1986,7 +2278,7 @@
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
             <article
-              use:trackRecommendation={{ candidateId: book.id }}
+              use:trackRecommendation={{ candidateId: book.id, runId: book.recommendation_run_id ?? "", active: view === "discover" }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
@@ -2082,15 +2374,15 @@
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision, { localOnly: true })}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision, { localOnly: true })}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision, { localOnly: true })}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
@@ -2121,7 +2413,7 @@
                   {:else if book.status === "saved"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport, { localOnly: true })}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                       </form>
@@ -2136,7 +2428,7 @@
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
                     {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision, { localOnly: true })}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                       </form>
@@ -2150,7 +2442,7 @@
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
-                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision, { localOnly: true })}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
@@ -3143,7 +3435,7 @@
                   <form
                     method="POST"
                     action="?/rebuildEmbeddings"
-                    use:enhance={setPending("rebuild-embeddings")}
+                    use:enhance={setPending("rebuild-embeddings", undefined, { refreshDiscoverIfOffView: true })}
                     class="w-full"
                   >
                     <ProfileField profileId={data.user?.profile_id} />
@@ -3671,10 +3963,10 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentHistory.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentHistory as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
@@ -3778,7 +4070,7 @@
           ><X size={17} /></button>
         </div>
 
-        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
+        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead, { localOnly: true })}>
           <div class="p-5 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />

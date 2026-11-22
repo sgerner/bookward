@@ -15,6 +15,8 @@ const querySchema = z.object({
   ]).default("recommended"),
   limit: z.coerce.number().int().min(1).max(24).default(8),
   offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+  run_id: z.string().trim().min(8).max(128).optional(),
+  start_run: z.enum(["1", "true"]).optional(),
 });
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Recommendations could not be loaded.";
@@ -28,11 +30,22 @@ export const GET: RequestHandler = async ({ url }) => {
     limit: String(parsed.data.limit + 1),
     offset: String(parsed.data.offset),
   });
+  if (parsed.data.run_id) {
+    params.set("run_id", parsed.data.run_id);
+    params.set("impression_limit", String(parsed.data.limit));
+  } else if (parsed.data.start_run) {
+    params.set("impression_limit", String(parsed.data.limit));
+  }
   try {
     const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
+    const mapped = items.slice(0, parsed.data.limit).map(toPageBook);
+    const resolvedRunId =
+      parsed.data.run_id ??
+      mapped.find((item) => item.recommendation_run_id)?.recommendation_run_id;
     return json({
-      items: items.slice(0, parsed.data.limit).map(toPageBook),
+      items: mapped,
       has_more: items.length > parsed.data.limit,
+      ...(resolvedRunId ? { recommendation_run_id: resolvedRunId } : {}),
     });
   } catch (error) {
     return json({ message: errorMessage(error) }, { status: engineStatus(error) });

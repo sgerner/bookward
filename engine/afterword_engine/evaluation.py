@@ -258,7 +258,7 @@ def ips_ndcg_at_k(
             if item is not None:
                 _score, label, weight = item
                 gains.append((rank, label, weight))
-        if not gains:
+        if not gains or sum(weight for _, _, weight in gains) <= 0:
             continue
         dcg = sum(
             label * weight / math.log2(rank + 1)
@@ -272,8 +272,7 @@ def ips_ndcg_at_k(
                 all_gains.append(label * weight)
         all_gains.sort(reverse=True)
         idcg = sum(gain / math.log2(position + 2) for position, gain in enumerate(all_gains[:k]))
-        if idcg > 0:
-            per_run.append(dcg / idcg)
+        per_run.append(dcg / idcg if idcg > 0 else 0.0)
     return sum(per_run) / len(per_run) if per_run else None
 
 

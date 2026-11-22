@@ -506,5 +506,172 @@ describe("page actions", () => {
     });
   });
 
+  it("forwards run_id when shortlisting a selected digest batch", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ updated: 2 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.append("ids", "7");
+    body.append("ids", "8");
+    body.set("run_id", "run-digest-1234");
+    await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+      run_id: "run-digest-1234",
+    });
+  });
 
+  it("gates recommendation run creation on non-Discover views", async () => {
+    const overview = {
+      recommendation_run_id: "",
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    for (const view of ["saved", "decisions", "sources", "settings"]) {
+      const fetchMock = vi.fn().mockImplementation(
+        () =>
+          new Response(JSON.stringify(overview), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const result = (await load({
+        url: new URL(`http://afterword.test/?view=${view}`),
+        locals: { user: null },
+      } as never)) as { recommendation_run_id: string };
+      expect(result.recommendation_run_id).toBe("");
+      expect(fetchMock.mock.calls[0][0]).toContain("track_run=false");
+    }
+  });
+
+  it("passes digest_period to overview so fatigued active digest picks are loaded", async () => {
+    const overview = {
+      recommendation_run_id: "run-digest-99",
+      recommendations: [
+        {
+          id: 30,
+          title: "Fatigued Digest Pick",
+          author: "A Writer",
+          description: "Still recommended",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: ["Sci-Fi"],
+          score: 64,
+          metadata_confidence: 1,
+          explanation: ["Weekly pick"],
+          status: "recommended",
+          source_name: "Source",
+          recommendation_run_id: "run-digest-99",
+        },
+      ],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input.includes("/api/digest/review")) {
+        return new Response(
+          JSON.stringify({ period: "2026-W42", ids: [30], found: true }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL(
+        "http://afterword.test/?view=discover&digest=1&digest_period=2026-W42",
+      ),
+      locals: { user: null },
+    } as never)) as {
+      recommendation_run_id: string;
+      digestReview: { requested: boolean; ids: number[] };
+      books: Array<{ id: number; recommendation_run_id: string }>;
+    };
+
+    expect(fetchMock.mock.calls[0][0]).toContain("digest_period=2026-W42");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("track_run=false");
+    expect(result.recommendation_run_id).toBe("run-digest-99");
+    expect(result.digestReview).toEqual({ requested: true, ids: [30] });
+    expect(result.books[0]).toMatchObject({
+      id: 30,
+      recommendation_run_id: "run-digest-99",
+    });
+  });
+
+  it("uses track_run=false when configuration actions inspect overview state", async () => {
+    const overview = {
+      sources: [{ id: 1, is_default: 1, enabled: 1 }],
+      recommendations: [],
+      history: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "http://librarr:5050",
+        librarr_api_key_set: true,
+        librarr_media_type: "audiobook",
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("enabled", "0");
+    await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/overview?track_run=false",
+    );
+  });
 });
