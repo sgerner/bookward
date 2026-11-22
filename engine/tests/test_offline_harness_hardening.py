@@ -311,8 +311,8 @@ def test_sqlite_loader_matches_enriched_json_export_and_preserves_verified_metad
                 emb,
             )
 
-    # Make SQLite file read-only on disk to verify ?mode=ro opens cleanly without write access.
-    os.chmod(sqlite_path, 0o444)
+    # Make SQLite file owner read-only on disk to verify ?mode=ro opens cleanly without write access.
+    os.chmod(sqlite_path, 0o400)
 
     enriched_candidates = []
     src_map = {s["id"]: s for s in sources}
