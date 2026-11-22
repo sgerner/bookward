@@ -991,6 +991,13 @@ MIGRATIONS = [
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_LOOPBACK_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1373,10 +1380,11 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (settings.public_url or default_value) if key == "digest_app_url" else default_value
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1389,14 +1397,22 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
-            con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
-            )
+        # Upgrade an untouched loopback default (including Docker's
+        # http://127.0.0.1:3000) when the deployment advertises a different
+        # public origin, without overwriting a URL explicitly chosen by an operator.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        if configured_public_url:
+            custom_flag = con.execute(
+                "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+            ).fetchone()
+            if not custom_flag or custom_flag[0] != "1":
+                placeholders = ",".join("?" for _ in DEFAULT_DIGEST_LOOPBACK_URLS)
+                con.execute(
+                    f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                    f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                    f"AND RTRIM(value,'/')!=?",
+                    (configured_public_url, *DEFAULT_DIGEST_LOOPBACK_URLS, configured_public_url),
+                )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
             "UPDATE sources SET name=? WHERE url='builtin://upcoming' AND name='Afterword demo upcoming books'",

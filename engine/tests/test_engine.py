@@ -2532,7 +2532,9 @@ def test_digest_settings_are_safe_and_bulk_feedback_is_idempotent(database):
         assert digest["enabled"] is True and digest["channels"] == []
         assert "discord_webhook_url" not in digest
         assert client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2, 99999], "action": "save"}).json()["updated"] == 2
-        assert client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2], "action": "save"}).json()["updated"] == 2
+        repeat = client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2], "action": "save"}).json()
+        assert repeat["updated"] == 0 and repeat["skipped"] == 2
+        assert row("SELECT COUNT(*) count FROM feedback WHERE action='save'")["count"] == 2
 
 
 def test_digest_scheduler_window_and_preview(database):

@@ -8,6 +8,7 @@ records, and never exposes provider credentials to the web application.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import smtplib
@@ -22,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .config import settings
+from .covers import placeholder_cover_url, safe_cover_url
 from .database import row, rows, transaction
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
 from .ingestion import read_identity_rows_with_current_verified_work_ids
@@ -31,7 +34,9 @@ from .security import safe_error_message, validate_public_url
 CHANNELS = {"discord", "email"}
 SMTP_SECURITY = {"none", "starttls", "ssl"}
 MAX_DELIVERY_ATTEMPTS = 3
+DISCORD_MAX_CONTENT = 1990
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_HTML_IMG_TAG_RE = re.compile(r"<img\b[^>]*\bsrc=([\"'])(.*?)\1[^>]*>", re.IGNORECASE)
 
 
 def _bool(value, default=False):
@@ -102,7 +107,9 @@ def digest_config(values: dict | None = None) -> dict:
         "minimum_score": _float(values.get("digest_minimum_score"), 80, 0, 100),
         "maximum_books": _int(values.get("digest_maximum_books"), 5, 1, 20),
         "only_new": _bool(values.get("digest_only_new"), True),
-        "app_url": str(values.get("digest_app_url") or "http://localhost:5173").rstrip("/"),
+        "app_url": str(
+            values.get("digest_app_url") or settings.public_url or "http://localhost:5173"
+        ).rstrip("/"),
         "discord_webhook_url": str(values.get("digest_discord_webhook_url") or ""),
         "email_to": str(values.get("digest_email_to") or ""),
         "email_from": str(values.get("digest_email_from") or ""),
@@ -115,7 +122,7 @@ def digest_config(values: dict | None = None) -> dict:
     }
 
 
-def validate_digest_config(config: dict) -> None:
+def validate_digest_config(config: dict, *, previous: dict | None = None) -> None:
     """Validate user-provided settings before they are persisted."""
 
     try:
@@ -133,10 +140,20 @@ def validate_digest_config(config: dict) -> None:
     if any(channel not in CHANNELS for channel in normalized_channel_values):
         raise ValueError("Unsupported digest channel")
     channels = parse_channels(normalized_channel_values)
-    # Turning the digest off is a kill switch. Do not make an operator repair
-    # a stale webhook or SMTP credential before they can stop delivery. The
-    # full provider validation runs again when the digest is enabled.
+    # Turning an active schedule off is a one-step kill switch: do not make an
+    # operator repair a stale webhook or SMTP credential before stopping
+    # automatic delivery. When saving channels directly (even while scheduling
+    # stays off), validate every active channel.
     enabled = _bool(config.get("enabled"), True)
+    if previous is None:
+        channels_to_validate = set(channels) if enabled else set()
+    else:
+        prev_enabled = _bool(previous.get("enabled"), False)
+        prev_channels = set(parse_channels(previous.get("channels")))
+        if prev_enabled and not enabled:
+            channels_to_validate = set(channels) - prev_channels
+        else:
+            channels_to_validate = set(channels)
     app_url = str(config.get("app_url") or "")
     parsed_app = urlparse(app_url)
     if (
@@ -150,7 +167,7 @@ def validate_digest_config(config: dict) -> None:
     ):
         raise ValueError("Digest app URL must use HTTP or HTTPS")
     webhook = str(config.get("discord_webhook_url") or "")
-    if enabled and "discord" in channels:
+    if "discord" in channels_to_validate:
         if not webhook:
             raise ValueError("Discord webhook URL is required when Discord is enabled")
         if not webhook.startswith("https://"):
@@ -163,7 +180,7 @@ def validate_digest_config(config: dict) -> None:
         validate_public_url(webhook)
     if config.get("smtp_security") not in SMTP_SECURITY:
         raise ValueError("SMTP security must be none, starttls, or ssl")
-    if enabled and "email" in channels:
+    if "email" in channels_to_validate:
         for label in ("email_to", "email_from"):
             if not _valid_email(config.get(label, "")):
                 raise ValueError(f"Valid {label.replace('_', ' ')} is required when email is enabled")
@@ -319,6 +336,12 @@ def _link(config: dict, key: str) -> str:
     return f"{config['app_url']}?view=discover&digest=1&digest_period={quote(key)}"
 
 
+def _book_line(item: dict, *, include_reason: bool = True) -> str:
+    explanation = (item.get("explanation") or []) if include_reason else []
+    reason = f" — {explanation[0]}" if explanation else ""
+    return f"• {item['title']} — {item['author']} (ranking score {float(item['score']):.0f}){reason}"
+
+
 def _lines(items: list[dict], config: dict, key: str, test: bool = False) -> str:
     if test:
         return (
@@ -328,18 +351,70 @@ def _lines(items: list[dict], config: dict, key: str, test: bool = False) -> str
         )
     lines = [f"Bookward · new recommendations ({key})", ""]
     for item in items:
-        explanation = item.get("explanation") or []
-        reason = f" — {explanation[0]}" if explanation else ""
-        lines.append(f"• {item['title']} — {item['author']} (ranking score {float(item['score']):.0f}){reason}")
+        lines.append(_book_line(item))
     lines += ["", f"Review and shortlist these books in Bookward: {_link(config, key)}"]
     return "\n".join(lines)
 
 
+def _overflow_line(remaining: int) -> str:
+    noun = "book" if remaining == 1 else "books"
+    return f"…and {remaining} more {noun} in this digest."
+
+
 def _discord_payload(items: list[dict], config: dict, key: str, test=False) -> dict:
-    content = _lines(items, config, key, test)
-    # Discord rejects content over 2,000 characters. The selection limit keeps
-    # this uncommon, but truncate as a final guard for long titles/reasons.
-    return {"username": "Bookward", "content": content[:1990], "allowed_mentions": {"parse": []}}
+    if test:
+        header = (
+            "Bookward weekly digest test\n\n"
+            "This is a test notification. Your digest channel is configured correctly."
+        )
+        footer = f"Open Bookward: {config['app_url']}"
+        content = f"{header}\n{footer}"
+        if len(content) > DISCORD_MAX_CONTENT and len(footer) < DISCORD_MAX_CONTENT:
+            budget = DISCORD_MAX_CONTENT - len(footer) - 2
+            content = f"{header[:max(0, budget)].rstrip()}…\n{footer}" if budget > 0 else footer
+        return {
+            "username": "Bookward",
+            "content": content[:DISCORD_MAX_CONTENT],
+            "allowed_mentions": {"parse": []},
+        }
+
+    header = f"Bookward · new recommendations ({key})"
+    footer = f"Review and shortlist these books in Bookward: {_link(config, key)}"
+    book_lines = [_book_line(item) for item in items]
+    full = "\n".join([header, "", *book_lines, "", footer])
+    if len(full) <= DISCORD_MAX_CONTENT:
+        content = full
+    else:
+        content = ""
+        for count in range(len(book_lines) - 1, 0, -1):
+            overflow = _overflow_line(len(book_lines) - count)
+            candidate = "\n".join([header, "", *book_lines[:count], overflow, "", footer])
+            if len(candidate) <= DISCORD_MAX_CONTENT:
+                content = candidate
+                break
+        if not content and items:
+            remaining = len(items) - 1
+            overflow_parts = [_overflow_line(remaining)] if remaining > 0 else []
+            compact_first = _book_line(items[0], include_reason=False)
+            candidate = "\n".join([header, "", compact_first, *overflow_parts, "", footer])
+            if len(candidate) <= DISCORD_MAX_CONTENT:
+                content = candidate
+            else:
+                shell_len = len("\n".join([header, "", "", *overflow_parts, "", footer]))
+                budget = DISCORD_MAX_CONTENT - shell_len
+                if budget > 4:
+                    clipped_first = f"{compact_first[: budget - 1].rstrip()}…"
+                    content = "\n".join([header, "", clipped_first, *overflow_parts, "", footer])
+                else:
+                    fallback = "\n".join([header, "", _overflow_line(len(items)), "", footer])
+                    content = fallback if len(fallback) <= DISCORD_MAX_CONTENT else footer[:DISCORD_MAX_CONTENT]
+        elif not content:
+            content = full[:DISCORD_MAX_CONTENT]
+    return {
+        "username": "Bookward",
+        "content": content[:DISCORD_MAX_CONTENT],
+        "allowed_mentions": {"parse": []},
+    }
 
 
 async def _send_discord(config: dict, payload: dict) -> str:
@@ -358,7 +433,115 @@ async def _send_discord(config: dict, payload: dict) -> str:
     return "discord webhook"
 
 
-def _smtp_send(config: dict, subject: str, body: str) -> str:
+def _email_cover_url(item: dict) -> str:
+    """Return a validated HTTPS cover URL on KNOWN_COVER_HOSTS or empty string."""
+
+    raw_cover = str(item.get("cover_url") or "").strip()
+    if raw_cover:
+        return safe_cover_url(raw_cover)
+    return safe_cover_url(
+        placeholder_cover_url(str(item.get("title") or ""), str(item.get("author") or ""))
+    )
+
+
+def _sanitize_html_images(markup: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw_url = html.unescape(match.group(2))
+        validated = safe_cover_url(raw_url)
+        if not validated:
+            return ""
+        return match.group(0)
+
+    return _HTML_IMG_TAG_RE.sub(replace, markup)
+
+
+def _email_html(items: list[dict], config: dict, key: str, test: bool = False) -> str:
+    app_url = html.escape(str(config.get("app_url") or ""), quote=True)
+    if test:
+        return (
+            "<!doctype html><html><body style=\"margin:0;padding:24px;background:#0f172a;"
+            "color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">"
+            "<div style=\"max-width:600px;margin:0 auto;background:#1e293b;border-radius:12px;padding:24px;\">"
+            "<h1 style=\"margin:0 0 12px;font-size:20px;color:#f8fafc;\">Bookward weekly digest test</h1>"
+            "<p style=\"margin:0 0 20px;line-height:1.6;color:#cbd5e1;\">"
+            "This is a test notification. Your digest channel is configured correctly."
+            "</p>"
+            f"<p style=\"margin:0;\"><a href=\"{app_url}\" style=\"display:inline-block;"
+            "background:#38bdf8;color:#0f172a;text-decoration:none;font-weight:600;"
+            "padding:10px 16px;border-radius:8px;\">Open Bookward</a></p>"
+            "</div></body></html>"
+        )
+
+    review_url = html.escape(_link(config, key), quote=True)
+    escaped_key = html.escape(key, quote=True)
+    cards: list[str] = []
+    for item in items:
+        title = html.escape(str(item.get("title") or ""), quote=True)
+        author = html.escape(str(item.get("author") or ""), quote=True)
+        score = f"{float(item.get('score') or 0):.0f}"
+        explanation = item.get("explanation") or []
+        reason = html.escape(str(explanation[0]), quote=True) if explanation else ""
+        cover = _email_cover_url(item)
+        cover_cell = (
+            f"<td width=\"84\" valign=\"top\" style=\"padding-right:16px;\">"
+            f"<img src=\"{html.escape(cover, quote=True)}\" alt=\"Cover of {title}\" "
+            f"width=\"84\" height=\"126\" style=\"display:block;width:84px;height:126px;"
+            f"object-fit:cover;border-radius:6px;background:#0f172a;\" />"
+            f"</td>"
+            if cover
+            else ""
+        )
+        reason_html = (
+            f"<p style=\"margin:8px 0 0;font-size:14px;line-height:1.5;color:#cbd5e1;\">{reason}</p>"
+            if reason
+            else ""
+        )
+        cards.append(
+            "<div style=\"margin:0 0 16px;padding:16px;background:#1e293b;"
+            "border:1px solid #334155;border-radius:10px;\">"
+            "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" width=\"100%\"><tr>"
+            f"{cover_cell}"
+            "<td valign=\"top\">"
+            f"<div style=\"display:inline-block;margin:0 0 6px;padding:2px 8px;border-radius:999px;"
+            f"background:#0f172a;color:#38bdf8;font-size:12px;font-weight:600;\">Ranking score {score}</div>"
+            f"<h2 style=\"margin:0;font-size:17px;line-height:1.35;color:#f8fafc;\">{title}</h2>"
+            f"<p style=\"margin:4px 0 0;font-size:14px;color:#94a3b8;\">{author}</p>"
+            f"{reason_html}"
+            f"<p style=\"margin:10px 0 0;font-size:13px;\"><a href=\"{review_url}\" "
+            "style=\"color:#38bdf8;text-decoration:underline;\">Review in Bookward</a></p>"
+            "</td></tr></table></div>"
+        )
+
+    return (
+        "<!doctype html><html><body style=\"margin:0;padding:24px;background:#0f172a;"
+        "color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">"
+        "<div style=\"max-width:640px;margin:0 auto;\">"
+        f"<h1 style=\"margin:0 0 6px;font-size:22px;color:#f8fafc;\">Bookward · new recommendations ({escaped_key})</h1>"
+        "<p style=\"margin:0 0 20px;font-size:14px;color:#94a3b8;\">"
+        "Your highest-scoring new picks are ready to review."
+        "</p>"
+        f"{''.join(cards)}"
+        "<div style=\"margin-top:24px;padding-top:16px;border-top:1px solid #334155;\">"
+        f"<a href=\"{review_url}\" style=\"display:inline-block;background:#38bdf8;color:#0f172a;"
+        "text-decoration:none;font-weight:600;padding:12px 18px;border-radius:8px;\">"
+        "Review and shortlist these books in Bookward</a>"
+        f"<p style=\"margin:12px 0 0;font-size:12px;color:#94a3b8;word-break:break-all;\">{review_url}</p>"
+        "</div></div></body></html>"
+    )
+
+
+def _smtp_send(
+    config: dict,
+    subject: str,
+    body: str | dict,
+    html_body: str | None = None,
+) -> str:
+    if isinstance(body, dict):
+        text_body = str(body.get("body") or "")
+        resolved_html = html_body if html_body is not None else body.get("html")
+    else:
+        text_body = str(body or "")
+        resolved_html = html_body
     host = config["smtp_host"].strip()
     security_mode = config["smtp_security"]
     context = ssl.create_default_context()
@@ -378,13 +561,22 @@ def _smtp_send(config: dict, subject: str, body: str) -> str:
         message["To"] = config["email_to"]
         message["Subject"] = subject
         message["Date"] = formatdate(localtime=False)
-        message.set_content(body)
+        message.set_content(text_body)
+        if resolved_html:
+            message.add_alternative(_sanitize_html_images(str(resolved_html)), subtype="html")
         client.send_message(message)
     return config["email_to"]
 
 
-async def _send_email(config: dict, subject: str, body: str) -> str:
-    return await asyncio.to_thread(_smtp_send, config, subject, body)
+async def _send_email(
+    config: dict,
+    subject: str,
+    body: str | dict,
+    html_body: str | None = None,
+) -> str:
+    if html_body is None:
+        return await asyncio.to_thread(_smtp_send, config, subject, body)
+    return await asyncio.to_thread(_smtp_send, config, subject, body, html_body)
 
 
 def _insert_delivery(key: str, channel: str, recipient: str, payload: dict, candidate_ids: list[int]) -> str:
@@ -518,6 +710,7 @@ async def send_digest(
         return {"status": "skipped", "reason": "no_channels", "period": key, "items": len(items), "deliveries": []}
     candidate_ids = [int(item["id"]) for item in items]
     body = _lines(items, config, key, test)
+    html_body = _email_html(items, config, key, test)
     subject = "Bookward weekly digest test" if test else f"Bookward · {len(items)} new book recommendations"
     pending = []
     for channel in channels:
@@ -525,7 +718,7 @@ async def send_digest(
             payload = _discord_payload(items, config, key, test)
             recipient = "Discord webhook"
         else:
-            payload = {"subject": subject, "body": body}
+            payload = {"subject": subject, "body": body, "html": html_body}
             recipient = config["email_to"]
         delivery_id = _insert_delivery(key, channel, recipient, payload, candidate_ids)
 
@@ -536,7 +729,7 @@ async def send_digest(
             if channel == "discord":
                 await _send_discord(config, payload)
             else:
-                await _send_email(config, subject, body)
+                await _send_email(config, subject, payload)
             _delivery_result(delivery_id, True)
             return {"id": delivery_id, "channel": channel, "status": "sent"}
         except Exception as exc:
@@ -588,7 +781,15 @@ async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
         if channel == "discord":
             await _send_discord(config, payload)
         elif channel == "email":
-            await _send_email(config, payload.get("subject", "Bookward digest"), payload.get("body", ""))
+            if "html" not in payload and "body" in payload:
+                escaped_lines = "<br />".join(
+                    html.escape(line, quote=True) for line in str(payload.get("body") or "").splitlines()
+                )
+                payload = {
+                    **payload,
+                    "html": f"<!doctype html><html><body><p>{escaped_lines}</p></body></html>",
+                }
+            await _send_email(config, payload.get("subject", "Bookward digest"), payload)
         else:
             raise ValueError("Unsupported delivery channel")
         _delivery_result(delivery_id, True)
