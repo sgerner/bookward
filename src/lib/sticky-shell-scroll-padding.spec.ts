@@ -26,7 +26,10 @@ function collectElements(node: unknown): ElementMatch[] {
   const record = node as Record<string, unknown>;
   const found: ElementMatch[] = [];
 
-  if (record.type === "RegularElement" && typeof record.name === "string") {
+  if (
+    (record.type === "RegularElement" || record.type === "Component") &&
+    typeof record.name === "string"
+  ) {
     const rawAttributes = (record.attributes as Array<{
       type: string;
       name?: string;
@@ -99,14 +102,9 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const srOnlySwitches = elements.filter(
-      (el) =>
-        el.name === "input" &&
-        (el.attributes.get("class") ?? "").split(/\s+/).includes("sr-only") &&
-        el.attributes.get("role") === "switch",
-    );
-    expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
-    for (const control of srOnlySwitches) {
+    const switchFields = elements.filter((el) => el.name === "SwitchField");
+    expect(switchFields.length).toBeGreaterThanOrEqual(4);
+    for (const control of switchFields) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
       expect(control.end).toBeLessThanOrEqual(shell.end);
     }
