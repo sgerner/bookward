@@ -288,6 +288,33 @@ describe("page actions", () => {
     );
   });
 
+  it("rejects an invalid URL when adding a custom source without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidUrl of [
+      "not-a-url",
+      "",
+      null,
+      new File(["https://books.example/list"], "url.txt"),
+    ]) {
+      const body = new FormData();
+      body.set("label", "Invalid source");
+      if (invalidUrl !== null) body.set("url", invalidUrl);
+
+      const result = await actions.source!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Add a valid name and public URL.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not save a custom source when preview finds no books", async () => {
     const fetchMock = vi
       .fn()
@@ -781,6 +808,73 @@ describe("page actions", () => {
       maximum_books: 6,
       smtp_security: "starttls",
     });
+  });
+
+  it("retries a digest delivery when given a valid delivery UUID", async () => {
+    const deliveryId = "550e8400-e29b-41d4-a716-446655440000";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-456" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"status":"sent"}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", deliveryId);
+    const result = await actions.retryDigest!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Digest delivery retry queued." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8000/api/digest/deliveries/${deliveryId}/retry`,
+      expect.objectContaining({
+        method: "POST",
+        body: "{}",
+      }),
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/job-456",
+    );
+  });
+
+  it("rejects an invalid delivery UUID in retryDigest without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidId of [
+      "not-a-uuid",
+      "",
+      null,
+      new File(["550e8400-e29b-41d4-a716-446655440000"], "id.txt"),
+    ]) {
+      const body = new FormData();
+      if (invalidId !== null) body.set("id", invalidId);
+
+      const result = await actions.retryDigest!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Invalid delivery.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("shortlists a selected digest batch in one engine call", async () => {

@@ -211,7 +211,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 };
 
 const idSchema = z.coerce.number().int().positive();
-const urlSchema = z.string().url();
+const urlSchema = z.url();
 const fail = (statusCode: number, data: { message: string }) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
@@ -902,7 +902,7 @@ export const actions: Actions = {
     }
   },
   retryDigest: async ({ request }) => {
-    const id = z.string().uuid().safeParse((await request.formData()).get("id"));
+    const id = z.uuid().safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid delivery." });
     try {
       const queued = await engine<{ job_id: string }>(
