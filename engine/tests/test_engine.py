@@ -2968,6 +2968,10 @@ def test_update_source_guardrails_protect_builtin_association_and_seeded_default
             "SELECT id,url FROM sources WHERE url=?",
             (engine_database.DEFAULT_SOURCES[0][1],),
         ).fetchone()
+        con.execute(
+            "UPDATE sources SET lifecycle='permanent', last_scanned_at=?, last_status='ok:3' WHERE id=?",
+            ("2026-01-01T00:00:00+00:00", seeded["id"]),
+        )
 
     with TestClient(app, headers=authenticated_headers()) as client:
         for locked_id in (builtin_id, assoc_id):
@@ -2992,6 +2996,9 @@ def test_update_source_guardrails_protect_builtin_association_and_seeded_default
         )
         assert to_one_time.status_code == 200
         assert to_one_time.json()["lifecycle"] == "one_time"
+        assert row(
+            "SELECT last_scanned_at FROM sources WHERE id=?", (seeded["id"],)
+        )["last_scanned_at"] is None
 
         to_permanent = client.put(
             f"/api/sources/{seeded['id']}", json={"lifecycle": "permanent"}

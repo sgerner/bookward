@@ -2764,7 +2764,13 @@ def update_source(source_id: int, payload: SourceUpdateIn):
         if url_changed:
             updates.append("last_scanned_at=NULL")
             updates.append("last_status=NULL")
-        elif filters_changed and effective_lifecycle == "one_time":
+        elif effective_lifecycle == "one_time" and (
+            filters_changed
+            or (
+                payload.lifecycle == "one_time"
+                and source["lifecycle"] != "one_time"
+            )
+        ):
             updates.append("last_scanned_at=NULL")
 
         if updates:
