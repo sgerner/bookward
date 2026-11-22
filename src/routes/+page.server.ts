@@ -1,6 +1,12 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
-import { engine, engineStatus } from "#lib/server/engine.js";
+import {
+  GOODREADS_CSV_LIMIT_MESSAGE,
+  GOODREADS_CSV_MAX_BYTES,
+  engine,
+  engineStatus,
+  isPayloadTooLarge,
+} from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -247,7 +253,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 };
 
 const idSchema = z.coerce.number().int().positive();
-const urlSchema = z.string().url();
+const urlSchema = z.url();
 const fail = (statusCode: number, data: { message: string }) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
@@ -609,10 +615,20 @@ export const actions: Actions = {
     }
   },
   importGoodreadsCsv: async ({ request }) => {
-    const incoming = await request.formData();
+    let incoming: FormData;
+    try {
+      incoming = await request.formData();
+    } catch (error) {
+      if (isPayloadTooLarge(error)) {
+        return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+      }
+      throw error;
+    }
     const file = incoming.get("file");
     if (!(file instanceof File) || file.size === 0)
       return fail(400, { message: "Choose a Goodreads CSV export." });
+    if (file.size > GOODREADS_CSV_MAX_BYTES)
+      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
     const body = new FormData();
     body.set("file", file, file.name);
     try {
@@ -622,7 +638,7 @@ export const actions: Actions = {
       );
       return { message: `Imported ${result.imported} Goodreads books.` };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureLibrar: async ({ request }) => {
@@ -763,22 +779,15 @@ export const actions: Actions = {
         "/api/embeddings/rebuild",
         { method: "POST", body: "{}" },
       );
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        const job = await engine<{
-          status: string;
-          error: string | null;
-          result: string | null;
-        }>(`/api/jobs/${result.job_id}`);
-        if (job.status === "complete")
-          return {
-            message: "Embeddings rebuilt and recommendations refreshed.",
-          };
-        if (job.status === "failed")
-          return fail(502, {
-            message: job.error || "Embedding rebuild failed.",
-          });
-      }
+      const job = await waitForJob(result.job_id, 20);
+      if (job.status === "complete")
+        return {
+          message: "Embeddings rebuilt and recommendations refreshed.",
+        };
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Embedding rebuild failed.",
+        });
       return {
         message: `Embedding rebuild is still running (${result.job_id.slice(0, 8)}).`,
       };
@@ -792,29 +801,22 @@ export const actions: Actions = {
         method: "POST",
         body: "{}",
       });
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        const job = await engine<{
-          status: string;
-          error: string | null;
-          result: string | null;
-        }>(`/api/jobs/${result.job_id}`);
-        if (job.status === "complete") {
-          try {
-            const result = job.result ? JSON.parse(job.result) as { errors?: unknown[] } : {};
-            if (Array.isArray(result.errors) && result.errors.length)
-              return { message: `Sources refreshed with ${result.errors.length} source${result.errors.length === 1 ? "" : "s"} needing attention.` };
-          } catch {
-            // A malformed optional result should not turn a completed sync into
-            // a failed UI action.
-          }
-          return { message: "Sources scanned and recommendations refreshed." };
+      const job = await waitForJob(result.job_id, 20);
+      if (job.status === "complete") {
+        try {
+          const parsed = job.result ? JSON.parse(job.result) as { errors?: unknown[] } : {};
+          if (Array.isArray(parsed.errors) && parsed.errors.length)
+            return { message: `Sources refreshed with ${parsed.errors.length} source${parsed.errors.length === 1 ? "" : "s"} needing attention.` };
+        } catch {
+          // A malformed optional result should not turn a completed sync into
+          // a failed UI action.
         }
-        if (job.status === "failed")
-          return fail(502, {
-            message: job.error || "Recommendation refresh failed.",
-          });
+        return { message: "Sources scanned and recommendations refreshed." };
       }
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Recommendation refresh failed.",
+        });
       return {
         message: `Refresh is still running (${result.job_id.slice(0, 8)}).`,
       };
@@ -840,7 +842,7 @@ export const actions: Actions = {
         method: "POST",
         body: JSON.stringify({ mode }),
       });
-      const job = await pollCatalogAuditJob(queued.job_id);
+      const job = await waitForJob(queued.job_id, 2, 250);
       if (job.status === "failed")
         return fail(502, {
           message: job.error || `${modeLabel} failed.`,
@@ -876,7 +878,7 @@ export const actions: Actions = {
         method: "POST",
         body: JSON.stringify({ retry: true }),
       });
-      const job = await pollCatalogAuditJob(queued.job_id);
+      const job = await waitForJob(queued.job_id, 2, 250);
       if (job.status === "failed")
         return fail(502, {
           message: job.error || "Catalog audit retry failed.",
@@ -1028,7 +1030,7 @@ export const actions: Actions = {
     }
   },
   retryDigest: async ({ request }) => {
-    const id = z.string().uuid().safeParse((await request.formData()).get("id"));
+    const id = z.uuid().safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid delivery." });
     try {
       const queued = await engine<{ job_id: string }>(
@@ -1082,9 +1084,9 @@ export const actions: Actions = {
   },
 };
 
-async function waitForJob(jobId: string) {
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
+async function waitForJob(jobId: string, maxAttempts = 30, delayMs = 500) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
     const job = await engine<{
       status: string;
       error: string | null;
@@ -1110,19 +1112,6 @@ function digestJobFailure(result: string | null) {
   } catch {
     return null;
   }
-}
-
-async function pollCatalogAuditJob(jobId: string) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const job = await engine<{
-      status: string;
-      error: string | null;
-      result: string | null;
-    }>(`/api/jobs/${jobId}`);
-    if (job.status === "complete" || job.status === "failed") return job;
-  }
-  return { status: "running", error: null, result: null };
 }
 
 function parseAuditRemaining(result: string | null): number | null {
