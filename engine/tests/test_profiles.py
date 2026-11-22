@@ -1307,3 +1307,62 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
         applied = {row[0] for row in con.execute("SELECT version FROM schema_migrations")}
     assert {"previous_status", "undone_at"} <= columns
     assert feedback_migration in applied
+
+
+def test_secondary_profile_initializes_with_demo_source_disabled_and_migrates_empty_demo_source(
+    identity_store,
+):
+    reader = profiles.create_account("cold-start-reader", "reader-password-12345")
+    reader_session, _ = profiles.create_session(reader["id"])
+    admin_session, _ = profiles.create_session(identity_store["id"])
+
+    with TestClient(app) as client:
+        secondary_overview = client.get(
+            "/api/overview",
+            headers={
+                "x-bookward-session": reader_session,
+                "x-bookward-profile": reader["profile_id"],
+            },
+        )
+        legacy_overview = client.get(
+            "/api/overview",
+            headers={
+                "x-bookward-session": admin_session,
+                "x-bookward-profile": "legacy",
+            },
+        )
+
+    assert secondary_overview.status_code == 200
+    secondary_body = secondary_overview.json()
+    assert secondary_body["counts"]["reads"] == 0
+    assert secondary_body["counts"]["demo_reads"] == 0
+    assert secondary_body["counts"]["demo_candidates"] == 0
+    secondary_builtin = next(
+        item for item in secondary_body["sources"] if item["url"] == "builtin://upcoming"
+    )
+    assert secondary_builtin["enabled"] == 0
+    assert secondary_builtin["candidate_count"] == 0
+    assert sum(int(item["enabled"]) for item in secondary_body["sources"]) == 10
+
+    assert legacy_overview.status_code == 200
+    legacy_body = legacy_overview.json()
+    assert legacy_body["counts"]["demo_reads"] == 4
+    assert legacy_body["counts"]["demo_candidates"] == 4
+    legacy_builtin = next(
+        item for item in legacy_body["sources"] if item["url"] == "builtin://upcoming"
+    )
+    assert legacy_builtin["enabled"] == 1
+    assert legacy_builtin["candidate_count"] == 4
+
+    # Simulate an existing secondary profile created before migration 26 where
+    # builtin://upcoming was inserted enabled=1 with zero candidates.
+    with profile_scope(reader["profile_id"]):
+        with transaction() as con:
+            con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+            con.execute("DELETE FROM schema_migrations WHERE version=26")
+        initialize(seed_demo=False)
+        with connect() as con:
+            migrated = con.execute(
+                "SELECT enabled FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()
+    assert migrated["enabled"] == 0

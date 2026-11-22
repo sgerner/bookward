@@ -25,7 +25,7 @@ from .covers import (
     safe_cover_url,
     wait_for_openlibrary_request_slot,
 )
-from .database import normalize_key, persist_metadata_field_provenance, private_setting, row, rows, transaction
+from .database import normalize_key, persist_metadata_field_provenance, private_setting, purge_demo_reads, row, rows, transaction
 from .identity import (
     book_author_identity_key,
     book_catalog_title_identity_key,
@@ -822,9 +822,12 @@ def import_goodreads_csv(content: bytes):
                 "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
                 "AND excluded.isbn IS NOT reads.isbn THEN NULL "
                 "ELSE reads.openlibrary_lookup_attempted_at END,"
-                "isbn=COALESCE(excluded.isbn,reads.isbn)",
+                "isbn=COALESCE(excluded.isbn,reads.isbn),"
+                "source=CASE WHEN reads.source='demo' THEN excluded.source ELSE reads.source END",
                 values,
             )
+        if count > 0:
+            purge_demo_reads(con)
     # Importing a history is also the point at which naturally supplied
     # ratings can become outcomes for recommendations shown earlier. Import
     # lazily to keep the ingestion module independent of the telemetry module
@@ -2073,9 +2076,12 @@ async def import_goodreads_rss(url: str):
             "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
             "AND excluded.isbn IS NOT reads.isbn THEN NULL "
             "ELSE reads.openlibrary_lookup_attempted_at END,"
-            "isbn=COALESCE(excluded.isbn,reads.isbn)",
+            "isbn=COALESCE(excluded.isbn,reads.isbn),"
+            "source=CASE WHEN reads.source='demo' THEN excluded.source ELSE reads.source END",
             read_rows,
         )
+        if count > 0:
+            purge_demo_reads(con)
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
     return count

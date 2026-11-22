@@ -985,6 +985,51 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        INSERT INTO jobs(id, kind, status)
+        SELECT 'migration-26-score-' || lower(hex(randomblob(8))), 'score', 'queued'
+        WHERE EXISTS (SELECT 1 FROM reads WHERE source = 'demo')
+          AND (
+              EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
+              OR EXISTS (
+                  SELECT 1 FROM sources
+                  WHERE url = 'builtin://upcoming' AND enabled = 0
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM jobs
+              WHERE kind = 'score' AND status IN ('queued', 'running')
+          );
+        DELETE FROM embeddings
+        WHERE entity_type = 'read'
+          AND entity_id IN (SELECT id FROM reads WHERE source = 'demo')
+          AND (
+              EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
+              OR EXISTS (
+                  SELECT 1 FROM sources
+                  WHERE url = 'builtin://upcoming' AND enabled = 0
+              )
+          );
+        DELETE FROM reads
+        WHERE source = 'demo'
+          AND (
+              EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
+              OR EXISTS (
+                  SELECT 1 FROM sources
+                  WHERE url = 'builtin://upcoming' AND enabled = 0
+              )
+          );
+        UPDATE sources
+        SET enabled = 0
+        WHERE url = 'builtin://upcoming'
+          AND enabled = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM candidates WHERE source_id = sources.id
+          );
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1326,6 +1371,16 @@ def persist_metadata_field_provenance(
     return written
 
 
+def purge_demo_reads(con: sqlite3.Connection) -> int:
+    """Delete synthetic cold-start demo reads and their cached read embeddings."""
+
+    con.execute(
+        "DELETE FROM embeddings WHERE entity_type='read' "
+        "AND entity_id IN (SELECT id FROM reads WHERE source='demo')"
+    )
+    return con.execute("DELETE FROM reads WHERE source='demo'").rowcount
+
+
 def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
     """Execute complete SQL statements on the caller's active transaction."""
 
@@ -1397,7 +1452,10 @@ def initialize(*, seed_demo: bool = True):
                 "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
                 (settings.public_url,),
             )
-        con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
+        con.execute(
+            "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)",
+            ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1 if seed_demo else 0, 1),
+        )
         con.execute(
             "UPDATE sources SET name=? WHERE url='builtin://upcoming' AND name='Afterword demo upcoming books'",
             ("Bookward demo upcoming books",),
@@ -1410,7 +1468,12 @@ def initialize(*, seed_demo: bool = True):
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []
-        if seed_demo and not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone():
+        if (
+            seed_demo
+            and not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone()
+            and not con.execute("SELECT 1 FROM reads LIMIT 1").fetchone()
+        ):
+            con.execute("UPDATE sources SET enabled=1 WHERE id=?", (builtin_id,))
             for item in seed_items:
                 release_date = (date.today() + timedelta(days=int(item.get("release_offset_days", 30)))).isoformat()
                 con.execute("""INSERT OR IGNORE INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,score,explanation,status,normalized_key)

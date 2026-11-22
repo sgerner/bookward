@@ -2782,3 +2782,211 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def test_disabling_builtin_demo_source_purges_demo_reads_retains_source_and_queues_score(database):
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        initial_overview = client.get("/api/overview").json()
+        assert initial_overview["counts"]["demo_reads"] == 4
+        assert initial_overview["counts"]["demo_candidates"] == 4
+        builtin = next(item for item in initial_overview["sources"] if item["is_default"])
+        assert builtin["enabled"] == 1
+        assert builtin["candidate_count"] == 4
+
+        toggled = client.put(f"/api/sources/{builtin['id']}/toggle")
+        assert toggled.status_code == 200
+        job_id = toggled.json()["job_id"]
+        assert job_id is not None
+
+        updated_overview = client.get("/api/overview").json()
+
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (job_id,)) == {
+        "kind": "score",
+        "status": "queued",
+    }
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
+    assert row("SELECT enabled,is_default FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+        "is_default": 1,
+    }
+    assert updated_overview["counts"]["demo_reads"] == 0
+    assert updated_overview["recommendations"] == []
+
+
+def test_goodreads_csv_import_updates_matching_demo_title_and_surfaces_unread_demo_candidates(database):
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        piranesi_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,80,'recommended',?)",
+            (
+                "Piranesi",
+                "Susanna Clarke",
+                "A house of infinite halls and statues flooded by tides.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("Piranesi", "Susanna Clarke"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (piranesi_id,),
+        )
+
+    # While synthetic demo reads are active, Piranesi is suppressed as already read.
+    assert "Piranesi" not in {item["title"] for item in recommendation_list()}
+
+    csv_payload = (
+        b"Title,Author,My Rating,Date Read,ISBN13,Exclusive Shelf\n"
+        b"Sea of Tranquility,Emily St. John Mandel,3,2025/04/01,9780593321447,read\n"
+        b"Project Hail Mary,Andy Weir,5,2025/05/01,9780593135204,read\n"
+    )
+    assert import_goodreads_csv(csv_payload) == 2
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row(
+        "SELECT rating,source,isbn FROM reads WHERE title='Sea of Tranquility'"
+    ) == {
+        "rating": 3.0,
+        "source": "goodreads_csv",
+        "isbn": "9780593321447",
+    }
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 2
+
+    asyncio.run(score_all("local", "hashing-768"))
+    assert "Piranesi" in {item["title"] for item in recommendation_list()}
+
+
+def test_goodreads_rss_and_manual_read_replace_demo_source_and_purge_remaining_demo_reads(
+    database, monkeypatch
+):
+    async def fake_fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [
+            {
+                "title": "Piranesi",
+                "author_name": "Susanna Clarke",
+                "user_rating": "4",
+                "user_read_at": "2025/03/10",
+                "isbn13": "9781635575637",
+            },
+            {
+                "title": "Dune",
+                "author_name": "Frank Herbert",
+                "user_rating": "5",
+                "user_read_at": "2025/03/12",
+                "isbn13": "9780441172719",
+            },
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+
+    assert asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    ) == 2
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT rating,source,isbn FROM reads WHERE title='Piranesi'") == {
+        "rating": 4.0,
+        "source": "goodreads_rss",
+        "isbn": "9781635575637",
+    }
+
+    # Re-seed synthetic demo reads on a fresh candidate to verify Mark Read atomically
+    # replaces a matching demo row without inheriting its synthetic rating and purges others.
+    with transaction() as con:
+        con.execute("DELETE FROM reads")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES"
+            "('Sea of Tranquility','Emily St. John Mandel',5,'demo'),"
+            "('The Fifth Season','N. K. Jemisin',5,'demo')"
+        )
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,source_id,score,status,normalized_key) "
+            "VALUES('Sea of Tranquility','Emily St. John Mandel',?,82,'recommended',?)",
+            (web_source_id, normalize_key("Sea of Tranquility", "Emily St. John Mandel")),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        marked = client.post(f"/api/recommendations/{candidate_id}/read", json={})
+
+    assert marked.status_code == 200
+    assert marked.json()["already_present"] is False
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT rating,source FROM reads WHERE title='Sea of Tranquility'") == {
+        "rating": None,
+        "source": "manual",
+    }
+
+
+def test_migration_26_purges_stale_demo_reads_and_stops_falsified_explanations(tmp_path, monkeypatch):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-26.db"))
+    init_db(seed_demo=True)
+
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        mandel_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,0,'new',?)",
+            (
+                "The Glass Hotel",
+                "Emily St. John Mandel",
+                "A financial collapse and disappearance at the edge of the wilderness.",
+                json.dumps(["literary fiction"]),
+                web_source_id,
+                normalize_key("The Glass Hotel", "Emily St. John Mandel"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (mandel_candidate_id,),
+        )
+        # Simulate an installation upgraded from before demo-read purging where real
+        # reads coexist alongside the 4 seeded demo reads.
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) "
+            "VALUES('Dune','Frank Herbert',5,'goodreads_csv')"
+        )
+
+    asyncio.run(score_all("local", "hashing-768"))
+    pre_upgrade_reasons = json.loads(
+        row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
+    )
+    assert "You rated a book by this author highly" in pre_upgrade_reasons
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=26")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune' AND source='goodreads_csv'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
+
+    asyncio.run(score_all("local", "hashing-768"))
+    post_upgrade_reasons = json.loads(
+        row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
+    )
+    assert "You rated a book by this author highly" not in post_upgrade_reasons
