@@ -42,6 +42,12 @@
   import ProfileField from "#lib/components/ProfileField.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import {
+    applyLlmRerankFormOverrides,
+    llmCardStatus,
+    resetLlmRerankOverrides,
+    selectLlmCatalogProvider,
+  } from "#lib/llm-rerank-ui.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
@@ -379,12 +385,24 @@
       api_url: "https://api.openai.com/v1/chat/completions",
       model: "gpt-4o-mini",
       api_key_set: false,
+      last_status: "",
+      last_error: "",
+      last_attempt_at: "",
+      last_success_at: "",
+      cooldown_until: "",
     },
   );
   const llmEnabled = $derived(llmEnabledOverride ?? llmRerank.enabled);
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const llmStatus = $derived(
+    llmCardStatus({
+      enabled: llmEnabled,
+      last_status: llmRerank.last_status,
+      last_error: llmRerank.last_error,
+    }),
+  );
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -431,15 +449,14 @@
   }
 
   function handleLlmProviderChange(providerId: string) {
-    llmProviderOverride = providerId;
+    const selection = selectLlmCatalogProvider(providerId, llmCatalogProviders);
+    llmProviderOverride = selection.provider;
     llmModelSearch = "";
-    const match = llmCatalogProviders.find((p) => p.id === providerId);
-    if (!match) return;
-    if (match.api) {
-      llmApiUrlOverride = match.api;
+    if (selection.apiUrl !== null) {
+      llmApiUrlOverride = selection.apiUrl;
     }
-    if (match.models.length > 0) {
-      llmModelOverride = match.models[0].id;
+    if (selection.model !== null) {
+      llmModelOverride = selection.model;
     }
   }
   const apiTokens = $derived(
@@ -777,13 +794,18 @@
     key: string,
     optimistic?: OptimisticFactory,
   ): SubmitFunction {
-    return ({ formData }) => {
-      withPending(key, true);
+    return ({ formData, action }) => {
+      const isLlmTest =
+        key === "llm-rerank" && action.search.includes("testLlmRerank");
+      const pendingKey = isLlmTest ? "llm-rerank-test" : key;
+      withPending(pendingKey, true);
       let change: OptimisticChange | void;
-      try {
-        change = optimistic?.(formData);
-      } catch {
-        change = undefined;
+      if (!isLlmTest) {
+        try {
+          change = optimistic?.(formData);
+        } catch {
+          change = undefined;
+        }
       }
       return async ({ update, result }) => {
         const succeeded = result.type === "success" || result.type === "redirect";
@@ -802,7 +824,7 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          await update();
+          await update(isLlmTest ? { reset: false } : undefined);
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -822,7 +844,7 @@
               : "The request could not be completed. Your change was reverted.",
           );
         } finally {
-          withPending(key, false);
+          withPending(pendingKey, false);
         }
       };
     };
@@ -994,6 +1016,25 @@
         embeddingModelOverride = null;
         embeddingUrlOverride = null;
       },
+    };
+  }
+
+  function optimisticLlmRerank(formData: FormData) {
+    const next = applyLlmRerankFormOverrides(formData);
+    llmEnabledOverride = next.enabled;
+    llmProviderOverride = next.provider;
+    llmApiUrlOverride = next.apiUrl;
+    llmModelOverride = next.model;
+    const clear = () => {
+      const reset = resetLlmRerankOverrides();
+      llmEnabledOverride = reset.enabled;
+      llmProviderOverride = reset.provider;
+      llmApiUrlOverride = reset.apiUrl;
+      llmModelOverride = reset.model;
+    };
+    return {
+      commit: clear,
+      rollback: clear,
     };
   }
 
@@ -3254,8 +3295,10 @@
                     </h2>
                   </div>
                   <span
-                    class={`badge shrink-0 ${llmEnabled ? "preset-tonal-success" : "preset-tonal-surface"}`}
-                    >{llmEnabled ? "Enabled" : "Disabled"}</span
+                    class={`badge shrink-0 ${llmStatus.badgeClass}`}
+                    >{#if llmStatus.degraded}<TriangleAlert
+                        size={13}
+                      /> {/if}{llmStatus.label}</span
                   >
                 </div>
                 <p class="text-sm leading-6 text-surface-700-300">
@@ -3269,6 +3312,19 @@
                   >
                   or enter an endpoint directly.
                 </p>
+                {#if llmRerank.last_success_at && !llmStatus.degraded}
+                  <p class="mt-2 text-xs text-surface-600-400">
+                    Last verified (UTC): {llmRerank.last_success_at}
+                  </p>
+                {/if}
+                {#if llmRerank.last_status === "failed" || llmRerank.last_error}
+                  <p
+                    class="mt-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm leading-6"
+                    role="alert"
+                  >
+                    LLM reranking failed{#if llmRerank.last_attempt_at} on <time datetime={llmRerank.last_attempt_at}>{llmRerank.last_attempt_at}</time> UTC{/if}: {llmRerank.last_error || "Check the endpoint URL, model, and API key."}{#if llmRerank.cooldown_until} Serving base rankings until <time datetime={llmRerank.cooldown_until}>{llmRerank.cooldown_until}</time> UTC.{/if}
+                  </p>
+                {/if}
                 <div class="mt-4 space-y-3 border border-surface-300-700/50 p-3">
                   <div class="flex flex-wrap items-center justify-between gap-2">
                     <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
@@ -3356,7 +3412,7 @@
                   class="mt-4 space-y-4"
                   method="POST"
                   action="?/configureLlmRerank"
-                  use:enhance={setPending("llm-rerank")}
+                  use:enhance={setPending("llm-rerank", optimisticLlmRerank)}
                 >
                   <ProfileField profileId={data.user?.profile_id} />
                   <input type="hidden" name="provider" value={llmProvider} />
@@ -3416,16 +3472,29 @@
                       Clear saved LLM API key</label
                     >
                   {/if}
-                  <button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
-                    type="submit"
-                    disabled={isPending("llm-rerank")}
-                    aria-busy={isPending("llm-rerank")}
-                    >{#if isPending("llm-rerank")}<RefreshCw
-                        size={16}
-                        class="animate-spin"
-                      />{:else}<Check size={16} />{/if} Save LLM reranker</button
-                  >
+                  <div class="grid gap-2 sm:grid-cols-2">
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      formaction="?/testLlmRerank"
+                      disabled={isPending("llm-rerank") || isPending("llm-rerank-test")}
+                      aria-busy={isPending("llm-rerank-test")}
+                      >{#if isPending("llm-rerank-test")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Send size={16} />{/if} Test connection</button
+                    >
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={isPending("llm-rerank") || isPending("llm-rerank-test")}
+                      aria-busy={isPending("llm-rerank")}
+                      >{#if isPending("llm-rerank")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Check size={16} />{/if} Save LLM reranker</button
+                    >
+                  </div>
                 </form>
               </section>
               <section

@@ -506,5 +506,227 @@ describe("page actions", () => {
     });
   });
 
+  it("exposes LLM reranker status, redacted errors, and attempt timestamps from overview", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+        llm_rerank: {
+          enabled: true,
+          provider: "openai",
+          api_url: "https://api.openai.com/v1/chat/completions",
+          model: "gpt-4o-mini",
+          api_key_set: true,
+          last_status: "failed",
+          last_error: "HTTP 401: Incorrect API key [redacted]",
+          last_attempt_at: "2026-11-21T20:00:00+00:00",
+          last_success_at: "2026-11-20T12:00:00+00:00",
+          cooldown_until: "2026-11-21T20:05:00+00:00",
+        },
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      profile: {
+        llm_rerank: {
+          enabled: boolean;
+          last_status: string;
+          last_error: string;
+          last_attempt_at: string;
+          cooldown_until: string;
+        };
+      };
+    };
+
+    expect(result.profile.llm_rerank).toMatchObject({
+      enabled: true,
+      last_status: "failed",
+      last_error: "HTTP 401: Incorrect API key [redacted]",
+      last_attempt_at: "2026-11-21T20:00:00+00:00",
+      cooldown_until: "2026-11-21T20:05:00+00:00",
+    });
+  });
+
+  it("validates, saves, and tests LLM reranker settings through engine actions", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true, checked: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "Private, loopback, and link-local addresses are not allowed",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ok: true, model: "gpt-4o-mini" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "LLM connection test failed: HTTP 401: Incorrect API key [redacted]",
+          }),
+          {
+            status: 502,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const missingUrl = new FormData();
+    missingUrl.set("enabled", "on");
+    missingUrl.set("model", "gpt-4o-mini");
+    const missingResult = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", { method: "POST", body: missingUrl }),
+    } as never)) as { status: number; data: { error: boolean; message: string } };
+    expect(missingResult.status).toBe(400);
+    expect(missingResult.data.error).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const validBody = new FormData();
+    validBody.set("enabled", "on");
+    validBody.set("provider", "openai");
+    validBody.set("apiUrl", "https://api.openai.com/v1/chat/completions");
+    validBody.set("model", "gpt-4o-mini");
+    validBody.set("apiKey", "sk-live");
+    await expect(
+      actions.configureLlmRerank!({
+        request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "LLM reranker settings saved and verified.",
+    });
+
+    const loopbackBody = new FormData();
+    loopbackBody.set("enabled", "on");
+    loopbackBody.set("apiUrl", "http://127.0.0.1:11434/v1");
+    loopbackBody.set("model", "llama3.2");
+    const blockedResult = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", { method: "POST", body: loopbackBody }),
+    } as never)) as { status: number; data: { error: boolean; message: string } };
+    expect(blockedResult.status).toBe(400);
+    expect(blockedResult.data.message).toContain("Private, loopback");
+
+    const testBody = new FormData();
+    testBody.set("provider", "openai");
+    testBody.set("apiUrl", "https://api.openai.com/v1/chat/completions");
+    testBody.set("model", "gpt-4o-mini");
+    await expect(
+      actions.testLlmRerank!({
+        request: new Request("http://afterword.test", { method: "POST", body: testBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "LLM connection verified (gpt-4o-mini).",
+    });
+
+    const failedProbeResult = (await actions.testLlmRerank!({
+      request: new Request("http://afterword.test", { method: "POST", body: testBody }),
+    } as never)) as { status: number; data: { error: boolean; message: string } };
+    expect(failedProbeResult.status).toBe(502);
+    expect(failedProbeResult.data.message).toContain("[redacted]");
+  });
+
+  it("clears stale provider URLs, rolls back failed edits, and computes degraded badge status", async () => {
+    const {
+      applyLlmRerankFormOverrides,
+      llmCardStatus,
+      resetLlmRerankOverrides,
+      selectLlmCatalogProvider,
+    } = await import("#lib/llm-rerank-ui.js");
+
+    const catalog = [
+      {
+        id: "openai",
+        name: "OpenAI",
+        api: "https://api.openai.com/v1/chat/completions",
+        models: [{ id: "gpt-4o-mini", name: "GPT-4o mini" }],
+      },
+      {
+        id: "bedrock",
+        name: "Amazon Bedrock",
+        api: "",
+        models: [{ id: "claude-sonnet", name: "Claude Sonnet" }],
+      },
+    ];
+
+    const firstPick = selectLlmCatalogProvider("openai", catalog);
+    expect(firstPick.apiUrl).toBe("https://api.openai.com/v1/chat/completions");
+
+    // Switching to a provider without a preset catalog URL clears the stale OpenAI URL.
+    const secondPick = selectLlmCatalogProvider("bedrock", catalog);
+    expect(secondPick.apiUrl).toBe("");
+    expect(secondPick.model).toBe("claude-sonnet");
+
+    // Optimistic draft edits revert cleanly to null overrides on rollback so persisted settings win.
+    const draftForm = new FormData();
+    draftForm.set("enabled", "on");
+    draftForm.set("provider", "custom");
+    draftForm.set("apiUrl", "http://127.0.0.1:8080/v1");
+    draftForm.set("model", "local-model");
+    expect(applyLlmRerankFormOverrides(draftForm)).toEqual({
+      enabled: true,
+      provider: "custom",
+      apiUrl: "http://127.0.0.1:8080/v1",
+      model: "local-model",
+    });
+    expect(resetLlmRerankOverrides()).toEqual({
+      enabled: null,
+      provider: null,
+      apiUrl: null,
+      model: null,
+    });
+
+    expect(llmCardStatus({ enabled: false, last_status: "failed", last_error: "boom" })).toMatchObject({
+      state: "disabled",
+      label: "Disabled",
+      degraded: false,
+    });
+    expect(llmCardStatus({ enabled: true, last_status: "succeeded", last_error: "" })).toMatchObject({
+      state: "enabled",
+      label: "Enabled",
+      badgeClass: "preset-tonal-success",
+      degraded: false,
+    });
+    expect(llmCardStatus({ enabled: true, last_status: "failed", last_error: "HTTP 401" })).toMatchObject({
+      state: "degraded",
+      label: "Degraded",
+      badgeClass: "preset-tonal-warning",
+      degraded: true,
+    });
+  });
+
 
 });

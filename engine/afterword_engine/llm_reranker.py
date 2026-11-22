@@ -2,15 +2,275 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
+import threading
+import time
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import httpx
 
 from .config import settings
+from .security import safe_error_message, validate_service_url
+from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
+
+MAX_CACHED_PROFILES = 64
+MAX_CACHE_ENTRIES_PER_PROFILE = 8
+LLM_CIRCUIT_COOLDOWN_SECONDS = 300.0
+
+_STATE_LOCK = threading.Lock()
+_SLATE_CACHE: OrderedDict[str, OrderedDict[str, dict[str, Any]]] = OrderedDict()
+_CIRCUIT_BREAKER: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def current_llm_profile_key() -> str:
+    """Return an isolated per-profile cache and circuit-breaker scope key."""
+    profile = current_profile_id() or "legacy"
+    try:
+        db_path = str(profile_database_path())
+    except Exception:
+        db_path = settings.db
+    return f"{profile}::{db_path}"
+
+
+def llm_allowed_hosts(raw: str | None = None) -> set[str]:
+    source = settings.llm_rerank_allowed_hosts if raw is None else raw
+    return {
+        host.strip().lower().strip("[]").rstrip(".")
+        for host in str(source or "").split(",")
+        if host.strip()
+    }
+
+
+def _normalize_chat_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
+    cleaned = url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    if cleaned.endswith(("/v1", "/openai")):
+        return f"{cleaned}/chat/completions"
+    return cleaned
+
+
+def validate_llm_api_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+    """Validate an LLM endpoint URL against SSRF guards and normalize its chat path."""
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        raise ValueError("LLM API URL is required")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
+    hosts = llm_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    validate_service_url(cleaned, hosts)
+    return _normalize_chat_url(cleaned)
+
+
+def sanitize_llm_error(error: Any, api_key: str = "", limit: int = 300) -> str:
+    """Return a bounded, credential-redacted error message."""
+    raw = str(error or "").strip() or "Request failed"
+    secret = str(api_key or "").strip()
+    if secret and secret in raw:
+        raw = raw.replace(secret, "[redacted]")
+    redacted = safe_error_message(raw, limit=limit)
+    if secret and secret in redacted:
+        redacted = redacted.replace(secret, "[redacted]")[:limit]
+    return redacted
+
+
+def _config_fingerprint(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int,
+    max_delta: float,
+) -> str:
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16] if api_key else ""
+    payload = json.dumps(
+        {
+            "url": _normalize_chat_url(api_url),
+            "key": key_hash,
+            "model": model.strip(),
+            "top_k": int(top_k),
+            "max_delta": round(float(max_delta), 4),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def build_slate_cache_key(
+    *,
+    messages: Sequence[dict[str, str]],
+    interaction_events: Sequence[dict[str, Any]] | None,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int,
+    max_delta: float,
+) -> str:
+    """Compute a deterministic cache key invalidated by slate, feedback, or LLM setting changes."""
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=top_k,
+        max_delta=max_delta,
+    )
+    feedback_tail = [
+        (
+            event.get("id"),
+            event.get("candidate_id"),
+            event.get("event_type") or event.get("action"),
+            event.get("value"),
+        )
+        for event in (interaction_events or ())
+    ]
+    digest_payload = json.dumps(
+        {
+            "cfg": cfg_fp,
+            "messages": list(messages),
+            "feedback": feedback_tail,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_slate_payload(profile_key: str, cache_key: str) -> dict[str, Any] | None:
+    with _STATE_LOCK:
+        bucket = _SLATE_CACHE.get(profile_key)
+        if not bucket or cache_key not in bucket:
+            return None
+        _SLATE_CACHE.move_to_end(profile_key)
+        bucket.move_to_end(cache_key)
+        entry = bucket[cache_key]
+        return {
+            "mode": entry["mode"],
+            "entries": [dict(item) for item in entry["entries"] if isinstance(item, dict)],
+        }
+
+
+def set_cached_slate_payload(
+    profile_key: str,
+    cache_key: str,
+    payload: dict[str, Any],
+) -> None:
+    stored = {
+        "mode": str(payload.get("mode") or "adjustments"),
+        "entries": [
+            dict(item)
+            for item in (payload.get("entries") or ())
+            if isinstance(item, dict)
+        ],
+    }
+    with _STATE_LOCK:
+        bucket = _SLATE_CACHE.get(profile_key)
+        if bucket is None:
+            bucket = OrderedDict()
+            _SLATE_CACHE[profile_key] = bucket
+        _SLATE_CACHE.move_to_end(profile_key)
+        bucket[cache_key] = stored
+        bucket.move_to_end(cache_key)
+        while len(bucket) > MAX_CACHE_ENTRIES_PER_PROFILE:
+            bucket.popitem(last=False)
+        while len(_SLATE_CACHE) > MAX_CACHED_PROFILES:
+            _SLATE_CACHE.popitem(last=False)
+
+
+def get_circuit_breaker_state(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+) -> dict[str, Any] | None:
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+    )
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if entry.get("cfg") != cfg_fp or now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        return dict(entry)
+
+
+def trip_circuit_breaker(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    error: str,
+    cooldown_seconds: float = LLM_CIRCUIT_COOLDOWN_SECONDS,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+) -> dict[str, Any]:
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+    )
+    cooldown = max(1.0, float(cooldown_seconds))
+    now_mono = time.monotonic()
+    cooldown_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=cooldown)
+    ).isoformat(timespec="seconds")
+    record = {
+        "cfg": cfg_fp,
+        "open_until": now_mono + cooldown,
+        "cooldown_until": cooldown_until,
+        "error": error,
+    }
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER[profile_key] = record
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        while len(_CIRCUIT_BREAKER) > MAX_CACHED_PROFILES:
+            _CIRCUIT_BREAKER.popitem(last=False)
+    return dict(record)
+
+
+def clear_llm_rerank_state(profile_key: str | None = None, *, clear_all: bool = False) -> None:
+    with _STATE_LOCK:
+        if clear_all:
+            _SLATE_CACHE.clear()
+            _CIRCUIT_BREAKER.clear()
+            return
+        target = current_llm_profile_key() if profile_key is None else profile_key
+        _SLATE_CACHE.pop(target, None)
+        _CIRCUIT_BREAKER.pop(target, None)
+
+
+def clear_circuit_breaker(profile_key: str | None = None) -> None:
+    target = current_llm_profile_key() if profile_key is None else profile_key
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER.pop(target, None)
 
 
 def build_rerank_prompt(
@@ -229,16 +489,137 @@ def apply_llm_rerank_order(
     }
 
 
-def _normalize_chat_url(url: str) -> str:
-    """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
-    cleaned = url.strip().rstrip("/")
-    if not cleaned:
-        return ""
-    if cleaned.endswith("/chat/completions"):
-        return cleaned
-    if cleaned.endswith(("/v1", "/openai")):
-        return f"{cleaned}/chat/completions"
-    return cleaned
+def apply_cached_llm_payload(
+    candidates: Sequence[dict[str, Any]],
+    cached_payload: dict[str, Any],
+    *,
+    top_k: int = 24,
+    max_delta: float = 1.2,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    entries = cached_payload.get("entries") or []
+    if cached_payload.get("mode") == "listwise":
+        reranked, diag = apply_llm_rerank_order(
+            candidates, entries, top_k=top_k, max_nudge=max_delta
+        )
+    else:
+        reranked, diag = apply_llm_rerank_adjustments(
+            candidates, entries, top_k=top_k, max_delta=max_delta
+        )
+    return reranked, {**diag, "cached": True}
+
+
+def _extract_response_content(response: httpx.Response) -> dict[str, Any]:
+    is_redirect = getattr(response, "is_redirect", False) or (
+        300 <= int(getattr(response, "status_code", 200)) < 400
+    )
+    if is_redirect:
+        raise ValueError("Redirects are not allowed for the LLM endpoint")
+    status_code = int(getattr(response, "status_code", 200))
+    if status_code >= 400:
+        detail = ""
+        try:
+            err_body = response.json()
+            if isinstance(err_body, dict):
+                raw_err = err_body.get("error")
+                if isinstance(raw_err, dict):
+                    detail = str(raw_err.get("message") or "").strip()
+                elif isinstance(raw_err, str):
+                    detail = raw_err.strip()
+        except Exception:
+            detail = ""
+        if detail:
+            raise ValueError(f"HTTP {status_code}: {detail}")
+        response.raise_for_status()
+    else:
+        response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("LLM endpoint returned a non-JSON-object response")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("LLM endpoint returned no completion choices")
+    message = choices[0].get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM endpoint returned an empty completion message")
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM completion content must be a JSON object")
+    return parsed
+
+
+def _parse_rerank_payload(
+    candidates: Sequence[dict[str, Any]],
+    parsed: dict[str, Any],
+    *,
+    top_k: int,
+    max_delta: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
+    if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
+        entries = [dict(item) for item in parsed["adjustments"] if isinstance(item, dict)]
+        reranked, diag = apply_llm_rerank_adjustments(
+            candidates, entries, top_k=top_k, max_delta=max_delta
+        )
+        cache_entry = {"mode": "adjustments", "entries": entries} if diag.get("applied") else None
+        return reranked, diag, cache_entry
+    rankings = parsed.get("rankings")
+    if isinstance(rankings, list):
+        entries = [dict(item) for item in rankings if isinstance(item, dict)]
+        reranked, diag = apply_llm_rerank_order(
+            candidates, entries, top_k=top_k, max_nudge=max_delta
+        )
+        cache_entry = {"mode": "listwise", "entries": entries} if diag.get("applied") else None
+        return reranked, diag, cache_entry
+    raise ValueError("LLM completion JSON did not contain adjustments or rankings")
+
+
+async def probe_llm_reranker(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
+) -> dict[str, Any]:
+    """Send a lightweight JSON probe to verify live LLM endpoint connectivity and credentials."""
+    key = str(api_key or "").strip()
+    chosen_model = str(model or "").strip()
+    if not key:
+        raise ValueError("An API key is required to test the LLM reranker")
+    if not chosen_model:
+        raise ValueError("A model is required to test the LLM reranker")
+    url = validate_llm_api_url(api_url, allowed_hosts=allowed_hosts)
+    timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
+    probe_messages = [
+        {
+            "role": "system",
+            "content": 'Connection check. Return strict JSON: {"adjustments": []}',
+        },
+        {
+            "role": "user",
+            "content": '{"candidates": []}',
+        },
+    ]
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "model": chosen_model,
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"},
+                    "messages": probe_messages,
+                },
+            )
+            _extract_response_content(response)
+    except Exception as exc:
+        raise RuntimeError(sanitize_llm_error(exc, api_key=key)) from exc
+    return {"ok": True, "checked": True, "model": chosen_model, "api_url": url}
 
 
 async def rerank_with_llm(
@@ -252,21 +633,29 @@ async def rerank_with_llm(
     top_k: int | None = None,
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Call the configured OpenAI-compatible LLM endpoint and rerank top-K candidates."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
+    raw_url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
     timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
 
-    if not key or not url or not chosen_model or len(candidates) < 2:
+    if not key or not raw_url or not chosen_model or len(candidates) < 2:
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
-    messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        url = validate_llm_api_url(raw_url, allowed_hosts=allowed_hosts)
+        messages = build_rerank_prompt(
+            reads, candidates, interaction_events=interaction_events, top_k=k
+        )
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -277,16 +666,21 @@ async def rerank_with_llm(
                     "messages": messages,
                 },
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
-                return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
-            rankings = parsed.get("rankings") or []
-            return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
+            parsed = _extract_response_content(response)
+            reranked, diag, cache_entry = _parse_rerank_payload(
+                candidates, parsed, top_k=k, max_delta=delta
+            )
+            if cache_entry is not None:
+                diag = {**diag, "_cache_payload": cache_entry}
+            return reranked, diag
     except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
-        return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
+        err = sanitize_llm_error(exc, api_key=key)
+        LOGGER.warning("LLM reranker failed; falling back to base order: %s", err)
+        return [dict(c) for c in candidates], {
+            "applied": False,
+            "reason": "fallback",
+            "error": err,
+        }
 
 
 def rerank_with_llm_sync(
@@ -300,21 +694,34 @@ def rerank_with_llm_sync(
     top_k: int | None = None,
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
+    prebuilt_messages: Sequence[dict[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
     key = (api_key if api_key is not None else settings.llm_rerank_api_key).strip()
-    url = _normalize_chat_url(api_url if api_url is not None else settings.llm_rerank_api_url)
+    raw_url = (api_url if api_url is not None else settings.llm_rerank_api_url).strip()
     chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
     k = top_k if top_k is not None else settings.llm_rerank_top_k
     delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
     timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
 
-    if not key or not url or not chosen_model or len(candidates) < 2:
+    if not key or not raw_url or not chosen_model or len(candidates) < 2:
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
-    messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
-        with httpx.Client(timeout=timeout) as client:
+        url = validate_llm_api_url(raw_url, allowed_hosts=allowed_hosts)
+        messages = (
+            list(prebuilt_messages)
+            if prebuilt_messages is not None
+            else build_rerank_prompt(
+                reads, candidates, interaction_events=interaction_events, top_k=k
+            )
+        )
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
             response = client.post(
                 url,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -325,13 +732,18 @@ def rerank_with_llm_sync(
                     "messages": messages,
                 },
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
-                return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
-            rankings = parsed.get("rankings") or []
-            return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
+            parsed = _extract_response_content(response)
+            reranked, diag, cache_entry = _parse_rerank_payload(
+                candidates, parsed, top_k=k, max_delta=delta
+            )
+            if cache_entry is not None:
+                diag = {**diag, "_cache_payload": cache_entry}
+            return reranked, diag
     except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
-        return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
+        err = sanitize_llm_error(exc, api_key=key)
+        LOGGER.warning("LLM reranker failed; falling back to base order: %s", err)
+        return [dict(c) for c in candidates], {
+            "applied": False,
+            "reason": "fallback",
+            "error": err,
+        }

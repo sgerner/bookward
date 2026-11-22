@@ -1153,6 +1153,8 @@ class _LockedConnection(sqlite3.Connection):
                 self._database_lock.release_connection(self._database_lock_owner)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        if not getattr(self, "_database_lock_held", False):
+            return False
         try:
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
