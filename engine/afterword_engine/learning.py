@@ -13,8 +13,9 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .database import transaction
 from .decision_evidence import (
