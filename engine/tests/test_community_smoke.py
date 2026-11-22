@@ -54,10 +54,12 @@ class SmokeHandler(BaseHTTPRequestHandler):
 
     def _send(self, status, body="", headers=None):
         payload = body.encode("utf-8")
+        extra_headers = dict(headers or {})
+        content_type = extra_headers.pop("Content-Type", "text/html; charset=utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
-        for key, value in (headers or {}).items():
+        for key, value in extra_headers.items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(payload)
@@ -88,7 +90,41 @@ class SmokeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8")
+        raw_bytes = self.rfile.read(length)
+        if self.path == "/?/importGoodreadsCsv":
+            import json
+            limit_msg = "Goodreads CSV exports must be 10 MB or smaller (up to 20,000 books)."
+            if length > 12_000_000:
+                if self.headers.get("x-sveltekit-action") == "true":
+                    self._send(
+                        413,
+                        json.dumps({"detail": limit_msg, "message": limit_msg}),
+                        {"Content-Type": "application/json"},
+                    )
+                else:
+                    self._send(413, f"<html><body>{limit_msg}</body></html>")
+                return
+            if length > 10_000_000 or b"oversized-10m.csv" in raw_bytes:
+                self._send(
+                    413,
+                    json.dumps({"type": "failure", "status": 413, "data": limit_msg}),
+                    {"Content-Type": "application/json"},
+                )
+                return
+            if b"bad.csv" in raw_bytes:
+                self._send(
+                    400,
+                    json.dumps({"type": "failure", "status": 400}),
+                    {"Content-Type": "application/json"},
+                )
+                return
+            self._send(
+                200,
+                json.dumps({"type": "success", "status": 200}),
+                {"Content-Type": "application/json"},
+            )
+            return
+        raw = raw_bytes.decode("utf-8")
         data = parse_qs(raw)
         if self.path in {"/login?/setup", "/login?/login"}:
             self._send(
@@ -306,7 +342,7 @@ def test_passing_run_keeps_stderr_silent_and_cleans_up_tempdir(capsys):
     captured = capsys.readouterr()
     assert captured.out.strip() == (
         "PASS: setup, sign-in/out, authenticated views, SSR form bindings, "
-        "stale-profile guard, API authentication"
+        "stale-profile guard, CSV uploads, API authentication"
     )
     assert captured.err == ""
     assert _smoke_temp_dirs() == before_dirs
