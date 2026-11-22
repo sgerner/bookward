@@ -41,6 +41,7 @@
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import {
     applyLlmRerankFormOverrides,
@@ -767,22 +768,6 @@
     formNotificationDismissed = true;
   }
 
-  function actionResultMessage(result: {
-    type: string;
-    data?: unknown;
-    error?: unknown;
-  }) {
-    if (result.data && typeof result.data === "object" && "message" in result.data) {
-      const message = (result.data as { message?: unknown }).message;
-      if (typeof message === "string" && message.trim()) return message;
-    }
-    if (result.error && typeof result.error === "object" && "message" in result.error) {
-      const message = (result.error as { message?: unknown }).message;
-      if (typeof message === "string" && message.trim()) return message;
-    }
-    return "The request could not be completed. Your change was reverted.";
-  }
-
   function withPending(key: string, add: boolean) {
     const next = new Set(pendingActions);
     if (add) next.add(key);
@@ -824,6 +809,9 @@
             announceActionError(actionResultMessage(result));
             return;
           }
+          if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+          optimisticNotificationTimer = null;
+          optimisticNotification = null;
           await update(isLlmTest ? { reset: false } : undefined);
           if (
             succeeded &&
