@@ -10,11 +10,12 @@ ranking.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 import math
 import re
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
