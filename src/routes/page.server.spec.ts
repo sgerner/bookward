@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "./+page.server";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("page actions", () => {
   it("keeps the Settings view compatible with an engine before the token migration", async () => {
@@ -285,6 +288,33 @@ describe("page actions", () => {
     );
   });
 
+  it("rejects an invalid URL when adding a custom source without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidUrl of [
+      "not-a-url",
+      "",
+      null,
+      new File(["https://books.example/list"], "url.txt"),
+    ]) {
+      const body = new FormData();
+      body.set("label", "Invalid source");
+      if (invalidUrl !== null) body.set("url", invalidUrl);
+
+      const result = await actions.source!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Add a valid name and public URL.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not save a custom source when preview finds no books", async () => {
     const fetchMock = vi
       .fn()
@@ -440,6 +470,301 @@ describe("page actions", () => {
     );
   });
 
+  it("returns 502 when an embedding rebuild job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Embedder unreachable.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Connection refused"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedder unreachable.", error: true },
+    });
+
+    const secondPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedding rebuild failed.", error: true },
+    });
+
+    await expect(actions.rebuildEmbeddings!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Connection refused", error: true },
+    });
+  });
+
+  it("stops polling an embedding rebuild after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/embeddings/rebuild")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "job-1234567890" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Embedding rebuild is still running (job-1234).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
+  it("queues a sync job and waits for completion", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"errors":[]}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sync",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/sync-123",
+    );
+  });
+
+  it("reports singular and plural source error counts when a sync completes with errors", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out", "404 Not Found"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const singlePromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(singlePromise).resolves.toEqual({
+      message: "Sources refreshed with 1 source needing attention.",
+    });
+
+    const multiPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(multiPromise).resolves.toEqual({
+      message: "Sources refreshed with 2 sources needing attention.",
+    });
+  });
+
+  it("ignores malformed JSON in a completed sync job result", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-bad-json" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: "{not-valid-json",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(pending).resolves.toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+  });
+
+  it("returns 502 when a sync job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Database locked.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Sync unreachable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Database locked.", error: true },
+    });
+
+    const secondPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Recommendation refresh failed.", error: true },
+    });
+
+    await expect(actions.runSync!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Sync unreachable", error: true },
+    });
+  });
+
+  it("stops polling a sync job after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/sync")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "sync-123456" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Refresh is still running (sync-123).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
   it("persists digest timing and channel settings without sending blank secrets", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ saved: true }), {
@@ -485,6 +810,73 @@ describe("page actions", () => {
     });
   });
 
+  it("retries a digest delivery when given a valid delivery UUID", async () => {
+    const deliveryId = "550e8400-e29b-41d4-a716-446655440000";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-456" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"status":"sent"}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", deliveryId);
+    const result = await actions.retryDigest!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Digest delivery retry queued." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8000/api/digest/deliveries/${deliveryId}/retry`,
+      expect.objectContaining({
+        method: "POST",
+        body: "{}",
+      }),
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/job-456",
+    );
+  });
+
+  it("rejects an invalid delivery UUID in retryDigest without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidId of [
+      "not-a-uuid",
+      "",
+      null,
+      new File(["550e8400-e29b-41d4-a716-446655440000"], "id.txt"),
+    ]) {
+      const body = new FormData();
+      if (invalidId !== null) body.set("id", invalidId);
+
+      const result = await actions.retryDigest!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Invalid delivery.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("shortlists a selected digest batch in one engine call", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ updated: 2 }), {
@@ -506,5 +898,102 @@ describe("page actions", () => {
     });
   });
 
+  it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
 
+    const emptyForm = new FormData();
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: emptyForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: { message: "Choose a Goodreads CSV export.", error: true },
+    });
+
+    const oversizedForm = new FormData();
+    oversizedForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "goodreads.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: oversizedForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const streamErrorRequest = new Request("http://afterword.test", {
+      method: "POST",
+      // @ts-expect-error Node fetch requires half-duplex for streaming request bodies
+      duplex: "half",
+      headers: {
+        "x-bookward-profile": "alice-profile",
+        "content-type": "multipart/form-data; boundary=----bookward",
+      },
+      body: new ReadableStream({
+        start(controller) {
+          controller.error(Object.assign(new Error("Payload Too Large"), { status: 413 }));
+        },
+      }),
+    });
+    await expect(
+      actions.importGoodreadsCsv!({ request: streamErrorRequest } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "This does not look like a Goodreads export" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const invalidCsvForm = new FormData();
+    invalidCsvForm.set("file", new File(["bad,csv\n"], "bad.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: invalidCsvForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: { message: "This does not look like a Goodreads export", error: true },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "CSV is larger than 10 MB" }), {
+        status: 413,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const engine413Form = new FormData();
+    engine413Form.set("file", new File(["Title,Author\nDune,Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: engine413Form }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: "CSV is larger than 10 MB", error: true },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ imported: 3 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const validForm = new FormData();
+    validForm.set("file", new File(["Title,Author\nDune,Frank Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validForm }),
+      } as never),
+    ).resolves.toEqual({ message: "Imported 3 Goodreads books." });
+  });
 });

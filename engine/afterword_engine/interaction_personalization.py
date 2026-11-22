@@ -12,8 +12,9 @@ import math
 import re
 import unicodedata
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 

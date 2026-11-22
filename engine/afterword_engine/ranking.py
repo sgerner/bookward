@@ -1,7 +1,8 @@
 """Pure, bounded recommendation ranking from read and candidate embeddings."""
 
 import re
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 
