@@ -7,3 +7,19 @@
 
 @import '@skeletonlabs/skeleton/themes/cerberus';
 @import './theme-calibration.css';
+
+/* Clear the sticky top header (65px) and mobile bottom nav (65px + safe-area) on keyboard focus (WCAG 2.2 C43). */
+html:has([data-sticky-shell]) {
+	scroll-padding-top: calc(5rem + env(safe-area-inset-top, 0px));
+	scroll-padding-bottom: calc(5rem + env(safe-area-inset-bottom, 0px));
+}
+
+@media (min-width: 48rem) {
+	html:has([data-sticky-shell]) {
+		scroll-padding-bottom: 0;
+	}
+}
+
+[data-sticky-shell] input.sr-only[role="switch"] {
+	scroll-margin-block: 4rem;
+}
