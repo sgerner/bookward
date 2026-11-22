@@ -506,5 +506,98 @@ describe("page actions", () => {
     });
   });
 
+  it("imports a StoryGraph CSV export through the unified CSV action and names The StoryGraph", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ imported: 3, source: "storygraph_csv", job_id: "job-sg" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set(
+      "file",
+      new File(
+        ["Title,Authors,Read Status,Star Rating\nPiranesi,Susanna Clarke,read,4.75\n"],
+        "storygraph.csv",
+        { type: "text/csv" },
+      ),
+    );
+    const result = await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Imported 3 books from The StoryGraph.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/import/csv",
+    );
+  });
+
+  it("retains importGoodreadsCsv compatibility and surfaces 400 format errors clearly", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ imported: 1, source: "goodreads_csv", job_id: "job-gr" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "CSV must match Goodreads or The StoryGraph export format",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const validBody = new FormData();
+    validBody.set(
+      "file",
+      new File(["Title,Author,My Rating\nDune,Frank Herbert,5\n"], "goodreads.csv", {
+        type: "text/csv",
+      }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "Imported 1 book from Goodreads.",
+    });
+
+    const invalidBody = new FormData();
+    invalidBody.set(
+      "file",
+      new File(["Heading,Amount\nSomething,10\n"], "budget.csv", {
+        type: "text/csv",
+      }),
+    );
+    const failed = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalidBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(failed.status).toBe(400);
+    expect(failed.data.message).toContain("Goodreads or The StoryGraph");
+
+    const emptyResult = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: new FormData() }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(emptyResult.status).toBe(400);
+    expect(emptyResult.data.message).toBe(
+      "Choose a Goodreads or StoryGraph CSV export.",
+    );
+  });
+
 
 });

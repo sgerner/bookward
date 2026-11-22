@@ -953,3 +953,64 @@ def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
     assert row(
         "SELECT isbn,rating,source FROM reads WHERE title='Finished Work' AND author='A Reader'"
     ) == {"isbn": "9780593418574", "rating": None, "source": "manual"}
+
+
+@pytest.mark.parametrize("read_at", [None, "not-a-date"], ids=["missing-date", "invalid-date"])
+def test_storygraph_undated_imports_do_not_use_import_time_as_completion_time(database, read_at):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-01-01T12:00:00+00:00")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                candidate["title"],
+                candidate["author"],
+                4.5,
+                read_at,
+                "storygraph_csv",
+                "2099-01-02T12:00:00+00:00",
+            ),
+        )
+
+    assert attribute_read_outcomes()["reads_attributed"] == 0
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_events "
+        "WHERE event_type='read' AND candidate_id=?",
+        (candidate["id"],),
+    )["count"] == 0
+
+
+def test_storygraph_csv_import_attributes_dated_fractional_rating_outcomes(database):
+    from afterword_engine.ingestion import import_csv
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        con.execute(
+            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            ("StoryGraph Pick", "Primary Writer", source_id, "storygraph pick primary writer"),
+        )
+        candidate_id = con.execute(
+            "SELECT id FROM candidates WHERE title='StoryGraph Pick'"
+        ).fetchone()[0]
+    recommendations, run_id = tracked_recommendations()
+    assert candidate_id in {item["id"] for item in recommendations}
+
+    payload = (
+        "Title,Authors,Read Status,Last Date Read,Dates Read,Star Rating\n"
+        '"StoryGraph Pick","Primary Writer, Coauthor",read,,2099/01/02-2099/01/10,4.25\n'
+    ).encode("utf-8")
+    assert import_csv(payload) == {"imported": 1, "source": "storygraph_csv"}
+
+    event = row(
+        "SELECT * FROM recommendation_events WHERE event_key LIKE 'read:%' AND candidate_id=?",
+        (candidate_id,),
+    )
+    outcome = row("SELECT * FROM recommendation_outcomes WHERE event_id=?", (event["id"],))
+    assert event["run_id"] == run_id
+    assert event["value"] == 4.25
+    assert event["occurred_at"] == "2099/01/10"
+    assert outcome["label"] == 1.0
+    assert outcome["label_kind"] == "rating_positive"
+

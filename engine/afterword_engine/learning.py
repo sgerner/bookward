@@ -43,7 +43,7 @@ EVENT_TYPES = {
     "restore",
     "read",
 }
-HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv"})
+HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv", "storygraph_csv"})
 EVENT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 MAX_METADATA_BYTES = 4096

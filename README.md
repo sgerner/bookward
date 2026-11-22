@@ -39,9 +39,9 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 ## Why Bookward?
 
-- **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads credentials. The default Docker binding is localhost.
+- **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads or StoryGraph credentials. The default Docker binding is localhost.
 - **Recommendations are explainable.** Each book includes a match score, source, and plain-language reasons instead of an unexplained ranking.
-- **You control the inputs.** Import your Goodreads history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
+- **You control the inputs.** Import your Goodreads or The StoryGraph history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
 - **Discovery stays focused.** Shortlist recommendations, mark books Read to add them to your history, or find them in Librarr. Bookward does not track reading progress.
 - **Automation is optional and gentle.** Scheduled source refreshes and weekly Discord or email digests are off until you choose them. Delivery is recorded and retryable.
 - **It is comfortable to use.** The responsive interface includes keyboard-friendly controls, a skip-to-content link, accessible labels, light/dark/system modes, and reduced-motion support.
@@ -50,7 +50,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 ### For readers
 
-- Import a complete Goodreads CSV export, including ratings and read dates.
+- Import a complete Goodreads or The StoryGraph CSV export, including fractional ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
 - Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Mark a shortlisted book Read to add it to your history, with an optional rating.
@@ -111,7 +111,7 @@ Keep the engine port private; the versioned web proxy is the intended external A
 
 Bookward ranks books that it can find through your enabled sources; it does not invent titles or search every book in print. The ranking process is:
 
-1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads CSV and RSS imports describe what you have read and how you rated it.
+1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads and StoryGraph CSV exports and Goodreads RSS imports describe what you have read and how you rated it.
 2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It prefers a synopsis over an opening sentence, checks returned identifiers, and combines useful fields from verified records. Rated reads with valid ISBNs also receive a separate metadata cache. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
 3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. Read documents retain their existing title/author, stored genres and description template; the separate enriched-read metadata cache is not injected into those documents. Candidate documents use their available description and up to eight normalized subjects. Representations are cached and refreshed when source text changes.
    Before reuse, the engine also checks that a matching cache entry decodes to its declared, finite float32 vector shape. Each scoring pass carries the validated read-vector dimension into its separate candidate-vector lookup, so cached or newly generated candidates with a different dimension are rejected before cache writes. Forced rebuilds apply the same cross-set check before replacing the active vectors.
@@ -153,7 +153,7 @@ The default hashing provider runs on the Bookward engine host. If you choose a r
 ## How the app fits together
 
 ~~~
-Goodreads CSV / RSS + trusted public lists
+Goodreads / StoryGraph CSV / RSS + trusted public lists
                     |
                     v
           FastAPI engine + SQLite
@@ -227,7 +227,7 @@ On a new install, open `/login` and choose a username and password for the first
 
 ### 4. Make it yours
 
-1. Open **Settings** and import a full Goodreads CSV export. RSS is useful for incremental refreshes, but a CSV export is the way to bring in your complete history.
+1. Open **Settings** and import a full Goodreads or StoryGraph CSV export. RSS is useful for incremental Goodreads refreshes, but a CSV export is the way to bring in your complete history.
 2. Open **Sources** and keep only the public lists you trust. Add your own permanent feeds or one-time imports when you find a good list.
 3. Review the explanation on each recommendation, then shortlist the books you want to keep.
 4. Optionally connect Librarr under **Settings** and choose ebook or audiobook as the default waitlist format.
@@ -378,11 +378,11 @@ The UI intentionally shows a retryable 503 page when the engine is unavailable. 
 
 The default local embedder is intentionally small and predictable. FastEmbed, Ollama, and remote providers may download a model or take longer during their first indexing pass. Check **Settings** and the engine terminal for progress.
 
-### Goodreads import is incomplete
+### CSV or Goodreads import is incomplete
 
-Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
+Use a full Goodreads or StoryGraph CSV export for historical data. The Goodreads RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
 
-Goodreads CSV and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
+Goodreads CSV, StoryGraph CSV, and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
 
 ### Librarr works in Docker but not locally (or vice versa)
 
