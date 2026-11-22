@@ -40,6 +40,8 @@
   } from "@lucide/svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
+  import StarRating from "#lib/components/StarRating.svelte";
+  import Switch from "#lib/components/Switch.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
@@ -2441,18 +2443,13 @@
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
                       >
                         <ProfileField profileId={data.user?.profile_id} />
-                        <button
-                          type="submit"
-                          class={`relative h-7 w-12 rounded-full p-1 transition ${defaultSourceEnabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                          role="switch"
-                          aria-label="Toggle Bookward demo books"
-                          aria-checked={defaultSourceEnabled}
+                        <Switch
+                          kind="submit"
+                          checked={defaultSourceEnabled}
+                          ariaLabel="Toggle Bookward demo books"
                           disabled={isPending("toggle-default")}
-                          aria-busy={isPending("toggle-default")}
-                          ><span
-                            class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${defaultSourceEnabled ? "translate-x-5" : ""}`}
-                          ></span></button
-                        >
+                          busy={isPending("toggle-default")}
+                        />
                       </form>
                     </div>
                   {/if}
@@ -2577,18 +2574,13 @@
                               type="hidden"
                               name="id"
                               value={source.id}
-                            /><button
-                              type="submit"
-                              class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                              role="switch"
-                              aria-label={`Toggle ${source.label}`}
-                              aria-checked={sourceEnabled(source)}
+                            /><Switch
+                              kind="submit"
+                              checked={sourceEnabled(source)}
+                              ariaLabel={`Toggle ${source.label}`}
                               disabled={isPending(`toggle-source-${source.id}`)}
-                              aria-busy={isPending(`toggle-source-${source.id}`)}
-                              ><span
-                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
-                              ></span></button
-                            >
+                              busy={isPending(`toggle-source-${source.id}`)}
+                            />
                           </form>
                         </div>{/each}
                     {:else}
@@ -3528,8 +3520,7 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <div class="flex flex-wrap items-center gap-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-4 focus-within:ring-offset-surface-950">
-                    <input id="digest-enabled" class="sr-only" type="checkbox" name="enabled" checked={digestEnabled} role="switch" aria-label="Enable weekly digest" onchange={(event) => (digestEnabledOverride = (event.currentTarget as HTMLInputElement).checked)} />
+                  <div class="flex flex-wrap items-center gap-4">
                     <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-3">
@@ -3540,7 +3531,14 @@
                     </div>
                     <label for="digest-enabled" class="flex cursor-pointer items-center gap-3 text-sm font-semibold text-surface-950-50">
                       <span class="sr-only">Enable weekly digest</span>
-                      <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEnabled ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEnabled ? "translate-x-5" : ""}`}></span></span>
+                      <Switch
+                        id="digest-enabled"
+                        name="enabled"
+                        tone="secondary"
+                        checked={digestEnabled}
+                        ariaLabel="Enable weekly digest"
+                        onchange={(event) => (digestEnabledOverride = event.currentTarget.checked)}
+                      />
                     </label>
                   </div>
 
@@ -3571,7 +3569,13 @@
                         </div>
                         <label class="mt-4 flex cursor-pointer items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
                           <span><span class="block text-surface-950-50">Only send new books</span><span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span></span>
-                          <span class="relative shrink-0 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950"><input class="sr-only" type="checkbox" name="onlyNew" checked={digestOnlyNew} role="switch" aria-label="Only send new books" onchange={(event) => (digestOnlyNewOverride = (event.currentTarget as HTMLInputElement).checked)} /><span class={`block h-7 w-12 rounded-full p-1 transition ${digestOnlyNew ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestOnlyNew ? "translate-x-5" : ""}`}></span></span></span>
+                          <Switch
+                            name="onlyNew"
+                            tone="secondary"
+                            checked={digestOnlyNew}
+                            ariaLabel="Only send new books"
+                            onchange={(event) => (digestOnlyNewOverride = event.currentTarget.checked)}
+                          />
                         </label>
                       </section>
 
@@ -3581,12 +3585,19 @@
                           <p class="mt-1 text-sm text-surface-700-300">Choose one or both places to receive it.</p>
                         </div>
                         <div class="grid gap-3">
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-discord" class="sr-only" type="checkbox" name="channels" value="discord" checked={digestDiscord} role="switch" aria-label="Send digest to Discord" onchange={(event) => (digestDiscordOverride = (event.currentTarget as HTMLInputElement).checked)} />
+                          <div class="relative border border-surface-300-700/50 p-4">
                             <label for="digest-discord" class="flex cursor-pointer items-center gap-3">
                               <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
                               <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestDiscord ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestDiscord ? "translate-x-5" : ""}`}></span></span>
+                              <Switch
+                                id="digest-discord"
+                                name="channels"
+                                value="discord"
+                                tone="secondary"
+                                checked={digestDiscord}
+                                ariaLabel="Send digest to Discord"
+                                onchange={(event) => (digestDiscordOverride = event.currentTarget.checked)}
+                              />
                             </label>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
                               <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
@@ -3594,12 +3605,19 @@
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-tertiary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-email" class="sr-only" type="checkbox" name="channels" value="email" checked={digestEmail} role="switch" aria-label="Send digest by email" onchange={(event) => (digestEmailOverride = (event.currentTarget as HTMLInputElement).checked)} />
+                          <div class="relative border border-surface-300-700/50 p-4">
                             <label for="digest-email" class="flex cursor-pointer items-center gap-3">
                               <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
                               <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEmail ? "preset-filled-tertiary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEmail ? "translate-x-5" : ""}`}></span></span>
+                              <Switch
+                                id="digest-email"
+                                name="channels"
+                                value="email"
+                                tone="tertiary"
+                                checked={digestEmail}
+                                ariaLabel="Send digest by email"
+                                onchange={(event) => (digestEmailOverride = event.currentTarget.checked)}
+                              />
                             </label>
                             {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
                               <div class="grid gap-4 sm:grid-cols-2">
@@ -3806,18 +3824,7 @@
                 <p class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
                 <span class="text-xs text-surface-600-400">Optional</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-center gap-2" role="group" aria-label="Optional book rating">
-                {#each [1, 2, 3, 4, 5] as rating (rating)}
-                  <button
-                    type="button"
-                    class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
-                    aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
-                    aria-pressed={markReadRating === rating}
-                    onclick={() => (markReadRating = rating)}
-                  ><span aria-hidden="true">★</span></button>
-                {/each}
-                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => (markReadRating = 0)}>Clear rating</button>{/if}
-              </div>
+              <StarRating bind:value={markReadRating} />
             </div>
           </div>
 
@@ -3889,7 +3896,7 @@
             <label
               class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
+                class="input-ghost min-w-0 flex-1"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"

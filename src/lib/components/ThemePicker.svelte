@@ -132,12 +132,13 @@
 
 			<fieldset class="min-w-0 space-y-2 border-0 p-0">
 				<legend class="text-xs font-semibold uppercase tracking-[0.12em] text-surface-700-300">Color mode</legend>
-				<div class="grid grid-cols-3 gap-1 rounded-container preset-tonal-surface p-1" role="group" aria-label="Color mode">
+				<div class="grid grid-cols-3 gap-1.5 rounded-container border border-[var(--control-border)] preset-tonal-surface p-1.5" role="group" aria-label="Color mode">
 					{#each modes as item}
 						<button
 							in:fly={{ y: 6, duration: motionDuration(180), delay: motionDuration(20) }}
 							type="button"
-							class={`btn min-h-11 flex-col gap-1 ${mode === item.id ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
+							class={`theme-picker-option btn min-h-11 flex-col gap-1 ${mode === item.id ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
+							data-active={mode === item.id ? 'true' : 'false'}
 							aria-pressed={mode === item.id}
 							title={item.description}
 							onclick={() => chooseMode(item.id)}
@@ -154,17 +155,18 @@
 				<div class="flex items-center justify-between gap-3">
 					<span class="text-xs text-surface-700-300">{THEMES.length} palettes</span>
 				</div>
-				<div class="grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto pr-1" role="group" aria-label="Skeleton theme">
+				<div class="-mx-1.5 grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto p-1.5" role="group" aria-label="Skeleton theme">
 					{#each THEMES as item}
 						<button
 							in:fly={{ y: 6, duration: motionDuration(180), delay: motionDuration(20) }}
 							type="button"
-							class={`flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 ${theme === item.id ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
+							class={`theme-picker-option flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors ${theme === item.id ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
+							data-active={theme === item.id ? 'true' : 'false'}
 							aria-pressed={theme === item.id}
 							aria-label={`Use ${item.label} theme`}
 							onclick={() => chooseTheme(item.id)}
 						>
-							<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-surface-300-700" aria-hidden="true">
+							<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-[var(--control-border)]" aria-hidden="true">
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].primary}`}></span>
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].secondary}`}></span>
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[item.id].tertiary}`}></span>
@@ -173,8 +175,39 @@
 							{#if theme === item.id}<span in:scale={{ duration: motionDuration(150) }} out:fade={{ duration: motionDuration(90) }} class="ms-auto shrink-0"><Check size={15} strokeWidth={2.2} aria-hidden="true" /></span>{/if}
 						</button>
 					{/each}
-					</div>
-				</fieldset>
+				</div>
+			</fieldset>
 		</div>
 	{/if}
 </div>
+
+<style>
+	.theme-picker-option {
+		border: 1px solid var(--control-border);
+	}
+
+	.theme-picker-option[data-active='true'] {
+		border-color: var(--control-border-strong);
+	}
+
+	.theme-picker-option:focus-visible {
+		position: relative;
+		z-index: 1;
+		outline: 2px solid var(--focus-ring-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-ring-inner),
+			0 0 0 4px var(--focus-ring-outer);
+	}
+
+	@media (forced-colors: active) {
+		.theme-picker-option[data-active='true'] {
+			border: 2px solid Highlight;
+		}
+
+		.theme-picker-option:focus-visible {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+		}
+	}
+</style>

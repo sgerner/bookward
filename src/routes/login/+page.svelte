@@ -179,6 +179,15 @@
 		transform: translateY(1px);
 	}
 
+	.login-submit:focus-visible {
+		outline: 2px solid var(--focus-ring-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-ring-inner),
+			0 0 0 4px var(--focus-ring-outer),
+			0 10px 28px color-mix(in oklab, var(--color-primary-500) 28%, transparent);
+	}
+
 	@media (prefers-reduced-motion: reduce) {
 		.login-submit {
 			transition: none;
