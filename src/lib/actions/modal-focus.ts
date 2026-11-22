@@ -1,8 +1,22 @@
 const focusableSelector =
   'a[href], area[href], button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled), iframe, object, embed, summary, [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
 
+let activeModalLocks = 0;
+let previousBodyOverflow = "";
+
 export function modalFocus(node: HTMLElement) {
   const previousFocus = document.activeElement;
+  const body = document.body;
+  let unlocked = false;
+
+  if (body?.style) {
+    if (activeModalLocks === 0) {
+      previousBodyOverflow = body.style.overflow;
+    }
+    activeModalLocks += 1;
+    body.style.overflow = "hidden";
+  }
+
   const isAvailable = (element: HTMLElement) =>
     element.tabIndex >= 0 &&
     element.getClientRects().length > 0 &&
@@ -50,8 +64,16 @@ export function modalFocus(node: HTMLElement) {
 
   return {
     destroy() {
+      if (unlocked) return;
+      unlocked = true;
       node.removeEventListener("keydown", onKeydown);
       document.removeEventListener("focusin", onFocusIn);
+      if (body?.style && activeModalLocks > 0) {
+        activeModalLocks -= 1;
+        if (activeModalLocks === 0) {
+          body.style.overflow = previousBodyOverflow;
+        }
+      }
       if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
         previousFocus.focus({ preventScroll: true });
       }
