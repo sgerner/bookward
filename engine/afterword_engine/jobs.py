@@ -3,10 +3,18 @@ import uuid
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from threading import Event, Thread
+from threading import Event, Thread, get_ident
 import time
 
-from .database import rows, transaction
+from .database import (
+    RestoreEpochError,
+    bind_restore_epoch,
+    current_restore_epoch,
+    database_lock,
+    profile_restore_generation,
+    rows,
+    transaction,
+)
 from .security import safe_error_message
 
 LOGGER = logging.getLogger(__name__)
@@ -88,8 +96,12 @@ async def worker_loop(handler, stop):
     from .database import initialize
     from .profiles import profile_ids
     from .tenancy import profile_scope
+    loop = asyncio.get_running_loop()
+    loop_thread_id = get_ident()
     last_reaped_at: dict[str, float] = {}
     ready_profiles: set[str] = set()
+    ready_profile_epochs: dict[str, int] = {}
+    seen_restore_generations: dict[str, int] = {}
     profile_retry_after: dict[str, float] = {}
     while not stop.is_set():
         worked = False
@@ -97,62 +109,138 @@ async def worker_loop(handler, stop):
             if stop.is_set():
                 break
             current = time.monotonic()
-            if current < profile_retry_after.get(profile_id, 0):
-                continue
             try:
                 with profile_scope(profile_id):
+                    lock = database_lock()
+                    if lock.is_restoring():
+                        continue
+                    generation = profile_restore_generation()
+                    if seen_restore_generations.get(profile_id, 0) != generation:
+                        seen_restore_generations[profile_id] = generation
+                        ready_profiles.discard(profile_id)
+                        ready_profile_epochs.pop(profile_id, None)
+                        last_reaped_at.pop(profile_id, None)
+                        profile_retry_after.pop(profile_id, None)
+                    if current < profile_retry_after.get(profile_id, 0):
+                        continue
+                    if (
+                        profile_id in ready_profiles
+                        and ready_profile_epochs.get(profile_id) != current_restore_epoch()
+                    ):
+                        ready_profiles.discard(profile_id)
+                        ready_profile_epochs.pop(profile_id, None)
+                        last_reaped_at.pop(profile_id, None)
                     if profile_id not in ready_profiles:
                         initialize(seed_demo=False)
                         ready_profiles.add(profile_id)
-                    if (
-                        profile_id not in last_reaped_at
-                        or current - last_reaped_at[profile_id] >= JOB_REAPER_SECONDS
-                    ):
-                        _reap_abandoned_jobs()
-                        last_reaped_at[profile_id] = current
-                    job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
-                    if not job:
-                        continue
-                    lease_token = uuid.uuid4().hex
-                    claimed_at = now()
-                    with transaction() as con:
-                        claimed = con.execute(
-                            "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
-                            "lease_token=?,attempts=attempts+1 "
-                            "WHERE id=? AND status='queued'",
-                            (claimed_at, claimed_at, lease_token, job["id"]),
-                        ).rowcount
-                    if not claimed:
-                        continue
-                    worked = True
-                    heartbeat_stop = Event()
-                    heartbeat = Thread(
-                        target=_heartbeat,
-                        args=(profile_id, job["id"], lease_token, heartbeat_stop),
-                        name=f"job-heartbeat-{job['id'][:8]}",
-                        daemon=True,
-                    )
-                    heartbeat.start()
-                    try:
-                        result = await handler(job["kind"])
+                        ready_profile_epochs[profile_id] = current_restore_epoch()
+                        seen_restore_generations[profile_id] = profile_restore_generation()
+                    epoch = current_restore_epoch()
+                    with bind_restore_epoch(epoch):
+                        if (
+                            profile_id not in last_reaped_at
+                            or current - last_reaped_at[profile_id] >= JOB_REAPER_SECONDS
+                        ):
+                            _reap_abandoned_jobs()
+                            last_reaped_at[profile_id] = current
+                        job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
+                        if not job:
+                            continue
+                        lease_token = uuid.uuid4().hex
+                        claimed_at = now()
                         with transaction() as con:
-                            con.execute(
-                                "UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
-                                "WHERE id=? AND status='running' AND lease_token=?",
-                                (json.dumps(result), now(), job["id"], lease_token),
+                            claimed = con.execute(
+                                "UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,"
+                                "lease_token=?,attempts=attempts+1 "
+                                "WHERE id=? AND status='queued'",
+                                (claimed_at, claimed_at, lease_token, job["id"]),
+                            ).rowcount
+                        if not claimed:
+                            continue
+                        worked = True
+                        heartbeat_stop = Event()
+                        job_aborted = Event()
+                        handler_task = asyncio.create_task(handler(job["kind"]))
+
+                        def cancel_handler() -> None:
+                            job_aborted.set()
+                            if get_ident() == loop_thread_id:
+                                handler_task.cancel()
+                                return
+                            try:
+                                loop.call_soon_threadsafe(handler_task.cancel)
+                            except RuntimeError:
+                                pass
+
+                        with lock.track_worker_job(cancel_handler, loop_thread_id):
+                            heartbeat = Thread(
+                                target=_heartbeat,
+                                args=(
+                                    profile_id,
+                                    job["id"],
+                                    lease_token,
+                                    heartbeat_stop,
+                                    cancel_handler,
+                                    epoch,
+                                ),
+                                name=f"job-heartbeat-{job['id'][:8]}",
+                                daemon=True,
                             )
-                    except Exception as exc:
-                        with transaction() as con:
-                            con.execute(
-                                "UPDATE jobs SET status='failed',error=?,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
-                                "WHERE id=? AND status='running' AND lease_token=?",
-                                (safe_error_message(exc, limit=2000), now(), job["id"], lease_token),
-                            )
-                    finally:
-                        heartbeat_stop.set()
-                        await asyncio.to_thread(heartbeat.join)
+                            heartbeat.start()
+                            try:
+                                result = await handler_task
+                                if job_aborted.is_set():
+                                    ready_profiles.discard(profile_id)
+                                    ready_profile_epochs.pop(profile_id, None)
+                                    last_reaped_at.pop(profile_id, None)
+                                else:
+                                    with transaction() as con:
+                                        con.execute(
+                                            "UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
+                                            "WHERE id=? AND status='running' AND lease_token=?",
+                                            (json.dumps(result), now(), job["id"], lease_token),
+                                        )
+                            except asyncio.CancelledError:
+                                outer = asyncio.current_task()
+                                if not job_aborted.is_set() or (
+                                    outer is not None and outer.cancelling()
+                                ):
+                                    handler_task.cancel()
+                                    await asyncio.gather(handler_task, return_exceptions=True)
+                                    raise
+                                ready_profiles.discard(profile_id)
+                                ready_profile_epochs.pop(profile_id, None)
+                                last_reaped_at.pop(profile_id, None)
+                            except RestoreEpochError:
+                                ready_profiles.discard(profile_id)
+                                ready_profile_epochs.pop(profile_id, None)
+                                last_reaped_at.pop(profile_id, None)
+                            except Exception as exc:
+                                if job_aborted.is_set():
+                                    ready_profiles.discard(profile_id)
+                                    ready_profile_epochs.pop(profile_id, None)
+                                    last_reaped_at.pop(profile_id, None)
+                                else:
+                                    with transaction() as con:
+                                        con.execute(
+                                            "UPDATE jobs SET status='failed',error=?,finished_at=?,heartbeat_at=NULL,lease_token=NULL "
+                                            "WHERE id=? AND status='running' AND lease_token=?",
+                                            (safe_error_message(exc, limit=2000), now(), job["id"], lease_token),
+                                        )
+                            finally:
+                                heartbeat_stop.set()
+                                try:
+                                    await asyncio.to_thread(heartbeat.join)
+                                except asyncio.CancelledError:
+                                    heartbeat.join(timeout=1.0)
+                                    raise
+            except RestoreEpochError:
+                ready_profiles.discard(profile_id)
+                ready_profile_epochs.pop(profile_id, None)
+                last_reaped_at.pop(profile_id, None)
             except Exception:
                 ready_profiles.discard(profile_id)
+                ready_profile_epochs.pop(profile_id, None)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
                 LOGGER.exception("Worker skipped unavailable profile %s", profile_id)
         if not worked:
@@ -165,6 +253,8 @@ def _heartbeat(
     job_id: str,
     lease_token: str,
     stop: Event,
+    on_lost_lease=None,
+    expected_epoch: int | None = None,
 ) -> None:
     """Keep a live job leased so another worker cannot mistake it for a crash."""
 
@@ -172,14 +262,24 @@ def _heartbeat(
 
     while not stop.wait(JOB_HEARTBEAT_SECONDS):
         try:
-            with profile_scope(profile_id), transaction() as con:
+            with (
+                profile_scope(profile_id),
+                bind_restore_epoch(expected_epoch),
+                transaction() as con,
+            ):
                 updated = con.execute(
                     "UPDATE jobs SET heartbeat_at=? "
                     "WHERE id=? AND status='running' AND lease_token=?",
                     (now(), job_id, lease_token),
                 ).rowcount
+        except RestoreEpochError:
+            if on_lost_lease is not None:
+                on_lost_lease()
+            return
         except Exception:
             LOGGER.exception("Could not renew lease for job %s", job_id)
             continue
         if not updated:
+            if on_lost_lease is not None:
+                on_lost_lease()
             return

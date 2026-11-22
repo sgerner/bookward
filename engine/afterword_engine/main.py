@@ -19,7 +19,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import (
+    RestoreEpochError,
+    bind_restore_epoch,
+    connect,
+    database_lock,
+    initialize,
+    normalize_key,
+    row,
+    rows,
+    transaction,
+)
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -288,25 +298,35 @@ def _enqueue_candidate_quality_followup():
 def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
-    queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
-        queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
-    if not active_job("metadata") and candidate_metadata_refresh_remaining():
-        queued["metadata"] = enqueue_job("metadata", dedupe=True)
-    if not active_job("read_metadata") and read_metadata_refresh_remaining():
-        queued["read_metadata"] = enqueue_job("read_metadata", dedupe=True)
-    return queued
+    with database_lock().scheduler_guard() as can_schedule:
+        if not can_schedule:
+            return {}
+        with bind_restore_epoch():
+            queued = {}
+            if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+                queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
+            if not active_job("metadata") and candidate_metadata_refresh_remaining():
+                queued["metadata"] = enqueue_job("metadata", dedupe=True)
+            if not active_job("read_metadata") and read_metadata_refresh_remaining():
+                queued["read_metadata"] = enqueue_job("read_metadata", dedupe=True)
+            return queued
 
 
 def queue_digest_if_due():
     """Schedule a digest immediately after scoring, when its window is open."""
 
-    try:
-        if digest_is_due(private_settings()) and not active_job("digest"):
-            return enqueue_job("digest", dedupe=True)
-    except Exception:
+    with database_lock().scheduler_guard() as can_schedule:
+        if not can_schedule:
+            return None
+        try:
+            with bind_restore_epoch():
+                if digest_is_due(private_settings()) and not active_job("digest"):
+                    return enqueue_job("digest", dedupe=True)
+        except RestoreEpochError:
+            raise
+        except Exception:
+            return None
         return None
-    return None
 
 
 async def source_scheduler_loop(stop):
@@ -329,15 +349,20 @@ async def source_scheduler_loop(stop):
             next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
         for profile_id in identity_store.profile_ids():
             try:
-                with profile_scope(profile_id):
-                    if (
-                        source_sync_is_due()
-                        and not active_job("sync")
-                        and not active_job("sync_due")
-                    ):
-                        enqueue_job("sync_due", dedupe=True)
-                    if check_enrichment_retries:
-                        _queue_due_enrichment_retries()
+                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule:
+                    if not can_schedule:
+                        continue
+                    with bind_restore_epoch():
+                        if (
+                            source_sync_is_due()
+                            and not active_job("sync")
+                            and not active_job("sync_due")
+                        ):
+                            enqueue_job("sync_due", dedupe=True)
+                        if check_enrichment_retries:
+                            _queue_due_enrichment_retries()
+            except RestoreEpochError:
+                continue
             except Exception:
                 # A transient profile database error must not stop schedules
                 # for other profiles or terminate the scheduler.
@@ -358,9 +383,14 @@ async def digest_scheduler_loop(stop):
     while not stop.is_set():
         for profile_id in identity_store.profile_ids():
             try:
-                with profile_scope(profile_id):
-                    if digest_is_due(private_settings()) and not active_job("digest"):
-                        enqueue_job("digest", dedupe=True)
+                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule:
+                    if not can_schedule:
+                        continue
+                    with bind_restore_epoch():
+                        if digest_is_due(private_settings()) and not active_job("digest"):
+                            enqueue_job("digest", dedupe=True)
+            except RestoreEpochError:
+                continue
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
         try:
@@ -372,51 +402,55 @@ async def digest_scheduler_loop(stop):
 def queue_goodreads_rss_if_due(current_time=None):
     """Queue the nightly Goodreads feed sync and retry failures up to three times."""
 
-    now = current_time or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now = now.astimezone(timezone.utc)
-    if now.hour < GOODREADS_RSS_SYNC_HOUR_UTC:
-        return None
-    if not private_settings().get("goodreads_rss_url", "").strip():
-        return None
+    with database_lock().scheduler_guard() as can_schedule:
+        if not can_schedule:
+            return None
+        with bind_restore_epoch():
+            now = current_time or datetime.now(timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            now = now.astimezone(timezone.utc)
+            if now.hour < GOODREADS_RSS_SYNC_HOUR_UTC:
+                return None
+            if not private_settings().get("goodreads_rss_url", "").strip():
+                return None
 
-    sync_date = now.date().isoformat()
-    with transaction() as con:
-        scheduled = con.execute(
-            "SELECT id,status,attempts FROM jobs WHERE kind='goodreads_rss' "
-            "AND date(created_at)=? ORDER BY created_at DESC LIMIT 1",
-            (sync_date,),
-        ).fetchone()
-        if scheduled:
-            if scheduled["status"] in {"queued", "running", "complete"}:
-                return scheduled["id"] if scheduled["status"] != "complete" else None
-            if scheduled["status"] == "failed":
-                if int(scheduled["attempts"] or 0) >= GOODREADS_RSS_MAX_ATTEMPTS:
-                    return None
-                updated = con.execute(
-                    "UPDATE jobs SET status='queued',error=NULL,finished_at=NULL "
-                    "WHERE id=? AND status='failed' AND attempts<?",
-                    (scheduled["id"], GOODREADS_RSS_MAX_ATTEMPTS),
-                ).rowcount
-                return scheduled["id"] if updated else None
-        active = con.execute(
-            "SELECT id FROM jobs WHERE kind='goodreads_rss' "
-            "AND status IN ('queued','running') LIMIT 1"
-        ).fetchone()
-        if active:
-            return active["id"]
-        job_id = str(uuid.uuid4())
-        con.execute(
-            "INSERT INTO jobs(id,kind,status) VALUES(?,'goodreads_rss','queued')",
-            (job_id,),
-        )
-        con.execute(
-            "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
-            (sync_date,),
-        )
-        return job_id
+            sync_date = now.date().isoformat()
+            with transaction() as con:
+                scheduled = con.execute(
+                    "SELECT id,status,attempts FROM jobs WHERE kind='goodreads_rss' "
+                    "AND date(created_at)=? ORDER BY created_at DESC LIMIT 1",
+                    (sync_date,),
+                ).fetchone()
+                if scheduled:
+                    if scheduled["status"] in {"queued", "running", "complete"}:
+                        return scheduled["id"] if scheduled["status"] != "complete" else None
+                    if scheduled["status"] == "failed":
+                        if int(scheduled["attempts"] or 0) >= GOODREADS_RSS_MAX_ATTEMPTS:
+                            return None
+                        updated = con.execute(
+                            "UPDATE jobs SET status='queued',error=NULL,finished_at=NULL "
+                            "WHERE id=? AND status='failed' AND attempts<?",
+                            (scheduled["id"], GOODREADS_RSS_MAX_ATTEMPTS),
+                        ).rowcount
+                        return scheduled["id"] if updated else None
+                active = con.execute(
+                    "SELECT id FROM jobs WHERE kind='goodreads_rss' "
+                    "AND status IN ('queued','running') LIMIT 1"
+                ).fetchone()
+                if active:
+                    return active["id"]
+                job_id = str(uuid.uuid4())
+                con.execute(
+                    "INSERT INTO jobs(id,kind,status) VALUES(?,'goodreads_rss','queued')",
+                    (job_id,),
+                )
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date',?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                    (sync_date,),
+                )
+                return job_id
 
 
 async def goodreads_rss_scheduler_loop(stop):
@@ -429,8 +463,13 @@ async def goodreads_rss_scheduler_loop(stop):
     while not stop.is_set():
         for profile_id in identity_store.profile_ids():
             try:
-                with profile_scope(profile_id):
-                    queue_goodreads_rss_if_due()
+                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule:
+                    if not can_schedule:
+                        continue
+                    with bind_restore_epoch():
+                        queue_goodreads_rss_if_due()
+            except RestoreEpochError:
+                continue
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
         try:
@@ -439,6 +478,11 @@ async def goodreads_rss_scheduler_loop(stop):
             pass
 
 async def handle_job(kind: str):
+    with bind_restore_epoch():
+        return await _handle_job(kind)
+
+
+async def _handle_job(kind: str):
     config = private_settings()
     if kind == "read_work_identities":
         result = await refresh_read_work_identities()
@@ -580,6 +624,8 @@ async def handle_job(kind: str):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
+        except RestoreEpochError:
+            raise
         except Exception as exc:
             message = safe_error_message(exc)
             with transaction() as con:
@@ -615,6 +661,8 @@ async def handle_job(kind: str):
         for source in sources:
             try:
                 total += await scan_source(source)
+            except RestoreEpochError:
+                raise
             except Exception as exc:
                 message = safe_error_message(exc)
                 with transaction() as con:

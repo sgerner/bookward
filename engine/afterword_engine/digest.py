@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from .database import row, rows, transaction
+from .database import RestoreEpochError, row, rows, transaction
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
 from .ingestion import read_identity_rows_with_current_verified_work_ids
 from .security import safe_error_message, validate_public_url
@@ -539,6 +539,8 @@ async def send_digest(
                 await _send_email(config, subject, body)
             _delivery_result(delivery_id, True)
             return {"id": delivery_id, "channel": channel, "status": "sent"}
+        except RestoreEpochError:
+            raise
         except Exception as exc:
             error = safe_error_message(exc)
             _delivery_result(delivery_id, False, error)
@@ -608,6 +610,8 @@ async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
                 candidate_ids = []
             _mark_period_sent(delivery["period_key"], candidate_ids)
         return {"id": delivery_id, "status": "sent"}
+    except RestoreEpochError:
+        raise
     except Exception as exc:
         error = safe_error_message(exc)
         _delivery_result(delivery_id, False, error)

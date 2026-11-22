@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
@@ -9,10 +10,20 @@ from fastapi.testclient import TestClient
 from auth_helpers import authenticated_headers
 from cryptography.fernet import Fernet
 
-from afterword_engine import backups
+from afterword_engine import backups, profiles, scoring
 from afterword_engine.config import settings
-from afterword_engine.database import initialize, private_setting, row, transaction
-from afterword_engine.main import app
+from afterword_engine.database import (
+    RestoreEpochError,
+    current_restore_epoch,
+    initialize,
+    private_setting,
+    row,
+    rows,
+    transaction,
+)
+from afterword_engine.embeddings import content_hash, vector_blob
+from afterword_engine.jobs import enqueue_job, worker_loop
+from afterword_engine.main import app, handle_job, queue_goodreads_rss_if_due
 from afterword_engine.secrets import seal
 
 
@@ -299,3 +310,250 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
     assert restored.json()["restored_backup"] == backup["id"]
     assert row("SELECT 1 FROM reads WHERE title='API recovery'") is not None
     assert private_setting("api_recovery_secret") == "api secret"
+
+
+def test_restore_while_rebuild_embeddings_awaits_vectors_preserves_restored_embeddings(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    reads_list = rows("SELECT * FROM reads ORDER BY id")
+    candidates_list = rows("SELECT * FROM candidates ORDER BY id")
+    expected_total = len(reads_list) + len(candidates_list)
+    assert expected_total >= 8
+
+    with transaction() as con:
+        con.execute("DELETE FROM embeddings")
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','ollama',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','nomic-embed-text',0)"
+        )
+        for entity_type, items in (("read", reads_list), ("candidate", candidates_list)):
+            for item in items:
+                vector = [0.25] * 4
+                con.execute(
+                    "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        entity_type,
+                        item["id"],
+                        "ollama",
+                        "nomic-embed-text",
+                        vector_blob(vector),
+                        len(vector),
+                        content_hash(scoring.document(item)),
+                    ),
+                )
+    snapshot = backups.create_backup()
+
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','openai',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','text-embedding-3-small',0)"
+        )
+
+    awaiting_vectors = asyncio.Event()
+    release_vectors = asyncio.Event()
+
+    class SlowEmbedder:
+        name = "openai"
+        model = "text-embedding-3-small"
+
+        async def embed(self, texts):
+            awaiting_vectors.set()
+            await release_vectors.wait()
+            return [[0.75] * 4 for _ in texts]
+
+    monkeypatch.setattr(scoring, "get_embedder", lambda *_args, **_kwargs: SlowEmbedder())
+
+    # 1. Worker-managed rebuild_embeddings is canceled during restore quiescence.
+    enqueue_job("rebuild_embeddings", dedupe=True)
+    stop = asyncio.Event()
+
+    async def run_worker_restore():
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
+        await asyncio.wait_for(awaiting_vectors.wait(), timeout=2)
+        await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+        stop.set()
+        release_vectors.set()
+        await asyncio.wait_for(worker, timeout=2)
+
+    asyncio.run(run_worker_restore())
+
+    stored = rows("SELECT entity_type,entity_id,backend,model FROM embeddings")
+    assert len(stored) == expected_total
+    assert {(item["backend"], item["model"]) for item in stored} == {
+        ("ollama", "nomic-embed-text")
+    }
+    assert private_setting("embedding_backend") == "ollama"
+    assert current_restore_epoch() == 1
+    assert rows("SELECT id FROM jobs WHERE status IN ('queued','running')") == []
+
+    # 2. Even if an unfenced coroutine/thread resumes from await after restore swaps
+    #    an older snapshot (epoch 0 -> 2), transaction() blocks all writes by epoch.
+    awaiting_vectors = asyncio.Event()
+    release_vectors = asyncio.Event()
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','openai',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','text-embedding-3-small',0)"
+        )
+
+    async def run_late_resumed_rebuild():
+        rebuild_task = asyncio.create_task(handle_job("rebuild_embeddings"))
+        await asyncio.wait_for(awaiting_vectors.wait(), timeout=2)
+        await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+        release_vectors.set()
+        with pytest.raises(RestoreEpochError):
+            await asyncio.wait_for(rebuild_task, timeout=2)
+
+    asyncio.run(run_late_resumed_rebuild())
+
+    stored_after = rows("SELECT entity_type,entity_id,backend,model FROM embeddings")
+    assert len(stored_after) == expected_total
+    assert {(item["backend"], item["model"]) for item in stored_after} == {
+        ("ollama", "nomic-embed-text")
+    }
+    assert current_restore_epoch() == 2
+
+
+def test_restore_and_startup_recovery_scrub_unfinished_jobs_and_keep_terminal_rows(database):
+    today = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+    created_iso = today.isoformat()
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('goodreads_rss_url','https://www.goodreads.com/review/list_rss/1',0)"
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,created_at) VALUES('job-queued','digest:manual','queued',?)",
+            (created_iso,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,started_at,heartbeat_at,lease_token,attempts,created_at) "
+            "VALUES('job-running','goodreads_rss','running',?,?,?,1,?)",
+            (created_iso, created_iso, "stale-lease", created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,result,finished_at,created_at) "
+            "VALUES('job-complete','score','complete','{\"scored\": 4}',?,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,error,attempts,finished_at,created_at) "
+            "VALUES('job-failed','sync','failed','network timeout',3,?,?)",
+            (created_iso, created_iso),
+        )
+    snapshot = backups.create_backup()
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,created_at) VALUES('safety-queued','sync','queued',?)",
+            (created_iso,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,started_at,lease_token,attempts,created_at) "
+            "VALUES('safety-running','score','running',?,'live-lease',1,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,result,finished_at,created_at) "
+            "VALUES('safety-complete','goodreads_rss','complete','{}',?,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,error,attempts,finished_at,created_at) "
+            "VALUES('safety-failed','digest','failed','smtp down',3,?,?)",
+            (created_iso, created_iso),
+        )
+
+    result = backups.restore_backup(snapshot["id"])
+    assert current_restore_epoch() == 1
+    restored_jobs = {
+        item["id"]: item["status"] for item in rows("SELECT id,status FROM jobs")
+    }
+    assert restored_jobs == {
+        "job-complete": "complete",
+        "job-failed": "failed",
+    }
+    # Scrubbing the running goodreads_rss row deleted it instead of marking it failed,
+    # so the scheduler queues a fresh job cleanly rather than replaying a stale row.
+    fresh_job_id = queue_goodreads_rss_if_due(today)
+    assert fresh_job_id is not None
+    assert fresh_job_id != "job-running"
+
+    # Simulate an interrupted restore rolling back to safety_backup on startup.
+    safety_path = database / "backups" / f"{result['safety_backup']['id']}.sqlite3"
+    backups._write_restore_journal(safety_path, safety_path)
+    assert backups.recover_interrupted_restore() is True
+    assert current_restore_epoch() == 2
+    recovered_jobs = {
+        item["id"]: item["status"] for item in rows("SELECT id,status FROM jobs")
+    }
+    assert recovered_jobs == {
+        "safety-complete": "complete",
+        "safety-failed": "failed",
+    }
+
+
+def test_failed_restore_prechecks_preserve_active_jobs_and_restore_epoch(database):
+    profiles.initialize_auth()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("precheck_secret", seal("live secret")),
+        )
+    valid_backup = backups.create_backup()
+    key_sidecar = database / "backups" / f"{valid_backup['id']}.secret.key"
+    original_key = key_sidecar.read_bytes()
+    key_sidecar.write_bytes(Fernet.generate_key())
+    key_sidecar.chmod(0o600)
+
+    corrupt_id = "bookward-20260102T000000Z-badbad00"
+    corrupt_snapshot = database / "backups" / f"{corrupt_id}.sqlite3"
+    with sqlite3.connect(corrupt_snapshot) as con:
+        con.execute("CREATE TABLE not_bookward (id INTEGER)")
+
+    job_id = enqueue_job("keep_running")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    stop = asyncio.Event()
+    cancelled = False
+
+    async def active_handler(kind):
+        nonlocal cancelled
+        assert kind == "keep_running"
+        started.set()
+        try:
+            await release.wait()
+            stop.set()
+            return {"preserved": True}
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async def run():
+        worker = asyncio.create_task(worker_loop(active_handler, stop))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        try:
+            for bad_id in ("../invalid", corrupt_id, valid_backup["id"]):
+                with pytest.raises(backups.BackupError):
+                    await asyncio.to_thread(backups.restore_backup, bad_id)
+            assert cancelled is False
+            assert current_restore_epoch() == 0
+        finally:
+            release.set()
+            await asyncio.wait_for(worker, timeout=2)
+            key_sidecar.write_bytes(original_key)
+
+    asyncio.run(run())
+
+    assert cancelled is False
+    assert current_restore_epoch() == 0
+    finished = row("SELECT status,result FROM jobs WHERE id=?", (job_id,))
+    assert finished == {"status": "complete", "result": '{"preserved": true}'}

@@ -18,10 +18,19 @@ from fastapi.testclient import TestClient
 from afterword_engine import backups, database, profiles
 from afterword_engine.api_tokens import generate_api_token, legacy_hash_api_token
 from afterword_engine.config import settings
-from afterword_engine.database import MIGRATIONS, connect, database_lock, initialize, transaction
+from afterword_engine.database import (
+    MIGRATIONS,
+    RestoreEpochError,
+    bind_restore_epoch,
+    connect,
+    current_restore_epoch,
+    database_lock,
+    initialize,
+    transaction,
+)
 import afterword_engine.jobs as jobs
 from afterword_engine.jobs import enqueue_job, worker_loop
-from afterword_engine.main import app
+from afterword_engine.main import app, queue_goodreads_rss_if_due
 from afterword_engine.secrets import installation_key, installation_key_path, seal, unseal
 from afterword_engine.tenancy import current_profile_id, profile_database_path, profile_scope
 
@@ -740,6 +749,225 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
             executor.shutdown(wait=True)
         assert lock_acquired.wait(timeout=2)
         restore.result(timeout=2)
+
+
+def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_restore(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        snapshot = backups.create_backup()
+        first_job_id = enqueue_job("disappearing_lease")
+
+    init_calls: list[str] = []
+    original_initialize = database.initialize
+
+    def spy_initialize(*, seed_demo=True):
+        init_calls.append(current_profile_id() or "legacy")
+        return original_initialize(seed_demo=seed_demo)
+
+    monkeypatch.setattr(database, "initialize", spy_initialize)
+
+    stop = asyncio.Event()
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    never_complete = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def handler(kind):
+        if kind == "disappearing_lease":
+            first_started.set()
+            try:
+                await never_complete.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+        if kind == "after_restore":
+            second_done.set()
+            stop.set()
+            return {"after_restore": True}
+        return {}
+
+    async def run():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            assert init_calls == ["legacy"]
+            with profile_scope("legacy"), transaction() as con:
+                con.execute("DELETE FROM jobs WHERE id=?", (first_job_id,))
+            await asyncio.wait_for(first_cancelled.wait(), timeout=2)
+
+            with profile_scope("legacy"):
+                await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+                second_job_id = enqueue_job("after_restore")
+
+            await asyncio.wait_for(second_done.wait(), timeout=2)
+            await asyncio.wait_for(worker, timeout=2)
+            return second_job_id
+        finally:
+            stop.set()
+            never_complete.set()
+
+    second_job_id = asyncio.run(run())
+
+    with profile_scope("legacy"), connect() as con:
+        second_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (second_job_id,)
+        ).fetchone()
+    assert first_cancelled.is_set()
+    assert init_calls.count("legacy") >= 2
+    assert second_job["status"] == "complete"
+    assert second_job["result"] == '{"after_restore": true}'
+
+
+def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants(
+    identity_store,
+):
+    from datetime import datetime, timezone
+
+    alice = profiles.create_account("tenant-alice", "tenant-alice-password-long")
+    bob = profiles.create_account("tenant-bob", "tenant-bob-password-long")
+    sync_time = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+
+    for account, rss_url in (
+        (alice, "https://www.goodreads.com/review/list_rss/alice"),
+        (bob, "https://www.goodreads.com/review/list_rss/bob"),
+    ):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            with transaction() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,0)",
+                    (rss_url,),
+                )
+
+    with profile_scope(alice["profile_id"]):
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice snapshot read','Alice','test')"
+            )
+            con.execute(
+                "INSERT INTO jobs(id,kind,status) VALUES('alice-stale-queued','sync','queued')"
+            )
+        alice_backup = backups.create_backup()
+        with transaction() as con:
+            con.execute("DELETE FROM jobs WHERE id='alice-stale-queued'")
+        alice_live_job = enqueue_job("alice_active")
+
+    with profile_scope(bob["profile_id"]):
+        bob_live_job = enqueue_job("bob_active")
+
+    alice_started = asyncio.Event()
+    alice_cancelled = asyncio.Event()
+    alice_hold = asyncio.Event()
+    bob_started = asyncio.Event()
+    bob_release = asyncio.Event()
+    alice_stop = asyncio.Event()
+    bob_stop = asyncio.Event()
+
+    async def alice_handler(kind):
+        if current_profile_id() != alice["profile_id"]:
+            await asyncio.sleep(0.05)
+            return {}
+        assert kind == "alice_active"
+        alice_started.set()
+        try:
+            await alice_hold.wait()
+        except asyncio.CancelledError:
+            alice_cancelled.set()
+            raise
+        return {"owner": "alice"}
+
+    async def bob_handler(kind):
+        assert current_profile_id() == bob["profile_id"]
+        assert kind == "bob_active"
+        bob_started.set()
+        await bob_release.wait()
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Bob concurrent read','Bob','test')"
+            )
+        bob_stop.set()
+        return {"owner": "bob"}
+
+    async def run():
+        # Run dedicated profile-filtered workers concurrently so Alice's active job
+        # and Bob's active job are both in flight when Alice restores.
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        try:
+            alice_worker = asyncio.create_task(worker_loop(alice_handler, alice_stop))
+            await asyncio.wait_for(alice_started.wait(), timeout=2)
+
+            profiles.profile_ids = lambda: [bob["profile_id"]]
+            bob_worker = asyncio.create_task(worker_loop(bob_handler, bob_stop))
+            await asyncio.wait_for(bob_started.wait(), timeout=2)
+            profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+
+            # While Alice's quiescence barrier is active, Alice's scheduler pauses
+            # while Bob's scheduler still queues work normally.
+            with profile_scope(alice["profile_id"]):
+                alice_lock = database_lock()
+            with alice_lock.quiesce():
+                await asyncio.wait_for(alice_cancelled.wait(), timeout=2)
+                with profile_scope(alice["profile_id"]):
+                    assert queue_goodreads_rss_if_due(sync_time) is None
+                with profile_scope(bob["profile_id"]):
+                    bob_scheduled = queue_goodreads_rss_if_due(sync_time)
+                    assert bob_scheduled is not None
+
+            # Capture a pre-restore epoch fence for Alice before swapping Alice's DB.
+            with profile_scope(alice["profile_id"]):
+                pre_restore_epoch = current_restore_epoch()
+                assert pre_restore_epoch == 0
+                await asyncio.to_thread(backups.restore_backup, alice_backup["id"])
+                with bind_restore_epoch(pre_restore_epoch):
+                    with pytest.raises(RestoreEpochError):
+                        with transaction() as con:
+                            con.execute(
+                                "INSERT INTO reads(title,author,source) VALUES('Late Alice write','Alice','test')"
+                            )
+
+            # Bob's active job was never canceled or fenced by Alice's restore.
+            bob_release.set()
+            await asyncio.wait_for(bob_worker, timeout=2)
+            alice_stop.set()
+            await asyncio.wait_for(alice_worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            alice_stop.set()
+            bob_stop.set()
+            alice_hold.set()
+            bob_release.set()
+
+    asyncio.run(run())
+
+    with profile_scope(alice["profile_id"]), connect() as con:
+        alice_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        alice_jobs = con.execute(
+            "SELECT id,status FROM jobs WHERE status IN ('queued','running')"
+        ).fetchall()
+        alice_epoch = current_restore_epoch()
+    assert alice_reads == {"Alice snapshot read"}
+    assert alice_jobs == []
+    assert alice_epoch == 1
+    assert alice_live_job is not None
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        bob_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (bob_live_job,)
+        ).fetchone()
+        bob_epoch = current_restore_epoch()
+    assert "Bob concurrent read" in bob_reads
+    assert bob_job["status"] == "complete"
+    assert bob_job["result"] == '{"owner": "bob"}'
+    assert bob_epoch == 0
 
 
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):
