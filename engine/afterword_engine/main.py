@@ -78,6 +78,7 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    sync_read_rating_in_connection,
     _impression_precedes,
     _read_label,
     _read_time,
@@ -680,7 +681,7 @@ app.add_middleware(
     # the engine port does not turn every legacy endpoint into a wildcard CORS
     # API.
     allow_origins=[settings.cors_origin],
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
@@ -1210,6 +1211,30 @@ class MarkReadIn(BaseModel):
     )
 
 
+class ReadingHistoryRatingIn(BaseModel):
+    rating: int | None = None
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def validate_whole_star_rating(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, int):
+            if 1 <= value <= 5:
+                return value
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "":
+                return None
+            if trimmed in {"1", "2", "3", "4", "5"}:
+                return int(trimmed)
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+
+
 class TelemetryEventIn(BaseModel):
     event_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
     candidate_id: int = Field(gt=0)
@@ -1633,6 +1658,52 @@ def reading_history():
         item["algorithm_explanation"] = []
         item["metadata_confidence"] = None
     return items
+
+
+@app.put("/api/reading-history/{read_id}")
+@app.patch("/api/reading-history/{read_id}")
+def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    """Set, change, or clear a whole-star rating on an existing read entry."""
+    if read_id <= 0:
+        raise HTTPException(404, "Read entry not found")
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?",
+            (read_id,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        con.execute(
+            "UPDATE reads SET rating=? WHERE id=?",
+            (payload.rating, read_id),
+        )
+        updated = dict(
+            con.execute(
+                "SELECT * FROM reads WHERE id=?",
+                (read_id,),
+            ).fetchone()
+        )
+        try:
+            sync_read_rating_in_connection(con, updated)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    job_id = enqueue_followup_job("score")
+    raw_rating = updated.get("rating")
+    normalized_rating = (
+        int(raw_rating)
+        if raw_rating is not None and float(raw_rating).is_integer()
+        else raw_rating
+    )
+    return {
+        "id": int(updated["id"]),
+        "title": updated["title"],
+        "author": updated["author"],
+        "rating": normalized_rating,
+        "read_at": updated.get("read_at"),
+        "source": updated.get("source") or "",
+        "created_at": updated.get("created_at"),
+        "job_id": job_id,
+    }
 
 
 @app.get("/api/reading-history/scores")
@@ -3180,6 +3251,8 @@ def api_root():
         "documentation": "GET /openapi.json or /docs on the engine",
         "endpoints": {
             "overview": "GET /api/v1/overview",
+            "reading_history": "GET /api/v1/reading-history",
+            "reading_history_rating": "PUT /api/v1/reading-history/{id}",
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
@@ -3203,6 +3276,17 @@ def api_me(request: Request):
 @api_v1.get("/overview")
 def api_overview():
     return overview_payload(include_api_tokens=False)
+
+
+@api_v1.get("/reading-history")
+def api_reading_history():
+    return reading_history()
+
+
+@api_v1.put("/reading-history/{read_id}")
+@api_v1.patch("/reading-history/{read_id}")
+def api_update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    return update_reading_history_rating(read_id, payload)
 
 
 @api_v1.get("/settings")

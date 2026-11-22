@@ -9,7 +9,7 @@ const forwardedHeaders = [
   "idempotency-key",
   "x-api-key",
 ];
-const nestedApiMethods = "GET, POST, PUT, DELETE, OPTIONS";
+const nestedApiMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 const rootApiMethods = "GET, OPTIONS";
 
 function corsHeaders(request: Request, methods = nestedApiMethods) {

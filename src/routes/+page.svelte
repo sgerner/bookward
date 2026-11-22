@@ -42,6 +42,12 @@
   import ProfileField from "#lib/components/ProfileField.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import {
+    applyRatingOverrides,
+    effectiveBookRating,
+    formatRatingConfirmation,
+    starButtonLabel,
+  } from "#lib/reading-history-ratings.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
@@ -119,16 +125,24 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreGeneration = 0;
+  let readingHistoryScoreAbortController: AbortController | null = null;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let committedHistoryRatings = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
+  let discoverNeedsRefresh = $state(false);
+  let ratingRequestSeq = new Map<number, number>();
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -287,6 +301,12 @@
         matchesBookFilter(book),
     ),
   );
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = filter.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -305,7 +325,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -615,7 +635,7 @@
       }
       readingHistory = payload.items;
       readingHistoryState = "ready";
-      void loadReadingHistoryScores(payload.items.length);
+      void loadReadingHistoryScores(payload.items.length, { restart: true });
     } catch (error) {
       readingHistoryError = error instanceof Error
         ? error.message
@@ -623,22 +643,35 @@
       readingHistoryState = "error";
     }
   }
-  function loadReadingHistoryScores(total: number) {
-    if (readingHistoryScoreTask) return readingHistoryScoreTask;
+  function loadReadingHistoryScores(total: number, options: { restart?: boolean } = {}) {
+    if (options.restart) {
+      readingHistoryScoreGeneration += 1;
+      readingHistoryScoreAbortController?.abort();
+      readingHistoryScoreAbortController = null;
+      readingHistoryScoreOffset = 0;
+      readingHistoryScoreTask = null;
+    } else if (readingHistoryScoreTask) {
+      return readingHistoryScoreTask;
+    }
     const batchSize = 20;
     if (total === 0) {
       readingHistoryScoreState = "ready";
       return Promise.resolve();
     }
+    const generation = readingHistoryScoreGeneration;
+    const controller = new AbortController();
+    readingHistoryScoreAbortController = controller;
     readingHistoryScoreState = "loading";
     readingHistoryScoreError = "";
     const task = (async () => {
       try {
         for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
+          if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
           const response = await fetch(
             `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
-            { headers: profileHeaders },
+            { headers: profileHeaders, signal: controller.signal },
           );
+          if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
           const payload = (await response.json().catch(() => ({}))) as {
             scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
             message?: string;
@@ -653,18 +686,130 @@
           });
           readingHistoryScoreOffset = offset + batchSize;
         }
-        readingHistoryScoreState = "ready";
+        if (generation === readingHistoryScoreGeneration && !controller.signal.aborted) {
+          readingHistoryScoreState = "ready";
+        }
       } catch (error) {
+        if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
         readingHistoryScoreError = error instanceof Error
           ? error.message
           : "Reading history scores could not be loaded.";
         readingHistoryScoreState = "error";
       } finally {
-        readingHistoryScoreTask = null;
+        if (generation === readingHistoryScoreGeneration) {
+          readingHistoryScoreTask = null;
+        }
+        if (readingHistoryScoreAbortController === controller) {
+          readingHistoryScoreAbortController = null;
+        }
       }
     })();
     readingHistoryScoreTask = task;
     return task;
+  }
+  function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return Promise.resolve();
+    return loadReadingHistoryScores(readingHistory.length, { restart: true });
+  }
+  async function updateReadingHistoryRating(
+    item: { id: number; title: string; rating: number | null },
+    nextRating: number | null,
+    surface: "history" | "recent",
+    triggerElement?: HTMLElement | null,
+  ) {
+    const currentRating = effectiveBookRating(item.id, item.rating, historyRatingOverrides);
+    if (currentRating === nextRating && !pendingRatingIds.has(item.id)) return;
+
+    const hadKeyboardFocus =
+      typeof document !== "undefined" &&
+      triggerElement != null &&
+      document.activeElement === triggerElement;
+    const clearingFocusedControl = hadKeyboardFocus && nextRating === null;
+
+    const baselineRating = Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)
+      ? committedHistoryRatings[item.id]
+      : currentRating;
+    if (!Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)) {
+      committedHistoryRatings = { ...committedHistoryRatings, [item.id]: baselineRating };
+    }
+
+    const seq = (ratingRequestSeq.get(item.id) ?? 0) + 1;
+    ratingRequestSeq.set(item.id, seq);
+    historyRatingOverrides = { ...historyRatingOverrides, [item.id]: nextRating };
+    readingHistory = readingHistory.map((entry) =>
+      entry.id === item.id ? { ...entry, rating: nextRating } : entry,
+    );
+    pendingRatingIds = new Set([...pendingRatingIds, item.id]);
+
+    if (hadKeyboardFocus && typeof document !== "undefined") {
+      void tick().then(() => {
+        if (clearingFocusedControl) {
+          const firstStar = document.querySelector<HTMLButtonElement>(
+            `[data-rating-star="${surface}-${item.id}-1"]`,
+          );
+          if (firstStar) {
+            firstStar.focus();
+            return;
+          }
+        }
+        if (document.activeElement === document.body) {
+          const fallback =
+            document.querySelector<HTMLButtonElement>(
+              `[data-rating-star^="${surface}-"][data-rating-star$="-1"]`,
+            ) ??
+            document.querySelector<HTMLElement>('[aria-label="Filter read books by rating"]');
+          fallback?.focus();
+        }
+      });
+    }
+
+    try {
+      const response = await fetch("/api/reading-history", {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ id: item.id, rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      const savedRating =
+        payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+      committedHistoryRatings = { ...committedHistoryRatings, [item.id]: savedRating };
+      if (ratingRequestSeq.get(item.id) !== seq) return;
+      historyRatingOverrides = { ...historyRatingOverrides, [item.id]: savedRating };
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === item.id ? { ...entry, rating: savedRating } : entry,
+      );
+      discoverNeedsRefresh = true;
+      announceActionSuccess(formatRatingConfirmation(item.title, savedRating));
+      if (readingHistoryState === "ready") {
+        void refreshReadingHistoryScores();
+      }
+    } catch (error) {
+      if (ratingRequestSeq.get(item.id) !== seq) return;
+      const reverted = Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)
+        ? committedHistoryRatings[item.id]
+        : baselineRating;
+      historyRatingOverrides = { ...historyRatingOverrides, [item.id]: reverted };
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === item.id ? { ...entry, rating: reverted } : entry,
+      );
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    } finally {
+      if (ratingRequestSeq.get(item.id) === seq) {
+        const nextPending = new Set(pendingRatingIds);
+        nextPending.delete(item.id);
+        pendingRatingIds = nextPending;
+      }
+    }
   }
   function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
     decisionFilter = filter;
@@ -701,6 +846,13 @@
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
     if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
+    if (view === "discover" && discoverNeedsRefresh) {
+      discoverNeedsRefresh = false;
+      additionalDiscoverBooks = [];
+      discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      discoverHasMore = true;
+      void invalidateAll();
+    }
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
@@ -1392,6 +1544,31 @@
     additionalDecisionBooks = [];
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => {
+      if (pendingRatingIds.size === 0) {
+        committedHistoryRatings = {};
+        historyRatingOverrides = {};
+        return;
+      }
+      const nextCommitted: Record<number, number | null> = {};
+      const nextOverrides: Record<number, number | null> = {};
+      for (const id of pendingRatingIds) {
+        if (Object.prototype.hasOwnProperty.call(committedHistoryRatings, id)) {
+          nextCommitted[id] = committedHistoryRatings[id];
+        }
+        if (Object.prototype.hasOwnProperty.call(historyRatingOverrides, id)) {
+          nextOverrides[id] = historyRatingOverrides[id];
+        }
+      }
+      committedHistoryRatings = nextCommitted;
+      historyRatingOverrides = nextOverrides;
+    });
   });
 
   $effect(() => {
@@ -2258,6 +2435,9 @@
                         {/if}
                       </div>
                     </div>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-3">
+                      {@render inlineStarRating(item, "history")}
+                    </div>
                     <div class="mt-3 border-t border-surface-300-700/40 pt-2">
                       <button
                         type="button"
@@ -2316,6 +2496,36 @@
             {/if}
           </section>
         {/if}
+      {/snippet}
+
+      {#snippet inlineStarRating(item: { id: number; title: string; rating: number | null }, surface: "history" | "recent")}
+        {@const currentRating = item.rating}
+        {@const ratingPending = pendingRatingIds.has(item.id)}
+        <div
+          class="flex flex-wrap items-center gap-1.5"
+          role="group"
+          aria-label={`Rating for ${item.title}`}
+          aria-busy={ratingPending}
+          data-rating-group={`${surface}-${item.id}`}
+        >
+          {#each [1, 2, 3, 4, 5] as rating (rating)}
+            <button
+              type="button"
+              data-rating-star={`${surface}-${item.id}-${rating}`}
+              class={`grid size-9 place-items-center rounded-lg border text-base transition duration-150 motion-safe:hover:-translate-y-0.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${(currentRating ?? 0) >= rating ? "border-amber-500/60 bg-amber-500/15 text-amber-700 shadow-sm dark:border-amber-400/50 dark:bg-amber-400/15 dark:text-amber-300" : "border-surface-300-700/70 bg-surface-50-950/50 text-surface-600-400 hover:border-amber-500/50 hover:text-amber-600 dark:hover:border-amber-400/40 dark:hover:text-amber-300"}`}
+              aria-label={starButtonLabel(rating)}
+              aria-pressed={currentRating === rating}
+              onclick={(event) => void updateReadingHistoryRating(item, rating, surface, event.currentTarget)}
+            ><span aria-hidden="true">★</span></button>
+          {/each}
+          {#if currentRating !== null && currentRating > 0}
+            <button
+              type="button"
+              class="btn btn-sm ml-1 min-h-9 preset-tonal-surface text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500"
+              onclick={(event) => void updateReadingHistoryRating(item, null, surface, event.currentTarget)}
+            >Clear rating</button>
+          {/if}
+        </div>
       {/snippet}
 
       <!-- Layer each view in the same grid cell so fade intros/outros overlap instead of leaving a blank frame. -->
@@ -3671,33 +3881,37 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentReads.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-w-0 flex-col gap-2.5 rounded-xl preset-tonal-surface p-3"
                       >
-                        <BookOpen size={15} class="shrink-0 text-primary-500" />
-                        <div class="min-w-0 flex-1">
-                          <span
-                            class="block truncate text-sm font-medium text-surface-950-50"
-                            >{item.title}</span
-                          ><small
-                            class="block truncate text-xs text-surface-700-300"
-                            >{item.author}</small
-                          >
+                        <div class="flex min-w-0 items-center gap-3">
+                          <BookOpen size={15} class="shrink-0 text-primary-500" />
+                          <div class="min-w-0 flex-1">
+                            <span
+                              class="block truncate text-sm font-medium text-surface-950-50"
+                              >{item.title}</span
+                            ><small
+                              class="block truncate text-xs text-surface-700-300"
+                              >{item.author}</small
+                            >
+                          </div>
+                          {#if item.rating !== null && item.rating > 0}<span
+                              in:scale={{ duration: motionDuration(150) }}
+                              class="badge badge-sm shrink-0 preset-tonal-secondary"
+                              aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}
+                              >{item.rating} ★</span
+                            >{:else}<span class="badge badge-sm shrink-0 preset-tonal-surface">Unrated</span>{/if}
                         </div>
-                        {#if item.rating}<span
-                            in:scale={{ duration: motionDuration(150) }}
-                            class="shrink-0 text-xs font-semibold text-primary-600-400"
-                            >{item.rating} ★</span
-                          >{/if}
+                        {@render inlineStarRating(item, "recent")}
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
