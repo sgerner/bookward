@@ -16,6 +16,7 @@ import asyncio
 import json
 import re
 import unicodedata
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -290,6 +291,99 @@ def _provider_match(
     }
 
 
+async def _fetch_catalog_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    provider: str,
+    query_kind: str,
+    params: Mapping[str, Any],
+    trace: list[dict[str, Any]] | None = None,
+    request: Callable[..., Awaitable[httpx.Response]] | None = None,
+    rate_limit_statuses: Collection[int] = frozenset(),
+) -> tuple[Any, dict[str, Any]] | None:
+    fetch_trace: dict[str, Any] = {
+        "provider": provider,
+        "fetched_at": _utc_now(),
+        "query_kind": query_kind,
+        "status": "request_error",
+    }
+    if trace is not None:
+        trace.append(fetch_trace)
+    try:
+        response = (
+            await request(client, url, params=params)
+            if request is not None
+            else await client.get(url, params=params)
+        )
+        fetch_trace["http_status"] = response.status_code
+        if response.is_error:
+            fetch_trace["status"] = (
+                "rate_limited" if response.status_code in rate_limit_statuses else "http_error"
+            )
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            fetch_trace["status"] = "invalid_json"
+            return None
+    except Exception as exc:
+        fetch_trace["error_type"] = type(exc).__name__
+        return None
+    return payload, fetch_trace
+
+
+def _select_best_provider_match(
+    candidates: Iterable[dict[str, Any]],
+    fetch_trace: dict[str, Any],
+    *,
+    isbn: str = "",
+    mismatched_identifiers: int = 0,
+    include_identifier_trace: bool = True,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    matched_count = 0
+    for match in candidates:
+        matched_count += 1
+        if best is None or (
+            match["quality_score"],
+            match["description_kind"] == "synopsis",
+            match["description_content_quality_heuristic"],
+            len(match["genres"]),
+        ) > (
+            best["quality_score"],
+            best["description_kind"] == "synopsis",
+            best["description_content_quality_heuristic"],
+            len(best["genres"]),
+        ):
+            best = match
+    fetch_trace["matched_count"] = matched_count
+    if include_identifier_trace:
+        fetch_trace["mismatched_identifier_count"] = mismatched_identifiers
+    if best:
+        fetch_trace["status"] = "matched"
+        fetch_trace["provider_id"] = best["provider_id"]
+        fetch_trace["available_fields"] = [
+            field for field in ("description", "genres", "cover_url", "release_date") if best.get(field)
+        ]
+        if include_identifier_trace:
+            source_payloads = best["metadata_provenance"]["source_payloads"]
+            identifiers = source_payloads[0]["payload"].get("identifiers", []) if source_payloads else []
+            evidence, verified = _isbn_identifier_evidence(isbn, identifiers)
+            fetch_trace["identifier_evidence"] = evidence
+            fetch_trace["identifier_verified"] = verified
+            best["isbn_verified"] = bool(isbn and verified)
+        else:
+            best["isbn_verified"] = False
+        best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
+    else:
+        fetch_trace["status"] = "no_match"
+        if include_identifier_trace and isbn:
+            fetch_trace["identifier_evidence"] = "mismatch" if mismatched_identifiers else "no_result"
+            fetch_trace["identifier_verified"] = False
+    return best
+
+
 async def _open_library_match(
     title: str,
     author: str,
@@ -305,31 +399,21 @@ async def _open_library_match(
         "limit": CATALOG_LIMIT,
         "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,edition_key",
     }
-    fetch_trace: dict[str, Any] = {
-        "provider": "openlibrary",
-        "fetched_at": _utc_now(),
-        "query_kind": "isbn" if isbn else "title_author",
-        "status": "request_error",
-    }
-    if trace is not None:
-        trace.append(fetch_trace)
-    try:
-        response = await _openlibrary_request(client, OPEN_LIBRARY_SEARCH, params=params)
-        fetch_trace["http_status"] = response.status_code
-        if response.is_error:
-            fetch_trace["status"] = "http_error"
-            return None
-        try:
-            payload = response.json()
-        except ValueError:
-            fetch_trace["status"] = "invalid_json"
-            return None
-    except Exception as exc:
-        fetch_trace["error_type"] = type(exc).__name__
+    fetched = await _fetch_catalog_json(
+        client,
+        OPEN_LIBRARY_SEARCH,
+        provider="openlibrary",
+        query_kind="isbn" if isbn else "title_author",
+        params=params,
+        trace=trace,
+        request=_openlibrary_request,
+        rate_limit_statuses=frozenset(),
+    )
+    if fetched is None:
         return None
+    payload, fetch_trace = fetched
     docs = payload.get("docs", []) if isinstance(payload, dict) else []
-    best: dict[str, Any] | None = None
-    matched_count = 0
+    candidates: list[dict[str, Any]] = []
     mismatched_identifiers = 0
     for doc in docs if isinstance(docs, list) else []:
         if not isinstance(doc, dict):
@@ -395,38 +479,13 @@ async def _open_library_match(
             source_payload=source_payload,
         )
         match["openlibrary_work_id"] = canonical_work_id
-        matched_count += 1
-        if best is None or (
-            match["quality_score"],
-            match["description_kind"] == "synopsis",
-            match["description_content_quality_heuristic"],
-            len(match["genres"]),
-        ) > (
-            best["quality_score"],
-            best["description_kind"] == "synopsis",
-            best["description_content_quality_heuristic"],
-            len(best["genres"]),
-        ):
-            best = match
-    fetch_trace["matched_count"] = matched_count
-    fetch_trace["mismatched_identifier_count"] = mismatched_identifiers
-    if best:
-        fetch_trace["status"] = "matched"
-        fetch_trace["provider_id"] = best["provider_id"]
-        fetch_trace["available_fields"] = [field for field in ("description", "genres", "cover_url", "release_date") if best.get(field)]
-        identifiers = best["metadata_provenance"]["source_payloads"][0]["payload"].get("identifiers", [])
-        evidence, verified = _isbn_identifier_evidence(isbn, identifiers)
-        fetch_trace["identifier_evidence"] = evidence
-        fetch_trace["identifier_verified"] = verified
-        best["isbn_verified"] = bool(isbn and verified)
-    else:
-        fetch_trace["status"] = "no_match"
-        if isbn:
-            fetch_trace["identifier_evidence"] = "mismatch" if mismatched_identifiers else "no_result"
-            fetch_trace["identifier_verified"] = False
-    if best:
-        best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
-    return best
+        candidates.append(match)
+    return _select_best_provider_match(
+        candidates,
+        fetch_trace,
+        isbn=isbn,
+        mismatched_identifiers=mismatched_identifiers,
+    )
 
 
 async def _google_books_match(
@@ -446,30 +505,19 @@ async def _google_books_match(
     if google_books_api_key:
         # Do not include the request URL in fetch traces or exception text.
         params["key"] = google_books_api_key
-    fetch_trace: dict[str, Any] = {
-        "provider": "google_books",
-        "fetched_at": _utc_now(),
-        "query_kind": "isbn" if isbn else "title_author",
-        "status": "request_error",
-    }
-    if trace is not None:
-        trace.append(fetch_trace)
-    try:
-        response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
-        fetch_trace["http_status"] = response.status_code
-        if response.is_error:
-            fetch_trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"
-            return None
-        try:
-            payload = response.json()
-        except ValueError:
-            fetch_trace["status"] = "invalid_json"
-            return None
-    except Exception as exc:
-        fetch_trace["error_type"] = type(exc).__name__
+    fetched = await _fetch_catalog_json(
+        client,
+        GOOGLE_BOOKS_SEARCH,
+        provider="google_books",
+        query_kind="isbn" if isbn else "title_author",
+        params=params,
+        trace=trace,
+        rate_limit_statuses={429},
+    )
+    if fetched is None:
         return None
-    best: dict[str, Any] | None = None
-    matched_count = 0
+    payload, fetch_trace = fetched
+    candidates: list[dict[str, Any]] = []
     mismatched_identifiers = 0
     for item in payload.get("items", []) if isinstance(payload, dict) else []:
         if not isinstance(item, dict):
@@ -512,7 +560,7 @@ async def _google_books_match(
             "authors": [_clean_metadata_text(value, 300) for value in authors if value],
             "description": description,
             "genres": genres,
-                "identifiers": projected_identifiers,
+            "identifiers": projected_identifiers,
             "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
             "publication_date_source_field": "publishedDate" if release_date else "",
             "cover_url": image,
@@ -538,37 +586,13 @@ async def _google_books_match(
             source_payload=source_payload,
         )
         match["openlibrary_work_id"] = ""
-        matched_count += 1
-        if best is None or (
-            match["quality_score"],
-            match["description_kind"] == "synopsis",
-            match["description_content_quality_heuristic"],
-            len(match["genres"]),
-        ) > (
-            best["quality_score"],
-            best["description_kind"] == "synopsis",
-            best["description_content_quality_heuristic"],
-            len(best["genres"]),
-        ):
-            best = match
-    fetch_trace["matched_count"] = matched_count
-    fetch_trace["mismatched_identifier_count"] = mismatched_identifiers
-    if best:
-        fetch_trace["status"] = "matched"
-        fetch_trace["provider_id"] = best["provider_id"]
-        fetch_trace["available_fields"] = [field for field in ("description", "genres", "cover_url", "release_date") if best.get(field)]
-        identifiers = best["metadata_provenance"]["source_payloads"][0]["payload"].get("identifiers", [])
-        evidence, verified = _isbn_identifier_evidence(isbn, identifiers)
-        fetch_trace["identifier_evidence"] = evidence
-        fetch_trace["identifier_verified"] = verified
-        best["isbn_verified"] = bool(isbn and verified)
-        best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
-    else:
-        fetch_trace["status"] = "no_match"
-        if isbn:
-            fetch_trace["identifier_evidence"] = "mismatch" if mismatched_identifiers else "no_result"
-            fetch_trace["identifier_verified"] = False
-    return best
+        candidates.append(match)
+    return _select_best_provider_match(
+        candidates,
+        fetch_trace,
+        isbn=isbn,
+        mismatched_identifiers=mismatched_identifiers,
+    )
 
 
 async def _apple_books_match(
@@ -586,34 +610,19 @@ async def _apple_books_match(
     term = " ".join(part for part in (query_title[:200], author[:150]) if part).strip()
     if not term:
         return None
-    fetch_trace: dict[str, Any] = {
-        "provider": "apple_books",
-        "fetched_at": _utc_now(),
-        "query_kind": f"title_author_{media}",
-        "status": "request_error",
-    }
-    if trace is not None:
-        trace.append(fetch_trace)
-    try:
-        response = await client.get(
-            APPLE_BOOKS_SEARCH,
-            params={"media": media, "term": term, "limit": 5, "country": "us"},
-        )
-        fetch_trace["http_status"] = response.status_code
-        if response.is_error:
-            fetch_trace["status"] = "rate_limited" if response.status_code in {403, 429} else "http_error"
-            return None
-        try:
-            payload = response.json()
-        except ValueError:
-            fetch_trace["status"] = "invalid_json"
-            return None
-    except Exception as exc:
-        fetch_trace["error_type"] = type(exc).__name__
+    fetched = await _fetch_catalog_json(
+        client,
+        APPLE_BOOKS_SEARCH,
+        provider="apple_books",
+        query_kind=f"title_author_{media}",
+        params={"media": media, "term": term, "limit": 5, "country": "us"},
+        trace=trace,
+        rate_limit_statuses={403, 429},
+    )
+    if fetched is None:
         return None
-
-    best: dict[str, Any] | None = None
-    matched_count = 0
+    payload, fetch_trace = fetched
+    candidates: list[dict[str, Any]] = []
     for item in payload.get("results", []) if isinstance(payload, dict) else []:
         if not isinstance(item, dict):
             continue
@@ -659,30 +668,13 @@ async def _apple_books_match(
             genres=genres,
             source_payload=source_payload,
         )
-        matched_count += 1
-        if best is None or (
-            match["quality_score"],
-            match["description_kind"] == "synopsis",
-            match["description_content_quality_heuristic"],
-            len(match["genres"]),
-        ) > (
-            best["quality_score"],
-            best["description_kind"] == "synopsis",
-            best["description_content_quality_heuristic"],
-            len(best["genres"]),
-        ):
-            best = match
-    fetch_trace["matched_count"] = matched_count
-    if best:
-        fetch_trace["status"] = "matched"
-        fetch_trace["provider_id"] = best["provider_id"]
-        fetch_trace["available_fields"] = [
-            field for field in ("description", "genres", "cover_url", "release_date") if best.get(field)
-        ]
-        best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
-    else:
-        fetch_trace["status"] = "no_match"
-    return best
+        match["openlibrary_work_id"] = ""
+        candidates.append(match)
+    return _select_best_provider_match(
+        candidates,
+        fetch_trace,
+        include_identifier_trace=False,
+    )
 
 
 async def resolve_catalog_match(

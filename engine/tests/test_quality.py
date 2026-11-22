@@ -15,13 +15,19 @@ from afterword_engine.isbn import normalize_isbn_identifier
 from afterword_engine.quality import (
     APPLE_BOOKS_SEARCH,
     QUALITY_VERSION,
+    _apple_books_match,
+    _author_similarity,
+    _dedupe_and_hide,
+    _fetch_catalog_json,
+    _google_books_match,
+    _open_library_match,
+    _provider_match,
+    _select_best_provider_match,
     audit_candidates,
     candidate_quality_audit_candidates,
     canonical_isbn,
     has_candidate_quality_audit_candidates,
     local_flags,
-    _dedupe_and_hide,
-    _author_similarity,
 )
 
 
@@ -789,3 +795,238 @@ def test_bounded_v5_recovery_selects_legacy_google_books_without_openlibrary_wor
     assert legacy_google in selected_ids
     assert legacy_ol_complete not in selected_ids
 
+
+def test_fetch_catalog_json_registers_trace_before_await_and_handles_json_edges():
+    observed_mid_flight: list[dict[str, object]] = []
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            trace: list[dict[str, object]] = []
+
+            async def inspect_then_fail(req_client, url, *, params):
+                assert req_client is client
+                assert url == OPEN_LIBRARY_SEARCH
+                assert params == {"title": "Probe"}
+                observed_mid_flight.extend(dict(entry) for entry in trace)
+                raise httpx.ConnectError("offline")
+
+            failed = await _fetch_catalog_json(
+                client,
+                OPEN_LIBRARY_SEARCH,
+                provider="openlibrary",
+                query_kind="title_author",
+                params={"title": "Probe"},
+                trace=trace,
+                request=inspect_then_fail,
+            )
+            assert failed is None
+            assert len(observed_mid_flight) == 1
+            assert observed_mid_flight[0]["status"] == "request_error"
+            assert "http_status" not in observed_mid_flight[0]
+            assert trace[0]["status"] == "request_error"
+            assert trace[0]["error_type"] == "ConnectError"
+
+        def transport_handler(request: httpx.Request) -> httpx.Response:
+            mode = request.url.params.get("title") or request.url.params.get("q") or request.url.params.get("term")
+            if "invalid-json" in str(mode):
+                return httpx.Response(200, content=b"{not-valid-json")
+            if "null-json" in str(mode):
+                return httpx.Response(200, content=b"null")
+            return httpx.Response(200, content=b"[]")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport_handler)) as mock_client:
+            for provider_fn, expected_provider in (
+                (_open_library_match, "openlibrary"),
+                (_google_books_match, "google_books"),
+                (_apple_books_match, "apple_books"),
+            ):
+                bad_trace: list[dict[str, object]] = []
+                assert await provider_fn("invalid-json", "A Writer", mock_client, trace=bad_trace) is None
+                assert bad_trace[0]["provider"] == expected_provider
+                assert bad_trace[0]["http_status"] == 200
+                assert bad_trace[0]["status"] == "invalid_json"
+                assert "error_type" not in bad_trace[0]
+
+                for non_dict_title in ("null-json", "list-json"):
+                    empty_trace: list[dict[str, object]] = []
+                    assert await provider_fn(non_dict_title, "A Writer", mock_client, trace=empty_trace) is None
+                    assert empty_trace[0]["status"] == "no_match"
+                    assert empty_trace[0]["matched_count"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("provider_fn", "status_code", "expected_status"),
+    [
+        (_open_library_match, 429, "http_error"),
+        (_open_library_match, 403, "http_error"),
+        (_open_library_match, 503, "http_error"),
+        (_google_books_match, 429, "rate_limited"),
+        (_google_books_match, 403, "http_error"),
+        (_google_books_match, 503, "http_error"),
+        (_apple_books_match, 403, "rate_limited"),
+        (_apple_books_match, 429, "rate_limited"),
+        (_apple_books_match, 503, "http_error"),
+    ],
+)
+def test_provider_match_rate_limit_status_sets(provider_fn, status_code, expected_status):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": "throttled"})
+
+    async def run():
+        trace: list[dict[str, object]] = []
+        kwargs = {"google_books_api_key": "secret-google-key"} if provider_fn is _google_books_match else {}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await provider_fn("A Book", "A Writer", client, trace=trace, **kwargs)
+        assert result is None
+        assert len(trace) == 1
+        assert trace[0]["http_status"] == status_code
+        assert trace[0]["status"] == expected_status
+        assert "secret-google-key" not in json.dumps(trace)
+
+    asyncio.run(run())
+
+
+def test_select_best_provider_match_four_tuple_ranking_and_ties():
+    def candidate(
+        provider_id: str,
+        *,
+        catalog_title: str = "A Book",
+        description: str = "Short synopsis.",
+        description_kind: str = "synopsis",
+        genres: list[str] | None = None,
+    ):
+        return _provider_match(
+            provider="openlibrary",
+            provider_id=provider_id,
+            work_id=provider_id,
+            title="A Book",
+            author="A Writer",
+            catalog_title=catalog_title,
+            catalog_author="A Writer",
+            description=description,
+            description_kind=description_kind,
+            description_source_field="description" if description_kind == "synopsis" else "first_sentence",
+            genres=genres or [],
+            source_payload={"key": provider_id, "identifiers": ["9780307474278"]},
+        )
+
+    # 1. quality_score dominates synopsis/heuristic/genre advantages.
+    trace_score: dict[str, object] = {}
+    best_score = _select_best_provider_match(
+        [
+            candidate("lower-score", catalog_title="A Book Subtitle", description="Longer synopsis." * 20, genres=["Fiction", "Drama"]),
+            candidate("exact-score", catalog_title="A Book", description="Brief.", description_kind="opening_sentence"),
+        ],
+        trace_score,
+        isbn="9780307474278",
+    )
+    assert best_score is not None and best_score["provider_id"] == "exact-score"
+    assert trace_score["identifier_verified"] is True
+
+    # 2. description_kind == "synopsis" beats non-synopsis at equal quality_score.
+    best_kind = _select_best_provider_match(
+        [
+            candidate("opening", description="Long opening sentence. " * 25, description_kind="opening_sentence", genres=["Fiction", "Drama"]),
+            candidate("synopsis", description="Short synopsis.", description_kind="synopsis"),
+        ],
+        {},
+    )
+    assert best_kind is not None and best_kind["provider_id"] == "synopsis"
+
+    # 3. description_content_quality_heuristic breaks synopsis ties before genre count.
+    best_heuristic = _select_best_provider_match(
+        [
+            candidate("shorter-synopsis", description="Brief synopsis.", genres=["Fiction", "Drama", "Mystery"]),
+            candidate("longer-synopsis", description="Detailed synopsis content. " * 10, genres=["Fiction"]),
+        ],
+        {},
+    )
+    assert best_heuristic is not None and best_heuristic["provider_id"] == "longer-synopsis"
+
+    # 4. len(genres) breaks ties when score, kind, and heuristic match; strict > keeps first on full ties.
+    tie_trace: dict[str, object] = {}
+    best_tie = _select_best_provider_match(
+        [
+            candidate("fewer-genres", description="Identical synopsis.", genres=["Fiction"]),
+            candidate("first-tied-winner", description="Identical synopsis.", genres=["Fiction", "Mystery"]),
+            candidate("second-tied-loser", description="Identical synopsis.", genres=["History", "Drama"]),
+        ],
+        tie_trace,
+    )
+    assert best_tie is not None and best_tie["provider_id"] == "first-tied-winner"
+    assert tie_trace["matched_count"] == 3
+    assert best_tie["metadata_provenance"]["fetch_trace"] == [tie_trace]
+
+
+def test_apple_books_trace_keys_and_early_guards():
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "NoMatchBook" in request.url.params.get("term", ""):
+            return httpx.Response(200, json={"results": []})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 101,
+                        "trackName": "Apple Match",
+                        "artistName": "A Writer",
+                        "description": "Same synopsis.",
+                        "genres": ["Books", "Fiction"],
+                    },
+                    {
+                        "trackId": 202,
+                        "trackName": "Apple Match",
+                        "artistName": "A Writer",
+                        "description": "Same synopsis.",
+                        "genres": ["Books", "Mystery"],
+                    },
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            guard_trace: list[dict[str, object]] = []
+            assert await _apple_books_match("Apple Match", "A Writer", client, isbn="9780307474278", trace=guard_trace) is None
+            assert await _apple_books_match("   ", "   ", client, trace=guard_trace) is None
+            assert guard_trace == []
+            assert calls == []
+
+            matched_trace: list[dict[str, object]] = []
+            match = await _apple_books_match("Apple Match", "A Writer", client, media="audiobook", trace=matched_trace)
+            assert match is not None
+            assert match["provider_id"] == "101"
+            assert set(matched_trace[0].keys()) == {
+                "provider",
+                "fetched_at",
+                "query_kind",
+                "status",
+                "http_status",
+                "matched_count",
+                "provider_id",
+                "available_fields",
+            }
+            assert matched_trace[0]["query_kind"] == "title_author_audiobook"
+            assert matched_trace[0]["status"] == "matched"
+            assert matched_trace[0]["matched_count"] == 2
+            assert match["metadata_provenance"]["fetch_trace"] == [matched_trace[0]]
+
+            no_match_trace: list[dict[str, object]] = []
+            assert await _apple_books_match("NoMatchBook", "A Writer", client, trace=no_match_trace) is None
+            assert set(no_match_trace[0].keys()) == {
+                "provider",
+                "fetched_at",
+                "query_kind",
+                "status",
+                "http_status",
+                "matched_count",
+            }
+            assert no_match_trace[0]["status"] == "no_match"
+            assert no_match_trace[0]["matched_count"] == 0
+
+    asyncio.run(run())

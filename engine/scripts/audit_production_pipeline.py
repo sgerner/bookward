@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 import json
 import hashlib
@@ -16,7 +17,7 @@ import re
 import sqlite3
 import statistics
 import sys
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
