@@ -17,9 +17,9 @@ from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Qu
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_SOURCE_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -1147,8 +1147,28 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
+    name: str | None = None
+    url: str | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
+
+
+_HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
+
+
+def _is_custom_source(source: dict[str, Any] | sqlite3.Row) -> bool:
+    return bool(
+        source["kind"] == "web"
+        and not source["is_default"]
+        and source["url"] not in DEFAULT_SOURCE_URLS
+    )
+
+
+def _serialize_source(source: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    item = dict(source)
+    item["filters"] = normalize_source_filters(item.get("filters"))
+    item["is_custom"] = _is_custom_source(item)
+    return item
 
 
 class SourceScheduleIn(BaseModel):
@@ -1537,11 +1557,6 @@ def overview_payload(
     recommendation_limit: int | None = None,
     decision_limit: int = 24,
 ):
-    def source_payload(source):
-        item = dict(source)
-        item["filters"] = normalize_source_filters(item.get("filters"))
-        return item
-
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
@@ -1571,7 +1586,7 @@ def overview_payload(
             "decisions": decisions,
             "decisions_has_more": decisions_has_more,
             "recommendation_run_id": run_id,
-            "sources": [source_payload(item) for item in connection.execute(
+            "sources": [_serialize_source(item) for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()],
             "history": [dict(item) for item in connection.execute(
@@ -2445,6 +2460,14 @@ def _reject_inline_nyt_key(url: str):
             "Store NYT credentials in encrypted NYT API settings instead of the source URL.",
         )
 
+@app.get("/api/sources")
+def list_sources():
+    return [
+        _serialize_source(source)
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    ]
+
+
 @app.post("/api/sources")
 def add_source(payload: SourceIn):
     _reject_inline_nyt_key(str(payload.url))
@@ -2651,47 +2674,154 @@ async def llm_models_catalog():
         raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
 
 
+def _validate_source_update_guardrails(source: dict[str, Any] | sqlite3.Row, payload: SourceUpdateIn):
+    if source["kind"] in {"builtin", "association"} or source["is_default"]:
+        if payload.name is not None:
+            raise HTTPException(400, "This source name cannot be changed")
+        if payload.url is not None:
+            raise HTTPException(400, "This source URL cannot be changed")
+        if payload.filters is not None:
+            raise HTTPException(
+                400,
+                "The built-in source cannot be filtered"
+                if source["kind"] == "builtin"
+                else "This source cannot be filtered",
+            )
+        if payload.lifecycle is not None:
+            raise HTTPException(400, "This source lifecycle cannot be changed")
+    if payload.url is not None and source["url"] in DEFAULT_SOURCE_URLS:
+        raise HTTPException(400, "Default source URLs cannot be changed")
+
+
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
-    updates = []
-    values = []
-    if payload.filters is not None:
-        updates.append("filters=?")
-        values.append(json.dumps(payload.filters.model_dump()))
-    if payload.lifecycle is not None:
-        updates.append("lifecycle=?")
-        values.append(payload.lifecycle)
+    initial = row(
+        "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_scanned_at "
+        "FROM sources WHERE id=?",
+        (source_id,),
+    )
+    if not initial:
+        raise HTTPException(404, "Source not found")
+    _validate_source_update_guardrails(initial, payload)
+
+    cleaned_name: str | None = None
+    if payload.name is not None:
+        cleaned_name = payload.name.strip()
+        if len(cleaned_name) < 2 or len(cleaned_name) > 100:
+            raise HTTPException(400, "Source name must be between 2 and 100 characters")
+
+    normalized_url: str | None = None
+    if payload.url is not None:
+        raw_url = payload.url.strip()
+        if not raw_url or len(raw_url) > 2048:
+            raise HTTPException(400, "Invalid public URL")
+        _reject_inline_nyt_key(raw_url)
+        try:
+            validate_public_url(raw_url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+        try:
+            normalized_url = str(_HTTP_URL_ADAPTER.validate_python(raw_url))
+        except ValidationError as exc:
+            raise HTTPException(400, "Invalid public URL") from exc
+
     with transaction() as con:
         source = con.execute(
-            "SELECT enabled,kind,lifecycle,filters FROM sources WHERE id=?",
+            "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_scanned_at "
+            "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
-        if not source: raise HTTPException(404, "Source not found")
-        if payload.filters is not None and source["kind"] == "builtin":
-            raise HTTPException(400, "The built-in source cannot be filtered")
-        if payload.lifecycle is not None and source["kind"] in {"builtin", "association"}:
-            raise HTTPException(400, "This source lifecycle cannot be changed")
+        if not source:
+            raise HTTPException(404, "Source not found")
+        _validate_source_update_guardrails(source, payload)
+
+        updates: list[str] = []
+        values: list[object] = []
+        name_changed = False
+        url_changed = False
+        existing_filters = normalize_source_filters(source["filters"])
+
+        if cleaned_name is not None:
+            updates.append("name=?")
+            values.append(cleaned_name)
+            name_changed = cleaned_name != source["name"]
+        if normalized_url is not None:
+            updates.append("url=?")
+            values.append(normalized_url)
+            url_changed = normalized_url != source["url"]
+        if payload.filters is not None:
+            updates.append("filters=?")
+            values.append(json.dumps(payload.filters.model_dump()))
+        if payload.lifecycle is not None:
+            updates.append("lifecycle=?")
+            values.append(payload.lifecycle)
+
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        filters_changed = (
+            payload.filters is not None
+            and payload.filters.model_dump() != existing_filters
+        )
+        if url_changed:
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_status=NULL")
+        elif filters_changed and effective_lifecycle == "one_time":
+            updates.append("last_scanned_at=NULL")
+
         if updates:
             values.append(source_id)
-            con.execute(
-                f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
-            )
+            try:
+                con.execute(
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "Source already exists") from exc
+
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
-        else normalize_source_filters(source["filters"])
+        else existing_filters
     )
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if updates and source["enabled"] and source["kind"] != "association"
-        else None
+    needs_source_scan = (
+        url_changed
+        or payload.filters is not None
+        or payload.lifecycle is not None
     )
+    job_id = None
+    if source["enabled"] and source["kind"] not in {"builtin", "association"}:
+        if needs_source_scan:
+            job_id = enqueue_job(f"source:{source_id}", dedupe=True)
+        elif name_changed:
+            job_id = enqueue_job("score", dedupe=True)
     return {
         "id": source_id,
+        "name": cleaned_name if cleaned_name is not None else source["name"],
+        "url": normalized_url if normalized_url is not None else source["url"],
         "filters": filters,
-        "lifecycle": payload.lifecycle or source["lifecycle"],
+        "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
+
+
+@app.post("/api/sources/{source_id}/refresh")
+def refresh_source(source_id: int):
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,is_default,lifecycle FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if source["kind"] in {"builtin", "association"} or source["is_default"]:
+            raise HTTPException(400, "Only web sources can be refreshed")
+        if not source["enabled"]:
+            raise HTTPException(400, "Enable this source before refreshing it")
+        if source["lifecycle"] == "one_time":
+            con.execute(
+                "UPDATE sources SET last_scanned_at=NULL WHERE id=?",
+                (source_id,),
+            )
+    job_id = enqueue_job(f"source:{source_id}", dedupe=True)
+    return {"id": source_id, "job_id": job_id}
 
 
 def _save_digest_settings(updates: dict):
@@ -3247,10 +3377,7 @@ async def api_import_librarr(candidate_id: int):
 
 @api_v1.get("/sources")
 def api_sources():
-    return [
-        {**source, "filters": normalize_source_filters(source.get("filters"))}
-        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
-    ]
+    return list_sources()
 
 
 @api_v1.post("/sources/preview")
@@ -3276,6 +3403,11 @@ def api_update_source_schedule(payload: SourceScheduleIn):
 @api_v1.put("/sources/{source_id}")
 def api_update_source(source_id: int, payload: SourceUpdateIn):
     return update_source(source_id, payload)
+
+
+@api_v1.post("/sources/{source_id}/refresh")
+def api_refresh_source(source_id: int):
+    return refresh_source(source_id)
 
 
 @api_v1.post("/import/goodreads/rss")

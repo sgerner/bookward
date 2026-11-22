@@ -61,6 +61,11 @@
     id?: number;
     undo_id?: number;
     undo_label?: string;
+    editSource?: {
+      id: number;
+      label: string;
+      url: string;
+    };
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
@@ -175,6 +180,8 @@
   let optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
   let defaultSourceEnabledOverride = $state<boolean | null>(null);
   let sourceEnabledOverrides = $state<Record<number, boolean>>({});
+  let openSourceEditIds = $state(new Set<number>());
+  let sourceEditDrafts = $state<Record<number, { label: string; url: string }>>({});
   let sourceScheduleOverride = $state<number | null>(null);
   let librarrUrlOverride = $state<string | null>(null);
   let librarrConnectedOverride = $state<boolean | null>(null);
@@ -834,6 +841,77 @@
 
   function isPending(key: string) {
     return pendingActions.has(key);
+  }
+
+  function setSourceEditOpen(id: number, isOpen: boolean) {
+    if (openSourceEditIds.has(id) === isOpen) return;
+    const next = new Set(openSourceEditIds);
+    if (isOpen) next.add(id);
+    else next.delete(id);
+    openSourceEditIds = next;
+  }
+
+  function sourceEditDraftValue(
+    source: { id: number; label: string; url: string },
+    field: "label" | "url",
+  ) {
+    const draft = sourceEditDrafts[source.id];
+    if (draft) return draft[field];
+    if (formState?.editSource?.id === source.id) return formState.editSource[field];
+    return source[field];
+  }
+
+  function updateSourceEditDraft(
+    source: { id: number; label: string; url: string },
+    field: "label" | "url",
+    value: string,
+  ) {
+    const existing = sourceEditDrafts[source.id] ?? {
+      label: sourceEditDraftValue(source, "label"),
+      url: sourceEditDraftValue(source, "url"),
+    };
+    sourceEditDrafts = {
+      ...sourceEditDrafts,
+      [source.id]: { ...existing, [field]: value },
+    };
+  }
+
+  function enhanceSourceEdit(sourceId: number): SubmitFunction {
+    const key = `edit-source-${sourceId}`;
+    return ({ formData }) => {
+      withPending(key, true);
+      const submittedLabel = String(formData.get("label") ?? "");
+      const submittedUrl = String(formData.get("url") ?? "");
+      sourceEditDrafts = {
+        ...sourceEditDrafts,
+        [sourceId]: { label: submittedLabel, url: submittedUrl },
+      };
+      setSourceEditOpen(sourceId, true);
+      return async ({ update, result }) => {
+        const succeeded = result.type === "success" || result.type === "redirect";
+        try {
+          if (result.type === "error") {
+            announceActionError(actionResultMessage(result));
+            return;
+          }
+          await update({ reset: false });
+          if (succeeded) {
+            const nextDrafts = { ...sourceEditDrafts };
+            delete nextDrafts[sourceId];
+            sourceEditDrafts = nextDrafts;
+            setSourceEditOpen(sourceId, false);
+          }
+        } catch (error) {
+          announceActionError(
+            error instanceof Error
+              ? error.message
+              : "The request could not be completed.",
+          );
+        } finally {
+          withPending(key, false);
+        }
+      };
+    };
   }
 
   function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
@@ -1748,7 +1826,7 @@
       >{/each}
       </nav>
       <div class="ml-auto flex items-center gap-2">
-        {#if activeView === "discover" || activeView === "saved"}<form
+        {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
             use:enhance={setPending("sync")}
@@ -2497,7 +2575,28 @@
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
                               {#if source.lifecycle === "one_time"}
-                                One-time import · {formatSourceScan(source.last_scanned_at, source.last_status)}
+                                One-time import
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <span aria-hidden="true"> · </span>
+                                  <form
+                                    class="inline"
+                                    method="POST"
+                                    action="?/switchSourceLifecycle"
+                                    use:enhance={setPending(`source-lifecycle-${source.id}`)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <input type="hidden" name="lifecycle" value="permanent" />
+                                    <button
+                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      type="submit"
+                                      disabled={isPending(`source-lifecycle-${source.id}`)}
+                                      aria-busy={isPending(`source-lifecycle-${source.id}`)}
+                                    >Switch to Permanent Feed</button>
+                                  </form>
+                                {/if}
+                                <span aria-hidden="true"> · </span>
+                                {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {:else}
                                 Permanent feed
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
@@ -2505,11 +2604,12 @@
                                   <form
                                     class="inline"
                                     method="POST"
-                                    action="?/switchSourceToOneTime"
+                                    action="?/switchSourceLifecycle"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
                                   >
                                     <ProfileField profileId={data.user?.profile_id} />
                                     <input type="hidden" name="id" value={source.id} />
+                                    <input type="hidden" name="lifecycle" value="one_time" />
                                     <button
                                       class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
@@ -2522,74 +2622,161 @@
                                 {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {/if}
                             </span>
-                            <details class="mt-3 w-full max-w-full">
-                              <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
-                                Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
-                                  ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
-                                  : ""}
-                              </summary>
+                            <div class="mt-3 flex flex-col gap-2">
+                              {#if source.is_custom}
+                                <details
+                                  class="w-full max-w-full"
+                                  open={openSourceEditIds.has(source.id) || formState?.editSource?.id === source.id}
+                                  ontoggle={(event) => {
+                                    const isOpen = (event.currentTarget as HTMLDetailsElement).open;
+                                    setSourceEditOpen(source.id, isOpen);
+                                  }}
+                                >
+                                  <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                    Edit source
+                                  </summary>
+                                  <form
+                                    class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    method="POST"
+                                    action="?/editSource"
+                                    use:enhance={enhanceSourceEdit(source.id)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Name
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="label"
+                                        value={sourceEditDraftValue(source, "label")}
+                                        oninput={(event) => updateSourceEditDraft(source, "label", (event.currentTarget as HTMLInputElement).value)}
+                                        minlength={2}
+                                        maxlength={100}
+                                        required
+                                      />
+                                    </label>
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Public URL
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="url"
+                                        type="url"
+                                        value={sourceEditDraftValue(source, "url")}
+                                        oninput={(event) => updateSourceEditDraft(source, "url", (event.currentTarget as HTMLInputElement).value)}
+                                        placeholder="https://…"
+                                        required
+                                      />
+                                    </label>
+                                    {#if formState?.error && formState?.editSource?.id === source.id && formState?.message}
+                                      <p class="border-l-2 border-error-500 preset-tonal-error p-2.5 text-xs leading-5 text-surface-900-100" role="alert">
+                                        {formState.message}
+                                      </p>
+                                    {/if}
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                      type="submit"
+                                      disabled={isPending(`edit-source-${source.id}`)}
+                                      aria-busy={isPending(`edit-source-${source.id}`)}
+                                    >{#if isPending(`edit-source-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save source</button>
+                                  </form>
+                                </details>
+                              {/if}
+                              {#if source.kind !== "association" && source.kind !== "builtin"}
+                                <details class="w-full max-w-full">
+                                  <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                    Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
+                                      ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
+                                      : ""}
+                                  </summary>
+                                  <form
+                                    class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    method="POST"
+                                    action="?/configureSourceFilters"
+                                    use:enhance={setPending(`source-filters-${source.id}`)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Include genres
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="includeGenres"
+                                        value={source.filters.include_genres.join(", ")}
+                                        placeholder="science fiction, fantasy"
+                                      />
+                                    </label>
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Exclude genres
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="excludeGenres"
+                                        value={source.filters.exclude_genres.join(", ")}
+                                        placeholder="romance, cookbook"
+                                      />
+                                    </label>
+                                    <p class="text-xs leading-5 text-surface-600-400">
+                                      Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
+                                    </p>
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                      type="submit"
+                                      disabled={isPending(`source-filters-${source.id}`)}
+                                      aria-busy={isPending(`source-filters-${source.id}`)}
+                                    >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                                  </form>
+                                </details>
+                              {/if}
+                            </div>
+                          </div>
+                          <div class="flex shrink-0 items-center gap-2">
+                            {#if source.kind === "web" && sourceEnabled(source)}
                               <form
-                                class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
                                 method="POST"
-                                action="?/configureSourceFilters"
-                                use:enhance={setPending(`source-filters-${source.id}`)}
+                                action="?/refreshSource"
+                                use:enhance={setPending(`refresh-source-${source.id}`)}
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
-                                <label class="block text-xs font-medium text-surface-800-200">
-                                  Include genres
-                                  <input
-                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
-                                    name="includeGenres"
-                                    value={source.filters.include_genres.join(", ")}
-                                    placeholder="science fiction, fantasy"
-                                  />
-                                </label>
-                                <label class="block text-xs font-medium text-surface-800-200">
-                                  Exclude genres
-                                  <input
-                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
-                                    name="excludeGenres"
-                                    value={source.filters.exclude_genres.join(", ")}
-                                    placeholder="romance, cookbook"
-                                  />
-                                </label>
-                                <p class="text-xs leading-5 text-surface-600-400">
-                                  Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
-                                </p>
                                 <button
-                                  class="btn btn-sm min-h-9 preset-tonal-secondary"
                                   type="submit"
-                                  disabled={isPending(`source-filters-${source.id}`)}
-                                  aria-busy={isPending(`source-filters-${source.id}`)}
-                                >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                                  class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-secondary"
+                                  aria-label={`Refresh ${source.label}`}
+                                  title={`Refresh ${source.label}`}
+                                  disabled={isPending(`refresh-source-${source.id}`)}
+                                  aria-busy={isPending(`refresh-source-${source.id}`)}
+                                >
+                                  <RefreshCw
+                                    size={15}
+                                    class={isPending(`refresh-source-${source.id}`) ? "animate-spin" : ""}
+                                  />
+                                </button>
                               </form>
-                            </details>
-                          </div>
-                          <form
-                            class="shrink-0"
-                            method="POST"
-                            action="?/toggleSource"
-                            use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
-                          >
-                            <ProfileField profileId={data.user?.profile_id} />
-                            <input
-                              type="hidden"
-                              name="id"
-                              value={source.id}
-                            /><button
-                              type="submit"
-                              class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                              role="switch"
-                              aria-label={`Toggle ${source.label}`}
-                              aria-checked={sourceEnabled(source)}
-                              disabled={isPending(`toggle-source-${source.id}`)}
-                              aria-busy={isPending(`toggle-source-${source.id}`)}
-                              ><span
-                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
-                              ></span></button
+                            {/if}
+                            <form
+                              class="shrink-0"
+                              method="POST"
+                              action="?/toggleSource"
+                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
                             >
-                          </form>
+                              <ProfileField profileId={data.user?.profile_id} />
+                              <input
+                                type="hidden"
+                                name="id"
+                                value={source.id}
+                              /><button
+                                type="submit"
+                                class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
+                                role="switch"
+                                aria-label={`Toggle ${source.label}`}
+                                aria-checked={sourceEnabled(source)}
+                                disabled={isPending(`toggle-source-${source.id}`)}
+                                aria-busy={isPending(`toggle-source-${source.id}`)}
+                                ><span
+                                  class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
+                                ></span></button
+                              >
+                            </form>
+                          </div>
                         </div>{/each}
                     {:else}
                       <div class="border-b border-surface-200-800 px-1 py-5 text-sm text-surface-600-400">

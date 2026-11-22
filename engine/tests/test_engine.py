@@ -2782,3 +2782,311 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def test_update_custom_source_persists_name_and_url_and_returns_409_on_duplicate(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    scanned_urls: list[str] = []
+
+    async def fake_scan_source(source):
+        scanned_urls.append(source["url"])
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status='ok:2' WHERE id=?",
+                (source["id"],),
+            )
+        return 2
+
+    monkeypatch.setattr(main, "scan_source", fake_scan_source)
+
+    with transaction() as con:
+        first_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES(?,?,1,'one_time','error:404','2026-01-01T00:00:00+00:00')",
+            ("goodreads.com", "https://books.example.test/old-feed.xml"),
+        ).lastrowid
+        second_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
+            ("goodreads.com", "https://books.example.test/other-feed.xml"),
+        ).lastrowid
+
+    client = TestClient(app, headers=authenticated_headers())
+    listed = {item["id"]: item for item in client.get("/api/sources").json()}
+    assert listed[first_id]["is_custom"] is True
+    default_row = next(
+        item
+        for item in listed.values()
+        if item["url"] == engine_database.DEFAULT_SOURCES[0][1]
+    )
+    assert default_row["is_custom"] is False
+
+    updated = client.put(
+        f"/api/sources/{first_id}",
+        json={
+            "name": "  Sci-Fi Weekly  ",
+            "url": "https://books.example.test/moved-feed.xml",
+        },
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["name"] == "Sci-Fi Weekly"
+    assert body["url"] == "https://books.example.test/moved-feed.xml"
+    assert body["job_id"]
+
+    stored = row(
+        "SELECT name,url,last_scanned_at,last_status FROM sources WHERE id=?",
+        (first_id,),
+    )
+    assert stored == {
+        "name": "Sci-Fi Weekly",
+        "url": "https://books.example.test/moved-feed.xml",
+        "last_scanned_at": None,
+        "last_status": None,
+    }
+
+    conflict = client.put(
+        f"/api/sources/{first_id}",
+        json={
+            "name": "Conflicting Feed",
+            "url": "https://books.example.test/other-feed.xml",
+        },
+    )
+    assert conflict.status_code == 409
+    assert row("SELECT name,url FROM sources WHERE id=?", (first_id,)) == {
+        "name": "Sci-Fi Weekly",
+        "url": "https://books.example.test/moved-feed.xml",
+    }
+
+    token = client.post(
+        "/api/settings/api-tokens", json={"name": "Source update v1"}
+    ).json()["token"]
+    v1_headers = {"Authorization": f"Bearer {token}"}
+    v1_ok = client.put(
+        f"/api/v1/sources/{second_id}",
+        headers=v1_headers,
+        json={"name": "Mystery Shelf", "url": "https://books.example.test/mystery.xml"},
+    )
+    assert v1_ok.status_code == 200
+    assert v1_ok.json()["name"] == "Mystery Shelf"
+    assert v1_ok.json()["url"] == "https://books.example.test/mystery.xml"
+
+    v1_conflict = client.put(
+        f"/api/v1/sources/{second_id}",
+        headers=v1_headers,
+        json={"url": "https://books.example.test/moved-feed.xml"},
+    )
+    assert v1_conflict.status_code == 409
+
+    monkeypatch.setattr(main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=2))
+    result = asyncio.run(handle_job(f"source:{first_id}"))
+    assert result["collected"] == 2
+    assert scanned_urls == ["https://books.example.test/moved-feed.xml"]
+
+
+def test_update_source_url_rejects_unsafe_addresses_and_inline_nyt_keys(
+    database, monkeypatch
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,enabled) VALUES(?,?,1)",
+            ("Custom Feed", "https://books.example.test/feed.xml"),
+        ).lastrowid
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        for unsafe_url in (
+            "http://books.example.test/plain-http.xml",
+            "https://127.0.0.1/loopback.xml",
+            "https://localhost/loopback.xml",
+            "https://10.0.0.12/private.xml",
+            "https://169.254.169.254/latest/meta-data",
+            "https://internal.local/feed.xml",
+        ):
+            response = client.put(
+                f"/api/sources/{source_id}", json={"url": unsafe_url}
+            )
+            assert response.status_code == 400, unsafe_url
+
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.25", 443))
+            ],
+        )
+        dns_private = client.put(
+            f"/api/sources/{source_id}",
+            json={"url": "https://rebind.example.test/feed.xml"},
+        )
+        assert dns_private.status_code == 400
+
+        nyt_inline = client.put(
+            f"/api/sources/{source_id}",
+            json={
+                "url": "https://api.nytimes.com/svc/books/v3/lists/overview.json?api-key=never-echo-secret"
+            },
+        )
+        assert nyt_inline.status_code == 400
+        assert "encrypted NYT API settings" in nyt_inline.json()["detail"]
+        assert "never-echo-secret" not in nyt_inline.text
+
+        bad_name = client.put(f"/api/sources/{source_id}", json={"name": " "})
+        assert bad_name.status_code == 400
+
+    assert row("SELECT name,url FROM sources WHERE id=?", (source_id,)) == {
+        "name": "Custom Feed",
+        "url": "https://books.example.test/feed.xml",
+    }
+
+
+def test_update_source_guardrails_protect_builtin_association_and_seeded_defaults(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    with transaction() as con:
+        builtin_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()["id"]
+        assoc_id = con.execute(
+            "INSERT INTO sources(name,url,kind,enabled) VALUES(?,?,?,1)",
+            ("Open Library Lists", "association://openlibrary_lists", "association"),
+        ).lastrowid
+        seeded = con.execute(
+            "SELECT id,url FROM sources WHERE url=?",
+            (engine_database.DEFAULT_SOURCES[0][1],),
+        ).fetchone()
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        for locked_id in (builtin_id, assoc_id):
+            for payload in (
+                {"name": "Renamed Locked Source"},
+                {"url": "https://books.example.test/override.xml"},
+                {"filters": {"include_genres": ["Fantasy"], "exclude_genres": []}},
+                {"lifecycle": "one_time"},
+            ):
+                resp = client.put(f"/api/sources/{locked_id}", json=payload)
+                assert resp.status_code == 400, (locked_id, payload)
+
+        seeded_url_resp = client.put(
+            f"/api/sources/{seeded['id']}",
+            json={"url": "https://books.example.test/override-default.xml"},
+        )
+        assert seeded_url_resp.status_code == 400
+        assert row("SELECT url FROM sources WHERE id=?", (seeded["id"],))["url"] == seeded["url"]
+
+        to_one_time = client.put(
+            f"/api/sources/{seeded['id']}", json={"lifecycle": "one_time"}
+        )
+        assert to_one_time.status_code == 200
+        assert to_one_time.json()["lifecycle"] == "one_time"
+
+        to_permanent = client.put(
+            f"/api/sources/{seeded['id']}", json={"lifecycle": "permanent"}
+        )
+        assert to_permanent.status_code == 200
+        assert to_permanent.json()["lifecycle"] == "permanent"
+
+
+def test_refresh_single_source_scans_one_time_and_preserves_recommended_scores(
+    database, monkeypatch
+):
+    with transaction() as con:
+        builtin_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()["id"]
+        assoc_id = con.execute(
+            "INSERT INTO sources(name,url,kind,enabled) VALUES(?,?,?,1)",
+            ("Assoc Provider", "association://test_provider", "association"),
+        ).lastrowid
+        disabled_id = con.execute(
+            "INSERT INTO sources(name,url,enabled) VALUES(?,?,0)",
+            ("Disabled Feed", "https://books.example.test/disabled.xml"),
+        ).lastrowid
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES(?,?,1,'one_time','error:timeout','2026-01-01T00:00:00+00:00')",
+            ("Retry Feed", "https://books.example.test/retry.xml"),
+        ).lastrowid
+        candidate_id = 1
+        con.execute(
+            "UPDATE candidates SET source_id=?, status='recommended', score=92.4 WHERE id=?",
+            (source_id, candidate_id),
+        )
+
+    client = TestClient(app, headers=authenticated_headers())
+    assert client.post("/api/sources/999999/refresh").status_code == 404
+    assert client.post(f"/api/sources/{builtin_id}/refresh").status_code == 400
+    assert client.post(f"/api/sources/{assoc_id}/refresh").status_code == 400
+    assert client.post(f"/api/sources/{disabled_id}/refresh").status_code == 400
+
+    refreshed = client.post(f"/api/sources/{source_id}/refresh")
+    assert refreshed.status_code == 200
+    job_id = refreshed.json()["job_id"]
+    assert job_id
+    assert row("SELECT kind FROM jobs WHERE id=?", (job_id,)) == {
+        "kind": f"source:{source_id}"
+    }
+    assert row("SELECT last_scanned_at FROM sources WHERE id=?", (source_id,)) == {
+        "last_scanned_at": None
+    }
+    assert row(
+        "SELECT status,score FROM candidates WHERE id=?", (candidate_id,)
+    ) == {"status": "recommended", "score": 92.4}
+
+    token = client.post(
+        "/api/settings/api-tokens", json={"name": "Source refresh v1"}
+    ).json()["token"]
+    v1_refreshed = client.post(
+        f"/api/v1/sources/{source_id}/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert v1_refreshed.status_code == 200
+    assert v1_refreshed.json()["job_id"] == job_id
+
+    async def failing_scan(_source):
+        raise RuntimeError("temporary feed outage")
+
+    monkeypatch.setattr(main, "scan_source", failing_scan)
+    with pytest.raises(RuntimeError, match="temporary feed outage"):
+        asyncio.run(handle_job(f"source:{source_id}"))
+
+    assert row("SELECT status,score FROM candidates WHERE id=?", (candidate_id,)) == {
+        "status": "recommended",
+        "score": 92.4,
+    }
+
+    scanned_ids: list[int] = []
+
+    async def succeeding_scan(source):
+        scanned_ids.append(source["id"])
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status='ok:1' WHERE id=?",
+                (source["id"],),
+            )
+        return 1
+
+    monkeypatch.setattr(main, "scan_source", succeeding_scan)
+    monkeypatch.setattr(main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=1))
+    result = asyncio.run(handle_job(f"source:{source_id}"))
+    assert result["source_id"] == source_id
+    assert result["collected"] == 1
+    assert result["scored"] == 1
+    assert scanned_ids == [source_id]
+    assert row("SELECT status,score FROM candidates WHERE id=?", (candidate_id,)) == {
+        "status": "recommended",
+        "score": 92.4,
+    }

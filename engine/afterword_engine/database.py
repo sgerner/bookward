@@ -1029,6 +1029,7 @@ DEFAULT_SOURCES = (
     ("Open Library · Literary fiction", "https://openlibrary.org/subjects/literary_fiction.json?limit=50", 0),
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
 )
+DEFAULT_SOURCE_URLS = frozenset(url for _, url, _ in DEFAULT_SOURCES)
 
 class _ProfileDatabaseLock:
     """Allow concurrent connections and let backup/restore take an exclusive lock."""
