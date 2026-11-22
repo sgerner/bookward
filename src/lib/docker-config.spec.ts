@@ -143,7 +143,7 @@ describe.skipIf(!hasDockerConfig)('root Docker web build configuration', () => {
 		const manifestCopyIndex = buildStage.findIndex(
 			(line) => line.startsWith('COPY ') && line.includes('package*.json') && line.includes('.npmrc'),
 		);
-		const npmCiIndex = buildStage.indexOf('RUN npm ci');
+		const npmCiIndex = buildStage.indexOf('RUN npm ci --ignore-scripts');
 		const buildRunIndex = buildStage.indexOf('RUN npm run check && npm run build');
 
 		expect(manifestCopyIndex).toBeGreaterThanOrEqual(0);

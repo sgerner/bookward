@@ -1,6 +1,12 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
-import { engine, engineStatus } from "#lib/server/engine.js";
+import {
+  GOODREADS_CSV_LIMIT_MESSAGE,
+  GOODREADS_CSV_MAX_BYTES,
+  engine,
+  engineStatus,
+  isPayloadTooLarge,
+} from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -211,7 +217,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 };
 
 const idSchema = z.coerce.number().int().positive();
-const urlSchema = z.string().url();
+const urlSchema = z.url();
 const fail = (statusCode: number, data: { message: string }) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
@@ -573,10 +579,20 @@ export const actions: Actions = {
     }
   },
   importGoodreadsCsv: async ({ request }) => {
-    const incoming = await request.formData();
+    let incoming: FormData;
+    try {
+      incoming = await request.formData();
+    } catch (error) {
+      if (isPayloadTooLarge(error)) {
+        return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+      }
+      throw error;
+    }
     const file = incoming.get("file");
     if (!(file instanceof File) || file.size === 0)
       return fail(400, { message: "Choose a Goodreads CSV export." });
+    if (file.size > GOODREADS_CSV_MAX_BYTES)
+      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
     const body = new FormData();
     body.set("file", file, file.name);
     try {
@@ -586,7 +602,7 @@ export const actions: Actions = {
       );
       return { message: `Imported ${result.imported} Goodreads books.` };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureLibrar: async ({ request }) => {
@@ -902,7 +918,7 @@ export const actions: Actions = {
     }
   },
   retryDigest: async ({ request }) => {
-    const id = z.string().uuid().safeParse((await request.formData()).get("id"));
+    const id = z.uuid().safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid delivery." });
     try {
       const queued = await engine<{ job_id: string }>(

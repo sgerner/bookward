@@ -50,7 +50,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 ### For readers
 
-- Import a complete Goodreads CSV export, including ratings and read dates.
+- Import a complete Goodreads CSV export (up to 10 MB or 20,000 books), including ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
 - Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Mark a shortlisted book Read to add it to your history, with an optional rating.
@@ -192,6 +192,8 @@ npm ci
 uv sync --project engine --extra dev --frozen
 ~~~
 
+`.npmrc` blocks npm install scripts during `npm ci`, so `.svelte-kit` types are synced when you run `npm run dev`, `npm run check`, or `npm run build`.
+
 If you do not use `uv`, create a virtual environment and install the engine package directly:
 
 ~~~
@@ -294,6 +296,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `ORIGIN` | Canonical browser origin embedded in the web build. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
+| `BODY_SIZE_LIMIT` | Maximum HTTP request body accepted by the Node web server; defaults to `12M` so Goodreads CSV exports up to 10 MB (20,000 books) can upload. |
 | `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional one-time bootstrap credentials for the first administrator, or compatibility migration from existing Basic authentication. |
 | `ENGINE_SERVICE_SECRET` | Private credential shared by the web and engine containers. |
 | `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | Optional OpenID Connect provider configuration. |
@@ -393,6 +396,6 @@ The URL must be reachable from the engine process, not just from your browser. U
 
 ## Automation and releases
 
-Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds. Dependabot checks npm, Python, Docker, Docker Compose, and GitHub Actions dependencies weekly.
+Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds with npm install scripts blocked via `.npmrc` and `--ignore-scripts`. Dependabot checks npm, Python, Docker, Docker Compose, and GitHub Actions dependencies weekly, and `npm test` fails if unreviewed Linux install scripts enter `package-lock.json`.
 
 Pushing a tag matching `vMAJOR.MINOR.PATCH` runs the complete CI checks before publishing the Bookward and engine images to GitHub Container Registry as the version tag. Only the highest numeric release tag also publishes `latest`. Manual publishing must also select a version tag; branches cannot overwrite release images.
