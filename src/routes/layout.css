@@ -7,3 +7,35 @@
 @import '@skeletonlabs/skeleton-svelte';
 
 @import '@skeletonlabs/skeleton/themes/cerberus';
+
+@layer components {
+	.card,
+	.input,
+	.select,
+	input[type='file'] {
+		min-width: 0;
+		max-width: 100%;
+	}
+}
+
+@media (max-width: 24rem) {
+	.btn:not(.btn-icon) {
+		max-width: 100%;
+		height: auto;
+		white-space: normal;
+		line-height: 1.25;
+		text-align: center;
+	}
+
+	.btn:not(.btn-icon) > :where(svg) {
+		flex-shrink: 0;
+	}
+}
+
+@media (max-height: 20rem) {
+	header.sticky,
+	nav.fixed,
+	.sticky {
+		position: static;
+	}
+}
