@@ -1790,7 +1790,7 @@
         class="flex min-h-11 shrink-0 items-center gap-3 text-surface-950-50 no-underline"
         aria-label="Bookward home"
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
-          ><img src={bookwardMark} alt="" class="size-full object-cover" aria-hidden="true" /></span
+          ><img src={bookwardMark} alt="" width="128" height="128" class="size-full object-cover" aria-hidden="true" /></span
         ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
           >Bookward</span
         ></a
@@ -2055,7 +2055,7 @@
           </section>
         {/if}
         <section
-          class="grid gap-3 sm:gap-4 lg:grid-cols-2"
+          class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
@@ -2068,19 +2068,6 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              {#if book.cover_url}
-                <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden rounded-[inherit] sm:hidden" aria-hidden="true">
-                  <img
-                    class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px]"
-                    src={book.cover_url}
-                    alt=""
-                    loading={index > 2 ? "lazy" : "eager"}
-                    onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
-                  />
-                  <div class="absolute inset-0 preset-filled-surface-50-950 opacity-[0.82]"></div>
-                  <div class="absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15"></div>
-                </div>
-              {/if}
               {#if view === "discover" && digestVisible && book.status === "recommended"}
                 <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
                   <input
@@ -2092,26 +2079,34 @@
                   />
                 </label>
               {/if}
-              <button
-                type="button"
-                class={`relative hidden h-full w-full self-stretch overflow-hidden preset-tonal-surface text-left before:pointer-events-none before:absolute before:inset-0 before:z-10 before:bg-gradient-to-t before:from-primary-950/30 before:via-transparent before:to-secondary-500/10 before:content-[''] sm:block`}
-                onclick={() => toggleRecommendationDetails(book.id)}
-                aria-label={`View details for ${book.title}`}
-                aria-expanded={expandedRecommendationDetails.has(book.id)}
+              <div
+                class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
               >
-                <span class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400">
+                <span class="absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex" aria-hidden="true">
                   <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
                 </span>
                 {#if book.cover_url}<img
                     in:fade={{ duration: motionDuration(340) }}
-                    class="absolute inset-0 h-full w-full object-cover transition duration-500 group-hover:scale-[1.05]"
+                    class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px] sm:scale-100 sm:opacity-100 sm:blur-none sm:transition sm:duration-500 sm:group-hover:scale-[1.05]"
                     src={book.cover_url}
-                    alt={`Cover of ${book.title}`}
+                    alt=""
+                    width="160"
+                    height="240"
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
-              </button>
+                <div class="pointer-events-none absolute inset-0 preset-filled-surface-50-950 opacity-[0.82] sm:hidden" aria-hidden="true"></div>
+                <div class="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15 sm:hidden" aria-hidden="true"></div>
+                <button
+                  type="button"
+                  class="hidden text-left sm:absolute sm:inset-0 sm:z-20 sm:block focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-500"
+                  onclick={() => toggleRecommendationDetails(book.id)}
+                  aria-label={`View details for ${book.title}`}
+                  aria-expanded={expandedRecommendationDetails.has(book.id)}
+                >
+                  <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                </button>
+              </div>
               <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
@@ -3859,7 +3854,7 @@
         tabindex="-1"
         in:scale={{ duration: motionDuration(260), start: 0.94 }}
         out:scale={{ duration: motionDuration(170), start: 0.97 }}
-        class="relative isolate w-full max-w-xl overflow-hidden rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
+        class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-full max-w-xl overflow-x-hidden overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
       >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
@@ -3891,11 +3886,17 @@
             <input type="hidden" name="rating" value={markReadRating || ""} />
 
             <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
-              <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
+              <div class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
+                <BookOpen size={22} class="text-surface-600-400" aria-hidden="true" />
                 {#if markReadBook.cover_url}
-                  <img src={markReadBook.cover_url} alt="" class="h-full w-full object-cover" />
-                {:else}
-                  <BookOpen size={24} class="text-surface-600-400" />
+                  <img
+                    src={markReadBook.cover_url}
+                    alt=""
+                    width="48"
+                    height="72"
+                    class="absolute inset-0 h-full w-full object-cover"
+                    onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
+                  />
                 {/if}
               </div>
               <div class="min-w-0">
@@ -3955,13 +3956,13 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="relative m-0 flex card max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         aria-modal="true"
         onclick={(event) => event.stopPropagation()}
       >
         <div
-          class="flex items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
+          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium text-primary-600-400">
@@ -3984,7 +3985,7 @@
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
         </div>
-        <div class="max-h-[calc(100vh-11rem)] overflow-y-auto p-5 sm:p-6">
+        <div class="max-h-[calc(100dvh-11rem)] min-h-0 flex-1 overflow-y-auto p-5 sm:p-6">
           <form
             class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
@@ -4084,20 +4085,24 @@
                   class="flex items-center gap-4 preset-tonal-surface p-3 sm:p-4"
                 >
                   <div
-                    class="grid size-16 shrink-0 place-items-center overflow-hidden preset-filled-surface-500 sm:size-20"
+                    class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
                   >
+                    <BookOpen
+                      size={22}
+                      class="text-surface-600-400"
+                      aria-hidden="true"
+                    />
                     {#if cover}<img
                         in:fade={{ duration: motionDuration(180) }}
-                        class="h-full w-full object-cover"
+                        class="absolute inset-0 h-full w-full object-cover"
                         src={cover}
                         alt={`Cover of ${resultTitle(result)}`}
+                        width="48"
+                        height="72"
                         loading="lazy"
                         onerror={(event) =>
                           ((event.currentTarget as HTMLImageElement).hidden =
                             true)}
-                      />{:else}<BookOpen
-                        size={22}
-                        class="text-surface-600-400"
                       />{/if}
                   </div>
                   <div class="min-w-0 flex-1">
