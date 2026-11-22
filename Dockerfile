@@ -3,7 +3,7 @@ ARG ORIGIN
 ENV ORIGIN=${ORIGIN}
 WORKDIR /app
 COPY package*.json .npmrc ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 COPY tsconfig.json vite.config.ts ./
 COPY static ./static
 COPY src ./src

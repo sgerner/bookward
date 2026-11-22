@@ -29,7 +29,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Type and Svelte checks
         run: npm run check
@@ -115,7 +115,7 @@ jobs:
           cache-dependency-glob: engine/uv.lock
       - name: Install dependencies
         run: |
-          npm ci
+          npm ci --ignore-scripts
           uv sync --project engine --extra dev --frozen
       - name: Verify fresh-install web and engine flows
         run: uv run --project engine python scripts/community_smoke.py
