@@ -22,6 +22,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
+from .http_bounds import JSON_CONTENT_TYPES, stream_response_async
 from .identity import book_author_identity_key, book_catalog_title_identity_key, canonical_part
 from .isbn import canonical_isbn, isbn_parts
 from .subjects import normalize_subjects
@@ -102,7 +103,18 @@ async def _openlibrary_request(
     """Send a request through the shared Open Library rate budget."""
 
     await wait_for_openlibrary_request_slot()
-    return await client.get(url, **kwargs)
+    return await stream_response_async(
+        client,
+        "GET",
+        url,
+        max_bytes=settings.source_max_bytes,
+        allowed_content_types=JSON_CONTENT_TYPES,
+        allow_missing_content_type=True,
+        raise_for_status=False,
+        content_type_error="Open Library returned an unsupported content type",
+        size_error="Open Library response is too large",
+        **kwargs,
+    )
 
 
 def _bounded_source_payload(value: object) -> dict[str, object]:
@@ -587,9 +599,31 @@ async def _lookup_google_books_record(
     try:
         if client is None:
             async with metadata_client() as owned_client:
-                response = await owned_client.get(GOOGLE_BOOKS_SEARCH, params=params)
+                response = await stream_response_async(
+                    owned_client,
+                    "GET",
+                    GOOGLE_BOOKS_SEARCH,
+                    params=params,
+                    max_bytes=settings.source_max_bytes,
+                    allowed_content_types=JSON_CONTENT_TYPES,
+                    allow_missing_content_type=True,
+                    raise_for_status=False,
+                    content_type_error="Google Books returned an unsupported content type",
+                    size_error="Google Books response is too large",
+                )
         else:
-            response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
+            response = await stream_response_async(
+                client,
+                "GET",
+                GOOGLE_BOOKS_SEARCH,
+                params=params,
+                max_bytes=settings.source_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                raise_for_status=False,
+                content_type_error="Google Books returned an unsupported content type",
+                size_error="Google Books response is too large",
+            )
         trace["http_status"] = response.status_code
         if response.is_error:
             trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"

@@ -20,6 +20,7 @@ import httpx
 
 from ..associations import Association, RateLimiter, record_association_request, select_seed_reads
 from ..config import settings
+from ..http_bounds import stream_json_async
 from ..identity import ReadIdentityIndex
 from ..isbn import isbn_parts, normalize_isbn_identifier
 from ..security import resolve_public_target
@@ -137,17 +138,17 @@ class GoogleBooksClient:
                 trust_env=False,
                 headers={"User-Agent": GOOGLE_BOOKS_USER_AGENT},
             ) as client:
-                response = await client.request(
+                response, payload = await stream_json_async(
+                    client,
                     "GET",
                     pinned,
                     params=query,
                     headers={"Host": host_header},
                     extensions={"sni_hostname": hostname},
+                    max_bytes=settings.source_max_bytes,
+                    content_type_error="Google Books returned an unsupported content type",
+                    size_error="Google Books response is too large",
                 )
-                response.raise_for_status()
-                if len(response.content) > settings.source_max_bytes:
-                    raise ValueError("Google Books response is too large")
-                payload = response.json()
                 if not isinstance(payload, Mapping):
                     raise ValueError("Google Books response must be an object")
                 ttl = min(_cache_ttl(response.headers), self.max_cache_ttl_seconds)

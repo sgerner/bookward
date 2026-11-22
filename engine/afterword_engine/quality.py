@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 from typing import Any
 import httpx
 
+from .config import settings
 from .covers import (
     GOOGLE_BOOKS_SEARCH,
     METADATA_GENRE_LIMIT,
@@ -43,6 +44,7 @@ from .covers import (
     safe_cover_url,
 )
 from .database import persist_metadata_field_provenance, private_setting, rows, transaction
+from .http_bounds import JSON_CONTENT_TYPES, stream_response_async
 from .identity import (
     canonical_part,
     ReadIdentityIndex,
@@ -445,7 +447,18 @@ async def _google_books_match(
     if trace is not None:
         trace.append(fetch_trace)
     try:
-        response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
+        response = await stream_response_async(
+            client,
+            "GET",
+            GOOGLE_BOOKS_SEARCH,
+            params=params,
+            max_bytes=settings.source_max_bytes,
+            allowed_content_types=JSON_CONTENT_TYPES,
+            allow_missing_content_type=True,
+            raise_for_status=False,
+            content_type_error="Google Books returned an unsupported content type",
+            size_error="Google Books response is too large",
+        )
         fetch_trace["http_status"] = response.status_code
         if response.is_error:
             fetch_trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"
@@ -583,9 +596,17 @@ async def _apple_books_match(
     if trace is not None:
         trace.append(fetch_trace)
     try:
-        response = await client.get(
+        response = await stream_response_async(
+            client,
+            "GET",
             APPLE_BOOKS_SEARCH,
             params={"media": media, "term": term, "limit": 5, "country": "us"},
+            max_bytes=settings.source_max_bytes,
+            allowed_content_types=JSON_CONTENT_TYPES,
+            allow_missing_content_type=True,
+            raise_for_status=False,
+            content_type_error="Apple Books returned an unsupported content type",
+            size_error="Apple Books response is too large",
         )
         fetch_trace["http_status"] = response.status_code
         if response.is_error:

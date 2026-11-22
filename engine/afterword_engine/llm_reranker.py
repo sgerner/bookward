@@ -9,6 +9,8 @@ from typing import Any, Sequence
 import httpx
 
 from .config import settings
+from .http_bounds import stream_json_async, stream_json_sync
+from .security import safe_error_message
 
 LOGGER = logging.getLogger(__name__)
 
@@ -267,7 +269,9 @@ async def rerank_with_llm(
     messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
+            _response, payload = await stream_json_async(
+                client,
+                "POST",
                 url,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
@@ -276,16 +280,17 @@ async def rerank_with_llm(
                     "response_format": {"type": "json_object"},
                     "messages": messages,
                 },
+                max_bytes=settings.llm_rerank_max_bytes,
+                size_error="LLM reranker response is too large",
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+            content = payload["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
                 return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
             rankings = parsed.get("rankings") or []
             return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
     except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
+        LOGGER.warning("LLM reranker failed; falling back to base order: %s", safe_error_message(exc))
         return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
 
 
@@ -315,7 +320,9 @@ def rerank_with_llm_sync(
     messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(
+            _response, payload = stream_json_sync(
+                client,
+                "POST",
                 url,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
@@ -324,14 +331,15 @@ def rerank_with_llm_sync(
                     "response_format": {"type": "json_object"},
                     "messages": messages,
                 },
+                max_bytes=settings.llm_rerank_max_bytes,
+                size_error="LLM reranker response is too large",
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+            content = payload["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
                 return apply_llm_rerank_adjustments(candidates, parsed["adjustments"], top_k=k, max_delta=delta)
             rankings = parsed.get("rankings") or []
             return apply_llm_rerank_order(candidates, rankings, top_k=k, max_nudge=delta)
     except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
+        LOGGER.warning("LLM reranker failed; falling back to base order: %s", safe_error_message(exc))
         return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}

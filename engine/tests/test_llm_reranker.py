@@ -157,23 +157,33 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
     import afterword_engine.main as main_module
 
     calls = 0
+    closed = 0
+    client_kwargs: dict[str, object] = {}
 
     class FakeResponse:
+        headers = {"content-type": "application/json"}
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict:
-            return {
-                "openai": {
-                    "name": "OpenAI",
-                    "api": "https://api.openai.com/v1",
-                    "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
+        async def aiter_bytes(self):
+            yield json.dumps(
+                {
+                    "openai": {
+                        "name": "OpenAI",
+                        "api": "https://api.openai.com/v1",
+                        "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
+                    }
                 }
-            }
+            ).encode("utf-8")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed += 1
 
     class FakeClient:
         def __init__(self, *args, **kwargs) -> None:
-            pass
+            client_kwargs.update(kwargs)
 
         async def __aenter__(self):
             return self
@@ -181,18 +191,28 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
         async def __aexit__(self, *args) -> None:
             return None
 
-        async def get(self, url: str):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        async def send(self, request, *, stream: bool = False, **kwargs):
             nonlocal calls
+            assert stream is True
+            assert request["url"] == "https://models.dev/api.json"
             calls += 1
             return FakeResponse()
 
-    main_module._MODELS_DEV_CACHE["providers"] = []
-    main_module._MODELS_DEV_CACHE["expires_at"] = 0.0
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "providers", [])
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "expires_at", 0.0)
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "retry_after", 0.0)
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "last_error", "")
     monkeypatch.setattr(main_module.httpx, "AsyncClient", FakeClient)
 
     first = asyncio.run(main_module.llm_models_catalog())
     second = asyncio.run(main_module.llm_models_catalog())
     assert calls == 1
+    assert closed == 1
+    assert client_kwargs.get("follow_redirects") is False
+    assert client_kwargs.get("trust_env") is False
     assert first["cached"] is False
     assert second["cached"] is True
     assert first["providers"][0]["id"] == "openai"

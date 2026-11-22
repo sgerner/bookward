@@ -24,7 +24,9 @@ from ..associations import (
     record_association_request,
     select_seed_reads,
 )
+from ..config import settings
 from ..database import rows
+from ..http_bounds import stream_json_async
 from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import normalize_isbn_identifier
 from ..security import resolve_public_target
@@ -137,17 +139,17 @@ class LibraryThingClient:
                 trust_env=False,
                 headers={"User-Agent": LIBRARYTHING_USER_AGENT},
             ) as client:
-                response = await client.request(
+                _response, payload = await stream_json_async(
+                    client,
                     "GET",
                     pinned,
                     params={**query, "apiKey": self.api_key},
                     headers={"Host": host_header},
                     extensions={"sni_hostname": hostname},
+                    max_bytes=settings.source_max_bytes,
+                    content_type_error="LibraryThing returned an unsupported content type",
+                    size_error="LibraryThing response is too large",
                 )
-                response.raise_for_status()
-                if len(response.content) > 2_000_000:
-                    raise ValueError("LibraryThing response is too large")
-                payload = response.json()
                 if not isinstance(payload, Mapping):
                     raise ValueError("LibraryThing response must be an object")
         except Exception:

@@ -23,6 +23,7 @@ from ..associations import (
     record_association_request,
 )
 from ..config import settings
+from ..http_bounds import stream_json_async
 from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import isbn_parts, normalize_isbn_identifier
 from ..security import resolve_public_target
@@ -202,17 +203,17 @@ class OpenLibraryClient:
                 trust_env=False,
                 headers=headers,
             ) as client:
-                response = await client.request(
+                _response, payload = await stream_json_async(
+                    client,
                     "GET",
                     pinned,
                     params=params,
                     headers={"Host": host_header},
                     extensions={"sni_hostname": hostname},
+                    max_bytes=settings.source_max_bytes,
+                    content_type_error="Open Library returned an unsupported content type",
+                    size_error="Open Library response is too large",
                 )
-                response.raise_for_status()
-                if len(response.content) > settings.source_max_bytes:
-                    raise ValueError("Open Library response is too large")
-                payload = response.json()
         except Exception:
             record_association_request(OPEN_LIBRARY_LISTS_PROVIDER, cache_key, "error")
             raise

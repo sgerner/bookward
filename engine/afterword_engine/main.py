@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -45,6 +46,13 @@ from .ingestion import (
     refresh_read_work_identities,
     refresh_missing_candidate_metadata,
     scan_source,
+)
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    ResponseTooLargeError,
+    iter_bounded_bytes_async,
+    stream_bytes_async,
+    stream_json_async,
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
@@ -947,9 +955,13 @@ async def _oidc_metadata():
     issuer, discovery_url, redirect_uri, allow_local_http = _oidc_config()
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            response = await client.get(discovery_url)
-            response.raise_for_status()
-            metadata = response.json()
+            _response, metadata = await stream_json_async(
+                client,
+                "GET",
+                discovery_url,
+                max_bytes=settings.oidc_max_bytes,
+                size_error="OIDC discovery response is too large",
+            )
     except Exception as exc:
         raise HTTPException(502, "The SSO provider could not be reached") from exc
     if not isinstance(metadata, dict) or metadata.get("issuer") != issuer or not all(
@@ -1028,7 +1040,9 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         raise HTTPException(502, "The SSO provider does not support a configured client authentication method")
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            token_response = await client.post(
+            _token_response, tokens = await stream_json_async(
+                client,
+                "POST",
                 metadata["token_endpoint"],
                 data={
                     "grant_type": "authorization_code", "code": code,
@@ -1037,14 +1051,23 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
                     **token_client_fields,
                 },
                 auth=token_auth,
+                max_bytes=settings.oidc_max_bytes,
+                size_error="OIDC token response is too large",
             )
-            token_response.raise_for_status()
-            tokens = token_response.json()
+            if not isinstance(tokens, dict):
+                raise ValueError("OIDC token response must be a JSON object")
             id_token = tokens.get("id_token", "")
             header = jwt.get_unverified_header(id_token)
-            keys_response = await client.get(metadata["jwks_uri"])
-            keys_response.raise_for_status()
-            jwks = keys_response.json().get("keys", [])
+            _keys_response, jwks_payload = await stream_json_async(
+                client,
+                "GET",
+                metadata["jwks_uri"],
+                max_bytes=settings.oidc_max_bytes,
+                size_error="OIDC JWKS response is too large",
+            )
+            if not isinstance(jwks_payload, dict):
+                raise ValueError("OIDC JWKS response must be a JSON object")
+            jwks = jwks_payload.get("keys", [])
         jwk = next((key for key in jwks if key.get("kid") == header.get("kid")), None)
         if not jwk:
             raise ValueError("Unknown signing key")
@@ -2239,10 +2262,23 @@ async def import_librarr(candidate_id: int):
         validate_service_url(config["librarr_url"], allowed)
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             media_type = normalize_media_type(config.get("librarr_media_type"))
-            response = await client.post(f"{config['librarr_url'].rstrip('/')}/api/wishlist", headers={"X-Api-Key":config["librarr_api_key"],"Idempotency-Key":key}, json={"title":candidate["title"],"author":candidate["author"],"media_type":media_type})
-            response.raise_for_status()
-            try: data = response.json()
-            except ValueError: data = {}
+            _response, body = await stream_bytes_async(
+                client,
+                "POST",
+                f"{config['librarr_url'].rstrip('/')}/api/wishlist",
+                headers={"X-Api-Key": config["librarr_api_key"], "Idempotency-Key": key},
+                json={"title": candidate["title"], "author": candidate["author"], "media_type": media_type},
+                max_bytes=settings.librarr_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Librarr returned an unsupported wishlist content type",
+                size_error="Librarr wishlist response is too large",
+            )
+            try:
+                parsed_body = json.loads(body) if body.strip() else {}
+                data = parsed_body if isinstance(parsed_body, dict) else {}
+            except ValueError:
+                data = {}
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
             con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
@@ -2287,9 +2323,17 @@ async def stream_librarr_search(
 
     async def stream_bytes():
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
+            async for chunk in iter_bounded_bytes_async(
+                upstream,
+                max_bytes=settings.librarr_stream_max_bytes,
+                size_error="Librarr search stream is too large",
+            ):
+                yield chunk
+        except ResponseTooLargeError:
+            LOGGER.warning(
+                "Aborted Librarr SSE stream after exceeding %d bytes",
+                settings.librarr_stream_max_bytes,
+            )
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -2574,7 +2618,29 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
     return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
 
 
-_MODELS_DEV_CACHE: dict[str, object] = {"expires_at": 0.0, "providers": []}
+_MODELS_DEV_FAILURE_COOLDOWN_SECONDS = 60.0
+_MODELS_DEV_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+_MODELS_DEV_CACHE: dict[str, object] = {
+    "expires_at": 0.0,
+    "retry_after": 0.0,
+    "last_error": "",
+    "providers": [],
+}
+
+
+def _models_dev_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _MODELS_DEV_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MODELS_DEV_LOCKS[loop] = lock
+    return lock
+
+
+def _models_dev_clock() -> float:
+    return time.monotonic()
 _KNOWN_LLM_CHAT_URLS = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "google": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -2633,22 +2699,56 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
-    now = time.monotonic()
+    now = _models_dev_clock()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get("https://models.dev/api.json")
-            resp.raise_for_status()
-            providers = _normalize_models_dev_catalog(resp.json())
-        _MODELS_DEV_CACHE["providers"] = providers
-        _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
-        return {"providers": providers, "cached": False}
-    except Exception as exc:
+    if now < float(_MODELS_DEV_CACHE.get("retry_after") or 0.0):
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        detail = str(_MODELS_DEV_CACHE.get("last_error") or "Request failed")
+        raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}")
+
+    async with _models_dev_lock():
+        now = _models_dev_clock()
+        cached = _MODELS_DEV_CACHE.get("providers") or []
+        if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
+            return {"providers": cached, "cached": True}
+        if now < float(_MODELS_DEV_CACHE.get("retry_after") or 0.0):
+            if cached:
+                return {"providers": cached, "cached": True, "stale": True}
+            detail = str(_MODELS_DEV_CACHE.get("last_error") or "Request failed")
+            raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}")
+        try:
+            async with httpx.AsyncClient(
+                timeout=12.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                _resp, raw_catalog = await stream_json_async(
+                    client,
+                    "GET",
+                    "https://models.dev/api.json",
+                    max_bytes=settings.models_dev_max_bytes,
+                    size_error="models.dev catalog response is too large",
+                )
+            if not isinstance(raw_catalog, dict):
+                raise ValueError("models.dev catalog must be a JSON object")
+            providers = _normalize_models_dev_catalog(raw_catalog)
+            fetched_at = _models_dev_clock()
+            _MODELS_DEV_CACHE["providers"] = providers
+            _MODELS_DEV_CACHE["expires_at"] = fetched_at + 3600.0
+            _MODELS_DEV_CACHE["retry_after"] = 0.0
+            _MODELS_DEV_CACHE["last_error"] = ""
+            return {"providers": providers, "cached": False}
+        except Exception as exc:
+            failed_at = _models_dev_clock()
+            detail = safe_error_message(exc)
+            _MODELS_DEV_CACHE["retry_after"] = failed_at + _MODELS_DEV_FAILURE_COOLDOWN_SECONDS
+            _MODELS_DEV_CACHE["last_error"] = detail
+            if cached:
+                return {"providers": cached, "cached": True, "stale": True}
+            raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}") from exc
 
 
 @app.put("/api/sources/{source_id}")
@@ -2924,7 +3024,7 @@ async def preview_google_book_associations():
     try:
         associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+        raise HTTPException(502, f"Google Books preview failed: {safe_error_message(exc)}") from exc
     return {
         "provider": provider.provider,
         "count": len(associations),

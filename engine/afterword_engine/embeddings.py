@@ -6,6 +6,8 @@ import httpx
 import numpy as np
 from sklearn.feature_extraction.text import HashingVectorizer
 from .config import settings
+from .http_bounds import stream_json_async
+from .security import safe_error_message
 
 class Embedder:
     name = "base"
@@ -19,7 +21,7 @@ class Embedder:
             if not dimensions: raise ValueError("Provider returned an empty vector")
             return {"ok": True, "backend": self.name, "model": self.model, "dimensions":dimensions, "latency_ms":round((time.perf_counter()-started)*1000)}
         except Exception as exc:
-            return {"ok":False,"backend":self.name,"model":self.model,"error":str(exc)[:500]}
+            return {"ok":False,"backend":self.name,"model":self.model,"error":safe_error_message(exc, limit=500)}
 
 class LocalHashingEmbedder(Embedder):
     name = "local"
@@ -48,8 +50,15 @@ class OllamaEmbedder(Embedder):
     def __init__(self, url, model): self.url, self.model = url.rstrip('/'), model
     async def embed(self, texts):
         async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(f"{self.url}/api/embed", json={"model": self.model, "input": texts})
-            response.raise_for_status(); return response.json()["embeddings"]
+            _response, payload = await stream_json_async(
+                client,
+                "POST",
+                f"{self.url}/api/embed",
+                json={"model": self.model, "input": texts},
+                max_bytes=settings.embedding_max_bytes,
+                size_error="Embedding response is too large",
+            )
+            return payload["embeddings"]
 
 
 def _ordered_openai_embeddings(payload, expected_count: int) -> list[list[float]]:
@@ -87,9 +96,16 @@ class OpenAICompatibleEmbedder(Embedder):
         headers = {"authorization": f"Bearer {self.key}"} if self.key else {}
         async with httpx.AsyncClient(timeout=120) as client:
             suffix = "/embeddings" if self.url.endswith("/v1") else "/v1/embeddings"
-            response = await client.post(f"{self.url}{suffix}", headers=headers, json={"model": self.model, "input": texts})
-            response.raise_for_status()
-            return _ordered_openai_embeddings(response.json(), len(texts))
+            _response, payload = await stream_json_async(
+                client,
+                "POST",
+                f"{self.url}{suffix}",
+                headers=headers,
+                json={"model": self.model, "input": texts},
+                max_bytes=settings.embedding_max_bytes,
+                size_error="Embedding response is too large",
+            )
+            return _ordered_openai_embeddings(payload, len(texts))
 
 def get_embedder(backend=None, model=None, url=None, api_key=None):
     backend = backend or settings.embedding_backend
