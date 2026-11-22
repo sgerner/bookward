@@ -1307,3 +1307,543 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
         applied = {row[0] for row in con.execute("SELECT version FROM schema_migrations")}
     assert {"previous_status", "undone_at"} <= columns
     assert feedback_migration in applied
+
+
+def test_auth_registry_key_caches_disk_secret_and_refreshes_on_env_or_file_change(
+    tmp_path, monkeypatch
+):
+    from cryptography.fernet import Fernet
+    import afterword_engine.secrets as engine_secrets
+
+    db_one = tmp_path / "one" / "afterword.db"
+    db_two = tmp_path / "two" / "afterword.db"
+    monkeypatch.setattr(settings, "db", str(db_one))
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    engine_secrets.clear_auth_registry_key_cache()
+
+    disk_reads = 0
+    original_generated_key = engine_secrets._generated_key
+
+    def counting_generated_key(path: Path) -> bytes:
+        nonlocal disk_reads
+        disk_reads += 1
+        return original_generated_key(path)
+
+    monkeypatch.setattr(engine_secrets, "_generated_key", counting_generated_key)
+
+    first = engine_secrets.auth_registry_key()
+    second = engine_secrets.auth_registry_key()
+    assert first == second
+    assert disk_reads == 1
+
+    env_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("AFTERWORD_SECRET_KEY", env_key)
+    assert engine_secrets.auth_registry_key() == env_key.encode()
+    assert disk_reads == 1
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY")
+    assert engine_secrets.auth_registry_key() == first
+    assert disk_reads == 1
+
+    # Atomic file replacement (os.replace) refreshes the cached secret.
+    key_path = db_one.with_name("secret.key")
+    replacement_file = db_one.with_name("secret.key.next")
+    replacement_key = Fernet.generate_key()
+    replacement_file.write_bytes(replacement_key)
+    replacement_file.replace(key_path)
+    assert engine_secrets.auth_registry_key() == replacement_key
+    assert disk_reads == 2
+    assert engine_secrets.auth_registry_key() == replacement_key
+    assert disk_reads == 2
+
+    # Switching settings.db refreshes automatically.
+    monkeypatch.setattr(settings, "db", str(db_two))
+    other_key = engine_secrets.auth_registry_key()
+    assert other_key != replacement_key
+    assert disk_reads == 3
+
+
+def test_api_token_digest_cache_is_bounded_hmac_keyed_and_excludes_invalid_tokens(
+    identity_store, monkeypatch
+):
+    import hashlib
+    import hmac
+    import statistics
+    from afterword_engine.api_tokens import hash_api_token
+    from afterword_engine.secrets import auth_registry_key
+
+    profiles.invalidate_auth_caches(clear_all=True)
+    reader = profiles.create_account("cache-reader", "cache-reader-password-long")
+    created_a = profiles.create_profile_api_token(reader["profile_id"], "Token A")
+    created_b = profiles.create_profile_api_token(reader["profile_id"], "Token B")
+    created_c = profiles.create_profile_api_token(reader["profile_id"], "Token C")
+    token_a = created_a["token"]
+
+    # Invalid tokens never enter the verified digest cache.
+    invalid_token = generate_api_token()
+    assert profiles.authenticate_api_token(invalid_token) is None
+    assert len(profiles._VERIFIED_TOKEN_DIGESTS) == 0
+
+    derivations = 0
+
+    def counting_hash(raw: str) -> str:
+        nonlocal derivations
+        derivations += 1
+        return hash_api_token(raw)
+
+    monkeypatch.setattr(profiles, "hash_api_token", counting_hash)
+
+    assert profiles.authenticate_api_token(token_a)["id"] == created_a["id"]
+    assert derivations == 1
+
+    expected_hmac_key = hmac.new(
+        auth_registry_key(), token_a.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    assert list(profiles._VERIFIED_TOKEN_DIGESTS.keys()) == [expected_hmac_key]
+    cached_entry = profiles._VERIFIED_TOKEN_DIGESTS[expected_hmac_key]
+    assert token_a not in profiles._VERIFIED_TOKEN_DIGESTS
+    assert token_a not in repr(cached_entry)
+
+    # Repeat authentications hit the cache in < 5 ms median without PBKDF2 hashing.
+    latencies_ms = []
+    for _ in range(25):
+        started = time.perf_counter()
+        verified = profiles.authenticate_api_token(token_a)
+        latencies_ms.append((time.perf_counter() - started) * 1000)
+        assert verified["profile_id"] == reader["profile_id"]
+    assert derivations == 1
+    assert statistics.median(latencies_ms) < 5.0
+
+    # Bounded LRU eviction keeps at most TOKEN_CACHE_MAX_ENTRIES entries.
+    monkeypatch.setattr(profiles, "TOKEN_CACHE_MAX_ENTRIES", 2)
+    assert profiles.authenticate_api_token(created_b["token"]) is not None
+    assert profiles.authenticate_api_token(token_a) is not None  # Refresh A as MRU
+    assert profiles.authenticate_api_token(created_c["token"]) is not None  # Evicts B
+    assert len(profiles._VERIFIED_TOKEN_DIGESTS) == 2
+    assert profiles.has_cached_api_token(token_a) is True
+    assert profiles.has_cached_api_token(created_c["token"]) is True
+    assert profiles.has_cached_api_token(created_b["token"]) is False
+
+
+def test_token_cache_invalidates_immediately_on_revocation_status_password_and_restore(
+    identity_store,
+):
+    reader = profiles.create_account("revoke-reader", "revoke-reader-password-long")
+    first = profiles.create_profile_api_token(reader["profile_id"], "First")
+    second = profiles.create_profile_api_token(reader["profile_id"], "Second")
+
+    assert profiles.authenticate_api_token(first["token"]) is not None
+    assert profiles.has_cached_api_token(first["token"]) is True
+    profiles.revoke_profile_api_token(reader["profile_id"], first["id"])
+    assert profiles.has_cached_api_token(first["token"]) is False
+    assert profiles.authenticate_api_token(first["token"]) is None
+
+    # Password updates and resets immediately drop cached token entries.
+    assert profiles.authenticate_api_token(second["token"]) is not None
+    assert profiles.has_cached_api_token(second["token"]) is True
+    profiles.update_password(reader["id"], "updated-reader-password-long")
+    assert profiles.has_cached_api_token(second["token"]) is False
+
+    assert profiles.authenticate_api_token(second["token"]) is not None
+    assert profiles.has_cached_api_token(second["token"]) is True
+    profiles.reset_password(reader["id"], "reset-reader-password-long-enough")
+    assert profiles.has_cached_api_token(second["token"]) is False
+
+    # Disabling the account immediately invalidates cached tokens and rejects next request.
+    assert profiles.authenticate_api_token(second["token"]) is not None
+    assert profiles.has_cached_api_token(second["token"]) is True
+    profiles.set_account_status(reader["id"], "disabled")
+    assert profiles.has_cached_api_token(second["token"]) is False
+    assert profiles.authenticate_api_token(second["token"]) is None
+
+    # Identity backup restore immediately invalidates cached tokens and rejects next request.
+    other = profiles.create_account("restore-invalidate", "restore-invalidate-password")
+    before_restore = profiles.create_profile_api_token(other["profile_id"], "Snapshot token")
+    snapshot = backups.create_auth_backup()
+    assert profiles.authenticate_api_token(before_restore["token"]) is not None
+    assert profiles.has_cached_api_token(before_restore["token"]) is True
+    backups.restore_auth_backup(snapshot["id"])
+    assert profiles.has_cached_api_token(before_restore["token"]) is False
+    assert profiles.authenticate_api_token(before_restore["token"]) is None
+
+
+def test_session_and_api_token_activity_writes_debounce_to_60s_with_immediate_exceptions(
+    identity_store, monkeypatch
+):
+    from datetime import datetime, timedelta, timezone
+    from afterword_engine.api_tokens import hash_api_token
+
+    current_time = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(profiles, "utc_now", lambda: current_time)
+
+    reader = profiles.create_account("debounce-reader", "debounce-reader-password-long")
+    session, _ = profiles.create_session(reader["id"])
+    created_token = profiles.create_profile_api_token(reader["profile_id"], "Debounced")
+    raw_token = created_token["token"]
+    token_id = created_token["id"]
+
+    legacy_created = profiles.create_profile_api_token(reader["profile_id"], "Legacy")
+    legacy_raw = legacy_created["token"]
+    legacy_id = legacy_created["id"]
+    with profiles.auth_connect() as con:
+        con.execute(
+            "UPDATE api_tokens SET token_hash=?,last_used_at=NULL WHERE id=?",
+            (legacy_hash_api_token(legacy_raw), legacy_id),
+        )
+
+    session_writes = 0
+    token_writes = 0
+    original_auth_connect = profiles.auth_connect
+
+    def tracing_auth_connect(*args, **kwargs):
+        con = original_auth_connect(*args, **kwargs)
+
+        def trace(sql: str):
+            nonlocal session_writes, token_writes
+            normalized = " ".join(sql.strip().upper().split())
+            if normalized.startswith("UPDATE AUTH_SESSIONS"):
+                session_writes += 1
+            elif normalized.startswith("UPDATE API_TOKENS"):
+                token_writes += 1
+
+        con.set_trace_callback(trace)
+        return con
+
+    monkeypatch.setattr(profiles, "auth_connect", tracing_auth_connect)
+
+    # First token use writes immediately; repeat uses inside 60s skip writes.
+    current_time += timedelta(seconds=5)
+    assert profiles.authenticate_api_token(raw_token) is not None
+    assert token_writes == 1
+    with original_auth_connect() as con:
+        first_used_at = con.execute(
+            "SELECT last_used_at FROM api_tokens WHERE id=?", (token_id,)
+        ).fetchone()["last_used_at"]
+    assert first_used_at is not None
+
+    current_time += timedelta(seconds=20)
+    assert profiles.authenticate_api_token(raw_token) is not None
+    assert profiles.authenticate_api_token(raw_token) is not None
+    assert token_writes == 1
+
+    # After 60s, routine activity writes once again.
+    current_time += timedelta(seconds=45)
+    assert profiles.authenticate_api_token(raw_token) is not None
+    assert token_writes == 2
+
+    # Legacy SHA-256 token upgrades immediately without throttling.
+    assert profiles.authenticate_api_token(legacy_raw) is not None
+    assert token_writes == 3
+    with original_auth_connect() as con:
+        upgraded = con.execute(
+            "SELECT token_hash,last_used_at FROM api_tokens WHERE id=?", (legacy_id,)
+        ).fetchone()
+    assert upgraded["token_hash"] == hash_api_token(legacy_raw)
+    assert upgraded["last_used_at"] is not None
+
+    # Session activity updates at most once per 60s window.
+    current_time += timedelta(seconds=5)
+    assert profiles.resolve_session(session)["id"] == reader["id"]
+    assert session_writes == 1
+    current_time += timedelta(seconds=15)
+    assert profiles.resolve_session(session)["id"] == reader["id"]
+    assert profiles.resolve_session(session)["id"] == reader["id"]
+    assert session_writes == 1
+
+    current_time += timedelta(seconds=50)
+    assert profiles.resolve_session(session)["id"] == reader["id"]
+    assert session_writes == 2
+
+    # Expired session revokes immediately without throttling (24-hour idle expiry).
+    current_time += timedelta(hours=profiles.SESSION_IDLE_HOURS, seconds=1)
+    assert profiles.resolve_session(session) is None
+    assert session_writes == 3
+    import hashlib
+
+    with original_auth_connect() as con:
+        revoked_row = con.execute(
+            "SELECT revoked_at FROM auth_sessions WHERE token_hash=?",
+            (hashlib.sha256(session.encode()).hexdigest(),),
+        ).fetchone()
+    assert revoked_row["revoked_at"] is not None
+
+    # 7-day absolute expiry revokes even when active inside the 24h idle window.
+    long_lived_session, _ = profiles.create_session(reader["id"])
+    for _ in range(7):
+        current_time += timedelta(hours=23)
+        assert profiles.resolve_session(long_lived_session)["id"] == reader["id"]
+    current_time += timedelta(hours=10)
+    writes_before_abs_expiry = session_writes
+    assert profiles.resolve_session(long_lived_session) is None
+    assert session_writes == writes_before_abs_expiry + 1
+
+
+def test_concurrent_api_token_requests_and_invalid_flood_keep_event_loop_and_health_responsive(
+    identity_store, monkeypatch
+):
+    import statistics
+    import threading
+    from afterword_engine.api_tokens import hash_api_token
+
+    readers = [
+        profiles.create_account(f"api-reader-{idx}", f"api-reader-{idx}-password-long")
+        for idx in range(8)
+    ]
+    for reader in readers:
+        with profile_scope(reader["profile_id"]):
+            initialize(seed_demo=False)
+    sessions = [profiles.create_session(reader["id"])[0] for reader in readers]
+    # Warm session debounce slots so /auth/me measures steady-state reader checks
+    # alongside cold PBKDF2 derivations.
+    for session in sessions:
+        assert profiles.resolve_session(session) is not None
+    valid_tokens = [
+        profiles.create_profile_api_token(readers[idx]["profile_id"], f"Client {idx}")["token"]
+        for idx in range(8)
+    ]
+    invalid_tokens = [generate_api_token() for _ in range(8)]
+
+    active_derivations = 0
+    peak_derivations = 0
+    counter_lock = threading.Lock()
+
+    def tracked_hash_api_token(token: str) -> str:
+        nonlocal active_derivations, peak_derivations
+        with counter_lock:
+            active_derivations += 1
+            peak_derivations = max(peak_derivations, active_derivations)
+        try:
+            return hash_api_token(token)
+        finally:
+            with counter_lock:
+                active_derivations -= 1
+
+    monkeypatch.setattr(profiles, "hash_api_token", tracked_hash_api_token)
+
+    def percentile_95(samples: list[float]) -> float:
+        ordered = sorted(samples)
+        index = min(len(ordered) - 1, max(0, int(round(0.95 * (len(ordered) - 1)))))
+        return ordered[index]
+
+    async def run_benchmark():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            for batch in (valid_tokens[:4], valid_tokens[:8], invalid_tokens):
+                for token in valid_tokens:
+                    profiles.invalidate_auth_caches(
+                        cache_key=profiles._token_cache_key(token)
+                    )
+                sleep_samples: list[float] = []
+                health_samples: list[float] = []
+                auth_me_samples: list[float] = []
+                running = True
+
+                async def timer_probe():
+                    while running:
+                        started = time.perf_counter()
+                        await asyncio.sleep(0.01)
+                        sleep_samples.append((time.perf_counter() - started) * 1000)
+
+                async def health_probe():
+                    while running:
+                        started = time.perf_counter()
+                        response = await client.get("/api/health")
+                        assert response.status_code == 200
+                        health_samples.append((time.perf_counter() - started) * 1000)
+                        await asyncio.sleep(0.01)
+
+                async def session_probe():
+                    cursor = 0
+                    while running:
+                        started = time.perf_counter()
+                        response = await client.get(
+                            "/auth/me",
+                            headers={"x-bookward-session": sessions[cursor % len(sessions)]},
+                        )
+                        assert response.status_code == 200
+                        auth_me_samples.append((time.perf_counter() - started) * 1000)
+                        cursor += 1
+                        await asyncio.sleep(0.01)
+
+                probes = [
+                    asyncio.create_task(timer_probe()),
+                    asyncio.create_task(health_probe()),
+                    asyncio.create_task(session_probe()),
+                ]
+                await asyncio.sleep(0.02)
+                responses = await asyncio.gather(
+                    *(
+                        client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+                        for token in batch
+                    )
+                )
+                running = False
+                await asyncio.gather(*probes)
+
+                expected = 401 if batch is invalid_tokens else 200
+                assert all(item.status_code == expected for item in responses)
+                assert sleep_samples and percentile_95(sleep_samples) < 25.0
+                assert health_samples and percentile_95(health_samples) < 25.0
+                assert auth_me_samples and percentile_95(auth_me_samples) < 25.0
+
+            # Cached /api/v1/me calls complete well below 5ms median.
+            cached_samples = []
+            for _ in range(30):
+                started = time.perf_counter()
+                response = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {valid_tokens[0]}"},
+                )
+                assert response.status_code == 200
+                cached_samples.append((time.perf_counter() - started) * 1000)
+            assert statistics.median(cached_samples) < 5.0
+
+    asyncio.run(run_benchmark())
+    assert peak_derivations <= profiles.TOKEN_DERIVATION_CONCURRENCY
+    for bad in invalid_tokens:
+        assert profiles.has_cached_api_token(bad) is False
+
+
+def test_ten_concurrent_ssr_session_fanouts_debounce_writes_without_sqlite_busy(
+    identity_store, monkeypatch
+):
+    readers = [
+        profiles.create_account(f"ssr-reader-{idx}", f"ssr-reader-{idx}-password-long")
+        for idx in range(10)
+    ]
+    for reader in readers:
+        with profile_scope(reader["profile_id"]):
+            initialize(seed_demo=False)
+    sessions = [profiles.create_session(reader["id"])[0] for reader in readers]
+
+    activity_writes = 0
+    original_auth_connect = profiles.auth_connect
+
+    def counting_auth_connect(*args, **kwargs):
+        con = original_auth_connect(*args, **kwargs)
+
+        def trace(sql: str):
+            nonlocal activity_writes
+            if " ".join(sql.strip().upper().split()).startswith("UPDATE AUTH_SESSIONS"):
+                activity_writes += 1
+
+        con.set_trace_callback(trace)
+        return con
+
+    monkeypatch.setattr(profiles, "auth_connect", counting_auth_connect)
+
+    async def simulate_ten_ssr_loads():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+            async def load_one_page(session_token: str):
+                headers = {"x-bookward-session": session_token}
+                me = await client.get("/auth/me", headers=headers)
+                assert me.status_code == 200
+                overview, backup_state = await asyncio.gather(
+                    client.get(
+                        "/api/overview?recommendation_limit=24&decision_limit=24",
+                        headers=headers,
+                    ),
+                    client.get("/api/backups", headers=headers),
+                )
+                assert overview.status_code == 200
+                assert backup_state.status_code == 200
+
+            await asyncio.gather(*(load_one_page(token) for token in sessions))
+            first_wave_writes = activity_writes
+            await asyncio.gather(*(load_one_page(token) for token in sessions))
+            return first_wave_writes, activity_writes - first_wave_writes
+
+    first_wave, second_wave = asyncio.run(simulate_ten_ssr_loads())
+    assert first_wave <= 10
+    assert second_wave == 0
+
+
+def test_wal_auth_registry_allows_concurrent_reads_and_preserves_0600_across_backups_and_restore(
+    identity_store,
+):
+    import stat
+
+    reader = profiles.create_account("wal-reader", "wal-reader-password-with-length")
+    session, _ = profiles.create_session(reader["id"])
+    token = profiles.create_profile_api_token(reader["profile_id"], "WAL API")["token"]
+    assert profiles.resolve_session(session)["id"] == reader["id"]
+    assert profiles.authenticate_api_token(token)["profile_id"] == reader["profile_id"]
+
+    registry = profiles.auth_path()
+    with profiles.auth_connect() as con:
+        journal_mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+        inside_con = con
+    assert str(journal_mode).lower() == "wal"
+    # Connection must close deterministically when exiting the context manager.
+    with pytest.raises(sqlite3.ProgrammingError):
+        inside_con.execute("SELECT 1")
+
+    def assert_private_registry_files():
+        assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{registry}{suffix}")
+            if sidecar.exists():
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+    assert_private_registry_files()
+
+    # Concurrent authentication reads succeed while an uncommitted write lock is held.
+    writer_ready = Event()
+    release_writer = Event()
+
+    def hold_write_transaction():
+        with profiles.auth_connect() as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO auth_meta(key,value) VALUES('concurrent_probe','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+            writer_ready.set()
+            assert release_writer.wait(timeout=5)
+            writer.commit()
+
+    worker = Thread(target=hold_write_transaction, daemon=True)
+    worker.start()
+    try:
+        assert writer_ready.wait(timeout=2)
+        assert profiles.resolve_session(session)["id"] == reader["id"]
+        assert profiles.authenticate_api_token(token)["profile_id"] == reader["profile_id"]
+    finally:
+        release_writer.set()
+        worker.join(timeout=2)
+
+    # Concurrent authentication reads also run cleanly alongside create_auth_backup.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        backup_future = executor.submit(backups.create_auth_backup)
+        read_futures = [
+            executor.submit(profiles.resolve_session, session),
+            executor.submit(profiles.authenticate_api_token, token),
+            executor.submit(backups.identity_backup_status),
+        ]
+        snapshot = backup_future.result(timeout=5)
+        assert read_futures[0].result(timeout=5)["id"] == reader["id"]
+        assert read_futures[1].result(timeout=5)["profile_id"] == reader["profile_id"]
+        assert read_futures[2].result(timeout=5)["enabled"] is True
+
+    snapshot_file = backups.auth_backup_directory() / f"{snapshot['id']}.sqlite3"
+    assert stat.S_IMODE(snapshot_file.stat().st_mode) == 0o600
+    with sqlite3.connect(snapshot_file) as check_con:
+        assert check_con.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert_private_registry_files()
+
+    status = backups.identity_backup_status()
+    assert status["last_error"] is None
+    assert_private_registry_files()
+
+    restored = backups.restore_auth_backup(snapshot["id"])
+    assert restored["restored"] is True
+    assert_private_registry_files()
+    with profiles.auth_connect() as con:
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    assert_private_registry_files()
+    assert profiles.resolve_session(session) is None
+    assert profiles.authenticate_api_token(token) is None
+

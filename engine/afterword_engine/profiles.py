@@ -4,12 +4,16 @@ Recommendation data lives in a separate SQLite file per profile. This module
 stores only login identity and the opaque mapping that selects that file.
 """
 
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import hmac
 import logging
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,10 +30,16 @@ from .api_tokens import (
     token_prefix,
 )
 from .config import settings
+from .database import _database_setup_lock, database_lock
+from .secrets import auth_registry_key
 
 LOGGER = logging.getLogger(__name__)
 SESSION_IDLE_HOURS = 24
 SESSION_ABSOLUTE_DAYS = 7
+ACTIVITY_UPDATE_INTERVAL_SECONDS = 60
+TOKEN_CACHE_MAX_ENTRIES = 1024
+ACTIVITY_CACHE_MAX_ENTRIES = 4096
+TOKEN_DERIVATION_CONCURRENCY = max(1, min(2, (os.cpu_count() or 2) // 2))
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
 
@@ -114,18 +124,342 @@ def auth_path() -> Path:
     return Path(f"{settings.db}.auth.sqlite3")
 
 
-def auth_connect():
-    path = auth_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    con = sqlite3.connect(path, timeout=10)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA busy_timeout=5000")
+def auth_lock(path: str | Path | None = None):
+    """Return the process lock coordinating connections and restores for auth.sqlite3."""
+    target = os.path.abspath(path if path is not None else auth_path())
+    return database_lock(target)
+
+
+@contextmanager
+def auth_shared_lock(path: str | Path | None = None):
+    """Hold a shared reader/backup connection slot without blocking other readers."""
+    lock = auth_lock(path)
+    owner = lock.acquire_connection()
     try:
-        path.chmod(0o600)
+        yield
+    finally:
+        lock.release_connection(owner)
+
+
+def restrict_auth_files(path: Path | None = None) -> None:
+    """Keep the identity registry and SQLite WAL sidecars mode 0600."""
+    target = path if path is not None else auth_path()
+    for candidate in (target, Path(f"{target}-wal"), Path(f"{target}-shm")):
+        try:
+            candidate.chmod(0o600)
+        except OSError:
+            continue
+
+
+class _AuthConnection(sqlite3.Connection):
+    """Close identity-registry connections deterministically and guard restores."""
+
+    def __init__(self, *args, **kwargs):
+        raw_target = args[0] if args else None
+        target_path = Path(raw_target) if isinstance(raw_target, (str, Path)) else auth_path()
+        self._database_lock = auth_lock(target_path)
+        self._database_lock_owner = self._database_lock.acquire_connection()
+        self._database_lock_held = True
+        try:
+            if not target_path.exists():
+                try:
+                    descriptor = os.open(target_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            super().__init__(*args, **kwargs)
+        except Exception:
+            self._database_lock_held = False
+            self._database_lock.release_connection(self._database_lock_owner)
+            raise
+
+    def close(self):
+        held = getattr(self, "_database_lock_held", False)
+        if held:
+            self._database_lock_held = False
+        try:
+            super().close()
+        finally:
+            if held:
+                self._database_lock.release_connection(self._database_lock_owner)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+_WAL_READY_IDENTITY: tuple[str, int, int] | None = None
+
+
+def _wal_files_ready(path: Path, identity: tuple[str, int, int] | None) -> bool:
+    if identity is None or identity != _WAL_READY_IDENTITY:
+        return False
+    shm = Path(f"{path}-shm")
+    try:
+        return (shm.stat().st_mode & 0o777) == 0o600
     except OSError:
-        pass
-    return con
+        return False
+
+
+def auth_connect(*, timeout: float = 10):
+    global _WAL_READY_IDENTITY
+    path = auth_path()
+    identity = _registry_file_identity(path)
+    if identity is None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    con = sqlite3.connect(
+        path, timeout=timeout, check_same_thread=False, factory=_AuthConnection
+    )
+    try:
+        con.row_factory = sqlite3.Row
+        busy_ms = max(5000, int(timeout * 1000))
+        if not _wal_files_ready(path, identity):
+            with _database_setup_lock(Path(os.path.abspath(path))):
+                identity = _registry_file_identity(path)
+                if not _wal_files_ready(path, identity):
+                    restrict_auth_files(path)
+                    mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+                    if str(mode).lower() != "wal":
+                        con.execute("PRAGMA journal_mode=WAL")
+                    restrict_auth_files(path)
+                    _WAL_READY_IDENTITY = _registry_file_identity(path)
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute(f"PRAGMA busy_timeout={busy_ms}")
+        return con
+    except Exception:
+        con.close()
+        raise
+
+
+@dataclass(frozen=True)
+class _CachedTokenDigest:
+    token_hash: str
+    token_id: int
+    profile_id: str
+    account_id: str | None
+
+
+@dataclass
+class _ActivitySlot:
+    claimed_at: float
+    db_timestamp: str
+    committed: bool
+    owner_id: str
+    account_id: str | None = None
+
+
+_AUTH_CACHE_LOCK = threading.Lock()
+_CACHE_REGISTRY_IDENTITY: tuple[str, int, int] | None = None
+_VERIFIED_TOKEN_DIGESTS: OrderedDict[str, _CachedTokenDigest] = OrderedDict()
+_SESSION_ACTIVITY_WRITES: OrderedDict[str, _ActivitySlot] = OrderedDict()
+_TOKEN_ACTIVITY_WRITES: OrderedDict[int, _ActivitySlot] = OrderedDict()
+_TOKEN_DERIVATION_SEMAPHORE = threading.BoundedSemaphore(TOKEN_DERIVATION_CONCURRENCY)
+
+
+def _registry_file_identity(path: Path | None = None) -> tuple[str, int, int] | None:
+    target = path if path is not None else auth_path()
+    try:
+        st = target.stat()
+    except OSError:
+        return None
+    return (os.path.abspath(target), st.st_dev, st.st_ino)
+
+
+def _sync_cache_registry_identity_unlocked() -> None:
+    global _CACHE_REGISTRY_IDENTITY
+    identity = _registry_file_identity()
+    if identity != _CACHE_REGISTRY_IDENTITY:
+        _VERIFIED_TOKEN_DIGESTS.clear()
+        _SESSION_ACTIVITY_WRITES.clear()
+        _TOKEN_ACTIVITY_WRITES.clear()
+        _CACHE_REGISTRY_IDENTITY = identity
+
+
+def is_valid_api_token_format(token: str | None) -> bool:
+    return bool(
+        token
+        and len(token) <= TOKEN_MAX_LENGTH
+        and token.startswith(TOKEN_PREFIX)
+        and not any(character.isspace() for character in token)
+    )
+
+
+def _token_cache_key(token: str) -> str:
+    return hmac.new(
+        auth_registry_key(), token.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def has_cached_api_token(token: str | None) -> bool:
+    """Return True if a token's HMAC key is currently in the verified digest cache."""
+    if not is_valid_api_token_format(token):
+        return False
+    cache_key = _token_cache_key(token)
+    with _AUTH_CACHE_LOCK:
+        _sync_cache_registry_identity_unlocked()
+        return cache_key in _VERIFIED_TOKEN_DIGESTS
+
+
+def _get_cached_token_digest(cache_key: str) -> _CachedTokenDigest | None:
+    with _AUTH_CACHE_LOCK:
+        _sync_cache_registry_identity_unlocked()
+        entry = _VERIFIED_TOKEN_DIGESTS.get(cache_key)
+        if entry is not None:
+            _VERIFIED_TOKEN_DIGESTS.move_to_end(cache_key)
+        return entry
+
+
+def _store_cached_token_digest(cache_key: str, entry: _CachedTokenDigest) -> None:
+    with _AUTH_CACHE_LOCK:
+        _sync_cache_registry_identity_unlocked()
+        _VERIFIED_TOKEN_DIGESTS[cache_key] = entry
+        _VERIFIED_TOKEN_DIGESTS.move_to_end(cache_key)
+        while len(_VERIFIED_TOKEN_DIGESTS) > TOKEN_CACHE_MAX_ENTRIES:
+            _VERIFIED_TOKEN_DIGESTS.popitem(last=False)
+
+
+def invalidate_auth_caches(
+    *,
+    account_id: str | None = None,
+    profile_id: str | None = None,
+    token_id: int | None = None,
+    cache_key: str | None = None,
+    session_digest: str | None = None,
+    clear_all: bool = False,
+) -> None:
+    """Immediately drop cached token digests and activity throttle state."""
+    global _CACHE_REGISTRY_IDENTITY, _WAL_READY_IDENTITY
+    with _AUTH_CACHE_LOCK:
+        if clear_all:
+            _VERIFIED_TOKEN_DIGESTS.clear()
+            _SESSION_ACTIVITY_WRITES.clear()
+            _TOKEN_ACTIVITY_WRITES.clear()
+            _CACHE_REGISTRY_IDENTITY = _registry_file_identity()
+            _WAL_READY_IDENTITY = None
+            return
+        if cache_key is not None:
+            _VERIFIED_TOKEN_DIGESTS.pop(cache_key, None)
+        if token_id is not None or profile_id is not None or account_id is not None:
+            stale_keys = [
+                key
+                for key, item in _VERIFIED_TOKEN_DIGESTS.items()
+                if (token_id is not None and item.token_id == token_id)
+                or (profile_id is not None and item.profile_id == profile_id)
+                or (account_id is not None and item.account_id == account_id)
+            ]
+            for key in stale_keys:
+                _VERIFIED_TOKEN_DIGESTS.pop(key, None)
+            stale_tokens = [
+                tid
+                for tid, slot in _TOKEN_ACTIVITY_WRITES.items()
+                if (token_id is not None and tid == token_id)
+                or (profile_id is not None and slot.owner_id == profile_id)
+                or (account_id is not None and slot.account_id == account_id)
+            ]
+            for tid in stale_tokens:
+                _TOKEN_ACTIVITY_WRITES.pop(tid, None)
+        if session_digest is not None:
+            _SESSION_ACTIVITY_WRITES.pop(session_digest, None)
+        if account_id is not None:
+            stale_sessions = [
+                digest
+                for digest, slot in _SESSION_ACTIVITY_WRITES.items()
+                if slot.owner_id == account_id
+            ]
+            for digest in stale_sessions:
+                _SESSION_ACTIVITY_WRITES.pop(digest, None)
+
+
+def _parse_stored_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _claim_activity_slot(
+    table: OrderedDict,
+    key,
+    *,
+    now: datetime,
+    current_db_timestamp: str | None,
+    next_db_timestamp: str,
+    owner_id: str,
+    account_id: str | None = None,
+    force: bool = False,
+) -> tuple[bool, _ActivitySlot | None]:
+    now_ts = now.timestamp()
+    with _AUTH_CACHE_LOCK:
+        _sync_cache_registry_identity_unlocked()
+        previous = table.get(key)
+        if not force and previous is not None:
+            if not previous.committed:
+                if 0 <= (now_ts - previous.claimed_at) < ACTIVITY_UPDATE_INTERVAL_SECONDS:
+                    return False, previous
+            elif (
+                current_db_timestamp == previous.db_timestamp
+                and 0 <= (now_ts - previous.claimed_at) < ACTIVITY_UPDATE_INTERVAL_SECONDS
+            ):
+                return False, previous
+            elif current_db_timestamp is not None:
+                parsed_db = _parse_stored_utc(current_db_timestamp)
+                if (
+                    parsed_db is not None
+                    and 0 <= (now - parsed_db).total_seconds() < ACTIVITY_UPDATE_INTERVAL_SECONDS
+                ):
+                    return False, previous
+        prior_copy = (
+            _ActivitySlot(
+                claimed_at=previous.claimed_at,
+                db_timestamp=previous.db_timestamp,
+                committed=previous.committed,
+                owner_id=previous.owner_id,
+                account_id=previous.account_id,
+            )
+            if previous is not None
+            else None
+        )
+        table[key] = _ActivitySlot(
+            claimed_at=now_ts,
+            db_timestamp=next_db_timestamp,
+            committed=False,
+            owner_id=owner_id,
+            account_id=account_id,
+        )
+        table.move_to_end(key)
+        while len(table) > ACTIVITY_CACHE_MAX_ENTRIES:
+            table.popitem(last=False)
+        return True, prior_copy
+
+
+def _finalize_activity_slot(
+    table: OrderedDict,
+    key,
+    claimed_at: float,
+    previous: _ActivitySlot | None,
+    *,
+    committed: bool,
+) -> None:
+    with _AUTH_CACHE_LOCK:
+        slot = table.get(key)
+        if slot is None or slot.claimed_at != claimed_at:
+            return
+        if committed:
+            slot.committed = True
+        elif previous is None:
+            table.pop(key, None)
+        else:
+            table[key] = previous
 
 
 def utc_now() -> datetime:
@@ -236,18 +570,23 @@ def update_password(account_id: str, password: str) -> None:
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        updated = con.execute(
+        target = con.execute(
+            "SELECT profile_id FROM accounts WHERE id=? AND status='active'",
+            (account_id,),
+        ).fetchone()
+        if not target:
+            con.rollback()
+            raise LookupError("Account not found.")
+        con.execute(
             "UPDATE accounts SET password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND status='active'",
             (password_hash, account_id),
-        ).rowcount
-        if not updated:
-            con.rollback()
-            raise LookupError("Account not found.")
+        )
         con.execute(
             "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL",
             (account_id,),
         )
+    invalidate_auth_caches(account_id=account_id, profile_id=target["profile_id"])
 
 
 def reset_password(account_id: str, password: str) -> None:
@@ -256,14 +595,23 @@ def reset_password(account_id: str, password: str) -> None:
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        updated = con.execute(
-            "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND status='active'", (password_hash, account_id)
-        ).rowcount
-        if not updated:
+        target = con.execute(
+            "SELECT profile_id FROM accounts WHERE id=? AND status='active'",
+            (account_id,),
+        ).fetchone()
+        if not target:
             con.rollback()
             raise LookupError("Account not found.")
-        con.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL", (account_id,))
+        con.execute(
+            "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='active'",
+            (password_hash, account_id),
+        )
+        con.execute(
+            "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL",
+            (account_id,),
+        )
+    invalidate_auth_caches(account_id=account_id, profile_id=target["profile_id"])
 
 
 def _account(row) -> dict:
@@ -370,26 +718,72 @@ def resolve_session(raw: str | None):
     digest = hashlib.sha256(raw.encode()).hexdigest()
     now = utc_now()
     with auth_connect() as con:
-        con.execute("BEGIN IMMEDIATE")
         found = con.execute(
-            "SELECT a.*,s.token_hash,s.created_at session_created_at,s.idle_expires_at,s.absolute_expires_at,s.auth_version session_auth_version "
+            "SELECT a.*,s.token_hash,s.created_at session_created_at,s.last_seen_at,"
+            "s.idle_expires_at,s.absolute_expires_at,s.auth_version session_auth_version "
             "FROM auth_sessions s JOIN accounts a ON a.id=s.account_id "
             "JOIN profiles p ON p.id=a.profile_id "
             "WHERE s.token_hash=? AND s.revoked_at IS NULL AND a.status='active' AND p.status='active'",
             (digest,),
         ).fetchone()
         if not found or found["auth_version"] != found["session_auth_version"]:
-            con.rollback()
             return None
         if now.isoformat() >= found["idle_expires_at"] or now.isoformat() >= found["absolute_expires_at"]:
-            con.execute("UPDATE auth_sessions SET revoked_at=? WHERE token_hash=?", (iso(now), digest))
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,?) WHERE token_hash=?",
+                (iso(now), digest),
+            )
             con.commit()
+            invalidate_auth_caches(session_digest=digest)
             return None
-        con.execute(
-            "UPDATE auth_sessions SET last_seen_at=?,idle_expires_at=? WHERE token_hash=?",
-            (iso(now), min(now + timedelta(hours=SESSION_IDLE_HOURS), datetime.fromisoformat(found["absolute_expires_at"])).isoformat(timespec="seconds"), digest),
+
+        absolute_dt = datetime.fromisoformat(found["absolute_expires_at"])
+        idle_dt = datetime.fromisoformat(found["idle_expires_at"])
+        near_idle_expiry = (
+            idle_dt < absolute_dt
+            and (idle_dt - now) <= timedelta(seconds=ACTIVITY_UPDATE_INTERVAL_SECONDS)
         )
-        con.commit()
+        next_seen = iso(now)
+        should_write, prior_slot = _claim_activity_slot(
+            _SESSION_ACTIVITY_WRITES,
+            digest,
+            now=now,
+            current_db_timestamp=found["last_seen_at"],
+            next_db_timestamp=next_seen,
+            owner_id=found["id"],
+            account_id=found["id"],
+            force=near_idle_expiry,
+        )
+        if should_write:
+            claimed_at = now.timestamp()
+            committed = False
+            try:
+                next_idle = min(
+                    now + timedelta(hours=SESSION_IDLE_HOURS), absolute_dt
+                ).isoformat(timespec="seconds")
+                con.execute("BEGIN IMMEDIATE")
+                updated = con.execute(
+                    "UPDATE auth_sessions SET last_seen_at=?,idle_expires_at=? "
+                    "WHERE token_hash=? AND revoked_at IS NULL "
+                    "AND auth_version=(SELECT auth_version FROM accounts WHERE id=? AND status='active') "
+                    "AND EXISTS (SELECT 1 FROM profiles WHERE id=? AND status='active')",
+                    (next_seen, next_idle, digest, found["id"], found["profile_id"]),
+                ).rowcount
+                if not updated:
+                    con.rollback()
+                    invalidate_auth_caches(session_digest=digest)
+                    return None
+                con.commit()
+                committed = True
+            finally:
+                _finalize_activity_slot(
+                    _SESSION_ACTIVITY_WRITES,
+                    digest,
+                    claimed_at,
+                    prior_slot,
+                    committed=committed,
+                )
         account = _account(found)
         account["session_created_at"] = found["session_created_at"]
         return account
@@ -403,6 +797,7 @@ def revoke_session(raw: str | None):
                 "UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) WHERE token_hash=?",
                 (digest,),
             )
+        invalidate_auth_caches(session_digest=digest)
 
 
 def set_account_status(account_id: str, status: str):
@@ -411,7 +806,7 @@ def set_account_status(account_id: str, status: str):
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
         target = con.execute(
-            "SELECT role,status FROM accounts WHERE id=?", (account_id,)
+            "SELECT role,status,profile_id FROM accounts WHERE id=?", (account_id,)
         ).fetchone()
         if not target:
             con.rollback()
@@ -430,13 +825,15 @@ def set_account_status(account_id: str, status: str):
         if not changed:
             con.rollback()
             raise LookupError("Account not found.")
-        con.execute("UPDATE profiles SET status=? WHERE id=(SELECT profile_id FROM accounts WHERE id=?)", (status, account_id))
+        con.execute("UPDATE profiles SET status=? WHERE id=?", (status, target["profile_id"]))
         con.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL", (account_id,))
         if status == "disabled":
             con.execute(
                 "UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) "
-                "WHERE profile_id=(SELECT profile_id FROM accounts WHERE id=?)", (account_id,)
+                "WHERE profile_id=?",
+                (target["profile_id"],),
             )
+    invalidate_auth_caches(account_id=account_id, profile_id=target["profile_id"])
 
 
 def link_oidc_identity(account_id: str, issuer: str, subject: str, email: str = "") -> None:
@@ -605,35 +1002,150 @@ def revoke_profile_api_token(profile_id: str, token_id: int):
         ).rowcount
     if not changed:
         raise LookupError("API token not found.")
+    invalidate_auth_caches(profile_id=profile_id, token_id=token_id)
+
+
+_ACTIVE_TOKEN_QUERY = (
+    "SELECT t.id,t.name,t.profile_id,t.token_hash,t.last_used_at,a.id AS account_id "
+    "FROM api_tokens t "
+    "JOIN profiles p ON p.id=t.profile_id "
+    "LEFT JOIN accounts a ON a.profile_id=p.id "
+    "WHERE t.token_hash=? AND t.revoked_at IS NULL "
+    "AND p.status='active' AND COALESCE(a.status,'active')='active'"
+)
 
 
 def authenticate_api_token(token: str):
-    if (not token or len(token) > TOKEN_MAX_LENGTH or not token.startswith(TOKEN_PREFIX)
-            or any(character.isspace() for character in token)):
+    if not is_valid_api_token_format(token):
         return None
-    current_hash = hash_api_token(token)
-    legacy_hash = legacy_hash_api_token(token)
+    cache_key = _token_cache_key(token)
+    cached = _get_cached_token_digest(cache_key)
+    current_hash: str | None = cached.token_hash if cached is not None else None
+    legacy_hash: str | None = None
+    needs_upgrade = False
+
+    if current_hash is not None:
+        with auth_connect() as con:
+            found = con.execute(_ACTIVE_TOKEN_QUERY, (current_hash,)).fetchone()
+            if found is None:
+                invalidate_auth_caches(cache_key=cache_key)
+                legacy_candidate = legacy_hash_api_token(token)
+                if con.execute(_ACTIVE_TOKEN_QUERY, (legacy_candidate,)).fetchone() is None:
+                    return None
+                current_hash = None
+            else:
+                return _complete_api_token_auth(
+                    con,
+                    found=found,
+                    cache_key=cache_key,
+                    resolved_hash=current_hash,
+                    needs_upgrade=False,
+                )
+
+    with _TOKEN_DERIVATION_SEMAPHORE:
+        rechecked = _get_cached_token_digest(cache_key)
+        if rechecked is not None:
+            current_hash = rechecked.token_hash
+        else:
+            current_hash = hash_api_token(token)
+        legacy_hash = legacy_hash_api_token(token)
+
     with auth_connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        found = con.execute(
-            "SELECT t.id,t.name,t.profile_id,t.token_hash FROM api_tokens t "
-            "JOIN profiles p ON p.id=t.profile_id WHERE t.token_hash=? AND t.revoked_at IS NULL AND p.status='active'",
-            (current_hash,),
-        ).fetchone()
-        if not found:
-            found = con.execute(
-                "SELECT t.id,t.name,t.profile_id,t.token_hash FROM api_tokens t "
-                "JOIN profiles p ON p.id=t.profile_id WHERE t.token_hash=? AND t.revoked_at IS NULL AND p.status='active'",
-                (legacy_hash,),
-            ).fetchone()
-            if found:
-                con.execute("UPDATE api_tokens SET token_hash=? WHERE id=?", (current_hash, found["id"]))
-        if not found:
-            con.rollback()
-            return None
-        con.execute("UPDATE api_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=?", (found["id"],))
-        con.commit()
-        return dict(found)
+        found = con.execute(_ACTIVE_TOKEN_QUERY, (current_hash,)).fetchone()
+        if found is None:
+            found = con.execute(_ACTIVE_TOKEN_QUERY, (legacy_hash,)).fetchone()
+            if found is None:
+                return None
+            needs_upgrade = legacy_hash != current_hash
+        return _complete_api_token_auth(
+            con,
+            found=found,
+            cache_key=cache_key,
+            resolved_hash=current_hash,
+            needs_upgrade=needs_upgrade,
+        )
+
+
+def _complete_api_token_auth(
+    con: sqlite3.Connection,
+    *,
+    found: sqlite3.Row,
+    cache_key: str,
+    resolved_hash: str,
+    needs_upgrade: bool,
+) -> dict | None:
+    now = utc_now()
+    next_used = now.strftime("%Y-%m-%d %H:%M:%S")
+    first_use = found["last_used_at"] is None
+    should_write, prior_slot = _claim_activity_slot(
+        _TOKEN_ACTIVITY_WRITES,
+        int(found["id"]),
+        now=now,
+        current_db_timestamp=found["last_used_at"],
+        next_db_timestamp=next_used,
+        owner_id=found["profile_id"],
+        account_id=found["account_id"],
+        force=first_use or needs_upgrade,
+    )
+    if should_write:
+        claimed_at = now.timestamp()
+        committed = False
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if needs_upgrade:
+                updated = con.execute(
+                    "UPDATE api_tokens SET token_hash=?,last_used_at=? "
+                    "WHERE id=? AND revoked_at IS NULL "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM profiles p LEFT JOIN accounts a ON a.profile_id=p.id "
+                    "WHERE p.id=? AND p.status='active' AND COALESCE(a.status,'active')='active'"
+                    ")",
+                    (resolved_hash, next_used, found["id"], found["profile_id"]),
+                ).rowcount
+            else:
+                updated = con.execute(
+                    "UPDATE api_tokens SET last_used_at=? "
+                    "WHERE id=? AND revoked_at IS NULL "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM profiles p LEFT JOIN accounts a ON a.profile_id=p.id "
+                    "WHERE p.id=? AND p.status='active' AND COALESCE(a.status,'active')='active'"
+                    ")",
+                    (next_used, found["id"], found["profile_id"]),
+                ).rowcount
+            if not updated:
+                con.rollback()
+                invalidate_auth_caches(
+                    cache_key=cache_key,
+                    token_id=int(found["id"]),
+                    profile_id=found["profile_id"],
+                )
+                return None
+            con.commit()
+            committed = True
+        finally:
+            _finalize_activity_slot(
+                _TOKEN_ACTIVITY_WRITES,
+                int(found["id"]),
+                claimed_at,
+                prior_slot,
+                committed=committed,
+            )
+
+    _store_cached_token_digest(
+        cache_key,
+        _CachedTokenDigest(
+            token_hash=resolved_hash,
+            token_id=int(found["id"]),
+            profile_id=found["profile_id"],
+            account_id=found["account_id"],
+        ),
+    )
+    return {
+        "id": found["id"],
+        "name": found["name"],
+        "profile_id": found["profile_id"],
+        "token_hash": resolved_hash,
+    }
 
 
 def migrate_legacy_api_tokens(legacy_rows: list[dict]):

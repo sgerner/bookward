@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -686,6 +687,20 @@ app.add_middleware(
 )
 
 
+_API_TOKEN_DERIVATION_LIMITERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _api_token_derivation_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    limiter = _API_TOKEN_DERIVATION_LIMITERS.get(loop)
+    if limiter is None:
+        limiter = asyncio.Semaphore(identity_store.TOKEN_DERIVATION_CONCURRENCY)
+        _API_TOKEN_DERIVATION_LIMITERS[loop] = limiter
+    return limiter
+
+
 @app.middleware("http")
 async def authenticate_engine_request(request: Request, call_next):
     """Select a profile only from a verified session or profile-owned API token."""
@@ -728,7 +743,14 @@ async def authenticate_engine_request(request: Request, call_next):
                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
             )
         candidate = bearer or api_key
-        token = identity_store.authenticate_api_token(candidate)
+        if (
+            identity_store.is_valid_api_token_format(candidate)
+            and not identity_store.has_cached_api_token(candidate)
+        ):
+            async with _api_token_derivation_limiter():
+                token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
+        else:
+            token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
         if not token:
             return JSONResponse(
                 {"detail": "A valid API token is required"},
@@ -746,13 +768,17 @@ async def authenticate_engine_request(request: Request, call_next):
     oidc_login_start = path == "/auth/oidc/start" and request.query_params.get("intent", "login") == "login"
     oidc_callback = path == "/auth/oidc/callback"
     if oidc_callback and request.headers.get("x-bookward-session"):
-        request.state.account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+        request.state.account = await asyncio.to_thread(
+            identity_store.resolve_session, request.headers.get("x-bookward-session")
+        )
     if public_auth or oidc_login_start or oidc_callback:
         response = await call_next(request)
         response.headers["cache-control"] = "no-store"
         return response
 
-    account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+    account = await asyncio.to_thread(
+        identity_store.resolve_session, request.headers.get("x-bookward-session")
+    )
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
