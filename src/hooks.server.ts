@@ -1,29 +1,9 @@
 import type { Handle } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
-import { timingSafeEqual } from 'node:crypto';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { withSessionToken } from '#lib/server/request-context.js';
 
 const SESSION_COOKIE = 'bookward_session';
-
-// Kept as a narrow utility for installations migrating from the former
-// Basic-auth configuration. It is no longer used as the browser auth flow.
-function equal(left: string, right: string) {
-	const a = Buffer.from(left); const b = Buffer.from(right);
-	return a.length === b.length && timingSafeEqual(a, b);
-}
-
-export function authorized(request: Request, username: string, password: string) {
-	const header = request.headers.get('authorization') || '';
-	if (!header.startsWith('Basic ')) return false;
-	try {
-		const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-		const separator = decoded.indexOf(':');
-		return separator >= 0 && equal(decoded.slice(0, separator), username) && equal(decoded.slice(separator + 1), password);
-	} catch {
-		return false;
-	}
-}
 
 export function isPublicApiPath(pathname: string) {
 	let decoded: string;
