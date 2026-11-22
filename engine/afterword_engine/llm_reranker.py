@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -12,7 +10,10 @@ import re
 import secrets
 import threading
 import time
-from typing import Any, Sequence
+from collections import OrderedDict
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
