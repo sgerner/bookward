@@ -39,9 +39,57 @@ describe("page actions", () => {
   });
 
   it("loads recommendations without creating or forwarding a device cookie", async () => {
+    const pageBookKeys = [
+      "author",
+      "cover_url",
+      "genres",
+      "id",
+      "metadata_confidence",
+      "published_kind",
+      "published_on",
+      "quality_status",
+      "reason",
+      "recommendation_run_id",
+      "score",
+      "source_enabled",
+      "source_id",
+      "source_name",
+      "source_url",
+      "status",
+      "synopsis",
+      "title",
+    ];
     const overview = {
           recommendation_run_id: "run-1234",
-          recommendations: [],
+          recommendations: [
+            {
+              id: 5,
+              title: "Recommended book",
+              author: "First Writer",
+              description: "Recommended summary",
+              cover_url: "https://covers.example/recommended.jpg",
+              source_url: "https://books.example/recommended",
+              source_id: 1,
+              release_date: "2026-11-15",
+              date_kind: "day",
+              genres: ["Science Fiction"],
+              score: 94,
+              metadata_confidence: 0.92,
+              explanation: ["Matches rated books", "Trusted list"],
+              status: "recommended",
+              normalized_key: "recommended-book::first-writer",
+              created_at: "2026-10-01 00:00:00",
+              updated_at: "2026-10-02 00:00:00",
+              isbn13: "9780000000005",
+              isbn10: "0000000005",
+              score_batch_id: "batch-5",
+              source_name: "A source",
+              quality_work_id: "/works/OL5W",
+              quality_provider: "openlibrary",
+              quality_isbn13: "9780000000005",
+              quality_isbn10: "0000000005",
+            },
+          ],
           decisions: [
             {
               id: 9,
@@ -50,6 +98,7 @@ describe("page actions", () => {
               description: "A description",
               cover_url: "https://covers.example/deferred.jpg",
               source_url: "https://books.example/deferred",
+              source_id: 2,
               release_date: null,
               date_kind: "unknown",
               genres: ["Fantasy"],
@@ -57,7 +106,17 @@ describe("page actions", () => {
               metadata_confidence: 0.8,
               explanation: ["A good match"],
               status: "maybe_later",
+              normalized_key: "deferred-book::a-writer",
+              created_at: "2026-09-01 00:00:00",
+              updated_at: "2026-09-02 00:00:00",
+              isbn13: "9780000000009",
+              isbn10: "0000000009",
+              score_batch_id: "batch-9",
               source_name: "A source",
+              quality_work_id: "/works/OL9W",
+              quality_provider: "openlibrary",
+              quality_isbn13: "9780000000009",
+              quality_isbn10: "0000000009",
             },
           ],
           history: [],
@@ -85,15 +144,55 @@ describe("page actions", () => {
       locals: { user: null },
     } as never)) as {
       recommendation_run_id: string;
-      decisions: Array<{ id: number; status: string; reason: string }>;
+      books: Array<Record<string, unknown>>;
+      decisions: Array<Record<string, unknown>>;
     };
     expect(result.recommendation_run_id).toBe("run-1234");
+    expect(Object.keys(result.books[0]).sort()).toEqual(pageBookKeys);
+    expect(result.books).toEqual([
+      {
+        id: 5,
+        recommendation_run_id: "run-1234",
+        title: "Recommended book",
+        author: "First Writer",
+        cover_url: "https://covers.example/recommended.jpg",
+        source_url: "https://books.example/recommended",
+        source_id: 1,
+        source_name: "A source",
+        source_enabled: true,
+        quality_status: null,
+        published_on: "2026-11-15",
+        published_kind: "day",
+        genres: ["Science Fiction"],
+        score: 94,
+        metadata_confidence: 0.92,
+        synopsis: "Recommended summary",
+        reason: "Matches rated books · Trusted list",
+        status: "recommended",
+      },
+    ]);
+    expect(Object.keys(result.decisions[0]).sort()).toEqual(pageBookKeys);
     expect(result.decisions).toEqual([
-      expect.objectContaining({
+      {
         id: 9,
-        status: "maybe_later",
+        recommendation_run_id: "",
+        title: "Deferred book",
+        author: "A Writer",
+        cover_url: "https://covers.example/deferred.jpg",
+        source_url: "https://books.example/deferred",
+        source_id: 2,
+        source_name: "A source",
+        source_enabled: true,
+        quality_status: null,
+        published_on: null,
+        published_kind: "unknown",
+        genres: ["Fantasy"],
+        score: 81,
+        metadata_confidence: 0.8,
+        synopsis: "A description",
         reason: "A good match",
-      }),
+        status: "maybe_later",
+      },
     ]);
     expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
