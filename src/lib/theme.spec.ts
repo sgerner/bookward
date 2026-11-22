@@ -19,6 +19,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 	setTheme,
 	type ThemeMode,
 } from './theme';
+import {
+	DEFAULT_SKELETON_ROOT_TOKENS,
+	THEME_COLOR_ROLES,
+	THEME_SHADES,
+	buildCriticalCalibrationCss,
+	calibrateThemeTokens,
+	contrastRatio,
+	extractCssVariables,
+	parseCssColor,
+} from './theme-contrast';
 
 type MemoryStorage = {
 	getItem: (key: string) => string | null;
@@ -87,6 +97,16 @@ describe('theme preferences', () => {
 
 		const stylesheet = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
 		expect(stylesheet).toContain(`@import '@skeletonlabs/skeleton/themes/${DEFAULT_THEME}'`);
+		expect(stylesheet).toContain(`@import './theme-calibration.css'`);
+		const cerberusCss = readFileSync(
+			join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${DEFAULT_THEME}.css`),
+			'utf8',
+		);
+		const criticalCalibration = readFileSync(
+			join(process.cwd(), 'src/routes/theme-calibration.css'),
+			'utf8',
+		);
+		expect(criticalCalibration).toBe(buildCriticalCalibrationCss(cerberusCss));
 		for (const theme of pickerThemes) expect(THEME_LOADERS[theme]).toEqual(expect.any(Function));
 		for (const theme of pickerThemes) {
 			const source = readFileSync(join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme}.css`), 'utf8');
@@ -97,6 +117,128 @@ describe('theme preferences', () => {
 		}
 		for (const theme of pickerThemes.filter((theme) => theme !== DEFAULT_THEME)) {
 			expect(stylesheet).not.toContain(`@import '@skeletonlabs/skeleton/themes/${theme}'`);
+			expect(criticalCalibration).not.toContain(`:root[data-theme="${theme}"]`);
+		}
+	});
+
+	it('calibrates every Skeleton palette and :root fallback to WCAG 2.2 G18 4.5:1 across light and dark modes', () => {
+		const palettes = [
+			{ id: 'root', raw: DEFAULT_SKELETON_ROOT_TOKENS },
+			...THEMES.map((theme) => ({
+				id: theme.id,
+				raw: extractCssVariables(
+					readFileSync(
+						join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme.id}.css`),
+						'utf8',
+					),
+				),
+			})),
+		];
+
+		for (const palette of palettes) {
+			const calibrated = calibrateThemeTokens(palette.raw);
+
+			// Surface scale must be strictly monotonic from 50 (lightest) to 950 (darkest).
+			const surfaceLightness = THEME_SHADES.map((shade) => {
+				const token = calibrated.light[`--color-surface-${shade}`];
+				expect(token, `${palette.id} --color-surface-${shade}`).toBeDefined();
+				return parseCssColor(token).L;
+			});
+			for (let i = 0; i < surfaceLightness.length - 1; i += 1) {
+				expect(
+					surfaceLightness[i],
+					`${palette.id} surface-${THEME_SHADES[i]} > surface-${THEME_SHADES[i + 1]}`,
+				).toBeGreaterThan(surfaceLightness[i + 1]);
+			}
+
+			for (const mode of ['light', 'dark'] as const) {
+				const active = mode === 'dark' ? { ...calibrated.light, ...calibrated.dark } : calibrated.light;
+				const surfaceBg = parseCssColor(active['--color-surface-50-950']);
+				const rootBg = parseCssColor(
+					active[mode === 'light' ? '--color-root-bg-light' : '--color-root-bg-dark'],
+				);
+
+				// Surface contrast and muted/body text tokens on surface and root backgrounds.
+				for (const textProp of [
+					'--color-surface-contrast-50-950',
+					'--color-surface-600-400',
+					'--color-surface-700-300',
+					'--color-surface-800-200',
+					'--color-surface-900-100',
+					'--color-surface-950-50',
+					mode === 'light' ? '--typo-base--color-light' : '--typo-base--color-dark',
+					mode === 'light' ? '--typo-anchor--color-light' : '--typo-anchor--color-dark',
+				]) {
+					const fg = parseCssColor(active[textProp]);
+					expect(
+						contrastRatio(fg, surfaceBg),
+						`${palette.id}/${mode} ${textProp} on surface-50-950`,
+					).toBeGreaterThanOrEqual(4.5);
+					expect(
+						contrastRatio(fg, rootBg),
+						`${palette.id}/${mode} ${textProp} on root-bg`,
+					).toBeGreaterThanOrEqual(4.5);
+				}
+
+				const headingToken =
+					active[mode === 'light' ? '--typo-heading--color-light' : '--typo-heading--color-dark'];
+				if (headingToken) {
+					const headingFg = parseCssColor(headingToken);
+					expect(
+						contrastRatio(headingFg, surfaceBg),
+						`${palette.id}/${mode} heading on surface-50-950`,
+					).toBeGreaterThanOrEqual(4.5);
+					expect(
+						contrastRatio(headingFg, rootBg),
+						`${palette.id}/${mode} heading on root-bg`,
+					).toBeGreaterThanOrEqual(4.5);
+				}
+
+				// Underlying 600 (light) and 400 (dark) tokens inlined by Tailwind v4 utilities.
+				for (const role of THEME_COLOR_ROLES) {
+					const shadeProp = `--color-${role}-${mode === 'light' ? '600' : '400'}`;
+					const shadeFg = parseCssColor(active[shadeProp]);
+					expect(
+						contrastRatio(shadeFg, surfaceBg),
+						`${palette.id}/${mode} ${shadeProp} on surface-50-950`,
+					).toBeGreaterThanOrEqual(4.5);
+					expect(
+						contrastRatio(shadeFg, rootBg),
+						`${palette.id}/${mode} ${shadeProp} on root-bg`,
+					).toBeGreaterThanOrEqual(4.5);
+
+					// Paired 600-400 token.
+					const paired600400 = parseCssColor(active[`--color-${role}-600-400`]);
+					expect(
+						contrastRatio(paired600400, surfaceBg),
+						`${palette.id}/${mode} --color-${role}-600-400 on surface-50-950`,
+					).toBeGreaterThanOrEqual(4.5);
+
+					// Tonal preset pair (50-950 background vs 950-50 foreground).
+					const tonalBg = parseCssColor(active[`--color-${role}-50-950`]);
+					const tonalFg = parseCssColor(active[`--color-${role}-950-50`]);
+					expect(
+						contrastRatio(tonalFg, tonalBg),
+						`${palette.id}/${mode} preset-tonal-${role}`,
+					).toBeGreaterThanOrEqual(4.5);
+
+					// Filled-500 preset pair (500 background vs contrast-500 foreground).
+					const filledBg = parseCssColor(active[`--color-${role}-500`]);
+					const filledFg = parseCssColor(active[`--color-${role}-contrast-500`]);
+					expect(
+						contrastRatio(filledFg, filledBg),
+						`${palette.id}/${mode} preset-filled-${role}-500`,
+					).toBeGreaterThanOrEqual(4.5);
+
+					// Switch control non-text boundary contrast (SC 1.4.11 >= 3:1).
+					if (role === 'primary' || role === 'secondary' || role === 'tertiary' || role === 'surface') {
+						expect(
+							contrastRatio(filledBg, surfaceBg),
+							`${palette.id}/${mode} switch ${role}-500 vs surface-50-950`,
+						).toBeGreaterThanOrEqual(3);
+					}
+				}
+			}
 		}
 	});
 
@@ -123,6 +265,7 @@ describe('theme preferences', () => {
 
 		expect(style.dataset.bookwardTheme).toBe('mint');
 		expect(style.textContent).toContain('[data-theme="mint"]');
+		expect(style.textContent).toContain(':root[data-theme="mint"]');
 		expect(append).toHaveBeenCalledTimes(1);
 		THEME_LOADERS.mint = originalLoader;
 	});

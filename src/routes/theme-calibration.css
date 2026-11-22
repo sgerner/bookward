@@ -1,0 +1,394 @@
+/* Auto-calibrated WCAG 2.2 SC 1.4.3 / G18 tokens for :root and cerberus. */
+@layer base {
+	:root {
+		--color-root-bg-light: oklch(0.985 0 0);
+		--color-root-bg-dark: oklch(0.145 0 0);
+		--color-surface-50: oklch(0.992 0 0);
+		--color-surface-100: oklch(0.972 0 0);
+		--color-surface-200: oklch(0.922 0 0);
+		--color-surface-300: oklch(0.87 0 0);
+		--color-surface-400: oklch(0.708 0 0);
+		--color-surface-600: oklch(0.439 0 0);
+		--color-surface-700: oklch(0.371 0 0);
+		--color-surface-800: oklch(0.269 0 0);
+		--color-surface-900: oklch(0.205 0 0);
+		--color-surface-950: oklch(0.145 0 0);
+		--color-surface-contrast-50: oklch(0.145 0 0);
+		--color-surface-contrast-950: oklch(0.985 0 0);
+		--color-surface-contrast-50-950: oklch(0.145 0 0);
+		--color-surface-700-300: oklch(0.371 0 0);
+		--color-surface-800-200: oklch(0.269 0 0);
+		--color-surface-900-100: oklch(0.205 0 0);
+		--color-primary-50: oklch(0.985 0 0);
+		--color-primary-950: oklch(0.145 0 0);
+		--color-primary-50-950: oklch(0.985 0 0);
+		--color-primary-950-50: oklch(0.145 0 0);
+		--color-primary-600: oklch(0.439 0 0);
+		--color-primary-400: oklch(0.708 0 0);
+		--color-primary-600-400: oklch(0.439 0 0);
+		--color-primary-500: oklch(0.5468 0 0);
+		--color-primary-contrast-500: oklch(0.985 0 0);
+		--color-secondary-50: oklch(0.985 0 0);
+		--color-secondary-950: oklch(0.145 0 0);
+		--color-secondary-50-950: oklch(0.985 0 0);
+		--color-secondary-950-50: oklch(0.145 0 0);
+		--color-secondary-600: oklch(0.439 0 0);
+		--color-secondary-400: oklch(0.708 0 0);
+		--color-secondary-600-400: oklch(0.439 0 0);
+		--color-secondary-500: oklch(0.5468 0 0);
+		--color-secondary-contrast-500: oklch(0.985 0 0);
+		--color-tertiary-50: oklch(0.985 0 0);
+		--color-tertiary-950: oklch(0.145 0 0);
+		--color-tertiary-50-950: oklch(0.985 0 0);
+		--color-tertiary-950-50: oklch(0.145 0 0);
+		--color-tertiary-600: oklch(0.439 0 0);
+		--color-tertiary-400: oklch(0.708 0 0);
+		--color-tertiary-600-400: oklch(0.439 0 0);
+		--color-tertiary-500: oklch(0.5468 0 0);
+		--color-tertiary-contrast-500: oklch(0.985 0 0);
+		--color-success-50: oklch(0.985 0 0);
+		--color-success-950: oklch(0.145 0 0);
+		--color-success-50-950: oklch(0.985 0 0);
+		--color-success-950-50: oklch(0.145 0 0);
+		--color-success-600: oklch(0.439 0 0);
+		--color-success-400: oklch(0.708 0 0);
+		--color-success-600-400: oklch(0.439 0 0);
+		--color-success-500: oklch(0.5468 0 0);
+		--color-success-contrast-500: oklch(0.985 0 0);
+		--color-warning-50: oklch(0.985 0 0);
+		--color-warning-950: oklch(0.145 0 0);
+		--color-warning-50-950: oklch(0.985 0 0);
+		--color-warning-950-50: oklch(0.145 0 0);
+		--color-warning-600: oklch(0.439 0 0);
+		--color-warning-400: oklch(0.708 0 0);
+		--color-warning-600-400: oklch(0.439 0 0);
+		--color-warning-500: oklch(0.5468 0 0);
+		--color-warning-contrast-500: oklch(0.985 0 0);
+		--color-error-50: oklch(0.985 0 0);
+		--color-error-950: oklch(0.145 0 0);
+		--color-error-50-950: oklch(0.985 0 0);
+		--color-error-950-50: oklch(0.145 0 0);
+		--color-error-600: oklch(0.439 0 0);
+		--color-error-400: oklch(0.708 0 0);
+		--color-error-600-400: oklch(0.439 0 0);
+		--color-error-500: oklch(0.5468 0 0);
+		--color-error-contrast-500: oklch(0.985 0 0);
+		--color-surface-50-950: oklch(0.992 0 0);
+		--color-surface-950-50: oklch(0.145 0 0);
+		--color-surface-600-400: oklch(0.439 0 0);
+		--color-surface-500: oklch(0.5503 0 0);
+		--color-surface-contrast-500: oklch(0.992 0 0);
+		--typo-base--color-light: oklch(0.145 0 0);
+		--typo-base--color-dark: oklch(0.985 0 0);
+		--typo-anchor--color-light: oklch(0.5014 0 0);
+		--typo-anchor--color-dark: oklch(0.708 0 0);
+	}
+
+	:root.dark {
+		--color-surface-contrast-50-950: oklch(0.985 0 0);
+		--color-surface-700-300: oklch(0.87 0 0);
+		--color-surface-800-200: oklch(0.922 0 0);
+		--color-surface-900-100: oklch(0.972 0 0);
+		--color-primary-50-950: oklch(0.145 0 0);
+		--color-primary-950-50: oklch(0.985 0 0);
+		--color-primary-600-400: oklch(0.708 0 0);
+		--color-primary-500: oklch(0.5781 0 0);
+		--color-primary-contrast-500: oklch(0.12 0 0);
+		--color-secondary-50-950: oklch(0.145 0 0);
+		--color-secondary-950-50: oklch(0.985 0 0);
+		--color-secondary-600-400: oklch(0.708 0 0);
+		--color-secondary-500: oklch(0.5781 0 0);
+		--color-secondary-contrast-500: oklch(0.12 0 0);
+		--color-tertiary-50-950: oklch(0.145 0 0);
+		--color-tertiary-950-50: oklch(0.985 0 0);
+		--color-tertiary-600-400: oklch(0.708 0 0);
+		--color-tertiary-500: oklch(0.5781 0 0);
+		--color-tertiary-contrast-500: oklch(0.12 0 0);
+		--color-success-50-950: oklch(0.145 0 0);
+		--color-success-950-50: oklch(0.985 0 0);
+		--color-success-600-400: oklch(0.708 0 0);
+		--color-success-500: oklch(0.5781 0 0);
+		--color-success-contrast-500: oklch(0.12 0 0);
+		--color-warning-50-950: oklch(0.145 0 0);
+		--color-warning-950-50: oklch(0.985 0 0);
+		--color-warning-600-400: oklch(0.708 0 0);
+		--color-warning-500: oklch(0.5781 0 0);
+		--color-warning-contrast-500: oklch(0.12 0 0);
+		--color-error-50-950: oklch(0.145 0 0);
+		--color-error-950-50: oklch(0.985 0 0);
+		--color-error-600-400: oklch(0.708 0 0);
+		--color-error-500: oklch(0.5781 0 0);
+		--color-error-contrast-500: oklch(0.12 0 0);
+		--color-surface-50-950: oklch(0.145 0 0);
+		--color-surface-950-50: oklch(0.992 0 0);
+		--color-surface-600-400: oklch(0.708 0 0);
+		--color-surface-500: oklch(0.5781 0 0);
+		--color-surface-contrast-500: oklch(0.12 0 0);
+	}
+}
+
+:root[data-theme="cerberus"] {
+	--color-root-bg-light: oklch(0.99 0 0);
+	--color-root-bg-dark: oklch(0.18 0 0);
+	--color-surface-50: oklch(0.99 0 0);
+	--color-surface-100: oklch(0.91 0 0);
+	--color-surface-200: oklch(0.81 0 0);
+	--color-surface-300: oklch(0.72 0 0);
+	--color-surface-400: oklch(0.6285 0 0);
+	--color-surface-600: oklch(0.45 0 0);
+	--color-surface-700: oklch(0.39 0 0);
+	--color-surface-800: oklch(0.32 0 0);
+	--color-surface-900: oklch(0.25 0 0);
+	--color-surface-950: oklch(0.18 0 0);
+	--color-surface-contrast-50: oklch(0.18 0 0);
+	--color-surface-contrast-950: oklch(0.99 0 0);
+	--color-surface-contrast-50-950: oklch(0.18 0 0);
+	--color-surface-700-300: oklch(0.39 0 0);
+	--color-surface-800-200: oklch(0.32 0 0);
+	--color-surface-900-100: oklch(0.25 0 0);
+	--color-primary-50: oklch(0.945 0.0264 257.51);
+	--color-primary-950: oklch(0.28 0.08 257.49);
+	--color-primary-50-950: oklch(0.945 0.0264 257.51);
+	--color-primary-950-50: oklch(0.28 0.08 257.49);
+	--color-primary-600: oklch(0.5125 0.19 258.15);
+	--color-primary-400: oklch(0.6316 0.19 255.71);
+	--color-primary-600-400: oklch(0.5125 0.19 258.15);
+	--color-primary-500: oklch(0.5538 0.2077 258.29);
+	--color-primary-contrast-500: oklch(0.985 0.0071 258.29);
+	--color-secondary-50: oklch(0.945 0.0308 300.12);
+	--color-secondary-950: oklch(0.3 0.13 291.15);
+	--color-secondary-50-950: oklch(0.945 0.0308 300.12);
+	--color-secondary-950-50: oklch(0.3 0.13 291.15);
+	--color-secondary-600: oklch(0.45 0.21 299.59);
+	--color-secondary-400: oklch(0.6502 0.2 302.74);
+	--color-secondary-600-400: oklch(0.45 0.21 299.59);
+	--color-secondary-500: oklch(0.49 0.23 300.45);
+	--color-secondary-contrast-500: oklch(0.87 0.05 300.12);
+	--color-tertiary-50: oklch(0.945 0.045 328.89);
+	--color-tertiary-950: oklch(0.26 0.085 355.33);
+	--color-tertiary-50-950: oklch(0.945 0.045 328.89);
+	--color-tertiary-950-50: oklch(0.26 0.085 355.33);
+	--color-tertiary-600: oklch(0.535 0.2161 1.69);
+	--color-tertiary-400: oklch(0.6611 0.25 355.84);
+	--color-tertiary-600-400: oklch(0.535 0.2161 1.69);
+	--color-tertiary-500: oklch(0.65 0.2554 2.47);
+	--color-tertiary-contrast-500: oklch(0.2298 0.085 355.33);
+	--color-success-50: oklch(0.94 0.0873 178.68);
+	--color-success-950: oklch(0.27 0.04 185.3);
+	--color-success-50-950: oklch(0.94 0.0873 178.68);
+	--color-success-950-50: oklch(0.27 0.04 185.3);
+	--color-success-600: oklch(0.4946 0.0927 175.71);
+	--color-success-400: oklch(0.85 0.13 175.46);
+	--color-success-600-400: oklch(0.4946 0.0927 175.71);
+	--color-success-500: oklch(0.83 0.13 174.96);
+	--color-success-contrast-500: oklch(0.27 0.04 185.3);
+	--color-warning-50: oklch(0.96 0.0417 84.57);
+	--color-warning-950: oklch(0.26 0.0674 51.44);
+	--color-warning-50-950: oklch(0.96 0.0417 84.57);
+	--color-warning-950-50: oklch(0.26 0.0674 51.44);
+	--color-warning-600: oklch(0.5119 0.1095 72.26);
+	--color-warning-400: oklch(0.85 0.12 78.36);
+	--color-warning-600-400: oklch(0.5119 0.1095 72.26);
+	--color-warning-500: oklch(0.82 0.14 76.72);
+	--color-warning-contrast-500: oklch(0.4332 0.1122 51.44);
+	--color-error-50: oklch(0.945 0.0277 14);
+	--color-error-950: oklch(0.26 0.085 29.23);
+	--color-error-50-950: oklch(0.945 0.0277 14);
+	--color-error-950-50: oklch(0.26 0.085 29.23);
+	--color-error-600: oklch(0.5316 0.21 28.53);
+	--color-error-400: oklch(0.67 0.19 26.71);
+	--color-error-600-400: oklch(0.5316 0.21 28.53);
+	--color-error-500: oklch(0.64 0.22 28.71);
+	--color-error-contrast-500: oklch(0.2246 0.085 29.23);
+	--color-surface-50-950: oklch(0.99 0 0);
+	--color-surface-950-50: oklch(0.18 0 0);
+	--color-surface-600-400: oklch(0.45 0 0);
+	--color-surface-500: oklch(0.51 0 0);
+	--color-surface-contrast-500: oklch(0.99 0 0);
+	--typo-base--color-light: oklch(0.18 0 0);
+	--typo-base--color-dark: oklch(0.99 0 0);
+	--typo-anchor--color-light: oklch(0.5125 0.1922 258.29);
+	--typo-anchor--color-dark: oklch(0.6316 0.19 255.71);
+}
+
+:root[data-theme="cerberus"].dark {
+	--color-surface-contrast-50-950: oklch(0.99 0 0);
+	--color-surface-700-300: oklch(0.72 0 0);
+	--color-surface-800-200: oklch(0.81 0 0);
+	--color-surface-900-100: oklch(0.91 0 0);
+	--color-primary-50-950: oklch(0.28 0.08 257.49);
+	--color-primary-950-50: oklch(0.945 0.0264 257.51);
+	--color-primary-600-400: oklch(0.6316 0.19 255.71);
+	--color-primary-500: oklch(0.5852 0.21 258.29);
+	--color-primary-contrast-500: oklch(0.12 0.03 258.29);
+	--color-secondary-50-950: oklch(0.3 0.13 291.15);
+	--color-secondary-950-50: oklch(0.945 0.0308 300.12);
+	--color-secondary-600-400: oklch(0.6502 0.2 302.74);
+	--color-secondary-500: oklch(0.5268 0.23 300.45);
+	--color-secondary-contrast-500: oklch(0.9203 0.045 300.12);
+	--color-tertiary-50-950: oklch(0.26 0.085 355.33);
+	--color-tertiary-950-50: oklch(0.945 0.045 328.89);
+	--color-tertiary-600-400: oklch(0.6611 0.25 355.84);
+	--color-success-50-950: oklch(0.27 0.04 185.3);
+	--color-success-950-50: oklch(0.94 0.0873 178.68);
+	--color-success-600-400: oklch(0.85 0.13 175.46);
+	--color-warning-50-950: oklch(0.26 0.0674 51.44);
+	--color-warning-950-50: oklch(0.96 0.0417 84.57);
+	--color-warning-600-400: oklch(0.85 0.12 78.36);
+	--color-error-50-950: oklch(0.26 0.085 29.23);
+	--color-error-950-50: oklch(0.945 0.0277 14);
+	--color-error-600-400: oklch(0.67 0.19 26.71);
+	--color-surface-50-950: oklch(0.18 0 0);
+	--color-surface-950-50: oklch(0.99 0 0);
+	--color-surface-600-400: oklch(0.6285 0 0);
+}
+
+/* Shared tonal foreground inheritance to prevent WCAG 2.2 Failure F24. */
+.preset-tonal-primary {
+	--bookward-tonal-fg: var(--color-primary-950-50);
+}
+.preset-tonal-secondary {
+	--bookward-tonal-fg: var(--color-secondary-950-50);
+}
+.preset-tonal-tertiary {
+	--bookward-tonal-fg: var(--color-tertiary-950-50);
+}
+.preset-tonal-success {
+	--bookward-tonal-fg: var(--color-success-950-50);
+}
+.preset-tonal-warning {
+	--bookward-tonal-fg: var(--color-warning-950-50);
+}
+.preset-tonal-error {
+	--bookward-tonal-fg: var(--color-error-950-50);
+}
+
+:is(
+	.preset-tonal-surface,
+	.preset-tonal,
+	.preset-filled,
+	[class*="preset-filled-"],
+	.input,
+	.select,
+	.textarea
+) {
+	--bookward-tonal-fg: initial;
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) :where(code) {
+	color: var(--bookward-tonal-fg, var(--color-surface-950-50));
+	background-color: transparent;
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) :is(.h1, .h2, .h3, .h4, .h5, .h6) {
+	color: var(--bookward-tonal-fg, inherit);
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+):is(.text-surface-950-50),
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) .text-surface-950-50:not(.preset-tonal-surface, .preset-tonal, .preset-filled, [class*="preset-filled-"], .input, .select, .textarea) {
+	color: var(--bookward-tonal-fg, var(--color-surface-950-50));
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+):is(.text-surface-900-100),
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) .text-surface-900-100:not(.preset-tonal-surface, .preset-tonal, .preset-filled, [class*="preset-filled-"], .input, .select, .textarea) {
+	color: var(--bookward-tonal-fg, var(--color-surface-900-100));
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+):is(.text-surface-800-200),
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) .text-surface-800-200:not(.preset-tonal-surface, .preset-tonal, .preset-filled, [class*="preset-filled-"], .input, .select, .textarea) {
+	color: var(--bookward-tonal-fg, var(--color-surface-800-200));
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+):is(.text-surface-700-300),
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) .text-surface-700-300:not(.preset-tonal-surface, .preset-tonal, .preset-filled, [class*="preset-filled-"], .input, .select, .textarea) {
+	color: var(--bookward-tonal-fg, var(--color-surface-700-300));
+}
+
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+):is(.text-surface-600-400),
+:is(
+	.preset-tonal-primary,
+	.preset-tonal-secondary,
+	.preset-tonal-tertiary,
+	.preset-tonal-success,
+	.preset-tonal-warning,
+	.preset-tonal-error
+) .text-surface-600-400:not(.preset-tonal-surface, .preset-tonal, .preset-filled, [class*="preset-filled-"], .input, .select, .textarea) {
+	color: var(--bookward-tonal-fg, var(--color-surface-600-400));
+}

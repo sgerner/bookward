@@ -4,6 +4,8 @@
  * `app.html` and the hydrated picker share the same storage contract.
  */
 
+import { calibrateThemeStylesheet } from './theme-contrast.js';
+
 export const THEME_STORAGE_KEY = 'bookward-theme';
 export const MODE_STORAGE_KEY = 'bookward-color-mode';
 const LEGACY_THEME_STORAGE_KEY = 'afterword-theme';
@@ -135,7 +137,7 @@ export function loadTheme(theme: SkeletonThemeName): Promise<void> {
 			if (typeof stylesheet !== 'string') throw new Error(`Theme stylesheet for ${nextTheme} was unavailable`);
 			const style = document.createElement('style');
 			style.dataset.bookwardTheme = nextTheme;
-			style.textContent = stylesheet;
+			style.textContent = calibrateThemeStylesheet(nextTheme, stylesheet);
 			document.head.append(style);
 		},
 		(error) => {
