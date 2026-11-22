@@ -1723,7 +1723,7 @@
     class="sticky top-0 z-40 border-b border-primary-500/15 preset-filled-surface-50-950 shadow-lg shadow-primary-500/5 backdrop-blur-xl"
   >
     <div
-      class="relative mx-auto flex min-h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:gap-6 lg:px-8"
+      class="header-reflow relative mx-auto flex min-h-16 max-w-7xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-6 lg:gap-x-6 lg:px-8"
     >
       <a
         href="/"
@@ -1736,7 +1736,7 @@
         ></a
       >
       <nav
-        class="hidden min-w-0 flex-1 items-center gap-1 md:flex"
+        class="hidden min-w-0 flex-1 basis-[15rem] flex-wrap items-center gap-1.5 py-1 md:flex"
         aria-label="Primary navigation"
       >
         {#each navItems as item}{@const Icon = item.icon}<button
@@ -1747,7 +1747,7 @@
             ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span>{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</button
       >{/each}
       </nav>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex shrink-0 items-center gap-2">
         {#if activeView === "discover" || activeView === "saved"}<form
             method="POST"
             action="?/runSync"
@@ -1784,7 +1784,7 @@
               class="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
             >
               <div class="border-b border-surface-300-700/40 px-2 pb-3">
-                <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+                <p class="text-reflow text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
                 {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
               </div>
               <div class="grid gap-1 py-2">
@@ -1902,7 +1902,7 @@
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
-            class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
+            class="text-reflow text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
               <div class="input flex min-h-11 w-full min-w-0 items-center gap-2 sm:flex-1">
@@ -2023,8 +2023,8 @@
                 aria-label={`View details for ${book.title}`}
                 aria-expanded={expandedRecommendationDetails.has(book.id)}
               >
-                <span class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400">
-                  <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
+                <span class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400" aria-hidden="true">
+                  <BookOpen size={28} /><span class="text-reflow text-xs">{book.title}</span>
                 </span>
                 {#if book.cover_url}<img
                     in:fade={{ duration: motionDuration(340) }}
@@ -2054,9 +2054,9 @@
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
                 </div>
-                <div>
-                  <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
-                  <p class="mt-1 text-base text-surface-700-300">{book.author}</p>
+                <div class="min-w-0">
+                  <h2 class="text-reflow text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="text-reflow mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
                 <details
                   class="group/details text-base text-surface-700-300"
@@ -2242,14 +2242,14 @@
               <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {#each visibleReadingHistory as item (item.id)}
                   <article class="card min-w-0 preset-tonal-success p-4">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
-                      <div class="min-w-0 flex-1">
-                        <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
-                        <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h2 class="text-reflow font-semibold leading-snug text-surface-950-50">{item.title}</h2>
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">{item.author}</p>
                         <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
-                      <div class="flex shrink-0 flex-col items-end gap-2">
+                      <div class="ml-auto flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
                           <span class="badge preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
@@ -2276,7 +2276,7 @@
                             <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
                             <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
                           </dl>
-                          <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
+                          <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-relaxed">
                             {#if item.algorithm_score !== null}
                               <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
                               <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
@@ -2324,7 +2324,7 @@
         {#if activeView === "discover"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -2333,7 +2333,7 @@
         {:else if activeView === "saved"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -2342,7 +2342,7 @@
         {:else if activeView === "decisions"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -2357,7 +2357,7 @@
           >
             <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Choose your sources.
               </h1>
@@ -2385,7 +2385,7 @@
                     </p>
                   </div>
                   <div
-                    class="flex min-w-0 w-full items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
+                    class="flex min-w-0 w-full flex-wrap items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
                     role="tablist"
                     aria-label="Filter sources by lifecycle"
                   >
@@ -2397,7 +2397,7 @@
                         aria-controls="source-filter-panel"
                         aria-selected={sourceFilter === option.value}
                         tabindex={sourceFilter === option.value ? 0 : -1}
-                        class={`min-h-9 min-w-0 flex-1 break-words px-2 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
+                        class={`text-reflow min-h-9 min-w-0 flex-1 px-2 py-1.5 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
                         onclick={() => (sourceFilter = option.value)}
                         onkeydown={(event) => {
                           if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -2418,17 +2418,17 @@
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
-                      class="flex min-h-24 items-center gap-4 py-4"
+                      class="flex min-h-24 flex-wrap items-center gap-4 py-4"
                     >
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Sparkles size={18} /></span
                       >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-medium text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-medium text-surface-950-50">
                           Bookward demo books
                         </h3>
-                        <p class="mt-1 text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           A small offline sample to test a fresh installation.
                         </p>
                         <span class="mt-1 block text-xs text-surface-600-400"
@@ -2436,6 +2436,7 @@
                         >
                       </div>
                       <form
+                        class="ml-auto shrink-0"
                         method="POST"
                         action="?/toggleDefault"
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
@@ -2460,17 +2461,17 @@
                     <div in:fade={{ duration: motionDuration(160) }} out:fade={{ duration: motionDuration(100) }}>
                   {#each visibleSourceGroups as group}
                     <div
-                      class="flex min-w-0 items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
+                      class="flex min-w-0 flex-wrap items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
                     >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-semibold text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-semibold text-surface-950-50">
                           {group.label}
                         </h3>
-                        <p class="mt-1 break-words text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           {group.description}
                         </p>
                       </div>
-                      <span class="badge max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
+                      <span class="badge shrink-0 preset-tonal-surface"
                         >{group.active} active · {group.sources.length} total</span
                       >
                     </div>
@@ -2482,17 +2483,17 @@
                             delay: motionDelay(source.id % 5, 24),
                           }}
                           out:fade={{ duration: motionDuration(120) }}
-                          class="flex min-h-24 min-w-0 items-center gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:gap-4"
+                          class="flex min-h-24 min-w-0 flex-wrap items-start gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:items-center sm:gap-4"
                         >
                           <span
                             class={`grid size-10 shrink-0 place-items-center ${source.lifecycle === "one_time" ? "preset-tonal-tertiary" : "preset-tonal-secondary"}`}
                             ><Link2 size={18} /></span
                           >
-                          <div class="min-w-0 flex-1">
-                            <h3 class="truncate font-medium text-surface-950-50">
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <h3 class="text-reflow font-medium text-surface-950-50">
                               {source.label}
                             </h3>
-                            <p class="mt-1 truncate text-sm text-surface-700-300">
+                            <p class="url-reflow mt-1 text-sm text-surface-700-300">
                               {source.url}
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
@@ -2554,7 +2555,7 @@
                                     placeholder="romance, cookbook"
                                   />
                                 </label>
-                                <p class="text-xs leading-5 text-surface-600-400">
+                                <p class="text-xs leading-relaxed text-surface-600-400">
                                   Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                                 </p>
                                 <button
@@ -2567,7 +2568,7 @@
                             </details>
                           </div>
                           <form
-                            class="shrink-0"
+                            class="ml-auto shrink-0"
                             method="POST"
                             action="?/toggleSource"
                             use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
@@ -2720,7 +2721,7 @@
                           placeholder="romance, cookbook"
                         />
                       </label>
-                      <p class="text-xs leading-5 text-surface-600-400">
+                      <p class="text-xs leading-relaxed text-surface-600-400">
                         Comma-separated. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                       </p>
                     </div>
@@ -2742,19 +2743,19 @@
         {:else}
           <div
             data-view="settings"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
-            <section class="mb-6 max-w-2xl">
+            <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Settings.
               </h1>
             </section>
-            <section class="grid gap-5 lg:grid-cols-2">
-              <section class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2">
+            <section class="grid min-w-0 gap-5 lg:grid-cols-2">
+              <section class="card min-w-0 preset-tonal-surface p-5 sm:p-6 lg:col-span-2">
                 <div class="mb-5 flex items-start gap-3">
                   <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"><Database size={19} /></span>
                   <div class="min-w-0 flex-1">
@@ -2787,7 +2788,7 @@
                         {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
                       </button>
                     </form>
-                    <p class="mt-3 text-xs leading-5 text-surface-600-400">The snapshots and key recovery files are stored on the server and can be restored here.</p>
+                    <p class="mt-3 text-xs leading-relaxed text-surface-600-400">The snapshots and key recovery files are stored on the server and can be restored here.</p>
                     <div class="mt-4 space-y-2">
                       {#if data.backupStatus.backups.length}
                         {#each data.backupStatus.backups as backup (backup.id)}
@@ -2829,20 +2830,20 @@
                   duration: motionDuration(300),
                   delay: motionDelay(0),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/connectGoodreads"
                 use:enhance={setPending("goodreads-rss")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Goodreads RSS
                     </h2>
@@ -2902,21 +2903,21 @@
                   duration: motionDuration(300),
                   delay: motionDelay(1),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/importGoodreadsCsv"
                 enctype="multipart/form-data"
                 use:enhance={setPending("goodreads-csv")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Upload size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Goodreads export
                     </h2>
@@ -2956,20 +2957,20 @@
                   duration: motionDuration(300),
                   delay: motionDelay(2),
                 }}
-                class="card scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><Library size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Librarr
                     </h2>
@@ -3037,16 +3038,16 @@
                   duration: motionDuration(300),
                   delay: motionDelay(3),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Settings2 size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Embedding provider
                     </h2>
@@ -3166,16 +3167,16 @@
                   duration: motionDuration(300),
                   delay: motionDelay(4),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Google Books API
                     </h2>
@@ -3239,16 +3240,16 @@
                   duration: motionDuration(300),
                   delay: motionDelay(4),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                       ><Sparkles size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       LLM reranker
                     </h2>
@@ -3434,14 +3435,14 @@
                   duration: motionDuration(300),
                   delay: motionDelay(4),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
                 <div class="mb-5 flex items-start gap-3">
                   <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                     ><KeyRound size={19} /></span
                   >
                   <div class="min-w-0 flex-1">
-                    <h2 class="text-lg font-semibold text-surface-950-50">API access</h2>
+                    <h2 class="text-reflow text-lg font-semibold text-surface-950-50">API access</h2>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">
                       Connect automations and other apps to Bookward with a token. Tokens are shown only once when created.
                     </p>
@@ -3450,18 +3451,18 @@
 
                 <div class="mb-5 border border-surface-300-700/50 p-3 text-sm">
                   <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
-                  <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
-                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
+                  <code class="url-reflow mt-1 block text-surface-950-50">{page.url.origin}/api/v1</code>
+                  <span class="mt-2 block text-xs leading-relaxed text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
                 {#if revealedApiToken}
                   <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <Check size={18} class="mt-0.5 shrink-0" />
-                      <div class="min-w-0 flex-1">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
                         <p class="font-semibold">Copy this token now</p>
-                        <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
-                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
+                        <p class="mt-1 text-xs leading-relaxed">For your security, Bookward will not display it again.</p>
+                        <code class="url-reflow mt-3 block rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
                         class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"
@@ -3494,8 +3495,8 @@
                     <ul class="mt-3 divide-y divide-surface-300-700/40 border border-surface-300-700/40">
                       {#each apiTokens as token (token.id)}
                         <li class="flex flex-wrap items-center gap-3 p-3">
-                          <div class="min-w-0 flex-1">
-                            <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <p class="text-reflow text-sm font-medium text-surface-950-50">{token.name}</p>
                             <p class="mt-1 text-xs text-surface-700-300"><code>{token.token_prefix}…</code> · Created {token.created_at}</p>
                             {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
                           </div>
@@ -3524,7 +3525,7 @@
                   duration: motionDuration(300),
                   delay: motionDelay(4),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
@@ -3661,14 +3662,14 @@
                   duration: motionDuration(300),
                   delay: motionDelay(5),
                 }}
-                class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
+                class="card min-w-0 preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
                 <div class="mb-5 flex flex-wrap items-center gap-3">
                   <span
                     class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                     ><BookOpen size={19} /></span
                   >
-                  <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
+                  <h2 class="text-reflow flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if data.history.length}<div
@@ -3681,15 +3682,15 @@
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
-                        <div class="min-w-0 flex-1">
+                        <div class="min-w-0 flex-1 basis-[8rem]">
                           <span
-                            class="block truncate text-sm font-medium text-surface-950-50"
+                            class="text-reflow block text-sm font-medium text-surface-950-50"
                             >{item.title}</span
                           ><small
-                            class="block truncate text-xs text-surface-700-300"
+                            class="text-reflow mt-0.5 block text-xs text-surface-700-300"
                             >{item.author}</small
                           >
                         </div>
@@ -3715,18 +3716,18 @@
   </div>
 
   <nav
-    class="fixed inset-x-0 bottom-0 z-40 flex border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
+    class="fixed inset-x-0 bottom-0 z-40 flex flex-wrap border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
     aria-label="Mobile navigation"
   >
     {#each navItems as item}{@const Icon = item.icon}<button
         type="button"
-        class={`relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
+        class={`relative flex min-h-16 min-w-[4.5rem] flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
         aria-current={activeView === item.id ? "page" : undefined}
         onclick={() => go(item.id)}
         ><Icon
           size={19}
           strokeWidth={activeView === item.id ? 2.2 : 1.8}
-        /><span class="flex items-center gap-1">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
+        /><span class="text-reflow flex flex-wrap items-center justify-center gap-1 text-center">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
             in:scale={{ duration: motionDuration(150) }}
             out:fade={{ duration: motionDuration(90) }}
             class="absolute bottom-1 size-1 rounded-full preset-filled-primary-500"
@@ -3753,20 +3754,20 @@
         tabindex="-1"
         in:scale={{ duration: motionDuration(260), start: 0.94 }}
         out:scale={{ duration: motionDuration(170), start: 0.97 }}
-        class="relative isolate w-full max-w-xl overflow-hidden rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
+        class="modal-scroll-shell relative isolate w-full max-w-xl rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
       >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
           <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
         </div>
-        <div class="flex items-start justify-between gap-5 border-b border-surface-200-800/70 p-5 sm:p-7">
-          <div class="flex min-w-0 items-center gap-4">
-            <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
+        <div class="flex shrink-0 items-start justify-between gap-3 border-b border-surface-200-800/70 p-4 sm:gap-5 sm:p-7">
+          <div class="flex min-w-0 flex-wrap items-center gap-3 sm:gap-4">
+            <span class="hidden size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10 sm:grid">
               <BookOpen size={22} />
             </span>
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1 basis-[8rem]">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
+              <h2 id="mark-read-title" class="text-reflow mt-1 text-lg font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -3778,13 +3779,13 @@
           ><X size={17} /></button>
         </div>
 
-        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
+        <form class="modal-scroll-body min-h-0 flex-1 overflow-y-auto" method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
           <div class="p-5 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
 
-            <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
+            <div class="flex flex-wrap items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
               <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
                 {#if markReadBook.cover_url}
                   <img src={markReadBook.cover_url} alt="" class="h-full w-full object-cover" />
@@ -3792,9 +3793,9 @@
                   <BookOpen size={24} class="text-surface-600-400" />
                 {/if}
               </div>
-              <div class="min-w-0">
-                <p class="line-clamp-2 text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
-                <p class="mt-1 truncate text-sm text-surface-700-300">{markReadBook.author}</p>
+              <div class="min-w-0 flex-1 basis-[8rem]">
+                <p class="text-reflow text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
+                <p class="text-reflow mt-1 text-sm text-surface-700-300">{markReadBook.author}</p>
               </div>
               <span class="ml-auto hidden size-9 shrink-0 place-items-center rounded-full bg-secondary-500/10 text-secondary-600-400 sm:grid" aria-hidden="true"><Check size={17} /></span>
             </div>
@@ -3849,36 +3850,36 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="modal-scroll-shell relative m-0 card w-full max-w-2xl justify-self-center preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         aria-modal="true"
         onclick={(event) => event.stopPropagation()}
       >
         <div
-          class="flex items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
+          class="flex shrink-0 items-start justify-between gap-3 border-b border-surface-200-800 p-4 sm:gap-4 sm:p-6"
         >
           <div class="min-w-0">
-            <p class="text-sm font-medium text-primary-600-400">
+            <p class="text-xs font-medium text-primary-600-400 sm:text-sm">
               Librarr search
             </p>
             <h2
               id="librarr-search-title"
-              class="mt-1 truncate text-2xl font-semibold tracking-tight text-surface-950-50"
+              class="text-reflow mt-1 text-xl font-semibold tracking-tight text-surface-950-50 sm:text-2xl"
             >
               Find a book to add
             </h2>
-            <p class="mt-1 truncate text-sm text-surface-700-300">
-              {librarrSearchBook?.title} · {librarrSearchBook?.author}
-            </p>
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm preset-tonal-surface"
+            class="btn btn-icon btn-sm shrink-0 preset-tonal-surface"
             aria-label="Close Librarr search"
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
         </div>
-        <div class="max-h-[calc(100vh-11rem)] overflow-y-auto p-5 sm:p-6">
+        <div class="modal-scroll-body min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+          <p class="text-reflow mb-4 text-sm text-surface-700-300">
+            {librarrSearchBook?.title} · {librarrSearchBook?.author}
+          </p>
           <form
             class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
@@ -3972,7 +3973,7 @@
                     duration: motionDuration(220),
                     delay: motionDelay(index, 24),
                   }}
-                  class="flex items-center gap-4 preset-tonal-surface p-3 sm:p-4"
+                  class="flex flex-wrap items-center gap-3 preset-tonal-surface p-3 sm:gap-4 sm:p-4"
                 >
                   <div
                     class="grid size-16 shrink-0 place-items-center overflow-hidden preset-filled-surface-500 sm:size-20"
@@ -3991,13 +3992,13 @@
                         class="text-surface-600-400"
                       />{/if}
                   </div>
-                  <div class="min-w-0 flex-1">
+                  <div class="min-w-0 flex-1 basis-[8rem]">
                     <h3
-                      class="line-clamp-2 text-base font-semibold text-surface-950-50 sm:text-lg"
+                      class="text-reflow text-base font-semibold text-surface-950-50 sm:text-lg"
                     >
                       {resultTitle(result)}
                     </h3>
-                    <p class="mt-1 truncate text-sm text-surface-700-300">
+                    <p class="text-reflow mt-1 text-sm text-surface-700-300">
                       {resultAuthor(result)}
                     </p>
                     <span
@@ -4008,7 +4009,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm ml-auto min-h-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}
