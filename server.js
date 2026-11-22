@@ -206,7 +206,9 @@ function formatListeningAddress(socketPath, host, port, address) {
  */
 export async function startServer(options = {}) {
 	const env = options.env ?? process.env;
-	const proc = options.processTarget ?? process;
+	/** @type {ProcessTarget} */
+	const proc =
+		options.processTarget ?? /** @type {ProcessTarget} */ (/** @type {unknown} */ (process));
 	const log = options.log ?? console.log;
 
 	const originConfig = prepareRuntimeEnv(env);
