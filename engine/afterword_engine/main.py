@@ -8,11 +8,13 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
+import numpy as np
 from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,7 +112,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_scope
+from .tenancy import current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -1635,18 +1637,120 @@ def reading_history():
     return items
 
 
+READING_HISTORY_SCORE_MAX_LIMIT = 200
+_RATED_READ_VECTOR_CACHE_MAX_ENTRIES = 8
+_RATED_READ_VECTOR_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, ...]] = OrderedDict()
+
+
+def _rated_read_state_digest(rated_reads: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for item in rated_reads:
+        digest.update(
+            json.dumps(
+                (
+                    item.get("id"),
+                    item.get("title"),
+                    item.get("author"),
+                    item.get("rating"),
+                    item.get("read_at"),
+                    item.get("genres"),
+                    item.get("description"),
+                ),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
+    query = (
+        "SELECT entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+        "FROM embeddings WHERE entity_type='read' AND backend=? AND model=? "
+        "ORDER BY entity_id"
+    )
+    entries = (
+        connection.execute(query, (backend, model)).fetchall()
+        if connection is not None
+        else rows(query, (backend, model))
+    )
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+async def _cached_rated_read_vectors(
+    embedder,
+    config: dict[str, Any],
+    rated_reads: list[dict[str, Any]],
+    embedding_cache_digest: str,
+) -> Sequence[Sequence[float]]:
+    tenant_key = (
+        current_profile_id() or "legacy",
+        str(profile_database_path().resolve()),
+    )
+    api_key_digest = hashlib.sha256(
+        str(getattr(embedder, "key", None) or config.get("embedding_api_key") or "").encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    embedder_base_key = (
+        type(embedder).__qualname__,
+        str(embedder.name),
+        str(embedder.model),
+        str(config.get("embedding_backend") or ""),
+        str(config.get("embedding_model") or ""),
+        str(getattr(embedder, "url", None) or config.get("embedding_url") or ""),
+        api_key_digest,
+    )
+    reads_state_key = _rated_read_state_digest(rated_reads)
+    lookup_key = (tenant_key, (*embedder_base_key, embedding_cache_digest), reads_state_key)
+    cached = _RATED_READ_VECTOR_CACHE.get(lookup_key)
+    if cached is not None:
+        _RATED_READ_VECTOR_CACHE.move_to_end(lookup_key)
+        return cached
+
+    computed = await cached_vectors(embedder, "read", rated_reads)
+    frozen: list[np.ndarray] = []
+    for vector in computed:
+        arr = np.asarray(vector, dtype=np.float64).copy()
+        arr.setflags(write=False)
+        frozen.append(arr)
+    stored = tuple(frozen)
+    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
+    _RATED_READ_VECTOR_CACHE[store_key] = stored
+    _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
+    while len(_RATED_READ_VECTOR_CACHE) > _RATED_READ_VECTOR_CACHE_MAX_ENTRIES:
+        _RATED_READ_VECTOR_CACHE.popitem(last=False)
+    return stored
+
+
 @app.get("/api/reading-history/scores")
 async def reading_history_scores(
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=20),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
+    resolved_offset = offset.default if hasattr(offset, "default") else int(offset)
+    resolved_limit = limit.default if hasattr(limit, "default") else int(limit)
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+            (resolved_limit, resolved_offset),
         ).fetchall()]
+        if not items:
+            return []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -1664,8 +1768,26 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-    if not items:
-        return []
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+        try:
+            embedder = get_embedder(
+                config.get("embedding_backend"),
+                config.get("embedding_model"),
+                config.get("embedding_url"),
+                config.get("embedding_api_key"),
+            )
+            embedding_cache_digest = _read_embedding_cache_digest(
+                connection, embedder.name, embedder.model
+            )
+        except Exception:
+            LOGGER.exception("Could not calculate current-profile reading history scores")
+            raise
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -1694,17 +1816,9 @@ async def reading_history_scores(
 
     try:
         if virtual_candidates:
-            config = private_settings()
-            embedder = get_embedder(
-                config.get("embedding_backend"),
-                config.get("embedding_model"),
-                config.get("embedding_url"),
-                config.get("embedding_api_key"),
+            read_vectors = await _cached_rated_read_vectors(
+                embedder, config, rated_reads, embedding_cache_digest
             )
-            rated_reads = rows(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            )
-            read_vectors = await cached_vectors(embedder, "read", rated_reads)
             candidate_vectors = await cached_vectors(
                 embedder,
                 "read_candidate",

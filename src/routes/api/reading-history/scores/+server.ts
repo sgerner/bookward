@@ -12,10 +12,18 @@ type ReadingHistoryScore = {
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Reading history scores could not be loaded.";
 
+const MAX_SCORE_LIMIT = 200;
+
 export const GET: RequestHandler = async ({ url }) => {
   const offset = Number(url.searchParams.get("offset") ?? 0);
-  const limit = Number(url.searchParams.get("limit") ?? 20);
-  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 20) {
+  const limit = Number(url.searchParams.get("limit") ?? MAX_SCORE_LIMIT);
+  if (
+    !Number.isInteger(offset) ||
+    offset < 0 ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_SCORE_LIMIT
+  ) {
     return json({ message: "Invalid reading history score range." }, { status: 400 });
   }
 

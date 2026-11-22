@@ -45,9 +45,23 @@
   import { createTelemetryClient } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
+  import {
+    applyReadingHistoryScores,
+    buildViewUrl,
+    isSameNavigationUrl,
+    mergeLoadedBooks,
+    READING_HISTORY_SCORE_BATCH_SIZE,
+    readUrlViewState,
+    reconcileBookMutation,
+    reconcilePagedBooks,
+    sortReadingHistory,
+    type DecisionFilter,
+    type ReadingHistoryScorePatch,
+    type ReadingHistorySort,
+    type View,
+  } from "#lib/page-state.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
-  type View = "discover" | "saved" | "decisions" | "sources" | "settings";
   type NavItem = {
     id: View;
     label: string;
@@ -86,7 +100,13 @@
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
-  let activeView = $state<View>(readView(page.url.searchParams.get("view")));
+  const initialUrlState = untrack(() =>
+    readUrlViewState(
+      page.shallow?.url ?? page.url,
+      data.digestReview.requested,
+    ),
+  );
+  let activeView = $state<View>(initialUrlState.view);
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
   let filter = $state("");
@@ -111,7 +131,7 @@
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
-  let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
+  let decisionFilter = $state<DecisionFilter>(initialUrlState.decisionFilter);
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
@@ -119,16 +139,31 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryGeneration = 0;
+  let bufferedReadingHistoryScores = $state(new Map<number, ReadingHistoryScorePatch>());
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
-  let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
+  let readingHistorySort = $state<ReadingHistorySort>("recent");
   let expandedReadingDetails = $state<number[]>([]);
-  // This is only an identity sentinel. Keeping it outside `$state` avoids
-  // proxying `data.books` and retriggering the synchronization effect forever.
-  let previousDataBooks: PageBook[] | null = null;
-  let previousDataDecisions: PageBook[] | null = null;
-  let previousDataDecisionsHasMore: boolean | null = null;
+  // Keep identity sentinels outside `$state` to avoid proxying server arrays
+  // and retriggering synchronization effects unnecessarily.
+  let previousDataBooks: PageBook[] | null = untrack(() => data.books);
+  let previousDataDecisions: PageBook[] | null = untrack(() => data.decisions);
+  let previousProfileId: string | undefined = untrack(
+    () => data.user?.profile_id,
+  );
+  let previousSearchFilter = "";
+  let previousGenreFilter = "";
+  const undoBookSnapshots = new Map<
+    number,
+    {
+      book: PageBook;
+      previousStatus: string;
+      discoverIndex: number;
+      decisionIndex: number;
+    }
+  >();
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -149,7 +184,7 @@
   let librarrBulkAdding = $state(false);
   let librarrAdded = $state<Set<string>>(new Set());
   let librarrSearchAbortController: AbortController | null = null;
-  let digestMode = $state(page.url.searchParams.get("digest") === "1");
+  let digestMode = $state(initialUrlState.digestMode);
   let selectedDigestIds = $state<Set<number>>(new Set());
   let digestEnabledOverride = $state<boolean | null>(null);
   let digestOnlyNewOverride = $state<boolean | null>(null);
@@ -242,10 +277,13 @@
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
   const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
-      const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
+    mergeLoadedBooks(
+      data.books,
+      data.decisions,
+      additionalDiscoverBooks,
+      additionalDecisionBooks,
+      bookStatusOverrides,
+    ),
   );
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
@@ -296,35 +334,17 @@
     };
     const matchesSearch = (item: ReadingHistoryItem) =>
       !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
-    const timestamps = new Map<number, number>();
-    const readTimestamp = (item: ReadingHistoryItem) => {
-      const cached = timestamps.get(item.id);
-      if (cached !== undefined) return cached;
-      const timestamp = Date.parse(item.read_at ?? item.created_at);
-      const normalized = Number.isFinite(timestamp) ? timestamp : 0;
-      timestamps.set(item.id, normalized);
-      return normalized;
-    };
-    return readingHistory
-      .filter((item) =>
+    const matching = readingHistory.filter(
+      (item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
         (readingHistorySourceFilter === "all" || item.source === readingHistorySourceFilter),
-      )
-      .sort((left, right) => {
-        if (readingHistorySort === "oldest") return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "score_high" || readingHistorySort === "score_low") {
-          if (left.algorithm_score === null) return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
-          if (right.algorithm_score === null) return -1;
-          const scoreOrder = readingHistorySort === "score_high"
-            ? right.algorithm_score - left.algorithm_score
-            : left.algorithm_score - right.algorithm_score;
-          return scoreOrder || left.title.localeCompare(right.title);
-        }
-        if (readingHistorySort === "rating_high") return (right.rating ?? 0) - (left.rating ?? 0) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "title") return left.title.localeCompare(right.title);
-        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
-      });
+    );
+    return sortReadingHistory(
+      matching,
+      readingHistorySort,
+      readingHistoryScoreState === "idle" || readingHistoryScoreState === "loading",
+    );
   });
   const readingHistorySources = $derived(
     [...new Set(readingHistory.map((item) => item.source).filter(Boolean))]
@@ -334,7 +354,9 @@
     filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
   const scoredReadingHistoryCount = $derived(
-    readingHistory.filter((item) => item.algorithm_score !== null).length,
+    readingHistory.filter(
+      (item) => item.algorithm_score !== null || bufferedReadingHistoryScores.has(item.id),
+    ).length,
   );
   const filteredBooks = $derived(
     activeView === "saved"
@@ -459,7 +481,8 @@
   );
   const digestVisible = $derived(
     digestMode &&
-      (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
+      (!(page.shallow?.url ?? page.url).searchParams.has("digest_period") ||
+        data.digestReview.requested),
   );
   const hasMoreDiscoverBooks = $derived(
     activeView === "discover" &&
@@ -592,47 +615,79 @@
     };
   });
 
-  function readView(value: string | null): View {
-    return value && ["discover", "saved", "decisions", "sources", "settings"].includes(value)
-      ? (value as View)
-      : "discover";
+  function resetClientPagination() {
+    additionalDiscoverBooks = [];
+    additionalDecisionBooks = [];
+    discoverHasMore = true;
+    discoverLoadError = "";
+    discoverVisibleCount = DISCOVER_PAGE_SIZE;
+    decisionsHasMoreOverride = null;
+    decisionsLoadError = "";
+    undoBookSnapshots.clear();
   }
+
+  function resetReadingHistory() {
+    readingHistoryGeneration += 1;
+    readingHistoryScoreTask = null;
+    readingHistory = [];
+    readingHistoryState = "idle";
+    readingHistoryError = "";
+    readingHistoryScoreState = "idle";
+    readingHistoryScoreError = "";
+    readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
+  }
+
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
+    const generation = ++readingHistoryGeneration;
+    readingHistoryScoreTask = null;
     readingHistoryState = "loading";
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
     readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
     try {
       const response = await fetch("/api/reading-history", { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: ReadingHistoryItem[];
         message?: string;
       };
+      if (generation !== readingHistoryGeneration) return;
       if (!response.ok || !Array.isArray(payload.items)) {
         throw new Error(payload.message || "Reading history could not be loaded.");
       }
       readingHistory = payload.items;
       readingHistoryState = "ready";
-      void loadReadingHistoryScores(payload.items.length);
+      void loadReadingHistoryScores(payload.items.length, generation);
     } catch (error) {
+      if (generation !== readingHistoryGeneration) return;
       readingHistoryError = error instanceof Error
         ? error.message
         : "Reading history could not be loaded.";
       readingHistoryState = "error";
     }
   }
-  function loadReadingHistoryScores(total: number) {
+  function loadReadingHistoryScores(total: number, generation = readingHistoryGeneration) {
     if (readingHistoryScoreTask) return readingHistoryScoreTask;
-    const batchSize = 20;
-    if (total === 0) {
+    const batchSize = READING_HISTORY_SCORE_BATCH_SIZE;
+    if (total === 0 || readingHistoryScoreOffset >= total) {
+      if (bufferedReadingHistoryScores.size > 0) {
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          bufferedReadingHistoryScores,
+        );
+        bufferedReadingHistoryScores = new Map();
+      }
       readingHistoryScoreState = "ready";
       return Promise.resolve();
     }
     readingHistoryScoreState = "loading";
     readingHistoryScoreError = "";
-    const task = (async () => {
+    let finished = false;
+    let task: Promise<void> | null = null;
+    const run = async () => {
       try {
         for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
           const response = await fetch(
@@ -640,36 +695,90 @@
             { headers: profileHeaders },
           );
           const payload = (await response.json().catch(() => ({}))) as {
-            scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
+            scores?: ReadingHistoryScorePatch[];
             message?: string;
           };
+          if (generation !== readingHistoryGeneration) return;
           if (!response.ok || !Array.isArray(payload.scores)) {
             throw new Error(payload.message || "Reading history scores could not be loaded.");
           }
-          const scoresById = new Map(payload.scores.map((item) => [item.id, item]));
-          readingHistory = readingHistory.map((item) => {
-            const score = scoresById.get(item.id);
-            return score ? { ...item, ...score } : item;
-          });
+          const nextBuffer = new Map(bufferedReadingHistoryScores);
+          for (const score of payload.scores) {
+            nextBuffer.set(score.id, score);
+          }
+          bufferedReadingHistoryScores = nextBuffer;
           readingHistoryScoreOffset = offset + batchSize;
         }
+        if (generation !== readingHistoryGeneration) return;
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          bufferedReadingHistoryScores,
+        );
+        bufferedReadingHistoryScores = new Map();
         readingHistoryScoreState = "ready";
       } catch (error) {
+        if (generation !== readingHistoryGeneration) return;
         readingHistoryScoreError = error instanceof Error
           ? error.message
           : "Reading history scores could not be loaded.";
         readingHistoryScoreState = "error";
       } finally {
-        readingHistoryScoreTask = null;
+        finished = true;
+        if (task && readingHistoryScoreTask === task) {
+          readingHistoryScoreTask = null;
+        }
       }
-    })();
-    readingHistoryScoreTask = task;
+    };
+    task = run();
+    if (!finished) {
+      readingHistoryScoreTask = task;
+    }
     return task;
   }
-  function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
-    decisionFilter = filter;
-    readingHistoryVisibleCount = 30;
-    if (filter === "read") void loadReadingHistory();
+  function syncFromUrl(url: Parameters<typeof readUrlViewState>[0]) {
+    const nextUrlState = readUrlViewState(url, data.digestReview.requested);
+    const previousView = untrack(() => activeView);
+    const previousFilter = untrack(() => decisionFilter);
+    const previousDigest = untrack(() => digestMode);
+
+    revealedApiToken = tokenForView(
+      nextUrlState.view,
+      untrack(() => revealedApiToken),
+    );
+    if (previousView !== nextUrlState.view) {
+      activeView = nextUrlState.view;
+      if (typeof window !== "undefined") {
+        window.scrollTo(0, 0);
+      }
+    }
+    if (previousFilter !== nextUrlState.decisionFilter) {
+      decisionFilter = nextUrlState.decisionFilter;
+      readingHistoryVisibleCount = 30;
+    }
+    if (previousDigest !== nextUrlState.digestMode) {
+      digestMode = nextUrlState.digestMode;
+      if (!nextUrlState.digestMode) {
+        clearDigestSelection();
+      }
+    }
+  }
+  function selectDecisionFilter(nextFilter: DecisionFilter) {
+    const filterChanged = decisionFilter !== nextFilter;
+    decisionFilter = nextFilter;
+    if (filterChanged) {
+      readingHistoryVisibleCount = 30;
+    }
+    if (nextFilter === "read") void loadReadingHistory();
+    if (typeof window !== "undefined" && activeView === "decisions") {
+      const currentUrl = new URL(window.location.href);
+      const nextUrl = buildViewUrl(currentUrl, {
+        view: "decisions",
+        decisionFilter: nextFilter,
+      });
+      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+        pushState(nextUrl, {});
+      }
+    }
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -697,15 +806,71 @@
       ? value
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
-  function go(view: View) {
+  function go(view: View, nextDecisionFilter?: DecisionFilter) {
+    const targetFilter =
+      view === "decisions"
+        ? (nextDecisionFilter ?? (activeView === "decisions" ? decisionFilter : "all"))
+        : "all";
+    if (
+      view === activeView &&
+      (nextDecisionFilter === undefined || targetFilter === decisionFilter)
+    ) {
+      return;
+    }
+    const viewChanged = view !== activeView;
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
-    if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
+    decisionFilter = targetFilter;
+    if (view !== "discover" && digestMode) {
+      digestMode = false;
+      clearDigestSelection();
+    }
+    if (view === "decisions") {
+      readingHistoryVisibleCount = 30;
+      if (targetFilter === "read") void loadReadingHistory();
+    }
     if (typeof window !== "undefined") {
-      const url = new URL(window.location.href);
-      url.searchParams.set("view", view);
-      if (view !== "discover") url.searchParams.delete("digest");
-      pushState(url, {});
+      const currentUrl = new URL(window.location.href);
+      const nextUrl = buildViewUrl(currentUrl, {
+        view,
+        decisionFilter: targetFilter,
+        digestMode: view === "discover" && digestMode,
+        clearDigestPeriod: view !== "discover" || !digestMode,
+      });
+      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+        pushState(nextUrl, {});
+      }
+      if (viewChanged) {
+        window.scrollTo(0, 0);
+      }
+    }
+  }
+  function onHomeClick(event: MouseEvent) {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    revealedApiToken = tokenForView("discover", revealedApiToken);
+    activeView = "discover";
+    decisionFilter = "all";
+    if (digestMode) {
+      digestMode = false;
+      clearDigestSelection();
+    }
+    if (typeof window !== "undefined") {
+      const currentUrl = new URL(window.location.href);
+      const nextUrl = new URL("/", currentUrl.origin);
+      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+        pushState(nextUrl, {});
+      }
+      window.scrollTo(0, 0);
     }
   }
   async function goToLibrarrSettings() {
@@ -802,7 +967,10 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          await update();
+          await update({ navigate: false });
+          if (succeeded && key === "sync") {
+            resetClientPagination();
+          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -810,8 +978,7 @@
               key === "goodreads-rss" ||
               key === "goodreads-csv")
           ) {
-            readingHistory = [];
-            readingHistoryState = "idle";
+            resetReadingHistory();
           }
           if (succeeded) change?.commit?.();
         } catch (error) {
@@ -836,19 +1003,48 @@
     return pendingActions.has(key);
   }
 
-  function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
+  function optimisticBookStatus(
+    id: number,
+    status: string,
+    recordUndo = false,
+  ): OptimisticChange | void {
+    const discoverIndex = additionalDiscoverBooks.findIndex((item) => item.id === id);
+    const decisionIndex = additionalDecisionBooks.findIndex((item) => item.id === id);
+    const book = allBooks.find((item) => item.id === id);
     if (!book) return;
+    if (recordUndo && ["saved", "rejected", "maybe_later"].includes(status)) {
+      undoBookSnapshots.set(id, {
+        book: { ...book },
+        previousStatus: book.status,
+        discoverIndex,
+        decisionIndex,
+      });
+    } else if (status === "recommended" || status === "read") {
+      undoBookSnapshots.delete(id);
+    }
+    const snapshot = { ...book };
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
+        const reconciled = reconcileBookMutation({
+          serverBooks: data.books,
+          serverDecisions: data.decisions,
+          additionalDiscoverBooks,
+          additionalDecisionBooks,
+          id,
+          nextStatus: status,
+          snapshot,
+        });
+        additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+        additionalDecisionBooks = reconciled.additionalDecisionBooks;
         if (bookStatusOverrides[id] !== status) return;
         const next = { ...bookStatusOverrides };
         delete next[id];
         bookStatusOverrides = next;
       },
       rollback: () => {
+        if (recordUndo) undoBookSnapshots.delete(id);
         if (bookStatusOverrides[id] !== status) return;
         const next = { ...bookStatusOverrides };
         if (previous === undefined) delete next[id];
@@ -862,8 +1058,48 @@
     const id = Number(formData.get("id"));
     const status = String(formData.get("status") ?? "");
     return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
-      ? optimisticBookStatus(id, status)
+      ? optimisticBookStatus(id, status, true)
       : undefined;
+  }
+
+  function optimisticUndoDecision(formData: FormData): OptimisticChange | void {
+    const id = Number(formData.get("id"));
+    if (!Number.isInteger(id)) return;
+    const undoSnapshot = undoBookSnapshots.get(id);
+    const restoredStatus = undoSnapshot?.previousStatus ?? "recommended";
+    const fallbackBook = allBooks.find((item) => item.id === id);
+    const snapshot = undoSnapshot?.book ?? (fallbackBook ? { ...fallbackBook } : undefined);
+    const previousOverride = bookStatusOverrides[id];
+    bookStatusOverrides = { ...bookStatusOverrides, [id]: restoredStatus };
+    return {
+      commit: () => {
+        const reconciled = reconcileBookMutation({
+          serverBooks: data.books,
+          serverDecisions: data.decisions,
+          additionalDiscoverBooks,
+          additionalDecisionBooks,
+          id,
+          nextStatus: restoredStatus,
+          snapshot,
+          restoreDiscoverIndex: undoSnapshot?.discoverIndex,
+          restoreDecisionIndex: undoSnapshot?.decisionIndex,
+        });
+        additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+        additionalDecisionBooks = reconciled.additionalDecisionBooks;
+        undoBookSnapshots.delete(id);
+        if (bookStatusOverrides[id] !== restoredStatus) return;
+        const next = { ...bookStatusOverrides };
+        delete next[id];
+        bookStatusOverrides = next;
+      },
+      rollback: () => {
+        if (bookStatusOverrides[id] !== restoredStatus) return;
+        const next = { ...bookStatusOverrides };
+        if (previousOverride === undefined) delete next[id];
+        else next[id] = previousOverride;
+        bookStatusOverrides = next;
+      },
+    };
   }
 
   function optimisticRead(formData: FormData) {
@@ -1303,6 +1539,7 @@
     void searchLibrarr();
   }
   function openMarkRead(book: PageBook) {
+    openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
   }
@@ -1372,32 +1609,60 @@
   });
 
   $effect(() => {
-    const nextBooks = data.books;
-    if (previousDataBooks === nextBooks) return;
-    previousDataBooks = nextBooks;
-    additionalDiscoverBooks = [];
-    discoverHasMore = true;
-    discoverLoadError = "";
+    const nextProfileId = data.user?.profile_id;
+    if (previousProfileId === nextProfileId) return;
+    previousProfileId = nextProfileId;
+    resetClientPagination();
+    resetReadingHistory();
   });
 
   $effect(() => {
-    const nextDecisions = data.decisions;
-    const nextHasMore = Boolean(data.decisions_has_more);
+    const currentUrl = page.shallow?.url ?? page.url;
+    syncFromUrl(currentUrl);
+  });
+
+  $effect(() => {
     if (
-      previousDataDecisions === nextDecisions &&
-      previousDataDecisionsHasMore === nextHasMore
-    ) return;
-    previousDataDecisions = nextDecisions;
-    previousDataDecisionsHasMore = nextHasMore;
-    additionalDecisionBooks = [];
-    decisionsHasMoreOverride = null;
-    decisionsLoadError = "";
+      activeView === "decisions" &&
+      decisionFilter === "read" &&
+      readingHistoryState === "idle"
+    ) {
+      void loadReadingHistory();
+    }
   });
 
   $effect(() => {
-    activeView;
-    filter;
-    genreFilter;
+    const nextBooks = data.books;
+    const nextDecisions = data.decisions;
+    if (
+      previousDataBooks === nextBooks &&
+      previousDataDecisions === nextDecisions
+    ) {
+      return;
+    }
+    previousDataBooks = nextBooks;
+    previousDataDecisions = nextDecisions;
+    const reconciled = reconcilePagedBooks(
+      nextBooks,
+      nextDecisions,
+      untrack(() => additionalDiscoverBooks),
+      untrack(() => additionalDecisionBooks),
+    );
+    additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+    additionalDecisionBooks = reconciled.additionalDecisionBooks;
+  });
+
+  $effect(() => {
+    const nextFilter = filter;
+    const nextGenre = genreFilter;
+    if (
+      previousSearchFilter === nextFilter &&
+      previousGenreFilter === nextGenre
+    ) {
+      return;
+    }
+    previousSearchFilter = nextFilter;
+    previousGenreFilter = nextGenre;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;
   });
 
@@ -1405,18 +1670,6 @@
     const selected = genreFilter.trim().toLowerCase();
     if (selected && !bookGenres.some((genre) => genre.toLowerCase() === selected)) {
       genreFilter = "";
-    }
-  });
-
-  // A delivery link can outlive its notification history. Keep that case
-  // useful by showing the normal Discover feed instead of an empty digest.
-  $effect(() => {
-    if (
-      digestMode &&
-      page.url.searchParams.has("digest_period") &&
-      !data.digestReview.requested
-    ) {
-      digestMode = false;
     }
   });
 
@@ -1583,12 +1836,7 @@
 
   onMount(() => {
     const onPopState = () => {
-      const nextView = readView(
-        new URL(window.location.href).searchParams.get("view"),
-      );
-      revealedApiToken = tokenForView(nextView, revealedApiToken);
-      activeView = nextView;
-      digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
+      syncFromUrl(new URL(window.location.href));
     };
     const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && markReadBook) closeMarkRead();
@@ -1729,6 +1977,7 @@
         href="/"
         class="flex min-h-11 shrink-0 items-center gap-3 text-surface-950-50 no-underline"
         aria-label="Bookward home"
+        onclick={onHomeClick}
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
           ><img src={bookwardMark} alt="" class="size-full object-cover" aria-hidden="true" /></span
         ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
@@ -1863,7 +2112,7 @@
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`, optimisticUndoDecision)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={visibleNotification.id} />
@@ -1939,9 +2188,9 @@
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
             {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length} loaded decisions. Load more to include older books.</p>{/if}
@@ -2185,7 +2434,7 @@
         {:else}
           <section
             aria-label="Read books"
-            aria-busy={readingHistoryState === "loading"}
+            aria-busy={readingHistoryState === "idle" || readingHistoryState === "loading"}
             class="min-w-0"
           >
             {#if readingHistoryState === "ready"}
@@ -2230,7 +2479,7 @@
                 <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
-            {#if readingHistoryState === "loading"}
+            {#if readingHistoryState === "idle" || readingHistoryState === "loading"}
               <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
               <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
@@ -3669,7 +3918,7 @@
                     ><BookOpen size={19} /></span
                   >
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
-                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
+                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => go("decisions", "read")}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if data.history.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
