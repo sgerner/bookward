@@ -198,3 +198,15 @@ def test_rated_read_vector_cache_reuses_vectors_across_batches_and_scopes_invali
     # Returning to the original profile still reuses its cached entry without recomputing.
     asyncio.run(main.reading_history_scores(offset=0, limit=50))
     assert read_vector_computations == 4
+
+    # Secret API credentials are never stored or hashed into in-memory vector cache keys.
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES('embedding_api_key','super-secret-api-key',0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+    asyncio.run(main.reading_history_scores(offset=0, limit=50))
+    assert read_vector_computations == 4
+    for cache_key in main._RATED_READ_VECTOR_CACHE:
+        assert "super-secret-api-key" not in repr(cache_key)
+

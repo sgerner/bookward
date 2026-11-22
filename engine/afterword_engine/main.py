@@ -1694,11 +1694,6 @@ async def _cached_rated_read_vectors(
         current_profile_id() or "legacy",
         str(profile_database_path().resolve()),
     )
-    api_key_digest = hashlib.sha256(
-        str(getattr(embedder, "key", None) or config.get("embedding_api_key") or "").encode(
-            "utf-8"
-        )
-    ).hexdigest()
     embedder_base_key = (
         type(embedder).__qualname__,
         str(embedder.name),
@@ -1706,7 +1701,6 @@ async def _cached_rated_read_vectors(
         str(config.get("embedding_backend") or ""),
         str(config.get("embedding_model") or ""),
         str(getattr(embedder, "url", None) or config.get("embedding_url") or ""),
-        api_key_digest,
     )
     reads_state_key = _rated_read_state_digest(rated_reads)
     lookup_key = (tenant_key, (*embedder_base_key, embedding_cache_digest), reads_state_key)
