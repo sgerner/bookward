@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-ref:
     name: Validate release tag
@@ -35,6 +39,10 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: publish-ghcr
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       packages: write
