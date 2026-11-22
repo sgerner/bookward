@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -11,7 +12,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
