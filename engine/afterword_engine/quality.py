@@ -17,7 +17,6 @@ import json
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from typing import Any
 import httpx
 
@@ -44,17 +43,22 @@ from .covers import (
 )
 from .database import persist_metadata_field_provenance, private_setting, rows, transaction
 from .identity import (
-    canonical_part,
     ReadIdentityIndex,
     _title_without_format_suffix,
     book_identity,
     book_identity_match_index,
     book_row_identity_match_keys,
+    canonical_part,
+    catalog_author_similarity,
+    catalog_derivative_subjects_conflict,
+    catalog_language_allowed,
+    catalog_title_similarity,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
-QUALITY_VERSION = "candidate-quality-v4"
+QUALITY_VERSION = "candidate-quality-v5"
+_NON_CATALOG_PROVIDERS = frozenset({"source", "penguinrandomhouse"})
 APPLE_BOOKS_SEARCH = "https://itunes.apple.com/search"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
@@ -79,67 +83,21 @@ def _tokens(value: object) -> set[str]:
     return set(canonical_part(value).split())
 
 
-_TRAILING_PAREN = re.compile(r"\s*\([^()]{2,80}\)\s*$")
-
-
-def _string_title_similarity(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    token_a, token_b = _tokens(a), _tokens(b)
-    shared = token_a & token_b
-    overlap = len(shared) / max(1, len(token_a | token_b))
-    return max(overlap, SequenceMatcher(None, a, b).ratio())
-
-
 def _title_similarity(left: object, right: object) -> float:
-    a = canonical_part(left)
-    b = canonical_part(right)
-    score = _string_title_similarity(a, b)
-    if score == 1.0:
-        return 1.0
-    stripped_a = canonical_part(_title_without_format_suffix(left))
-    stripped_b = canonical_part(_title_without_format_suffix(right))
-    if stripped_a != a or stripped_b != b:
-        score = max(score, _string_title_similarity(stripped_a, stripped_b))
-    # Catalogs often append a parenthetical series name without a number,
-    # e.g. "The Fellowship of the Ring (Lord of the Rings)".
-    raw_left = str(left or "").strip()
-    raw_right = str(right or "").strip()
-    if bool(_TRAILING_PAREN.search(raw_left)) != bool(_TRAILING_PAREN.search(raw_right)):
-        base_a = canonical_part(_TRAILING_PAREN.sub("", raw_left))
-        base_b = canonical_part(_TRAILING_PAREN.sub("", raw_right))
-        if len(base_a.split()) >= 2 and len(base_b.split()) >= 2:
-            score = max(score, _string_title_similarity(base_a, base_b))
-    return score
+    return catalog_title_similarity(left, right)
 
 
 def _author_similarity(left: object, right: object) -> float:
-    a = canonical_part(left)
-    b = canonical_part(right)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    token_a, token_b = _tokens(a), _tokens(b)
-    if not token_a or not token_b:
-        return 0.0
-    shared = token_a & token_b
-    overlap = len(shared) / max(1, len(token_a | token_b))
-    # Catalogs frequently omit middle initials or suffixes.  A matching
-    # surname is useful evidence, but never enough to pass without a title
-    # match because author names are not unique.
-    parts_a = canonical_part(left).split()
-    parts_b = canonical_part(right).split()
-    surname_match = bool(shared) and parts_a[-1] == parts_b[-1]
-    initial_match = surname_match and parts_a[0][:1] == parts_b[0][:1]
-    # A surname alone is weak evidence ("A Writer" and "B Writer" are not
-    # the same author). Matching first initials makes common catalog variants
-    # such as "J.R.R. Tolkien" and "John Tolkien" useful without making an
-    # exact title override an author mismatch.
-    surname_score = 0.85 if initial_match else (0.55 if surname_match else 0.0)
-    return max(overlap, surname_score)
+    return catalog_author_similarity(left, right)
+
+
+def _is_accepted_match(match: dict[str, Any] | None) -> bool:
+    return bool(
+        match
+        and match.get("quality_score", 0) >= 0.82
+        and match.get("title_match", 0) >= 0.82
+        and match.get("author_match", 0) >= 0.65
+    )
 
 
 def _first_isbn(values: object) -> tuple[str, str]:
@@ -193,6 +151,8 @@ def _provider_match(
     cover_url: str = "",
     genres: list[str] | None = None,
     source_payload: object = None,
+    identifier_evidence: str = "not_applicable",
+    identifier_verified: bool = False,
 ) -> dict[str, Any]:
     title_match = _title_similarity(title, catalog_title)
     author_match = _author_similarity(author, catalog_author)
@@ -252,6 +212,8 @@ def _provider_match(
         "work_id": work_id,
         "isbn13": isbn13,
         "isbn10": isbn10,
+        "identifier_evidence": identifier_evidence,
+        "identifier_verified": bool(identifier_verified),
         "title_match": round(title_match, 4),
         "author_match": round(author_match, 4),
         "quality_score": round(confidence, 4),
@@ -294,6 +256,7 @@ async def _open_library_match(
     client: httpx.AsyncClient,
     *,
     isbn: str = "",
+    expected_isbn: str = "",
     trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     query_title = _title_without_format_suffix(title) or title
@@ -301,7 +264,7 @@ async def _open_library_match(
         ("isbn" if isbn else "title"): isbn or query_title[:500],
         **({} if isbn else {"author": author[:300]}),
         "limit": CATALOG_LIMIT,
-        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,edition_key",
+        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,edition_key,language",
     }
     fetch_trace: dict[str, Any] = {
         "provider": "openlibrary",
@@ -326,6 +289,7 @@ async def _open_library_match(
         fetch_trace["error_type"] = type(exc).__name__
         return None
     docs = payload.get("docs", []) if isinstance(payload, dict) else []
+    target_isbn = isbn or expected_isbn
     best: dict[str, Any] | None = None
     matched_count = 0
     mismatched_identifiers = 0
@@ -336,11 +300,16 @@ async def _open_library_match(
         if isbn and not _query_isbn_matches(isbn, raw_identifiers):
             mismatched_identifiers += 1
             continue
+        if not catalog_language_allowed(title, doc.get("language")):
+            continue
+        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, raw_identifiers)
+        if not doc_verified and catalog_derivative_subjects_conflict(title, doc.get("subject")):
+            continue
         authors = doc.get("author_name") or []
         if isinstance(authors, str):
             authors = [authors]
         catalog_author = ", ".join(str(value) for value in authors if value)
-        projected_identifiers = _isbn_provenance_values(isbn, raw_identifiers)
+        projected_identifiers = _isbn_provenance_values(target_isbn, raw_identifiers)
         isbn13, isbn10 = _first_isbn(projected_identifiers)
         cover = ""
         if str(doc.get("cover_i") or "").isdigit():
@@ -385,14 +354,22 @@ async def _open_library_match(
             cover_url=safe_cover_url(cover),
             genres=genres,
             source_payload=source_payload,
+            identifier_evidence=doc_evidence,
+            identifier_verified=doc_verified,
         )
         matched_count += 1
         if best is None or (
+            _is_accepted_match(match),
+            bool(match.get("identifier_verified")),
+            match.get("identifier_evidence") != "mismatch",
             match["quality_score"],
             match["description_kind"] == "synopsis",
             match["description_content_quality_heuristic"],
             len(match["genres"]),
         ) > (
+            _is_accepted_match(best),
+            bool(best.get("identifier_verified")),
+            best.get("identifier_evidence") != "mismatch",
             best["quality_score"],
             best["description_kind"] == "synopsis",
             best["description_content_quality_heuristic"],
@@ -425,6 +402,7 @@ async def _google_books_match(
     client: httpx.AsyncClient,
     *,
     isbn: str = "",
+    expected_isbn: str = "",
     trace: list[dict[str, Any]] | None = None,
     google_books_api_key: str = "",
 ) -> dict[str, Any] | None:
@@ -458,6 +436,7 @@ async def _google_books_match(
     except Exception as exc:
         fetch_trace["error_type"] = type(exc).__name__
         return None
+    target_isbn = isbn or expected_isbn
     best: dict[str, Any] | None = None
     matched_count = 0
     mismatched_identifiers = 0
@@ -480,7 +459,12 @@ async def _google_books_match(
         if isbn and not _query_isbn_matches(isbn, identifiers):
             mismatched_identifiers += 1
             continue
-        projected_identifiers = _isbn_provenance_values(isbn, identifiers)
+        if not catalog_language_allowed(title, info.get("language")):
+            continue
+        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, identifiers)
+        if not doc_verified and catalog_derivative_subjects_conflict(title, info.get("categories")):
+            continue
+        projected_identifiers = _isbn_provenance_values(target_isbn, identifiers)
         isbn13, isbn10 = _first_isbn(projected_identifiers)
         image_links = info.get("imageLinks") or {}
         image = ""
@@ -502,7 +486,7 @@ async def _google_books_match(
             "authors": [_clean_metadata_text(value, 300) for value in authors if value],
             "description": description,
             "genres": genres,
-                "identifiers": projected_identifiers,
+            "identifiers": projected_identifiers,
             "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
             "publication_date_source_field": "publishedDate" if release_date else "",
             "cover_url": image,
@@ -526,14 +510,22 @@ async def _google_books_match(
             cover_url=image,
             genres=genres,
             source_payload=source_payload,
+            identifier_evidence=doc_evidence,
+            identifier_verified=doc_verified,
         )
         matched_count += 1
         if best is None or (
+            _is_accepted_match(match),
+            bool(match.get("identifier_verified")),
+            match.get("identifier_evidence") != "mismatch",
             match["quality_score"],
             match["description_kind"] == "synopsis",
             match["description_content_quality_heuristic"],
             len(match["genres"]),
         ) > (
+            _is_accepted_match(best),
+            bool(best.get("identifier_verified")),
+            best.get("identifier_evidence") != "mismatch",
             best["quality_score"],
             best["description_kind"] == "synopsis",
             best["description_content_quality_heuristic"],
@@ -610,6 +602,10 @@ async def _apple_books_match(
         catalog_author = str(item.get("artistName") or "").strip()
         if not track_id or not catalog_title:
             continue
+        if not catalog_language_allowed(title, item.get("language") or item.get("languageCodesISO2A")):
+            continue
+        if catalog_derivative_subjects_conflict(title, item.get("genres")):
+            continue
         description = _clean_metadata_text(item.get("description"))
         description_kind = "synopsis" if description else ""
         release_date, release_date_kind = _publication_date(item.get("releaseDate"))
@@ -649,11 +645,13 @@ async def _apple_books_match(
         )
         matched_count += 1
         if best is None or (
+            _is_accepted_match(match),
             match["quality_score"],
             match["description_kind"] == "synopsis",
             match["description_content_quality_heuristic"],
             len(match["genres"]),
         ) > (
+            _is_accepted_match(best),
             best["quality_score"],
             best["description_kind"] == "synopsis",
             best["description_content_quality_heuristic"],
@@ -735,7 +733,13 @@ async def resolve_catalog_match(
                     }
                 )
                 return None
-            kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
+            kwargs: dict[str, Any] = (
+                {"google_books_api_key": google_books_api_key}
+                if lookup_provider is _google_books_match
+                else {}
+            )
+            if query_isbn and not isbn_arg:
+                kwargs["expected_isbn"] = query_isbn
             result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
             _record_rate_limits()
             return result
@@ -826,32 +830,54 @@ async def resolve_catalog_match(
             return None
 
         # De-duplicate an ISBN and a text result for the same provider record,
-        # retaining whichever parsed record supplies more useful fields.
+        # retaining whichever parsed record supplies more useful fields while
+        # preserving exact identifier verification for that record.
         by_record: dict[tuple[str, str], dict[str, Any]] = {}
         for match in matches:
             record_key = (str(match.get("provider") or ""), str(match.get("provider_id") or ""))
             prior = by_record.get(record_key)
             rank = (
                 accepted(match),
+                match.get("identifier_evidence") != "mismatch",
                 match.get("description_kind") == "synopsis",
                 len(str(match.get("description") or "")),
                 len(match.get("genres") or []),
                 bool(match.get("cover_url")),
                 bool(match.get("release_date")),
+                bool(match.get("identifier_verified")),
             )
             prior_rank = (
                 accepted(prior),
+                prior.get("identifier_evidence") != "mismatch",
                 prior.get("description_kind") == "synopsis",
                 len(str(prior.get("description") or "")),
                 len(prior.get("genres") or []),
                 bool(prior.get("cover_url")),
                 bool(prior.get("release_date")),
+                bool(prior.get("identifier_verified")),
             ) if prior else None
             if prior is None or rank > prior_rank:
-                by_record[record_key] = match
+                merged = dict(match)
+                if prior and prior.get("identifier_verified") and not merged.get("identifier_verified"):
+                    merged["identifier_verified"] = True
+                    merged["identifier_evidence"] = "matched"
+                by_record[record_key] = merged
+            elif prior and match.get("identifier_verified") and not prior.get("identifier_verified"):
+                prior = dict(prior)
+                prior["identifier_verified"] = True
+                prior["identifier_evidence"] = "matched"
+                by_record[record_key] = prior
         records = list(by_record.values())
         verified_records = [record for record in records if accepted(record)]
-        identity_record = max(records, key=lambda record: record["quality_score"])
+        identity_record = max(
+            records,
+            key=lambda record: (
+                accepted(record),
+                bool(record.get("identifier_verified")),
+                record.get("identifier_evidence") != "mismatch",
+                record.get("quality_score", 0),
+            ),
+        )
         metadata_records = verified_records or []
         if not metadata_records:
             identity_record = dict(identity_record)
@@ -863,7 +889,8 @@ async def resolve_catalog_match(
                 "source_payloads": [],
             }
             identity_record["provider_lookup_unavailable"] = any(
-                trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+                trace.get("provider") in {"openlibrary", "google_books"}
+                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
                 for trace in fetch_trace
             )
             identity_record["provider_rate_limited"] = any(
@@ -871,20 +898,36 @@ async def resolve_catalog_match(
             )
             return identity_record
 
+        has_isbn_verified = bool(
+            query_isbn and any(record.get("identifier_verified") for record in metadata_records)
+        )
         description_records = [record for record in metadata_records if record.get("description")]
         description_record = max(
             description_records,
             key=lambda record: (
                 record.get("description_kind") == "synopsis",
-                len(str(record.get("description") or "")),
+                bool(record.get("identifier_verified")),
+                record.get("identifier_evidence") != "mismatch",
                 record.get("quality_score", 0),
+                len(str(record.get("description") or "")),
             ),
             default=None,
         )
         description = str(description_record.get("description") or "") if description_record else ""
+        eligible_genre_records = sorted(
+            (
+                record
+                for record in metadata_records
+                if not (has_isbn_verified and record.get("identifier_evidence") == "mismatch")
+            ),
+            key=lambda record: (
+                not bool(record.get("identifier_verified")),
+                -float(record.get("quality_score", 0) or 0.0),
+            ),
+        )
         genres: list[str] = []
         genre_sources: list[dict[str, str]] = []
-        for record in metadata_records:
+        for record in eligible_genre_records:
             before = len(genres)
             genres = _catalog_genres(genres + list(record.get("genres") or []), limit=METADATA_GENRE_LIMIT)
             if len(genres) > before:
@@ -896,12 +939,37 @@ async def resolve_catalog_match(
                     "source_field": "subject" if provider == "openlibrary" else "categories",
                     "normalization_version": METADATA_NORMALIZATION_VERSION,
                 })
-        cover_record = next((record for record in metadata_records if record.get("cover_url")), None)
+        cover_record = next(
+            (
+                record
+                for record in sorted(
+                    metadata_records,
+                    key=lambda record: (
+                        not bool(record.get("identifier_verified")),
+                        record.get("identifier_evidence") == "mismatch",
+                        -float(record.get("quality_score", 0) or 0.0),
+                    ),
+                )
+                if record.get("cover_url")
+            ),
+            None,
+        )
         date_rank = {"day": 3, "month": 2, "year": 1}
+        eligible_date_records = (
+            record
+            for record in metadata_records
+            if record.get("release_date")
+            and not (has_isbn_verified and record.get("identifier_evidence") == "mismatch")
+        )
         date_record = max(
-            (record for record in metadata_records if record.get("release_date")),
-            key=lambda record: date_rank.get(
-                record.get("release_date_kind") or _publication_date_kind(record.get("release_date")), 0
+            eligible_date_records,
+            key=lambda record: (
+                bool(record.get("identifier_verified")),
+                float(record.get("quality_score", 0) or 0.0),
+                date_rank.get(
+                    record.get("release_date_kind") or _publication_date_kind(record.get("release_date")), 0
+                ),
+                len(str(record.get("release_date") or "")),
             ),
             default=None,
         )
@@ -1056,12 +1124,25 @@ async def _audit_one(
             **({"metadata_provenance": match.get("metadata_provenance", {})} if unavailable else {}),
             **source_identifiers,
         }
-    accepted = match["quality_score"] >= 0.82 and match["title_match"] >= 0.82 and match["author_match"] >= 0.65
+    accepted = _is_accepted_match(match)
+    if not accepted:
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "quarantine",
+            "quality_score": match["quality_score"],
+            "title_match": match["title_match"],
+            "author_match": match["author_match"],
+            "flags": sorted(set(flags + ["catalog_match_ambiguous"])),
+            "provider": "",
+            "provider_id": "",
+            "work_id": "",
+            **source_identifiers,
+        }
     return {
         "candidate_id": int(candidate["id"]),
-        "quality_status": "accepted" if accepted else "quarantine",
+        "quality_status": "accepted",
         "quality_score": match["quality_score"],
-        "flags": sorted(set(flags + ([] if accepted else ["catalog_match_ambiguous"]))),
+        "flags": flags,
         **match,
         "isbn13": source_isbn13 or match.get("isbn13", ""),
         "isbn10": source_isbn10 or match.get("isbn10", ""),
@@ -1069,6 +1150,11 @@ async def _audit_one(
 
 
 def _candidate_fields_complete(candidate: dict[str, Any]) -> bool:
+    prior_version = str(candidate.get("_audit_version") or "")
+    if prior_version and prior_version != QUALITY_VERSION and (
+        candidate.get("_has_catalog_provenance") or candidate.get("_metadata_provider")
+    ):
+        return False
     genres = candidate.get("genres") or []
     if isinstance(genres, str):
         try:
@@ -1087,6 +1173,26 @@ def _candidate_fields_complete(candidate: dict[str, Any]) -> bool:
     )
 
 
+def _attach_catalog_provenance_flags(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not candidates:
+        return candidates
+    catalog_ids: set[int] = set()
+    candidate_ids = [int(item["id"]) for item in candidates]
+    for start in range(0, len(candidate_ids), 400):
+        batch = candidate_ids[start : start + 400]
+        placeholders = ",".join("?" for _ in batch)
+        for item in rows(
+            "SELECT DISTINCT entity_id FROM metadata_field_provenance "
+            f"WHERE entity_type='candidate' AND entity_id IN ({placeholders}) "
+            "AND provider NOT IN ('source','penguinrandomhouse')",
+            tuple(batch),
+        ):
+            catalog_ids.add(int(item["entity_id"]))
+    for candidate in candidates:
+        candidate["_has_catalog_provenance"] = int(candidate["id"]) in catalog_ids
+    return candidates
+
+
 def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[str, tuple[str, ...]]:
     """Return the shared SQL predicate and parameters for a due bounded audit."""
 
@@ -1101,8 +1207,7 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "COALESCE(q.quality_status,'pending')='pending' "
         "OR q.audit_version='legacy-pending-audit-v1' "
         "OR (q.quality_status IN ('accepted','quarantine') "
-        "AND COALESCE(q.audit_version,'')!=? "
-        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
+        "AND COALESCE(q.audit_version,'')!=?) "
         "OR (q.quality_status='quarantine' AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
         "AND datetime(q.audited_at)<=datetime(?)))"
@@ -1115,7 +1220,7 @@ def candidate_quality_audit_candidates(
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Select a bounded batch due for quality audit, validating old ISBN rows."""
+    """Select a bounded batch due for quality audit, including non-ISBN prior-version rows."""
 
     batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
     predicate, params = candidate_quality_audit_eligibility(now)
@@ -1124,10 +1229,7 @@ def candidate_quality_audit_candidates(
     offset = 0
     while len(selected_ids) < batch_limit:
         page = rows(
-            "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
-            "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
-            "q.quality_status,q.audit_version,q.flags_json "
+            "SELECT c.id,q.quality_status,q.audit_version,q.flags_json "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "LEFT JOIN sources s ON s.id=c.source_id "
             f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
@@ -1138,25 +1240,20 @@ def candidate_quality_audit_candidates(
             break
         for candidate in page:
             status = str(candidate.get("quality_status") or "pending")
-            legacy_pending = candidate.get("audit_version") == "legacy-pending-audit-v1"
+            audit_version = str(candidate.get("audit_version") or "")
+            legacy_pending = audit_version == "legacy-pending-audit-v1"
             try:
                 flags = json.loads(candidate.get("flags_json") or "[]")
             except (TypeError, ValueError, json.JSONDecodeError):
                 flags = []
             expired_provider_outage = bool(
                 status == "quarantine"
-                and candidate.get("audit_version") == QUALITY_VERSION
+                and audit_version == QUALITY_VERSION
                 and isinstance(flags, list)
                 and "catalog_provider_unavailable" in flags
             )
-            if status == "pending" or legacy_pending or expired_provider_outage:
-                selected_ids.append(int(candidate["id"]))
-            elif any(
-                isbn_parts_from_source(
-                    [candidate.get("eligibility_isbn13"), candidate.get("eligibility_isbn10")],
-                    candidate.get("source_url", ""),
-                )
-            ):
+            prior_version = status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION
+            if status == "pending" or legacy_pending or expired_provider_outage or prior_version:
                 selected_ids.append(int(candidate["id"]))
             if len(selected_ids) >= batch_limit:
                 break
@@ -1166,14 +1263,16 @@ def candidate_quality_audit_candidates(
     if not selected_ids:
         return []
     placeholders = ",".join("?" for _ in selected_ids)
-    return rows(
-        "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
+    selected = rows(
+        "SELECT c.*,s.url AS source_root,q.audit_version AS _audit_version,"
+        "q.metadata_provider AS _metadata_provider,"
         "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         f"WHERE c.id IN ({placeholders}) ORDER BY c.id",
         tuple(selected_ids),
     )
+    return _attach_catalog_provenance_flags(selected)
 
 
 def has_candidate_quality_audit_candidates(*, now: datetime | None = None) -> bool:
@@ -1182,17 +1281,200 @@ def has_candidate_quality_audit_candidates(*, now: datetime | None = None) -> bo
     return bool(candidate_quality_audit_candidates(limit=1, now=now))
 
 
+def _provenance_payload_genres(raw_payload: object) -> list[str]:
+    try:
+        parsed = json.loads(str(raw_payload or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    payload = parsed.get("payload")
+    if isinstance(payload, dict) and payload.get("genres"):
+        return _catalog_genres(payload.get("genres"), limit=METADATA_GENRE_LIMIT)
+    if parsed.get("genres"):
+        return _catalog_genres(parsed.get("genres"), limit=METADATA_GENRE_LIMIT)
+    return []
+
+
 def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> bool:
     candidate_id = int(candidate["id"])
     status = result.get("quality_status", "quarantine")
     flags = result.get("flags", [])
+    transient_outage = isinstance(flags, list) and "catalog_provider_unavailable" in flags
+
+    prior_quality = con.execute(
+        "SELECT quality_status,audit_version,metadata_provider,metadata_provider_id "
+        "FROM candidate_quality WHERE candidate_id=?",
+        (candidate_id,),
+    ).fetchone()
+    prior_audit_version = str(
+        candidate.get("_audit_version")
+        or (prior_quality["audit_version"] if prior_quality else "")
+        or ""
+    )
+    existing_provider = str(
+        candidate.get("_metadata_provider")
+        or (prior_quality["metadata_provider"] if prior_quality else "")
+        or ""
+    )
+    existing_provider_id = str(
+        candidate.get("_metadata_provider_id")
+        or (prior_quality["metadata_provider_id"] if prior_quality else "")
+        or ""
+    )
+    is_prior_version = bool(prior_audit_version and prior_audit_version != QUALITY_VERSION)
+
+    provenance_rows = con.execute(
+        "SELECT field,provider,provider_id,source_payload FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=?",
+        (candidate_id,),
+    ).fetchall()
+    source_provenance_fields: set[str] = set()
+    catalog_provenance_fields: set[str] = set()
+    provenance_by_field: set[str] = set()
+    catalog_recorded_genres: list[str] = []
+    source_recorded_genres: list[str] = []
+    for prov_row in provenance_rows:
+        field_name = str(prov_row["field"] or "")
+        provider_name = str(prov_row["provider"] or "")
+        provenance_by_field.add(field_name)
+        if provider_name in _NON_CATALOG_PROVIDERS:
+            source_provenance_fields.add(field_name)
+            if field_name == "genres":
+                source_recorded_genres.extend(_provenance_payload_genres(prov_row["source_payload"]))
+        else:
+            catalog_provenance_fields.add(field_name)
+            if field_name == "genres":
+                catalog_recorded_genres.extend(_provenance_payload_genres(prov_row["source_payload"]))
+
+    existing_description = _clean_metadata_text(candidate.get("description"), 4000)
+    existing_cover = str(candidate.get("cover_url") or "")
+    existing_release_date = str(candidate.get("release_date") or "").strip()
+    existing_date_kind = str(candidate.get("date_kind") or "")
+    raw_existing_genres = candidate.get("genres", "[]")
+    if isinstance(raw_existing_genres, str):
+        try:
+            raw_existing_genres = json.loads(raw_existing_genres)
+        except (TypeError, ValueError):
+            raw_existing_genres = [raw_existing_genres] if raw_existing_genres.strip() else []
+    normalized_existing_genres = _catalog_genres(raw_existing_genres, limit=METADATA_GENRE_LIMIT)
+
+    is_catalog_description = "description" not in source_provenance_fields and (
+        "description" in catalog_provenance_fields
+        or (
+            "description" not in provenance_by_field
+            and bool(existing_provider and existing_provider not in _NON_CATALOG_PROVIDERS)
+        )
+    )
+    is_catalog_cover = (
+        "cover_url" not in source_provenance_fields and "cover_url" in catalog_provenance_fields
+    )
+    is_catalog_date = "release_date" not in source_provenance_fields and (
+        "release_date" in catalog_provenance_fields or existing_date_kind == "catalog"
+    )
+    if "genres" in catalog_provenance_fields:
+        if catalog_recorded_genres:
+            catalog_genre_keys = {genre.casefold() for genre in catalog_recorded_genres}
+            source_genre_keys = {genre.casefold() for genre in source_recorded_genres}
+            preserved_source_genres = [
+                genre
+                for genre in normalized_existing_genres
+                if genre.casefold() not in catalog_genre_keys or genre.casefold() in source_genre_keys
+            ]
+        elif "genres" in source_provenance_fields:
+            preserved_source_genres = normalized_existing_genres
+        else:
+            preserved_source_genres = []
+    else:
+        preserved_source_genres = normalized_existing_genres
+
+    if status != "accepted":
+        next_metadata_provider = existing_provider if transient_outage else ""
+        next_metadata_provider_id = existing_provider_id if transient_outage else ""
+        con.execute(
+            """INSERT INTO candidate_quality(
+                candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
+                work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
+                metadata_provider_id,audited_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+                quality_status=excluded.quality_status,
+                quality_score=excluded.quality_score,
+                flags_json=excluded.flags_json,
+                provider=excluded.provider,
+                provider_id=excluded.provider_id,
+                work_id=excluded.work_id,
+                isbn13=excluded.isbn13,
+                isbn10=excluded.isbn10,
+                title_match=excluded.title_match,
+                author_match=excluded.author_match,
+                audit_version=excluded.audit_version,
+                metadata_provider=excluded.metadata_provider,
+                metadata_provider_id=excluded.metadata_provider_id,
+                audited_at=excluded.audited_at,
+                updated_at=CURRENT_TIMESTAMP""",
+            (
+                candidate_id,
+                status,
+                float(result.get("quality_score", 0) or 0),
+                json.dumps(flags, separators=(",", ":")),
+                str(result.get("provider", "")),
+                str(result.get("provider_id", "")),
+                str(result.get("work_id", "")),
+                str(result.get("isbn13", "")),
+                str(result.get("isbn10", "")),
+                float(result.get("title_match", 0) or 0),
+                float(result.get("author_match", 0) or 0),
+                QUALITY_VERSION,
+                next_metadata_provider,
+                next_metadata_provider_id,
+            ),
+        )
+        if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
+            con.execute(
+                "UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (candidate_id,),
+            )
+        if not transient_outage:
+            clear_description = bool(is_catalog_description and existing_description)
+            clear_cover = bool(is_catalog_cover and existing_cover)
+            clear_date = bool(is_catalog_date and existing_release_date)
+            clear_genres = preserved_source_genres != normalized_existing_genres
+            if clear_description or clear_cover or clear_date or clear_genres:
+                cleaned_genres_json = json.dumps(
+                    preserved_source_genres, ensure_ascii=False, separators=(",", ":")
+                )
+                con.execute(
+                    """UPDATE candidates SET
+                        description=CASE WHEN ?=1 THEN '' ELSE description END,
+                        cover_url=CASE WHEN ?=1 THEN '' ELSE cover_url END,
+                        release_date=CASE WHEN ?=1 THEN NULL ELSE release_date END,
+                        date_kind=CASE WHEN ?=1 THEN 'unknown' ELSE date_kind END,
+                        genres=CASE WHEN ?=1 THEN ? ELSE genres END,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (
+                        int(clear_description),
+                        int(clear_cover),
+                        int(clear_date),
+                        int(clear_date),
+                        int(clear_genres),
+                        cleaned_genres_json,
+                        candidate_id,
+                    ),
+                )
+            if catalog_provenance_fields:
+                con.execute(
+                    "DELETE FROM metadata_field_provenance "
+                    "WHERE entity_type='candidate' AND entity_id=? "
+                    "AND provider NOT IN ('source','penguinrandomhouse')",
+                    (candidate_id,),
+                )
+        return False
+
     description = _text(result.get("description"), 4000)
     description_candidate = result.get("description_candidate")
     if not isinstance(description_candidate, dict):
         description_candidate = {}
-    existing_description = _clean_metadata_text(candidate.get("description"), 4000)
-    existing_provider = str(candidate.get("_metadata_provider") or "")
-    existing_provider_id = str(candidate.get("_metadata_provider_id") or "")
     can_upgrade_opening_sentence = bool(
         existing_description
         and description_candidate.get("kind") == "synopsis"
@@ -1203,50 +1485,91 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         and existing_provider_id == str(description_candidate.get("provider_id") or "")
         and description
     )
-    store_description = bool(description and (not existing_description or can_upgrade_opening_sentence))
+    if is_catalog_description:
+        if description:
+            store_description = description != existing_description or can_upgrade_opening_sentence
+            next_description = description
+        elif is_prior_version and existing_description:
+            store_description = True
+            next_description = ""
+        else:
+            store_description = False
+            next_description = existing_description
+    else:
+        store_description = bool(description and (not existing_description or can_upgrade_opening_sentence))
+        next_description = description if store_description else existing_description
+
     cover_url = str(result.get("cover_url") or "")
-    existing_cover = str(candidate.get("cover_url") or "")
-    store_cover = bool(
-        cover_url
-        and (
-            not existing_cover
-            or "/b/isbn/" in existing_cover
-            or existing_cover.startswith("https://placehold.co/")
+    if is_catalog_cover:
+        if cover_url:
+            store_cover = cover_url != existing_cover
+            next_cover = cover_url
+        elif is_prior_version and existing_cover:
+            store_cover = True
+            next_cover = ""
+        else:
+            store_cover = False
+            next_cover = existing_cover
+    else:
+        store_cover = bool(
+            cover_url
+            and (
+                not existing_cover
+                or "/b/isbn/" in existing_cover
+                or existing_cover.startswith("https://placehold.co/")
+            )
         )
-    )
+        next_cover = cover_url if store_cover else existing_cover
+
     release_date = _text(result.get("release_date"), 32)
-    store_release_date = bool(release_date and not candidate.get("release_date"))
-    release_date_kind = str(result.get("release_date_kind") or "catalog") if store_release_date else ""
-    existing_genres = candidate.get("genres", "[]")
-    if isinstance(existing_genres, str):
-        try:
-            existing_genres = json.loads(existing_genres)
-        except (TypeError, ValueError):
-            existing_genres = [existing_genres] if existing_genres.strip() else []
-    normalized_existing_genres = _catalog_genres(existing_genres, limit=METADATA_GENRE_LIMIT)
-    merged_genres = _catalog_genres(
-        normalized_existing_genres
-        + _catalog_genres(result.get("genres", []), limit=METADATA_GENRE_LIMIT),
-        limit=METADATA_GENRE_LIMIT,
+    next_release_date: str | None = existing_release_date or None
+    next_release_date_kind = existing_date_kind
+    store_release_date = False
+    if is_catalog_date:
+        if release_date:
+            candidate_date_kind = str(result.get("release_date_kind") or "catalog")
+            if release_date != existing_release_date or candidate_date_kind != existing_date_kind:
+                store_release_date = True
+                next_release_date = release_date
+                next_release_date_kind = candidate_date_kind
+        elif is_prior_version and existing_release_date:
+            store_release_date = True
+            next_release_date = None
+            next_release_date_kind = "unknown"
+    elif release_date and not existing_release_date:
+        store_release_date = True
+        next_release_date = release_date
+        next_release_date_kind = str(result.get("release_date_kind") or "catalog")
+
+    result_genres = _catalog_genres(result.get("genres", []), limit=METADATA_GENRE_LIMIT)
+    genre_base = (
+        preserved_source_genres
+        if "genres" in catalog_provenance_fields and (is_prior_version or result_genres)
+        else normalized_existing_genres
     )
+    merged_genres = _catalog_genres(genre_base + result_genres, limit=METADATA_GENRE_LIMIT)
     store_genres = merged_genres != normalized_existing_genres
     genres_json = json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":"))
 
     selected_fields = []
-    if store_description:
+    if store_description and next_description:
         selected_fields.append(("description", result.get("description_provider"), result.get("description_provider_id")))
-    if store_genres:
+    if store_genres and result_genres:
         selected_fields.append(("genres", result.get("genres_provider"), result.get("genres_provider_id")))
-    if store_cover:
+    if store_cover and next_cover:
         selected_fields.append(("cover_url", result.get("cover_provider"), result.get("cover_provider_id")))
-    if store_release_date:
+    if store_release_date and next_release_date:
         selected_fields.append(("release_date", result.get("release_date_provider"), result.get("release_date_provider_id")))
+
     if store_description:
-        metadata_provider = str(result.get("description_provider") or "")
-        metadata_provider_id = str(result.get("description_provider_id") or "")
+        metadata_provider = str(result.get("description_provider") or "") if next_description else ""
+        metadata_provider_id = str(result.get("description_provider_id") or "") if next_description else ""
+    elif is_catalog_description and description:
+        metadata_provider = str(result.get("description_provider") or existing_provider)
+        metadata_provider_id = str(result.get("description_provider_id") or existing_provider_id)
     else:
-        metadata_provider = str(candidate.get("_metadata_provider") or "")
-        metadata_provider_id = str(candidate.get("_metadata_provider_id") or "")
+        metadata_provider = existing_provider
+        metadata_provider_id = existing_provider_id
 
     con.execute(
         """INSERT INTO candidate_quality(
@@ -1266,8 +1589,8 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             title_match=excluded.title_match,
             author_match=excluded.author_match,
             audit_version=excluded.audit_version,
-            metadata_provider=CASE WHEN excluded.metadata_provider!='' THEN excluded.metadata_provider ELSE metadata_provider END,
-            metadata_provider_id=CASE WHEN excluded.metadata_provider_id!='' THEN excluded.metadata_provider_id ELSE metadata_provider_id END,
+            metadata_provider=excluded.metadata_provider,
+            metadata_provider_id=excluded.metadata_provider_id,
             audited_at=excluded.audited_at,
             updated_at=CURRENT_TIMESTAMP""",
         (
@@ -1287,15 +1610,9 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             metadata_provider_id,
         ),
     )
-    if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
-        con.execute(
-            "UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (candidate_id,),
-        )
-    if status != "accepted":
-        return False
 
-    if store_description or store_cover or store_release_date or store_genres:
+    any_candidate_change = store_description or store_cover or store_release_date or store_genres
+    if any_candidate_change:
         con.execute(
             """UPDATE candidates SET
                 description=CASE WHEN ?=1 THEN ? ELSE description END,
@@ -1305,34 +1622,64 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 genres=CASE WHEN ?=1 THEN ? ELSE genres END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (
-                int(store_description), description,
-                int(store_cover), cover_url,
-                int(store_release_date), release_date,
-                int(store_release_date), release_date_kind,
+                int(store_description), next_description,
+                int(store_cover), next_cover,
+                int(store_release_date), next_release_date,
+                int(store_release_date), next_release_date_kind,
                 int(store_genres), genres_json,
                 candidate_id,
             ),
         )
 
-        field_provider_keys = {
-            "description": ("description_provider", "description_provider_id"),
-            "genres": ("genres_provider", "genres_provider_id"),
-            "cover_url": ("cover_provider", "cover_provider_id"),
-            "release_date": ("release_date_provider", "release_date_provider_id"),
-        }
-        for field, provider, provider_id in selected_fields:
-            provider_key, provider_id_key = field_provider_keys[field]
-            persist_metadata_field_provenance(
-                con,
-                "candidate",
-                candidate_id,
-                field,
-                result,
-                default_provider=str(provider or result.get(provider_key) or ""),
-                default_provider_id=str(provider_id or result.get(provider_id_key) or ""),
-                default_confidence=float(result.get("quality_score", 0) or 0),
-            )
-    return bool(selected_fields)
+    provenance_refresh_fields = set()
+    if store_description or (is_catalog_description and is_prior_version):
+        provenance_refresh_fields.add("description")
+    if store_genres or ("genres" in catalog_provenance_fields and is_prior_version):
+        provenance_refresh_fields.add("genres")
+    if store_cover or (is_catalog_cover and is_prior_version):
+        provenance_refresh_fields.add("cover_url")
+    if store_release_date or (is_catalog_date and is_prior_version):
+        provenance_refresh_fields.add("release_date")
+
+    for field in provenance_refresh_fields:
+        con.execute(
+            "DELETE FROM metadata_field_provenance "
+            "WHERE entity_type='candidate' AND entity_id=? AND field=? "
+            "AND provider NOT IN ('source','penguinrandomhouse')",
+            (candidate_id, field),
+        )
+
+    field_provider_keys = {
+        "description": ("description_provider", "description_provider_id"),
+        "genres": ("genres_provider", "genres_provider_id"),
+        "cover_url": ("cover_provider", "cover_provider_id"),
+        "release_date": ("release_date_provider", "release_date_provider_id"),
+    }
+    provenance_fields_to_write = list(selected_fields)
+    if is_prior_version:
+        existing_selected = {field for field, _, _ in provenance_fields_to_write}
+        if "description" in provenance_refresh_fields and next_description and is_catalog_description and "description" not in existing_selected:
+            provenance_fields_to_write.append(("description", result.get("description_provider"), result.get("description_provider_id")))
+        if "genres" in provenance_refresh_fields and result_genres and "genres" not in existing_selected:
+            provenance_fields_to_write.append(("genres", result.get("genres_provider"), result.get("genres_provider_id")))
+        if "cover_url" in provenance_refresh_fields and next_cover and is_catalog_cover and "cover_url" not in existing_selected:
+            provenance_fields_to_write.append(("cover_url", result.get("cover_provider"), result.get("cover_provider_id")))
+        if "release_date" in provenance_refresh_fields and next_release_date and is_catalog_date and "release_date" not in existing_selected:
+            provenance_fields_to_write.append(("release_date", result.get("release_date_provider"), result.get("release_date_provider_id")))
+
+    for field, provider, provider_id in provenance_fields_to_write:
+        provider_key, provider_id_key = field_provider_keys[field]
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            candidate_id,
+            field,
+            result,
+            default_provider=str(provider or result.get(provider_key) or ""),
+            default_provider_id=str(provider_id or result.get(provider_id_key) or ""),
+            default_confidence=float(result.get("quality_score", 0) or 0),
+        )
+    return any_candidate_change
 
 
 def _dedupe_and_hide(con) -> int:
@@ -1432,7 +1779,8 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
         )
     else:
         query = (
-            "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
+            "SELECT c.*,s.url AS source_root,q.audit_version AS _audit_version,"
+            "q.metadata_provider AS _metadata_provider,"
             "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
             "LEFT JOIN sources s ON s.id=c.source_id "
             "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
@@ -1442,7 +1790,7 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
         if limit is not None:
             query += " LIMIT ?"
             params = (max(1, int(limit)),)
-        candidates = rows(query, params)
+        candidates = _attach_catalog_provenance_flags(rows(query, params))
     if not candidates:
         with transaction() as con:
             deduped = _dedupe_and_hide(con)

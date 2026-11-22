@@ -15,14 +15,16 @@ from afterword_engine.isbn import normalize_isbn_identifier
 from afterword_engine.quality import (
     APPLE_BOOKS_SEARCH,
     QUALITY_VERSION,
+    _author_similarity,
+    _dedupe_and_hide,
+    _store_result,
     audit_candidates,
     candidate_quality_audit_candidates,
     canonical_isbn,
     has_candidate_quality_audit_candidates,
     local_flags,
-    _dedupe_and_hide,
-    _author_similarity,
 )
+from afterword_engine.scoring import score_all
 
 
 @pytest.fixture(autouse=True)
@@ -219,12 +221,15 @@ def test_provider_unavailable_quarantine_retries_after_backoff(database):
 
 
 def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
-    assert QUALITY_VERSION == "candidate-quality-v4"
+    assert QUALITY_VERSION == "candidate-quality-v5"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
     quality_isbn_quarantine = add_candidate("Old Quarantine Quality ISBN", "A Writer")
+    v4_no_isbn_accepted = add_candidate("V4 Accepted Without ISBN", "A Writer")
+    v4_no_isbn_quarantine = add_candidate("V4 Quarantine Without ISBN", "A Writer")
     invalid_isbn = add_candidate("Invalid ISBN", "A Writer", isbn13="9780307474279")
+    current_accepted = add_candidate("Current Accepted Without ISBN", "A Writer")
     curated = add_candidate("Curated Seed", "A Writer", isbn13="9780307474278")
     expired_outage = add_candidate("Expired Outage", "A Writer")
     fresh_outage = add_candidate("Fresh Outage", "A Writer", isbn13="9780307474278")
@@ -238,7 +243,10 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
             (old_quarantine, "quarantine", "candidate-quality-v2"),
             (quality_isbn_accepted, "accepted", "candidate-quality-v3"),
             (quality_isbn_quarantine, "quarantine", "candidate-quality-v2"),
+            (v4_no_isbn_accepted, "accepted", "candidate-quality-v4"),
+            (v4_no_isbn_quarantine, "quarantine", "candidate-quality-v4"),
             (invalid_isbn, "accepted", "candidate-quality-v3"),
+            (current_accepted, "accepted", QUALITY_VERSION),
             (curated, "accepted", "builtin-curated-v1"),
             (expired_outage, "quarantine", QUALITY_VERSION),
             (fresh_outage, "quarantine", QUALITY_VERSION),
@@ -290,6 +298,9 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         old_quarantine,
         quality_isbn_accepted,
         quality_isbn_quarantine,
+        v4_no_isbn_accepted,
+        v4_no_isbn_quarantine,
+        invalid_isbn,
         expired_outage,
         pending,
         legacy_pending,
@@ -297,7 +308,7 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
     selected_by_id = {int(item["id"]): item for item in selected}
     assert selected_by_id[quality_isbn_accepted]["isbn13"] == ""
     assert selected_by_id[quality_isbn_quarantine]["isbn10"] == ""
-    assert invalid_isbn not in selected_ids
+    assert current_accepted not in selected_ids
     assert curated not in selected_ids
     assert fresh_outage not in selected_ids
     assert len(candidate_quality_audit_candidates(limit=500, now=reference_time)) == 50
@@ -408,6 +419,10 @@ def test_isbn_recovery_does_not_reaudit_accepted_candidates(database):
         con.execute(
             "UPDATE candidate_quality SET quality_status='quarantine',audit_version='candidate-quality-v1' WHERE candidate_id=?",
             (quarantined_id,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, accepted_id),
         )
     accepted_before = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (accepted_id,))
 
@@ -550,3 +565,398 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["provider_id"] == "6758952748"
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_audit_quarantines_homonym_author_without_attaching_wrong_work(database):
+    candidate_id = add_candidate("Home", "Marilynne Robinson")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, candidate_id),
+        )
+    assert _author_similarity("Marilynne Robinson", "Michael Robinson") < 0.65
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLHOMONYMW",
+                        "title": "Home",
+                        "author_name": ["Michael Robinson"],
+                        "isbn": ["9780061120084"],
+                        "description": "Unrelated homonym book blurb.",
+                        "first_publish_year": 2014,
+                        "subject": ["Biography"],
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+
+    assert result["quarantine"] == 1
+    assert quality["quality_status"] == "quarantine"
+    assert quality["author_match"] < 0.65
+    assert "catalog_match_ambiguous" in json.loads(quality["flags_json"])
+    assert quality["provider"] == ""
+    assert quality["provider_id"] == ""
+    assert quality["work_id"] == ""
+    assert quality["isbn13"] == ""
+    assert candidate["description"] == ""
+    assert candidate["release_date"] is None
+
+
+@respx.mock
+def test_audit_rejects_derivatives_and_foreign_language_records(database):
+    parenthetical_id = add_candidate("Fourth Wing", "Rebecca Yarros")
+    prefix_id = add_candidate("Tomorrow, and Tomorrow, and Tomorrow", "Gabrielle Zevin")
+    spanish_id = add_candidate("The Shadow Wind", "Carlos Writer")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?,?)",
+            (QUALITY_VERSION, parenthetical_id, prefix_id, spanish_id),
+        )
+
+    def ol_handler(request):
+        assert "language" in request.url.params.get("fields", "").split(",")
+        title = request.url.params.get("title", "")
+        if "Fourth Wing" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLGUIDE1W",
+                            "title": "Fourth Wing (Summary & Study Guide)",
+                            "author_name": ["Rebecca Yarros"],
+                            "description": "Chapter-by-chapter study guide.",
+                            "language": ["eng"],
+                        }
+                    ]
+                },
+            )
+        if "Tomorrow" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLGUIDE2W",
+                            "title": "Summary of Tomorrow, and Tomorrow, and Tomorrow",
+                            "author_name": ["Gabrielle Zevin"],
+                            "description": "Quick summary and analysis.",
+                            "language": ["eng"],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLSPANISHW",
+                        "title": "The Shadow Wind",
+                        "author_name": ["Carlos Writer"],
+                        "description": "Una novela en español.",
+                        "language": ["spa"],
+                    }
+                ]
+            },
+        )
+
+    def gb_handler(request):
+        q = request.url.params.get("q", "")
+        if "Shadow Wind" in q:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "spanish-vol",
+                            "volumeInfo": {
+                                "title": "The Shadow Wind",
+                                "authors": ["Carlos Writer"],
+                                "description": "Edición española.",
+                                "language": "es",
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"items": []})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(side_effect=gb_handler)
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["audited"] == 3
+    assert result["quarantine"] == 3
+    for cid in (parenthetical_id, prefix_id, spanish_id):
+        quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (cid,))
+        candidate = row("SELECT * FROM candidates WHERE id=?", (cid,))
+        assert quality["quality_status"] == "quarantine"
+        assert candidate["description"] == ""
+
+
+@respx.mock
+def test_v5_reaudit_quarantine_clears_catalog_fields_and_preserves_source_fields(database):
+    catalog_polluted_id = add_candidate("Home", "Marilynne Robinson")
+    source_curated_id = add_candidate("Home", "Marilynne R. Author")
+    with transaction() as con:
+        source_id = str(con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0])
+        con.execute(
+            "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind=?,genres=? WHERE id=?",
+            (
+                "Polluted homonym synopsis.",
+                "https://covers.openlibrary.org/b/id/999-L.jpg",
+                "2014-01-01",
+                "year",
+                json.dumps(["Literary fiction", "Biography"]),
+                catalog_polluted_id,
+            ),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLHOMONYMW',work_id='/works/OLHOMONYMW',"
+            "metadata_provider='openlibrary',metadata_provider_id='/works/OLHOMONYMW' WHERE candidate_id=?",
+            (catalog_polluted_id,),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'genres','source',?,1.0,'{}')",
+            (catalog_polluted_id, source_id),
+        )
+        for field, payload in (
+            ("description", {"payload": {"description": "Polluted homonym synopsis."}}),
+            ("cover_url", {"payload": {"cover_id": "999"}}),
+            ("release_date", {"payload": {"publication_date": "2014"}}),
+            ("genres", {"payload": {"genres": ["Biography"]}}),
+        ):
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,?,'openlibrary','/works/OLHOMONYMW',0.94,?)",
+                (catalog_polluted_id, field, json.dumps(payload)),
+            )
+
+        con.execute(
+            "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind=?,genres=? WHERE id=?",
+            (
+                "Curated feed blurb from discovery source.",
+                "https://covers.openlibrary.org/b/id/111-L.jpg",
+                "2008-09-02",
+                "source",
+                json.dumps(["Literary fiction"]),
+                source_curated_id,
+            ),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLHOMONYM2W',work_id='/works/OLHOMONYM2W' WHERE candidate_id=?",
+            (source_curated_id,),
+        )
+        for field in ("description", "cover_url", "release_date", "genres"):
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,?,'source',?,1.0,'{}')",
+                (source_curated_id, field, source_id),
+            )
+
+    selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert {catalog_polluted_id, source_curated_id} <= selected_ids
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLHOMONYMW",
+                        "title": "Home",
+                        "author_name": ["Michael Robinson"],
+                        "description": "Polluted homonym synopsis.",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["quarantine"] == 2
+
+    polluted_after = row("SELECT * FROM candidates WHERE id=?", (catalog_polluted_id,))
+    polluted_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (catalog_polluted_id,))
+    assert polluted_quality["quality_status"] == "quarantine"
+    assert polluted_quality["audit_version"] == QUALITY_VERSION
+    assert polluted_quality["work_id"] == ""
+    assert polluted_quality["metadata_provider"] == ""
+    assert polluted_after["description"] == ""
+    assert polluted_after["cover_url"] == ""
+    assert polluted_after["release_date"] is None
+    assert json.loads(polluted_after["genres"]) == ["Literary fiction"]
+    remaining_prov = rows(
+        "SELECT field,provider FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+        (catalog_polluted_id,),
+    )
+    assert remaining_prov == [{"field": "genres", "provider": "source"}]
+
+    curated_after = row("SELECT * FROM candidates WHERE id=?", (source_curated_id,))
+    assert curated_after["description"] == "Curated feed blurb from discovery source."
+    assert curated_after["cover_url"] == "https://covers.openlibrary.org/b/id/111-L.jpg"
+    assert curated_after["release_date"] == "2008-09-02"
+    assert json.loads(curated_after["genres"]) == ["Literary fiction"]
+
+
+def test_store_result_replaces_polluted_v4_catalog_description_keeps_source_and_updates_embeddings(database):
+    verified_synopsis = (
+        "Twenty-year-old Violet Sorrengail was supposed to enter the Scribe Quadrant, "
+        "living a quiet life among books and history."
+    )
+    assert len(verified_synopsis) == 121
+    polluted_blurb = (
+        "Resumen completo y guía de estudio de Alas de Sangre: análisis detallado de capítulos, "
+        "personajes, temas principales y preguntas de discusión para estudiantes y clubes de lectura "
+        "que buscan comprender cada escena de esta edición especial en español ya"
+    )
+    assert len(polluted_blurb) == 251
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+            ("Dragonflight", "Anne McCaffrey", 5.0, "test"),
+        ).lastrowid
+        source_id = str(con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0])
+
+    catalog_cid = add_candidate("Fourth Wing", "Rebecca Yarros", isbn13="9781649374042", status="recommended")
+    source_cid = add_candidate("Source Curated Fantasy", "Rebecca Yarros", status="recommended")
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET description=?,genres=? WHERE id=?",
+            (polluted_blurb, json.dumps(["Fantasy", "Study Aids"]), catalog_cid),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='google_books',provider_id='spanish-guide',metadata_provider='google_books',"
+            "metadata_provider_id='spanish-guide',isbn13='9781649374042' WHERE candidate_id=?",
+            (catalog_cid,),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'description','google_books','spanish-guide',0.95,?)",
+            (catalog_cid, json.dumps({"payload": {"description": polluted_blurb}})),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'genres','google_books','spanish-guide',0.95,?)",
+            (catalog_cid, json.dumps({"payload": {"genres": ["Fantasy", "Study Aids"]}})),
+        )
+
+        con.execute(
+            "UPDATE candidates SET description=?,genres=? WHERE id=?",
+            ("Editorial source description that must remain intact.", json.dumps(["Fantasy"]), source_cid),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLSOURCEW' WHERE candidate_id=?",
+            (source_cid,),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'description','source',?,1.0,'{}')",
+            (source_cid, source_id),
+        )
+
+    class TrackingEmbedder:
+        name, model = "test", "v5-refresh"
+
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def embed(self, texts):
+            self.calls.extend(texts)
+            return [[1.0, 0.2] if "Violet Sorrengail" in text else [0.2, 1.0] for text in texts]
+
+    embedder = TrackingEmbedder()
+    assert asyncio.run(score_all(embedder=embedder)) == 2
+    initial_hashes = {
+        (item["entity_type"], int(item["entity_id"])): item["content_hash"]
+        for item in rows("SELECT entity_type,entity_id,content_hash FROM embeddings WHERE backend='test' AND model='v5-refresh'")
+    }
+    embedder.calls.clear()
+
+    clean_catalog_result = {
+        "quality_status": "accepted",
+        "quality_score": 1.0,
+        "title_match": 1.0,
+        "author_match": 1.0,
+        "flags": [],
+        "provider": "openlibrary",
+        "provider_id": "/works/OLFOURTHWINGW",
+        "work_id": "/works/OLFOURTHWINGW",
+        "isbn13": "9781649374042",
+        "isbn10": "1649374046",
+        "description": verified_synopsis,
+        "description_kind": "synopsis",
+        "description_provider": "openlibrary",
+        "description_provider_id": "/works/OLFOURTHWINGW",
+        "genres": ["Fantasy"],
+        "genres_provider": "openlibrary",
+        "genres_provider_id": "/works/OLFOURTHWINGW",
+        "metadata_provenance": {
+            "fetched_at": "2026-11-01T00:00:00Z",
+            "fields": {
+                "description": {"provider": "openlibrary", "provider_id": "/works/OLFOURTHWINGW", "kind": "synopsis"},
+                "genres": {"provider": "openlibrary", "provider_id": "/works/OLFOURTHWINGW", "kind": "subjects"},
+            },
+            "source_payloads": [
+                {
+                    "provider": "openlibrary",
+                    "provider_id": "/works/OLFOURTHWINGW",
+                    "payload": {"description": verified_synopsis, "genres": ["Fantasy"]},
+                }
+            ],
+        },
+    }
+
+    with transaction() as con:
+        catalog_candidate = dict(con.execute("SELECT * FROM candidates WHERE id=?", (catalog_cid,)).fetchone())
+        source_candidate = dict(con.execute("SELECT * FROM candidates WHERE id=?", (source_cid,)).fetchone())
+        assert _store_result(con, catalog_candidate, clean_catalog_result) is True
+        assert _store_result(con, source_candidate, clean_catalog_result) is False
+
+    updated_catalog = row("SELECT description,genres FROM candidates WHERE id=?", (catalog_cid,))
+    updated_source = row("SELECT description,genres FROM candidates WHERE id=?", (source_cid,))
+    assert updated_catalog["description"] == verified_synopsis
+    assert json.loads(updated_catalog["genres"]) == ["Fantasy"]
+    assert updated_source["description"] == "Editorial source description that must remain intact."
+    desc_prov = rows(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (catalog_cid,),
+    )
+    assert desc_prov == [{"provider": "openlibrary", "provider_id": "/works/OLFOURTHWINGW"}]
+
+    assert asyncio.run(score_all(embedder=embedder)) == 2
+    assert len(embedder.calls) == 1
+    assert verified_synopsis in embedder.calls[0]
+    refreshed_hashes = {
+        (item["entity_type"], int(item["entity_id"])): item["content_hash"]
+        for item in rows("SELECT entity_type,entity_id,content_hash FROM embeddings WHERE backend='test' AND model='v5-refresh'")
+    }
+    assert refreshed_hashes[("candidate", catalog_cid)] != initial_hashes[("candidate", catalog_cid)]
+    assert refreshed_hashes[("candidate", source_cid)] == initial_hashes[("candidate", source_cid)]
+    assert refreshed_hashes[("read", read_id)] == initial_hashes[("read", read_id)]

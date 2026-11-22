@@ -22,7 +22,19 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
-from .identity import book_author_identity_key, book_catalog_title_identity_key, canonical_part
+from .identity import (
+    _title_without_format_suffix,
+    book_author_identity_key,
+    book_catalog_title_identity_key,
+    canonical_part,
+    catalog_author_matches,
+    catalog_author_similarity,
+    catalog_derivative_subjects_conflict,
+    catalog_language_allowed,
+    catalog_title_allowed,
+    catalog_title_matches,
+    catalog_title_similarity,
+)
 from .isbn import canonical_isbn, isbn_parts
 from .subjects import normalize_subjects
 
@@ -321,51 +333,15 @@ def _normalized_title(value: object) -> str:
 
 
 def _title_matches(wanted: str, candidate: object) -> bool:
-    """Require a normalized full-title match before using catalog metadata."""
+    """Require an edition-compatible normalized title match before using catalog metadata."""
 
-    normalized = _normalized_title(candidate)
-    return bool(wanted and normalized and wanted == normalized)
+    return catalog_title_matches(wanted, candidate)
 
 
 def _author_matches(wanted: str, candidates: object) -> bool:
-    """Match a full author name or its first initial and surname.
+    """Match a full author name or a single-character initial plus surname."""
 
-    Catalogs vary in whether they include middle names and initials. A shared
-    surname alone is too weak to attach descriptions or subjects to a work.
-    """
-
-    if isinstance(candidates, str):
-        candidates = [candidates]
-    if not isinstance(candidates, (list, tuple)):
-        return False
-    wanted_parts = [part.strip() for part in re.split(r"\s*(?:,|;|&|\band\b)\s*", wanted, flags=re.I) if part.strip()]
-    for wanted_author in wanted_parts:
-        wanted_normalized = canonical_part(wanted_author)
-        wanted_tokens = wanted_normalized.split()
-        if not wanted_tokens:
-            continue
-        for candidate in candidates:
-            candidate_normalized = canonical_part(candidate)
-            candidate_tokens = candidate_normalized.split()
-            if not candidate_tokens:
-                continue
-            if book_author_identity_key(wanted_author) == book_author_identity_key(candidate):
-                return True
-            if wanted_normalized == candidate_normalized:
-                return True
-            if (
-                len(wanted_tokens) >= 2
-                and len(candidate_tokens) >= 2
-                and wanted_tokens[-1] == candidate_tokens[-1]
-                and wanted_tokens[0][0] == candidate_tokens[0][0]
-                and (
-                    wanted_tokens[0] == candidate_tokens[0]
-                    or len(wanted_tokens[0]) == 1
-                    or len(candidate_tokens[0]) == 1
-                )
-            ):
-                return True
-    return False
+    return catalog_author_matches(wanted, candidates)
 
 
 def _catalog_genres(value: object, limit: int = 8) -> list[str]:
@@ -444,12 +420,13 @@ async def _lookup_open_library_record(
     client: httpx.AsyncClient | None = None,
     *,
     isbn: str = "",
+    expected_isbn: str = "",
 ) -> dict[str, object]:
     params = {
         ("isbn" if isbn else "title"): isbn or title[:500],
         **({} if isbn else {"author": author[:300]}),
         "limit": 5,
-        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13",
+        "fields": "key,title,author_name,cover_i,first_publish_year,first_publish_date,first_sentence,description,subject,isbn,isbn13,language",
     }
     trace: dict[str, object] = {
         "provider": "openlibrary",
@@ -479,7 +456,7 @@ async def _lookup_open_library_record(
     if not isinstance(docs, list):
         trace["status"] = "invalid_response"
         return {"_fetch_trace": trace}
-    wanted = _normalized_title(title)
+    target_isbn = isbn or expected_isbn
     matched: list[dict[str, object]] = []
     mismatched_identifiers = 0
     for doc in docs:
@@ -489,9 +466,21 @@ async def _lookup_open_library_record(
         if isbn and not _query_isbn_matches(isbn, returned_isbns):
             mismatched_identifiers += 1
             continue
-        authors = doc.get("author_name")
-        if not _title_matches(wanted, doc.get("title")) or not _author_matches(author, authors):
+        if not catalog_language_allowed(title, doc.get("language")):
             continue
+        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, returned_isbns)
+        if not doc_verified and catalog_derivative_subjects_conflict(title, doc.get("subject")):
+            continue
+        authors = doc.get("author_name")
+        if not _title_matches(title, doc.get("title")) or not _author_matches(author, authors):
+            continue
+        title_match = round(catalog_title_similarity(title, doc.get("title")), 4)
+        author_match = round(catalog_author_similarity(author, authors), 4)
+        quality_score = (
+            1.0
+            if title_match >= 0.98 and author_match >= 0.98
+            else round(min(1.0, title_match * 0.65 + author_match * 0.35), 4)
+        )
         release_date, date_kind, release_date_source_field = _openlibrary_publication_date(doc)
         synopsis = _clean_metadata_text(doc.get("description"))
         opening_sentence = _clean_metadata_text(doc.get("first_sentence"), 1500)
@@ -499,7 +488,7 @@ async def _lookup_open_library_record(
         description_kind = "synopsis" if synopsis else "opening_sentence" if opening_sentence else ""
         provider_id = str(doc.get("key") or "")
         genres = _catalog_genres(doc.get("subject"), limit=METADATA_GENRE_LIMIT)
-        identifiers = _isbn_provenance_values(isbn, returned_isbns)
+        identifiers = _isbn_provenance_values(target_isbn, returned_isbns)
         matched.append({
             "cover_url": cover_url_from_open_library(doc.get("cover_i")),
             "description": description,
@@ -513,8 +502,11 @@ async def _lookup_open_library_record(
             "provider_id": provider_id,
             "catalog_title": str(doc.get("title") or ""),
             "catalog_author": _author_display(authors),
-            "title_match": 1.0,
-            "author_match": 1.0,
+            "title_match": title_match,
+            "author_match": author_match,
+            "quality_score": quality_score,
+            "_identifier_evidence": doc_evidence,
+            "_identifier_verified": doc_verified,
             "_fetched_at": trace["fetched_at"],
             "_source_payload": _bounded_source_payload({
                 "key": provider_id,
@@ -541,6 +533,9 @@ async def _lookup_open_library_record(
     best = max(
         matched,
         key=lambda value: (
+            bool(value.get("_identifier_verified")),
+            value.get("_identifier_evidence") != "mismatch",
+            float(value.get("quality_score") or 0.0),
             value.get("description_kind") == "synopsis",
             len(str(value.get("description") or "")),
             date_rank.get(str(value.get("date_kind") or ""), 0),
@@ -571,6 +566,7 @@ async def _lookup_google_books_record(
     client: httpx.AsyncClient | None = None,
     *,
     isbn: str = "",
+    expected_isbn: str = "",
     google_books_api_key: str = "",
 ) -> dict[str, object]:
     params = {"q": f"isbn:{isbn}" if isbn else f"intitle:{title[:300]} inauthor:{author[:200]}", "maxResults": 5}
@@ -606,7 +602,7 @@ async def _lookup_google_books_record(
     if not isinstance(items, list):
         trace["status"] = "invalid_response"
         return {"_fetch_trace": trace}
-    wanted = _normalized_title(title)
+    target_isbn = isbn or expected_isbn
     matched: list[dict[str, object]] = []
     mismatched_identifiers = 0
     for item in items:
@@ -621,8 +617,20 @@ async def _lookup_google_books_record(
         if isbn and not _query_isbn_matches(isbn, identifiers):
             mismatched_identifiers += 1
             continue
-        if not _title_matches(wanted, info.get("title")) or not _author_matches(author, info.get("authors")):
+        if not catalog_language_allowed(title, info.get("language")):
             continue
+        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, identifiers)
+        if not doc_verified and catalog_derivative_subjects_conflict(title, info.get("categories")):
+            continue
+        if not _title_matches(title, info.get("title")) or not _author_matches(author, info.get("authors")):
+            continue
+        title_match = round(catalog_title_similarity(title, info.get("title")), 4)
+        author_match = round(catalog_author_similarity(author, info.get("authors")), 4)
+        quality_score = (
+            1.0
+            if title_match >= 0.98 and author_match >= 0.98
+            else round(min(1.0, title_match * 0.65 + author_match * 0.35), 4)
+        )
         release_date, date_kind = _publication_date(info.get("publishedDate"))
         description = _clean_metadata_text(info.get("description"))
         genres = _catalog_genres(info.get("categories"), limit=METADATA_GENRE_LIMIT)
@@ -640,8 +648,11 @@ async def _lookup_google_books_record(
             "provider_id": provider_id,
             "catalog_title": str(info.get("title") or ""),
             "catalog_author": _author_display(info.get("authors")),
-            "title_match": 1.0,
-            "author_match": 1.0,
+            "title_match": title_match,
+            "author_match": author_match,
+            "quality_score": quality_score,
+            "_identifier_evidence": doc_evidence,
+            "_identifier_verified": doc_verified,
             "_fetched_at": trace["fetched_at"],
             "_source_payload": _bounded_source_payload({
                 "id": provider_id,
@@ -649,7 +660,7 @@ async def _lookup_google_books_record(
                 "authors": [_clean_metadata_text(value, 300) for value in (info.get("authors") if isinstance(info.get("authors"), list) else [info.get("authors")]) if value],
                 "description": description,
                 "genres": genres,
-                "identifiers": _isbn_provenance_values(isbn, identifiers),
+                "identifiers": _isbn_provenance_values(target_isbn, identifiers),
                 "publication_date": _clean_metadata_text(info.get("publishedDate"), 40),
                 "publication_date_source_field": "publishedDate" if release_date else "",
                 "cover_url": _google_cover_url(info.get("imageLinks")),
@@ -667,6 +678,9 @@ async def _lookup_google_books_record(
     best = max(
         matched,
         key=lambda value: (
+            bool(value.get("_identifier_verified")),
+            value.get("_identifier_evidence") != "mismatch",
+            float(value.get("quality_score") or 0.0),
             value.get("description_kind") == "synopsis",
             len(str(value.get("description") or "")),
             date_rank.get(str(value.get("date_kind") or ""), 0),
@@ -843,13 +857,17 @@ async def resolve_book_metadata(
                     if lookup is _lookup_google_books_record
                     else {}
                 )
+                target_isbn = source_isbn13 or source_isbn10
+                if target_isbn and not query_isbn:
+                    kwargs["expected_isbn"] = target_isbn
                 if lookup_cache is None:
                     return await lookup(title, author, client=client, isbn=query_isbn, **kwargs)
                 cache_key = (
                     lookup.__name__,
-                    _normalized_title(title),
-                    _normalized_title(author),
+                    canonical_part(title),
+                    canonical_part(author),
                     query_isbn,
+                    target_isbn,
                     "google-key" if google_books_api_key else "no-google-key",
                 )
                 task = lookup_cache.get(cache_key)
@@ -911,11 +929,40 @@ async def resolve_book_metadata(
             if record.get("provider"):
                 records.append(record)
 
+    target_isbn = source_isbn13 or source_isbn10
+
+    def _record_identifiers(record: dict[str, object]) -> object:
+        payload = record.get("_source_payload")
+        if isinstance(payload, dict):
+            return payload.get("identifiers", [])
+        return []
+
+    def _record_isbn_evidence(record: dict[str, object]) -> tuple[str, bool]:
+        trace = record.get("_fetch_trace")
+        if isinstance(trace, dict) and trace.get("identifier_verified") is True:
+            return "matched", True
+        return _isbn_identifier_evidence(target_isbn, _record_identifiers(record))
+
+    def _record_confidence(record: dict[str, object]) -> float:
+        if "quality_score" in record:
+            return float(record.get("quality_score") or 0.0)
+        t_score = float(record.get("title_match") or 0.0)
+        a_score = float(record.get("author_match") or 0.0)
+        if t_score >= 0.98 and a_score >= 0.98:
+            return 1.0
+        return round(min(1.0, t_score * 0.65 + a_score * 0.35), 4)
+
+    has_isbn_verified = bool(
+        target_isbn and any(_record_isbn_evidence(record)[1] for record in records)
+    )
     description_records = [record for record in records if record.get("description")]
     description_record = max(
         description_records,
         key=lambda record: (
             record.get("description_kind") == "synopsis",
+            _record_isbn_evidence(record)[1],
+            _record_isbn_evidence(record)[0] != "mismatch",
+            _record_confidence(record),
             len(str(record.get("description") or "")),
         ),
         default=None,
@@ -987,9 +1034,20 @@ async def resolve_book_metadata(
             result["cover_provider_id"] = cover_record.get("provider_id", "")
 
     date_rank = {"day": 3, "month": 2, "year": 1}
+    eligible_date_records = [
+        record
+        for record in records
+        if record.get("release_date")
+        and not (has_isbn_verified and _record_isbn_evidence(record)[0] == "mismatch")
+    ]
     date_record = max(
-        (record for record in records if record.get("release_date")),
-        key=lambda record: date_rank.get(str(record.get("date_kind") or ""), 0),
+        eligible_date_records,
+        key=lambda record: (
+            _record_isbn_evidence(record)[1],
+            _record_confidence(record),
+            date_rank.get(str(record.get("date_kind") or ""), 0),
+            len(str(record.get("release_date") or "")),
+        ),
         default=None,
     )
     if needs_release_date and date_record:
@@ -1002,7 +1060,18 @@ async def resolve_book_metadata(
     remaining_genres = max(0, METADATA_GENRE_LIMIT - len(source_genres))
     catalog_genres: list[str] = []
     genre_sources: list[dict[str, str]] = []
-    for record in records:
+    eligible_genre_records = sorted(
+        (
+            record
+            for record in records
+            if not (has_isbn_verified and _record_isbn_evidence(record)[0] == "mismatch")
+        ),
+        key=lambda record: (
+            not _record_isbn_evidence(record)[1],
+            -_record_confidence(record),
+        ),
+    )
+    for record in eligible_genre_records:
         if not remaining_genres:
             break
         additions = _catalog_genres(record.get("genres"), limit=METADATA_GENRE_LIMIT)
@@ -1160,6 +1229,13 @@ async def resolve_openlibrary_work_metadata(
         trace["returned_work_id"] = returned_id
         if returned_id != work_id:
             trace["status"] = "work_id_mismatch"
+        elif not catalog_language_allowed(title, payload.get("languages") or payload.get("language")):
+            trace["status"] = "no_match"
+        elif (
+            (title and payload.get("title") and not catalog_title_allowed(title, payload.get("title")))
+            or catalog_derivative_subjects_conflict(title, payload.get("subjects"))
+        ):
+            trace["status"] = "no_match"
         else:
             synopsis = _clean_metadata_text(payload.get("description"))
             opening_sentence = _clean_metadata_text(payload.get("first_sentence"), 1500)
