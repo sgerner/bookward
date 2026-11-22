@@ -47,6 +47,19 @@ export function sanitizeEngineMessage(detail: string | undefined, status: number
   return cleaned;
 }
 
+export const GOODREADS_CSV_MAX_BYTES = 10_000_000;
+export const GOODREADS_CSV_LIMIT_MESSAGE =
+  'Goodreads CSV exports must be 10 MB or smaller (up to 20,000 books). Choose a smaller CSV file and try again.';
+
+export function isPayloadTooLarge(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth++) {
+    if ((current as { status?: unknown }).status === 413) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 export function engineStatus(error: unknown, passthroughStatus?: number): number {
   if (error instanceof EngineError) {
     return error.status < 500 || error.status === passthroughStatus || error.status === 503

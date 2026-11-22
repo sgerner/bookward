@@ -1,17 +1,47 @@
 import type { Handle } from '@sveltejs/kit/hooks';
-import { redirect } from '@sveltejs/kit';
-import { ENGINE_UNAVAILABLE_MESSAGE, EngineError, engine } from '#lib/server/engine.js';
+import { error as httpError, redirect } from '@sveltejs/kit';
+import {
+	ENGINE_UNAVAILABLE_MESSAGE,
+	EngineError,
+	GOODREADS_CSV_LIMIT_MESSAGE,
+	engine,
+	isPayloadTooLarge
+} from '#lib/server/engine.js';
 import { withSessionToken } from '#lib/server/request-context.js';
 
 const SESSION_COOKIE = 'bookward_session';
 const ORIGIN_ERROR_DETAIL = 'Request origin could not be verified';
 const AUTH_REQUIRED_DETAIL = 'Authentication required. Sign in again to continue.';
 const STALE_PROFILE_DETAIL = 'This page belongs to a different profile. Reload before continuing.';
+const formDataByRequest = new WeakMap<Request, Promise<FormData>>();
 
 type SessionLookup =
 	| { status: 'authenticated'; user: NonNullable<App.Locals['user']> }
 	| { status: 'unauthenticated' }
 	| { status: 'unavailable' };
+
+function requestFormData(request: Request): Promise<FormData> {
+	let cached = formDataByRequest.get(request);
+	if (!cached) {
+		const parse = request.formData.bind(request);
+		cached = parse();
+		formDataByRequest.set(request, cached);
+		Object.defineProperty(request, 'formData', {
+			configurable: true,
+			value: () => cached!
+		});
+	}
+	return cached;
+}
+
+function prefersHtmlError(request: Request, path: string): boolean {
+	if (path.startsWith('/api/') || request.headers.get('x-sveltekit-action') === 'true') return false;
+	const accept = (request.headers.get('accept') || '').toLowerCase();
+	const htmlIndex = accept.indexOf('text/html');
+	if (htmlIndex === -1) return false;
+	const jsonIndex = accept.indexOf('application/json');
+	return jsonIndex === -1 || htmlIndex < jsonIndex;
+}
 
 export function isPublicApiPath(pathname: string) {
 	let decoded: string;
@@ -131,14 +161,15 @@ async function submittedProfile(request: Request): Promise<string> {
 	const contentType = request.headers.get('content-type') || '';
 	try {
 		if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
-			const form = await request.clone().formData();
+			const form = await requestFormData(request);
 			return String(form.get('__profile_id') || '');
 		}
 		if (contentType.includes('application/json')) {
 			const body = await request.clone().json() as { expected_profile_id?: unknown };
 			return typeof body.expected_profile_id === 'string' ? body.expected_profile_id : '';
 		}
-	} catch {
+	} catch (cause) {
+		if (isPayloadTooLarge(cause)) throw cause;
 		return '';
 	}
 	return '';
@@ -220,7 +251,18 @@ export const handle: Handle = async ({ event, resolve }) => {
 	const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
 		(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
 	if (boundProfile) {
-		const expected = await submittedProfile(event.request);
+		let expected = '';
+		try {
+			expected = await submittedProfile(event.request);
+		} catch (cause) {
+			if (isPayloadTooLarge(cause)) {
+				if (prefersHtmlError(event.request, path)) {
+					throw httpError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+				}
+				return jsonError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+			}
+			throw cause;
+		}
 		if (!expected || expected !== user.profile_id) {
 			if (mutation && isUnhydratedFormPost(event.request, path)) {
 				return htmlError(409, 'Profile changed', STALE_PROFILE_DETAIL, 'Reload Bookward', '/');

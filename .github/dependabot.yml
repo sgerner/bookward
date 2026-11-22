@@ -38,3 +38,32 @@ updates:
       actions:
         patterns:
           - "*"
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /engine
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      containers:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: node
+        versions:
+          - ">=25.0.0"
+      - dependency-name: python
+        versions:
+          - ">=3.13.0"
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      compose:
+        patterns:
+          - "*"

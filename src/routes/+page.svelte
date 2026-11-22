@@ -41,8 +41,9 @@
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
-  import { actionErrorMessage, payloadErrorMessage } from "#lib/client-errors.js";
+  import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
     createNotificationChannels,
     type TransientNotice,
@@ -673,17 +674,6 @@
 
   function announceActionSuccess(message: string) {
     notifications.announceSuccess(message);
-  }
-
-  function actionResultMessage(
-    result: {
-      type: string;
-      data?: unknown;
-      error?: unknown;
-    },
-    fallback = "The request could not be completed. Your change was reverted.",
-  ) {
-    return actionErrorMessage(result, fallback);
   }
 
   function withPending(key: string, add: boolean) {
