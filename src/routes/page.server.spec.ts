@@ -506,5 +506,221 @@ describe("page actions", () => {
     });
   });
 
+  it("reads sources and settings directly without requesting /api/overview", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify([
+            {
+              id: 1,
+              name: "Bookward demo books",
+              url: "builtin://upcoming",
+              enabled: 1,
+              kind: "builtin",
+              is_default: 1,
+              lifecycle: "permanent",
+              filters: { include_genres: [], exclude_genres: [] },
+              last_status: null,
+              last_scanned_at: null,
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ enabled: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            embedding_backend: "local",
+            embedding_model: "hashing-768",
+            embedding_url: "",
+            embedding_api_key_set: false,
+            librarr_url: "http://librarr:5050",
+            librarr_api_key_set: true,
+            librarr_media_type: "audiobook",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
 
+    const toggleResult = await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never);
+    expect(toggleResult).toEqual({ message: "Upcoming-book source updated." });
+
+    const embedBody = new FormData();
+    embedBody.set("backend", "local");
+    embedBody.set("model", "hashing-768");
+    const embedResult = await actions.configureEmbeddings!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: embedBody,
+      }),
+    } as never);
+    expect(embedResult).toEqual({
+      message: "Embedding provider saved and checked.",
+    });
+
+    const calledUrls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(calledUrls).toEqual([
+      "http://127.0.0.1:8000/api/sources",
+      "http://127.0.0.1:8000/api/sources/1/toggle",
+      "http://127.0.0.1:8000/api/settings",
+      "http://127.0.0.1:8000/api/settings",
+    ]);
+    expect(calledUrls.some((url) => url.includes("/api/overview"))).toBe(false);
+  });
+
+  it("attaches recommendation_run_id only to recommended discovery books on overview load", async () => {
+    const overview = {
+      recommendation_run_id: "run-discover-only",
+      recommendations_has_more: false,
+      recommendations: [
+        {
+          id: 1,
+          title: "Discovery Pick",
+          author: "Author A",
+          description: "",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: [],
+          score: 92,
+          metadata_confidence: 1,
+          explanation: ["Strong match"],
+          status: "recommended",
+          source_name: "Demo",
+        },
+        {
+          id: 2,
+          title: "Shortlisted Pick",
+          author: "Author B",
+          description: "",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: [],
+          score: 88,
+          metadata_confidence: 1,
+          explanation: ["Saved earlier"],
+          status: "saved",
+          source_name: "Demo",
+        },
+      ],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        source_sync_interval_hours: 24,
+        digest: {},
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        () =>
+          new Response(JSON.stringify(overview), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const result = (await load({
+      url: new URL("http://afterword.test/"),
+      locals: { user: null },
+    } as never)) as {
+      recommendations_has_more: boolean;
+      books: Array<{ id: number; status: string; recommendation_run_id: string }>;
+    };
+    expect(result.recommendations_has_more).toBe(false);
+    expect(result.books).toEqual([
+      expect.objectContaining({
+        id: 1,
+        status: "recommended",
+        recommendation_run_id: "run-discover-only",
+      }),
+      expect.objectContaining({
+        id: 2,
+        status: "saved",
+        recommendation_run_id: "",
+      }),
+    ]);
+  });
+
+  it("disables impression tracking when loading Settings or submitting Settings form actions", async () => {
+    const overview = {
+      recommendation_run_id: "",
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        source_sync_interval_hours: 24,
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    fetchMock.mockClear();
+    await load({
+      url: new URL("http://afterword.test/?/configureEmbeddings"),
+      request: new Request("http://afterword.test/?/configureEmbeddings", {
+        headers: { referer: "http://afterword.test/?view=settings" },
+      }),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+    fetchMock.mockClear();
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request(
+        "http://afterword.test/__data.json?x-sveltekit-trailing-slash=1&x-sveltekit-invalidated=11",
+        { headers: { referer: "http://afterword.test/?view=settings" } },
+      ),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+  });
 });

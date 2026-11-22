@@ -1,6 +1,6 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
-import { engineStatus, engine } from "#lib/server/engine.js";
+import { engineStatus, engineWithHeaders } from "#lib/server/engine.js";
 import { toPageBook, type Recommendation } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -25,15 +25,35 @@ export const GET: RequestHandler = async ({ url }) => {
 
   const params = new URLSearchParams({
     status: parsed.data.status,
-    limit: String(parsed.data.limit + 1),
+    limit: String(parsed.data.limit),
     offset: String(parsed.data.offset),
   });
   try {
-    const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
-    return json({
-      items: items.slice(0, parsed.data.limit).map(toPageBook),
-      has_more: items.length > parsed.data.limit,
-    });
+    const { data: items, headers } = await engineWithHeaders<Recommendation[]>(
+      `/api/recommendations?${params.toString()}`,
+    );
+    const hasMoreHeader = headers.get("x-bookward-has-more")?.trim().toLowerCase();
+    const has_more =
+      hasMoreHeader === "true"
+        ? true
+        : hasMoreHeader === "false"
+          ? false
+          : items.length > parsed.data.limit;
+    const responseHeaders = new Headers();
+    if (hasMoreHeader === "true" || hasMoreHeader === "false") {
+      responseHeaders.set("X-Bookward-Has-More", hasMoreHeader);
+    }
+    const runId = headers.get("x-bookward-recommendation-run")?.trim();
+    if (runId) {
+      responseHeaders.set("X-Bookward-Recommendation-Run", runId);
+    }
+    return json(
+      {
+        items: items.slice(0, parsed.data.limit).map(toPageBook),
+        has_more,
+      },
+      { headers: responseHeaders },
+    );
   } catch (error) {
     return json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }

@@ -126,3 +126,75 @@ export function createTelemetryClient(options: TelemetryOptions = {}) {
 }
 
 export type TelemetryClient = ReturnType<typeof createTelemetryClient>;
+
+export type VisibilityTrackingOptions = {
+  candidateId: number;
+  enabled?: boolean;
+  onVisible: (candidateId: number) => void;
+};
+
+export function observeRecommendationVisibility(
+  node: HTMLElement,
+  initialDetail: VisibilityTrackingOptions,
+) {
+  let detail = initialDetail;
+  let sent = false;
+  let observing = false;
+
+  const markVisible = () => {
+    if (sent || detail.enabled === false) return;
+    sent = true;
+    detail.onVisible(detail.candidateId);
+    stopObserving();
+  };
+
+  const observer =
+    typeof IntersectionObserver === "undefined"
+      ? undefined
+      : new IntersectionObserver(
+          (entries) => {
+            if (entries.some((entry) => entry.isIntersecting)) markVisible();
+          },
+          { threshold: 0.25 },
+        );
+
+  function startObserving() {
+    if (sent || detail.enabled === false) return;
+    if (observer) {
+      if (!observing) {
+        observer.observe(node);
+        observing = true;
+      }
+    } else {
+      markVisible();
+    }
+  }
+
+  function stopObserving() {
+    if (observer && observing) {
+      observer.disconnect();
+      observing = false;
+    }
+  }
+
+  startObserving();
+
+  return {
+    update(nextDetail: VisibilityTrackingOptions) {
+      const candidateChanged = nextDetail.candidateId !== detail.candidateId;
+      detail = nextDetail;
+      if (candidateChanged) {
+        sent = false;
+        stopObserving();
+      }
+      if (detail.enabled === false) {
+        stopObserving();
+      } else {
+        startObserving();
+      }
+    },
+    destroy() {
+      stopObserving();
+    },
+  };
+}

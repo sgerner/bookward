@@ -1,6 +1,6 @@
 <script lang="ts">
   import { applyAction, deserialize, enhance, type SubmitFunction } from "$app/forms";
-  import { invalidateAll, pushState } from "$app/navigation";
+  import { goto, invalidateAll, pushState } from "$app/navigation";
   import { page } from "$app/state";
   import { onMount, tick, untrack } from "svelte";
   import { flip } from "svelte/animate";
@@ -42,7 +42,10 @@
   import ProfileField from "#lib/components/ProfileField.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { tokenForView } from "#lib/api-token-ui.js";
-  import { createTelemetryClient } from "#lib/telemetry.js";
+  import {
+    createTelemetryClient,
+    observeRecommendationVisibility,
+  } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
@@ -105,7 +108,7 @@
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let discoverHasMore = $state(true);
+  let discoverHasMore = $state(untrack(() => data.recommendations_has_more ?? true));
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
   let decisionsHasMoreOverride = $state<boolean | null>(null);
@@ -241,12 +244,22 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
-  const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
+  const allBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const combined: PageBook[] = [];
+    for (const book of [
+      ...data.books,
+      ...data.decisions,
+      ...additionalDiscoverBooks,
+      ...additionalDecisionBooks,
+    ]) {
+      if (seen.has(book.id)) continue;
+      seen.add(book.id);
       const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
-  );
+      combined.push(status === undefined ? book : { ...book, status });
+    }
+    return combined;
+  });
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
@@ -705,6 +718,14 @@
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
       if (view !== "discover") url.searchParams.delete("digest");
+      if (
+        view === "discover" &&
+        !data.recommendation_run_id &&
+        data.books.some((book) => book.status === "recommended")
+      ) {
+        void goto(url);
+        return;
+      }
       pushState(url, {});
     }
   }
@@ -1332,31 +1353,12 @@
 
   function trackRecommendation(
     node: HTMLElement,
-    detail: { candidateId: number },
+    detail: { candidateId: number; enabled?: boolean },
   ) {
-    let sent = false;
-    const markVisible = () => {
-      if (sent) return;
-      sent = true;
-      recordBookEvent(detail.candidateId, "visible");
-      observer?.disconnect();
-    };
-    const observer =
-      typeof IntersectionObserver === "undefined"
-        ? undefined
-        : new IntersectionObserver(
-            (entries) => {
-              if (entries.some((entry) => entry.isIntersecting)) markVisible();
-            },
-            { threshold: 0.25 },
-          );
-    if (observer) observer.observe(node);
-    else markVisible();
-    return {
-      destroy() {
-        observer?.disconnect();
-      },
-    };
+    return observeRecommendationVisibility(node, {
+      ...detail,
+      onVisible: (candidateId) => recordBookEvent(candidateId, "visible"),
+    });
   }
 
   async function copyApiToken() {
@@ -1376,7 +1378,7 @@
     if (previousDataBooks === nextBooks) return;
     previousDataBooks = nextBooks;
     additionalDiscoverBooks = [];
-    discoverHasMore = true;
+    discoverHasMore = data.recommendations_has_more ?? true;
     discoverLoadError = "";
   });
 
@@ -1986,7 +1988,7 @@
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
             <article
-              use:trackRecommendation={{ candidateId: book.id }}
+              use:trackRecommendation={{ candidateId: book.id, enabled: view === "discover" }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}

@@ -76,6 +76,7 @@ from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
     build_decision_evidence,
+    is_discovery_run_metadata,
     record_event_in_connection,
     record_events,
     _impression_precedes,
@@ -1314,17 +1315,66 @@ def api_token_list():
     return identity_store.list_profile_api_tokens(current_profile_id() or "legacy")
 
 
-def tracked_recommendations(
+def _slice_discovery_pool(
+    *,
+    recommended: list[dict[str, Any]],
+    non_recommended: list[dict[str, Any]],
+    status: str | None,
+    limit: int | None,
+    offset: int,
+    recommended_limit: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, int, int | None]:
+    ranked = recommended if status == "recommended" else recommended + non_recommended
+    if recommended_limit is not None and status is None and offset == 0:
+        cap = max(0, int(recommended_limit))
+        discovery_slice = recommended[:cap]
+        remaining = [
+            item
+            for item in non_recommended
+            if item.get("status") in {"saved", "imported", "new"}
+        ]
+        recommendations = discovery_slice + remaining
+        has_more = len(recommended) > len(discovery_slice)
+        return recommendations, discovery_slice, has_more, 0, cap
+    start = max(0, int(offset))
+    end = None if limit is None else start + max(0, int(limit))
+    recommendations = ranked[start:end]
+    discovery_slice = [
+        item for item in recommendations if item.get("status") == "recommended"
+    ]
+    has_more = end is not None and len(ranked) > end
+    return recommendations, discovery_slice, has_more, start, limit
+
+
+def tracked_recommendations_page(
     *,
     status: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
     offset: int = 0,
     connection=None,
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
     private: dict | None = None,
-):
+    track_impressions: bool = True,
+) -> tuple[list[dict[str, Any]], str, bool]:
+    can_personalize = status in (None, "", "all", "recommended")
+    if not can_personalize:
+        fetch_limit = None if limit is None else max(0, int(limit)) + 1
+        batch = recommendation_list(
+            connection,
+            status=status,
+            limit=fetch_limit,
+            offset=offset,
+            recommended_limit=recommended_limit,
+            identity_context=identity_context,
+            include_imported=include_imported,
+        )
+        if limit is None:
+            return batch, "", False
+        cap = max(0, int(limit))
+        return batch[:cap], "", len(batch) > cap
+
     ranking_at = datetime.now(timezone.utc)
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
@@ -1341,157 +1391,179 @@ def tracked_recommendations(
         "adjusted_candidates": 0,
         "max_score_adjustment": 0.0,
     }
-    can_personalize = status in (None, "", "all", "recommended")
-    if can_personalize:
-        try:
-            # Score the full eligible recommendation pool before pagination so
-            # a learned preference can promote a strong match from below the
-            # unpersonalized page boundary.
-            ranked = recommendation_list(
-                connection,
-                status=status,
-                limit=None,
-                offset=0,
-                identity_context=identity_context,
-                include_imported=include_imported,
-            )
-            base_pool = [dict(item) for item in ranked]
-            interaction_events = load_interaction_events(connection)
-            # The event primary key orders actions; cached vectors are keyed by
-            # candidate id. Normalize only the cache inputs so learner event
-            # ordering and latest-event semantics keep their original ids.
-            cache_events = [
-                {**event, "id": event["candidate_id"]}
-                for event in interaction_events
-            ]
-            cached_vectors = load_cached_candidate_vectors(
-                [*ranked, *cache_events], connection
-            )
-            interaction_vectors = {
-                int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
-                for event in interaction_events
-                if int(event["candidate_id"]) in cached_vectors
-            }
-            ranked, diagnostics = personalize_recommendations(
-                ranked,
-                interaction_events,
-                now=ranking_at,
-                interaction_vectors=interaction_vectors,
-                candidate_vectors=cached_vectors,
-            )
-            if settings.impression_fatigue_enabled:
-                visible_day_counts = load_unacted_visible_impression_counts(
-                    connection,
-                    window_days=settings.impression_fatigue_window_days,
-                    now=ranking_at,
-                )
-                ranked, fatigue_diagnostics = apply_impression_fatigue(
-                    ranked,
-                    visible_day_counts,
-                    grace_days=settings.impression_fatigue_grace_days,
-                    penalty_per_day=settings.impression_fatigue_penalty_per_day,
-                    max_penalty=settings.impression_fatigue_max_penalty,
-                )
-                diagnostics["impression_fatigue"] = fatigue_diagnostics
-            personalized_pool = [dict(item) for item in ranked]
-            learning_metadata.update(diagnostics)
-            recommended = [
-                item for item in ranked if item.get("status") == "recommended"
-            ]
-            if recommended:
-                diversified, discovery_metadata = diversify_discovery_slate(
-                    recommended, cached_vectors
-                )
-                llm_cfg = effective_llm_rerank_settings(connection, private)
-                if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
-                    from .llm_reranker import rerank_with_llm_sync
-
-                    read_rows = (
-                        [
-                            dict(r)
-                            for r in connection.execute(
-                                "SELECT title, author, rating FROM reads ORDER BY id"
-                            ).fetchall()
-                        ]
-                        if connection is not None
-                        else rows("SELECT title, author, rating FROM reads ORDER BY id")
-                    )
-                    diversified, llm_diag = rerank_with_llm_sync(
-                        read_rows,
-                        diversified,
-                        interaction_events=interaction_events,
-                        api_url=llm_cfg["api_url"],
-                        api_key=llm_cfg["api_key"],
-                        model=llm_cfg["model"],
-                    )
-                    learning_metadata["llm_rerank"] = llm_diag
-                ranked = diversified + [
-                    item for item in ranked if item.get("status") != "recommended"
-                ]
-            else:
-                discovery_metadata = empty_discovery_slate_diagnostics(
-                    "no_recommended_candidates"
-                )
-            final_pool = [dict(item) for item in ranked]
-            if recommended_limit is not None and status is None and offset == 0:
-                recommended = [item for item in ranked if item.get("status") == "recommended"]
-                remaining = [
-                    item for item in ranked
-                    if item.get("status") in {"saved", "imported", "new"}
-                ]
-                recommendations = recommended[:max(0, int(recommended_limit))] + remaining
-            else:
-                start = max(0, int(offset))
-                end = None if limit is None else start + max(0, int(limit))
-                recommendations = ranked[start:end]
-        except Exception:
-            # Personalization must never take the recommendation service down.
-            # On malformed legacy evidence, return the existing champion order.
-            LOGGER.exception(
-                "Interaction personalization failed; serving the base ranking"
-            )
-            recommendations = recommendation_list(
-                connection,
-                status=status,
-                limit=limit,
-                offset=offset,
-                recommended_limit=recommended_limit,
-                identity_context=identity_context,
-                include_imported=include_imported,
-            )
-            learning_metadata = {
-                "mode": "base_ranker_fallback",
-                "scope": "installation",
-                "applied": False,
-                "observed_books": 0,
-                "qualified_features": 0,
-                "semantic_evidence_books": 0,
-                "semantic_adjusted_candidates": 0,
-                "adjusted_candidates": 0,
-                "max_score_adjustment": 0.0,
-            }
-            discovery_metadata = empty_discovery_slate_diagnostics(
-                "base_ranker_fallback"
-            )
-    else:
-        recommendations = recommendation_list(
+    try:
+        # Score the full eligible recommendation pool before pagination so
+        # a learned preference can promote a strong match from below the
+        # unpersonalized page boundary.
+        ranked = recommendation_list(
             connection,
+            status=status,
+            limit=None,
+            offset=0,
+            identity_context=identity_context,
+            include_imported=include_imported,
+        )
+        base_pool = [dict(item) for item in ranked]
+        interaction_events = load_interaction_events(connection)
+        # The event primary key orders actions; cached vectors are keyed by
+        # candidate id. Normalize only the cache inputs so learner event
+        # ordering and latest-event semantics keep their original ids.
+        cache_events = [
+            {**event, "id": event["candidate_id"]}
+            for event in interaction_events
+        ]
+        cached_vectors = load_cached_candidate_vectors(
+            [*ranked, *cache_events], connection
+        )
+        interaction_vectors = {
+            int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
+            for event in interaction_events
+            if int(event["candidate_id"]) in cached_vectors
+        }
+        ranked, diagnostics = personalize_recommendations(
+            ranked,
+            interaction_events,
+            now=ranking_at,
+            interaction_vectors=interaction_vectors,
+            candidate_vectors=cached_vectors,
+        )
+        if settings.impression_fatigue_enabled:
+            visible_day_counts = load_unacted_visible_impression_counts(
+                connection,
+                window_days=settings.impression_fatigue_window_days,
+                now=ranking_at,
+            )
+            ranked, fatigue_diagnostics = apply_impression_fatigue(
+                ranked,
+                visible_day_counts,
+                grace_days=settings.impression_fatigue_grace_days,
+                penalty_per_day=settings.impression_fatigue_penalty_per_day,
+                max_penalty=settings.impression_fatigue_max_penalty,
+            )
+            diagnostics["impression_fatigue"] = fatigue_diagnostics
+        personalized_pool = [dict(item) for item in ranked]
+        learning_metadata.update(diagnostics)
+        recommended = [
+            item for item in ranked if item.get("status") == "recommended"
+        ]
+        non_recommended = [
+            item for item in ranked if item.get("status") != "recommended"
+        ]
+        if recommended:
+            diversified, discovery_metadata = diversify_discovery_slate(
+                recommended, cached_vectors
+            )
+            llm_cfg = effective_llm_rerank_settings(connection, private)
+            if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
+                from .llm_reranker import rerank_with_llm_sync
+
+                read_rows = (
+                    [
+                        dict(r)
+                        for r in connection.execute(
+                            "SELECT title, author, rating FROM reads ORDER BY id"
+                        ).fetchall()
+                    ]
+                    if connection is not None
+                    else rows("SELECT title, author, rating FROM reads ORDER BY id")
+                )
+                diversified, llm_diag = rerank_with_llm_sync(
+                    read_rows,
+                    diversified,
+                    interaction_events=interaction_events,
+                    api_url=llm_cfg["api_url"],
+                    api_key=llm_cfg["api_key"],
+                    model=llm_cfg["model"],
+                )
+                learning_metadata["llm_rerank"] = llm_diag
+            # Sample the full discovery pool before pagination so shortlist/imported
+            # candidates never inflate tail_size and paginated discovery slices
+            # retain true full-pool marginal propensities.
+            if settings.exploration_enabled:
+                diversified = epsilon_tail_explore(
+                    diversified,
+                    epsilon=settings.exploration_epsilon,
+                    stable_top_k=settings.exploration_stable_top_k,
+                )
+            recommended = diversified
+        else:
+            discovery_metadata = empty_discovery_slate_diagnostics(
+                "no_recommended_candidates"
+            )
+        ranked = recommended if status == "recommended" else recommended + non_recommended
+        final_pool = [dict(item) for item in ranked]
+        (
+            recommendations,
+            discovery_slice,
+            has_more,
+            exposure_offset,
+            run_limit,
+        ) = _slice_discovery_pool(
+            recommended=recommended,
+            non_recommended=non_recommended,
             status=status,
             limit=limit,
             offset=offset,
             recommended_limit=recommended_limit,
+        )
+    except Exception:
+        # Personalization must never take the recommendation service down.
+        # On malformed legacy evidence, return the existing champion order.
+        LOGGER.exception(
+            "Interaction personalization failed; serving the base ranking"
+        )
+        fallback_pool = recommendation_list(
+            connection,
+            status=status,
+            limit=None,
+            offset=0,
             identity_context=identity_context,
             include_imported=include_imported,
         )
-    # Keep exploration outside the scorer and behind an environment flag.  A
-    # disabled deployment receives the same deterministic order and scores as
-    # before, while enabled traffic records exact tail propensities.
-    if settings.exploration_enabled:
-        recommendations = epsilon_tail_explore(
+        fallback_recommended = [
+            item for item in fallback_pool if item.get("status") == "recommended"
+        ]
+        fallback_other = [
+            item for item in fallback_pool if item.get("status") != "recommended"
+        ]
+        if settings.exploration_enabled and fallback_recommended:
+            fallback_recommended = epsilon_tail_explore(
+                fallback_recommended,
+                epsilon=settings.exploration_epsilon,
+                stable_top_k=settings.exploration_stable_top_k,
+            )
+        (
             recommendations,
-            epsilon=settings.exploration_epsilon,
-            stable_top_k=settings.exploration_stable_top_k,
+            discovery_slice,
+            has_more,
+            exposure_offset,
+            run_limit,
+        ) = _slice_discovery_pool(
+            recommended=fallback_recommended,
+            non_recommended=fallback_other,
+            status=status,
+            limit=limit,
+            offset=offset,
+            recommended_limit=recommended_limit,
         )
+        learning_metadata = {
+            "mode": "base_ranker_fallback",
+            "scope": "installation",
+            "applied": False,
+            "observed_books": 0,
+            "qualified_features": 0,
+            "semantic_evidence_books": 0,
+            "semantic_adjusted_candidates": 0,
+            "adjusted_candidates": 0,
+            "max_score_adjustment": 0.0,
+        }
+        discovery_metadata = empty_discovery_slate_diagnostics(
+            "base_ranker_fallback"
+        )
+
+    if not discovery_slice or not track_impressions:
+        return recommendations, "", has_more
+
     if base_pool is not None and personalized_pool is not None and final_pool is not None:
         decision_evidence = build_decision_evidence(
             connection,
@@ -1521,12 +1593,37 @@ def tracked_recommendations(
             "captured_at": ranking_at.isoformat(),
         }
     run_id = create_recommendation_run(
-        recommendations,
+        discovery_slice,
         decision_evidence=decision_evidence,
         status=status,
-        limit=limit,
+        limit=run_limit,
+        offset=exposure_offset,
         ranking_metadata=learning_metadata,
         discovery_slate_metadata=discovery_metadata,
+    )
+    return recommendations, run_id, has_more
+
+
+def tracked_recommendations(
+    *,
+    status: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    connection=None,
+    recommended_limit: int | None = None,
+    identity_context=None,
+    include_imported: bool = False,
+    private: dict | None = None,
+):
+    recommendations, run_id, _has_more = tracked_recommendations_page(
+        status=status,
+        limit=limit,
+        offset=offset,
+        connection=connection,
+        recommended_limit=recommended_limit,
+        identity_context=identity_context,
+        include_imported=include_imported,
+        private=private,
     )
     return recommendations, run_id
 
@@ -1536,6 +1633,7 @@ def overview_payload(
     include_api_tokens: bool = True,
     recommendation_limit: int | None = None,
     decision_limit: int = 24,
+    track_impressions: bool = True,
 ):
     def source_payload(source):
         item = dict(source)
@@ -1549,13 +1647,14 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        recommendations, run_id = tracked_recommendations(
+        recommendations, run_id, recommendations_has_more = tracked_recommendations_page(
             connection=connection,
             limit=recommendation_limit or 100,
             recommended_limit=recommendation_limit,
             identity_context=identity_context,
             include_imported=True,
             private=private,
+            track_impressions=track_impressions,
         )
         decision_batch = recommendation_list(
             connection,
@@ -1568,6 +1667,7 @@ def overview_payload(
         return {
             "counts": counts,
             "recommendations": recommendations,
+            "recommendations_has_more": recommendations_has_more,
             "decisions": decisions,
             "decisions_has_more": decisions_has_more,
             "recommendation_run_id": run_id,
@@ -1594,10 +1694,12 @@ async def health():
 def overview(
     recommendation_limit: int | None = Query(default=None, ge=1, le=100),
     decision_limit: int = Query(default=24, ge=1, le=24),
+    track_impressions: bool = Query(default=True),
 ):
     return overview_payload(
         recommendation_limit=recommendation_limit,
         decision_limit=decision_limit,
+        track_impressions=track_impressions,
     )
 
 
@@ -1907,15 +2009,19 @@ def recommendations(
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
     with connect() as connection:
-        values, run_id = tracked_recommendations(
+        values, run_id, has_more = tracked_recommendations_page(
             connection=connection,
             status=status,
             limit=limit,
             offset=offset,
         )
     for item in values:
-        item["recommendation_run_id"] = run_id
-    response.headers["X-Bookward-Recommendation-Run"] = run_id
+        item["recommendation_run_id"] = (
+            run_id if run_id and item.get("status") == "recommended" else ""
+        )
+    response.headers["X-Bookward-Has-More"] = "true" if has_more else "false"
+    if run_id:
+        response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
 
@@ -1970,15 +2076,20 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     impression = None
     if read_time is not None:
         prior_impressions = con.execute(
-            "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-            "FROM recommendation_impressions WHERE candidate_id=? "
-            "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+            "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+            "r.metadata AS run_metadata "
+            "FROM recommendation_impressions i "
+            "JOIN recommendation_runs r ON r.id=i.run_id "
+            "WHERE i.candidate_id=? "
+            "ORDER BY COALESCE(i.visible_at,i.presented_at) DESC,i.id DESC",
             (candidate["id"],),
         ).fetchall()
         impression = next(
             (
-                item for item in prior_impressions
-                if _impression_precedes(item, read_time, day_precision)
+                item
+                for item in prior_impressions
+                if is_discovery_run_metadata(item["run_metadata"])
+                and _impression_precedes(item, read_time, day_precision)
             ),
             None,
         )
@@ -3077,6 +3188,19 @@ def delete_api_token(token_id: int):
 @app.post("/api/tokens/{token_id}/revoke")
 def revoke_api_token(token_id: int):
     return _revoke_api_token(token_id)
+
+@app.get("/api/settings")
+def get_settings():
+    return safe_settings(include_api_tokens=False)
+
+
+@app.get("/api/sources")
+def list_sources():
+    return [
+        {**source, "filters": normalize_source_filters(source.get("filters"))}
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    ]
+
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):

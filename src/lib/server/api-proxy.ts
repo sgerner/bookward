@@ -83,9 +83,26 @@ export async function proxyApi(event: RequestEvent) {
   }
 
   const responseHeaders = corsHeaders(event.request, methods);
-  for (const name of ["cache-control", "content-type", "etag", "location", "www-authenticate"]) {
+  for (const name of [
+    "cache-control",
+    "content-type",
+    "etag",
+    "location",
+    "www-authenticate",
+    "x-bookward-has-more",
+    "x-bookward-recommendation-run",
+  ]) {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);
+  }
+  if (
+    responseHeaders.has("x-bookward-has-more") ||
+    responseHeaders.has("x-bookward-recommendation-run")
+  ) {
+    responseHeaders.set(
+      "access-control-expose-headers",
+      "X-Bookward-Has-More, X-Bookward-Recommendation-Run",
+    );
   }
   return new Response(upstream.body, {
     status: upstream.status,

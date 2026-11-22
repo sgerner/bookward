@@ -180,4 +180,32 @@ describe("public API proxy", () => {
       "https://client.example",
     );
   });
+
+  it("forwards recommendation pagination and run headers to API v1 callers", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-bookward-has-more": "true",
+            "x-bookward-recommendation-run": "run-v1-abc",
+          },
+        }),
+      ),
+    );
+    const request = new Request(
+      "http://bookward.test/api/v1/recommendations?status=recommended&limit=8&offset=24",
+      { headers: { origin: "https://client.example" } },
+    );
+
+    const response = await proxyApi(eventFor(request));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-bookward-has-more")).toBe("true");
+    expect(response.headers.get("x-bookward-recommendation-run")).toBe("run-v1-abc");
+    expect(response.headers.get("access-control-expose-headers")).toContain(
+      "X-Bookward-Has-More",
+    );
+  });
 });

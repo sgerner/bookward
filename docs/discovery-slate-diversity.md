@@ -10,9 +10,10 @@ and a replacement must be within five points of the displaced book's score.
 This lets a candidate from as low as rank 11 move into the first eight while
 keeping the rank movement bounded. The pass tries to avoid a third book by the
 same author in the visible slate and pairs whose current hash-valid candidate
-vectors have cosine similarity of at least 0.90. If it cannot find a
+vectors have cosine similarity of at least 0.75. If it cannot find a
 qualifying alternative, it leaves the book in place. Scores and explanations
-remain those produced by the existing ranker; only the item order changes.
+remain those produced by the existing ranker as relative ranking signals; only
+the item order changes.
 
 The author limit and similarity threshold are soft selection rules, not
 eligibility filters. They do not remove an author or a subject from the
@@ -30,8 +31,10 @@ outcomes can be separated from earlier ranking behavior.
 
 This is a conservative serving heuristic, not evidence that readers prefer a
 more varied list. Evaluate saves, passes, attributed ratings, and later
-reading outcomes by policy version before considering a broader MMR or other
-slate optimizer.
+reading outcomes by policy version—pairing raw-score `ips_auc` with within-run
+`ips_rank_concordance` and `ips_ndcg_at_k` so local swaps do not register as
+false score inversions—before considering a broader MMR or other slate
+optimizer.
 
 Engine checks cover author-repeat swaps, near-duplicate swaps, score and
 displacement bounds, deterministic pagination, and aggregate run metadata.

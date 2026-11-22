@@ -22,6 +22,7 @@ type BackupStatus = {
 type Overview = {
   counts?: { reads?: number };
   recommendation_run_id?: string;
+  recommendations_has_more?: boolean;
   recommendations: Array<{
     id: number;
     title: string;
@@ -125,7 +126,7 @@ type DigestSettings = {
   } | null;
 };
 
-export const load: PageServerLoad = async ({ url, locals }) => {
+export const load: PageServerLoad = async ({ url, request, locals }) => {
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
     interval_hours: 0,
@@ -135,9 +136,38 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     next_backup_at: null,
     backups: [],
   };
-  const overviewRequest = engine<Overview>(
-    "/api/overview?recommendation_limit=24&decision_limit=24",
-  );
+  let requestedView = url.searchParams.get("view");
+  const isInvalidatedDataRequest = (() => {
+    if (!request?.url) return false;
+    try {
+      return new URL(request.url).searchParams.has("x-sveltekit-invalidated");
+    } catch {
+      return false;
+    }
+  })();
+  if (
+    !requestedView &&
+    (request?.method === "POST" ||
+      isInvalidatedDataRequest ||
+      Array.from(url.searchParams.keys()).some((key) => key.startsWith("/")))
+  ) {
+    const referer = request?.headers?.get("referer");
+    if (referer) {
+      try {
+        requestedView = new URL(referer).searchParams.get("view");
+      } catch {
+        requestedView = null;
+      }
+    }
+  }
+  const isDiscoverView =
+    !requestedView ||
+    requestedView === "discover" ||
+    !["saved", "decisions", "sources", "settings"].includes(requestedView);
+  const overviewPath = isDiscoverView
+    ? "/api/overview?recommendation_limit=24&decision_limit=24"
+    : "/api/overview?recommendation_limit=24&decision_limit=24&track_impressions=false";
+  const overviewRequest = engine<Overview>(overviewPath);
   const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
     () => fallbackBackupStatus,
   );
@@ -172,10 +202,14 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   return {
     user: locals.user,
     recommendation_run_id: overview.recommendation_run_id ?? "",
+    recommendations_has_more: overview.recommendations_has_more,
     books: overview.recommendations.map((book) =>
       toPageBook({
         ...book,
-        recommendation_run_id: overview.recommendation_run_id ?? "",
+        recommendation_run_id:
+          book.status === "recommended"
+            ? (overview.recommendation_run_id ?? "")
+            : "",
       }),
     ),
     decisions: (overview.decisions ?? []).map((book) =>
@@ -505,10 +539,13 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  toggleDefault: async ({ request }) => {
+  toggleDefault: async () => {
     try {
-      const overview = await engine<Overview>("/api/overview");
-      const source = overview.sources.find((item) => item.is_default);
+      const payload = await engine<
+        Overview["sources"] | { sources: Overview["sources"] }
+      >("/api/sources");
+      const sources = Array.isArray(payload) ? payload : payload.sources;
+      const source = sources.find((item) => item.is_default);
       if (!source) return fail(404, { message: "Default source not found." });
       await engine(`/api/sources/${source.id}/toggle`, {
         method: "PUT",
@@ -606,17 +643,20 @@ export const actions: Actions = {
         message: "Enter a valid Librarr URL, API key, and media type.",
       });
     try {
-      const overview = await engine<Overview>("/api/overview");
-      if (!key.data && !overview.settings.librarr_api_key_set)
+      const payload = await engine<
+        Overview["settings"] | { settings: Overview["settings"] }
+      >("/api/settings");
+      const settings = "settings" in payload ? payload.settings : payload;
+      if (!key.data && !settings.librarr_api_key_set)
         return fail(400, {
           message: "Enter a Librarr API key for the first connection.",
         });
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
-          embedding_backend: overview.settings.embedding_backend,
-          embedding_model: overview.settings.embedding_model,
-          embedding_url: overview.settings.embedding_url,
+          embedding_backend: settings.embedding_backend,
+          embedding_model: settings.embedding_model,
+          embedding_url: settings.embedding_url,
           embedding_api_key: "",
           librarr_url: url.data,
           librarr_api_key: key.data,
@@ -652,7 +692,10 @@ export const actions: Actions = {
     if (!backend.success || !model.success)
       return fail(400, { message: "Choose an embedding backend and model." });
     try {
-      const overview = await engine<Overview>("/api/overview");
+      const payload = await engine<
+        Overview["settings"] | { settings: Overview["settings"] }
+      >("/api/settings");
+      const settings = "settings" in payload ? payload.settings : payload;
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -660,9 +703,9 @@ export const actions: Actions = {
           embedding_model: model.data,
           embedding_url: String(data.get("url") || ""),
           embedding_api_key: String(data.get("apiKey") || ""),
-          librarr_url: overview.settings.librarr_url,
+          librarr_url: settings.librarr_url,
           librarr_api_key: "",
-          librarr_media_type: overview.settings.librarr_media_type,
+          librarr_media_type: settings.librarr_media_type,
         }),
       });
       return { message: "Embedding provider saved and checked." };
