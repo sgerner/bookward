@@ -75,7 +75,61 @@ describe('authentication boundary', () => {
 		} as never);
 
 		expect(response.status).toBe(403);
+		await expect(response.json()).resolves.toEqual({
+			detail: 'Request origin could not be verified',
+			message: 'Request origin could not be verified.'
+		});
 		expect(fetchMock).not.toHaveBeenCalled();
+
+		const linkRequest = new Request('http://afterword.test/auth/oidc/start?intent=link', {
+			headers: { origin: 'https://attacker.test' }
+		});
+		const linkResponse = await handle({
+			event: eventFor(linkRequest, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(linkResponse.status).toBe(403);
+		await expect(linkResponse.json()).resolves.toMatchObject({
+			message: 'Request origin could not be verified.'
+		});
+	});
+
+	it('uses protocol-matched Secure flags when refreshing or deleting session cookies', async () => {
+		mockSessionLookup();
+		const httpEvent = eventFor(new Request('http://127.0.0.1:3000/'), 'valid-session');
+		await handle({
+			event: httpEvent,
+			resolve: vi.fn(() => Promise.resolve(new Response('ok')))
+		} as never);
+		expect((httpEvent as { cookies: { set: ReturnType<typeof vi.fn> } }).cookies.set).toHaveBeenCalledWith(
+			'bookward_session',
+			'valid-session',
+			expect.objectContaining({ httpOnly: true, secure: false, sameSite: 'lax', path: '/' })
+		);
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockImplementation(
+				() =>
+					new Response(JSON.stringify({ detail: 'Invalid session' }), {
+						status: 401,
+						headers: { 'content-type': 'application/json' }
+					})
+			)
+		);
+		const expiredHttpsEvent = eventFor(new Request('https://books.example.com/login'), 'expired');
+		await handle({
+			event: expiredHttpsEvent,
+			resolve: vi.fn(() => Promise.resolve(new Response('ok')))
+		} as never);
+		expect(
+			(expiredHttpsEvent as { cookies: { delete: ReturnType<typeof vi.fn> } }).cookies.delete
+		).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/'
+		});
 	});
 
 	it('binds authenticated mutations to the current profile and request session', async () => {

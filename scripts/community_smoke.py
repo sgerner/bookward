@@ -52,9 +52,10 @@ def main():
                    AFTERWORD_EMBEDDING_MODEL="hashing-768", AFTERWORD_EMBEDDING_API_KEY="",
                    AFTERWORD_SECRET_KEY="", AFTERWORD_OIDC_ISSUER="", AFTERWORD_OIDC_CLIENT_ID="",
                    AFTERWORD_PUBLIC_URL=origin, ENGINE_SERVICE_SECRET="isolated-smoke-service",
-                   ENGINE_URL=f"http://127.0.0.1:{engine_port}", ORIGIN=origin,
-                   HOST="127.0.0.1", PORT=str(web_port), OIDC_AUTO_LOGIN="false",
-                   PROTOCOL_HEADER="x-forwarded-proto")
+                   ENGINE_URL=f"http://127.0.0.1:{engine_port}", ORIGIN="",
+                   HOST="127.0.0.1", PORT=str(web_port), OIDC_AUTO_LOGIN="false")
+        env.pop("PROTOCOL_HEADER", None)
+        env.pop("HOST_HEADER", None)
         processes = []
         with tempfile.TemporaryFile(mode="w+") as logs:
             try:
@@ -63,8 +64,8 @@ def main():
                     "afterword_engine.main:app", "--app-dir", "engine", "--host", "127.0.0.1",
                     "--port", str(engine_port),
                 ], cwd=root, env=env, stdout=logs, stderr=logs))
-                processes.append(subprocess.Popen(["node", "build"], cwd=root, env=env, stdout=logs, stderr=logs))
-                with httpx.Client(base_url=origin, timeout=15, headers={"accept": "text/html", "x-forwarded-proto": "http"}) as client:
+                processes.append(subprocess.Popen(["node", "server.js"], cwd=root, env=env, stdout=logs, stderr=logs))
+                with httpx.Client(base_url=origin, timeout=15, headers={"accept": "text/html"}) as client:
                     for _ in range(100):
                         if any(process.poll() is not None for process in processes):
                             raise RuntimeError("A smoke-test service exited before startup")
@@ -77,9 +78,25 @@ def main():
                     else:
                         raise RuntimeError("Smoke-test services did not become ready")
                     assert client.get("/").status_code == 303
-                    response = client.post("/login?/setup", data={"username": "smoke-reader",
-                        "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
+                    blocked = client.post(
+                        "/login?/setup",
+                        data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+                        headers={"origin": "https://attacker.example", "accept": "application/json"},
+                    )
+                    assert blocked.status_code == 403, (blocked.status_code, blocked.text[:200])
+                    assert blocked.json().get("message")
+                    response = client.post(
+                        "/login?/setup",
+                        data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+                        headers={
+                            "origin": origin,
+                            "x-forwarded-proto": "https",
+                            "x-forwarded-host": "evil.example",
+                        },
+                    )
                     assert response.status_code == 303, (response.status_code, response.text[:200])
+                    set_cookie = response.headers.get("set-cookie", "")
+                    assert "bookward_session=" in set_cookie and "Secure" not in set_cookie, set_cookie
                     assert "bookward_session" in client.cookies
                     profile_id = None
                     for path in ["/", "/?view=sources", "/?view=settings", "/account", "/admin"]:
@@ -97,11 +114,18 @@ def main():
                         headers={"origin": origin}).status_code == 409
                     assert client.get("/api/v1/recommendations").status_code == 401
                     assert profile_id
-                    assert client.post("/auth/logout", data={"__profile_id": profile_id},
-                        headers={"origin": origin}).status_code == 303
+                    logout_response = client.post("/auth/logout", data={"__profile_id": profile_id},
+                        headers={"origin": origin})
+                    assert logout_response.status_code == 303
+                    logout_cookie = logout_response.headers.get("set-cookie", "")
+                    assert "bookward_session=" in logout_cookie and "Secure" not in logout_cookie, logout_cookie
                     assert client.get("/").status_code == 303
-                    response = client.post("/login?/login", data={"username": "smoke-reader",
-                        "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
+                    localhost_origin = f"http://localhost:{web_port}"
+                    response = client.post(
+                        "/login?/login",
+                        data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+                        headers={"host": f"localhost:{web_port}", "origin": localhost_origin},
+                    )
                     assert response.status_code == 303
                     assert client.get("/").status_code == 200
                     print("PASS: setup, sign-in/out, authenticated views, SSR form bindings, stale-profile guard, API authentication")

@@ -2,9 +2,12 @@ import type { Handle } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
 import { timingSafeEqual } from 'node:crypto';
 import { EngineError, engine } from '#lib/server/engine.js';
+import {
+	SESSION_COOKIE,
+	sessionCookieDeleteOptions,
+	sessionCookieOptions
+} from '#lib/server/cookies.js';
 import { withSessionToken } from '#lib/server/request-context.js';
-
-const SESSION_COOKIE = 'bookward_session';
 
 // Kept as a narrow utility for installations migrating from the former
 // Basic-auth configuration. It is no longer used as the browser auth flow.
@@ -82,6 +85,14 @@ async function submittedProfile(request: Request): Promise<string> {
 	return '';
 }
 
+function originVerificationFailed() {
+	const detail = 'Request origin could not be verified';
+	return withSecurityHeaders(new Response(JSON.stringify({ detail, message: `${detail}.` }), {
+		status: 403,
+		headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+	}));
+}
+
 export const handle: Handle = async ({ event, resolve }) => {
 	const path = event.url.pathname;
 	const session = event.cookies.get(SESSION_COOKIE);
@@ -96,16 +107,14 @@ export const handle: Handle = async ({ event, resolve }) => {
 		try { sameOriginReferrer = Boolean(referrer) && new URL(referrer!).origin === event.url.origin; } catch { /* Reject malformed referrers. */ }
 		if ((origin && origin !== event.url.origin) ||
 			(!origin && !sameOriginReferrer && fetchSite !== 'same-origin')) {
-			return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Request origin could not be verified' }), {
-				status: 403, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
-			}));
+			return originVerificationFailed();
 		}
 	}
 	if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
 		const origin = event.request.headers.get('origin');
 		const fetchSite = event.request.headers.get('sec-fetch-site');
 		if ((origin && origin !== event.url.origin) || (!origin && fetchSite !== 'same-origin')) {
-			return withSecurityHeaders(new Response('Request origin could not be verified', { status: 403 }));
+			return originVerificationFailed();
 		}
 	}
 
@@ -117,7 +126,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (path === '/login' && session) {
 		const user = await sessionUser(session);
 		if (user) throw redirect(303, '/');
-		event.cookies.delete(SESSION_COOKIE, { path: '/' });
+		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		return withSecurityHeaders(await resolve(event));
 	}
 
@@ -131,7 +140,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const user = await sessionUser(session);
 	if (!user) {
-		event.cookies.delete(SESSION_COOKIE, { path: '/' });
+		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		if (callback) return withSecurityHeaders(await resolve(event));
 		if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
 		throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
@@ -148,9 +157,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 	event.locals.user = user;
 	if (user.must_change_password && path !== '/account' && !path.startsWith('/auth/')) throw redirect(303, '/account?force_password_change=1');
-	event.cookies.set(SESSION_COOKIE, session, {
-		httpOnly: true, secure: event.url.protocol === 'https:', sameSite: 'lax', path: '/', maxAge: 24 * 60 * 60
-	});
+	event.cookies.set(SESSION_COOKIE, session, sessionCookieOptions(event.url));
 	const response = await withSessionToken(session, () => resolve(event));
 	response.headers.set('cache-control', 'private, no-store');
 	return withSecurityHeaders(response);

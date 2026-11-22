@@ -241,7 +241,7 @@ Docker is the easiest way to run Bookward as a small self-hosted service.
 cp .env.example .env
 ~~~
 
-Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. Compose embeds `ORIGIN` in the web build, so rebuild with `docker compose up --build` after changing it. Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
+For local or private-network HTTP runs, leave `ORIGIN` blank and Bookward will resolve the origin from the connection and `Host` header automatically. For a public domain, set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open; behind a trusted reverse proxy that overwrites forwarded headers, you can also set `PROTOCOL_HEADER=x-forwarded-proto` and `HOST_HEADER=x-forwarded-host`. `ORIGIN`, `PROTOCOL_HEADER`, and `HOST_HEADER` are runtime settings on the web container, so restart with `docker compose up -d` after changing them (no image rebuild needed). Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
 
 ~~~
 docker compose up --build -d
@@ -291,7 +291,8 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 
 | Variable | Purpose |
 | --- | --- |
-| `ORIGIN` | Canonical browser origin embedded in the web build. |
+| `ORIGIN` | Optional canonical browser origin checked at runtime for mutations and `Secure` cookies; derived from the connection or trusted proxy headers when blank. |
+| `PROTOCOL_HEADER` / `HOST_HEADER` | Optional trusted reverse-proxy header names (such as `x-forwarded-proto` and `x-forwarded-host`) read at runtime when `ORIGIN` is blank. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
 | `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional one-time bootstrap credentials for the first administrator, or compatibility migration from existing Basic authentication. |
