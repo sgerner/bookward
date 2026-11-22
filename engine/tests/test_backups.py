@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
@@ -136,7 +137,7 @@ def test_restore_makes_a_safety_snapshot_and_recovers_all_rows(database):
         ).fetchone() == (1,)
 
 
-def test_restore_rejects_a_non_bookward_file_without_changing_live_data(database):
+def test_restore_rejects_a_non_bookward_file_without_changing_live_data(database, caplog):
     (database / "backups").mkdir(exist_ok=True)
     invalid_id = "bookward-20260101T000000Z-deadbeef"
     invalid = database / "backups" / f"{invalid_id}.sqlite3"
@@ -148,9 +149,16 @@ def test_restore_rejects_a_non_bookward_file_without_changing_live_data(database
             ("Keep me", "Reader", "test"),
         )
 
-    with pytest.raises(backups.BackupError, match="not a Bookward database backup"):
-        backups.restore_backup(invalid_id)
+    with caplog.at_level(logging.ERROR, logger="afterword_engine.backups"):
+        with pytest.raises(backups.BackupError, match="not a Bookward database backup") as exc_info:
+            backups.restore_backup(invalid_id)
 
+    assert exc_info.value.__cause__ is None
+    assert caplog.records == []
+    assert backups.backup_status()["last_error"] == (
+        "Restore failed; the previous database remains active. "
+        "This file is not a Bookward database backup."
+    )
     assert row("SELECT 1 FROM reads WHERE title='Keep me'") is not None
 
 
@@ -224,6 +232,182 @@ def test_restore_rejects_a_mismatched_generated_key_before_replacement(database)
 
     assert row("SELECT 1 FROM reads WHERE title='Live data'") is not None
     key_sidecar.write_bytes(original_key)
+
+
+def _prepare_distinct_backup_and_live_state(database: Path) -> dict:
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Selected snapshot", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("selected_secret", seal("selected key")),
+        )
+    selected = backups.create_backup()
+
+    Path(settings.db).unlink()
+    Path(f"{settings.db}-wal").unlink(missing_ok=True)
+    Path(f"{settings.db}-shm").unlink(missing_ok=True)
+    (database / "secret.key").unlink()
+    initialize()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Live before restore", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("live_secret", seal("live key")),
+        )
+    return selected
+
+
+def test_restore_rolls_back_snapshot_and_key_on_post_swap_backup_error(
+    database, monkeypatch, caplog
+):
+    selected = _prepare_distinct_backup_and_live_state(database)
+    real_clear_journal = backups._clear_restore_journal
+    primary_error = backups.BackupError("post-swap check failed")
+    calls = 0
+
+    def fail_once_after_swap():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert row("SELECT 1 FROM reads WHERE title='Selected snapshot'") is not None
+            assert private_setting("selected_secret") == "selected key"
+            raise primary_error
+        real_clear_journal()
+
+    monkeypatch.setattr(backups, "_clear_restore_journal", fail_once_after_swap)
+
+    with caplog.at_level(logging.ERROR, logger="afterword_engine.backups"):
+        with pytest.raises(backups.BackupError) as exc_info:
+            backups.restore_backup(selected["id"])
+
+    assert exc_info.value is primary_error
+    assert exc_info.value.__cause__ is None
+    assert caplog.records == []
+    assert not backups._restore_journal_path().exists()
+    assert row("SELECT 1 FROM reads WHERE title='Live before restore'") is not None
+    assert row("SELECT 1 FROM reads WHERE title='Selected snapshot'") is None
+    assert private_setting("live_secret") == "live key"
+    assert backups.backup_status()["last_error"] == (
+        "Restore failed; the previous database remains active. post-swap check failed"
+    )
+
+
+def test_restore_rolls_back_and_chains_unexpected_post_swap_exception(
+    database, monkeypatch, caplog
+):
+    selected = _prepare_distinct_backup_and_live_state(database)
+    real_clear_journal = backups._clear_restore_journal
+    unexpected = RuntimeError("journal sync boom")
+    calls = 0
+
+    def fail_once_after_swap():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert row("SELECT 1 FROM reads WHERE title='Selected snapshot'") is not None
+            assert private_setting("selected_secret") == "selected key"
+            raise unexpected
+        real_clear_journal()
+
+    monkeypatch.setattr(backups, "_clear_restore_journal", fail_once_after_swap)
+
+    with caplog.at_level(logging.ERROR, logger="afterword_engine.backups"):
+        with pytest.raises(backups.BackupError) as exc_info:
+            backups.restore_backup(selected["id"])
+
+    expected_message = (
+        "Restore failed; the previous database remains active. journal sync boom"
+    )
+    assert str(exc_info.value) == expected_message
+    assert exc_info.value.__cause__ is unexpected
+    assert [record.getMessage() for record in caplog.records] == [
+        "Bookward restore failed"
+    ]
+    assert caplog.records[0].exc_info[1] is unexpected
+    assert not backups._restore_journal_path().exists()
+    assert row("SELECT 1 FROM reads WHERE title='Live before restore'") is not None
+    assert row("SELECT 1 FROM reads WHERE title='Selected snapshot'") is None
+    assert private_setting("live_secret") == "live key"
+    assert backups.backup_status()["last_error"] == expected_message
+
+
+def test_restore_secondary_rollback_failure_chains_error_and_cleans_unswapped_stage(
+    database, monkeypatch, caplog
+):
+    selected = _prepare_distinct_backup_and_live_state(database)
+    real_copy_to_stage = backups._copy_to_stage
+    primary_error = backups.BackupError("active database could not close")
+    staged_paths: list[Path] = []
+    copy_calls = 0
+
+    def copy_or_fail_rollback(source: Path, directory: Path) -> Path:
+        nonlocal copy_calls
+        copy_calls += 1
+        if copy_calls == 1:
+            staged = real_copy_to_stage(source, directory)
+            staged_paths.append(staged)
+            return staged
+        raise OSError("rollback stage copy failed")
+
+    def fail_live_swap(staged: Path, key_source: Path | None = None) -> None:
+        Path(f"{staged}-wal").write_bytes(b"unswapped wal")
+        raise primary_error
+
+    monkeypatch.setattr(backups, "_copy_to_stage", copy_or_fail_rollback)
+    monkeypatch.setattr(backups, "_replace_live_database", fail_live_swap)
+
+    with caplog.at_level(logging.ERROR, logger="afterword_engine.backups"):
+        with pytest.raises(backups.BackupError) as exc_info:
+            backups.restore_backup(selected["id"])
+
+    expected_message = (
+        "Restore failed; automatic rollback did not complete. "
+        "active database could not close"
+    )
+    assert exc_info.value is not primary_error
+    assert str(exc_info.value) == expected_message
+    assert exc_info.value.__cause__ is primary_error
+    assert [record.getMessage() for record in caplog.records] == [
+        "Failed to roll back an unsuccessful Bookward restore"
+    ]
+    assert backups.backup_status()["last_error"] == expected_message
+    assert len(staged_paths) == 1
+    assert not staged_paths[0].exists()
+    assert not Path(f"{staged_paths[0]}-wal").exists()
+
+
+def test_restore_missing_safety_backup_marks_rollback_failed(
+    database, monkeypatch, caplog
+):
+    selected = _prepare_distinct_backup_and_live_state(database)
+    primary_error = backups.BackupError("post-swap check failed")
+
+    monkeypatch.setattr(backups, "_create_snapshot_unlocked", lambda: None)
+    monkeypatch.setattr(backups, "_write_restore_journal", lambda *_args: None)
+    monkeypatch.setattr(
+        backups,
+        "_clear_restore_journal",
+        lambda: (_ for _ in ()).throw(primary_error),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="afterword_engine.backups"):
+        with pytest.raises(backups.BackupError) as exc_info:
+            backups.restore_backup(selected["id"])
+
+    expected_message = (
+        "Restore failed; automatic rollback did not complete. post-swap check failed"
+    )
+    assert exc_info.value is not primary_error
+    assert str(exc_info.value) == expected_message
+    assert exc_info.value.__cause__ is primary_error
+    assert caplog.records == []
+    assert backups.backup_status()["last_error"] == expected_message
 
 
 def test_startup_recovery_rolls_back_an_interrupted_database_and_key_swap(database):

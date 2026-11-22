@@ -10,9 +10,10 @@ instead of relying on the API's debugging-only title field.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
