@@ -803,3 +803,118 @@ def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unc
         assert test_ok.status_code == 200
         assert test_ok.json()["ok"] is True
         assert probe_calls == 3
+
+
+def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) -> None:
+    import asyncio
+    import socket
+    import httpx
+    import pytest
+    import afterword_engine.llm_reranker as reranker_module
+    from afterword_engine.config import settings
+
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    with pytest.raises(ValueError):
+        reranker_module.validate_llm_api_url("https://llm.example/v1/../admin")
+
+    captured: list[dict] = []
+
+    class InspectingAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):
+            captured.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", InspectingAsyncClient)
+    probe_res = asyncio.run(
+        reranker_module.probe_llm_reranker(
+            api_url="https://llm.example:8443/v1",
+            api_key="sk-probe-key",
+            model="gpt-4o-mini",
+        )
+    )
+    assert probe_res == {"ok": True, "checked": True, "model": "gpt-4o-mini"}
+    assert captured[-1]["url"] == "https://93.184.216.34:8443/v1/chat/completions"
+    assert captured[-1]["headers"]["Host"] == "llm.example:8443"
+    assert captured[-1]["extensions"] == {"sni_hostname": "llm.example"}
+
+    # Allowlisted internal hosts use the operator-configured host directly without SNI override.
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
+    asyncio.run(
+        reranker_module.probe_llm_reranker(
+            api_url="http://ollama:11434/v1",
+            api_key="sk-local",
+            model="llama3.2",
+        )
+    )
+    assert captured[-1]["url"] == "http://ollama:11434/v1/chat/completions"
+    assert "Host" not in captured[-1]["headers"]
+    assert "extensions" not in captured[-1]
+
+    # PBKDF2 fingerprints isolate slate cache keys and circuit-breaker state across API keys.
+    k1 = reranker_module.build_slate_cache_key(
+        messages=[{"role": "user", "content": "{}"}],
+        interaction_events=None,
+        api_url="https://llm.example/v1",
+        api_key="sk-key-one",
+        model="gpt-4o-mini",
+        top_k=24,
+        max_delta=1.2,
+    )
+    k2 = reranker_module.build_slate_cache_key(
+        messages=[{"role": "user", "content": "{}"}],
+        interaction_events=None,
+        api_url="https://llm.example/v1",
+        api_key="sk-key-two",
+        model="gpt-4o-mini",
+        top_k=24,
+        max_delta=1.2,
+    )
+    assert k1 != k2
+    assert "sk-key-one" not in k1
+
+    reranker_module.trip_circuit_breaker(
+        "profile-kdf-test",
+        api_url="https://llm.example/v1",
+        api_key="sk-key-one",
+        model="gpt-4o-mini",
+        error="HTTP 401",
+    )
+    assert (
+        reranker_module.get_circuit_breaker_state(
+            "profile-kdf-test",
+            api_url="https://llm.example/v1",
+            api_key="sk-key-one",
+            model="gpt-4o-mini",
+        )
+        is not None
+    )
+    assert (
+        reranker_module.get_circuit_breaker_state(
+            "profile-kdf-test",
+            api_url="https://llm.example/v1",
+            api_key="sk-key-two",
+            model="gpt-4o-mini",
+        )
+        is None
+    )

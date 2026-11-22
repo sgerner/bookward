@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 import hashlib
+import ipaddress
 import json
 import logging
+import re
+import secrets
 import threading
 import time
 from typing import Any, Sequence
@@ -15,7 +18,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import settings
-from .security import safe_error_message, validate_service_url
+from .security import resolve_public_target, safe_error_message, validate_service_url
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
@@ -23,6 +26,9 @@ LOGGER = logging.getLogger(__name__)
 MAX_CACHED_PROFILES = 64
 MAX_CACHE_ENTRIES_PER_PROFILE = 8
 LLM_CIRCUIT_COOLDOWN_SECONDS = 300.0
+_KEY_FINGERPRINT_SALT = secrets.token_bytes(16)
+_KEY_FINGERPRINT_ITERATIONS = 100_000
+_SAFE_LLM_PATH_RE = re.compile(r"^/[A-Za-z0-9._~:/=-]*$")
 
 _STATE_LOCK = threading.Lock()
 _SLATE_CACHE: OrderedDict[str, OrderedDict[str, dict[str, Any]]] = OrderedDict()
@@ -72,7 +78,76 @@ def validate_llm_api_url(url: str, allowed_hosts: set[str] | None = None) -> str
         raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
     hosts = llm_allowed_hosts() if allowed_hosts is None else allowed_hosts
     validate_service_url(cleaned, hosts)
-    return _normalize_chat_url(cleaned)
+    normalized = _normalize_chat_url(cleaned)
+    norm_path = urlparse(normalized).path or "/"
+    if ".." in norm_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(norm_path):
+        raise ValueError("LLM API URL contains an invalid path")
+    return normalized
+
+
+def _prepare_llm_request_target(
+    url: str, allowed_hosts: set[str] | None = None
+) -> tuple[str, dict[str, str], dict[str, str] | None]:
+    """Validate and pin an outbound LLM endpoint URL against SSRF and DNS rebinding."""
+    normalized = validate_llm_api_url(url, allowed_hosts=allowed_hosts)
+    parsed = urlparse(normalized)
+    if parsed.scheme == "https":
+        scheme = "https"
+        default_port = 443
+    elif parsed.scheme == "http":
+        scheme = "http"
+        default_port = 80
+    else:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+
+    port = parsed.port
+    port_suffix = ""
+    if port is not None and port != default_port:
+        port_str = str(port)
+        if not port_str.isdigit():
+            raise ValueError("Invalid LLM API URL port")
+        port_suffix = f":{port_str}"
+
+    raw_path = parsed.path or "/"
+    if ".." in raw_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(raw_path):
+        raise ValueError("LLM API URL contains an invalid path")
+
+    requested_host = (parsed.hostname or "").lower().rstrip(".")
+    if not requested_host:
+        raise ValueError("LLM API URL must include a hostname")
+
+    hosts = llm_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    matched_allowed: str | None = None
+    for allowed_host in hosts:
+        if allowed_host and requested_host == allowed_host:
+            matched_allowed = allowed_host
+            break
+
+    if matched_allowed is not None:
+        connect_host = f"[{matched_allowed}]" if ":" in matched_allowed else matched_allowed
+        return f"{scheme}://{connect_host}{port_suffix}{raw_path}", {}, None
+
+    _, address, resolved_host = resolve_public_target(
+        normalized, allow_http=(scheme == "http")
+    )
+    try:
+        ipaddress.ip_address(resolved_host)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    connect_host = f"[{address}]" if ":" in address else address
+    formatted_host = f"[{resolved_host}]" if ":" in resolved_host else resolved_host
+    host_header = formatted_host if not port_suffix else f"{formatted_host}{port_suffix}"
+    extensions = (
+        {"sni_hostname": resolved_host}
+        if scheme == "https" and not is_ip_literal
+        else None
+    )
+    return (
+        f"{scheme}://{connect_host}{port_suffix}{raw_path}",
+        {"Host": host_header},
+        extensions,
+    )
 
 
 def sanitize_llm_error(error: Any, api_key: str = "", limit: int = 300) -> str:
@@ -87,6 +162,19 @@ def sanitize_llm_error(error: Any, api_key: str = "", limit: int = 300) -> str:
     return redacted
 
 
+def _derive_api_key_fingerprint(api_key: str) -> str:
+    """Derive a non-reversible PBKDF2 fingerprint for in-memory cache isolation."""
+    if not api_key:
+        return ""
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        _KEY_FINGERPRINT_SALT,
+        _KEY_FINGERPRINT_ITERATIONS,
+        dklen=16,
+    ).hex()
+
+
 def _config_fingerprint(
     *,
     api_url: str,
@@ -95,11 +183,9 @@ def _config_fingerprint(
     top_k: int,
     max_delta: float,
 ) -> str:
-    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16] if api_key else ""
-    payload = json.dumps(
+    non_secret_payload = json.dumps(
         {
             "url": _normalize_chat_url(api_url),
-            "key": key_hash,
             "model": model.strip(),
             "top_k": int(top_k),
             "max_delta": round(float(max_delta), 4),
@@ -107,7 +193,9 @@ def _config_fingerprint(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    cfg_digest = hashlib.sha256(non_secret_payload.encode("utf-8")).hexdigest()[:24]
+    key_fp = _derive_api_key_fingerprint(api_key)
+    return f"{cfg_digest}:{key_fp}"
 
 
 def build_slate_cache_key(
@@ -139,7 +227,6 @@ def build_slate_cache_key(
     ]
     digest_payload = json.dumps(
         {
-            "cfg": cfg_fp,
             "messages": list(messages),
             "feedback": feedback_tail,
         },
@@ -147,7 +234,8 @@ def build_slate_cache_key(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+    slate_digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+    return f"{cfg_fp}:{slate_digest}"
 
 
 def get_cached_slate_payload(profile_key: str, cache_key: str) -> dict[str, Any] | None:
@@ -200,6 +288,14 @@ def get_circuit_breaker_state(
     top_k: int | None = None,
     max_delta: float | None = None,
 ) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
     cfg_fp = _config_fingerprint(
         api_url=api_url,
         api_key=api_key,
@@ -588,7 +684,9 @@ async def probe_llm_reranker(
         raise ValueError("An API key is required to test the LLM reranker")
     if not chosen_model:
         raise ValueError("A model is required to test the LLM reranker")
-    url = validate_llm_api_url(api_url, allowed_hosts=allowed_hosts)
+    target_url, host_headers, extensions = _prepare_llm_request_target(
+        api_url, allowed_hosts=allowed_hosts
+    )
     timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
     probe_messages = [
         {
@@ -600,6 +698,7 @@ async def probe_llm_reranker(
             "content": '{"candidates": []}',
         },
     ]
+    extra_kwargs: dict[str, Any] = {"extensions": extensions} if extensions else {}
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -607,19 +706,24 @@ async def probe_llm_reranker(
             trust_env=False,
         ) as client:
             response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                target_url,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    **host_headers,
+                },
                 json={
                     "model": chosen_model,
                     "temperature": 0.0,
                     "response_format": {"type": "json_object"},
                     "messages": probe_messages,
                 },
+                **extra_kwargs,
             )
             _extract_response_content(response)
     except Exception as exc:
         raise RuntimeError(sanitize_llm_error(exc, api_key=key)) from exc
-    return {"ok": True, "checked": True, "model": chosen_model, "api_url": url}
+    return {"ok": True, "checked": True, "model": chosen_model}
 
 
 async def rerank_with_llm(
@@ -647,24 +751,32 @@ async def rerank_with_llm(
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
     try:
-        url = validate_llm_api_url(raw_url, allowed_hosts=allowed_hosts)
+        target_url, host_headers, extensions = _prepare_llm_request_target(
+            raw_url, allowed_hosts=allowed_hosts
+        )
         messages = build_rerank_prompt(
             reads, candidates, interaction_events=interaction_events, top_k=k
         )
+        extra_kwargs: dict[str, Any] = {"extensions": extensions} if extensions else {}
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
         ) as client:
             response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                target_url,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    **host_headers,
+                },
                 json={
                     "model": chosen_model,
                     "temperature": 0.0,
                     "response_format": {"type": "json_object"},
                     "messages": messages,
                 },
+                **extra_kwargs,
             )
             parsed = _extract_response_content(response)
             reranked, diag, cache_entry = _parse_rerank_payload(
@@ -709,7 +821,9 @@ def rerank_with_llm_sync(
         return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
 
     try:
-        url = validate_llm_api_url(raw_url, allowed_hosts=allowed_hosts)
+        target_url, host_headers, extensions = _prepare_llm_request_target(
+            raw_url, allowed_hosts=allowed_hosts
+        )
         messages = (
             list(prebuilt_messages)
             if prebuilt_messages is not None
@@ -717,20 +831,26 @@ def rerank_with_llm_sync(
                 reads, candidates, interaction_events=interaction_events, top_k=k
             )
         )
+        extra_kwargs: dict[str, Any] = {"extensions": extensions} if extensions else {}
         with httpx.Client(
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
         ) as client:
             response = client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                target_url,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    **host_headers,
+                },
                 json={
                     "model": chosen_model,
                     "temperature": 0.0,
                     "response_format": {"type": "json_object"},
                     "messages": messages,
                 },
+                **extra_kwargs,
             )
             parsed = _extract_response_content(response)
             reranked, diag, cache_entry = _parse_rerank_payload(
