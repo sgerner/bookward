@@ -1,28 +1,44 @@
 import type { Handle } from '@sveltejs/kit/hooks';
-import { redirect } from '@sveltejs/kit';
-import { timingSafeEqual } from 'node:crypto';
-import { EngineError, engine } from '#lib/server/engine.js';
+import { error as httpError, redirect } from '@sveltejs/kit';
+import {
+	EngineError,
+	GOODREADS_CSV_LIMIT_MESSAGE,
+	engine,
+	isPayloadTooLarge
+} from '#lib/server/engine.js';
 import { withSessionToken } from '#lib/server/request-context.js';
 
 const SESSION_COOKIE = 'bookward_session';
+const formDataByRequest = new WeakMap<Request, Promise<FormData>>();
 
-// Kept as a narrow utility for installations migrating from the former
-// Basic-auth configuration. It is no longer used as the browser auth flow.
-function equal(left: string, right: string) {
-	const a = Buffer.from(left); const b = Buffer.from(right);
-	return a.length === b.length && timingSafeEqual(a, b);
+function requestFormData(request: Request): Promise<FormData> {
+	let cached = formDataByRequest.get(request);
+	if (!cached) {
+		const parse = request.formData.bind(request);
+		cached = parse();
+		formDataByRequest.set(request, cached);
+		Object.defineProperty(request, 'formData', {
+			configurable: true,
+			value: () => cached!
+		});
+	}
+	return cached;
 }
 
-export function authorized(request: Request, username: string, password: string) {
-	const header = request.headers.get('authorization') || '';
-	if (!header.startsWith('Basic ')) return false;
-	try {
-		const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-		const separator = decoded.indexOf(':');
-		return separator >= 0 && equal(decoded.slice(0, separator), username) && equal(decoded.slice(separator + 1), password);
-	} catch {
-		return false;
-	}
+function jsonError(status: number, detail: string) {
+	return withSecurityHeaders(new Response(JSON.stringify({ detail, message: detail }), {
+		status,
+		headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+	}));
+}
+
+function prefersHtmlError(request: Request, path: string): boolean {
+	if (path.startsWith('/api/') || request.headers.get('x-sveltekit-action') === 'true') return false;
+	const accept = (request.headers.get('accept') || '').toLowerCase();
+	const htmlIndex = accept.indexOf('text/html');
+	if (htmlIndex === -1) return false;
+	const jsonIndex = accept.indexOf('application/json');
+	return jsonIndex === -1 || htmlIndex < jsonIndex;
 }
 
 export function isPublicApiPath(pathname: string) {
@@ -69,14 +85,15 @@ async function submittedProfile(request: Request): Promise<string> {
 	const contentType = request.headers.get('content-type') || '';
 	try {
 		if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
-			const form = await request.clone().formData();
+			const form = await requestFormData(request);
 			return String(form.get('__profile_id') || '');
 		}
 		if (contentType.includes('application/json')) {
 			const body = await request.clone().json() as { expected_profile_id?: unknown };
 			return typeof body.expected_profile_id === 'string' ? body.expected_profile_id : '';
 		}
-	} catch {
+	} catch (cause) {
+		if (isPayloadTooLarge(cause)) throw cause;
 		return '';
 	}
 	return '';
@@ -96,9 +113,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 		try { sameOriginReferrer = Boolean(referrer) && new URL(referrer!).origin === event.url.origin; } catch { /* Reject malformed referrers. */ }
 		if ((origin && origin !== event.url.origin) ||
 			(!origin && !sameOriginReferrer && fetchSite !== 'same-origin')) {
-			return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Request origin could not be verified' }), {
-				status: 403, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
-			}));
+			return jsonError(403, 'Request origin could not be verified');
 		}
 	}
 	if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
@@ -139,11 +154,20 @@ export const handle: Handle = async ({ event, resolve }) => {
 	const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
 		(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
 	if (boundProfile) {
-		const expected = await submittedProfile(event.request);
+		let expected = '';
+		try {
+			expected = await submittedProfile(event.request);
+		} catch (cause) {
+			if (isPayloadTooLarge(cause)) {
+				if (prefersHtmlError(event.request, path)) {
+					throw httpError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+				}
+				return jsonError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+			}
+			throw cause;
+		}
 		if (!expected || expected !== user.profile_id) {
-			return withSecurityHeaders(new Response(JSON.stringify({ detail: 'This page belongs to a different profile. Reload before continuing.' }), {
-				status: 409, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
-			}));
+			return jsonError(409, 'This page belongs to a different profile. Reload before continuing.');
 		}
 	}
 	event.locals.user = user;
