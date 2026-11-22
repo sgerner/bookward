@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "svelte/compiler";
 
 type ElementMatch = {
+  type: "RegularElement" | "Component";
   name: string;
   start: number;
   end: number;
@@ -26,7 +27,10 @@ function collectElements(node: unknown): ElementMatch[] {
   const record = node as Record<string, unknown>;
   const found: ElementMatch[] = [];
 
-  if (record.type === "RegularElement" && typeof record.name === "string") {
+  if (
+    (record.type === "RegularElement" || record.type === "Component") &&
+    typeof record.name === "string"
+  ) {
     const rawAttributes = (record.attributes as Array<{
       type: string;
       name?: string;
@@ -45,6 +49,7 @@ function collectElements(node: unknown): ElementMatch[] {
       }
     }
     found.push({
+      type: record.type,
       name: record.name,
       start: record.start as number,
       end: record.end as number,
@@ -60,6 +65,15 @@ function collectElements(node: unknown): ElementMatch[] {
     }
   }
   return found;
+}
+
+function isSrOnlySwitchInput(el: ElementMatch): boolean {
+  return (
+    el.type === "RegularElement" &&
+    el.name === "input" &&
+    (el.attributes.get("class") ?? "").split(/\s+/).includes("sr-only") &&
+    el.attributes.get("role") === "switch"
+  );
 }
 
 describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
@@ -99,12 +113,21 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const srOnlySwitches = elements.filter(
-      (el) =>
-        el.name === "input" &&
-        (el.attributes.get("class") ?? "").split(/\s+/).includes("sr-only") &&
-        el.attributes.get("role") === "switch",
+    const inlineSrOnlySwitches = elements.filter(isSrOnlySwitchInput);
+    const switchFieldUsages = elements.filter(
+      (el) => el.type === "Component" && el.name === "SwitchField",
     );
+    if (switchFieldUsages.length > 0) {
+      const switchFieldElements = collectElements(
+        parse(readRelative("./components/SwitchField.svelte"), { modern: true }).fragment,
+      );
+      expect(
+        switchFieldElements.filter(isSrOnlySwitchInput),
+        "SwitchField should render an input.sr-only[role='switch'] control",
+      ).toHaveLength(1);
+    }
+
+    const srOnlySwitches = [...inlineSrOnlySwitches, ...switchFieldUsages];
     expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
     for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
