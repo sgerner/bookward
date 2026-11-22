@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any, Sequence
 
 import httpx
@@ -138,6 +139,7 @@ def apply_llm_rerank_adjustments(
         return items, {"applied": False, "reason": "insufficient_candidates"}
 
     adjusted_count = 0
+    validated_adjustments: list[dict[str, Any]] = []
     for entry in adjustments:
         if not isinstance(entry, dict):
             continue
@@ -145,6 +147,8 @@ def apply_llm_rerank_adjustments(
             cid = int(entry["id"])
             if cid in by_id:
                 raw_delta = float(entry.get("delta", 0.0))
+                if not math.isfinite(raw_delta):
+                    continue
                 clipped_delta = max(-max_delta, min(max_delta, raw_delta))
                 cand = by_id[cid]
                 base_score = float(cand.get("score") or 0.0)
@@ -156,6 +160,13 @@ def apply_llm_rerank_adjustments(
                     cand["explanation"] = explanation
                 if abs(clipped_delta) > 0.001:
                     adjusted_count += 1
+                validated_adjustments.append(
+                    {
+                        "id": cid,
+                        "delta": clipped_delta,
+                        "reason": reason,
+                    }
+                )
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -167,6 +178,9 @@ def apply_llm_rerank_adjustments(
         "applied": True,
         "adjusted_count": adjusted_count,
         "mode": "adjustments",
+        "top_k": max(0, int(top_k)),
+        "max_delta": float(max_delta),
+        "adjustments": validated_adjustments,
     }
 
 
@@ -222,10 +236,17 @@ def apply_llm_rerank_order(
         head,
         key=lambda row: (-float(row.get("score") or 0.0), -int(row.get("id") or 0)),
     )
+    validated_rankings = [
+        {"id": cid, **({"reason": reasons[cid]} if cid in reasons else {})}
+        for cid in ordered_ids
+    ]
     return reranked_head + tail, {
         "applied": True,
         "reranked_count": len(reasons) or n,
         "mode": "listwise",
+        "top_k": max(0, int(top_k)),
+        "max_delta": float(max_nudge),
+        "rankings": validated_rankings,
     }
 
 

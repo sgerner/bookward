@@ -19,8 +19,11 @@ from afterword_engine.identity import book_identity_match_index, book_row_identi
 from afterword_engine.ranking import rank_candidates
 from afterword_engine.scoring import SCORING_BATCH_SIZE, document, score_all
 from afterword_engine.scoring_evidence import (
+    SCORING_BATCH_SCHEMA_VERSION,
     build_scoring_batch_evidence,
     load_scoring_batch,
+    replay_scoring_batch,
+    verify_scoring_batch_replay,
 )
 
 
@@ -625,3 +628,206 @@ def test_clear_all_evidence_removes_scoring_batches_and_run_history(database):
         assert con.execute("SELECT score_batch_id FROM candidates WHERE id=?", (eligible_id,)).fetchone()[0] is None
         assert con.execute("SELECT COUNT(*) FROM recommendation_evidence_vectors").fetchone()[0] == 0
         assert con.execute("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1").fetchone()[0] == 0
+
+
+def test_scoring_batch_archives_goodreads_shelves_and_replays_zero_drift(database):
+    rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+    with transaction() as con:
+        boosted_id = _candidate(con, "Shelf Boosted Target", "S. Shelf")
+        reading_id = _candidate(con, "Currently Reading Hidden", "C. Reader")
+        con.execute(
+            "UPDATE candidate_quality SET isbn13='9780593135204' WHERE candidate_id=?",
+            (boosted_id,),
+        )
+        boosted = _served_candidate(con, boosted_id)
+        reading = _served_candidate(con, reading_id)
+        _store_vector(con, "candidate", boosted_id, boosted, [0.75, 0.35, 0.15])
+        _store_vector(con, "candidate", reading_id, reading, [0.65, 0.45, 0.25])
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
+            "VALUES('to-read','Different Edition Title','S. Shelf','9780593135204','2026-09-01')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,added_at) "
+            "VALUES('currently-reading','Currently Reading Hidden','C. Reader','2026-09-02')"
+        )
+
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 3
+
+    with connect() as con:
+        hidden_row = con.execute(
+            "SELECT status,score_batch_id FROM candidates WHERE id=?", (reading_id,)
+        ).fetchone()
+        assert hidden_row["status"] == "hidden"
+        assert hidden_row["score_batch_id"] is None
+
+        boosted_row = con.execute(
+            "SELECT status,score,explanation,score_batch_id FROM candidates WHERE id=?",
+            (boosted_id,),
+        ).fetchone()
+        ordinary_row = con.execute(
+            "SELECT status,score,explanation,score_batch_id FROM candidates WHERE id=?",
+            (eligible_id,),
+        ).fetchone()
+        assert boosted_row["status"] == "recommended"
+        assert boosted_row["score_batch_id"] == ordinary_row["score_batch_id"]
+        batch_id = boosted_row["score_batch_id"]
+
+        archived = load_scoring_batch(con, batch_id)
+        assert archived["schema_version"] == SCORING_BATCH_SCHEMA_VERSION == 2
+        assert archived["capture_status"] == "complete"
+        decision = archived["decision"]
+        assert decision["input_selection"]["goodreads_shelf_count"] == 2
+        assert [item["shelf"] for item in decision["goodreads_shelf_items"]] == [
+            "to-read",
+            "currently-reading",
+        ]
+        assert {
+            "impression_fatigue.py",
+            "llm_reranker.py",
+            "read_dates.py",
+        }.issubset(decision["policy"]["source_hashes"])
+        assert len(decision["policy"]["source_hashes"]) == 20
+
+        outputs_by_id = {
+            int(item["candidate_id"]): item for item in decision["candidate_outputs"]
+        }
+        assert reading_id not in outputs_by_id
+        boosted_out = outputs_by_id[boosted_id]
+        ordinary_out = outputs_by_id[eligible_id]
+        assert boosted_out["score"] == boosted_row["score"]
+        assert boosted_out["score"] == round(min(100.0, boosted_out["base_score"] + 10.0), 1)
+        assert boosted_out["shelf_boost"] == round(
+            boosted_out["score"] - boosted_out["base_score"], 1
+        )
+        assert boosted_out["shelf_boost"] > 0
+        assert boosted_out["explanation"][0] == "On your Goodreads to-read shelf"
+        assert boosted_out["explanation"] == json.loads(boosted_row["explanation"])
+        assert ordinary_out["base_score"] == ordinary_out["score"] == ordinary_row["score"]
+        assert ordinary_out["shelf_boost"] == 0.0
+
+        replayed = replay_scoring_batch(archived)
+        assert replayed["schema_version"] == 2
+        assert replayed["verification"]["matches_archived"] is True
+        assert replayed["verification"]["max_score_drift"] == 0.0
+        assert replayed["verification"]["max_base_score_drift"] == 0.0
+        assert verify_scoring_batch_replay(archived)["matches_archived"] is True
+
+        # Serving provenance confirms the shelf-boosted materialized score matches its batch link.
+        served_boosted = _served_candidate(con, boosted_id)
+        vector_map = {
+            (item["entity_type"], int(item["entity_id"])): np.frombuffer(
+                item["vector_bytes"], dtype="<f4"
+            )
+            for item in decision["vectors"]
+        }
+        provenance = build_decision_evidence(
+            con,
+            base_pool=[served_boosted],
+            personalized_pool=[served_boosted],
+            final_pool=[served_boosted],
+            interaction_events=[],
+            cached_vectors={boosted_id: vector_map[("candidate", boosted_id)]},
+            ranking_metadata={},
+            discovery_slate_metadata={},
+            request_context={"ranking_at": datetime.now(timezone.utc).isoformat()},
+        )["base_score_provenance"]
+        assert provenance["derivation_status"] == "complete"
+        assert provenance["candidates"][0]["status"] == "replayable"
+
+    with transaction() as con:
+        removed = purge_recommendation_evidence(con, candidate_ids=[boosted_id])
+        assert removed["scoring_batches_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_legacy_v1_scoring_batch_loads_and_replays_and_shelf_cap_fails_open(
+    database, monkeypatch
+):
+    from afterword_engine import scoring_evidence as scoring_evidence_module
+
+    rated_id, unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+    with connect() as con:
+        all_reads = [dict(r) for r in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
+        rated_reads = [r for r in all_reads if r["id"] == rated_id]
+        candidate = _served_candidate(con, eligible_id)
+        read_vec = np.asarray([0.8, 0.2, 0.1], dtype=np.float32)
+        cand_vec = np.asarray([0.7, 0.4, 0.2], dtype=np.float32)
+        ranked = rank_candidates(rated_reads, [read_vec], [candidate], [cand_vec])
+        v2_ev = build_scoring_batch_evidence(
+            con,
+            captured_at="2026-10-02T00:00:00+00:00",
+            read_history=all_reads,
+            rated_reads=rated_reads,
+            candidates=[candidate],
+            ranked=ranked,
+            read_vectors=[read_vec],
+            candidate_vectors={eligible_id: cand_vec},
+            backend="local",
+            model="test-model",
+            scoring_batch_size=SCORING_BATCH_SIZE,
+        )
+
+    # Strip v2 fields to construct an authentic schema_version=1 batch payload.
+    v1_ev = dict(v2_ev)
+    v1_ev["schema_version"] = 1
+    v1_ev.pop("goodreads_shelf_items", None)
+    v1_ev["input_selection"] = {
+        k: v
+        for k, v in v2_ev["input_selection"].items()
+        if k != "goodreads_shelf_count"
+    }
+    v1_ev["candidate_outputs"] = [
+        {
+            k: v
+            for k, v in item.items()
+            if k not in {"base_score", "shelf_boost"}
+        }
+        for item in v2_ev["candidate_outputs"]
+    ]
+    v1_raw_payload = {k: v for k, v in v1_ev.items() if not k.startswith("_")}
+    v1_ev["_raw_json"] = scoring_evidence_module._canonical_json(v1_raw_payload)
+
+    with transaction() as con:
+        status = scoring_evidence_module.persist_scoring_batch(
+            con, batch_id="legacy-v1-batch", evidence=v1_ev
+        )
+        assert status == "complete"
+
+    with connect() as con:
+        loaded_v1 = load_scoring_batch(con, "legacy-v1-batch")
+    assert loaded_v1["schema_version"] == 1
+    assert loaded_v1["capture_status"] == "complete"
+    assert "goodreads_shelf_items" not in loaded_v1["decision"]
+    replayed_v1 = replay_scoring_batch(loaded_v1)
+    assert replayed_v1["schema_version"] == 1
+    assert replayed_v1["verification"]["matches_archived"] is True
+    assert replayed_v1["verification"]["max_score_drift"] == 0.0
+
+    # Shelf cap fail-open: live score + boost still succeed while batch records `shelf_limit_exceeded`.
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author) "
+            "VALUES('to-read','A New Book','N. Writer')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author) "
+            "VALUES('to-read','Another Shelf Book','O. Writer')"
+        )
+    monkeypatch.setattr(scoring_evidence_module, "MAX_SCORING_SHELF_ITEMS", 1)
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
+    with connect() as con:
+        row = con.execute(
+            "SELECT score,explanation,score_batch_id FROM candidates WHERE id=?",
+            (eligible_id,),
+        ).fetchone()
+        assert "On your Goodreads to-read shelf" in json.loads(row["explanation"])
+        batch_record = load_scoring_batch(con, row["score_batch_id"])
+        assert batch_record["capture_status"] == "incomplete"
+        assert batch_record["reason"] == "shelf_limit_exceeded"
+

@@ -11,10 +11,13 @@ import pytest
 from afterword_engine.config import settings
 from afterword_engine.database import connect, initialize, transaction
 from afterword_engine.decision_evidence import (
+    EVIDENCE_SCHEMA_VERSION,
     build_decision_evidence,
     load_decision_evidence,
     persist_run_evidence,
     purge_recommendation_evidence,
+    replay_decision_evidence,
+    verify_decision_evidence_replay,
 )
 import afterword_engine.decision_evidence as decision_evidence_module
 from afterword_engine.embeddings import content_hash, vector_blob
@@ -539,3 +542,473 @@ def test_full_serving_replay_matches_two_request_contexts(database, status, limi
         ]
     finally:
         settings.exploration_enabled = previous_exploration
+
+
+def test_era_profile_fields_replay_reproduces_observed_books_and_era_adjustments(database):
+    previous_exploration = settings.exploration_enabled
+    settings.exploration_enabled = False
+    try:
+        with transaction() as con:
+            con.execute("UPDATE candidates SET status='excluded'")
+            source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+            # Seed 22 historical acted candidates: 11 classic 1960s-1970s saves, 11 2020s rejects.
+            for idx in range(11):
+                classic_id = con.execute(
+                    "INSERT INTO candidates(title,author,description,genres,score,status,source_id,normalized_key,release_date) "
+                    "VALUES(?,?,?,?,75.0,'saved',?,?,?)",
+                    (
+                        f"Classic Era Save {idx}",
+                        f"Classic Author {idx}",
+                        "Vintage speculative work.",
+                        json.dumps(["Space opera"]),
+                        source_id,
+                        f"classic-era-save-{idx}",
+                        f"197{idx % 9}-06-15",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.85,metadata_confidence=0.8 WHERE candidate_id=?",
+                    (classic_id,),
+                )
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source,occurred_at) "
+                    "VALUES(?,?,'save','ui',?)",
+                    (f"era-save-{idx}", classic_id, f"2026-10-{10 + (idx % 10):02d}T12:00:00+00:00"),
+                )
+
+                modern_id = con.execute(
+                    "INSERT INTO candidates(title,author,description,genres,score,status,source_id,normalized_key,release_date) "
+                    "VALUES(?,?,?,?,75.0,'excluded',?,?,?)",
+                    (
+                        f"Modern Era Reject {idx}",
+                        f"Modern Author {idx}",
+                        "Recent release.",
+                        json.dumps(["Cyberpunk"]),
+                        source_id,
+                        f"modern-era-reject-{idx}",
+                        f"202{idx % 5}-04-10",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.85,metadata_confidence=0.8 WHERE candidate_id=?",
+                    (modern_id,),
+                )
+                con.execute(
+                    "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source,occurred_at) "
+                    "VALUES(?,?,'reject','ui',?)",
+                    (f"era-reject-{idx}", modern_id, f"2026-10-{10 + (idx % 10):02d}T13:00:00+00:00"),
+                )
+
+            cand_modern = _candidate(con, "Live Modern Candidate", "Z. New", score=78.0)
+            cand_classic = _candidate(con, "Live Classic Candidate", "Y. Vintage", score=77.6)
+            con.execute(
+                "UPDATE candidates SET release_date='2024-09-01' WHERE id=?",
+                (cand_modern["id"],),
+            )
+            con.execute(
+                "UPDATE candidates SET release_date='1974-03-01' WHERE id=?",
+                (cand_classic["id"],),
+            )
+            cand_modern["release_date"] = "2024-09-01"
+            cand_classic["release_date"] = "1974-03-01"
+            vectors = {
+                int(cand_modern["id"]): np.asarray([1.0, 0.2, 0.1], dtype=np.float32),
+                int(cand_classic["id"]): np.asarray([0.2, 1.0, 0.1], dtype=np.float32),
+            }
+            _set_embeddings(con, [cand_modern, cand_classic], vectors)
+
+        with connect() as con:
+            served, run_id = tracked_recommendations(
+                status="recommended", limit=10, offset=0, connection=con
+            )
+        with connect() as con:
+            record = load_decision_evidence(con, run_id)
+
+        assert record["capture_status"] == "complete"
+        decision = record["decision"]
+        assert decision["schema_version"] == EVIDENCE_SCHEMA_VERSION == 2
+        assert decision["policy"]["ranking"]["applied"] is True
+        assert decision["policy"]["ranking"]["observed_books"] == 22
+        assert any(item.get("release_date") for item in decision["interaction_profile"])
+
+        replayed = replay_decision_evidence(record)
+        assert replayed["verification"]["matches_archived"] is True
+        assert replayed["verification"]["max_score_drift"] == 0.0
+        assert replayed["diagnostics"]["personalization"]["observed_books"] == 22
+        assert [item["id"] for item in replayed["pools"]["served"]] == [
+            item["id"] for item in served
+        ]
+        assert [item["score"] for item in replayed["pools"]["served"]] == [
+            item["score"] for item in served
+        ]
+
+        # Also verify explicit first_publication_year overrides reprint release_date in PROFILE_FIELDS.
+        ranking_at_iso = "2026-11-15T12:00:00+00:00"
+        fpy_events = [
+            {
+                "id": 5000 + i,
+                "candidate_id": 8000 + i,
+                "event_type": "save" if i < 11 else "reject",
+                "value": None,
+                "occurred_at": f"2026-11-{(i % 9) + 1:02d}T10:00:00+00:00",
+                "title": f"Reprint Book {i}",
+                "author": f"Unique Author {i}",
+                "genres": json.dumps(["History"]),
+                "description": "Reprint edition.",
+                "release_date": "2024-01-01",
+                "first_publication_year": 1968 if i < 11 else 2023,
+            }
+            for i in range(22)
+        ]
+        pool_inputs = [
+            {**cand_modern, "release_date": "2024-09-01", "first_publication_year": 2024},
+            {**cand_classic, "release_date": "2024-09-01", "first_publication_year": 1969},
+        ]
+        personalized_fpy, fpy_diag = personalize_recommendations(
+            pool_inputs,
+            fpy_events,
+            now=datetime.fromisoformat(ranking_at_iso),
+            interaction_vectors={},
+            candidate_vectors=vectors,
+        )
+        assert fpy_diag["applied"] is True
+        with connect() as con:
+            fpy_evidence = build_decision_evidence(
+                con,
+                base_pool=pool_inputs,
+                personalized_pool=personalized_fpy,
+                final_pool=personalized_fpy,
+                interaction_events=fpy_events,
+                cached_vectors=vectors,
+                ranking_metadata=fpy_diag,
+                discovery_slate_metadata={"applied": False, "reason": "no_qualifying_swaps"},
+                request_context={
+                    "status": "recommended",
+                    "limit": 10,
+                    "offset": 0,
+                    "ranking_at": ranking_at_iso,
+                    "exploration_enabled": False,
+                },
+            )
+        fpy_run_id = create_recommendation_run(personalized_fpy, decision_evidence=fpy_evidence)
+        with connect() as con:
+            loaded_fpy = load_decision_evidence(con, fpy_run_id)
+        assert loaded_fpy["decision"]["interaction_profile"][0]["first_publication_year"] == 1968
+        assert verify_decision_evidence_replay(loaded_fpy)["matches_archived"] is True
+    finally:
+        settings.exploration_enabled = previous_exploration
+
+
+@pytest.mark.parametrize("rerank_mode", ["adjustments", "listwise"])
+def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_leakage(
+    database, monkeypatch, rerank_mode
+):
+    import httpx
+    from afterword_engine.secrets import seal
+
+    monkeypatch.setattr(settings, "exploration_enabled", False)
+    monkeypatch.setattr(settings, "impression_fatigue_enabled", True)
+    monkeypatch.setattr(settings, "impression_fatigue_window_days", 21)
+    monkeypatch.setattr(settings, "impression_fatigue_grace_days", 1)
+    monkeypatch.setattr(settings, "impression_fatigue_penalty_per_day", 1.5)
+    monkeypatch.setattr(settings, "impression_fatigue_max_penalty", 9.0)
+    monkeypatch.setattr(settings, "llm_rerank_top_k", 24)
+    monkeypatch.setattr(settings, "llm_rerank_max_delta", 2.0)
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='excluded'")
+        first = _candidate(con, "Fatigued Front-Runner", "A. Writer", score=82.0)
+        second = _candidate(con, "Fresh Challenger", "B. Writer", score=79.5)
+        third = _candidate(con, "Steady Contender", "C. Writer", score=78.0)
+        vectors = {
+            int(first["id"]): np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            int(second["id"]): np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            int(third["id"]): np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        }
+        _set_embeddings(con, [first, second, third], vectors)
+
+        # Record 4 distinct unacted visible days within the last 10 days on `first` -> penalty 4.5.
+        now_utc = datetime.now().astimezone()
+        for day_offset in (1, 2, 3, 4):
+            day_iso = (
+                datetime.fromtimestamp(
+                    now_utc.timestamp() - day_offset * 86400, tz=now_utc.tzinfo
+                )
+                .astimezone()
+                .isoformat()
+            )
+            hist_run = f"fatigue-hist-{rerank_mode}-{day_offset}"
+            con.execute(
+                "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count,created_at) "
+                "VALUES(?,?,?,1,?)",
+                (hist_run, "default", "v1", day_iso),
+            )
+            con.execute(
+                "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+                "VALUES(?,?,1,82.0,1.0,?,?)",
+                (hist_run, first["id"], day_iso, day_iso),
+            )
+
+        con.executemany(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret",
+            [
+                ("llm_rerank_enabled", "1", 0),
+                ("llm_rerank_provider", "openai", 0),
+                (
+                    "llm_rerank_api_url",
+                    "https://user-cred:super-secret-pass@api.example.com/v1/chat/completions?token=query-secret-999#frag",
+                    0,
+                ),
+                ("llm_rerank_api_key", seal("sk-live-super-secret-bearer-777"), 1),
+                ("llm_rerank_model", "gpt-4o-mini", 0),
+            ],
+        )
+
+    llm_calls = 0
+
+    class _FakeLLMResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            if rerank_mode == "adjustments":
+                body = {
+                    "adjustments": [
+                        {"id": third["id"], "delta": 2.5, "reason": "Compelling thematic depth"},
+                        {"id": second["id"], "delta": -0.5, "reason": "Slightly narrower hook"},
+                        {"id": 999999, "delta": 5.0, "reason": "Hallucinated candidate"},
+                    ]
+                }
+            else:
+                body = {
+                    "rankings": [
+                        {"id": third["id"], "reason": "Best overall fit"},
+                        {"id": first["id"], "reason": "Strong premise despite delay"},
+                        {"id": second["id"], "reason": "Solid runner-up"},
+                    ]
+                }
+            return {"choices": [{"message": {"content": json.dumps(body)}}]}
+
+    class _ServingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url: str, *, headers: dict, json: dict):
+            nonlocal llm_calls
+            llm_calls += 1
+            assert "Bearer sk-live-super-secret-bearer-777" == headers["Authorization"]
+            return _FakeLLMResponse()
+
+    monkeypatch.setattr(httpx, "Client", _ServingClient)
+    with connect() as con:
+        served, run_id = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+    assert llm_calls == 1
+
+    # Block all HTTP clients during archive loading and replay to prove zero network calls.
+    class _BlockedClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("Replay must never instantiate an HTTP client")
+
+    monkeypatch.setattr(httpx, "Client", _BlockedClient)
+    monkeypatch.setattr(httpx, "AsyncClient", _BlockedClient)
+
+    with connect() as con:
+        raw_blob = con.execute(
+            "SELECT payload FROM recommendation_run_evidence WHERE run_id=?",
+            (run_id,),
+        ).fetchone()["payload"]
+        raw_decompressed = zlib.decompress(raw_blob).decode("utf-8")
+        record = load_decision_evidence(con, run_id)
+
+    assert record["capture_status"] == "complete"
+    decision = record["decision"]
+    assert decision["schema_version"] == 2
+
+    # Secret non-leakage assertions across raw compressed payload and loaded structure.
+    serialized_loaded = json.dumps(
+        {
+            **decision,
+            "vectors": [
+                {k: v for k, v in item.items() if k != "vector_bytes"}
+                for item in decision["vectors"]
+            ],
+        }
+    )
+    for text_blob in (raw_decompressed, serialized_loaded):
+        assert "sk-live-super-secret-bearer-777" not in text_blob
+        assert "super-secret-pass" not in text_blob
+        assert "user-cred" not in text_blob
+        assert "query-secret-999" not in text_blob
+        assert "frag" not in text_blob
+        assert "bearer" not in text_blob.lower()
+        assert "api_key" not in text_blob.lower()
+        assert "session_id" not in text_blob.lower()
+
+    fatigue_stage = decision["stage_inputs"]["impression_fatigue"]
+    assert fatigue_stage["settings"]["enabled"] is True
+    assert fatigue_stage["visible_day_counts"] == {str(first["id"]): 4}
+    personalized_by_id = {int(item["id"]): item for item in decision["pools"]["personalized"]}
+    assert personalized_by_id[int(first["id"])]["fatigue_penalty"] == 4.5
+
+    llm_stage = decision["stage_inputs"]["llm_rerank"]
+    assert llm_stage["settings"]["enabled"] is True
+    assert llm_stage["settings"]["configured"] is True
+    assert llm_stage["settings"]["endpoint_url"] == "https://api.example.com/v1/chat/completions"
+    assert llm_stage["settings"]["model"] == "gpt-4o-mini"
+    assert llm_stage["mode"] == rerank_mode
+    if rerank_mode == "adjustments":
+        assert len(llm_stage["adjustments"]) == 2
+        assert llm_stage["rankings"] == []
+    else:
+        assert len(llm_stage["rankings"]) == 3
+        assert llm_stage["adjustments"] == []
+
+    assert decision["policy"]["ranking"]["impression_fatigue"] == {
+        "applied": True,
+        "adjusted_candidates": 1,
+        "max_penalty": 4.5,
+    }
+    assert decision["policy"]["ranking"]["llm_rerank"]["applied"] is True
+    assert decision["policy"]["ranking"]["llm_rerank"]["mode"] == rerank_mode
+
+    replayed = replay_decision_evidence(record)
+    assert replayed["verification"]["matches_archived"] is True
+    assert replayed["verification"]["max_score_drift"] == 0.0
+    assert [item["id"] for item in replayed["pools"]["served"]] == [
+        item["id"] for item in served
+    ]
+    assert [item["score"] for item in replayed["pools"]["served"]] == [
+        item["score"] for item in served
+    ]
+    assert [item["explanation"] for item in replayed["pools"]["served"]] == [
+        item["explanation"] for item in served
+    ]
+
+    # Verify candidate privacy purge clears the extended v2 run and restores zero budget.
+    with transaction() as con:
+        purge_recommendation_evidence(con, clear_all_evidence=True)
+        assert (
+            con.execute(
+                "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_runtime_source_lineage_covers_all_twenty_modules_and_tracks_stage_edits(
+    tmp_path: Path, monkeypatch
+):
+    import shutil
+
+    decision_evidence_module._runtime_source_lineage.cache_clear()
+    try:
+        lineage = decision_evidence_module._runtime_source_lineage()
+        assert len(lineage["source_hashes"]) == 20
+        assert {
+            "impression_fatigue.py",
+            "llm_reranker.py",
+            "read_dates.py",
+            "decision_evidence.py",
+            "scoring_evidence.py",
+        }.issubset(lineage["source_hashes"])
+        for digest in lineage["source_hashes"].values():
+            assert len(digest) == 64
+
+        pkg_copy = tmp_path / "afterword_engine_copy"
+        shutil.copytree(Path(decision_evidence_module.__file__).resolve().parent, pkg_copy)
+        monkeypatch.setattr(
+            decision_evidence_module, "__file__", str(pkg_copy / "decision_evidence.py")
+        )
+        decision_evidence_module._runtime_source_lineage.cache_clear()
+        baseline = decision_evidence_module._runtime_source_lineage()
+        assert baseline == lineage
+
+        (pkg_copy / "impression_fatigue.py").write_text(
+            (pkg_copy / "impression_fatigue.py").read_text(encoding="utf-8")
+            + "\n# fatigue version bump\n",
+            encoding="utf-8",
+        )
+        decision_evidence_module._runtime_source_lineage.cache_clear()
+        after_fatigue = decision_evidence_module._runtime_source_lineage()
+        assert (
+            after_fatigue["source_hashes"]["impression_fatigue.py"]
+            != baseline["source_hashes"]["impression_fatigue.py"]
+        )
+        assert after_fatigue["runtime_code_id"] != baseline["runtime_code_id"]
+
+        (pkg_copy / "llm_reranker.py").write_text(
+            (pkg_copy / "llm_reranker.py").read_text(encoding="utf-8")
+            + "\n# reranker version bump\n",
+            encoding="utf-8",
+        )
+        decision_evidence_module._runtime_source_lineage.cache_clear()
+        after_reranker = decision_evidence_module._runtime_source_lineage()
+        assert (
+            after_reranker["source_hashes"]["llm_reranker.py"]
+            != after_fatigue["source_hashes"]["llm_reranker.py"]
+        )
+        assert after_reranker["runtime_code_id"] != after_fatigue["runtime_code_id"]
+    finally:
+        decision_evidence_module._runtime_source_lineage.cache_clear()
+
+
+def test_legacy_v1_decision_snapshot_loads_and_replays_and_rerank_cap_fails_open(database):
+    vector = np.asarray([0.6, 0.8, 0.0], dtype=np.float32)
+    with transaction() as con:
+        candidate = _candidate(con, "Legacy V1 Candidate", "L. Author", score=80.0)
+        _set_embeddings(con, [candidate], {candidate["id"]: vector})
+        v2_evidence = _build(con, [candidate], [], {candidate["id"]: vector})
+
+        # Convert to a legacy schema_version=1 payload without stage_inputs or v2 fields.
+        v1_evidence = dict(v2_evidence)
+        v1_evidence["schema_version"] = 1
+        v1_evidence.pop("stage_inputs", None)
+        v1_raw_payload = {
+            k: v
+            for k, v in v1_evidence.items()
+            if not k.startswith("_")
+        }
+        v1_evidence["_raw_json"] = decision_evidence_module._canonical_json(v1_raw_payload)
+
+        run_id = "legacy-v1-decision-run"
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count) "
+            "VALUES(?,?,?,1)",
+            (run_id, "fixture", "v1",),
+        )
+        assert persist_run_evidence(con, run_id=run_id, evidence=v1_evidence) == "complete"
+
+        over_cap = build_decision_evidence(
+            con,
+            base_pool=[candidate],
+            personalized_pool=[candidate],
+            final_pool=[candidate],
+            interaction_events=[],
+            cached_vectors={candidate["id"]: vector},
+            ranking_metadata={},
+            discovery_slate_metadata={},
+            request_context={"ranking_at": "2026-10-02T19:37:00-07:00"},
+            llm_rerank_adjustments=[{"id": candidate["id"], "delta": 0.1}] * 5_001,
+        )
+        assert over_cap["capture_status"] == "incomplete"
+        assert over_cap["reason"] == "rerank_limit_exceeded"
+
+    with connect() as con:
+        loaded = load_decision_evidence(con, run_id)
+    assert loaded["schema_version"] == 1
+    assert loaded["capture_status"] == "complete"
+    assert "stage_inputs" not in loaded["decision"]
+    replayed = replay_decision_evidence(loaded)
+    assert replayed["schema_version"] == 1
+    assert replayed["verification"]["matches_archived"] is True
+    assert replayed["verification"]["max_score_drift"] == 0.0
+

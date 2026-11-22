@@ -18,7 +18,8 @@ import zlib
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -33,7 +34,8 @@ LOGGER = logging.getLogger(__name__)
 
 POLICY = "rating-neighborhood"
 POLICY_VERSION = "rating-kernel-recency-era-confidence-interaction-installation-slate-v2"
-EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
+SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = frozenset({1, 2})
 
 # Request-time caps keep evidence work predictable. Current recommendation
 # responses contain at most 100 served rows and production pools are far below
@@ -58,10 +60,11 @@ POOL_FIELDS = (
     "quality_score", "quality_status", "quality_work_id", "quality_provider",
     "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
     "date_kind", "propensity", "first_publication_year", "publication_work_id", "publication_era",
+    "fatigue_penalty",
 )
 PROFILE_FIELDS = (
     "id", "candidate_id", "event_type", "value", "occurred_at", "title",
-    "author", "genres", "description",
+    "author", "genres", "description", "release_date", "first_publication_year",
 )
 REQUEST_FIELDS = (
     "status", "limit", "offset", "recommended_limit", "build_id",
@@ -72,6 +75,13 @@ RANKING_DIAGNOSTIC_FIELDS = (
     "mode", "scope", "applied", "observed_books", "qualified_features",
     "semantic_evidence_books", "semantic_adjusted_candidates",
     "adjusted_candidates", "max_score_adjustment",
+    "impression_fatigue", "llm_rerank",
+)
+FATIGUE_DIAGNOSTIC_FIELDS = (
+    "applied", "adjusted_candidates", "max_penalty",
+)
+LLM_RERANK_DIAGNOSTIC_FIELDS = (
+    "applied", "mode", "reason", "adjusted_count", "reranked_count", "top_k", "max_delta",
 )
 SLATE_DIAGNOSTIC_FIELDS = (
     "policy_version", "scope", "applied", "reason", "slate_size",
@@ -174,6 +184,31 @@ def _safe_identifier(value: Any, *, fallback: str = "unknown") -> str:
     return candidate
 
 
+def _safe_endpoint_url(value: Any) -> str:
+    """Return a credential-free HTTP(S) endpoint URL without query or fragment."""
+
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    if not candidate or len(candidate) > 512:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    host = f"[{hostname}]" if ":" in hostname else hostname.lower()
+    if port is not None:
+        host = f"{host}:{port}"
+    path = parsed.path.rstrip("/")
+    sanitized = f"{scheme}://{host}{path}"
+    return sanitized if len(sanitized) <= 256 else ""
+
+
 @lru_cache(maxsize=1)
 def _runtime_source_lineage() -> dict[str, Any]:
     """Hash the loaded pipeline's public source files once per engine process."""
@@ -185,10 +220,13 @@ def _runtime_source_lineage() -> dict[str, Any]:
         "config.py",
         "scoring.py",
         "ranking.py",
+        "read_dates.py",
         "publication_era_signal.py",
         "publication_year_metadata.py",
         "interaction_personalization.py",
+        "impression_fatigue.py",
         "discovery_slate.py",
+        "llm_reranker.py",
         "exploration.py",
         "embeddings.py",
         "subjects.py",
@@ -233,6 +271,263 @@ def _diagnostics(value: Mapping[str, Any] | None, fields: Iterable[str]) -> dict
         key: _json_value(value[key])
         for key in fields
         if key in value
+    }
+
+
+def _safe_llm_rerank_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    output: dict[str, Any] = {}
+    for key in LLM_RERANK_DIAGNOSTIC_FIELDS:
+        if key not in value:
+            continue
+        item = value[key]
+        if key in {"mode", "reason"}:
+            safe = _safe_identifier(item, fallback="")
+            if safe:
+                output[key] = safe
+        elif isinstance(item, (bool, int, float, np.generic)):
+            output[key] = _json_value(item)
+    return output
+
+
+def _ranking_diagnostics(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    output: dict[str, Any] = {}
+    for key in RANKING_DIAGNOSTIC_FIELDS:
+        if key not in value:
+            continue
+        if key == "impression_fatigue":
+            if isinstance(value[key], Mapping):
+                output[key] = _diagnostics(value[key], FATIGUE_DIAGNOSTIC_FIELDS)
+        elif key == "llm_rerank":
+            if isinstance(value[key], Mapping):
+                output[key] = _safe_llm_rerank_diagnostics(value[key])
+        else:
+            output[key] = _json_value(value[key])
+    return output
+
+
+def _normalize_visible_day_counts(
+    visible_day_counts: Any,
+    pool_ids: set[int],
+) -> dict[str, int]:
+    if visible_day_counts is None:
+        return {}
+    if not isinstance(visible_day_counts, Mapping):
+        raise _EvidenceLimitError("invalid_fatigue_inputs")
+    if len(visible_day_counts) > MAX_POOL_ITEMS * 2:
+        raise _EvidenceLimitError("pool_limit_exceeded")
+    normalized: dict[int, int] = {}
+    for raw_id, raw_days in visible_day_counts.items():
+        if isinstance(raw_id, bool) or isinstance(raw_days, bool):
+            raise _EvidenceLimitError("invalid_fatigue_inputs")
+        try:
+            candidate_id = int(raw_id)
+            days = int(raw_days)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise _EvidenceLimitError("invalid_fatigue_inputs") from exc
+        if candidate_id <= 0 or candidate_id not in pool_ids or days < 0:
+            continue
+        normalized[candidate_id] = days
+    if len(normalized) > MAX_POOL_ITEMS:
+        raise _EvidenceLimitError("pool_limit_exceeded")
+    return {str(cid): normalized[cid] for cid in sorted(normalized)}
+
+
+def _normalize_fatigue_stage(
+    impression_fatigue_settings: Mapping[str, Any] | None,
+    visible_day_counts: Any,
+    ranking_metadata: Mapping[str, Any] | None,
+    pool_ids: set[int],
+) -> dict[str, Any]:
+    cfg = impression_fatigue_settings if isinstance(impression_fatigue_settings, Mapping) else {}
+    try:
+        enabled = bool(cfg.get("enabled", settings.impression_fatigue_enabled))
+        window_days = max(0, int(cfg.get("window_days", settings.impression_fatigue_window_days)))
+        grace_days = max(0, int(cfg.get("grace_days", settings.impression_fatigue_grace_days)))
+        penalty_per_day = float(
+            cfg.get("penalty_per_day", settings.impression_fatigue_penalty_per_day)
+        )
+        max_penalty = float(
+            cfg.get("max_penalty", settings.impression_fatigue_max_penalty)
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _EvidenceLimitError("invalid_fatigue_inputs") from exc
+    if (
+        not math.isfinite(penalty_per_day)
+        or not math.isfinite(max_penalty)
+        or penalty_per_day < 0
+        or max_penalty < 0
+    ):
+        raise _EvidenceLimitError("invalid_fatigue_inputs")
+    normalized_counts = _normalize_visible_day_counts(visible_day_counts, pool_ids)
+    raw_diag = (
+        ranking_metadata.get("impression_fatigue")
+        if isinstance(ranking_metadata, Mapping)
+        else None
+    )
+    if isinstance(raw_diag, Mapping):
+        diag = _diagnostics(raw_diag, FATIGUE_DIAGNOSTIC_FIELDS)
+    else:
+        diag = {"applied": False, "adjusted_candidates": 0, "max_penalty": 0.0}
+    return {
+        "settings": {
+            "enabled": enabled,
+            "window_days": window_days,
+            "grace_days": grace_days,
+            "penalty_per_day": penalty_per_day,
+            "max_penalty": max_penalty,
+        },
+        "visible_day_counts": normalized_counts,
+        "diagnostics": diag,
+    }
+
+
+def _normalize_llm_rerank_stage(
+    llm_rerank_settings: Mapping[str, Any] | None,
+    llm_rerank_output: Mapping[str, Any] | None,
+    llm_rerank_adjustments: Sequence[Mapping[str, Any]] | None,
+    llm_rerank_rankings: Sequence[Mapping[str, Any]] | None,
+    ranking_metadata: Mapping[str, Any] | None,
+    pool_ids: set[int],
+) -> dict[str, Any]:
+    cfg = llm_rerank_settings if isinstance(llm_rerank_settings, Mapping) else {}
+    fallback_out = (
+        ranking_metadata.get("llm_rerank")
+        if isinstance(ranking_metadata, Mapping)
+        and isinstance(ranking_metadata.get("llm_rerank"), Mapping)
+        else {}
+    )
+    raw_out = llm_rerank_output if isinstance(llm_rerank_output, Mapping) else fallback_out
+    enabled = bool(cfg.get("enabled", False))
+    has_secret_key = bool(str(cfg.get("api_key") or "").strip())
+    configured = bool(
+        cfg.get(
+            "configured",
+            cfg.get("api_key_set", has_secret_key and enabled),
+        )
+    )
+    provider = _safe_identifier(cfg.get("provider"), fallback="")
+    endpoint_url = _safe_endpoint_url(cfg.get("endpoint_url") or cfg.get("api_url") or "")
+    model = _safe_identifier(
+        cfg.get("model", settings.llm_rerank_model if enabled else ""),
+        fallback="",
+    )
+    try:
+        top_k = max(
+            0,
+            int(raw_out.get("top_k", cfg.get("top_k", settings.llm_rerank_top_k))),
+        )
+        max_delta = float(
+            raw_out.get("max_delta", cfg.get("max_delta", settings.llm_rerank_max_delta))
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _EvidenceLimitError("invalid_rerank_inputs") from exc
+    if not math.isfinite(max_delta) or max_delta < 0 or top_k > MAX_POOL_ITEMS:
+        raise _EvidenceLimitError("invalid_rerank_inputs")
+
+    raw_adjustments = (
+        llm_rerank_adjustments
+        if llm_rerank_adjustments is not None
+        else raw_out.get("adjustments")
+        if isinstance(raw_out.get("adjustments"), Sequence)
+        and not isinstance(raw_out.get("adjustments"), (str, bytes))
+        else ()
+    )
+    raw_rankings = (
+        llm_rerank_rankings
+        if llm_rerank_rankings is not None
+        else raw_out.get("rankings")
+        if isinstance(raw_out.get("rankings"), Sequence)
+        and not isinstance(raw_out.get("rankings"), (str, bytes))
+        else ()
+    )
+    materialized_adjustments = _bounded_materialize(
+        raw_adjustments, limit=MAX_POOL_ITEMS, reason="rerank_limit_exceeded"
+    )
+    materialized_rankings = _bounded_materialize(
+        raw_rankings, limit=MAX_POOL_ITEMS, reason="rerank_limit_exceeded"
+    )
+    validated_adjustments: list[dict[str, Any]] = []
+    for entry in materialized_adjustments:
+        if not isinstance(entry, Mapping) or isinstance(entry.get("id"), bool):
+            continue
+        try:
+            cid = int(entry["id"])
+            delta = float(entry.get("delta", 0.0))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if cid <= 0 or cid not in pool_ids:
+            continue
+        if not math.isfinite(delta):
+            raise _EvidenceLimitError("non_finite_value")
+        clipped = max(-max_delta, min(max_delta, delta))
+        reason = " ".join(str(entry.get("reason") or "").split())[:140]
+        validated_adjustments.append(
+            {
+                "id": cid,
+                "delta": clipped,
+                "reason": reason,
+            }
+        )
+
+    validated_rankings: list[dict[str, Any]] = []
+    seen_ranking_ids: set[int] = set()
+    for entry in materialized_rankings:
+        if not isinstance(entry, Mapping) or isinstance(entry.get("id"), bool):
+            continue
+        try:
+            cid = int(entry["id"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if cid <= 0 or cid not in pool_ids or cid in seen_ranking_ids:
+            continue
+        seen_ranking_ids.add(cid)
+        reason = " ".join(str(entry.get("reason") or "").split())[:140]
+        validated_rankings.append(
+            {"id": cid, **({"reason": reason} if reason else {})}
+        )
+
+    explicit_mode = _safe_identifier(raw_out.get("mode"), fallback="")
+    if llm_rerank_adjustments is not None:
+        mode = "adjustments"
+        applied = bool(raw_out.get("applied", True))
+    elif llm_rerank_rankings is not None:
+        mode = "listwise"
+        applied = bool(validated_rankings) and bool(raw_out.get("applied", True))
+    else:
+        applied = bool(raw_out.get("applied", False))
+        if explicit_mode in {"adjustments", "listwise"}:
+            mode = explicit_mode
+        elif validated_adjustments:
+            mode = "adjustments"
+        elif validated_rankings:
+            mode = "listwise"
+        else:
+            mode = "none"
+    if not applied:
+        mode = "none"
+
+    diagnostics = _safe_llm_rerank_diagnostics(raw_out)
+    diagnostics.setdefault("applied", applied)
+    if applied and mode != "none":
+        diagnostics["mode"] = mode
+    return {
+        "settings": {
+            "enabled": enabled,
+            "configured": configured,
+            "provider": provider,
+            "endpoint_url": endpoint_url,
+            "model": model,
+            "top_k": top_k,
+            "max_delta": max_delta,
+        },
+        "mode": mode,
+        "adjustments": validated_adjustments if mode == "adjustments" else [],
+        "rankings": validated_rankings if mode == "listwise" else [],
+        "diagnostics": diagnostics,
     }
 
 
@@ -436,6 +731,12 @@ def build_decision_evidence(
     ranking_metadata,
     discovery_slate_metadata,
     request_context,
+    visible_day_counts: Mapping[int, int] | None = None,
+    impression_fatigue_settings: Mapping[str, Any] | None = None,
+    llm_rerank_settings: Mapping[str, Any] | None = None,
+    llm_rerank_output: Mapping[str, Any] | None = None,
+    llm_rerank_adjustments: Sequence[Mapping[str, Any]] | None = None,
+    llm_rerank_rankings: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Capture bounded exact serving inputs and actual vector artifacts.
 
@@ -565,6 +866,20 @@ def build_decision_evidence(
             vector_descriptors.append(descriptor)
 
         safe_context = _safe_context(request_context)
+        fatigue_stage = _normalize_fatigue_stage(
+            impression_fatigue_settings,
+            visible_day_counts,
+            ranking_metadata,
+            pool_ids,
+        )
+        llm_stage = _normalize_llm_rerank_stage(
+            llm_rerank_settings,
+            llm_rerank_output,
+            llm_rerank_adjustments,
+            llm_rerank_rankings,
+            ranking_metadata,
+            pool_ids,
+        )
         lineage = _runtime_source_lineage()
         requested_build_id = safe_context.get("build_id")
         environment_build_id = _safe_identifier(os.environ.get("BOOKWARD_BUILD_ID"))
@@ -595,10 +910,14 @@ def build_decision_evidence(
                 "source_hashes": lineage["source_hashes"],
                 "embedding_backend": backend,
                 "embedding_model": model,
-                "ranking": _diagnostics(ranking_metadata, RANKING_DIAGNOSTIC_FIELDS),
+                "ranking": _ranking_diagnostics(ranking_metadata),
                 "discovery_slate": _diagnostics(
                     discovery_slate_metadata, SLATE_DIAGNOSTIC_FIELDS
                 ),
+            },
+            "stage_inputs": {
+                "impression_fatigue": fatigue_stage,
+                "llm_rerank": llm_stage,
             },
             "base_score_provenance": _base_score_provenance(
                 connection, base_items, actual_document_hashes
@@ -732,7 +1051,7 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
         schema_version = int(evidence.get("schema_version", 0))
     except (TypeError, ValueError, OverflowError):
         schema_version = 0
-    if schema_version != EVIDENCE_SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
         _incomplete_row(connection, run_id, "unsupported_schema", captured_at)
         return "incomplete"
     if any(
@@ -741,6 +1060,15 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
     ) or not isinstance(evidence.get("interaction_profile"), list):
         _incomplete_row(connection, run_id, "invalid_evidence_payload", captured_at)
         return "incomplete"
+    if schema_version >= 2:
+        stage_inputs = evidence.get("stage_inputs")
+        if (
+            not isinstance(stage_inputs, Mapping)
+            or not isinstance(stage_inputs.get("impression_fatigue"), Mapping)
+            or not isinstance(stage_inputs.get("llm_rerank"), Mapping)
+        ):
+            _incomplete_row(connection, run_id, "invalid_evidence_payload", captured_at)
+            return "incomplete"
     pool_payload = evidence["pools"]
     if any(
         not isinstance(pool_payload.get(key), list)
@@ -888,7 +1216,7 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
         "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (
             run_id,
-            EVIDENCE_SCHEMA_VERSION,
+            schema_version,
             "complete",
             "",
             captured_at,
@@ -972,8 +1300,21 @@ def load_decision_evidence(connection, run_id: str) -> dict[str, Any] | None:
         payload = json.loads(raw_json)
     except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("Recommendation evidence payload is unreadable") from exc
-    if not isinstance(payload, dict) or int(payload.get("schema_version", 0)) != EVIDENCE_SCHEMA_VERSION:
+    schema_version = int(row["schema_version"])
+    if (
+        not isinstance(payload, dict)
+        or schema_version not in SUPPORTED_EVIDENCE_SCHEMA_VERSIONS
+        or int(payload.get("schema_version", 0)) != schema_version
+    ):
         raise ValueError("Unsupported recommendation evidence schema")
+    if schema_version >= 2:
+        stage_inputs = payload.get("stage_inputs")
+        if (
+            not isinstance(stage_inputs, dict)
+            or not isinstance(stage_inputs.get("impression_fatigue"), dict)
+            or not isinstance(stage_inputs.get("llm_rerank"), dict)
+        ):
+            raise ValueError("Recommendation stage inputs are invalid")
     provenance = payload.get("base_score_provenance")
     provenance_candidates = provenance.get("candidates", []) if isinstance(provenance, Mapping) else []
     if not isinstance(provenance_candidates, list):
@@ -1059,6 +1400,234 @@ def load_decision_evidence(connection, run_id: str) -> dict[str, Any] | None:
         ).fetchall()
     ]
     return result
+
+
+def replay_decision_evidence(record_or_decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Deterministically replay archived online stages without network calls."""
+
+    from .discovery_slate import (
+        DEFAULT_SLATE_SIZE,
+        MAX_DISPLACEMENT,
+        MAX_SCORE_SACRIFICE,
+        diversify_discovery_slate,
+        empty_diagnostics as empty_slate_diagnostics,
+    )
+    from .impression_fatigue import apply_impression_fatigue
+    from .interaction_personalization import personalize_recommendations
+    from .llm_reranker import apply_llm_rerank_adjustments, apply_llm_rerank_order
+
+    if not isinstance(record_or_decision, Mapping):
+        raise ValueError("Recommendation evidence record must be a mapping")
+    if "decision" in record_or_decision and isinstance(record_or_decision.get("decision"), Mapping):
+        if record_or_decision.get("capture_status") != "complete":
+            raise ValueError("Incomplete recommendation evidence cannot be replayed")
+        decision = record_or_decision["decision"]
+    else:
+        if record_or_decision.get("capture_status") not in (None, "complete"):
+            raise ValueError("Incomplete recommendation evidence cannot be replayed")
+        decision = record_or_decision
+
+    schema_version = int(decision.get("schema_version") or 0)
+    if schema_version not in SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
+        raise ValueError("Unsupported recommendation evidence schema")
+
+    vector_sources = decision.get("_vector_artifacts") or decision.get("vectors") or []
+    vector_map: dict[int, np.ndarray] = {}
+    for item in vector_sources:
+        if not isinstance(item, Mapping) or "vector_bytes" not in item:
+            continue
+        entity_id = int(item["entity_id"])
+        vector_map[entity_id] = np.frombuffer(bytes(item["vector_bytes"]), dtype="<f4").copy()
+
+    interaction_profile = list(decision.get("interaction_profile") or [])
+    interaction_ids = {
+        int(event["candidate_id"])
+        for event in interaction_profile
+        if isinstance(event, Mapping) and event.get("candidate_id") is not None
+    }
+    interaction_vectors = {
+        cid: vec for cid, vec in vector_map.items() if cid in interaction_ids
+    }
+    request_context = decision.get("request_context") or {}
+    ranking_at_raw = request_context.get("ranking_at")
+    ranking_at = (
+        datetime.fromisoformat(str(ranking_at_raw).replace("Z", "+00:00"))
+        if isinstance(ranking_at_raw, str) and ranking_at_raw.strip()
+        else None
+    )
+
+    pools = decision.get("pools") or {}
+    base_pool = [dict(item) for item in pools.get("base") or []]
+    replayed_personalized, personalization_diag = personalize_recommendations(
+        base_pool,
+        interaction_profile,
+        now=ranking_at,
+        interaction_vectors=interaction_vectors,
+        candidate_vectors=vector_map,
+    )
+
+    stage_inputs = decision.get("stage_inputs") if schema_version >= 2 else {}
+    stage_inputs = stage_inputs if isinstance(stage_inputs, Mapping) else {}
+    fatigue_stage = stage_inputs.get("impression_fatigue")
+    fatigue_diag = {"applied": False, "adjusted_candidates": 0, "max_penalty": 0.0}
+    if isinstance(fatigue_stage, Mapping):
+        fatigue_cfg = fatigue_stage.get("settings") or {}
+        if bool(fatigue_cfg.get("enabled", False)):
+            raw_counts = fatigue_stage.get("visible_day_counts") or {}
+            counts = {int(cid): int(days) for cid, days in raw_counts.items()}
+            replayed_personalized, fatigue_diag = apply_impression_fatigue(
+                replayed_personalized,
+                counts,
+                grace_days=int(fatigue_cfg.get("grace_days", 3)),
+                penalty_per_day=float(fatigue_cfg.get("penalty_per_day", 0.75)),
+                max_penalty=float(fatigue_cfg.get("max_penalty", 4.5)),
+            )
+
+    policy = decision.get("policy") or {}
+    slate_policy = policy.get("discovery_slate") if isinstance(policy, Mapping) else {}
+    slate_policy = slate_policy if isinstance(slate_policy, Mapping) else {}
+    recommended = [
+        item for item in replayed_personalized if item.get("status") == "recommended"
+    ]
+    llm_diag: dict[str, Any] = {"applied": False, "mode": "none"}
+    if recommended:
+        configured_slate_size = (
+            int(slate_policy["slate_size"])
+            if "slate_size" in slate_policy and int(slate_policy["slate_size"]) > 0
+            else DEFAULT_SLATE_SIZE
+        )
+        diversified, slate_diag = diversify_discovery_slate(
+            recommended,
+            vector_map,
+            slate_size=configured_slate_size,
+            max_displacement=int(slate_policy.get("max_displacement", MAX_DISPLACEMENT)),
+            max_score_sacrifice=float(
+                slate_policy.get("max_score_sacrifice", MAX_SCORE_SACRIFICE)
+            ),
+        )
+        llm_stage = stage_inputs.get("llm_rerank")
+        if isinstance(llm_stage, Mapping) and llm_stage.get("mode") in {"adjustments", "listwise"}:
+            llm_cfg = llm_stage.get("settings") or {}
+            top_k = int(llm_cfg.get("top_k", settings.llm_rerank_top_k))
+            max_delta = float(llm_cfg.get("max_delta", settings.llm_rerank_max_delta))
+            if llm_stage.get("mode") == "adjustments":
+                diversified, llm_diag = apply_llm_rerank_adjustments(
+                    diversified,
+                    list(llm_stage.get("adjustments") or []),
+                    top_k=top_k,
+                    max_delta=max_delta,
+                )
+            elif llm_stage.get("mode") == "listwise":
+                diversified, llm_diag = apply_llm_rerank_order(
+                    diversified,
+                    list(llm_stage.get("rankings") or []),
+                    top_k=top_k,
+                    max_nudge=max_delta,
+                )
+        replayed_final = diversified + [
+            item for item in replayed_personalized if item.get("status") != "recommended"
+        ]
+    else:
+        slate_diag = empty_slate_diagnostics("no_recommended_candidates")
+        replayed_final = list(replayed_personalized)
+
+    req_status = request_context.get("status")
+    req_limit = request_context.get("limit")
+    req_offset = int(request_context.get("offset") or 0)
+    req_recommended_limit = request_context.get("recommended_limit")
+    if req_recommended_limit is not None and req_status is None and req_offset == 0:
+        rec_only = [item for item in replayed_final if item.get("status") == "recommended"]
+        rem = [
+            item
+            for item in replayed_final
+            if item.get("status") in {"saved", "imported", "new"}
+        ]
+        replayed_served = rec_only[: max(0, int(req_recommended_limit))] + rem
+    else:
+        start = max(0, req_offset)
+        end = None if req_limit is None else start + max(0, int(req_limit))
+        replayed_served = replayed_final[start:end]
+
+    archived_personalized = list(pools.get("personalized") or [])
+    archived_final = list(pools.get("final") or [])
+
+    def _pool_parity(replayed_items: list[dict[str, Any]], archived_items: list[Mapping[str, Any]]):
+        ids_match = [int(i["id"]) for i in replayed_items] == [
+            int(i["id"]) for i in archived_items
+        ]
+        if len(replayed_items) == len(archived_items) and ids_match:
+            drifts = [
+                abs(float(r.get("score") or 0.0) - float(a.get("score") or 0.0))
+                for r, a in zip(replayed_items, archived_items)
+            ]
+            max_drift = round(max(drifts, default=0.0), 6)
+        else:
+            max_drift = float("inf")
+        scores_match = ids_match and max_drift == 0.0
+        explanations_match = ids_match and [
+            list(r.get("explanation") or []) for r in replayed_items
+        ] == [list(a.get("explanation") or []) for a in archived_items]
+        fatigue_match = ids_match and (
+            schema_version < 2
+            or [r.get("fatigue_penalty") for r in replayed_items]
+            == [a.get("fatigue_penalty") for a in archived_items]
+        )
+        return ids_match, scores_match, explanations_match, fatigue_match, max_drift
+
+    p_ids, p_scores, p_exp, p_fat, p_drift = _pool_parity(
+        replayed_personalized, archived_personalized
+    )
+    f_ids, f_scores, f_exp, f_fat, f_drift = _pool_parity(
+        replayed_final, archived_final
+    )
+    max_score_drift = max(p_drift, f_drift)
+    verification = {
+        "personalized_ids_match": p_ids,
+        "personalized_scores_match": p_scores,
+        "personalized_explanations_match": p_exp,
+        "personalized_fatigue_penalties_match": p_fat,
+        "final_ids_match": f_ids,
+        "final_scores_match": f_scores,
+        "final_explanations_match": f_exp,
+        "final_fatigue_penalties_match": f_fat,
+        "max_personalized_score_drift": p_drift,
+        "max_final_score_drift": f_drift,
+        "max_score_drift": max_score_drift,
+        "matches_archived": (
+            p_ids
+            and p_scores
+            and p_exp
+            and p_fat
+            and f_ids
+            and f_scores
+            and f_exp
+            and f_fat
+            and max_score_drift == 0.0
+        ),
+    }
+    return {
+        "schema_version": schema_version,
+        "pools": {
+            "personalized": replayed_personalized,
+            "final": replayed_final,
+            "served": replayed_served,
+        },
+        "diagnostics": {
+            "personalization": personalization_diag,
+            "impression_fatigue": fatigue_diag,
+            "discovery_slate": slate_diag,
+            "llm_rerank": {
+                k: v for k, v in llm_diag.items() if k not in {"adjustments", "rankings"}
+            },
+        },
+        "verification": verification,
+    }
+
+
+def verify_decision_evidence_replay(record_or_decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Return replay parity diagnostics for a loaded decision-evidence archive."""
+
+    return replay_decision_evidence(record_or_decision)["verification"]
 
 
 def archive_recommendation_event(

@@ -1,39 +1,49 @@
 # Recommendation decision evidence
 
 Each recommendation run keeps a bounded copy of the inputs needed to replay the
-online personalization and discovery-slate stages. It stores the ordered base,
-personalized, and final pools; the interaction events used by the learner; the
-actual cached float32 vectors passed to those stages; safe policy diagnostics;
-and the request time and pagination/exploration parameters. It also keeps
-independent copies of served cards and later first-party events and outcomes.
-These copies survive ordinary source refresh cleanup, which may remove the
-mutable catalog candidate and its older telemetry rows.
+online personalization, impression-fatigue, discovery-slate, and optional LLM
+reranking stages deterministically without network calls. It stores the ordered
+base, personalized, and final pools (including `fatigue_penalty` when applied);
+the interaction events used by the learner (including `release_date` and
+`first_publication_year` for publication-era learning); unacted visible-day
+counts and active impression-fatigue parameters; safe LLM reranker configuration
+and validated adjustments or rank nudges; the actual cached float32 vectors
+passed to those stages; safe policy diagnostics; and the request time and
+pagination/exploration parameters. It also keeps independent copies of served
+cards and later first-party events and outcomes. These copies survive ordinary
+source refresh cleanup, which may remove the mutable catalog candidate and its
+older telemetry rows.
 
 Each successful scoring job now writes an immutable batch containing the exact
 rated-read rows and vectors passed to the scorer, the full read identity
-projection used for exclusion, candidate scorer inputs and vectors, runtime
-source hashes/dependency versions, and the exact scores and explanations
-written by that job. A candidate row points to the batch that produced its
-current materialized score. Serving evidence checks that pointer against the
-stored score and book identity, and separately reports whether the candidate's
+projection used for exclusion, active `goodreads_shelf_items` rows (`to-read`
+and `currently-reading`), candidate scorer inputs and vectors, runtime source
+hashes/dependency versions across all twenty ranking and evidence modules, and
+both the pre-boost `base_score` and post-shelf `score` and explanations written
+by that job. A candidate row points to the batch that produced its current
+materialized score. Serving evidence checks that pointer against the stored
+score and book identity, and separately reports whether the candidate's
 serving-time embedding document still matches the original scorer input. A
 later description or genre edit can make inputs stale while the archived batch
-still reproduces the historical score. Scores without a valid complete batch
-link remain `unknown`, `incomplete`, or `partial`; a serving run is complete
-when its own online stages are replayable, regardless of older unlinked base
-scores. Runtime source hashes identify installed pipeline files when no
-deployment build ID is available; they are not a substitute for a build
+still reproduces the historical score. Archive loaders and replay helpers accept
+both legacy schema v1 and extended schema v2 snapshots. Scores without a valid
+complete batch link remain `unknown`, `incomplete`, or `partial`; a serving run
+is complete when its own online stages are replayable, regardless of older
+unlinked base scores. Runtime source hashes identify installed pipeline files
+when no deployment build ID is available; they are not a substitute for a build
 artifact.
 
 Evidence is local to the profile database and may contain book descriptions,
-interaction history, and actual vector bytes. It does not copy session IDs,
-provider credentials, or general settings. Capture is bounded to 5,000 rows in
+interaction history, shelf items, and actual vector bytes. It does not copy
+session IDs, API keys, bearer tokens, raw endpoint userinfo/query credentials,
+or general settings. Capture is bounded to 5,000 rows in
 each candidate pool, 5,000 interaction events, 6,000 vectors, 8,192 dimensions
 per vector, 32 MiB of vector bytes, and 8 MiB of serialized evidence per run.
 Served exposures, archived events, and outcomes have per-run caps of 5,000,
-2,000, and 2,000 rows. A scoring batch is capped at 10,000 history rows, 5,000
-candidate inputs/outputs, 15,000 vectors, 8,192 dimensions per vector, 64 MiB
-of vector bytes, and 16 MiB of serialized evidence. Both serving and scoring
+2,000, and 2,000 rows. A scoring batch is capped at 10,000 history rows, 10,000
+shelf rows, 5,000 candidate inputs/outputs, 15,000 vectors, 8,192 dimensions per
+vector, 64 MiB of vector bytes, and 16 MiB of serialized evidence. Both serving
+and scoring
 evidence share a profile-wide 512 MiB logical budget that includes payloads,
 deduplicated vector bytes, reference rows, exposure/event/outcome data, and
 scoring-batch read links. If a cap or budget is reached, scoring still writes

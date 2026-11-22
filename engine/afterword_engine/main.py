@@ -72,6 +72,7 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import EVIDENCE_SCHEMA_VERSION
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
@@ -1329,6 +1330,16 @@ def tracked_recommendations(
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
     cached_vectors = {}
+    visible_day_counts: dict[int, int] = {}
+    fatigue_settings = {
+        "enabled": bool(settings.impression_fatigue_enabled),
+        "window_days": int(settings.impression_fatigue_window_days),
+        "grace_days": int(settings.impression_fatigue_grace_days),
+        "penalty_per_day": float(settings.impression_fatigue_penalty_per_day),
+        "max_penalty": float(settings.impression_fatigue_max_penalty),
+    }
+    llm_cfg: dict[str, object] = {}
+    llm_rerank_output: dict[str, object] | None = None
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata = {
         "mode": "confidence_gated_live",
@@ -1398,12 +1409,16 @@ def tracked_recommendations(
             recommended = [
                 item for item in ranked if item.get("status") == "recommended"
             ]
+            llm_cfg = {
+                **effective_llm_rerank_settings(connection, private),
+                "top_k": settings.llm_rerank_top_k,
+                "max_delta": settings.llm_rerank_max_delta,
+            }
             if recommended:
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
                 )
-                llm_cfg = effective_llm_rerank_settings(connection, private)
-                if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
+                if llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip():
                     from .llm_reranker import rerank_with_llm_sync
 
                     read_rows = (
@@ -1420,11 +1435,16 @@ def tracked_recommendations(
                         read_rows,
                         diversified,
                         interaction_events=interaction_events,
-                        api_url=llm_cfg["api_url"],
-                        api_key=llm_cfg["api_key"],
-                        model=llm_cfg["model"],
+                        api_url=str(llm_cfg["api_url"]),
+                        api_key=str(llm_cfg["api_key"]),
+                        model=str(llm_cfg["model"]),
                     )
-                    learning_metadata["llm_rerank"] = llm_diag
+                    llm_rerank_output = llm_diag
+                    learning_metadata["llm_rerank"] = {
+                        key: value
+                        for key, value in llm_diag.items()
+                        if key not in {"adjustments", "rankings"}
+                    }
                 ranked = diversified + [
                     item for item in ranked if item.get("status") != "recommended"
                 ]
@@ -1450,6 +1470,7 @@ def tracked_recommendations(
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
             )
+            base_pool = personalized_pool = final_pool = None
             recommendations = recommendation_list(
                 connection,
                 status=status,
@@ -1512,10 +1533,14 @@ def tracked_recommendations(
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
             },
+            visible_day_counts=visible_day_counts,
+            impression_fatigue_settings=fatigue_settings,
+            llm_rerank_settings=llm_cfg,
+            llm_rerank_output=llm_rerank_output,
         )
     else:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
