@@ -306,25 +306,50 @@ describe("page actions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("saves normalized source genre filters", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ saved: true }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    );
+  it("saves normalized source genre filters after previewing matches", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 3, raw_count: 10 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
     body.set("id", "7");
+    body.set("url", "https://books.example/list");
+    body.set("currentUrl", "https://books.example/list");
     body.set("includeGenres", " Science fiction, fantasy, science fiction ");
     body.set("excludeGenres", " romance ");
     const result = await actions.configureSourceFilters!({
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
     expect(result).toEqual({
-      message: "Source filters updated; a fresh scan is queued.",
+      message: "Source filters updated (3 books matched); a fresh scan is queued.",
     });
-    expect(fetchMock).toHaveBeenCalledWith(
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8000/api/sources/preview",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://books.example/list",
+          filters: {
+            include_genres: ["Science fiction", "fantasy"],
+            exclude_genres: ["romance"],
+          },
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
       "http://127.0.0.1:8000/api/sources/7",
       expect.objectContaining({
         method: "PUT",
@@ -336,6 +361,201 @@ describe("page actions", () => {
         }),
       }),
     );
+  });
+
+  it("warns and requires confirmation before saving zero-match source filters", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 0, raw_count: 12 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 0, raw_count: 12 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const unconfirmed = new FormData();
+    unconfirmed.set("id", "7");
+    unconfirmed.set("url", "https://books.example/list");
+    unconfirmed.set("currentUrl", "https://books.example/list");
+    unconfirmed.set("includeGenres", "cyberpunk");
+    const warning = (await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: unconfirmed,
+      }),
+    } as never)) as {
+      status: number;
+      data: {
+        message: string;
+        zeroMatchConfirm?: { id: number; rawCount: number };
+      };
+    };
+    expect(warning.status).toBe(400);
+    expect(warning.data.message).toContain("0 of 12 books");
+    expect(warning.data.zeroMatchConfirm).toMatchObject({ id: 7, rawCount: 12 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const confirmed = new FormData();
+    confirmed.set("id", "7");
+    confirmed.set("url", "https://books.example/list");
+    confirmed.set("currentUrl", "https://books.example/list");
+    confirmed.set("includeGenres", "cyberpunk");
+    confirmed.set("confirmZeroMatch", "1");
+    const saved = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: confirmed,
+      }),
+    } as never);
+    expect(saved).toEqual({
+      message:
+        "Zero-match source filters confirmed and saved; a fresh scan is queued.",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("previews and updates custom source URLs and switches lifecycles both ways", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 5, raw_count: 6 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 5, raw_count: 6 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 7 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 7, lifecycle: "permanent" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const previewForm = new FormData();
+    previewForm.set("id", "7");
+    previewForm.set("url", "https://books.example/new-feed");
+    previewForm.set("currentUrl", "https://books.example/old-feed");
+    previewForm.set("intent", "preview");
+    const previewResult = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: previewForm,
+      }),
+    } as never);
+    expect(previewResult).toMatchObject({
+      message: "Preview matched 5 of 6 books.",
+      sourcePreview: { id: 7, url: "https://books.example/new-feed", count: 5, rawCount: 6 },
+    });
+
+    const saveForm = new FormData();
+    saveForm.set("id", "7");
+    saveForm.set("url", "https://books.example/new-feed");
+    saveForm.set("currentUrl", "https://books.example/old-feed");
+    saveForm.set("intent", "save");
+    const saveResult = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: saveForm,
+      }),
+    } as never);
+    expect(saveResult).toEqual({
+      message: "Source updated (5 books matched); a fresh scan is queued.",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://127.0.0.1:8000/api/sources/7",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          filters: { include_genres: [], exclude_genres: [] },
+          url: "https://books.example/new-feed",
+        }),
+      }),
+    );
+
+    const permanentForm = new FormData();
+    permanentForm.set("id", "7");
+    const permanentResult = await actions.switchSourceToPermanent!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: permanentForm,
+      }),
+    } as never);
+    expect(permanentResult).toEqual({
+      message: "Source changed to a permanent feed; a fresh scan is queued.",
+    });
+  });
+
+  it("validates Google Books key updates and reports queued metadata refreshes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "Google Books rejected the API key (HTTP 400: API key not valid.)",
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            saved: true,
+            google_books_api_key_set: true,
+            job_ids: { metadata: 11, read_metadata: 12 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const badForm = new FormData();
+    badForm.set("apiKey", "bad-key");
+    const rejected = (await actions.configureGoogleBooks!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: badForm,
+      }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(rejected.status).toBe(400);
+    expect(rejected.data.message).toContain("Google Books rejected the API key");
+
+    const goodForm = new FormData();
+    goodForm.set("apiKey", "valid-google-key");
+    const accepted = await actions.configureGoogleBooks!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: goodForm,
+      }),
+    } as never);
+    expect(accepted).toEqual({
+      message: "Google Books API key verified and saved; metadata refresh queued.",
+    });
   });
 
   it("saves the permanent-source refresh cadence", async () => {

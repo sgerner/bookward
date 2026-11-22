@@ -985,6 +985,17 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1405,8 +1416,12 @@ def initialize(*, seed_demo: bool = True):
         builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
         for name, url, enabled in DEFAULT_SOURCES:
             con.execute(
-                "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
-                (name, url, "web", enabled),
+                """INSERT INTO sources(name,url,kind,enabled,is_default)
+                SELECT ?,?,'web',?,0
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sources WHERE url=? OR (name=? AND kind='web')
+                )""",
+                (name, url, enabled, url, name),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []

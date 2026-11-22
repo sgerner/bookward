@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 from .config import settings
 from .identity import book_author_identity_key, book_catalog_title_identity_key, canonical_part
 from .isbn import canonical_isbn, isbn_parts
+from .security import safe_error_message
 from .subjects import normalize_subjects
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
@@ -57,12 +58,41 @@ SOURCE_PAYLOAD_LIMIT_BYTES = 8192
 OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 _CATALOG_PROVIDER_FAILURE_STATUSES = frozenset({
     "rate_limited",
+    "credential_error",
+    "server_error",
     "http_error",
     "request_error",
     "invalid_json",
     "invalid_response",
 })
 _OPEN_LIBRARY_RATE_LIMITERS = weakref.WeakKeyDictionary()
+
+
+def _classify_catalog_http_error(response: httpx.Response) -> str:
+    status_code = response.status_code
+    if status_code == 429:
+        return "rate_limited"
+    if status_code == 403:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            error_obj = payload["error"]
+            reasons = " ".join(
+                str(entry.get("reason") or "")
+                for entry in (error_obj.get("errors") or [])
+                if isinstance(entry, dict)
+            )
+            combined = f"{reasons} {error_obj.get('message') or ''}".casefold()
+            if "rate" in combined or "quota" in combined:
+                return "rate_limited"
+        return "credential_error"
+    if status_code in {400, 401}:
+        return "credential_error"
+    if status_code >= 500:
+        return "server_error"
+    return "http_error"
 
 
 def _utc_now() -> str:
@@ -465,7 +495,7 @@ async def _lookup_open_library_record(
             response = await _openlibrary_request(client, OPEN_LIBRARY_SEARCH, params=params)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
             return {"_fetch_trace": trace}
         try:
             payload = response.json()
@@ -592,7 +622,7 @@ async def _lookup_google_books_record(
             response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
             return {"_fetch_trace": trace}
         try:
             payload = response.json()
@@ -1143,7 +1173,7 @@ async def resolve_openlibrary_work_metadata(
             response = await _openlibrary_request(client, url)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
         else:
             try:
                 payload = response.json()
@@ -1281,3 +1311,60 @@ def fallback_cover_url(title: str, author: str, supplied: object = "", source_ur
 
     supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
     return supplied_url or placeholder_cover_url(title, author)
+
+
+async def validate_google_books_api_key(
+    api_key: str,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """Verify a non-empty Google Books API key with a minimal live search probe."""
+
+    key = str(api_key or "").strip()
+    if not key:
+        raise ValueError("Enter a Google Books API key.")
+
+    def _scrub(text: object) -> str:
+        cleaned = str(text or "").replace(key, "[redacted]")
+        return safe_error_message(cleaned, limit=240)
+
+    params = {"q": "intitle:dune", "maxResults": 1, "key": key}
+    try:
+        if client is None:
+            async with metadata_client() as owned_client:
+                response = await owned_client.get(GOOGLE_BOOKS_SEARCH, params=params)
+        else:
+            response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
+    except httpx.HTTPError as exc:
+        raise ValueError(
+            f"Could not reach Google Books to validate the API key: {_scrub(exc)}"
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    detail = ""
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        detail = _scrub(payload["error"].get("message") or "").strip()
+
+    if response.status_code in {400, 401, 403}:
+        suffix = f": {detail}" if detail else "."
+        raise ValueError(
+            f"Google Books rejected the API key (HTTP {response.status_code}{suffix})"
+            if not detail
+            else f"Google Books rejected the API key (HTTP {response.status_code}: {detail})"
+        )
+    if response.status_code == 429:
+        raise ValueError(
+            "Google Books rate-limited the validation check (HTTP 429). Check project quota or try again shortly."
+        )
+    if response.is_error:
+        raise ValueError(
+            f"Google Books could not validate the API key (HTTP {response.status_code})."
+        )
+    if not isinstance(payload, dict) or "error" in payload:
+        raise ValueError(
+            "Google Books returned an unexpected response while validating the API key."
+        )
+

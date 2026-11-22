@@ -45,6 +45,7 @@
   import { createTelemetryClient } from "#lib/telemetry.js";
   import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
+  import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "decisions" | "sources" | "settings";
@@ -61,6 +62,21 @@
     id?: number;
     undo_id?: number;
     undo_label?: string;
+    sourcePreview?: {
+      id: number;
+      url: string;
+      count: number;
+      rawCount: number;
+      includeGenres: string;
+      excludeGenres: string;
+    };
+    zeroMatchConfirm?: {
+      id: number;
+      url: string;
+      rawCount: number;
+      includeGenres: string;
+      excludeGenres: string;
+    };
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
@@ -1192,18 +1208,7 @@
   }
 
   function formatSourceScan(value: string | null, status: string | null) {
-    if (status?.startsWith("error:")) {
-      const detail = status.slice("error:".length).trim().replace(/\s+/g, " ");
-      if (!detail) return "Needs attention";
-      const clipped = detail.length > 140 ? `${detail.slice(0, 139)}…` : detail;
-      return `Needs attention: ${clipped}`;
-    }
-    if (!value) return "Not scanned yet";
-    const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
-    const date = new Date(normalized);
-    return Number.isNaN(date.valueOf())
-      ? "Scanned"
-      : `Scanned ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+    return formatSourceScanStatus(value, status);
   }
 
   function formatDeliveryDate(value: string | null | undefined) {
@@ -2497,7 +2502,33 @@
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
                               {#if source.lifecycle === "one_time"}
-                                One-time import · {formatSourceScan(source.last_scanned_at, source.last_status)}
+                                One-time import
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <span aria-hidden="true"> · </span>
+                                  <form
+                                    class="inline"
+                                    method="POST"
+                                    action="?/switchSourceToPermanent"
+                                    use:enhance={setPending(`source-lifecycle-${source.id}`)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <button
+                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      type="submit"
+                                      disabled={isPending(`source-lifecycle-${source.id}`)}
+                                      aria-busy={isPending(`source-lifecycle-${source.id}`)}
+                                    >Switch to Permanent Feed</button>
+                                  </form>
+                                {/if}
+                                <span aria-hidden="true"> · </span>
+                                <span
+                                  class={sourceScanTone(source.last_scanned_at, source.last_status) === "error"
+                                    ? "font-medium text-error-600-400"
+                                    : sourceScanTone(source.last_scanned_at, source.last_status) === "warning"
+                                      ? "font-medium text-warning-700-300"
+                                      : ""}
+                                >{formatSourceScan(source.last_scanned_at, source.last_status)}</span>
                               {:else}
                                 Permanent feed
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
@@ -2519,12 +2550,21 @@
                                   </form>
                                 {/if}
                                 <span aria-hidden="true"> · </span>
-                                {formatSourceScan(source.last_scanned_at, source.last_status)}
+                                <span
+                                  class={sourceScanTone(source.last_scanned_at, source.last_status) === "error"
+                                    ? "font-medium text-error-600-400"
+                                    : sourceScanTone(source.last_scanned_at, source.last_status) === "warning"
+                                      ? "font-medium text-warning-700-300"
+                                      : ""}
+                                >{formatSourceScan(source.last_scanned_at, source.last_status)}</span>
                               {/if}
                             </span>
-                            <details class="mt-3 w-full max-w-full">
+                            <details
+                              class="mt-3 w-full max-w-full"
+                              open={formState?.sourcePreview?.id === source.id || formState?.zeroMatchConfirm?.id === source.id || undefined}
+                            >
                               <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
-                                Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
+                                {source.kind !== "association" && source.kind !== "builtin" ? "URL & filters" : "Filters"}{source.filters.include_genres.length || source.filters.exclude_genres.length
                                   ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                   : ""}
                               </summary>
@@ -2536,12 +2576,34 @@
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
+                                <input type="hidden" name="currentUrl" value={source.url} />
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <label class="block text-xs font-medium text-surface-800-200">
+                                    Feed URL
+                                    <input
+                                      class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                      name="url"
+                                      type="url"
+                                      required
+                                      value={formState?.sourcePreview?.id === source.id
+                                        ? formState.sourcePreview.url
+                                        : formState?.zeroMatchConfirm?.id === source.id
+                                          ? formState.zeroMatchConfirm.url
+                                          : source.url}
+                                      placeholder="https://example.com/books/rss"
+                                    />
+                                  </label>
+                                {/if}
                                 <label class="block text-xs font-medium text-surface-800-200">
                                   Include genres
                                   <input
                                     class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="includeGenres"
-                                    value={source.filters.include_genres.join(", ")}
+                                    value={formState?.sourcePreview?.id === source.id
+                                      ? formState.sourcePreview.includeGenres
+                                      : formState?.zeroMatchConfirm?.id === source.id
+                                        ? formState.zeroMatchConfirm.includeGenres
+                                        : source.filters.include_genres.join(", ")}
                                     placeholder="science fiction, fantasy"
                                   />
                                 </label>
@@ -2550,19 +2612,67 @@
                                   <input
                                     class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="excludeGenres"
-                                    value={source.filters.exclude_genres.join(", ")}
+                                    value={formState?.sourcePreview?.id === source.id
+                                      ? formState.sourcePreview.excludeGenres
+                                      : formState?.zeroMatchConfirm?.id === source.id
+                                        ? formState.zeroMatchConfirm.excludeGenres
+                                        : source.filters.exclude_genres.join(", ")}
                                     placeholder="romance, cookbook"
                                   />
                                 </label>
                                 <p class="text-xs leading-5 text-surface-600-400">
                                   Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                                 </p>
-                                <button
-                                  class="btn btn-sm min-h-9 preset-tonal-secondary"
-                                  type="submit"
-                                  disabled={isPending(`source-filters-${source.id}`)}
-                                  aria-busy={isPending(`source-filters-${source.id}`)}
-                                >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                                {#if formState?.sourcePreview?.id === source.id}
+                                  <div
+                                    class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
+                                    role="status"
+                                  >
+                                    {#if formState.sourcePreview.count === 0}
+                                      Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
+                                    {:else}
+                                      Preview matched {formState.sourcePreview.count} of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}.
+                                    {/if}
+                                  </div>
+                                {/if}
+                                {#if formState?.zeroMatchConfirm?.id === source.id}
+                                  <div
+                                    class="space-y-2 border-l-2 border-warning-500 preset-tonal-warning p-3 text-xs leading-5"
+                                    role="alert"
+                                  >
+                                    <p class="font-medium">
+                                      0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
+                                    </p>
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-filled-warning-500"
+                                      type="submit"
+                                      name="confirmZeroMatch"
+                                      value="1"
+                                      disabled={isPending(`source-filters-${source.id}`)}
+                                      aria-busy={isPending(`source-filters-${source.id}`)}
+                                    ><TriangleAlert size={14} /> Confirm & save zero-match filters</button>
+                                  </div>
+                                {/if}
+                                <div class="flex flex-wrap items-center gap-2">
+                                  {#if source.kind !== "association" && source.kind !== "builtin"}
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-tonal-surface"
+                                      type="submit"
+                                      name="intent"
+                                      value="preview"
+                                      disabled={isPending(`source-filters-${source.id}`)}
+                                      aria-busy={isPending(`source-filters-${source.id}`)}
+                                    ><Search size={14} /> Preview matches</button>
+                                  {/if}
+                                  <button
+                                    class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                    type="submit"
+                                    name="intent"
+                                    value="save"
+                                    disabled={isPending(`source-filters-${source.id}`)}
+                                    aria-busy={isPending(`source-filters-${source.id}`)}
+                                  >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} {source.kind !== "association" && source.kind !== "builtin" ? "Save & rescan" : "Save filters"}</button>
+                                </div>
                               </form>
                             </details>
                           </div>
