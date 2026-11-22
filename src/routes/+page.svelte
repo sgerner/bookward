@@ -349,6 +349,13 @@
       : filteredBooks,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
+  const selectedDigestRunId = $derived.by(() => {
+    for (const id of selectedDigestIds) {
+      const runId = allBooks.find((book) => book.id === id)?.recommendation_run_id;
+      if (runId) return runId;
+    }
+    return data.recommendation_run_id ?? "";
+  });
   const digestSettings = $derived(data.profile.digest);
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
@@ -1966,6 +1973,7 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  <input type="hidden" name="run_id" value={selectedDigestRunId} />
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist

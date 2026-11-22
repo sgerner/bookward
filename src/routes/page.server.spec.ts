@@ -506,5 +506,28 @@ describe("page actions", () => {
     });
   });
 
+  it("forwards run_id when shortlisting a selected digest batch", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ updated: 2 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.append("run_id", "  run-digest-1234  ");
+    body.append("ids", "7");
+    body.append("ids", "8");
+    const result = await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "2 books added to your shortlist." });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+      run_id: "run-digest-1234",
+    });
+  });
+
 
 });

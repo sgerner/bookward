@@ -51,4 +51,19 @@ describe("authenticated native forms", () => {
       expect(missing, `${page} has a POST form without __profile_id`).toEqual([]);
     }
   });
+
+  it("includes a hidden run_id field in the digest bulk shortlist form", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../routes/+page.svelte", import.meta.url)),
+      "utf8",
+    );
+    const forms = postForms(parse(source, { modern: true }).fragment).map(({ start, end }) =>
+      source.slice(start, end),
+    );
+    const bulkForms = forms.filter((markup) => markup.includes('action="?/shortlistBulk"'));
+
+    expect(bulkForms).toHaveLength(1);
+    expect(bulkForms[0]).toContain('type="hidden" name="run_id"');
+    expect(bulkForms[0]).toContain("selectedDigestRunId");
+  });
 });
