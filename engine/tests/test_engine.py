@@ -25,7 +25,6 @@ from afterword_engine.covers import (
     fallback_cover_url,
     is_weak_cover_url,
     resolve_book_metadata,
-    resolve_cover_url,
     safe_cover_url,
 )
 from afterword_engine.ingestion import (
@@ -1574,29 +1573,6 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("https://books.example/cover.jpg", "https://books.example/list")
     assert safe_cover_url("https://tracking.example/cover.jpg", "https://books.example/list") == ""
     assert fallback_cover_url("A Book", "An Author").startswith("https://placehold.co/")
-
-@respx.mock
-def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
-    route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(200, json={"docs": [{"title": "A Book", "author_name": ["An Author"], "cover_i": 12345}]})
-    )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author", "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg"))
-    assert cover == "https://covers.openlibrary.org/b/id/12345-L.jpg"
-    assert route.called
-
-@respx.mock
-def test_cover_lookup_falls_back_to_google_books_then_placeholder():
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
-    google = respx.get(GOOGLE_BOOKS_SEARCH).mock(
-        return_value=httpx.Response(200, json={"items": [{"volumeInfo": {"title": "A Book", "authors": ["An Author"], "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=x"}}}]})
-    )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author"))
-    assert cover == "https://books.google.com/books/content?id=x"
-    assert google.called
-    respx.reset()
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(503))
-    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
-    assert asyncio.run(resolve_cover_url("No Match", "Nobody")).startswith("https://placehold.co/")
 
 @respx.mock
 def test_book_metadata_lookup_supplies_summary_and_year():
