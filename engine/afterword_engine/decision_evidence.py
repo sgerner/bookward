@@ -1235,21 +1235,47 @@ def purge_recommendation_evidence(
             (*candidates, *candidates, *candidates),
         ).fetchall()
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
+    read_event_keys: list[str] = []
     if reads:
-        read_marks = ",".join("?" for _ in reads)
-        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
-        event_marks = ",".join("?" for _ in read_event_keys)
-        rows = connection.execute(
-            "SELECT i.run_id FROM recommendation_outcomes o "
-            "JOIN recommendation_impressions i ON i.id=o.impression_id "
-            f"WHERE o.read_id IN ({read_marks}) UNION "
-            "SELECT run_id FROM recommendation_events "
-            f"WHERE event_key IN ({event_marks}) UNION "
-            "SELECT run_id FROM recommendation_evidence_events "
-            f"WHERE event_key IN ({event_marks})",
-            (*reads, *read_event_keys, *read_event_keys),
-        ).fetchall()
-        selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
+        key_set = {f"read:{read_id:08d}" for read_id in reads}
+        for start in range(0, len(reads), 200):
+            batch = reads[start : start + 200]
+            glob_clauses = " OR ".join("event_key GLOB ?" for _ in batch)
+            patterns = [f"manual-read:[0-9]*:{read_id:08d}" for read_id in batch]
+            for table in (
+                "recommendation_events",
+                "recommendation_evidence_events",
+                "recommendation_evidence_outcomes",
+            ):
+                found = connection.execute(
+                    f"SELECT DISTINCT event_key FROM {table} WHERE {glob_clauses}",
+                    patterns,
+                ).fetchall()
+                key_set.update(str(row["event_key"]) for row in found if row["event_key"])
+        read_event_keys = sorted(key_set)
+        for start in range(0, len(reads), 400):
+            batch = reads[start : start + 400]
+            read_marks = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT i.run_id FROM recommendation_outcomes o "
+                "JOIN recommendation_impressions i ON i.id=o.impression_id "
+                f"WHERE o.read_id IN ({read_marks})",
+                batch,
+            ).fetchall()
+            selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
+        for start in range(0, len(read_event_keys), 400):
+            batch = read_event_keys[start : start + 400]
+            event_marks = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT run_id FROM recommendation_events "
+                f"WHERE event_key IN ({event_marks}) UNION "
+                "SELECT run_id FROM recommendation_evidence_events "
+                f"WHERE event_key IN ({event_marks}) UNION "
+                "SELECT run_id FROM recommendation_evidence_outcomes "
+                f"WHERE event_key IN ({event_marks})",
+                (*batch, *batch, *batch),
+            ).fetchall()
+            selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
 
     scoring_batch_ids: set[str] = set()
     if candidates:
@@ -1358,21 +1384,33 @@ def purge_recommendation_evidence(
             candidates,
         )
     if reads:
-        read_marks = ",".join("?" for _ in reads)
-        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
-        event_marks = ",".join("?" for _ in read_event_keys)
-        connection.execute(
-            f"DELETE FROM recommendation_outcomes WHERE read_id IN ({read_marks})",
-            reads,
-        )
-        connection.execute(
-            f"DELETE FROM recommendation_events WHERE event_key IN ({event_marks})",
-            read_event_keys,
-        )
-        connection.execute(
-            f"DELETE FROM recommendation_evidence_events WHERE event_key IN ({event_marks})",
-            read_event_keys,
-        )
+        for start in range(0, len(reads), 400):
+            batch = reads[start : start + 400]
+            read_marks = ",".join("?" for _ in batch)
+            connection.execute(
+                f"DELETE FROM recommendation_outcomes WHERE read_id IN ({read_marks})",
+                batch,
+            )
+        for start in range(0, len(read_event_keys), 400):
+            batch = read_event_keys[start : start + 400]
+            event_marks = ",".join("?" for _ in batch)
+            connection.execute(
+                "DELETE FROM recommendation_outcomes WHERE event_id IN ("
+                f"SELECT id FROM recommendation_events WHERE event_key IN ({event_marks}))",
+                batch,
+            )
+            connection.execute(
+                f"DELETE FROM recommendation_evidence_outcomes WHERE event_key IN ({event_marks})",
+                batch,
+            )
+            connection.execute(
+                f"DELETE FROM recommendation_events WHERE event_key IN ({event_marks})",
+                batch,
+            )
+            connection.execute(
+                f"DELETE FROM recommendation_evidence_events WHERE event_key IN ({event_marks})",
+                batch,
+            )
     if clear_all_evidence:
         connection.execute("DELETE FROM recommendation_events")
         connection.execute("DELETE FROM feedback")

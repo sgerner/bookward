@@ -36,7 +36,10 @@ type Overview = {
     metadata_confidence: number;
     explanation: string[];
     status: string;
+    source_id?: number | null;
     source_name: string | null;
+    source_enabled?: boolean;
+    quality_status?: string | null;
   }>;
   decisions?: Overview["recommendations"];
   decisions_has_more?: boolean;
@@ -240,6 +243,30 @@ const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
 };
+const parseReadAtDateInput = (
+  raw: string,
+): { ok: true; value: string | undefined } | { ok: false; message: string } => {
+  const cleaned = raw.trim();
+  if (!cleaned) return { ok: true, value: undefined };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+    return { ok: false, message: "Enter a valid completion date (YYYY-MM-DD)." };
+  }
+  const [year, month, day] = cleaned.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (
+    Number.isNaN(parsed.valueOf()) ||
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() + 1 !== month ||
+    parsed.getUTCDate() !== day
+  ) {
+    return { ok: false, message: "Enter a valid completion date (YYYY-MM-DD)." };
+  }
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  if (cleaned > todayUtc) {
+    return { ok: false, message: "Completion date cannot be in the future." };
+  }
+  return { ok: true, value: cleaned };
+};
 export const actions: Actions = {
   createBackup: async () => {
     try {
@@ -349,7 +376,7 @@ export const actions: Actions = {
           : {}),
       };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   undoDecision: async ({ request }) => {
@@ -373,23 +400,127 @@ export const actions: Actions = {
     const id = idSchema.safeParse(data.get("id"));
     const rawRating = formText(data, "rating");
     const rating = rawRating ? Number(rawRating) : undefined;
+    const historical = ["1", "true", "on"].includes(
+      formText(data, "historical").toLowerCase(),
+    );
+    const parsedReadAt = parseReadAtDateInput(formText(data, "read_at"));
     if (
       !id.success ||
       (rating !== undefined && (!Number.isInteger(rating) || rating < 1 || rating > 5))
     ) {
       return fail(400, { message: "Choose a valid book and an optional rating from 1 to 5." });
     }
+    if (!parsedReadAt.ok) {
+      return fail(400, { message: parsedReadAt.message });
+    }
     try {
       await engine(`/api/recommendations/${id.data}/read`, {
         method: "POST",
         body: JSON.stringify({
           ...(rating === undefined ? {} : { rating }),
+          ...(historical ? { historical: true } : {}),
+          ...(parsedReadAt.value === undefined ? {} : { read_at: parsedReadAt.value }),
         }),
       });
+      if (historical) {
+        return {
+          message: rating === undefined
+            ? "Added past read to your reading history."
+            : `Added past read to your reading history with a ${rating}-star rating.`,
+        };
+      }
       return {
         message: rating === undefined
           ? "Marked Read and added to your history."
           : `Marked Read and added to your history with a ${rating}-star rating.`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  updateRead: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    if (!id.success) {
+      return fail(400, { message: "Choose a valid read history entry." });
+    }
+    const payload: { rating?: number | null; read_at?: string | null } = {};
+    if (formText(data, "clear_rating") === "1") {
+      payload.rating = null;
+    } else if (data.has("rating")) {
+      const rawRating = formText(data, "rating");
+      if (!rawRating) {
+        payload.rating = null;
+      } else {
+        const rating = Number(rawRating);
+        if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+          return fail(400, { message: "Choose a rating from 1 to 5, or clear the rating." });
+        }
+        payload.rating = rating;
+      }
+    }
+    if (formText(data, "clear_read_at") === "1") {
+      payload.read_at = null;
+    } else if (data.has("read_at")) {
+      const rawReadAt = formText(data, "read_at");
+      if (!rawReadAt) {
+        payload.read_at = null;
+      } else {
+        const parsedReadAt = parseReadAtDateInput(rawReadAt);
+        if (!parsedReadAt.ok) {
+          return fail(400, { message: parsedReadAt.message });
+        }
+        payload.read_at = parsedReadAt.value ?? null;
+      }
+    }
+    if (!("rating" in payload) && !("read_at" in payload)) {
+      return fail(400, { message: "Provide a rating or completion date update." });
+    }
+    try {
+      const updated = await engine<{
+        id: number;
+        title: string;
+        author: string;
+        rating: number | null;
+        read_at: string | null;
+        source: string;
+        created_at: string;
+      }>(`/api/reading-history/${id.data}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      let actionMessage = "Reading history updated.";
+      if ("rating" in payload && !("read_at" in payload)) {
+        actionMessage = payload.rating === null
+          ? "Cleared rating from your reading history."
+          : `Updated rating to ${payload.rating} ${payload.rating === 1 ? "star" : "stars"}.`;
+      } else if ("read_at" in payload && !("rating" in payload)) {
+        actionMessage = payload.read_at === null
+          ? "Cleared completion date."
+          : `Updated completion date to ${payload.read_at}.`;
+      }
+      return {
+        message: actionMessage,
+        updated_read: updated,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  deleteRead: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    if (!id.success) {
+      return fail(400, { message: "Choose a valid read history entry." });
+    }
+    try {
+      await engine(`/api/reading-history/${id.data}`, {
+        method: "DELETE",
+        body: "",
+      });
+      return {
+        message: "Removed manual read from your reading history.",
+        deleted_read_id: id.data,
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });

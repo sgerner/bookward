@@ -506,5 +506,169 @@ describe("page actions", () => {
     });
   });
 
+  it("propagates HTTP 409 when restoring a candidate from a disabled source", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail:
+            "This book's source is disabled. Re-enable the source in Sources to return it to Discover, or use Shortlist or Mark Read here.",
+        }),
+        {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "recommended");
+    const result = (await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string } };
 
+    expect(result.status).toBe(409);
+    expect(result.data.message).toContain("source is disabled");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/9/feedback",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "restore" }),
+      }),
+    );
+  });
+
+  it("forwards historical undated Mark Read submissions and validates optional dates", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "read", read_id: 12 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "42");
+    body.set("historical", "true");
+    body.set("rating", "4");
+    const result = await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Added past read to your reading history with a 4-star rating.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/42/read",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ rating: 4, historical: true }),
+      }),
+    );
+
+    const futureBody = new FormData();
+    futureBody.set("id", "42");
+    futureBody.set("read_at", "2099-01-01");
+    const futureResult = (await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body: futureBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(futureResult.status).toBe(400);
+    expect(futureResult.data.message).toContain("cannot be in the future");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates and clears read ratings and completion dates via PATCH", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ id: 15, rating: 4, read_at: "2025-11-04", source: "manual" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ id: 15, rating: null, read_at: null, source: "manual_history" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const updateBody = new FormData();
+    updateBody.set("id", "15");
+    updateBody.set("rating", "4");
+    updateBody.set("read_at", "2025-11-04");
+    const updated = await actions.updateRead!({
+      request: new Request("http://afterword.test", { method: "POST", body: updateBody }),
+    } as never);
+    expect(updated).toEqual({
+      message: "Reading history updated.",
+      updated_read: { id: 15, rating: 4, read_at: "2025-11-04", source: "manual" },
+    });
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "http://127.0.0.1:8000/api/reading-history/15",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ rating: 4, read_at: "2025-11-04" }),
+      }),
+    ]);
+
+    const clearBody = new FormData();
+    clearBody.set("id", "15");
+    clearBody.set("clear_rating", "1");
+    clearBody.set("clear_read_at", "1");
+    const cleared = await actions.updateRead!({
+      request: new Request("http://afterword.test", { method: "POST", body: clearBody }),
+    } as never);
+    expect(cleared).toEqual({
+      message: "Reading history updated.",
+      updated_read: { id: 15, rating: null, read_at: null, source: "manual_history" },
+    });
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "http://127.0.0.1:8000/api/reading-history/15",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ rating: null, read_at: null }),
+      }),
+    ]);
+  });
+
+  it("deletes manual read entries via DELETE and propagates 409 for imported sources", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ deleted: true, id: 15 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ detail: "Only manual read entries can be removed here." }),
+          { status: 409, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "15");
+    const deleted = await actions.deleteRead!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(deleted).toEqual({
+      message: "Removed manual read from your reading history.",
+      deleted_read_id: 15,
+    });
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "http://127.0.0.1:8000/api/reading-history/15",
+      expect.objectContaining({ method: "DELETE" }),
+    ]);
+
+    const importedBody = new FormData();
+    importedBody.set("id", "16");
+    const rejected = (await actions.deleteRead!({
+      request: new Request("http://afterword.test", { method: "POST", body: importedBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(rejected.status).toBe(409);
+    expect(rejected.data.message).toContain("Only manual read entries");
+  });
 });

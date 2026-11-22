@@ -180,4 +180,42 @@ describe("public API proxy", () => {
       "https://client.example",
     );
   });
+
+  it("advertises and forwards PATCH requests for nested reading-history routes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ read: { id: 21, rating: 5 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const preflight = new Request("http://bookward.test/api/v1/reading-history/21", {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://client.example",
+        "access-control-request-method": "PATCH",
+      },
+    });
+    const preflightResponse = await proxyApi(eventFor(preflight, "reading-history/21"));
+    expect(preflightResponse.status).toBe(204);
+    expect(preflightResponse.headers.get("access-control-allow-methods")).toContain("PATCH");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const patchRequest = new Request("http://bookward.test/api/v1/reading-history/21", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer bkw_test",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ rating: 5 }),
+    });
+    const patchResponse = await proxyApi(eventFor(patchRequest, "reading-history/21"));
+    expect(patchResponse.status).toBe(200);
+    expect(await patchResponse.json()).toEqual({ read: { id: 21, rating: 5 } });
+    const [target, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(target).toBe("http://127.0.0.1:8000/api/v1/reading-history/21");
+    expect(init.method).toBe("PATCH");
+    expect(await new Response(init.body).json()).toEqual({ rating: 5 });
+  });
 });

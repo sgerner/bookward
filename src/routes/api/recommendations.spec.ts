@@ -164,4 +164,43 @@ describe("recommendations endpoint", () => {
     );
     expect(payload.has_more).toBe(true);
   });
+
+  it("maps maybe_later slice items and preserves source_enabled flags", async () => {
+    engineMock.mockResolvedValue([
+      {
+        ...recommendation(12),
+        status: "maybe_later",
+        source_enabled: false,
+      },
+      {
+        ...recommendation(13),
+        status: "maybe_later",
+        source_enabled: true,
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=maybe_later&limit=24&offset=0",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=maybe_later&limit=25&offset=0",
+    );
+    expect(payload.items).toEqual([
+      expect.objectContaining({
+        id: 12,
+        status: "maybe_later",
+        source_enabled: false,
+      }),
+      expect.objectContaining({
+        id: 13,
+        status: "maybe_later",
+        source_enabled: true,
+      }),
+    ]);
+  });
 });

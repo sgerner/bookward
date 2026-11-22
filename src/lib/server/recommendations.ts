@@ -13,7 +13,10 @@ export type Recommendation = {
   metadata_confidence?: number | null;
   explanation: string[];
   status: string;
+  source_id?: number | null;
   source_name: string | null;
+  source_enabled?: boolean;
+  quality_status?: string | null;
 };
 
 const publicUrl = (value: string) => {
@@ -29,6 +32,7 @@ export function toPageBook(book: Recommendation) {
   return {
     ...book,
     recommendation_run_id: book.recommendation_run_id ?? "",
+    source_enabled: book.source_enabled !== false,
     cover_url: publicUrl(book.cover_url),
     source_url: publicUrl(book.source_url),
     published_on: book.release_date,

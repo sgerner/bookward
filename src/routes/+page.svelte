@@ -82,13 +82,28 @@
     commit?: () => void;
     rollback?: () => void;
   };
-  type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
+  type OptimisticFactory = (
+    formData: FormData,
+    submitter?: HTMLElement | null,
+  ) => OptimisticChange | void;
+  type DecisionSliceTab = "all" | "maybe_later" | "rejected";
+  type DecisionSliceState = {
+    items: PageBook[];
+    offset: number;
+    hasMore: boolean;
+    loaded: boolean;
+    loading: boolean;
+    error: string;
+  };
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
+  let markReadHistorical = $state(false);
+  let markReadDate = $state("");
+  const todayIsoDate = $derived(new Date().toISOString().slice(0, 10));
   let filter = $state("");
   let genreFilter = $state("");
   let shortlistSort = $state<"score" | "title" | "author">("score");
@@ -104,15 +119,38 @@
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
-  let additionalDecisionBooks = $state<PageBook[]>([]);
   let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
-  let decisionsHasMoreOverride = $state<boolean | null>(null);
-  let decisionsLoading = $state(false);
-  let decisionsLoadError = $state("");
+  let decisionSlices = $state<Record<DecisionSliceTab, DecisionSliceState>>({
+    all: {
+      items: [],
+      offset: 0,
+      hasMore: false,
+      loaded: true,
+      loading: false,
+      error: "",
+    },
+    maybe_later: {
+      items: [],
+      offset: 0,
+      hasMore: false,
+      loaded: false,
+      loading: false,
+      error: "",
+    },
+    rejected: {
+      items: [],
+      offset: 0,
+      hasMore: false,
+      loaded: false,
+      loading: false,
+      error: "",
+    },
+  });
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
+  let readDateDrafts = $state<Record<number, string>>({});
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
@@ -241,15 +279,87 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
+  function isBookSourceEnabled(book: PageBook) {
+    if (typeof book.source_id === "number") {
+      if (book.source_id in sourceEnabledOverrides) {
+        return sourceEnabledOverrides[book.source_id];
+      }
+      const customSource = data.sources.find((item) => item.id === book.source_id);
+      if (customSource) return Boolean(customSource.enabled);
+      if (defaultSourceEnabledOverride !== null) return defaultSourceEnabledOverride;
+    }
+    return book.source_enabled !== false;
+  }
+  function isBookRestorable(book: PageBook) {
+    if (!isBookSourceEnabled(book)) return false;
+    if (
+      typeof book.quality_status === "string" &&
+      book.quality_status !== "" &&
+      book.quality_status !== "accepted"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  function applyBookOverride(book: PageBook): PageBook {
+    const status = bookStatusOverrides[book.id];
+    return status === undefined ? book : { ...book, status };
+  }
+  function dedupeBooks(books: PageBook[]): PageBook[] {
+    const seen = new Set<number>();
+    const result: PageBook[] = [];
+    for (const raw of books) {
+      if (seen.has(raw.id)) continue;
+      seen.add(raw.id);
+      result.push(applyBookOverride(raw));
+    }
+    return result;
+  }
   const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
-      const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
+    dedupeBooks([
+      ...data.books,
+      ...data.decisions,
+      ...additionalDiscoverBooks,
+      ...decisionSlices.all.items,
+      ...decisionSlices.maybe_later.items,
+      ...decisionSlices.rejected.items,
+    ]),
   );
-  const decisionsHasMore = $derived(
-    decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
+  const activeDecisionTab = $derived<DecisionSliceTab>(
+    decisionFilter === "maybe_later" || decisionFilter === "rejected"
+      ? decisionFilter
+      : "all",
   );
+  const activeDecisionSlice = $derived(decisionSlices[activeDecisionTab]);
+  const decisionsHasMore = $derived(activeDecisionSlice.hasMore);
+  const decisionsLoading = $derived(activeDecisionSlice.loading);
+  const decisionsLoadError = $derived(activeDecisionSlice.error);
+  const loadedDecisionSliceBooks = $derived.by(() => {
+    const optimisticArchive = dedupeBooks([
+      ...data.books,
+      ...additionalDiscoverBooks,
+      ...data.decisions,
+      ...decisionSlices.all.items,
+      ...decisionSlices.maybe_later.items,
+      ...decisionSlices.rejected.items,
+    ]).filter(
+      (book) =>
+        bookStatusOverrides[book.id] !== undefined &&
+        ["rejected", "maybe_later"].includes(book.status) &&
+        (activeDecisionTab === "all" || book.status === activeDecisionTab),
+    );
+    if (activeDecisionTab === "all") {
+      return dedupeBooks([
+        ...optimisticArchive,
+        ...data.decisions,
+        ...decisionSlices.all.items,
+      ]).filter((book) => ["rejected", "maybe_later"].includes(book.status));
+    }
+    return dedupeBooks([
+      ...optimisticArchive,
+      ...decisionSlices[activeDecisionTab].items,
+    ]).filter((book) => book.status === activeDecisionTab);
+  });
   const discoverBooks = $derived(
     allBooks.filter(
       (book) => book.status === "recommended" && matchesBookFilter(book),
@@ -272,7 +382,7 @@
       : activeView === "decisions"
         ? decisionFilter === "read"
           ? []
-          : allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status))
+          : loadedDecisionSliceBooks
         : allBooks.filter((book) => book.status === "recommended"),
   );
   const bookGenres = $derived(
@@ -280,12 +390,7 @@
       .sort((left, right) => left.localeCompare(right)),
   );
   const decisionBooks = $derived(
-    allBooks.filter(
-      (book) =>
-        ["rejected", "maybe_later"].includes(book.status) &&
-        (decisionFilter === "all" || book.status === decisionFilter) &&
-        matchesBookFilter(book),
-    ),
+    loadedDecisionSliceBooks.filter((book) => matchesBookFilter(book)),
   );
   const filteredReadingHistory = $derived.by(() => {
     const query = filter.trim().toLowerCase();
@@ -296,14 +401,21 @@
     };
     const matchesSearch = (item: ReadingHistoryItem) =>
       !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
+    const hasExplicitReadDate = (item: ReadingHistoryItem) =>
+      Boolean(item.read_at && item.read_at.trim());
     const timestamps = new Map<number, number>();
-    const readTimestamp = (item: ReadingHistoryItem) => {
+    const explicitReadTimestamp = (item: ReadingHistoryItem) => {
       const cached = timestamps.get(item.id);
       if (cached !== undefined) return cached;
-      const timestamp = Date.parse(item.read_at ?? item.created_at);
+      const raw = item.read_at?.trim() ?? "";
+      const timestamp = raw ? Date.parse(raw.replace(/\//g, "-")) : Number.NaN;
       const normalized = Number.isFinite(timestamp) ? timestamp : 0;
       timestamps.set(item.id, normalized);
       return normalized;
+    };
+    const createdTimestamp = (item: ReadingHistoryItem) => {
+      const parsed = Date.parse(item.created_at);
+      return Number.isFinite(parsed) ? parsed : 0;
     };
     return readingHistory
       .filter((item) =>
@@ -312,7 +424,15 @@
         (readingHistorySourceFilter === "all" || item.source === readingHistorySourceFilter),
       )
       .sort((left, right) => {
-        if (readingHistorySort === "oldest") return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
+        if (readingHistorySort === "oldest") {
+          const leftDated = hasExplicitReadDate(left);
+          const rightDated = hasExplicitReadDate(right);
+          if (leftDated !== rightDated) return leftDated ? -1 : 1;
+          if (leftDated && rightDated) {
+            return explicitReadTimestamp(left) - explicitReadTimestamp(right) || left.id - right.id;
+          }
+          return createdTimestamp(left) - createdTimestamp(right) || left.id - right.id;
+        }
         if (readingHistorySort === "score_high" || readingHistorySort === "score_low") {
           if (left.algorithm_score === null) return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
           if (right.algorithm_score === null) return -1;
@@ -323,7 +443,13 @@
         }
         if (readingHistorySort === "rating_high") return (right.rating ?? 0) - (left.rating ?? 0) || left.title.localeCompare(right.title);
         if (readingHistorySort === "title") return left.title.localeCompare(right.title);
-        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
+        const leftDated = hasExplicitReadDate(left);
+        const rightDated = hasExplicitReadDate(right);
+        if (leftDated !== rightDated) return leftDated ? -1 : 1;
+        if (leftDated && rightDated) {
+          return explicitReadTimestamp(right) - explicitReadTimestamp(left) || right.id - left.id;
+        }
+        return createdTimestamp(right) - createdTimestamp(left) || right.id - left.id;
       });
   });
   const readingHistorySources = $derived(
@@ -597,9 +723,13 @@
       ? (value as View)
       : "discover";
   }
-  async function loadReadingHistory() {
-    if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
-    readingHistoryState = "loading";
+  async function loadReadingHistory(force = false) {
+    if (readingHistoryState === "loading") return;
+    if (!force && readingHistoryState === "ready") return;
+    const keepVisible = force && readingHistoryState === "ready";
+    if (!keepVisible) {
+      readingHistoryState = "loading";
+    }
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
@@ -620,7 +750,9 @@
       readingHistoryError = error instanceof Error
         ? error.message
         : "Reading history could not be loaded.";
-      readingHistoryState = "error";
+      if (!keepVisible) {
+        readingHistoryState = "error";
+      }
     }
   }
   function loadReadingHistoryScores(total: number) {
@@ -666,10 +798,85 @@
     readingHistoryScoreTask = task;
     return task;
   }
-  function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
-    decisionFilter = filter;
+  async function fetchDecisionSlicePage(tab: DecisionSliceTab, reset = false) {
+    const current = decisionSlices[tab];
+    if (current.loading) return;
+    const offset = reset ? 0 : current.offset;
+    decisionSlices = {
+      ...decisionSlices,
+      [tab]: {
+        ...current,
+        loading: true,
+        error: "",
+      },
+    };
+    const statusParam = tab === "all" ? "decisions" : tab;
+    try {
+      const params = new URLSearchParams({
+        status: statusParam,
+        limit: String(DECISION_PAGE_SIZE),
+        offset: String(offset),
+      });
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Past decisions could not be loaded.");
+      }
+      const latest = decisionSlices[tab];
+      const baseItems = reset ? [] : latest.items;
+      const existingIds = new Set(
+        (tab === "all" ? [...data.decisions, ...baseItems] : baseItems).map(
+          (book) => book.id,
+        ),
+      );
+      const nextItems = [
+        ...baseItems,
+        ...payload.items.filter((book) => !existingIds.has(book.id)),
+      ];
+      decisionSlices = {
+        ...decisionSlices,
+        [tab]: {
+          items: nextItems,
+          offset: offset + payload.items.length,
+          hasMore: payload.has_more === true,
+          loaded: true,
+          loading: false,
+          error: "",
+        },
+      };
+    } catch (error) {
+      const latest = decisionSlices[tab];
+      decisionSlices = {
+        ...decisionSlices,
+        [tab]: {
+          ...latest,
+          loading: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Past decisions could not be loaded.",
+        },
+      };
+    }
+  }
+  function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+    decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
-    if (filter === "read") void loadReadingHistory();
+    if (nextFilter === "read") {
+      void loadReadingHistory();
+    } else if (
+      (nextFilter === "maybe_later" || nextFilter === "rejected") &&
+      !decisionSlices[nextFilter].loaded &&
+      !decisionSlices[nextFilter].loading
+    ) {
+      void fetchDecisionSlicePage(nextFilter, true);
+    }
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -687,8 +894,17 @@
       goodreads_csv: "Goodreads CSV export",
       goodreads_rss: "Goodreads read shelf RSS",
       manual: "Added in Bookward",
+      manual_history: "Past read added in Bookward",
       demo: "Demo data",
     } as Record<string, string>)[source] ?? (source || "Unknown source");
+  }
+  function toDateInputValue(value: string | null) {
+    if (!value) return "";
+    const trimmed = value.trim().replace(/\//g, "-");
+    const match = /^(\d{4}-\d{2}-\d{2})/.exec(trimmed);
+    if (match) return match[1];
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.valueOf()) ? "" : parsed.toISOString().slice(0, 10);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -700,7 +916,16 @@
   function go(view: View) {
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
-    if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
+    if (view === "decisions") {
+      if (decisionFilter === "read") void loadReadingHistory();
+      else if (
+        (decisionFilter === "maybe_later" || decisionFilter === "rejected") &&
+        !decisionSlices[decisionFilter].loaded &&
+        !decisionSlices[decisionFilter].loading
+      ) {
+        void fetchDecisionSlicePage(decisionFilter, true);
+      }
+    }
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
@@ -777,11 +1002,11 @@
     key: string,
     optimistic?: OptimisticFactory,
   ): SubmitFunction {
-    return ({ formData }) => {
+    return ({ formData, submitter }) => {
       withPending(key, true);
       let change: OptimisticChange | void;
       try {
-        change = optimistic?.(formData);
+        change = optimistic?.(formData, submitter);
       } catch {
         change = undefined;
       }
@@ -810,8 +1035,58 @@
               key === "goodreads-rss" ||
               key === "goodreads-csv")
           ) {
-            readingHistory = [];
-            readingHistoryState = "idle";
+            if (activeView === "decisions" && decisionFilter === "read") {
+              void loadReadingHistory(true);
+            } else {
+              readingHistory = [];
+              readingHistoryState = "idle";
+            }
+          }
+          if (
+            succeeded &&
+            key.startsWith("update-read-") &&
+            result.type === "success" &&
+            result.data &&
+            typeof result.data === "object" &&
+            "updated_read" in result.data
+          ) {
+            const updatedRead = (result.data as {
+              updated_read?: Partial<ReadingHistoryItem> & { id: number };
+            }).updated_read;
+            if (updatedRead && typeof updatedRead.id === "number") {
+              readingHistory = readingHistory.map((entry) =>
+                entry.id === updatedRead.id
+                  ? {
+                      ...entry,
+                      rating: updatedRead.rating ?? null,
+                      read_at: updatedRead.read_at ?? null,
+                      source: updatedRead.source ?? entry.source,
+                    }
+                  : entry,
+              );
+              const nextDrafts = { ...readDateDrafts };
+              delete nextDrafts[updatedRead.id];
+              readDateDrafts = nextDrafts;
+              readingHistoryScoreOffset = 0;
+              void loadReadingHistoryScores(readingHistory.length);
+            }
+          }
+          if (
+            succeeded &&
+            key.startsWith("delete-read-") &&
+            result.type === "success" &&
+            result.data &&
+            typeof result.data === "object" &&
+            "deleted_read_id" in result.data
+          ) {
+            const deletedId = Number(
+              (result.data as { deleted_read_id?: unknown }).deleted_read_id,
+            );
+            if (Number.isInteger(deletedId)) {
+              readingHistory = readingHistory.filter((entry) => entry.id !== deletedId);
+              readingHistoryScoreOffset = 0;
+              void loadReadingHistoryScores(readingHistory.length);
+            }
           }
           if (succeeded) change?.commit?.();
         } catch (error) {
@@ -837,7 +1112,7 @@
   }
 
   function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
+    const book = allBooks.find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
@@ -854,6 +1129,74 @@
         if (previous === undefined) delete next[id];
         else next[id] = previous;
         bookStatusOverrides = next;
+      },
+    };
+  }
+
+  function optimisticUpdateRead(
+    formData: FormData,
+    submitter?: HTMLElement | null,
+  ): OptimisticChange | void {
+    const id = Number(formData.get("id"));
+    if (!Number.isInteger(id)) return;
+    const existing = readingHistory.find((entry) => entry.id === id);
+    if (!existing) return;
+    const snapshot = { ...existing };
+    const submitterAttr =
+      submitter instanceof HTMLButtonElement && submitter.name
+        ? { name: submitter.name, value: submitter.value }
+        : null;
+    const clearRating =
+      formData.get("clear_rating") === "1" ||
+      (submitterAttr?.name === "clear_rating" && submitterAttr.value === "1");
+    const clearReadAt =
+      formData.get("clear_read_at") === "1" ||
+      (submitterAttr?.name === "clear_read_at" && submitterAttr.value === "1");
+    let nextRating = existing.rating;
+    let nextReadAt = existing.read_at;
+    if (clearRating) {
+      nextRating = null;
+    } else if (submitterAttr?.name === "rating") {
+      const parsed = Number(submitterAttr.value);
+      if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 5) nextRating = parsed;
+    } else if (formData.has("rating")) {
+      const raw = String(formData.get("rating") ?? "").trim();
+      const parsed = raw ? Number(raw) : null;
+      if (parsed === null || (Number.isInteger(parsed) && parsed >= 1 && parsed <= 5)) {
+        nextRating = parsed;
+      }
+    }
+    if (clearReadAt) {
+      nextReadAt = null;
+    } else if (formData.has("read_at")) {
+      const raw = String(formData.get("read_at") ?? "").trim();
+      nextReadAt = raw || null;
+    }
+    readingHistory = readingHistory.map((entry) =>
+      entry.id === id ? { ...entry, rating: nextRating, read_at: nextReadAt } : entry,
+    );
+    return {
+      rollback: () => {
+        readingHistory = readingHistory.map((entry) =>
+          entry.id === id ? snapshot : entry,
+        );
+      },
+    };
+  }
+
+  function optimisticDeleteRead(formData: FormData): OptimisticChange | void {
+    const id = Number(formData.get("id"));
+    if (!Number.isInteger(id)) return;
+    const index = readingHistory.findIndex((entry) => entry.id === id);
+    if (index === -1) return;
+    const removed = readingHistory[index];
+    readingHistory = readingHistory.filter((entry) => entry.id !== id);
+    return {
+      rollback: () => {
+        if (readingHistory.some((entry) => entry.id === id)) return;
+        const copy = [...readingHistory];
+        copy.splice(Math.min(index, copy.length), 0, removed);
+        readingHistory = copy;
       },
     };
   }
@@ -1125,42 +1468,15 @@
   }
 
   async function loadMoreDecisions() {
-    if (decisionsLoading || !decisionsHasMore) return;
-    decisionsLoading = true;
-    decisionsLoadError = "";
-    const offset = data.decisions.length + additionalDecisionBooks.length;
-    try {
-      const params = new URLSearchParams({
-        status: "decisions",
-        limit: String(DECISION_PAGE_SIZE),
-        offset: String(offset),
-      });
-      const response = await fetch(`/api/recommendations?${params.toString()}`, {
-        headers: profileHeaders,
-      });
-      const payload = (await response.json().catch(() => ({}))) as {
-        items?: PageBook[];
-        has_more?: boolean;
-        message?: string;
-      };
-      if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Past decisions could not be loaded.");
-      }
-      const existing = new Set(
-        [...data.decisions, ...additionalDecisionBooks].map((book) => book.id),
-      );
-      additionalDecisionBooks = [
-        ...additionalDecisionBooks,
-        ...payload.items.filter((book) => !existing.has(book.id)),
-      ];
-      decisionsHasMoreOverride = payload.has_more === true;
-    } catch (error) {
-      decisionsLoadError = error instanceof Error
-        ? error.message
-        : "Past decisions could not be loaded.";
-    } finally {
-      decisionsLoading = false;
+    const tab = activeDecisionTab;
+    const slice = decisionSlices[tab];
+    if (slice.loading) return;
+    if (!slice.loaded) {
+      await fetchDecisionSlicePage(tab, true);
+      return;
     }
+    if (!slice.hasMore) return;
+    await fetchDecisionSlicePage(tab, false);
   }
 
   function toggleDigestBook(id: number) {
@@ -1302,13 +1618,18 @@
     librarrSearchOpen = true;
     void searchLibrarr();
   }
-  function openMarkRead(book: PageBook) {
+  function openMarkRead(book: PageBook, options: { historical?: boolean } = {}) {
+    openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
+    markReadHistorical = Boolean(options.historical);
+    markReadDate = "";
   }
   function closeMarkRead() {
     markReadBook = null;
     markReadRating = 0;
+    markReadHistorical = false;
+    markReadDate = "";
   }
   function closeLibrarrSearch() {
     librarrSearchAbortController?.abort();
@@ -1389,9 +1710,40 @@
     ) return;
     previousDataDecisions = nextDecisions;
     previousDataDecisionsHasMore = nextHasMore;
-    additionalDecisionBooks = [];
-    decisionsHasMoreOverride = null;
-    decisionsLoadError = "";
+    decisionSlices = {
+      all: {
+        items: [],
+        offset: nextDecisions.length,
+        hasMore: nextHasMore,
+        loaded: true,
+        loading: false,
+        error: "",
+      },
+      maybe_later: {
+        items: [],
+        offset: 0,
+        hasMore: false,
+        loaded: false,
+        loading: false,
+        error: "",
+      },
+      rejected: {
+        items: [],
+        offset: 0,
+        hasMore: false,
+        loaded: false,
+        loading: false,
+        error: "",
+      },
+    };
+    const currentView = untrack(() => activeView);
+    const currentFilter = untrack(() => decisionFilter);
+    if (
+      currentView === "decisions" &&
+      (currentFilter === "maybe_later" || currentFilter === "rejected")
+    ) {
+      void fetchDecisionSlicePage(currentFilter, true);
+    }
   });
 
   $effect(() => {
@@ -1939,12 +2291,12 @@
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
-            {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length} loaded decisions. Load more to include older books.</p>{/if}
+            {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {loadedDecisionSliceBooks.length} loaded decisions. Load more to include older books.</p>{/if}
           </section>
         {/if}
         {#if view !== "decisions" || decisionFilter !== "read"}
@@ -2114,7 +2466,7 @@
                           type="button"
                           class="btn btn-sm mt-3 min-h-10 w-full preset-filled-primary-500"
                           aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                          onclick={() => openMarkRead(book)}
+                          onclick={() => openMarkRead(book, { historical: true })}
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
@@ -2149,29 +2501,96 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                  {:else if book.status === "rejected" || book.status === "maybe_later"}
+                  {:else if book.status === "maybe_later"}
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                    </form>
+                    <button
+                      in:fly={{ y: 8, duration: motionDuration(180) }}
+                      type="button"
+                      class="btn btn-sm min-h-10 preset-tonal-secondary"
+                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
+                      onclick={() => openMarkRead(book, { historical: false })}
+                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={15} />{/if} Pass</button>
+                    </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Return to Discover: ${book.title}`} disabled={!isBookRestorable(book) || isPending(`restore-${book.id}`)} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
+                    {#if !isBookSourceEnabled(book)}
+                      <p class="w-full pt-1 text-xs leading-5 text-warning-800-200">
+                        Source disabled ({book.source_name || "custom feed"}) — re-enable it in Sources to return this book to Discover, or Shortlist or Mark Read here.
+                      </p>
+                    {:else if !isBookRestorable(book)}
+                      <p class="w-full pt-1 text-xs leading-5 text-warning-800-200">
+                        This book has not passed catalog quality checks for Discover. You can still Shortlist or Mark Read here.
+                      </p>
+                    {/if}
+                  {:else if book.status === "rejected"}
+                    {#if !isBookRestorable(book)}
+                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      </form>
+                      <button
+                        in:fly={{ y: 8, duration: motionDuration(180) }}
+                        type="button"
+                        class="btn btn-sm min-h-10 preset-tonal-secondary"
+                        aria-label={`Mark Read: ${book.title} by ${book.author}`}
+                        onclick={() => openMarkRead(book, { historical: false })}
+                      ><Check size={15} /> Mark Read</button>
+                    {/if}
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} disabled={!isBookRestorable(book) || isPending(`restore-${book.id}`)} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                    </form>
+                    {#if !isBookSourceEnabled(book)}
+                      <p class="w-full pt-1 text-xs leading-5 text-warning-800-200">
+                        Source disabled ({book.source_name || "custom feed"}) — re-enable it in Sources to return this book to Discover, or Shortlist or Mark Read here.
+                      </p>
+                    {:else if !isBookRestorable(book)}
+                      <p class="w-full pt-1 text-xs leading-5 text-warning-800-200">
+                        This book has not passed catalog quality checks for Discover. You can still Shortlist or Mark Read here.
+                      </p>
+                    {/if}
                   {/if}
                 </div>
               </div>
             </article>
-          {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
-              <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
-              <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : filter || genreFilter ? "No books match these filters" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : view === "saved" ? "No shortlist books match these filters" : "You are all caught up"}</h2>
-                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : filter || genreFilter ? "Change the search or genre filter to see more books." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+          {:else}
+            {#if view === "decisions" && decisionFilter !== "read" && !activeDecisionSlice.loaded && decisionsLoading}
+              <div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status">
+                <RefreshCw size={17} class="animate-spin" />
+                Loading {decisionFilter === "maybe_later" ? "deferred books" : "passed books"}…
               </div>
-              {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
-              {#if view === "discover" && !filter && !genreFilter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
-                <ProfileField profileId={data.user?.profile_id} />
-                <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
-                  {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
+            {:else if view === "decisions" && decisionFilter !== "read" && !activeDecisionSlice.loaded && decisionsLoadError}
+              <div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
+                <p class="text-sm text-surface-700-300">{decisionsLoadError}</p>
+                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={loadMoreDecisions}>
+                  <RefreshCw size={14} /> Try again
                 </button>
-              </form>{/if}
-            </div>{/each}
+              </div>
+            {:else}
+              <div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
+                <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
+                <div>
+                  <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : filter || genreFilter ? "No books match these filters" : view === "decisions" ? (decisionFilter === "maybe_later" ? "No books set aside for later" : decisionFilter === "rejected" ? "No passed books" : "No past decisions") : digestVisible ? "No digest picks yet" : view === "saved" ? "No shortlist books match these filters" : "You are all caught up"}</h2>
+                  <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : filter || genreFilter ? "Change the search or genre filter to see more books." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+                </div>
+                {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
+                {#if view === "discover" && !filter && !genreFilter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+                  <ProfileField profileId={data.user?.profile_id} />
+                  <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
+                    {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
+                  </button>
+                </form>{/if}
+              </div>
+            {/if}
+          {/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex justify-center pt-1">
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
@@ -2258,6 +2677,99 @@
                         {/if}
                       </div>
                     </div>
+                    <form
+                      method="POST"
+                      action="?/updateRead"
+                      class="mt-3 flex flex-wrap items-center gap-1.5 border-t border-surface-300-700/40 pt-3"
+                      use:enhance={setPending(`update-read-rating-${item.id}`, optimisticUpdateRead)}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={item.id} />
+                      <span class="mr-1 text-xs font-medium text-surface-700-300">Rating</span>
+                      {#each [1, 2, 3, 4, 5] as star (star)}
+                        <button
+                          type="submit"
+                          name="rating"
+                          value={star}
+                          class={`grid size-8 place-items-center rounded-lg border text-sm transition ${item.rating !== null && item.rating >= star ? "border-amber-400/50 bg-amber-400/15 text-amber-300" : "border-surface-300-700/60 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/40 hover:text-amber-300"}`}
+                          aria-label={`Rate ${item.title} ${star} ${star === 1 ? "star" : "stars"}`}
+                          aria-pressed={item.rating === star}
+                          disabled={isPending(`update-read-rating-${item.id}`)}
+                        ><span aria-hidden="true">★</span></button>
+                      {/each}
+                      {#if item.rating !== null && item.rating > 0}
+                        <button
+                          type="submit"
+                          name="clear_rating"
+                          value="1"
+                          class="btn btn-xs min-h-8 preset-tonal-surface"
+                          aria-label={`Clear rating for ${item.title}`}
+                          disabled={isPending(`update-read-rating-${item.id}`)}
+                        >Clear</button>
+                      {/if}
+                    </form>
+                    <form
+                      method="POST"
+                      action="?/updateRead"
+                      class="mt-2.5 flex flex-wrap items-center gap-2"
+                      use:enhance={setPending(`update-read-date-${item.id}`, optimisticUpdateRead)}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={item.id} />
+                      <label class="sr-only" for={`read-date-${item.id}`}>Completion date for {item.title}</label>
+                      <input
+                        id={`read-date-${item.id}`}
+                        type="date"
+                        name="read_at"
+                        max={todayIsoDate}
+                        value={readDateDrafts[item.id] ?? toDateInputValue(item.read_at)}
+                        oninput={(event) => {
+                          readDateDrafts = {
+                            ...readDateDrafts,
+                            [item.id]: (event.currentTarget as HTMLInputElement).value,
+                          };
+                        }}
+                        class="input min-h-8 min-w-0 flex-1 py-1 text-xs preset-tonal-surface"
+                      />
+                      <button
+                        type="submit"
+                        class="btn btn-xs min-h-8 preset-tonal-secondary"
+                        aria-label={`Save completion date for ${item.title}`}
+                        disabled={isPending(`update-read-date-${item.id}`)}
+                      >Save date</button>
+                      {#if item.read_at}
+                        <button
+                          type="submit"
+                          name="clear_read_at"
+                          value="1"
+                          class="btn btn-xs min-h-8 preset-tonal-surface"
+                          aria-label={`Clear completion date for ${item.title}`}
+                          disabled={isPending(`update-read-date-${item.id}`)}
+                        >Clear date</button>
+                      {/if}
+                    </form>
+                    {#if item.source === "goodreads_rss"}
+                      <p class="mt-2 text-xs leading-5 text-surface-700-300">
+                        Synced from Goodreads RSS — active RSS syncs refresh ratings from Goodreads.
+                      </p>
+                    {/if}
+                    {#if item.source === "manual" || item.source === "manual_history"}
+                      <form
+                        method="POST"
+                        action="?/deleteRead"
+                        class="mt-2.5 flex justify-end"
+                        use:enhance={setPending(`delete-read-${item.id}`, optimisticDeleteRead)}
+                      >
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <input type="hidden" name="id" value={item.id} />
+                        <button
+                          type="submit"
+                          class="btn btn-xs min-h-8 preset-tonal-error"
+                          aria-label={`Remove ${item.title} from reading history`}
+                          disabled={isPending(`delete-read-${item.id}`)}
+                        ><Trash2 size={13} /> Remove from Read</button>
+                      </form>
+                    {/if}
                     <div class="mt-3 border-t border-surface-300-700/40 pt-2">
                       <button
                         type="button"
@@ -3783,6 +4295,7 @@
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
+            <input type="hidden" name="historical" value={markReadHistorical ? "1" : "0"} />
 
             <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
               <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
@@ -3799,7 +4312,48 @@
               <span class="ml-auto hidden size-9 shrink-0 place-items-center rounded-full bg-secondary-500/10 text-secondary-600-400 sm:grid" aria-hidden="true"><Check size={17} /></span>
             </div>
 
-            <p id="mark-read-description" class="mt-5 max-w-md text-sm leading-6 text-surface-700-300">Add this book to your read history. You can leave a rating now, or keep the moment unrated.</p>
+            <div class="mt-5">
+              <p class="text-sm font-semibold text-surface-950-50">When did you read it?</p>
+              <div class="mt-2 grid grid-cols-2 gap-2" role="group" aria-label="When did you read this book?">
+                <button
+                  type="button"
+                  class={`btn btn-sm min-h-10 ${!markReadHistorical ? "preset-filled-primary-500" : "preset-tonal-surface"}`}
+                  aria-pressed={!markReadHistorical}
+                  onclick={() => (markReadHistorical = false)}
+                >Finished recently</button>
+                <button
+                  type="button"
+                  class={`btn btn-sm min-h-10 ${markReadHistorical ? "preset-filled-primary-500" : "preset-tonal-surface"}`}
+                  aria-pressed={markReadHistorical}
+                  onclick={() => (markReadHistorical = true)}
+                >Read in the past</button>
+              </div>
+              <p id="mark-read-description" class="mt-2.5 max-w-md text-sm leading-6 text-surface-700-300">
+                {markReadHistorical
+                  ? "Logs a past read in your history without counting it as a live recommendation conversion. Leave the date blank if you don't remember when you finished it."
+                  : "Records a recent completion in your read history. Leave a rating now, or keep the moment unrated."}
+              </p>
+            </div>
+
+            <div class="mt-5">
+              <div class="flex items-baseline justify-between gap-3">
+                <label for="mark-read-date" class="text-sm font-semibold text-surface-950-50">Completion date</label>
+                <span class="text-xs text-surface-600-400">Optional</span>
+              </div>
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  id="mark-read-date"
+                  type="date"
+                  name="read_at"
+                  max={todayIsoDate}
+                  bind:value={markReadDate}
+                  class="input min-h-10 flex-1 preset-tonal-surface"
+                />
+                {#if markReadDate}
+                  <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={() => (markReadDate = "")}>Clear date</button>
+                {/if}
+              </div>
+            </div>
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">

@@ -74,14 +74,18 @@ from .digest import (
 )
 from .learning import (
     EVENT_TYPES,
+    HISTORICAL_READ_SOURCES,
     create_recommendation_run,
     build_decision_evidence,
+    purge_recommendation_evidence,
+    reconcile_read_outcomes_in_connection,
     record_event_in_connection,
     record_events,
     _impression_precedes,
     _read_label,
     _read_time,
 )
+from .read_dates import read_day
 from .interaction_personalization import (
     load_interaction_events,
     load_cached_candidate_vectors,
@@ -680,7 +684,7 @@ app.add_middleware(
     # the engine port does not turn every legacy endpoint into a wildcard CORS
     # API.
     allow_origins=[settings.cors_origin],
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
@@ -1202,12 +1206,19 @@ class UndoFeedbackIn(BaseModel):
 
 class MarkReadIn(BaseModel):
     rating: int | None = Field(default=None, ge=1, le=5)
+    historical: bool = False
+    read_at: str | None = Field(default=None, max_length=64)
     session_id: str | None = Field(
         default=None,
         min_length=8,
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
     )
+
+
+class UpdateReadIn(BaseModel):
+    rating: int | None = Field(default=None, ge=1, le=5)
+    read_at: str | None = Field(default=None, max_length=64)
 
 
 class TelemetryEventIn(BaseModel):
@@ -1531,6 +1542,36 @@ def tracked_recommendations(
     return recommendations, run_id
 
 
+READS_RECENT_ORDER_SQL = (
+    "CASE WHEN read_at IS NULL OR TRIM(read_at)='' THEN 1 ELSE 0 END ASC, "
+    "CASE WHEN read_at IS NULL OR TRIM(read_at)='' "
+    "THEN COALESCE(julianday(created_at), 0) "
+    "ELSE COALESCE(julianday(replace(read_at, '/', '-')), 0) END DESC, "
+    "COALESCE(NULLIF(TRIM(read_at), ''), created_at) DESC, "
+    "id DESC"
+)
+
+
+def _normalize_read_at_input(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    cleaned = raw_value.strip()
+    if not cleaned:
+        return None
+    parsed_day = read_day(cleaned)
+    if parsed_day is None:
+        raise HTTPException(400, "Enter a valid completion date (YYYY-MM-DD)")
+    now_utc = datetime.now(timezone.utc)
+    if parsed_day > now_utc.date():
+        raise HTTPException(400, "Completion date cannot be in the future")
+    parsed_dt, day_precision = _read_time(cleaned)
+    if parsed_dt is not None and not day_precision:
+        if parsed_dt > now_utc + timedelta(minutes=5):
+            raise HTTPException(400, "Completion date cannot be in the future")
+        return parsed_dt.isoformat()
+    return parsed_day.isoformat()
+
+
 def overview_payload(
     *,
     include_api_tokens: bool = True,
@@ -1575,7 +1616,7 @@ def overview_payload(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()],
             "history": [dict(item) for item in connection.execute(
-                "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+                f"SELECT * FROM reads ORDER BY {READS_RECENT_ORDER_SQL} LIMIT 12"
             ).fetchall()],
             "settings": safe_settings(
                 include_api_tokens=include_api_tokens,
@@ -1607,7 +1648,7 @@ def reading_history():
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
+            f"ORDER BY {READS_RECENT_ORDER_SQL}"
         ).fetchall()]
         existing_scores = []
         candidate_keys = list(dict.fromkeys(
@@ -1644,7 +1685,7 @@ async def reading_history_scores(
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+            f"ORDER BY {READS_RECENT_ORDER_SQL} LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
         candidate_keys = list(dict.fromkeys(
@@ -1788,7 +1829,7 @@ def _recommendation_rows(
             if "rejected" in statuses:
                 archive_terms.append(
                     "(c.status='rejected' AND EXISTS(SELECT 1 FROM feedback f "
-                    "WHERE f.candidate_id=c.id AND f.action='reject'))"
+                    "WHERE f.candidate_id=c.id AND f.action='reject' AND f.undone_at IS NULL))"
                 )
             if "maybe_later" in statuses:
                 archive_terms.append("c.status='maybe_later'")
@@ -1797,8 +1838,24 @@ def _recommendation_rows(
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"c.status IN ({placeholders})")
             params.extend(statuses)
+    order_clause = (
+        " ORDER BY COALESCE("
+        "(SELECT MAX(julianday(f.created_at)) FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL), "
+        "julianday(c.updated_at)"
+        ") DESC, "
+        "COALESCE("
+        "(SELECT MAX(f.id) FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL), "
+        "0"
+        ") DESC, "
+        "julianday(c.updated_at) DESC, c.id DESC"
+        if is_decision_archive
+        else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+    )
     query = (
-        "SELECT c.*,s.name source_name,q.metadata_confidence,"
+        "SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
+        "q.metadata_confidence,q.quality_status,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
         "q.isbn10 quality_isbn10 "
@@ -1807,7 +1864,7 @@ def _recommendation_rows(
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+        + order_clause
     )
     result = (
         [dict(item) for item in connection.execute(query, params).fetchall()]
@@ -1896,6 +1953,7 @@ def recommendation_list(
             if work_url:
                 source_url = f"https://openlibrary.org{work_url}"
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
+        item["source_enabled"] = bool(item.get("source_enabled", 1))
         item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
     return result
 
@@ -1919,38 +1977,81 @@ def recommendations(
     return values
 
 
-def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=None):
+def _mark_candidate_read_in_connection(
+    con,
+    candidate,
+    rating=None,
+    session_id=None,
+    *,
+    historical: bool = False,
+    read_at: str | None = None,
+    rating_provided: bool = False,
+    read_at_provided: bool = False,
+):
     existing = con.execute(
-        "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
+        "SELECT id,rating,read_at,source,isbn,openlibrary_work_id,created_at "
+        "FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
-    saved_rating = rating if rating is not None else existing["rating"] if existing else None
-    read_at = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
         candidate["quality_isbn13"], candidate["quality_isbn10"]
     )
-    con.execute(
-        "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
-        "openlibrary_work_id,openlibrary_lookup_attempted_at) "
-        "VALUES(?,?,?,?,?,'manual',?,"
-        "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
-        "ON CONFLICT(title,author) DO UPDATE SET "
-        "rating=COALESCE(excluded.rating,reads.rating),"
-        "read_at=COALESCE(reads.read_at,excluded.read_at),"
-        "isbn=COALESCE(reads.isbn,excluded.isbn)",
-        (
-            candidate["title"],
-            candidate["author"],
-            rating,
-            read_at,
-            isbn13 or None,
-            openlibrary_work_id,
-            openlibrary_work_id,
-        ),
-    )
+    if existing is None:
+        target_source = "manual_history" if historical else "manual"
+        target_rating = rating
+        target_read_at = (
+            read_at
+            if (historical or read_at_provided or read_at is not None)
+            else now_iso
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
+            "openlibrary_work_id,openlibrary_lookup_attempted_at) "
+            "VALUES(?,?,?,?,?,?,?,"
+            "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            (
+                candidate["title"],
+                candidate["author"],
+                target_rating,
+                target_read_at,
+                isbn13 or None,
+                target_source,
+                openlibrary_work_id,
+                openlibrary_work_id,
+            ),
+        )
+    else:
+        target_rating = (
+            rating
+            if rating_provided or rating is not None
+            else existing["rating"]
+        )
+        if read_at_provided:
+            target_read_at = read_at
+        elif existing["read_at"] is not None:
+            target_read_at = existing["read_at"]
+        elif historical:
+            target_read_at = None
+        else:
+            target_read_at = now_iso
+        target_source = str(existing["source"] or "manual")
+        if read_at_provided and target_read_at is None and target_source == "manual":
+            target_source = "manual_history"
+        target_isbn = existing["isbn"] or (isbn13 or None)
+        con.execute(
+            "UPDATE reads SET rating=?, read_at=?, isbn=?, source=? WHERE id=?",
+            (
+                target_rating,
+                target_read_at,
+                target_isbn,
+                target_source,
+                existing["id"],
+            ),
+        )
     read = con.execute(
-        "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+        "SELECT id,title,author,rating,read_at,source,isbn,openlibrary_work_id,created_at "
         "FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
@@ -1962,13 +2063,14 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             (openlibrary_work_id, read["id"]),
         )
         read = con.execute(
-            "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+            "SELECT id,title,author,rating,read_at,source,isbn,openlibrary_work_id,created_at "
             "FROM reads WHERE id=?",
             (read["id"],),
         ).fetchone()
+    saved_rating = read["rating"]
     read_time, day_precision = _read_time(read["read_at"])
     impression = None
-    if read_time is not None:
+    if not historical and read_time is not None:
         prior_impressions = con.execute(
             "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
             "FROM recommendation_impressions WHERE candidate_id=? "
@@ -1983,12 +2085,18 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             None,
         )
     label, label_kind, confidence = _read_label({"rating": saved_rating})
-    event_metadata = {
+    event_metadata: dict[str, Any] = {
         "read_source": str(read["source"] or "unknown")[:32],
-        "time_precision": "day" if day_precision else "timestamp",
+        "time_precision": (
+            "unknown"
+            if read_time is None
+            else ("day" if day_precision else "timestamp")
+        ),
     }
+    if historical:
+        event_metadata["historical"] = True
     try:
-        record_event_in_connection(
+        recorded = record_event_in_connection(
             con,
             event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
             candidate_id=int(candidate["id"]),
@@ -1997,7 +2105,7 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             source="manual_read",
             run_id=str(impression["run_id"]) if impression is not None else None,
             metadata=event_metadata,
-            occurred_at=read["read_at"] or read_at,
+            occurred_at=read["read_at"] or now_iso,
             label=label if impression is not None else None,
             label_kind=label_kind if impression is not None else None,
             confidence=confidence if impression is not None else None,
@@ -2005,7 +2113,28 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if impression is None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE read_id=? OR event_id=?",
+            (int(read["id"]), int(recorded["id"])),
+        )
     return read, existing is not None
+
+
+def _ensure_candidate_restorable(candidate) -> None:
+    if not int(candidate["source_enabled"]):
+        source_label = str(candidate["source_name"] or "its source").strip()
+        raise HTTPException(
+            409,
+            f"Cannot return this book to Discover while {source_label} is disabled. "
+            "Re-enable the source in Sources, or Shortlist or Mark Read from History.",
+        )
+    if str(candidate["quality_status"]) != "accepted":
+        raise HTTPException(
+            409,
+            "Cannot return this book to Discover because it has not passed catalog quality checks. "
+            "You can still Shortlist or Mark Read from History.",
+        )
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2018,10 +2147,18 @@ def feedback(candidate_id: int, payload: FeedbackIn):
     }[payload.action]
     with transaction() as con:
         candidate = con.execute(
-            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+            "SELECT c.status, COALESCE(s.enabled, 0) AS source_enabled, "
+            "s.name AS source_name, COALESCE(q.quality_status, 'pending') AS quality_status "
+            "FROM candidates c "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.id=?",
+            (candidate_id,),
         ).fetchone()
         if not candidate:
             raise HTTPException(404, "Recommendation not found")
+        if payload.action == "restore":
+            _ensure_candidate_restorable(candidate)
         previous_status = str(candidate["status"])
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
         feedback_id = con.execute(
@@ -2121,6 +2258,11 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
 
 @app.post("/api/recommendations/{candidate_id}/read")
 def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
+    normalized_read_at = (
+        _normalize_read_at_input(payload.read_at)
+        if "read_at" in payload.model_fields_set
+        else None
+    )
     with transaction() as con:
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,"
@@ -2138,6 +2280,10 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
             candidate,
             rating=payload.rating,
             session_id=payload.session_id,
+            historical=bool(payload.historical),
+            read_at=normalized_read_at,
+            rating_provided="rating" in payload.model_fields_set,
+            read_at_provided="read_at" in payload.model_fields_set,
         )
         con.execute(
             "UPDATE candidates SET status='read',updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -2156,10 +2302,157 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
         "read_id": int(read["id"]),
         "status": "read",
         "rating": read["rating"],
+        "read_at": read["read_at"],
+        "source": read["source"],
         "job_id": job_id,
         "read_work_identities_job_id": read_work_identities_job_id,
         "read_metadata_job_id": read_metadata_job_id,
         "already_present": already_present,
+    }
+
+
+@app.patch("/api/reading-history/{read_id}")
+def update_reading_history_entry(read_id: int, payload: UpdateReadIn):
+    rating_updated = "rating" in payload.model_fields_set
+    read_at_updated = "read_at" in payload.model_fields_set
+    normalized_read_at = (
+        _normalize_read_at_input(payload.read_at) if read_at_updated else None
+    )
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?", (read_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        new_rating = payload.rating if rating_updated else existing["rating"]
+        new_read_at = normalized_read_at if read_at_updated else existing["read_at"]
+        new_source = str(existing["source"] or "manual")
+        if read_at_updated and new_read_at is None and new_source == "manual":
+            new_source = "manual_history"
+        con.execute(
+            "UPDATE reads SET rating=?, read_at=?, source=? WHERE id=?",
+            (new_rating, new_read_at, new_source, read_id),
+        )
+        updated = dict(
+            con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone()
+        )
+        reconcile = reconcile_read_outcomes_in_connection(
+            con,
+            updated,
+            read_at_updated=read_at_updated,
+        )
+    job_id = enqueue_job("score", dedupe=True)
+    return {
+        "id": int(updated["id"]),
+        "title": updated["title"],
+        "author": updated["author"],
+        "rating": updated["rating"],
+        "read_at": updated["read_at"],
+        "source": updated["source"],
+        "created_at": updated["created_at"],
+        "outcome": reconcile["outcome"],
+        "job_id": job_id,
+    }
+
+
+@app.delete("/api/reading-history/{read_id}")
+def delete_reading_history_entry(read_id: int):
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?", (read_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        if str(existing["source"] or "") not in {"manual", "manual_history"}:
+            raise HTTPException(
+                409,
+                "Only manual read entries can be removed here. Imported Goodreads entries are managed by your Goodreads import or RSS sync.",
+            )
+        deleted_row = dict(existing)
+        other_rows = [
+            dict(item)
+            for item in con.execute(
+                "SELECT * FROM reads WHERE id!=?", (read_id,)
+            ).fetchall()
+        ]
+        try:
+            deleted_meta = [
+                dict(item)
+                for item in con.execute(
+                    "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                    "FROM read_metadata WHERE read_id=? AND verified_work_id!=''",
+                    (read_id,),
+                ).fetchall()
+            ]
+            other_meta = [
+                dict(item)
+                for item in con.execute(
+                    "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                    "FROM read_metadata WHERE read_id!=? AND verified_work_id!=''",
+                    (read_id,),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            deleted_meta = []
+            other_meta = []
+
+        deleted_index = ReadIdentityIndex.from_reads(
+            read_identity_rows_with_current_verified_work_ids([deleted_row], deleted_meta)
+        )
+        remaining_index = ReadIdentityIndex.from_reads(
+            read_identity_rows_with_current_verified_work_ids(other_rows, other_meta)
+        )
+        linked_candidate_ids = {
+            int(item["candidate_id"])
+            for item in con.execute(
+                "SELECT DISTINCT candidate_id FROM recommendation_events "
+                "WHERE event_key GLOB ?",
+                (f"manual-read:[0-9]*:{read_id:08d}",),
+            ).fetchall()
+        }
+        read_candidates = [
+            dict(item)
+            for item in con.execute(
+                "SELECT c.*, q.work_id quality_work_id, q.provider quality_provider, "
+                "q.isbn13 quality_isbn13, q.isbn10 quality_isbn10, "
+                "COALESCE(q.quality_status, 'pending') AS quality_status, "
+                "COALESCE(s.enabled, 0) AS source_enabled "
+                "FROM candidates c "
+                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                "LEFT JOIN sources s ON s.id=c.source_id "
+                "WHERE c.status='read'"
+            ).fetchall()
+        ]
+        restored_candidates: list[dict[str, Any]] = []
+        for cand in read_candidates:
+            cid = int(cand["id"])
+            if (cid in linked_candidate_ids or deleted_index.matches(cand)) and not remaining_index.matches(cand):
+                restored_status = (
+                    "recommended"
+                    if int(cand["source_enabled"]) and str(cand["quality_status"]) == "accepted"
+                    else "maybe_later"
+                )
+                con.execute(
+                    "UPDATE candidates SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (restored_status, cid),
+                )
+                restored_candidates.append({"id": cid, "status": restored_status})
+
+        evidence = purge_recommendation_evidence(con, read_ids=[read_id])
+        con.execute("DELETE FROM read_metadata WHERE read_id=?", (read_id,))
+        con.execute(
+            "DELETE FROM embeddings WHERE entity_type='read' AND entity_id=?",
+            (read_id,),
+        )
+        con.execute("DELETE FROM reads WHERE id=?", (read_id,))
+
+    job_id = enqueue_job("score", dedupe=True)
+    return {
+        "deleted": True,
+        "id": read_id,
+        "restored_candidates": restored_candidates,
+        "evidence": evidence,
+        "job_id": job_id,
     }
 
 
@@ -2169,10 +2462,19 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     with transaction() as con:
         placeholders = ",".join("?" for _ in ids)
-        found = {
-            int(item["id"])
-            for item in con.execute(f"SELECT id FROM candidates WHERE id IN ({placeholders})", ids).fetchall()
-        }
+        rows_found = con.execute(
+            "SELECT c.id, COALESCE(s.enabled, 0) AS source_enabled, "
+            "s.name AS source_name, COALESCE(q.quality_status, 'pending') AS quality_status "
+            "FROM candidates c "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            f"WHERE c.id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        if payload.action == "restore":
+            for item in rows_found:
+                _ensure_candidate_restorable(item)
+        found = {int(item["id"]) for item in rows_found}
         for candidate_id in found:
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
             feedback_id = con.execute(
@@ -3233,6 +3535,26 @@ def api_feedback(candidate_id: int, payload: FeedbackIn):
 @api_v1.post("/recommendations/{candidate_id}/undo")
 def api_undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
     return undo_feedback(candidate_id, payload)
+
+
+@api_v1.post("/recommendations/{candidate_id}/read")
+def api_mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
+    return mark_recommendation_read(candidate_id, payload)
+
+
+@api_v1.get("/reading-history")
+def api_reading_history():
+    return reading_history()
+
+
+@api_v1.patch("/reading-history/{read_id}")
+def api_update_reading_history_entry(read_id: int, payload: UpdateReadIn):
+    return update_reading_history_entry(read_id, payload)
+
+
+@api_v1.delete("/reading-history/{read_id}")
+def api_delete_reading_history_entry(read_id: int):
+    return delete_reading_history_entry(read_id)
 
 
 @api_v1.post("/telemetry/events")
