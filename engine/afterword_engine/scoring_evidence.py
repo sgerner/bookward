@@ -10,8 +10,9 @@ import os
 import platform
 import re
 import zlib
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
