@@ -1,5 +1,5 @@
 const env = process.env;
-import { fail, redirect } from '@sveltejs/kit';
+import { error as httpError, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { safeNext } from '#lib/server/safe-next.js';
@@ -7,8 +7,16 @@ import { safeNext } from '#lib/server/safe-next.js';
 type AuthConfig = { setup_required: boolean; local_login_enabled: boolean; oidc_enabled: boolean };
 type SessionResult = { session_token: string; max_age: number };
 
-export const load: PageServerLoad = async ({ url }) => {
-	const config = await engine<AuthConfig>('/auth/config');
+export const load: PageServerLoad = async ({ url, locals }) => {
+	if (locals?.engineUnavailable) {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
+	let config: AuthConfig;
+	try {
+		config = await engine<AuthConfig>('/auth/config');
+	} catch {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	const next = safeNext(url.searchParams.get('next'));
 	const errorCode = url.searchParams.get('error');
 	const error = errorCode === 'unlinked' ? 'This SSO identity is not linked yet. Sign in with your local account and link it from Account settings.' : errorCode === 'sso' ? 'Single sign-on could not be completed. Try again or use your username and password.' : '';

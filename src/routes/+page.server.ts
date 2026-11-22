@@ -126,6 +126,9 @@ type DigestSettings = {
 };
 
 export const load: PageServerLoad = async ({ url, locals }) => {
+  if (locals?.engineUnavailable) {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
+  }
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
     interval_hours: 0,
@@ -144,10 +147,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   let overview: Overview;
   try {
     overview = await overviewRequest;
-  } catch (cause) {
-    throw httpError(503, {
-      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    });
+  } catch {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);

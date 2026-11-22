@@ -58,4 +58,14 @@ describe('login page loader', () => {
 		await expect(load({ url: new URL('https://bookward.test/login?next=%2F%2Fevil.example') } as never))
 			.rejects.toMatchObject({ status: 303, location: '/auth/oidc/start?intent=login&next=%2F' });
 	});
+
+	it('throws HTTP 503 when /auth/config is unreachable or hooks flagged an outage', async () => {
+		engine.mockRejectedValueOnce(new Error('fetch failed'));
+		await expect(load({ url: new URL('https://bookward.test/login'), locals: {} } as never))
+			.rejects.toMatchObject({ status: 503 });
+
+		await expect(load({ url: new URL('https://bookward.test/login'), locals: { engineUnavailable: true } } as never))
+			.rejects.toMatchObject({ status: 503 });
+		expect(engine).toHaveBeenCalledTimes(1);
+	});
 });

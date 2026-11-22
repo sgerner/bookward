@@ -506,5 +506,42 @@ describe("page actions", () => {
     });
   });
 
+  it("throws HTTP 503 without contacting the engine when hooks report an outage", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
 
+    await expect(
+      load({
+        url: new URL("http://afterword.test/"),
+        locals: { engineUnavailable: true },
+      } as never),
+    ).rejects.toMatchObject({
+      status: 503,
+      body: { message: "Bookward's recommendation engine is unavailable." },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws HTTP 503 without leaking internal error paths when overview fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("sqlite3.OperationalError: /tmp/secret/engine.db")),
+    );
+
+    let caught: unknown;
+    try {
+      await load({
+        url: new URL("http://afterword.test/"),
+        locals: { user: undefined },
+      } as never);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      status: 503,
+      body: { message: "Bookward's recommendation engine is unavailable." },
+    });
+    expect(JSON.stringify(caught)).not.toContain("engine.db");
+  });
 });

@@ -45,12 +45,12 @@ export function modalFocus(node: HTMLElement) {
     if (!node.contains(event.target as Node)) firstFocusable().focus();
   };
 
-  node.addEventListener("keydown", onKeydown);
+  document.addEventListener("keydown", onKeydown);
   document.addEventListener("focusin", onFocusIn);
 
   return {
     destroy() {
-      node.removeEventListener("keydown", onKeydown);
+      document.removeEventListener("keydown", onKeydown);
       document.removeEventListener("focusin", onFocusIn);
       if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
         previousFocus.focus({ preventScroll: true });

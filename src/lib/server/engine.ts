@@ -10,41 +10,95 @@ function internalHeaders(headers?: HeadersInit, accept = 'application/json') {
   if (session) merged.set('x-bookward-session', session);
   return merged;
 }
-export class EngineError extends Error { constructor(message: string, readonly status: number) { super(message); } }
+export const ENGINE_UNAVAILABLE_MESSAGE = "Bookward's recommendation engine is unavailable.";
+
+export class EngineError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly unavailable = status >= 500
+  ) {
+    super(message);
+  }
+}
+
+export function isEngineUnavailable(error: unknown): boolean {
+  return !(error instanceof EngineError) || error.unavailable || error.status >= 500;
+}
+
+export function sanitizeEngineMessage(detail: string | undefined, status: number): string {
+  const fallback = status >= 500 ? ENGINE_UNAVAILABLE_MESSAGE : `Engine returned ${status}`;
+  if (!detail || !detail.trim()) return fallback;
+  let cleaned = detail.trim();
+  const secret = env.ENGINE_SERVICE_SECRET?.trim();
+  if (secret && cleaned.includes(secret)) {
+    cleaned = cleaned.replaceAll(secret, '[redacted]');
+  }
+  const hasStackTrace =
+    cleaned.includes('Traceback (most recent call last)') ||
+    /\n\s*File "[^"]+", line \d+/.test(cleaned) ||
+    /\n\s+at\s+\S+/.test(cleaned);
+  const hasSqliteLeak =
+    /\bsqlite3\./i.test(cleaned) ||
+    /(?:\/|[A-Za-z]:\\)\S*\.(?:db|sqlite|sqlite3)(?:-(?:wal|shm|journal))?\b/i.test(cleaned);
+  if (hasStackTrace || hasSqliteLeak) {
+    return status >= 500 ? ENGINE_UNAVAILABLE_MESSAGE : 'The request could not be completed.';
+  }
+  return cleaned;
+}
 
 export function engineStatus(error: unknown, passthroughStatus?: number): number {
-  return error instanceof EngineError && (error.status < 500 || error.status === passthroughStatus)
-    ? error.status
-    : 502;
+  if (error instanceof EngineError) {
+    return error.status < 500 || error.status === passthroughStatus || error.status === 503
+      ? error.status
+      : 502;
+  }
+  return 503;
 }
 
 export async function engine<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const headers = new Headers(init?.headers);
   if (!(init?.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: internalHeaders(headers),
-    signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${base}${path}`, {
+      ...init,
+      headers: internalHeaders(headers),
+      signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout
+    });
+  } catch (error) {
+    if (init?.signal?.aborted) throw error;
+    throw new EngineError(ENGINE_UNAVAILABLE_MESSAGE, 503, true);
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { detail?: string };
-    throw new EngineError(payload.detail || `Engine returned ${response.status}`, response.status);
+    throw new EngineError(sanitizeEngineMessage(payload.detail, response.status), response.status);
   }
-  return response.json() as Promise<T>;
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new EngineError(ENGINE_UNAVAILABLE_MESSAGE, 503, true);
+  }
 }
 
 export async function engineStream(path: string, init?: RequestInit): Promise<Response> {
   const timeout = AbortSignal.timeout(55_000);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-  const response = await fetch(`${base}${path}`, {
-    ...init,
-    headers: internalHeaders(init?.headers, 'text/event-stream'),
-    signal
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${base}${path}`, {
+      ...init,
+      headers: internalHeaders(init?.headers, 'text/event-stream'),
+      signal
+    });
+  } catch (error) {
+    if (init?.signal?.aborted) throw error;
+    throw new EngineError(ENGINE_UNAVAILABLE_MESSAGE, 503, true);
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { detail?: string };
-    throw new EngineError(payload.detail || `Engine returned ${response.status}`, response.status);
+    throw new EngineError(sanitizeEngineMessage(payload.detail, response.status), response.status);
   }
   if (!response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
     await response.body?.cancel();

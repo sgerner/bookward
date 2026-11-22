@@ -1,4 +1,4 @@
-import { fail as kitFail, redirect } from '@sveltejs/kit';
+import { error as httpError, fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
@@ -8,11 +8,21 @@ type AuthConfig = { oidc_enabled: boolean };
 const fail = (status: number, data: { message: string }) => kitFail(status, { ...data, error: true as const });
 
 export const load: PageServerLoad = async ({ locals, url }) => {
+	if (locals?.engineUnavailable) {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	if (!locals.user) throw redirect(303, '/login');
-	const [methods, config] = await Promise.all([
-		engine<AuthMethods>('/auth/identities'),
-		engine<AuthConfig>('/auth/config')
-	]);
+	let methods: AuthMethods;
+	let config: AuthConfig;
+	try {
+		[methods, config] = await Promise.all([
+			engine<AuthMethods>('/auth/identities'),
+			engine<AuthConfig>('/auth/config')
+		]);
+	} catch (error) {
+		if (error instanceof EngineError && error.status === 401) throw redirect(303, '/login');
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	return {
 		user: locals.user,
 		methods,
