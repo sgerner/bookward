@@ -337,22 +337,22 @@ def test_catalog_and_quality_clients_reject_oversized_streams_and_fallback(monke
     apple_stream = CountingAsyncStream(b"i" * 50_000, 10)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        if url.startswith(covers.OPEN_LIBRARY_SEARCH):
+        target = (request.url.host, request.url.path)
+        if target == ("openlibrary.org", "/search.json"):
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},
                 stream=ol_stream,
                 request=request,
             )
-        if "/works/OL123W.json" in url:
+        if target == ("openlibrary.org", "/works/OL123W.json"):
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},
                 stream=work_stream,
                 request=request,
             )
-        if url.startswith(covers.GOOGLE_BOOKS_SEARCH):
+        if target == ("www.googleapis.com", "/books/v1/volumes"):
             return httpx.Response(
                 200,
                 json={
@@ -369,14 +369,14 @@ def test_catalog_and_quality_clients_reject_oversized_streams_and_fallback(monke
                 },
                 request=request,
             )
-        if "itunes.apple.com" in url:
+        if target == ("itunes.apple.com", "/search"):
             return httpx.Response(
                 200,
                 headers={"content-type": "text/javascript; charset=utf-8"},
                 stream=apple_stream,
                 request=request,
             )
-        raise AssertionError(f"Unexpected URL: {url}")
+        raise AssertionError(f"Unexpected URL: {request.url}")
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
