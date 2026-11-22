@@ -68,3 +68,14 @@ def normalize_subjects(value: object, limit: int = 8) -> list[str]:
         if len(subjects) >= max(0, limit):
             break
     return subjects
+
+
+def subject_display_map(value: object, limit: int = 8) -> dict[str, str]:
+    """Map normalized subject keys to display-cased subject labels."""
+
+    mapping: dict[str, str] = {}
+    for subject in normalize_subjects(value, limit=limit):
+        key = _subject_key(subject)
+        if key and key not in mapping:
+            mapping[key] = subject
+    return mapping

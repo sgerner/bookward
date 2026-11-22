@@ -293,9 +293,17 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
         except (TypeError, json.JSONDecodeError):
             item["genres"] = []
         try:
-            item["explanation"] = json.loads(item.get("explanation") or "[]")
+            raw_explanation = json.loads(item.get("explanation") or "[]")
         except (TypeError, json.JSONDecodeError):
-            item["explanation"] = []
+            raw_explanation = []
+        from .ranking import normalize_explanation_items
+
+        item["explanation"] = normalize_explanation_items(
+            raw_explanation,
+            genres=item["genres"],
+            author=item.get("author"),
+            release_date=item.get("release_date"),
+        )
     return result
 
 
@@ -319,6 +327,35 @@ def _link(config: dict, key: str) -> str:
     return f"{config['app_url']}?view=discover&digest=1&digest_period={quote(key)}"
 
 
+def _select_digest_reason(item: dict) -> str:
+    from .ranking import is_caveat_explanation, normalize_explanation_items
+
+    normalized = normalize_explanation_items(
+        item.get("explanation") or [],
+        genres=item.get("genres"),
+        author=item.get("author"),
+        release_date=item.get("release_date"),
+    )
+    positive_matches = [
+        text
+        for text in normalized
+        if not is_caveat_explanation(text)
+        and not text.casefold().startswith("from ")
+        and not text.casefold().startswith("moved up ")
+    ]
+    if positive_matches:
+        return positive_matches[0]
+    source_matches = [
+        text for text in normalized if text.casefold().startswith("from ")
+    ]
+    if source_matches:
+        return source_matches[0]
+    source_name = str(item.get("source_name") or "").strip()
+    if source_name:
+        return f"From {source_name}"
+    return ""
+
+
 def _lines(items: list[dict], config: dict, key: str, test: bool = False) -> str:
     if test:
         return (
@@ -328,8 +365,8 @@ def _lines(items: list[dict], config: dict, key: str, test: bool = False) -> str
         )
     lines = [f"Bookward · new recommendations ({key})", ""]
     for item in items:
-        explanation = item.get("explanation") or []
-        reason = f" — {explanation[0]}" if explanation else ""
+        selected_reason = _select_digest_reason(item)
+        reason = f" — {selected_reason}" if selected_reason else ""
         lines.append(f"• {item['title']} — {item['author']} (ranking score {float(item['score']):.0f}){reason}")
     lines += ["", f"Review and shortlist these books in Bookward: {_link(config, key)}"]
     return "\n".join(lines)

@@ -49,7 +49,7 @@ from .ingestion import (
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
-from .ranking import rank_candidates
+from .ranking import normalize_explanation_items, rank_candidates
 from .secrets import seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -1609,26 +1609,86 @@ def reading_history():
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
         ).fetchall()]
-        existing_scores = []
-        candidate_keys = list(dict.fromkeys(
-            normalize_key(item["title"], item["author"]) for item in items
-        ))
+        matched_candidates = []
+        candidate_keys = [
+            key
+            for key in dict.fromkeys(
+                normalize_key(item["title"], item["author"]) for item in items
+            )
+            if key
+        ]
         for start in range(0, len(candidate_keys), 500):
             key_batch = candidate_keys[start:start + 500]
             placeholders = ",".join("?" for _ in key_batch)
-            existing_scores.extend(connection.execute(
-                "SELECT title,author,score FROM candidates "
-                f"WHERE status!='new' AND normalized_key IN ({placeholders}) "
+            matched_candidates.extend(connection.execute(
+                "SELECT id,title,author,normalized_key FROM candidates "
+                f"WHERE normalized_key IN ({placeholders}) "
                 "ORDER BY updated_at DESC,id DESC",
                 key_batch,
             ).fetchall())
-    scores = {}
-    for candidate in existing_scores:
-        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-        scores.setdefault(key, candidate["score"])
+        if items:
+            matched_candidates.extend(connection.execute(
+                "SELECT c.id,c.title,c.author,c.normalized_key "
+                "FROM candidates c "
+                "JOIN reads r ON LOWER(TRIM(r.title))=LOWER(TRIM(c.title)) "
+                "AND LOWER(TRIM(r.author))=LOWER(TRIM(c.author)) "
+                "ORDER BY c.updated_at DESC,c.id DESC"
+            ).fetchall())
+        candidate_ids_by_norm_key: dict[str, list[int]] = {}
+        candidate_ids_by_identity: dict[str, list[int]] = {}
+        seen_candidate_ids: set[int] = set()
+        impression_scores: dict[int, float | None] = {}
+        for candidate in matched_candidates:
+            cid = int(candidate["id"])
+            norm_key = str(candidate["normalized_key"] or "")
+            if norm_key:
+                bucket = candidate_ids_by_norm_key.setdefault(norm_key, [])
+                if cid not in bucket:
+                    bucket.append(cid)
+            identity = book_identity(candidate["title"], candidate["author"])
+            if identity != "\x1f":
+                id_bucket = candidate_ids_by_identity.setdefault(identity, [])
+                if cid not in id_bucket:
+                    id_bucket.append(cid)
+            if cid in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(cid)
+            impression = connection.execute(
+                "SELECT i.score "
+                "FROM recommendation_impressions i "
+                "JOIN recommendation_runs r ON r.id = i.run_id "
+                "LEFT JOIN recommendation_evidence_exposures ex "
+                "ON ex.run_id = i.run_id AND ex.candidate_id = i.candidate_id "
+                "WHERE i.candidate_id = ? "
+                "AND COALESCE(json_extract(r.metadata, '$.status'), 'all') IN ('all', 'recommended') "
+                "AND COALESCE(json_extract(ex.candidate_snapshot_json, '$.status'), 'recommended') = 'recommended' "
+                "ORDER BY i.presented_at DESC "
+                "LIMIT 1",
+                (cid,),
+            ).fetchone()
+            impression_scores[cid] = (
+                round(float(impression["score"]), 1)
+                if impression is not None and impression["score"] is not None
+                else None
+            )
     for item in items:
-        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
-        item["rank_score"] = scores.get(key)
+        norm_key = normalize_key(item["title"], item["author"])
+        identity = book_identity(item["title"], item["author"])
+        candidate_ids = []
+        for cid in (
+            *candidate_ids_by_norm_key.get(norm_key, ()),
+            *candidate_ids_by_identity.get(identity, ()),
+        ):
+            if cid not in candidate_ids:
+                candidate_ids.append(cid)
+        item["rank_score"] = next(
+            (
+                impression_scores[cid]
+                for cid in candidate_ids
+                if impression_scores.get(cid) is not None
+            ),
+            None,
+        )
         item["algorithm_score"] = None
         item["algorithm_explanation"] = []
         item["metadata_confidence"] = None
@@ -1896,7 +1956,13 @@ def recommendation_list(
             if work_url:
                 source_url = f"https://openlibrary.org{work_url}"
         item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
-        item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = json.loads(item["genres"] or "[]")
+        item["explanation"] = normalize_explanation_items(
+            json.loads(item["explanation"] or "[]"),
+            genres=item["genres"],
+            author=item.get("author"),
+            release_date=item.get("release_date"),
+        )
     return result
 
 @app.get("/api/recommendations")

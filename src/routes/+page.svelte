@@ -96,6 +96,9 @@
   let profileMenuRoot = $state<HTMLDivElement | null>(null);
   let profileMenuButton = $state<HTMLButtonElement | null>(null);
   let expandedRecommendationDetails = $state(new Set<number>());
+  let expandedSynopses = $state(new Set<number>());
+  let measuredSynopses = $state(new Set<number>());
+  let overflowingSynopses = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const DECISION_PAGE_SIZE = 24;
@@ -681,6 +684,44 @@
     if (next.has(id)) next.delete(id);
     else next.add(id);
     expandedRecommendationDetails = next;
+  }
+  function toggleSynopsis(id: number) {
+    const next = new Set(expandedSynopses);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    expandedSynopses = next;
+  }
+  function measureSynopsisOverflow(node: HTMLElement, id: number) {
+    let currentId = id;
+    const check = () => {
+      if (untrack(() => expandedSynopses.has(currentId))) return;
+      const overflows = node.scrollHeight > node.clientHeight + 1;
+      untrack(() => {
+        if (!measuredSynopses.has(currentId)) {
+          const nextMeasured = new Set(measuredSynopses);
+          nextMeasured.add(currentId);
+          measuredSynopses = nextMeasured;
+        }
+        if (overflowingSynopses.has(currentId) !== overflows) {
+          const nextOverflow = new Set(overflowingSynopses);
+          if (overflows) nextOverflow.add(currentId);
+          else nextOverflow.delete(currentId);
+          overflowingSynopses = nextOverflow;
+        }
+      });
+    };
+    check();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(check) : null;
+    observer?.observe(node);
+    return {
+      update(nextId: number) {
+        currentId = nextId;
+        check();
+      },
+      destroy() {
+        observer?.disconnect();
+      },
+    };
   }
   function readingSourceLabel(source: string) {
     return ({
@@ -1985,6 +2026,11 @@
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
+            {@const rationaleLabel = book.status === "rejected" ? "Why Bookward showed this" : book.status === "maybe_later" ? "Why Bookward suggested this" : "Why this might be for you"}
+            {@const synopsisText = (book.synopsis ?? "").trim()}
+            {@const synopsisExpanded = expandedSynopses.has(book.id)}
+            {@const showSynopsisToggle = synopsisExpanded || (measuredSynopses.has(book.id) ? overflowingSynopses.has(book.id) : synopsisText.length > 140)}
+            {@const formattedRank = Number(book.score).toFixed(1)}
             <article
               use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
@@ -2034,11 +2080,11 @@
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {formattedRank}</span>
               </button>
               <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
-                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {formattedRank}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
@@ -2058,6 +2104,24 @@
                   <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
                   <p class="mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
+                {#if synopsisText}
+                  <div class="space-y-1">
+                    <p
+                      id={`book-synopsis-${book.id}`}
+                      use:measureSynopsisOverflow={book.id}
+                      class={`text-sm leading-6 text-surface-800-200 sm:text-base ${synopsisExpanded ? "" : "line-clamp-3"}`}
+                    >{synopsisText}</p>
+                    {#if showSynopsisToggle}
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center text-sm font-medium text-secondary-700-300 underline decoration-secondary-500/60 underline-offset-4 hover:text-secondary-900-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500"
+                        aria-expanded={synopsisExpanded}
+                        aria-controls={`book-synopsis-${book.id}`}
+                        onclick={() => toggleSynopsis(book.id)}
+                      >{synopsisExpanded ? "Show less" : "Read full summary"}</button>
+                    {/if}
+                  </div>
+                {/if}
                 <details
                   class="group/details text-base text-surface-700-300"
                   open={expandedRecommendationDetails.has(book.id)}
@@ -2069,15 +2133,21 @@
                   }}
                 >
                   <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
-                    <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
+                    <Sparkles size={15} /><span>{rationaleLabel}</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
-                  {#if expandedRecommendationDetails.has(book.id)}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
-                      <p class="mt-2 leading-6">{book.reason}</p>
-                      {#if book.synopsis}<div class="mt-4 border-l-2 border-secondary-500/50 pl-3">
-                          <p class="text-xs font-semibold uppercase tracking-[0.16em] text-secondary-600-400">Book summary</p>
-                          <p class="mt-1 leading-6 text-surface-800-200">{book.synopsis}</p>
-                        </div>{/if}
-                    </div>{/if}
+                  <div>
+                    {#if book.explanation.length > 0}
+                      <ul class="mt-2 list-disc space-y-1.5 pl-5 text-sm leading-6 text-surface-800-200 sm:text-base">
+                        {#each book.explanation as reasonItem, reasonIndex (`${book.id}-${reasonIndex}-${reasonItem}`)}
+                          <li>{reasonItem}</li>
+                        {/each}
+                      </ul>
+                    {:else if book.reason}
+                      <p class="mt-2 text-sm leading-6 text-surface-800-200 sm:text-base">{book.reason}</p>
+                    {:else}
+                      <p class="mt-2 text-sm leading-6 text-surface-700-300 sm:text-base">Ranked from your enabled sources and available catalog details.</p>
+                    {/if}
+                  </div>
                 </details>
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}

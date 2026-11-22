@@ -217,3 +217,144 @@ def test_sparse_catalog_metadata_shrinks_ranking_toward_neutral_and_explains_it(
     assert ranked[10]["metadata_confidence"] == 0.45
     assert ranked[10]["score"] < ranked[11]["score"]
     assert any("catalog details are sparse" in text for text in ranked[10]["explanation"])
+
+
+def test_fifty_book_sparse_and_neural_catalogs_emit_zero_false_negative_neighbor_caveats():
+    import asyncio
+    from afterword_engine.embeddings import LocalHashingEmbedder
+    from afterword_engine.scoring import document
+
+    genres_liked = [
+        ["Science fiction", "Space opera"],
+        ["Literary fiction", "History"],
+        ["Mystery", "Detective"],
+    ]
+    reads = []
+    for idx in range(1, 16):
+        g = genres_liked[idx % len(genres_liked)]
+        reads.append(
+            {
+                "id": idx,
+                "title": f"Beloved Chronicle {idx}",
+                "author": f"Favorite Writer {idx}",
+                "rating": 5 if idx % 2 else 4,
+                "genres": g,
+                "description": f"An imaginative novel about exploration, memory, and discovery in {g[0].lower()}.",
+            }
+        )
+    for idx in range(16, 21):
+        reads.append(
+            {
+                "id": idx,
+                "title": f"Unpleasant Tome {idx}",
+                "author": f"Disliked Writer {idx}",
+                "rating": 1 if idx % 2 else 2,
+                "genres": ["Business", "Corporate strategy"],
+                "description": "A repetitive manual on quarterly enterprise procurement workflows and spreadsheets.",
+            }
+        )
+
+    candidates = []
+    for idx in range(1, 51):
+        g = genres_liked[idx % len(genres_liked)]
+        candidates.append(
+            {
+                "id": 100 + idx,
+                "title": f"Promising Novel {idx}",
+                "author": f"New Voice {idx}",
+                "genres": g,
+                "description": f"A compelling story of human connection, mystery, and discovery across {g[0].lower()} worlds.",
+                "source_name": "Curated Shelf",
+            }
+        )
+
+    # 1. Sparse 768-dim local hashing catalog over scoring.document()
+    embedder = LocalHashingEmbedder()
+    read_vecs_sparse = asyncio.run(embedder.embed([document(r) for r in reads]))
+    cand_vecs_sparse = asyncio.run(embedder.embed([document(c) for c in candidates]))
+    sparse_ranked = rank_candidates(reads, read_vecs_sparse, candidates, cand_vecs_sparse)
+    sparse_net_positive = [item for item in sparse_ranked if item["score"] >= 50.0]
+    assert len(sparse_net_positive) == 50
+    assert sum(
+        any("similar to a 1–2★ book" in line for line in item["explanation"])
+        for item in sparse_net_positive
+    ) == 0
+
+    # 2. Dense 384-dim neural catalog (anisotropic shared-domain cosine floor ~0.35)
+    rng = np.random.default_rng(42)
+    shared_bg = rng.normal(0.0, 1.0, 384)
+    shared_bg /= np.linalg.norm(shared_bg)
+    liked_topic = rng.normal(0.0, 1.0, 384)
+    liked_topic /= np.linalg.norm(liked_topic)
+    disliked_topic = rng.normal(0.0, 1.0, 384)
+    disliked_topic /= np.linalg.norm(disliked_topic)
+
+    read_vecs_dense = []
+    for r in reads:
+        topic = liked_topic if r["rating"] >= 4 else disliked_topic
+        vec = 0.58 * shared_bg + 0.55 * topic + 0.60 * rng.normal(0.0, 1.0 / np.sqrt(384), 384)
+        read_vecs_dense.append(vec / np.linalg.norm(vec))
+
+    cand_vecs_dense = []
+    for _ in candidates:
+        vec = 0.58 * shared_bg + 0.55 * liked_topic + 0.60 * rng.normal(0.0, 1.0 / np.sqrt(384), 384)
+        cand_vecs_dense.append(vec / np.linalg.norm(vec))
+
+    dense_ranked = rank_candidates(reads, read_vecs_dense, candidates, cand_vecs_dense)
+    dense_net_positive = [item for item in dense_ranked if item["score"] >= 50.0]
+    assert len(dense_net_positive) == 50
+    assert sum(
+        any("similar to a 1–2★ book" in line for line in item["explanation"])
+        for item in dense_net_positive
+    ) == 0
+
+    # True disliked neighbor still emits the caveat
+    disliked_clone_vec = 0.58 * shared_bg + 0.85 * disliked_topic
+    disliked_clone_vec /= np.linalg.norm(disliked_clone_vec)
+    disliked_result = rank_candidates(
+        reads,
+        read_vecs_dense,
+        [{"id": 999, "title": "Enterprise Spreadsheet Sequel", "author": "Other"}],
+        [disliked_clone_vec],
+    )[0]
+    assert any("Reduced: similar to a 1–2★ book" in line for line in disliked_result["explanation"])
+
+
+def test_author_penalty_explains_prior_low_ratings_and_orders_positives_source_caveats():
+    reads = [
+        book(1, "Loved Classic", "Great Author", 5),
+        book(2, "Disappointing One", "Weak Author", 1),
+        book(3, "Disappointing Two", "Weak Author", 2),
+        book(4, "Solo Miss", "Single Miss Author", 2),
+    ]
+    read_vectors = [[1, 0], [0, 1], [0, 1], [0, 1]]
+    candidates = [
+        {
+            **book(10, "Another Try", "Weak Author"),
+            "source_name": "Indie Feed",
+            "catalog_confidence": 1.0,
+            "description": "",
+            "genres": "[]",
+        },
+        book(11, "Second Book", "Single Miss Author"),
+    ]
+    ranked = {
+        item["id"]: item
+        for item in rank_candidates(reads, read_vectors, candidates, [[1, 0], [1, 0]])
+    }
+    explanations = ranked[10]["explanation"]
+    assert "Closest highly rated title: Loved Classic" in explanations
+    assert "From Indie Feed" in explanations
+    assert "Reduced: you rated books by this author poorly" in explanations
+    assert any("catalog details are sparse" in line for line in explanations)
+
+    pos_idx = explanations.index("Closest highly rated title: Loved Classic")
+    source_idx = explanations.index("From Indie Feed")
+    author_caveat_idx = explanations.index("Reduced: you rated books by this author poorly")
+    sparse_caveat_idx = next(
+        idx for idx, line in enumerate(explanations) if "catalog details are sparse" in line
+    )
+    assert pos_idx < source_idx < author_caveat_idx
+    assert source_idx < sparse_caveat_idx
+
+    assert "Reduced: you rated a book by this author poorly" in ranked[11]["explanation"]

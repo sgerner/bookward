@@ -138,3 +138,49 @@ def test_digest_channels_are_delivered_concurrently(tmp_path, monkeypatch):
     assert started == {"discord", "email"}
     assert result["status"] == "sent"
     assert {item["status"] for item in result["deliveries"]} == {"sent"}
+
+
+def test_weekly_digest_lines_prefer_positive_or_source_reason_and_drop_legacy_jargon():
+    books = [
+        {
+            "title": "Caveat First Legacy",
+            "author": "Writer A",
+            "score": 84.2,
+            "genres": ["Sci-Fi"],
+            "explanation": [
+                'Reduced: similar to a 1–2★ book ("Bad Read")',
+                "Raised using books you saved, imported, or positively rated (subject sci fi)",
+                "From Literary Hub",
+            ],
+        },
+        {
+            "title": "Source Fallback Only",
+            "author": "Writer B",
+            "score": 78.0,
+            "explanation": [
+                "Ranking confidence reduced: catalog details are sparse",
+                "Moved up for variety so one author does not crowd your top picks",
+                "From Booker Longlist",
+            ],
+        },
+        {
+            "title": "Only Caveats",
+            "author": "Writer C",
+            "score": 72.5,
+            "explanation": [
+                "Lowered slightly after appearing on several recent days without a decision",
+                "Reduced: books from the 1970s tend to score lower in your reading history",
+            ],
+        },
+    ]
+    text = digest._lines(books, {"app_url": "https://bookward.example"}, "2026-W47")
+    assert "%" not in text
+    assert "held-out ratings" not in text
+    assert "imported" not in text
+    assert '1–2★ book ("Bad Read")' not in text
+    assert "Moved up for variety" not in text
+    assert "Lowered slightly" not in text
+    assert "Raised using books you shortlisted, added to Librarr, or rated highly (subject Sci-Fi)" in text
+    assert "From Booker Longlist" in text
+    assert "• Caveat First Legacy — Writer A (ranking score 84)" in text
+    assert "• Only Caveats — Writer C (ranking score 72)" in text

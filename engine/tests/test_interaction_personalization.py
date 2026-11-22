@@ -69,9 +69,10 @@ def test_confident_interactions_adjust_and_reorder_live_recommendations():
         "adjusted_candidates": 2,
         "max_score_adjustment": 2.0,
     }
-    assert "saved, imported, or positively rated" in ranked[0]["explanation"][-1]
-    assert "subject solar myth" in ranked[0]["explanation"][-1]
-    assert "subject dark thriller" in ranked[1]["explanation"][-1]
+    assert "Raised using books you shortlisted, added to Librarr, or rated highly" in ranked[0]["explanation"][-1]
+    assert "imported" not in ranked[0]["explanation"][-1]
+    assert "subject Solar myth" in ranked[0]["explanation"][-1]
+    assert "subject Dark thriller" in ranked[1]["explanation"][-1]
 
 
 def test_weak_or_unobserved_signals_leave_champion_order_unchanged():
@@ -290,3 +291,75 @@ def test_mature_semantic_pooling_uses_asymmetric_positive_floor():
     assert by_id[301]["score"] == 50
     assert by_id[302]["score"] < 50
     assert diagnostics["semantic_evidence_books"] == 20
+
+
+def test_mixed_punctuation_subject_casing_preserved_in_explanation():
+    events = [interaction(i, "save", "Sci-Fi & Fantasy") for i in range(1, 7)]
+    events.extend(interaction(6 + i, "reject", "Historical Mystery") for i in range(1, 7))
+    ranked, diagnostics = personalize_recommendations(
+        [
+            candidate(401, "Sci-Fi & Fantasy", 50),
+            candidate(402, "Historical Mystery", 50),
+        ],
+        events,
+        now=NOW,
+    )
+    assert diagnostics["applied"] is True
+    by_id = {item["id"]: item for item in ranked}
+    assert "subject Sci-Fi & Fantasy" in by_id[401]["explanation"][-1]
+    assert "subject Historical Mystery" in by_id[402]["explanation"][-1]
+
+
+def test_recommendation_list_normalizes_legacy_stored_explanations(tmp_path, monkeypatch):
+    import json
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    from afterword_engine.main import recommendation_list
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "legacy-explanations.db"))
+    initialize(seed_demo=False)
+    legacy_explanation = json.dumps(
+        [
+            'Similar to "Dune" (5★)',
+            "Adjusted +1.8 from your publication-era pattern on held-out ratings",
+            "Raised using books you saved, imported, or positively rated (subject sci fi, author frank herbert)",
+            "From Curated Shelf",
+        ]
+    )
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name, url, kind, enabled) VALUES('Curated Shelf', 'https://example.com', 'rss', 1)"
+        ).lastrowid
+        for cid, status in [(1, "saved"), (2, "rejected"), (3, "maybe_later")]:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, genres, score, explanation, status, normalized_key) "
+                "VALUES(?, ?, ?, 'Frank Herbert', ?, 84.0, ?, ?, ?)",
+                (
+                    cid,
+                    source_id,
+                    f"Book {cid}",
+                    json.dumps(["Sci-Fi"]),
+                    legacy_explanation,
+                    status,
+                    f"book-{cid}|frank-herbert",
+                ),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 WHERE candidate_id=?",
+                (cid,),
+            )
+        con.execute("INSERT INTO feedback(candidate_id, action) VALUES(2, 'reject')")
+
+    saved_items = recommendation_list(status="saved")
+    decision_items = recommendation_list(status="decisions")
+    assert len(saved_items) == 1
+    assert len(decision_items) == 2
+    for item in [*saved_items, *decision_items]:
+        joined = " ".join(item["explanation"])
+        assert "held-out ratings" not in joined
+        assert "imported" not in joined
+        assert "subject sci fi" not in joined
+        assert "shortlisted, added to Librarr, or rated highly" in joined
+        assert "subject Sci-Fi" in joined
+        assert "author Frank Herbert" in joined
+        assert "Matches a publication era you tend to rate highly" in joined
