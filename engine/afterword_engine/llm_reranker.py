@@ -756,53 +756,6 @@ async def discover_local_llm_models(
     return discovered
 
 
-async def rerank_with_llm(
-    reads: Sequence[dict[str, Any]],
-    candidates: Sequence[dict[str, Any]],
-    *,
-    interaction_events: Sequence[dict[str, Any]] | None = None,
-    mode: str | None = None,
-    api_url: str | None = None,
-    api_key: str | None = None,
-    model: str | None = None,
-    top_k: int | None = None,
-    max_delta: float | None = None,
-    timeout_seconds: float | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Call the configured Ollama, OpenAI-compatible, or cloud LLM endpoint and rerank top-K candidates."""
-    try:
-        resolved_mode, url, key, chosen_model = _resolve_rerank_runtime(
-            mode=mode, api_url=api_url, api_key=api_key, model=model
-        )
-    except ValueError as exc:
-        LOGGER.warning("Invalid LLM reranker mode; falling back to base order: %s", exc)
-        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
-
-    k = top_k if top_k is not None else settings.llm_rerank_top_k
-    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
-    timeout = timeout_seconds if timeout_seconds is not None else settings.llm_rerank_timeout_seconds
-
-    requires_key = resolved_mode == "cloud"
-    if (requires_key and not key) or not url or not chosen_model or len(candidates) < 2:
-        return [dict(c) for c in candidates], {"applied": False, "reason": "not_configured"}
-
-    messages = build_rerank_prompt(reads, candidates, interaction_events=interaction_events, top_k=k)
-    try:
-        content = await _request_llm_completion_async(
-            mode=resolved_mode,
-            api_url=url,
-            api_key=key,
-            model=chosen_model,
-            messages=messages,
-            timeout=timeout,
-        )
-        parsed = extract_llm_json(content)
-        return _apply_parsed_rerank(candidates, parsed, top_k=k, max_delta=delta)
-    except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
-        return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}
-
-
 def rerank_with_llm_sync(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -816,7 +769,7 @@ def rerank_with_llm_sync(
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Synchronous variant of ``rerank_with_llm`` for sync serving paths."""
+    """Call the configured Ollama, OpenAI-compatible, or cloud LLM endpoint synchronously and rerank top-K candidates."""
     try:
         resolved_mode, url, key, chosen_model = _resolve_rerank_runtime(
             mode=mode, api_url=api_url, api_key=api_key, model=model
