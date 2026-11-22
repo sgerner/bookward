@@ -8,6 +8,8 @@ interface LockfilePackageEntry {
   resolved?: string;
   optional?: boolean;
   os?: string[];
+  cpu?: string[];
+  libc?: string[];
   inBundle?: boolean;
   link?: boolean;
   hasInstallScript?: boolean;
@@ -101,6 +103,15 @@ function matchesPlatformList(list: string[] | undefined, target: string): boolea
   const positives = list.filter((entry) => !entry.startsWith("!"));
   return positives.length === 0 || positives.includes(target) || positives.includes("any");
 }
+
+function matchesCurrentLinuxPlatform(entry: LockfilePackageEntry): boolean {
+  return (
+    matchesPlatformList(entry.os, "linux") &&
+    matchesPlatformList(entry.cpu, "x64") &&
+    matchesPlatformList(entry.libc, "glibc")
+  );
+}
+
 function parseTrustedRegistryIdentity(
   resolved: string | undefined,
 ): { name: string; version: string } | null {
@@ -201,7 +212,7 @@ function findUnreviewedLinuxInstallScripts(
 
   for (const [pkgPath, entry] of Object.entries(lockfile.packages ?? {})) {
     if (pkgPath === "" || entry.link || entry.inBundle) continue;
-    if (entry.optional && !matchesPlatformList(entry.os, "linux")) continue;
+    if (entry.optional && !matchesCurrentLinuxPlatform(entry)) continue;
     if (!hasInstallLifecycleScript(entry)) continue;
 
     const verdict = resolveAllowScriptsVerdict(entry, pkgPath, allowScripts);
@@ -440,6 +451,23 @@ describe("npm install-script policy guardrails", () => {
           resolved: "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
           os: ["darwin"],
           optional: true,
+          hasInstallScript: true,
+        },
+        "node_modules/arm64-native-addon": {
+          version: "1.4.2",
+          resolved: "https://registry.npmjs.org/arm64-native-addon/-/arm64-native-addon-1.4.2.tgz",
+          optional: true,
+          os: ["linux"],
+          cpu: ["arm64"],
+          hasInstallScript: true,
+        },
+        "node_modules/musl-native-addon": {
+          version: "1.4.2",
+          resolved: "https://registry.npmjs.org/musl-native-addon/-/musl-native-addon-1.4.2.tgz",
+          optional: true,
+          os: ["linux"],
+          cpu: ["x64"],
+          libc: ["musl"],
           hasInstallScript: true,
         },
         "node_modules/@scope/native-addon": {
