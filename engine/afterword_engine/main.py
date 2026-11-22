@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -98,7 +98,10 @@ from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
     audit_candidates,
+    configure_candidate_quality_sweep,
+    finish_candidate_quality_batch,
     has_candidate_quality_audit_candidates,
+    prepare_candidate_quality_batch,
     quality_summary,
 )
 from .identity import (
@@ -147,6 +150,11 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class CandidateAuditIn(BaseModel):
+    mode: Literal["incremental", "full"] | None = None
+    retry: bool = False
 
 
 def _ensure_profile_database(profile_id: str):
@@ -289,7 +297,11 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+    if (
+        not active_job("candidate_quality")
+        and not active_job("candidate_quality_recovery")
+        and has_candidate_quality_audit_candidates()
+    ):
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -544,15 +556,43 @@ async def handle_job(kind: str):
             enqueue_followup_job("metadata")
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        quality = await audit_candidates(only_pending=False)
-        enqueue_job("read_work_identities", dedupe=True)
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
+        mode, started_at = prepare_candidate_quality_batch()
+        quality = await audit_candidates(
+            only_pending=(mode != "full"),
+            limit=QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=started_at,
         )
-        return {**quality, "scored": scored}
+        stopped = bool(quality.get("stopped"))
+        remaining = finish_candidate_quality_batch(
+            mode=mode,
+            started_at=started_at,
+            stopped=stopped,
+        )
+        changed = bool(
+            quality.get("status_changed")
+            or quality.get("deduped")
+            or quality.get("enriched")
+        )
+        is_final_batch = remaining == 0 and not stopped
+        score_job_id = (
+            enqueue_job("score", dedupe=True)
+            if (changed or is_final_batch)
+            else None
+        )
+        followup_job_id = (
+            enqueue_followup_job("candidate_quality")
+            if remaining > 0
+            else None
+        )
+        if quality.get("audited") or is_final_batch:
+            enqueue_job("read_work_identities", dedupe=True)
+        return {
+            **quality,
+            "mode": mode,
+            "remaining": remaining,
+            "followup_job_id": followup_job_id,
+            "score_job_id": score_job_id,
+        }
     if kind == "candidate_quality_recovery":
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
         _enqueue_candidate_quality_followup()
@@ -663,7 +703,7 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if has_candidate_quality_audit_candidates():
+                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -2827,10 +2867,12 @@ async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/candidates/audit")
-async def candidate_audit():
-    """Queue a full catalog identity and quality audit."""
+async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
+    """Queue a bounded incremental or full catalog identity and quality audit."""
 
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
+    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
+    return configure_candidate_quality_sweep(mode=mode, retry=retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():

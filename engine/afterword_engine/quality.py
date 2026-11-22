@@ -15,7 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import unicodedata
+import uuid
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -42,7 +44,7 @@ from .covers import (
     metadata_client,
     safe_cover_url,
 )
-from .database import persist_metadata_field_provenance, private_setting, rows, transaction
+from .database import persist_metadata_field_provenance, private_setting, row, rows, transaction
 from .identity import (
     canonical_part,
     ReadIdentityIndex,
@@ -52,6 +54,7 @@ from .identity import (
     book_row_identity_match_keys,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
+from .jobs import current_job_stop_requested, update_job_progress
 
 
 QUALITY_VERSION = "candidate-quality-v4"
@@ -60,6 +63,28 @@ CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 CATALOG_PROVIDER_RETRY_HOURS = 24
 QUALITY_AUDIT_BATCH_SIZE = 50
+QUALITY_AUDIT_SUBBATCH_SIZE = 10
+QUALITY_SWEEP_MODE_KEY = "candidate_quality_audit_mode"
+QUALITY_SWEEP_STARTED_AT_KEY = "candidate_quality_audit_started_at"
+QUALITY_SWEEP_ACTIVE_KEY = "candidate_quality_audit_active"
+QUALITY_SWEEP_COMPLETED_AT_KEY = "candidate_quality_audit_completed_at"
+_AUDIT_TIMESTAMP_LOCK = threading.Lock()
+_LAST_AUDIT_TIMESTAMP_US = 0
+
+
+def _utc_audit_timestamp() -> str:
+    """Return a strictly increasing naive UTC timestamp with microsecond precision."""
+
+    global _LAST_AUDIT_TIMESTAMP_US
+    epoch_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+    with _AUDIT_TIMESTAMP_LOCK:
+        if epoch_us <= _LAST_AUDIT_TIMESTAMP_US:
+            epoch_us = _LAST_AUDIT_TIMESTAMP_US + 1
+        _LAST_AUDIT_TIMESTAMP_US = epoch_us
+    resolved = datetime.fromtimestamp(epoch_us / 1_000_000, tz=timezone.utc).replace(
+        tzinfo=None
+    )
+    return resolved.isoformat(sep=" ", timespec="microseconds")
 UNKNOWN_AUTHOR_RE = re.compile(
     r"^(?:unknown(?:\s+author)?|n/?a|none|null|various(?:\s+authors?)?|anonymous|staff)$",
     re.IGNORECASE,
@@ -1110,19 +1135,20 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
     return predicate, (QUALITY_VERSION, QUALITY_VERSION, retry_before)
 
 
-def candidate_quality_audit_candidates(
-    limit: int = QUALITY_AUDIT_BATCH_SIZE,
+def _select_incremental_audit_candidate_ids(
+    limit: int | None,
     *,
     now: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Select a bounded batch due for quality audit, validating old ISBN rows."""
-
-    batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
+    audited_before: str | None = None,
+) -> list[int]:
     predicate, params = candidate_quality_audit_eligibility(now)
-    page_size = max(100, batch_limit * 4)
+    if audited_before:
+        predicate = f"({predicate}) AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+        params = (*params, audited_before)
+    page_size = max(100, min(limit or QUALITY_AUDIT_BATCH_SIZE, QUALITY_AUDIT_BATCH_SIZE) * 4)
     selected_ids: list[int] = []
     offset = 0
-    while len(selected_ids) < batch_limit:
+    while limit is None or len(selected_ids) < limit:
         page = rows(
             "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
             "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
@@ -1158,21 +1184,100 @@ def candidate_quality_audit_candidates(
                 )
             ):
                 selected_ids.append(int(candidate["id"]))
-            if len(selected_ids) >= batch_limit:
+            if limit is not None and len(selected_ids) >= limit:
                 break
         offset += len(page)
         if len(page) < page_size:
             break
+    return selected_ids
+
+
+def candidate_quality_audit_candidates(
+    limit: int = QUALITY_AUDIT_BATCH_SIZE,
+    *,
+    now: datetime | None = None,
+    audited_before: str | None = None,
+) -> list[dict[str, Any]]:
+    """Select a bounded batch due for quality audit, validating old ISBN rows."""
+
+    batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
+    selected_ids = _select_incremental_audit_candidate_ids(
+        batch_limit, now=now, audited_before=audited_before
+    )
     if not selected_ids:
         return []
     placeholders = ",".join("?" for _ in selected_ids)
     return rows(
-        "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
+        "SELECT c.*,s.url AS source_root,q.quality_status AS _quality_status,"
+        "q.metadata_provider AS _metadata_provider,"
         "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         f"WHERE c.id IN ({placeholders}) ORDER BY c.id",
         tuple(selected_ids),
+    )
+
+
+def full_quality_audit_candidates(
+    limit: int | None = QUALITY_AUDIT_BATCH_SIZE,
+    *,
+    audited_before: str | None = None,
+) -> list[dict[str, Any]]:
+    """Select non-rejected, non-curated candidates for an explicit full sweep."""
+
+    where = (
+        "c.status!='rejected' "
+        "AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) "
+        "AND COALESCE(q.audit_version,'')!='builtin-curated-v1'"
+    )
+    params: list[object] = []
+    if audited_before:
+        where += " AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+        params.append(audited_before)
+    query = (
+        "SELECT c.*,s.url AS source_root,q.quality_status AS _quality_status,"
+        "q.metadata_provider AS _metadata_provider,"
+        "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        f"WHERE {where} ORDER BY c.id"
+    )
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(max(1, int(limit)))
+    return rows(query, tuple(params))
+
+
+def candidate_quality_audit_remaining(
+    *,
+    mode: str = "incremental",
+    audited_before: str | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Count remaining candidates eligible in the given sweep mode."""
+
+    if mode == "full":
+        where = (
+            "c.status!='rejected' "
+            "AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) "
+            "AND COALESCE(q.audit_version,'')!='builtin-curated-v1'"
+        )
+        params: tuple[object, ...] = ()
+        if audited_before:
+            where += " AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+            params = (audited_before,)
+        found = row(
+            "SELECT COUNT(*) AS count FROM candidates c "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            f"WHERE {where}",
+            params,
+        )
+        return int((found or {}).get("count") or 0)
+    return len(
+        _select_incremental_audit_candidate_ids(
+            None, now=now, audited_before=audited_before
+        )
     )
 
 
@@ -1248,12 +1353,13 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         metadata_provider = str(candidate.get("_metadata_provider") or "")
         metadata_provider_id = str(candidate.get("_metadata_provider_id") or "")
 
+    audited_at = _utc_audit_timestamp()
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
             work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
             metadata_provider_id,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -1285,6 +1391,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             QUALITY_VERSION,
             metadata_provider,
             metadata_provider_id,
+            audited_at,
         ),
     )
     if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
@@ -1423,30 +1530,48 @@ def _dedupe_and_hide(con) -> int:
     return changed
 
 
-async def audit_candidates(*, only_pending: bool = False, limit: int | None = None) -> dict[str, Any]:
-    """Audit and enrich candidates, returning a deterministic quality report."""
+async def audit_candidates(
+    *,
+    only_pending: bool = False,
+    limit: int | None = None,
+    audited_before: str | None = None,
+    job_id: str | None = None,
+    stop: Any = None,
+) -> dict[str, Any]:
+    """Audit and enrich candidates in checkpointed 10-row sub-batches."""
 
     if only_pending:
         candidates = candidate_quality_audit_candidates(
-            limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE
+            limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=audited_before,
         )
     else:
-        query = (
-            "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
-            "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status!='rejected' ORDER BY c.id"
+        candidates = full_quality_audit_candidates(
+            limit=limit,
+            audited_before=audited_before,
         )
-        params: tuple[object, ...] = ()
-        if limit is not None:
-            query += " LIMIT ?"
-            params = (max(1, int(limit)),)
-        candidates = rows(query, params)
     if not candidates:
         with transaction() as con:
             deduped = _dedupe_and_hide(con)
-        return {"audited": 0, "accepted": 0, "quarantine": 0, "rejected": 0, "deduped": deduped, "enriched": 0}
+            update_job_progress(1.0, job_id=job_id, con=con)
+        return {
+            "audited": 0,
+            "accepted": 0,
+            "quarantine": 0,
+            "rejected": 0,
+            "deduped": deduped,
+            "enriched": 0,
+            "status_changed": deduped,
+            "quality_version": QUALITY_VERSION,
+        }
+
+    total_candidates = len(candidates)
+    counts = {"accepted": 0, "quarantine": 0, "rejected": 0}
+    enriched = 0
+    deduped = 0
+    status_changed = 0
+    audited_count = 0
+    stopped = False
 
     semaphore = asyncio.Semaphore(CATALOG_CONCURRENCY)
     cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]] = {}
@@ -1463,23 +1588,327 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
                     rate_limited_providers=rate_limited_providers,
                 )
 
-        results = await asyncio.gather(*(run(candidate) for candidate in candidates))
+        for start in range(0, total_candidates, QUALITY_AUDIT_SUBBATCH_SIZE):
+            if audited_count > 0 and current_job_stop_requested(stop):
+                stopped = True
+                break
+            subbatch = candidates[start : start + QUALITY_AUDIT_SUBBATCH_SIZE]
+            results = await asyncio.gather(*(run(candidate) for candidate in subbatch))
+            with transaction() as con:
+                for candidate, result in zip(subbatch, results):
+                    status = result.get("quality_status", "quarantine")
+                    counts[status] = counts.get(status, 0) + 1
+                    previous_quality_status = str(candidate.get("_quality_status") or "pending")
+                    previous_candidate_status = str(candidate.get("status") or "new")
+                    if status != previous_quality_status or (
+                        status == "rejected"
+                        and previous_candidate_status in {"new", "recommended"}
+                    ):
+                        status_changed += 1
+                    if _store_result(con, candidate, result):
+                        enriched += 1
+                sub_deduped = _dedupe_and_hide(con)
+                deduped += sub_deduped
+                status_changed += sub_deduped
+                audited_count += len(subbatch)
+                update_job_progress(
+                    audited_count / total_candidates, job_id=job_id, con=con
+                )
+            if audited_count < total_candidates and current_job_stop_requested(stop):
+                stopped = True
+                break
 
-    counts = {"accepted": 0, "quarantine": 0, "rejected": 0}
-    enriched = 0
-    with transaction() as con:
-        for candidate, result in zip(candidates, results):
-            status = result.get("quality_status", "quarantine")
-            counts[status] = counts.get(status, 0) + 1
-            if _store_result(con, candidate, result):
-                enriched += 1
-        deduped = _dedupe_and_hide(con)
-    return {
-        "audited": len(candidates),
+    report: dict[str, Any] = {
+        "audited": audited_count,
         **counts,
         "deduped": deduped,
         "enriched": enriched,
+        "status_changed": status_changed,
         "quality_version": QUALITY_VERSION,
+    }
+    if stopped:
+        report["stopped"] = True
+    return report
+
+
+def _save_sweep_settings(con, values: dict[str, str]) -> None:
+    for key, value in values.items():
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
+            "updated_at=CURRENT_TIMESTAMP",
+            (key, value),
+        )
+
+
+def _load_sweep_settings(con=None) -> dict[str, str]:
+    keys = (
+        QUALITY_SWEEP_MODE_KEY,
+        QUALITY_SWEEP_STARTED_AT_KEY,
+        QUALITY_SWEEP_ACTIVE_KEY,
+        QUALITY_SWEEP_COMPLETED_AT_KEY,
+    )
+    placeholders = ",".join("?" for _ in keys)
+    if con is not None:
+        found = con.execute(
+            f"SELECT key,value FROM settings WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+        return {item["key"]: str(item["value"] or "") for item in found}
+    return {
+        item["key"]: str(item["value"] or "")
+        for item in rows(
+            f"SELECT key,value FROM settings WHERE key IN ({placeholders})",
+            keys,
+        )
+    }
+
+
+def configure_candidate_quality_sweep(
+    mode: str | None = None,
+    *,
+    retry: bool = False,
+) -> dict[str, Any]:
+    """Persist sweep state in settings and queue a deduplicated manual audit job."""
+
+    with transaction() as con:
+        stored = _load_sweep_settings(con)
+        stored_mode = (
+            "full" if stored.get(QUALITY_SWEEP_MODE_KEY) == "full" else "incremental"
+        )
+        stored_started_at = stored.get(QUALITY_SWEEP_STARTED_AT_KEY, "").strip()
+        stored_active = stored.get(QUALITY_SWEEP_ACTIVE_KEY) == "1"
+
+        if mode in {"incremental", "full"}:
+            requested_mode = str(mode)
+        elif retry:
+            requested_mode = stored_mode
+        else:
+            requested_mode = "incremental"
+
+        existing = con.execute(
+            "SELECT id,status FROM jobs WHERE kind='candidate_quality' "
+            "AND status IN ('queued','running') "
+            "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, rowid ASC LIMIT 1"
+        ).fetchone()
+
+        if existing:
+            if requested_mode == "full" and stored_mode != "full":
+                effective_mode = "full"
+                effective_started_at = _utc_audit_timestamp()
+                _save_sweep_settings(
+                    con,
+                    {
+                        QUALITY_SWEEP_MODE_KEY: effective_mode,
+                        QUALITY_SWEEP_STARTED_AT_KEY: effective_started_at,
+                        QUALITY_SWEEP_ACTIVE_KEY: "1",
+                        QUALITY_SWEEP_COMPLETED_AT_KEY: "",
+                    },
+                )
+            else:
+                effective_mode = stored_mode if stored_active else requested_mode
+                effective_started_at = stored_started_at or _utc_audit_timestamp()
+                if not stored_active or not stored_started_at:
+                    _save_sweep_settings(
+                        con,
+                        {
+                            QUALITY_SWEEP_MODE_KEY: effective_mode,
+                            QUALITY_SWEEP_STARTED_AT_KEY: effective_started_at,
+                            QUALITY_SWEEP_ACTIVE_KEY: "1",
+                            QUALITY_SWEEP_COMPLETED_AT_KEY: "",
+                        },
+                    )
+            job_id = str(existing["id"])
+        else:
+            if (
+                retry
+                and stored_active
+                and stored_started_at
+                and requested_mode == stored_mode
+            ):
+                effective_started_at = stored_started_at
+            else:
+                effective_started_at = _utc_audit_timestamp()
+            effective_mode = requested_mode
+            _save_sweep_settings(
+                con,
+                {
+                    QUALITY_SWEEP_MODE_KEY: effective_mode,
+                    QUALITY_SWEEP_STARTED_AT_KEY: effective_started_at,
+                    QUALITY_SWEEP_ACTIVE_KEY: "1",
+                    QUALITY_SWEEP_COMPLETED_AT_KEY: "",
+                },
+            )
+            job_id = str(uuid.uuid4())
+            con.execute(
+                "INSERT INTO jobs(id,kind,status) VALUES(?,'candidate_quality','queued')",
+                (job_id,),
+            )
+
+    remaining = candidate_quality_audit_remaining(
+        mode=effective_mode, audited_before=effective_started_at
+    )
+    return {
+        "job_id": job_id,
+        "mode": effective_mode,
+        "started_at": effective_started_at,
+        "remaining": remaining,
+    }
+
+
+def prepare_candidate_quality_batch() -> tuple[str, str]:
+    """Return active (mode, started_at) for a candidate_quality worker turn."""
+
+    with transaction() as con:
+        stored = _load_sweep_settings(con)
+        stored_mode = (
+            "full" if stored.get(QUALITY_SWEEP_MODE_KEY) == "full" else "incremental"
+        )
+        stored_started_at = stored.get(QUALITY_SWEEP_STARTED_AT_KEY, "").strip()
+        stored_active = stored.get(QUALITY_SWEEP_ACTIVE_KEY) == "1"
+        if stored_active and stored_started_at:
+            return stored_mode, stored_started_at
+        started_at = _utc_audit_timestamp()
+        _save_sweep_settings(
+            con,
+            {
+                QUALITY_SWEEP_MODE_KEY: stored_mode,
+                QUALITY_SWEEP_STARTED_AT_KEY: started_at,
+                QUALITY_SWEEP_ACTIVE_KEY: "1",
+                QUALITY_SWEEP_COMPLETED_AT_KEY: "",
+            },
+        )
+        return stored_mode, started_at
+
+
+def finish_candidate_quality_batch(
+    *,
+    mode: str,
+    started_at: str,
+    stopped: bool = False,
+) -> int:
+    """Compute remaining candidates in the sweep and close sweep state when done."""
+
+    remaining = candidate_quality_audit_remaining(
+        mode=mode, audited_before=started_at
+    )
+    if remaining == 0 and not stopped:
+        with transaction() as con:
+            _save_sweep_settings(
+                con,
+                {
+                    QUALITY_SWEEP_ACTIVE_KEY: "0",
+                    QUALITY_SWEEP_COMPLETED_AT_KEY: _utc_audit_timestamp(),
+                },
+            )
+    return remaining
+
+
+def get_candidate_quality_sweep_status() -> dict[str, Any]:
+    """Return active sweep mode, remaining count, progress, and latest error."""
+
+    stored = _load_sweep_settings()
+    stored_mode = (
+        "full" if stored.get(QUALITY_SWEEP_MODE_KEY) == "full" else "incremental"
+    )
+    stored_started_at = stored.get(QUALITY_SWEEP_STARTED_AT_KEY, "").strip()
+    stored_active = stored.get(QUALITY_SWEEP_ACTIVE_KEY) == "1"
+    stored_completed_at = stored.get(QUALITY_SWEEP_COMPLETED_AT_KEY, "").strip()
+
+    active_manual = row(
+        "SELECT id,kind,status,progress,error,created_at,started_at,finished_at,attempts "
+        "FROM jobs WHERE kind='candidate_quality' AND status IN ('running','queued') "
+        "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, rowid ASC LIMIT 1"
+    )
+    latest_manual = row(
+        "SELECT id,kind,status,progress,error,created_at,started_at,finished_at,attempts "
+        "FROM jobs WHERE kind='candidate_quality' ORDER BY rowid DESC LIMIT 1"
+    )
+    active_recovery = row(
+        "SELECT id,kind,status,progress,error,created_at,started_at,finished_at,attempts "
+        "FROM jobs WHERE kind='candidate_quality_recovery' AND status IN ('running','queued') "
+        "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, rowid ASC LIMIT 1"
+    )
+
+    if active_manual:
+        mode = stored_mode
+        remaining = candidate_quality_audit_remaining(
+            mode=mode, audited_before=stored_started_at or None
+        )
+        status = str(active_manual["status"])
+        active = True
+        progress = float(active_manual["progress"] or 0.0)
+        job_id = str(active_manual["id"])
+        last_error = None
+        can_retry = False
+    elif (
+        latest_manual
+        and latest_manual["status"] == "failed"
+        and (stored_active or not stored_completed_at)
+    ):
+        mode = stored_mode
+        remaining = candidate_quality_audit_remaining(
+            mode=mode,
+            audited_before=stored_started_at if (stored_active and stored_started_at) else None,
+        )
+        status = "failed"
+        active = False
+        progress = float(latest_manual["progress"] or 0.0)
+        job_id = str(latest_manual["id"])
+        last_error = str(latest_manual["error"] or "Catalog audit failed.")
+        can_retry = True
+    elif stored_active:
+        mode = stored_mode
+        remaining = candidate_quality_audit_remaining(
+            mode=mode, audited_before=stored_started_at or None
+        )
+        status = "paused" if remaining > 0 else "complete"
+        active = False
+        progress = 1.0 if remaining == 0 else float((latest_manual or {}).get("progress") or 0.0)
+        job_id = str(latest_manual["id"]) if latest_manual else None
+        last_error = None
+        can_retry = remaining > 0
+    elif active_recovery:
+        mode = "incremental"
+        remaining = candidate_quality_audit_remaining(mode="incremental")
+        status = str(active_recovery["status"])
+        active = True
+        progress = float(active_recovery["progress"] or 0.0)
+        job_id = str(active_recovery["id"])
+        last_error = None
+        can_retry = False
+    else:
+        mode = "incremental"
+        remaining = candidate_quality_audit_remaining(mode="incremental")
+        has_completed = bool(
+            stored_completed_at
+            or (latest_manual and latest_manual["status"] == "complete")
+        )
+        status = "complete" if has_completed else "idle"
+        active = False
+        progress = 1.0 if has_completed else 0.0
+        job_id = str(latest_manual["id"]) if latest_manual else None
+        last_error = None
+        can_retry = False
+
+    return {
+        "status": status,
+        "active": active,
+        "mode": mode,
+        "last_mode": (
+            stored_mode
+            if (stored_completed_at or latest_manual or stored_active)
+            else None
+        ),
+        "batch_size": QUALITY_AUDIT_BATCH_SIZE,
+        "subbatch_size": QUALITY_AUDIT_SUBBATCH_SIZE,
+        "remaining": remaining,
+        "progress": round(progress, 4),
+        "started_at": stored_started_at or None,
+        "completed_at": stored_completed_at or None,
+        "job_id": job_id,
+        "last_error": last_error,
+        "can_retry": can_retry,
     }
 
 
@@ -1506,4 +1935,5 @@ def quality_summary() -> dict[str, Any]:
         "identifiers": identifiers,
         "flags": dict(sorted(flag_counts.items(), key=lambda item: (-item[1], item[0]))),
         "version": QUALITY_VERSION,
+        "audit": get_candidate_quality_sweep_status(),
     }

@@ -1,10 +1,12 @@
 import json
 import uuid
 import asyncio
+from contextvars import ContextVar
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 import time
+from typing import Any
 
 from .database import rows, transaction
 from .security import safe_error_message
@@ -15,8 +17,61 @@ JOB_HEARTBEAT_SECONDS = 30
 JOB_REAPER_SECONDS = 30
 JOB_MAX_ATTEMPTS = 3
 PROFILE_RETRY_SECONDS = 60
+_ACTIVE_JOB_CONTEXT: ContextVar[tuple[str, str, Any] | None] = ContextVar(
+    "afterword_active_job", default=None
+)
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def current_job_context() -> tuple[str, str, Any] | None:
+    """Return the active (job_id, lease_token, stop_event) in this worker task."""
+
+    return _ACTIVE_JOB_CONTEXT.get()
+
+
+def current_job_stop_requested(stop: Any = None) -> bool:
+    """Return whether the caller's or worker's stop signal is set."""
+
+    if stop is not None:
+        return bool(stop.is_set())
+    context = _ACTIVE_JOB_CONTEXT.get()
+    return bool(context and context[2] is not None and context[2].is_set())
+
+
+def update_job_progress(
+    progress: float,
+    *,
+    job_id: str | None = None,
+    con=None,
+) -> int:
+    """Persist fractional job progress, reusing an open transaction when given."""
+
+    bounded = max(0.0, min(1.0, float(progress)))
+    context = _ACTIVE_JOB_CONTEXT.get()
+
+    def _apply(connection) -> int:
+        if job_id is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running'",
+                (bounded, job_id),
+            ).rowcount
+        if context is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running' AND lease_token=?",
+                (bounded, context[0], context[1]),
+            ).rowcount
+        return connection.execute(
+            "UPDATE jobs SET progress=? WHERE id=("
+            "SELECT id FROM jobs WHERE kind IN ('candidate_quality','candidate_quality_recovery') "
+            "AND status='running' ORDER BY rowid DESC LIMIT 1)",
+            (bounded,),
+        ).rowcount
+
+    if con is not None:
+        return _apply(con)
+    with transaction() as managed:
+        return _apply(managed)
 
 
 def _reap_abandoned_jobs() -> int:
@@ -133,6 +188,7 @@ async def worker_loop(handler, stop):
                         daemon=True,
                     )
                     heartbeat.start()
+                    job_token = _ACTIVE_JOB_CONTEXT.set((job["id"], lease_token, stop))
                     try:
                         result = await handler(job["kind"])
                         with transaction() as con:
@@ -149,6 +205,7 @@ async def worker_loop(handler, stop):
                                 (safe_error_message(exc, limit=2000), now(), job["id"], lease_token),
                             )
                     finally:
+                        _ACTIVE_JOB_CONTEXT.reset(job_token)
                         heartbeat_stop.set()
                         await asyncio.to_thread(heartbeat.join)
             except Exception:

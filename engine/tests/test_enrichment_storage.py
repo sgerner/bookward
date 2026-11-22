@@ -856,6 +856,205 @@ def test_periodic_retry_scheduler_queues_quality_recovery_without_provider_work(
     assert engine_main._queue_due_enrichment_retries() == {}
 
 
+def test_manual_candidate_audit_defaults_incremental_supports_full_and_reports_summary(
+    database, monkeypatch
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()[0]
+        accepted_ids = []
+        for index in range(120):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    f"Catalog Accepted {index}",
+                    "A Writer",
+                    "https://example.com/accepted",
+                    source_id,
+                    f"catalog accepted {index}",
+                ),
+            ).lastrowid
+            accepted_ids.append(cid)
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                "WHERE candidate_id=?",
+                (QUALITY_VERSION, cid),
+            )
+        pending_id = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+            "VALUES(?,?,?,?,?)",
+            (
+                "Catalog Pending",
+                "A Writer",
+                "https://example.com/pending",
+                source_id,
+                "catalog pending",
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? "
+            "WHERE candidate_id=?",
+            (QUALITY_VERSION, pending_id),
+        )
+
+    audited_batches: list[list[int]] = []
+
+    async def fake_audit_one(candidate, *_args, **_kwargs):
+        audited_batches[-1].append(int(candidate["id"]))
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "accepted",
+            "quality_score": 0.91,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{candidate['id']}",
+            "work_id": f"/works/OL{candidate['id']}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    from afterword_engine import quality as quality_module
+
+    monkeypatch.setattr(quality_module, "_audit_one", fake_audit_one)
+
+    # Empty-body manual audit defaults to incremental mode (checking only pending/due rows).
+    queued_default = asyncio.run(engine_main.candidate_audit(None))
+    assert queued_default["mode"] == "incremental"
+    assert queued_default["remaining"] == 1
+    summary_during_incremental = engine_main.candidate_quality()
+    assert summary_during_incremental["audit"]["mode"] == "incremental"
+    assert summary_during_incremental["audit"]["active"] is True
+    assert summary_during_incremental["audit"]["remaining"] == 1
+
+    audited_batches.append([])
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality'")
+    inc_result = asyncio.run(handle_job("candidate_quality"))
+    assert inc_result["mode"] == "incremental"
+    assert inc_result["audited"] == 1
+    assert inc_result["remaining"] == 0
+    assert inc_result["followup_job_id"] is None
+    assert inc_result["score_job_id"] is not None
+    assert audited_batches[-1] == [pending_id]
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='score'")
+
+    # Explicit full mode sweeps all 121 non-curated candidates in 50-row continuation batches.
+    queued_full = asyncio.run(
+        engine_main.candidate_audit(engine_main.CandidateAuditIn(mode="full"))
+    )
+    assert queued_full["mode"] == "full"
+    assert queued_full["remaining"] == 121
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality'")
+
+    audited_batches.append([])
+    batch_one = asyncio.run(handle_job("candidate_quality"))
+    assert batch_one["audited"] == QUALITY_AUDIT_BATCH_SIZE
+    assert batch_one["remaining"] == 71
+    assert batch_one["followup_job_id"] is not None
+    # Unchanged accepted rows in batch 1 do not force mid-sweep rescoring; worker yields cleanly.
+    assert batch_one["score_job_id"] is None
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM jobs WHERE kind='candidate_quality' AND status='queued'"
+        )["count"]
+        == 1
+    )
+
+    # Simulate a failed second batch and verify quality_summary surfaces error + retry state.
+    failed_job_id = batch_one["followup_job_id"]
+    with transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='failed',progress=0.2,error='Catalog provider timed out' WHERE id=?",
+            (failed_job_id,),
+        )
+    failed_summary = engine_main.candidate_quality()
+    assert failed_summary["audit"]["status"] == "failed"
+    assert failed_summary["audit"]["mode"] == "full"
+    assert failed_summary["audit"]["remaining"] == 71
+    assert failed_summary["audit"]["last_error"] == "Catalog provider timed out"
+    assert failed_summary["audit"]["can_retry"] is True
+
+    # Retry preserves sweep_started_at so the first 50 audited rows are not repeated.
+    retried = asyncio.run(
+        engine_main.candidate_audit(engine_main.CandidateAuditIn(retry=True))
+    )
+    assert retried["mode"] == "full"
+    assert retried["started_at"] == queued_full["started_at"]
+    assert retried["remaining"] == 71
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality' AND status='queued'")
+
+    audited_batches.append([])
+    batch_two = asyncio.run(handle_job("candidate_quality"))
+    assert batch_two["audited"] == QUALITY_AUDIT_BATCH_SIZE
+    assert batch_two["remaining"] == 21
+    assert batch_two["followup_job_id"] is not None
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality' AND status='queued'")
+
+    audited_batches.append([])
+    batch_three = asyncio.run(handle_job("candidate_quality"))
+    assert batch_three["audited"] == 21
+    assert batch_three["remaining"] == 0
+    assert batch_three["followup_job_id"] is None
+    assert batch_three["score_job_id"] is not None
+
+    full_audited_ids = audited_batches[1] + audited_batches[2] + audited_batches[3]
+    assert len(full_audited_ids) == 121
+    assert set(full_audited_ids) == set(accepted_ids + [pending_id])
+    done_summary = engine_main.candidate_quality()
+    assert done_summary["audit"]["status"] == "complete"
+    assert done_summary["audit"]["active"] is False
+    assert done_summary["audit"]["remaining"] == 0
+
+
+def test_candidate_audit_http_endpoint_accepts_empty_body_and_explicit_modes(
+    database, monkeypatch
+):
+    from fastapi.testclient import TestClient
+    from afterword_engine import profiles
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    session, _ = profiles.create_session(admin["id"])
+    headers = {"x-bookward-session": session}
+
+    client = TestClient(engine_main.app)
+    # Empty-body POST with no JSON payload remains valid and defaults to incremental.
+    empty_res = client.post("/api/candidates/audit", headers=headers)
+    assert empty_res.status_code == 200
+    empty_payload = empty_res.json()
+    assert empty_payload["mode"] == "incremental"
+    assert empty_payload["job_id"]
+
+    quality_res = client.get("/api/candidates/quality", headers=headers)
+    assert quality_res.status_code == 200
+    quality_payload = quality_res.json()
+    assert quality_payload["audit"]["mode"] == "incremental"
+    assert quality_payload["audit"]["active"] is True
+
+    # Explicit full mode upgrades an active incremental sweep to full.
+    full_res = client.post(
+        "/api/candidates/audit", json={"mode": "full"}, headers=headers
+    )
+    assert full_res.status_code == 200
+    assert full_res.json()["mode"] == "full"
+
+    invalid_res = client.post(
+        "/api/candidates/audit", json={"mode": "bogus"}, headers=headers
+    )
+    assert invalid_res.status_code == 422
+
+
 def test_metadata_worker_requeues_past_first_candidate_batch_and_scores_changes(database, monkeypatch):
     candidate_ids = []
     with transaction() as con:

@@ -385,6 +385,52 @@
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const catalogQuality = $derived(
+    data.catalogQuality ?? {
+      statuses: [],
+      identifiers: { total: 0, with_isbn13: 0, with_catalog_match: 0 },
+      flags: {},
+      version: "",
+      audit: {
+        status: "idle" as const,
+        active: false,
+        mode: "incremental" as const,
+        last_mode: null,
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 0,
+        progress: 0,
+        started_at: null,
+        completed_at: null,
+        job_id: null,
+        last_error: null,
+        can_retry: false,
+      },
+    },
+  );
+  const catalogAudit = $derived(catalogQuality.audit);
+  const catalogStatusCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const item of catalogQuality.statuses) {
+      counts[item.quality_status] = item.count;
+    }
+    return {
+      accepted: counts.accepted ?? 0,
+      quarantine: counts.quarantine ?? 0,
+      pending: counts.pending ?? 0,
+    };
+  });
+  const catalogAuditPercent = $derived(
+    Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
+  );
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    if (activeView !== "settings" || !catalogAudit.active) return;
+    const timer = window.setInterval(() => {
+      void invalidateAll();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  });
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -3232,6 +3278,183 @@
                       />{:else}<Check size={16} />{/if} Save Google Books key</button
                   >
                 </form>
+              </section>
+              <section
+                id="catalog-audit-settings"
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><Database size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Catalog audit
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${
+                      catalogAudit.status === "failed"
+                        ? "preset-tonal-error"
+                        : catalogAudit.active
+                          ? "preset-tonal-secondary"
+                          : catalogAudit.remaining > 0
+                            ? "preset-tonal-warning"
+                            : "preset-tonal-success"
+                    }`}
+                  >
+                    {#if catalogAudit.status === "failed"}
+                      Needs retry
+                    {:else if catalogAudit.active}
+                      {catalogAudit.mode === "full" ? "Full sweep" : "Incremental"} · {catalogAudit.status === "queued" ? "Queued" : "Running"}
+                    {:else if catalogAudit.status === "paused"}
+                      Paused · {catalogAudit.remaining} left
+                    {:else if catalogAudit.remaining > 0}
+                      {catalogAudit.remaining} due
+                    {:else}
+                      Up to date
+                    {/if}
+                  </span>
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
+                </p>
+
+                <div
+                  class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
+                      {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
+                        ? "Active sweep mode"
+                        : "Default mode"}
+                    </span>
+                    <span class="font-medium text-surface-950-50">
+                      {catalogAudit.mode === "full"
+                        ? "Full catalog sweep"
+                        : "Incremental"}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-surface-700-300">Remaining to check</span>
+                    <strong class="text-surface-950-50">
+                      {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"}
+                    </strong>
+                  </div>
+                  <p class="text-xs text-surface-600-400">
+                    {catalogStatusCounts.accepted} accepted · {catalogStatusCounts.quarantine} quarantined{#if catalogStatusCounts.pending > 0} · {catalogStatusCounts.pending} pending{/if}
+                  </p>
+                  {#if catalogAudit.active}
+                    <div class="pt-1">
+                      <div class="mb-1 flex items-center justify-between text-xs text-surface-700-300">
+                        <span>Current {catalogAudit.batch_size}-book batch</span>
+                        <span>{catalogAuditPercent}%</span>
+                      </div>
+                      <div
+                        class="h-2 w-full overflow-hidden rounded-full bg-surface-300-700/50"
+                        role="progressbar"
+                        aria-label="Current catalog audit batch progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={catalogAuditPercent}
+                      >
+                        <div
+                          class="h-full rounded-full preset-filled-secondary-500 transition-all"
+                          style={`width: ${catalogAuditPercent}%`}
+                        ></div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+
+                {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
+                  <div
+                    class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
+                    role="alert"
+                  >
+                    <TriangleAlert size={16} class="shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <strong>
+                        {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
+                      </strong>
+                      {#if catalogAudit.remaining > 0}
+                        · {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"} remaining
+                      {/if}
+                      {#if catalogAudit.last_error}
+                        <span class="mt-1 block text-xs">{catalogAudit.last_error}</span>
+                      {/if}
+                    </span>
+                    <form
+                      method="POST"
+                      action="?/retryCatalogAudit"
+                      use:enhance={setPending("catalog-audit-retry")}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button
+                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                        type="submit"
+                        disabled={isPending("catalog-audit-retry") || catalogAudit.active}
+                        aria-busy={isPending("catalog-audit-retry")}
+                      >
+                        {#if isPending("catalog-audit-retry")}<RefreshCw
+                            size={14}
+                            class="animate-spin"
+                          />{:else}<RefreshCw size={14} />{/if} Retry
+                      </button>
+                    </form>
+                  </div>
+                {/if}
+
+                <div class="mt-4 grid gap-2 sm:grid-cols-2">
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-incremental")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="incremental" />
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
+                      aria-busy={isPending("catalog-audit-incremental")}
+                    >
+                      {#if isPending("catalog-audit-incremental") || (catalogAudit.active && catalogAudit.mode === "incremental")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Search size={16} />{/if} Audit due books
+                    </button>
+                  </form>
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-full")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="full" />
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
+                      aria-busy={isPending("catalog-audit-full")}
+                    >
+                      {#if isPending("catalog-audit-full") || (catalogAudit.active && catalogAudit.mode === "full")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<RefreshCw size={16} />{/if} Re-check full catalog
+                    </button>
+                  </form>
+                </div>
               </section>
               <section
                 in:fly={{

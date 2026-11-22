@@ -550,3 +550,193 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["provider_id"] == "6758952748"
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_audit_commits_10_row_subbatches_updates_progress_and_preserves_90_rows_at_91(
+    database, monkeypatch
+):
+    from afterword_engine import quality as quality_module
+
+    candidate_ids = [
+        add_candidate(f"Subbatch Book {index}", f"Author {index}")
+        for index in range(100)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,progress) VALUES('job-91','candidate_quality','running',0)"
+        )
+
+    observed_progress: list[float] = []
+    real_audit_one = quality_module._audit_one
+
+    async def interrupting_audit_one(candidate, *args, **kwargs):
+        if candidate["title"] == "Subbatch Book 90":
+            current = row("SELECT progress FROM jobs WHERE id='job-91'")
+            observed_progress.append(float(current["progress"]))
+            raise RuntimeError("Simulated provider crash at row 91")
+        return await real_audit_one(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(quality_module, "_audit_one", interrupting_audit_one)
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{title.replace(' ', '_')}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    with pytest.raises(RuntimeError, match="Simulated provider crash at row 91"):
+        asyncio.run(audit_candidates(only_pending=False, job_id="job-91"))
+
+    assert observed_progress == [pytest.approx(0.9)]
+    job = row("SELECT progress FROM jobs WHERE id='job-91'")
+    assert job["progress"] == pytest.approx(0.9)
+
+    committed = rows(
+        "SELECT candidate_id,quality_status,audit_version,audited_at "
+        "FROM candidate_quality WHERE candidate_id IN (%s) ORDER BY candidate_id"
+        % ",".join("?" for _ in candidate_ids),
+        tuple(candidate_ids),
+    )
+    accepted_ids = [
+        item["candidate_id"]
+        for item in committed
+        if item["quality_status"] == "accepted" and item["audit_version"] == QUALITY_VERSION
+    ]
+    pending_ids = [
+        item["candidate_id"]
+        for item in committed
+        if item["quality_status"] == "pending"
+    ]
+    assert accepted_ids == candidate_ids[:90]
+    assert pending_ids == candidate_ids[90:]
+
+
+@respx.mock
+def test_audit_stops_cleanly_between_subbatches_during_shutdown(database):
+    candidate_ids = [
+        add_candidate(f"Shutdown Book {index}", f"Author {index}")
+        for index in range(25)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,progress) VALUES('job-stop','candidate_quality','running',0)"
+        )
+
+    stop = asyncio.Event()
+    calls: list[str] = []
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        calls.append(title)
+        if len(calls) == 10:
+            stop.set()
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{len(calls)}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    result = asyncio.run(
+        audit_candidates(only_pending=False, job_id="job-stop", stop=stop)
+    )
+    assert result["audited"] == 10
+    assert result["accepted"] == 10
+    assert result["stopped"] is True
+    assert len(calls) == 10
+    assert row("SELECT progress FROM jobs WHERE id='job-stop'")["progress"] == pytest.approx(0.4)
+
+
+@respx.mock
+def test_full_sweep_skips_curated_demo_rows_and_already_audited_sweep_rows(database):
+    first = add_candidate("Sweep Book One", "Writer One")
+    second = add_candidate("Sweep Book Two", "Writer Two")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+            "WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, first, second),
+        )
+    curated_ids = [
+        item["candidate_id"]
+        for item in rows(
+            "SELECT candidate_id FROM candidate_quality WHERE audit_version='builtin-curated-v1'"
+        )
+    ]
+    assert len(curated_ids) > 0
+
+    called_titles: list[str] = []
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        called_titles.append(title)
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{title.replace(' ', '_')}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Writer")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    # Incremental mode skips current accepted rows and curated demo rows.
+    assert asyncio.run(audit_candidates(only_pending=True))["audited"] == 0
+    assert called_titles == []
+
+    # Full mode re-checks accepted rows once per sweep_started_at while skipping curated demo rows.
+    sweep_started_at = "2026-06-01 00:00:00.000000"
+    first_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=1, audited_before=sweep_started_at)
+    )
+    assert first_pass["audited"] == 1
+    assert called_titles == ["Sweep Book One"]
+
+    second_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=10, audited_before=sweep_started_at)
+    )
+    assert second_pass["audited"] == 1
+    assert called_titles == ["Sweep Book One", "Sweep Book Two"]
+
+    third_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=10, audited_before=sweep_started_at)
+    )
+    assert third_pass["audited"] == 0
