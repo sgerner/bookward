@@ -338,7 +338,7 @@ BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/
 docker compose -p bookward-smoke down -v
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests. The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
 
 ## Contributing
 
