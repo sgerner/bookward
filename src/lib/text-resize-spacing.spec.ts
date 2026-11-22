@@ -183,6 +183,7 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
     expect(librarrSlice).toContain("flex-1");
     expect(librarrSlice).toContain("overflow-y-auto");
     expect(source).not.toContain("max-h-[calc(100vh-11rem)]");
+    expect(source).not.toContain("max-h-[calc(100dvh-11rem)]");
   });
 
   it("eliminates truncate, line-clamp, and fixed leading-5 classes across +page.svelte and ThemePicker.svelte", () => {
