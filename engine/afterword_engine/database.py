@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
         UPDATE sources SET last_attempted_at=last_scanned_at
             WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;

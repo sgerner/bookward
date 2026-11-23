@@ -923,7 +923,9 @@ def restore_backup(backup_id: str) -> dict:
             "restored_backup": backup_id,
             "safety_backup": _backup_record(safety_backup),
         }
-    except BackupError as exc:
+    except Exception as exc:
+        if not isinstance(exc, BackupError):
+            LOGGER.exception("Bookward restore failed")
         rollback_failed = False
         if replaced:
             if safety_backup:
@@ -943,31 +945,9 @@ def restore_backup(backup_id: str) -> dict:
         else:
             message = f"Restore failed; the previous database remains active. {detail}"
         _set_last_error(message)
-        if rollback_failed:
+        if rollback_failed or not isinstance(exc, BackupError):
             raise BackupError(message) from exc
         raise exc
-    except Exception as exc:
-        LOGGER.exception("Bookward restore failed")
-        rollback_failed = False
-        if replaced:
-            if safety_backup:
-                try:
-                    with database_lock(live_path):
-                        rollback = _copy_to_stage(safety_backup, live_path.parent)
-                        _replace_live_database(rollback, _restore_key_sidecar(safety_backup))
-                        _clear_restore_journal()
-                except Exception:
-                    rollback_failed = True
-                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-            else:
-                rollback_failed = True
-        detail = safe_error_message(exc, limit=200)
-        if rollback_failed:
-            message = f"Restore failed; automatic rollback did not complete. {detail}"
-        else:
-            message = f"Restore failed; the previous database remains active. {detail}"
-        _set_last_error(message)
-        raise BackupError(message) from exc
     finally:
         if staged is not None:
             staged.unlink(missing_ok=True)

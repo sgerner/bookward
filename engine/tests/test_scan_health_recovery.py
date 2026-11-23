@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import socket
+import sqlite3
 
 from fastapi.testclient import TestClient
 import httpx
@@ -14,7 +15,7 @@ from auth_helpers import authenticated_headers
 from afterword_engine import profiles
 from afterword_engine.config import settings
 from afterword_engine.covers import GOOGLE_BOOKS_SEARCH, METADATA_NORMALIZATION_VERSION, OPEN_LIBRARY_SEARCH
-from afterword_engine.database import initialize, row, rows, transaction
+from afterword_engine.database import MIGRATIONS, initialize, row, rows, transaction
 from afterword_engine.ingestion import (
     candidate_metadata_refresh_remaining,
     fetch_bytes,
@@ -43,7 +44,7 @@ def _auth_headers() -> dict[str, str]:
     return authenticated_headers()
 
 
-def test_additive_migration_applies_across_all_profile_databases(database):
+def test_additive_migration_applies_across_all_profile_databases(database, tmp_path):
     profile_ids = [
         "legacy",
         "0123456789abcdef0123456789abcdef",
@@ -60,6 +61,29 @@ def test_additive_migration_applies_across_all_profile_databases(database):
             }
             assert "last_attempted_at" in source_columns
             assert "metadata_retry_status" in quality_columns
+
+    v26_db = tmp_path / "upgrade_v26.db"
+    settings.db = str(v26_db)
+    with sqlite3.connect(v26_db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version > 26:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        con.execute(
+            "INSERT INTO sources(name, url, last_scanned_at) VALUES(?, ?, ?)",
+            ("Existing Feed", "https://example.test/feed.xml", "2026-04-01T12:00:00Z"),
+        )
+    initialize(seed_demo=False)
+    assert row("SELECT 1 FROM schema_migrations WHERE version=27") is not None
+    upgraded = row("SELECT last_scanned_at, last_attempted_at FROM sources WHERE url=?", ("https://example.test/feed.xml",))
+    assert upgraded == {
+        "last_scanned_at": "2026-04-01T12:00:00Z",
+        "last_attempted_at": "2026-04-01T12:00:00Z",
+    }
 
 
 @respx.mock
