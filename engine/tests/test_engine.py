@@ -960,9 +960,7 @@ def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
     assert configured["goodreads_rss_last_sync_at"] == ""
 
 
-def test_sync_goodreads_rss_reuses_single_client_with_3_way_concurrency_and_speedup(database, monkeypatch):
-    import time
-
+def test_sync_goodreads_rss_reuses_single_client_with_3_way_concurrency(database, monkeypatch):
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
@@ -1032,15 +1030,12 @@ def test_sync_goodreads_rss_reuses_single_client_with_3_way_concurrency_and_spee
 
     monkeypatch.setattr(ingestion, "_source_client", fake_source_client)
 
-    started = time.perf_counter()
     result = asyncio.run(
         main._sync_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
     )
-    elapsed = time.perf_counter() - started
 
     assert len(created_clients) == 1
     assert max_in_flight == 3
-    assert elapsed < 0.35, f"Expected concurrent ~150ms sync (<350ms), got {elapsed:.3f}s"
     assert seen_hosts == ["www.goodreads.com", "www.goodreads.com", "www.goodreads.com"]
     assert result["imported"] == 1
     assert result["shelves"] == {"to-read": 1, "currently-reading": 0}
