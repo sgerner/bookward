@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import {
   parseReadingHistoryId,
@@ -23,23 +22,23 @@ const updateErrorMessage = (error: unknown) =>
 const updateById: RequestHandler = async ({ params, request }) => {
   const parsedId = parseReadingHistoryId(params.id);
   if (!parsedId.ok) {
-    return json({ message: parsedId.message }, { status: 400 });
+    return Response.json({ message: parsedId.message }, { status: 400 });
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return json({ message: "Send a valid JSON request body." }, { status: 400 });
+    return Response.json({ message: "Send a valid JSON request body." }, { status: 400 });
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return json({ message: "Send a valid JSON request body." }, { status: 400 });
+    return Response.json({ message: "Send a valid JSON request body." }, { status: 400 });
   }
 
   const record = body as Record<string, unknown>;
   const parsedRating = parseWholeStarRating(record.rating);
   if (!parsedRating.ok) {
-    return json({ message: parsedRating.message }, { status: 400 });
+    return Response.json({ message: parsedRating.message }, { status: 400 });
   }
 
   try {
@@ -51,9 +50,9 @@ const updateById: RequestHandler = async ({ params, request }) => {
       },
     );
     const { job_id = null, ...item } = updated;
-    return json({ item, job_id });
+    return Response.json({ item, job_id });
   } catch (error) {
-    return json({ message: updateErrorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: updateErrorMessage(error) }, { status: engineStatus(error) });
   }
 };
 
