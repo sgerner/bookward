@@ -12,7 +12,7 @@ from .covers import (
     fallback_cover_url,
     is_weak_cover_url,
 )
-from .identity import book_identity, book_identity_matches
+from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
 from .tenancy import profile_database_path
@@ -1745,9 +1745,6 @@ def demote_orphaned_recommended_candidates(
         ).rowcount,
     )
 
-def normalize_key(title: str, author: str):
-    import re
-    return re.sub(r"[^a-z0-9]+", " ", f"{title} {author}".lower()).strip()
 
 def rows(query: str, params=()):
     with connect() as con:
