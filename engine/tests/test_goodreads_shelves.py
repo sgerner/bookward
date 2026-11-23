@@ -189,7 +189,7 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
         assert "On your Goodreads to-read shelf" not in with_shelves[cid][2]
 
 
-def test_migration_26_and_startup_recover_hidden_rows_dedupe_shelves_and_preserve_profile_isolation(
+def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserve_profile_isolation(
     tmp_path: Path, monkeypatch
 ) -> None:
     root_db = tmp_path / "afterword.db"
@@ -201,7 +201,7 @@ def test_migration_26_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
     profile_b_db = tmp_path / "profiles" / f"{profile_b_id}.sqlite3"
     profile_a_db.parent.mkdir(parents=True, exist_ok=True)
 
-    # Construct a genuine schema-v25 database for profile_a with dual-shelf
+    # Construct a genuine schema-v26 database for profile_a with dual-shelf
     # stale rows and a stranded status='hidden' candidate.
     con = sqlite3.connect(profile_a_db)
     try:
@@ -209,7 +209,7 @@ def test_migration_26_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 26:
+            if version >= 27:
                 continue
             _execute_migration_script(con, script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -704,3 +704,98 @@ def test_rss_private_404_clears_stale_rss_preserving_csv_and_disconnect_clears_r
     assert after_disconnect == [
         ("to-read", "goodreads_csv", "CSV Fallback Book"),
     ]
+
+
+def test_goodreads_imports_delete_matching_items_from_both_shelves_using_title_author_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine import ingestion
+    from afterword_engine.ingestion import import_goodreads_csv, import_goodreads_rss
+
+    db_path = tmp_path / "shelf_delete_index.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    con = sqlite3.connect(db_path)
+    try:
+        plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("Project Hail Mary", "Andy Weir"),
+            ).fetchall()
+        ]
+        shelf_plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+                ("to-read",),
+            ).fetchall()
+        ]
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, source, title, author, isbn) VALUES(?, ?, ?, ?, ?)",
+            [
+                ("to-read", "goodreads_csv", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("currently-reading", "goodreads_rss", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("to-read", "goodreads_csv", "Artemis", "Andy Weir", None),
+                ("to-read", "goodreads_csv", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("currently-reading", "goodreads_rss", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("to-read", "goodreads_csv", "Dune", "Frank Herbert", "9780441172719"),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author" in detail
+        for detail in plan_details
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf" in detail
+        for detail in shelf_plan_details
+    )
+
+    csv_promotion = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,5,2026/03/10,2026/01/10,read,=\"9780593135204\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_promotion) == 1
+
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Piranesi</title>
+        <author_name>Susanna Clarke</author_name>
+        <user_rating>5</user_rating>
+        <user_read_at>2026/03/15</user_read_at>
+        <isbn13>9781635575637</isbn13>
+      </item>
+    </channel></rss>"""
+
+    async def fake_fetch_bytes(url: str, **kwargs):
+        return rss_xml, "application/rss+xml"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+    assert (
+        asyncio.run(
+            import_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+        )
+        == 1
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY title, shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    # Non-matching shelf rows by the same or other authors remain queued while
+    # both to-read and currently-reading rows across CSV and RSS are deleted for promoted books.
+    assert remaining == [
+        ("to-read", "Artemis", "Andy Weir"),
+        ("to-read", "Dune", "Frank Herbert"),
+    ]
+

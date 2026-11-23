@@ -799,7 +799,7 @@ def import_goodreads_csv(content: bytes):
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
     with transaction() as con:
-        if has_shelf_column or shelf_rows:
+        if shelf_rows or (has_shelf_column and not read_rows):
             con.execute("DELETE FROM goodreads_shelf_items WHERE source='goodreads_csv'")
         if shelf_rows:
             con.executemany(
@@ -813,6 +813,10 @@ def import_goodreads_csv(content: bytes):
                 shelf_rows,
             )
         if read_rows:
+            con.executemany(
+                "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ((item[0], item[1]) for item in read_rows),
+            )
             con.executemany(
                 "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
                 "VALUES(?,?,?,?,?,'goodreads_csv') "
@@ -2239,6 +2243,11 @@ async def import_goodreads_rss(url: str):
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        if read_rows:
+            con.executemany(
+                "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ((item[0], item[1]) for item in read_rows),
+            )
         con.executemany(
             "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
             "VALUES(?,?,?,?,?,'goodreads_rss') "

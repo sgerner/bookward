@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         CREATE TABLE goodreads_shelf_items_v2 (
             id INTEGER PRIMARY KEY,
             shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
@@ -1018,12 +1025,15 @@ MIGRATIONS = [
             added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
             updated_at=excluded.updated_at;
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
         DROP TABLE goodreads_shelf_items;
         ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items;
         CREATE INDEX idx_goodreads_shelf_items_shelf
             ON goodreads_shelf_items(shelf, updated_at DESC);
         CREATE INDEX idx_goodreads_shelf_items_source_shelf
             ON goodreads_shelf_items(source, shelf);
+        CREATE INDEX idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
         UPDATE candidates
         SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
         WHERE status='hidden';

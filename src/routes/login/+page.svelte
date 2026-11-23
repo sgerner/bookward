@@ -30,7 +30,7 @@
 	>
 		<section class="hidden min-w-0 lg:block" aria-labelledby="welcome-title">
 			<a href="/" class="inline-flex items-center gap-3 text-surface-950-50 no-underline">
-				<img src={bookwardMark} alt="" class="size-12 rounded-2xl shadow-lg shadow-primary-500/20" />
+				<img src={bookwardMark} alt="" width="128" height="128" class="size-12 rounded-2xl shadow-lg shadow-primary-500/20" />
 				<span>
 					<span class="block text-lg font-semibold tracking-tight">Bookward</span>
 					<span class="mt-0.5 block text-[0.65rem] font-bold tracking-[0.24em] text-surface-700-300">READ WITH INTENTION</span>
@@ -51,7 +51,7 @@
 				<div class="absolute -left-6 top-0 size-48 rounded-full bg-primary-500/20 blur-3xl" aria-hidden="true"></div>
 				<div class="relative flex items-center gap-5 rounded-3xl border border-primary-500/15 bg-surface-50-950/70 p-5 shadow-xl shadow-primary-500/5 backdrop-blur-xl">
 					<div class="relative grid size-20 shrink-0 place-items-center overflow-hidden rounded-[1.65rem] bg-gradient-to-br from-primary-500 via-secondary-500 to-tertiary-500 shadow-lg shadow-primary-500/20">
-						<img src={bookwardMark} alt="" class="size-16 rounded-[1.2rem]" aria-hidden="true" />
+						<img src={bookwardMark} alt="" width="128" height="128" class="size-16 rounded-[1.2rem]" aria-hidden="true" />
 					</div>
 					<div class="min-w-0">
 						<p class="text-xs font-bold uppercase tracking-[0.18em] text-surface-600-400">Your own reading world</p>
@@ -69,7 +69,7 @@
 				<div class="login-accent-bar absolute inset-x-0 top-0 h-1" aria-hidden="true"></div>
 
 				<a href="/" class="mb-8 inline-flex items-center gap-3 text-surface-950-50 no-underline lg:hidden">
-					<img src={bookwardMark} alt="" class="size-11 rounded-2xl shadow-lg shadow-primary-500/20" />
+					<img src={bookwardMark} alt="" width="128" height="128" class="size-11 rounded-2xl shadow-lg shadow-primary-500/20" />
 					<span>
 						<span class="block text-base font-semibold tracking-tight">Bookward</span>
 						<span class="mt-0.5 block text-[0.6rem] font-bold tracking-[0.22em] text-surface-700-300">READ WITH INTENTION</span>
