@@ -1354,12 +1354,12 @@ def test_secondary_profile_initializes_with_demo_source_disabled_and_migrates_em
     assert legacy_builtin["enabled"] == 1
     assert legacy_builtin["candidate_count"] == 4
 
-    # Simulate an existing secondary profile created before migration 26 where
+    # Simulate an existing secondary profile created before migration 27 where
     # builtin://upcoming was inserted enabled=1 with zero candidates.
     with profile_scope(reader["profile_id"]):
         with transaction() as con:
             con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
-            con.execute("DELETE FROM schema_migrations WHERE version=26")
+            con.execute("DELETE FROM schema_migrations WHERE version=27")
         initialize(seed_demo=False)
         with connect() as con:
             migrated = con.execute(

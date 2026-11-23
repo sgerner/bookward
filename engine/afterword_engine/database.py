@@ -988,8 +988,15 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         INSERT INTO jobs(id, kind, status)
-        SELECT 'migration-26-score-' || lower(hex(randomblob(8))), 'score', 'queued'
+        SELECT 'migration-27-score-' || lower(hex(randomblob(8))), 'score', 'queued'
         WHERE EXISTS (SELECT 1 FROM reads WHERE source = 'demo')
           AND (
               EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
