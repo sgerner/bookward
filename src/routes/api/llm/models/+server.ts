@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engine, engineStatus } from "#lib/server/engine.js";
 
@@ -35,9 +34,9 @@ export const GET: RequestHandler = async ({ url }) => {
     const catalog = await engine<LlmCatalogResponse>(
       query ? `/api/llm/models?${query}` : "/api/llm/models",
     );
-    return json(catalog);
+    return Response.json(catalog);
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };
 
@@ -58,8 +57,8 @@ export const POST: RequestHandler = async ({ request }) => {
         use_saved_key: payload.use_saved_key !== false,
       }),
     });
-    return json(catalog);
+    return Response.json(catalog);
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };

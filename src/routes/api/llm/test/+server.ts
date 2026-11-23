@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engine, engineStatus } from "#lib/server/engine.js";
 
@@ -31,8 +30,8 @@ export const POST: RequestHandler = async ({ request }) => {
         use_saved_key: payload.use_saved_key !== false,
       }),
     });
-    return json(result);
+    return Response.json(result);
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };
