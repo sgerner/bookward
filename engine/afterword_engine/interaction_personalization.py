@@ -304,16 +304,30 @@ def _parse_datetime(value: object) -> datetime | None:
     return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 
-def _event_order(event: dict[str, Any]):
-    occurred = _parse_datetime(event.get("occurred_at"))
-    # Stable event ids break timestamp ties. Missing timestamps sort before
-    # dated events, allowing a later known action to supersede them.
-    timestamp = occurred.timestamp() if occurred else float("-inf")
+_ELIGIBLE_EVENT_TYPES = frozenset(
+    {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}
+)
+_UNSET = object()
+
+
+def _event_order(
+    event: dict[str, Any],
+    input_index: int = 0,
+    *,
+    occurred: datetime | None | object = _UNSET,
+) -> tuple[float, int, int]:
+    if not isinstance(event, dict):
+        event = dict(event)
+    if occurred is _UNSET:
+        occurred = _parse_datetime(event.get("occurred_at"))
+    # Stable event ids and input order break timestamp ties. Missing timestamps
+    # sort before dated events, allowing a later known action to supersede them.
+    timestamp = occurred.timestamp() if isinstance(occurred, datetime) else float("-inf")
     try:
         event_id = int(event.get("id") or 0)
     except (TypeError, ValueError):
         event_id = 0
-    return timestamp, event_id
+    return timestamp, event_id, input_index
 
 
 def _event_label(event: dict[str, Any]) -> tuple[float | None, float]:
@@ -401,42 +415,59 @@ def _latest_observations(
     now: datetime,
     interaction_vectors: dict[int, np.ndarray] | None = None,
 ) -> list[dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    ordered = sorted((dict(item) for item in events), key=_event_order)
-    for event in ordered:
+    deduped: dict[str, list[Any]] = {}
+    for input_index, raw_event in enumerate(events):
+        event = dict(raw_event)
         event_type = str(event.get("event_type") or "").casefold()
-        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
+        if event_type not in _ELIGIBLE_EVENT_TYPES:
             continue
         identity = book_identity(event.get("title", ""), event.get("author", ""))
         if identity == "\x1f":
             continue
-        label, reliability = _event_label(event)
         occurred = _parse_datetime(event.get("occurred_at"))
+        order_key = _event_order(event, input_index, occurred=occurred)
+        existing = deduped.get(identity)
+        if existing is None:
+            deduped[identity] = [order_key, order_key, identity, event, occurred]
+        else:
+            if order_key < existing[0]:
+                existing[0] = order_key
+            if order_key > existing[1]:
+                existing[1] = order_key
+                existing[3] = event
+                existing[4] = occurred
+
+    vectors = interaction_vectors or {}
+    observations: list[dict[str, Any]] = []
+    for _first_key, _winner_key, identity, event, occurred in sorted(
+        deduped.values(), key=lambda entry: entry[0]
+    ):
+        label, reliability = _event_label(event)
+        if label is None:
+            continue
+        age_days = max(0.0, (now - occurred).total_seconds() / 86_400) if occurred else 0.0
+        weight = reliability * (0.5 ** (age_days / DECAY_HALF_LIFE_DAYS))
+        if weight < 0.05:
+            continue
+        features = _book_features(event)
+        if not features:
+            continue
         try:
             candidate_id = int(event.get("candidate_id"))
         except (TypeError, ValueError):
             candidate_id = 0
-        latest[identity] = {
-            "identity": identity,
-            "candidate_id": candidate_id,
-            "label": label,
-            "reliability": reliability,
-            "occurred_at": occurred,
-            "features": _book_features(event),
-            "vector": (interaction_vectors or {}).get(candidate_id),
-        }
-
-    observations = []
-    for item in latest.values():
-        if item["label"] is None or not item["features"]:
-            continue
-        occurred = item["occurred_at"]
-        age_days = max(0.0, (now - occurred).total_seconds() / 86_400) if occurred else 0.0
-        weight = item["reliability"] * (0.5 ** (age_days / DECAY_HALF_LIFE_DAYS))
-        if weight < 0.05:
-            continue
-        item["weight"] = weight
-        observations.append(item)
+        observations.append(
+            {
+                "identity": identity,
+                "candidate_id": candidate_id,
+                "label": label,
+                "reliability": reliability,
+                "occurred_at": occurred,
+                "features": features,
+                "vector": vectors.get(candidate_id),
+                "weight": weight,
+            }
+        )
     return observations
 
 
@@ -680,12 +711,13 @@ def _shelf_prior_features(item: Mapping[str, Any]) -> set[str]:
 
 
 def _extract_shelf_items(
-    events_list: list[dict[str, Any]],
+    events: Iterable[Mapping[str, Any]],
     shelf_items: Iterable[Mapping[str, Any]] | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     explicit_events: list[dict[str, Any]] = []
     combined_shelf: list[dict[str, Any]] = []
-    for event in events_list:
+    for raw_event in events:
+        event = raw_event if isinstance(raw_event, dict) else dict(raw_event)
         event_type = str(event.get("event_type") or "").strip().casefold()
         if event_type == SHELF_PRIOR_EVENT_TYPE:
             combined_shelf.append(dict(event, shelf="to-read"))
@@ -895,8 +927,7 @@ def evaluate_shelf_prior_gate(
 
     current_time = now or datetime.now(timezone.utc)
     current_time = current_time.replace(tzinfo=current_time.tzinfo or timezone.utc).astimezone(timezone.utc)
-    raw_events = [dict(item) for item in events]
-    explicit_events, combined_shelf = _extract_shelf_items(raw_events, shelf_items)
+    explicit_events, combined_shelf = _extract_shelf_items(events, shelf_items)
     if not combined_shelf:
         return {
             "status": "inconclusive",
@@ -911,17 +942,23 @@ def evaluate_shelf_prior_gate(
             "prequential_challenger_auc": None,
         }
 
-    ordered = sorted(explicit_events, key=_event_order)
+    ordered_with_keys: list[tuple[tuple[float, int, int], datetime | None, dict[str, Any]]] = []
+    for input_index, event in enumerate(explicit_events):
+        occurred = _parse_datetime(event.get("occurred_at"))
+        ordered_with_keys.append(
+            (_event_order(event, input_index, occurred=occurred), occurred, event)
+        )
+    ordered_with_keys.sort(key=lambda entry: entry[0])
+
     latest_by_identity: dict[str, dict[str, Any]] = {}
-    for index, event in enumerate(ordered, start=1):
+    for index, (order_key, occurred, event) in enumerate(ordered_with_keys, start=1):
         event_type = str(event.get("event_type") or "").strip().casefold()
-        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
+        if event_type not in _ELIGIBLE_EVENT_TYPES:
             continue
         identity = book_identity(event.get("title", ""), event.get("author", ""))
         if identity == "\x1f":
             continue
         label, reliability = _event_label(event)
-        occurred = _parse_datetime(event.get("occurred_at"))
         raw_score = event.get("base_score", event.get("score"))
         if raw_score is None:
             base_score = 50.0
@@ -966,7 +1003,7 @@ def evaluate_shelf_prior_gate(
             candidate_id = index
         latest_by_identity[identity] = {
             "identity": identity,
-            "order_key": _event_order(event),
+            "order_key": order_key,
             "occurred_at": occurred,
             "label": label,
             "reliability": reliability,
@@ -1020,10 +1057,10 @@ def evaluate_shelf_prior_gate(
     events_with_identity = [
         (
             book_identity(ev.get("title", ""), ev.get("author", "")),
-            _event_order(ev),
+            order_key,
             ev,
         )
-        for ev in ordered
+        for order_key, _occurred, ev in ordered_with_keys
     ]
 
     for target in labeled:
@@ -1143,8 +1180,7 @@ def personalize_recommendations(
 
     current_time = now or datetime.now(timezone.utc)
     current_time = current_time.replace(tzinfo=current_time.tzinfo or timezone.utc).astimezone(timezone.utc)
-    raw_events = [dict(item) for item in events]
-    explicit_events, combined_shelf = _extract_shelf_items(raw_events, shelf_items)
+    explicit_events, combined_shelf = _extract_shelf_items(events, shelf_items)
     observations = _latest_observations(
         explicit_events,
         now=current_time,
