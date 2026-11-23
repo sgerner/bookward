@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         ALTER TABLE reads ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
         ALTER TABLE goodreads_shelf_items ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
         """,

@@ -14,8 +14,9 @@ import math
 import re
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 from .database import transaction
 from .decision_evidence import (
