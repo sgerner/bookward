@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         ALTER TABLE candidate_quality ADD COLUMN openlibrary_work_id TEXT NOT NULL DEFAULT '';
         ALTER TABLE candidate_quality ADD COLUMN isbn_verified INTEGER NOT NULL DEFAULT 0
             CHECK(isbn_verified IN (0, 1));
@@ -1114,7 +1121,7 @@ MIGRATIONS = [
               )
         );
 
-        CREATE TEMP TABLE _migration_26_requeue AS
+        CREATE TEMP TABLE _migration_27_requeue AS
         SELECT c.id AS candidate_id
         FROM candidates c
         JOIN candidate_quality q ON q.candidate_id = c.id
@@ -1133,7 +1140,7 @@ MIGRATIONS = [
 
         UPDATE candidates
         SET status = 'new', updated_at = CURRENT_TIMESTAMP
-        WHERE id IN (SELECT candidate_id FROM _migration_26_requeue);
+        WHERE id IN (SELECT candidate_id FROM _migration_27_requeue);
 
         UPDATE candidate_quality
         SET quality_status = 'pending',
@@ -1142,9 +1149,9 @@ MIGRATIONS = [
             isbn10 = '',
             isbn_verified = 0,
             updated_at = CURRENT_TIMESTAMP
-        WHERE candidate_id IN (SELECT candidate_id FROM _migration_26_requeue);
+        WHERE candidate_id IN (SELECT candidate_id FROM _migration_27_requeue);
 
-        DROP TABLE _migration_26_requeue;
+        DROP TABLE _migration_27_requeue;
         """,
     ),
 ]

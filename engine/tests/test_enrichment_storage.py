@@ -983,14 +983,14 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
 
 
-def test_migration_26_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
-    settings.db = str(tmp_path / "legacy-v25.db")
+def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+    settings.db = str(tmp_path / "legacy-v26.db")
     con = sqlite3.connect(settings.db)
     con.execute(
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     for version, script in MIGRATIONS:
-        if version >= 26:
+        if version >= 27:
             break
         con.executescript(script)
         con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -1072,7 +1072,7 @@ def test_migration_26_decouples_work_ids_verifies_source_isbns_and_requeues_only
 
     initialize(seed_demo=False)
 
-    assert row("SELECT version FROM schema_migrations WHERE version=26") == {"version": 26}
+    assert row("SELECT version FROM schema_migrations WHERE version=27") == {"version": 27}
     assert row(
         "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
         (ol_verified,),
