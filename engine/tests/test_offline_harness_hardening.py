@@ -26,7 +26,7 @@ import evaluate_ranking as ranking_eval
 import evaluate_ranking_experiments as ranking_experiments
 import evaluate_ranking_synergy as synergy
 from afterword_engine.embeddings import content_hash
-from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import read_metadata_identity_hash
 from afterword_engine.ranking import rank_candidates
 from afterword_engine.scoring import document
 
@@ -87,7 +87,7 @@ def test_sqlite_loader_matches_enriched_json_export_and_preserves_verified_metad
             "identity_provider_id": "/works/OL100W",
             "identity_evidence": "{}",
             "metadata_provenance": "{}",
-            "identity_hash": _read_metadata_identity_hash(reads[0]),
+            "identity_hash": read_metadata_identity_hash(reads[0]),
             "description": "An expansive galactic chronicle of psychohistory and empire.",
             "description_kind": "synopsis",
             "genres": '["Science Fiction", "Space Opera"]',
@@ -465,7 +465,7 @@ def test_prepare_excludes_subtitle_alias_suffix_isbn_and_work_id_duplicates_and_
                 "verified_work_id": "/works/OL424242W",
                 "identity_provider": "openlibrary",
                 "identity_provider_id": "/works/OL424242W",
-                "identity_hash": _read_metadata_identity_hash(item),
+                "identity_hash": read_metadata_identity_hash(item),
                 "description": "",
                 "genres": "[]",
             })

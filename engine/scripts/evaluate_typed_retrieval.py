@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import base64
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 import hashlib
@@ -20,7 +21,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx

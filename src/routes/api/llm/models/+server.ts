@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engine, engineStatus } from "#lib/server/engine.js";
 
@@ -20,8 +19,8 @@ const errorMessage = (error: unknown) =>
 export const GET: RequestHandler = async () => {
   try {
     const catalog = await engine<LlmCatalogResponse>("/api/llm/models");
-    return json(catalog);
+    return Response.json(catalog);
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };
