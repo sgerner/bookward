@@ -18,6 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from operator import itemgetter
 from pathlib import Path
 from typing import Any
 
@@ -185,19 +186,47 @@ def ips_auc(
     """Compute pairwise IPS AUC with confidence-adjusted propensity weights."""
 
     usable = _weighted_rows(rows, score_key=score_key)
-    positives = [(score, weight) for _, score, label, weight in usable if label > positive_threshold]
-    negatives = [(score, weight) for _, score, label, weight in usable if label < positive_threshold]
-    denominator = sum(left_weight * right_weight for _, left_weight in positives for _, right_weight in negatives)
-    if not positives or not negatives or denominator <= 0:
+    scored: list[tuple[float, bool, float]] = []
+    total_pos_weight = 0.0
+    total_neg_weight = 0.0
+    has_positive = False
+    has_negative = False
+    for _, score, label, weight in usable:
+        if label > positive_threshold:
+            has_positive = True
+            total_pos_weight += weight
+            scored.append((0.0 if score == 0.0 else score, True, weight))
+        elif label < positive_threshold:
+            has_negative = True
+            total_neg_weight += weight
+            scored.append((0.0 if score == 0.0 else score, False, weight))
+    denominator = total_pos_weight * total_neg_weight
+    if not has_positive or not has_negative or denominator <= 0:
         return None
+    scored.sort(key=itemgetter(0))
     numerator = 0.0
-    for positive, positive_weight in positives:
-        for negative, negative_weight in negatives:
-            pair_weight = positive_weight * negative_weight
-            if positive > negative:
-                numerator += pair_weight
-            elif positive == negative:
-                numerator += pair_weight * 0.5
+    cumulative_lower_neg_weight = 0.0
+    current_score = scored[0][0]
+    pos_group_weight = 0.0
+    neg_group_weight = 0.0
+    for score, is_positive, weight in scored:
+        if score != current_score:
+            numerator += (
+                pos_group_weight * cumulative_lower_neg_weight
+                + 0.5 * pos_group_weight * neg_group_weight
+            )
+            cumulative_lower_neg_weight += neg_group_weight
+            current_score = score
+            pos_group_weight = 0.0
+            neg_group_weight = 0.0
+        if is_positive:
+            pos_group_weight += weight
+        else:
+            neg_group_weight += weight
+    numerator += (
+        pos_group_weight * cumulative_lower_neg_weight
+        + 0.5 * pos_group_weight * neg_group_weight
+    )
     return numerator / denominator
 
 

@@ -44,8 +44,7 @@ from afterword_engine.ranking import (
     _top_weighted,
 )
 from afterword_engine.covers import METADATA_GENRE_LIMIT
-from afterword_engine.identity import book_identity
-from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import book_identity, read_metadata_identity_hash
 from afterword_engine.subjects import normalize_subjects
 from evaluate_next_five import development_folds as frozen_development_folds
 from evaluate_ranking import load_corpus, prepare
@@ -812,7 +811,7 @@ def _verified_field_provenance(
     if int(original.get("read_id", -1)) != read_id or int(supplemented.get("read_id", -1)) != read_id:
         return None
     try:
-        if str(original.get("identity_hash") or "") != _read_metadata_identity_hash(read):
+        if str(original.get("identity_hash") or "") != read_metadata_identity_hash(read):
             return None
     except (KeyError, TypeError, ValueError):
         return None
