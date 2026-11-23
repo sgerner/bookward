@@ -181,9 +181,10 @@ export const load: PageServerLoad = async ({ url, request, locals }) => {
   try {
     overview = await overviewRequest;
   } catch (cause) {
-    throw httpError(503, {
-      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    });
+    throw httpError(
+      503,
+      `Bookward's recommendation engine is unavailable. ${message(cause)}`,
+    );
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
