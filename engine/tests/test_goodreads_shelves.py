@@ -168,3 +168,98 @@ def test_import_goodreads_csv_populates_and_clears_shelf_items(tmp_path: Path, m
         ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
         ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
     ]
+
+
+def test_goodreads_imports_delete_matching_items_from_both_shelves_using_title_author_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine import ingestion
+    from afterword_engine.ingestion import import_goodreads_csv, import_goodreads_rss
+
+    db_path = tmp_path / "shelf_delete_index.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    con = sqlite3.connect(db_path)
+    try:
+        plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("Project Hail Mary", "Andy Weir"),
+            ).fetchall()
+        ]
+        shelf_plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+                ("to-read",),
+            ).fetchall()
+        ]
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn) VALUES(?, ?, ?, ?)",
+            [
+                ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("currently-reading", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("to-read", "project hail mary", "Andy Weir", None),
+                ("to-read", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("to-read", "Dune", "Frank Herbert", "9780441172719"),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author" in detail
+        for detail in plan_details
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf" in detail
+        for detail in shelf_plan_details
+    )
+
+    csv_promotion = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,5,2026/03/10,2026/01/10,read,=\"9780593135204\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_promotion) == 1
+
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Piranesi</title>
+        <author_name>Susanna Clarke</author_name>
+        <user_rating>5</user_rating>
+        <user_read_at>2026/03/15</user_read_at>
+        <isbn13>9781635575637</isbn13>
+      </item>
+    </channel></rss>"""
+
+    async def fake_fetch_bytes(url: str, **kwargs):
+        return rss_xml, "application/rss+xml"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+    assert (
+        asyncio.run(
+            import_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+        )
+        == 1
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY title, shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    # Exact BINARY collation preserves differently cased non-matching shelf rows
+    # while deleting both to-read and currently-reading rows for promoted books.
+    assert remaining == [
+        ("to-read", "Dune", "Frank Herbert"),
+        ("to-read", "project hail mary", "Andy Weir"),
+    ]
+
