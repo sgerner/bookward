@@ -330,7 +330,8 @@ def ips_auc(
     by_score: dict[float, dict[float, float]] = defaultdict(lambda: defaultdict(float))
     for _row, score, label, weight in usable:
         if weight > 0:
-            by_score[score][label] += weight
+            normalized_score = 0.0 if score == 0.0 else score
+            by_score[normalized_score][label] += weight
     if not by_score:
         return None
     numerator = 0.0
