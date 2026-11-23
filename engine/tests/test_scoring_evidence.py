@@ -14,8 +14,11 @@ from afterword_engine.decision_evidence import (
     purge_recommendation_evidence,
 )
 from afterword_engine.embeddings import content_hash, vector_blob
-from afterword_engine.ingestion import _read_metadata_identity_hash
-from afterword_engine.identity import book_identity_match_index, book_row_identity_match_keys
+from afterword_engine.identity import (
+    book_identity_match_index,
+    book_row_identity_match_keys,
+    read_metadata_identity_hash,
+)
 from afterword_engine.ranking import rank_candidates
 from afterword_engine.scoring import SCORING_BATCH_SIZE, document, score_all
 from afterword_engine.scoring_evidence import (
@@ -281,7 +284,7 @@ def test_score_all_filters_only_current_verified_metadata_work_aliases_and_archi
             identity_hash = (
                 "stale-identity-hash"
                 if key == "stale"
-                else _read_metadata_identity_hash(read)
+                else read_metadata_identity_hash(read)
             )
             con.execute(
                 "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
@@ -356,7 +359,7 @@ def test_score_all_filters_only_current_verified_metadata_work_aliases_and_archi
         assert fresh_identity["read_metadata_identity_provider"] == "openlibrary"
         assert fresh_identity["quality_work_id"] == work_ids["fresh"]
         assert fresh_identity["quality_provider"] == "openlibrary"
-        assert fresh_identity["read_metadata_identity_hash"] == _read_metadata_identity_hash(
+        assert fresh_identity["read_metadata_identity_hash"] == read_metadata_identity_hash(
             dict(con.execute("SELECT * FROM reads WHERE id=?", (read_ids["fresh"],)).fetchone())
         )
         assert book_row_identity_match_keys(

@@ -32,6 +32,7 @@ from .identity import (
     book_identity_match_keys,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
+    read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .security import resolve_public_target
@@ -1049,22 +1050,6 @@ async def refresh_read_work_identities(
     }
 
 
-def _read_metadata_identity_hash(read):
-    """Fingerprint the read's bibliographic identity and verified work key."""
-
-    isbn13, isbn10 = isbn_parts(read.get("isbn"))
-    identity = {
-        "title": normalize_key(read.get("title", ""), ""),
-        "author": normalize_key("", read.get("author", "")),
-        "source_isbn": re.sub(r"[^0-9xX]", "", str(read.get("isbn") or "")).upper(),
-        "isbn13": isbn13,
-        "isbn10": isbn10,
-        "openlibrary_work_id": book_openlibrary_work_id(read),
-    }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def read_identity_rows_with_current_verified_work_ids(reads, metadata_rows):
     """Project fresh, provider-consistent verified work IDs onto read rows.
 
@@ -1093,7 +1078,7 @@ def read_identity_rows_with_current_verified_work_ids(reads, metadata_rows):
             projected.append(item)
             continue
 
-        if str(metadata.get("identity_hash") or "") != _read_metadata_identity_hash(item):
+        if str(metadata.get("identity_hash") or "") != read_metadata_identity_hash(item):
             projected.append(item)
             continue
         if str(metadata.get("identity_provider") or "").strip().casefold() != "openlibrary":
@@ -1167,7 +1152,7 @@ def _read_metadata_attempt_is_due(read, retry_before):
         {"openlibrary_work_id": read.get("cached_work_id") or ""}
     )
     if (
-        str(read.get("cached_identity_hash") or "") != _read_metadata_identity_hash(read)
+        str(read.get("cached_identity_hash") or "") != read_metadata_identity_hash(read)
         or (current_work_id and cached_work_id and cached_work_id != current_work_id)
     ):
         return True
@@ -1633,7 +1618,7 @@ async def refresh_read_metadata(
                 )
                 metadata, identity_evidence, verified_work_id = {}, {}, ""
 
-            identity_hash = _read_metadata_identity_hash(read)
+            identity_hash = read_metadata_identity_hash(read)
             identity_provider = str(identity_evidence.get("provider") or "")
             identity_provider_id = str(identity_evidence.get("provider_id") or "")
             if identity_evidence or attempt_error_type:
@@ -1661,7 +1646,7 @@ async def refresh_read_metadata(
 
             with transaction() as con:
                 current = con.execute("SELECT * FROM reads WHERE id=?", (read["id"],)).fetchone()
-                if current is None or _read_metadata_identity_hash(dict(current)) != identity_hash:
+                if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
                     # A title, author, or ISBN edit landed while fetching.
                     continue
                 if book_openlibrary_work_id(dict(current)) != work_id:
