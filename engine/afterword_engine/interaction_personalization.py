@@ -187,16 +187,30 @@ def _parse_datetime(value: object) -> datetime | None:
     return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 
-def _event_order(event: dict[str, Any]):
-    occurred = _parse_datetime(event.get("occurred_at"))
-    # Stable event ids break timestamp ties. Missing timestamps sort before
-    # dated events, allowing a later known action to supersede them.
-    timestamp = occurred.timestamp() if occurred else float("-inf")
+_ELIGIBLE_EVENT_TYPES = frozenset(
+    {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}
+)
+_UNSET = object()
+
+
+def _event_order(
+    event: dict[str, Any],
+    input_index: int = 0,
+    *,
+    occurred: datetime | None | object = _UNSET,
+) -> tuple[float, int, int]:
+    if not isinstance(event, dict):
+        event = dict(event)
+    if occurred is _UNSET:
+        occurred = _parse_datetime(event.get("occurred_at"))
+    # Stable event ids and input order break timestamp ties. Missing timestamps
+    # sort before dated events, allowing a later known action to supersede them.
+    timestamp = occurred.timestamp() if isinstance(occurred, datetime) else float("-inf")
     try:
         event_id = int(event.get("id") or 0)
     except (TypeError, ValueError):
         event_id = 0
-    return timestamp, event_id
+    return timestamp, event_id, input_index
 
 
 def _event_label(event: dict[str, Any]) -> tuple[float | None, float]:
@@ -284,42 +298,59 @@ def _latest_observations(
     now: datetime,
     interaction_vectors: dict[int, np.ndarray] | None = None,
 ) -> list[dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    ordered = sorted((dict(item) for item in events), key=_event_order)
-    for event in ordered:
+    deduped: dict[str, list[Any]] = {}
+    for input_index, raw_event in enumerate(events):
+        event = dict(raw_event)
         event_type = str(event.get("event_type") or "").casefold()
-        if event_type not in {"save", "reject", "maybe_later", "restore", "read", "librarr_import"}:
+        if event_type not in _ELIGIBLE_EVENT_TYPES:
             continue
         identity = book_identity(event.get("title", ""), event.get("author", ""))
         if identity == "\x1f":
             continue
-        label, reliability = _event_label(event)
         occurred = _parse_datetime(event.get("occurred_at"))
+        order_key = _event_order(event, input_index, occurred=occurred)
+        existing = deduped.get(identity)
+        if existing is None:
+            deduped[identity] = [order_key, order_key, identity, event, occurred]
+        else:
+            if order_key < existing[0]:
+                existing[0] = order_key
+            if order_key > existing[1]:
+                existing[1] = order_key
+                existing[3] = event
+                existing[4] = occurred
+
+    vectors = interaction_vectors or {}
+    observations: list[dict[str, Any]] = []
+    for _first_key, _winner_key, identity, event, occurred in sorted(
+        deduped.values(), key=lambda entry: entry[0]
+    ):
+        label, reliability = _event_label(event)
+        if label is None:
+            continue
+        age_days = max(0.0, (now - occurred).total_seconds() / 86_400) if occurred else 0.0
+        weight = reliability * (0.5 ** (age_days / DECAY_HALF_LIFE_DAYS))
+        if weight < 0.05:
+            continue
+        features = _book_features(event)
+        if not features:
+            continue
         try:
             candidate_id = int(event.get("candidate_id"))
         except (TypeError, ValueError):
             candidate_id = 0
-        latest[identity] = {
-            "identity": identity,
-            "candidate_id": candidate_id,
-            "label": label,
-            "reliability": reliability,
-            "occurred_at": occurred,
-            "features": _book_features(event),
-            "vector": (interaction_vectors or {}).get(candidate_id),
-        }
-
-    observations = []
-    for item in latest.values():
-        if item["label"] is None or not item["features"]:
-            continue
-        occurred = item["occurred_at"]
-        age_days = max(0.0, (now - occurred).total_seconds() / 86_400) if occurred else 0.0
-        weight = item["reliability"] * (0.5 ** (age_days / DECAY_HALF_LIFE_DAYS))
-        if weight < 0.05:
-            continue
-        item["weight"] = weight
-        observations.append(item)
+        observations.append(
+            {
+                "identity": identity,
+                "candidate_id": candidate_id,
+                "label": label,
+                "reliability": reliability,
+                "occurred_at": occurred,
+                "features": features,
+                "vector": vectors.get(candidate_id),
+                "weight": weight,
+            }
+        )
     return observations
 
 
