@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         CREATE TABLE IF NOT EXISTS candidate_sources (
             candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
             source_id INTEGER NOT NULL REFERENCES sources(id),
@@ -1591,7 +1598,7 @@ def initialize(*, seed_demo: bool = True):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
         recompute_candidate_sources(con)
-        if 26 in applied_now or con.execute(
+        if 27 in applied_now or con.execute(
             "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
             "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
         ).fetchone():

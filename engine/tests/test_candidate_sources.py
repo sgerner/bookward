@@ -57,7 +57,7 @@ def database(tmp_path: Path):
 def test_migration_backfills_candidate_sources_cascades_delete_and_recovers_duplicates(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "upgrade-v25.db"
+    db_path = tmp_path / "upgrade-v26.db"
     settings.db = str(db_path)
 
     with sqlite3.connect(db_path) as con:
@@ -68,7 +68,7 @@ def test_migration_backfills_candidate_sources_cascades_delete_and_recovers_dupl
             "applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 26:
+            if version >= 27:
                 break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -180,7 +180,7 @@ def test_migration_backfills_candidate_sources_cascades_delete_and_recovers_dupl
 
     initialize(seed_demo=False)
 
-    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {26}
+    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {27}
     winner_membership = row(
         "SELECT * FROM candidate_sources WHERE candidate_id=? AND source_id=?",
         (disabled_winner, disabled_sid),

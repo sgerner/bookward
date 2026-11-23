@@ -9,11 +9,12 @@ the evidence improves ranking quality.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 import time
-from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
 
