@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engine } from "#lib/server/engine.js";
 
@@ -21,5 +20,5 @@ export const POST: RequestHandler = async ({ request }) => {
     // Telemetry is deliberately best effort. A reader should never see a
     // recommendation action fail because the optional event path is down.
   }
-  return json({ accepted: true }, { status: 202 });
+  return Response.json({ accepted: true }, { status: 202 });
 };
