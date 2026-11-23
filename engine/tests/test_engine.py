@@ -136,6 +136,39 @@ def test_database_indexes_cover_recent_history_and_job_queue(database):
     assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
 
 
+def test_database_indexes_cover_goodreads_shelf_deletes(database):
+    indexes = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
+            ("idx_goodreads_shelf_items_shelf", "idx_goodreads_shelf_items_title_author"),
+        )
+    }
+
+    assert indexes == {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    delete_by_book_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("Project Hail Mary", "Andy Weir"),
+    )
+    delete_by_shelf_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+        ("to-read",),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in delete_by_book_plan
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf"
+        in item["detail"]
+        for item in delete_by_shelf_plan
+    )
+
+
 def test_startup_quality_audit_ignores_rejected_legacy_candidates(database):
     candidate_id = row("SELECT id FROM candidates ORDER BY id LIMIT 1")["id"]
     with transaction() as con:
@@ -2341,6 +2374,99 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
     initialize()
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
+
+
+def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(tmp_path, monkeypatch):
+    settings.db = str(tmp_path / "v25.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version > 25:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 26))
+        assert (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_goodreads_shelf_items_title_author'"
+            ).fetchone()
+            is None
+        )
+        pre_upgrade_plan = [
+            item[3]
+            for item in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("CSV Promoted", "Author One"),
+            )
+        ]
+        assert any("SCAN goodreads_shelf_items" in detail for detail in pre_upgrade_plan)
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) VALUES(?, ?, ?)",
+            [
+                ("to-read", "CSV Promoted", "Author One"),
+                ("currently-reading", "CSV Promoted", "Author One"),
+                ("to-read", "RSS Promoted", "Author Two"),
+                ("currently-reading", "RSS Promoted", "Author Two"),
+                ("to-read", "Still Queued", "Author Three"),
+            ],
+        )
+
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+    assert row("SELECT 1 FROM schema_migrations WHERE version=26") is not None
+    post_upgrade_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("CSV Promoted", "Author One"),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in post_upgrade_plan
+    )
+
+    # Rerunning initialize() remains idempotent with IF NOT EXISTS.
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+
+    csv_count = import_goodreads_csv(
+        b"Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        b"CSV Promoted,Author One,5,2026/03/01,2026/02/01,read,=\"9780593135204\"\n"
+    )
+    assert csv_count == 1
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM goodreads_shelf_items WHERE title=? AND author=?",
+            ("CSV Promoted", "Author One"),
+        )["count"]
+        == 0
+    )
+
+    async def fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [
+            {
+                "title": "RSS Promoted",
+                "author_name": "Author Two",
+                "user_rating": "4",
+                "user_read_at": "2026/03/02",
+                "isbn13": "9781635575637",
+            }
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+    rss_count = asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    )
+    assert rss_count == 1
+    remaining = rows("SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf, title")
+    assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
 
 
 def test_initialize_removes_retired_llm_data_from_v11_database(tmp_path):
