@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from afterword_engine.config import settings
 from afterword_engine.database import initialize
-from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import read_metadata_identity_hash
 from scripts.evaluate_organic_reads import evaluate_organic_reads
 
 
@@ -361,7 +361,7 @@ def test_pool_filters_ineligible_or_post_read_candidates_and_matches_audited_key
         con.execute(
             "INSERT INTO read_metadata(read_id, verified_work_id, identity_provider, identity_provider_id, identity_hash) "
             "VALUES(6, '/works/OL424242W', 'openlibrary', '/works/OL424242W', ?)",
-            (_read_metadata_identity_hash(read_6),),
+            (read_metadata_identity_hash(read_6),),
         )
         con.execute(
             "INSERT INTO reads(id, title, author, rating, read_at, source, openlibrary_work_id) "
