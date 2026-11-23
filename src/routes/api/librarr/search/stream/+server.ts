@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { engineStatus, engineStream } from '#lib/server/engine.js';
 
@@ -8,7 +7,7 @@ export const GET: RequestHandler = async ({ url, request }) => {
   const query = url.searchParams.get('q')?.trim() ?? '';
   const mediaType = url.searchParams.get('media_type') ?? 'audiobook';
   if (query.length < 2 || query.length > 200 || !['ebook', 'audiobook'].includes(mediaType)) {
-    return json({ message: 'Enter at least two characters and choose a valid media type.' }, { status: 400 });
+    return Response.json({ message: 'Enter at least two characters and choose a valid media type.' }, { status: 400 });
   }
   const params = new URLSearchParams({ q: query, media_type: mediaType });
   try {
@@ -24,6 +23,6 @@ export const GET: RequestHandler = async ({ url, request }) => {
       }
     });
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error, 501) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error, 501) });
   }
 };
