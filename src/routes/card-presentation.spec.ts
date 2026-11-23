@@ -27,14 +27,15 @@ import Page from "./+page.svelte";
 function sampleBook(overrides: Record<string, unknown> = {}) {
   return {
     id: 101,
+    recommendation_run_id: "run-abc",
     title: "The Left Hand of Darkness",
     author: "Ursula K. Le Guin",
     synopsis:
       "A lone human emissary is sent to Winter, an icy world whose inhabitants have no fixed gender, where political intrigue and a perilous trek across an ice sheet reshape diplomacy and friendship forever.",
     cover_url: "",
     source_url: "https://books.example/left-hand",
-    release_date: "1969-03-01",
-    date_kind: "published",
+    published_on: "1969-03-01",
+    published_kind: "published",
     genres: ["Science fiction", "Speculative"],
     score: 81.24,
     metadata_confidence: 0.95,
@@ -46,7 +47,6 @@ function sampleBook(overrides: Record<string, unknown> = {}) {
     ],
     reason: 'Similar to "The Dispossessed" (5★)',
     status: "recommended",
-    source: "Curated Sci-Fi",
     ...overrides,
   };
 }

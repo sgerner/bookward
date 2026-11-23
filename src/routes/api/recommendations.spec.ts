@@ -27,6 +27,24 @@ import { GET } from "./recommendations/+server";
 
 afterEach(() => vi.clearAllMocks());
 
+const PAGE_BOOK_KEYS = [
+  "author",
+  "cover_url",
+  "explanation",
+  "genres",
+  "id",
+  "metadata_confidence",
+  "published_kind",
+  "published_on",
+  "reason",
+  "recommendation_run_id",
+  "score",
+  "source_url",
+  "status",
+  "synopsis",
+  "title",
+];
+
 describe("recommendations endpoint", () => {
   it("loads the requested page without a device cookie and maps the response for the browser", async () => {
     engineMock.mockResolvedValue([
@@ -37,13 +55,24 @@ describe("recommendations endpoint", () => {
         description: "A description",
         cover_url: "https://covers.example/book.jpg",
         source_url: "https://books.example/book",
+        source_id: 3,
         release_date: "2026-10-01",
         date_kind: "day",
         genres: ["Fantasy"],
         score: 91,
         explanation: ["A good match"],
         status: "recommended",
+        normalized_key: "a-book::a-writer",
+        created_at: "2026-09-01 00:00:00",
+        updated_at: "2026-09-02 00:00:00",
+        isbn13: "9780000000007",
+        isbn10: "0000000007",
+        score_batch_id: "batch-7",
         source_name: "A source",
+        quality_work_id: "/works/OL7W",
+        quality_provider: "openlibrary",
+        quality_isbn13: "9780000000007",
+        quality_isbn10: "0000000007",
       },
     ]);
 
@@ -52,22 +81,81 @@ describe("recommendations endpoint", () => {
         "http://bookward.test/api/recommendations?status=recommended&limit=2&offset=4",
       ),
     } as never);
+    const payload = await response.json();
 
     expect(response.status).toBe(200);
     expect(engineMock).toHaveBeenCalledWith(
       "/api/recommendations?status=recommended&limit=3&offset=4",
     );
-    expect(await response.json()).toEqual({
+    expect(Object.keys(payload.items[0]).sort()).toEqual(PAGE_BOOK_KEYS);
+    expect(payload).toEqual({
       items: [
-        expect.objectContaining({
+        {
           id: 7,
+          recommendation_run_id: "",
+          title: "A Book",
+          author: "A Writer",
           cover_url: "https://covers.example/book.jpg",
           source_url: "https://books.example/book",
-          reason: "A good match",
           published_on: "2026-10-01",
-        }),
+          published_kind: "day",
+          genres: ["Fantasy"],
+          score: 91,
+          metadata_confidence: null,
+          synopsis: "A description",
+          explanation: ["A good match"],
+          reason: "A good match",
+          status: "recommended",
+        },
       ],
       has_more: false,
+    });
+  });
+
+  it("sanitizes non-HTTP URLs and joins multiple explanation items", async () => {
+    engineMock.mockResolvedValue([
+      {
+        id: 11,
+        recommendation_run_id: "run-abcd1234",
+        title: "Unsafe Link Book",
+        author: "A Writer",
+        description: "Summary text",
+        cover_url: "javascript:alert(1)",
+        source_url: "ftp://files.example/book",
+        release_date: null,
+        date_kind: "unknown",
+        genres: ["Mystery"],
+        score: 77,
+        metadata_confidence: 0.52,
+        explanation: ["Similar to a 5-star read", "Trusted source"],
+        status: "recommended",
+        source_name: "A source",
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL("http://bookward.test/api/recommendations?status=recommended&limit=1"),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(Object.keys(payload.items[0]).sort()).toEqual(PAGE_BOOK_KEYS);
+    expect(payload.items[0]).toEqual({
+      id: 11,
+      recommendation_run_id: "run-abcd1234",
+      title: "Unsafe Link Book",
+      author: "A Writer",
+      cover_url: "",
+      source_url: "",
+      published_on: null,
+      published_kind: "unknown",
+      genres: ["Mystery"],
+      score: 77,
+      metadata_confidence: 0.52,
+      synopsis: "Summary text",
+      explanation: ["Similar to a 5-star read", "Trusted source"],
+      reason: "Similar to a 5-star read · Trusted source",
+      status: "recommended",
     });
   });
 

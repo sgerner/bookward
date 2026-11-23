@@ -14,7 +14,7 @@ ENGINE = Path(__file__).parents[1]
 sys.path.insert(0, str(ENGINE / "scripts"))
 import evaluate_embedding_representations as study
 from evaluate_ordinal_interests import history_components
-from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import read_metadata_identity_hash
 from afterword_engine.covers import METADATA_GENRE_LIMIT
 from afterword_engine.subjects import normalize_subjects
 
@@ -35,7 +35,7 @@ def test_identity_only_view_is_labeled_as_cache_reference_and_uses_title_author_
     verified = {
         "read_id": 1,
         "verified_work_id": "works:/verified",
-        "identity_hash": _read_metadata_identity_hash(reads[0]),
+        "identity_hash": read_metadata_identity_hash(reads[0]),
         "description": "An adventure among hidden islands.",
         "genres": '["Adventure", "Fantasy"]',
         "description_kind": "synopsis",
@@ -86,7 +86,7 @@ def test_strict_provenance_requires_synopsis_and_hashes_all_production_genres():
             "verified_work_id": work_id,
             "identity_provider": "openlibrary",
             "identity_provider_id": work_id,
-            "identity_hash": _read_metadata_identity_hash(item),
+            "identity_hash": read_metadata_identity_hash(item),
             "description": description,
             "description_kind": description_kind,
             "genres": json.dumps(row_genres, ensure_ascii=False, separators=(",", ":")),
@@ -185,7 +185,7 @@ def test_metadata_coverage_union_includes_subject_only_and_description_only_rows
         metadata.append({
             "read_id": item["id"],
             "verified_work_id": f"works:/{item['id']}",
-            "identity_hash": _read_metadata_identity_hash(item),
+            "identity_hash": read_metadata_identity_hash(item),
             "description": description,
             "genres": genres,
             "description_kind": "synopsis",
