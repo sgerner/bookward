@@ -26,7 +26,6 @@ sys.path.insert(0, str(SCRIPTS))
 
 import evaluate_metric_facets as grounded
 import evaluate_next_five_combinations as metrics
-from afterword_engine.ingestion import _read_metadata_identity_hash
 from afterword_engine.subjects import normalize_subjects
 
 
