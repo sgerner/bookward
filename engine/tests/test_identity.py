@@ -1,18 +1,23 @@
 import asyncio
+import hashlib
+import json
+import sqlite3
 
 import pytest
 
+from afterword_engine import database as db_module
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, transaction
 from afterword_engine.digest import _candidate_rows
-from afterword_engine.ingestion import _read_metadata_identity_hash
 from afterword_engine.identity import (
+    ReadIdentityIndex,
     book_catalog_title_identity_key,
     book_identity,
     book_identity_match_index,
     book_identity_matches,
-    ReadIdentityIndex,
     book_row_identity_match_keys,
+    normalize_key,
+    read_metadata_identity_hash,
 )
 from afterword_engine.main import recommendation_list
 from afterword_engine.scoring import score_all
@@ -214,7 +219,7 @@ def test_recommendation_filter_uses_only_current_provider_consistent_read_work_i
             identity_hash = (
                 "stale-identity-hash"
                 if key == "stale"
-                else _read_metadata_identity_hash(read)
+                else read_metadata_identity_hash(read)
             )
             con.execute(
                 "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
@@ -259,7 +264,7 @@ def test_read_metadata_alias_does_not_replace_a_conflicting_raw_work_id(database
                 metadata_work_id,
                 "openlibrary",
                 metadata_work_id,
-                _read_metadata_identity_hash(read),
+                read_metadata_identity_hash(read),
             ),
         )
 
@@ -549,6 +554,71 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
         status = con.execute("SELECT status FROM candidates WHERE id=?", (alias_cid,)).fetchone()["status"]
     assert deduped >= 1
     assert status == "rejected"
+
+
+def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():
+    assert db_module.normalize_key is normalize_key
+
+    empty_payload = {
+        "title": "",
+        "author": "",
+        "source_isbn": "",
+        "isbn13": "",
+        "isbn10": "",
+        "openlibrary_work_id": "",
+    }
+    expected_empty_digest = hashlib.sha256(
+        json.dumps(empty_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    try:
+        null_row = con.execute(
+            "SELECT NULL AS title, NULL AS author, NULL AS isbn, NULL AS openlibrary_work_id"
+        ).fetchone()
+        populated_row = con.execute(
+            "SELECT ? AS title, ? AS author, ? AS isbn, ? AS openlibrary_work_id",
+            (
+                "Unreasonable Hospitality",
+                "Will Guidara",
+                "0-593-41857-3",
+                "https://openlibrary.org/works/OL123456W",
+            ),
+        ).fetchone()
+
+        assert read_metadata_identity_hash(None) == expected_empty_digest
+        assert read_metadata_identity_hash({}) == expected_empty_digest
+        assert (
+            read_metadata_identity_hash(
+                {
+                    "title": None,
+                    "author": None,
+                    "isbn": None,
+                    "openlibrary_work_id": None,
+                }
+            )
+            == expected_empty_digest
+        )
+        assert read_metadata_identity_hash(null_row) == expected_empty_digest
+        assert read_metadata_identity_hash({"title": "none", "author": ""}) != expected_empty_digest
+        assert read_metadata_identity_hash({"title": "", "author": "none"}) != expected_empty_digest
+
+        expected_populated_payload = {
+            "title": "unreasonable hospitality",
+            "author": "will guidara",
+            "source_isbn": "0593418573",
+            "isbn13": "9780593418574",
+            "isbn10": "0593418573",
+            "openlibrary_work_id": "/works/OL123456W",
+        }
+        expected_populated_digest = hashlib.sha256(
+            json.dumps(expected_populated_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        assert read_metadata_identity_hash(populated_row) == expected_populated_digest
+        assert read_metadata_identity_hash(dict(populated_row)) == expected_populated_digest
+    finally:
+        con.close()
 
 
 def test_read_identity_index_matches_coauthors_subtitles_and_series_variants():

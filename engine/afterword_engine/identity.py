@@ -1,5 +1,7 @@
 """Conservative identities used to keep read books out of recommendations."""
 
+import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -126,6 +128,10 @@ def _row_value(item, key: str, default=""):
         return item[key]
     except (IndexError, KeyError, TypeError):
         return default
+
+
+def normalize_key(title: str, author: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", f"{title} {author}".lower()).strip()
 
 
 def _without_leading_article(text: str) -> str:
@@ -448,6 +454,23 @@ def book_openlibrary_work_id(item) -> str:
         if kind == "work" and provider == "openlibrary":
             return f"/works/{identifier}"
     return ""
+
+
+def read_metadata_identity_hash(read) -> str:
+    """Fingerprint the read's bibliographic identity and verified work key."""
+
+    isbn = _row_value(read, "isbn")
+    isbn13, isbn10 = isbn_parts(isbn)
+    identity = {
+        "title": normalize_key(str(_row_value(read, "title") or ""), ""),
+        "author": normalize_key("", str(_row_value(read, "author") or "")),
+        "source_isbn": re.sub(r"[^0-9xX]", "", str(isbn or "")).upper(),
+        "isbn13": isbn13,
+        "isbn10": isbn10,
+        "openlibrary_work_id": book_openlibrary_work_id(read),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _is_unknown_author_row(item) -> bool:

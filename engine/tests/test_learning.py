@@ -956,7 +956,7 @@ def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
 
 
 def test_read_attribution_matches_subtitles_coauthors_isbns_and_verified_work_ids(database):
-    from afterword_engine.ingestion import _read_metadata_identity_hash
+    from afterword_engine.identity import read_metadata_identity_hash
 
     with transaction() as con:
         source_id = con.execute(
@@ -1039,7 +1039,7 @@ def test_read_attribution_matches_subtitles_coauthors_isbns_and_verified_work_id
                 "/works/OL777W",
                 "openlibrary",
                 "/works/OL777W",
-                _read_metadata_identity_hash(work_read),
+                read_metadata_identity_hash(work_read),
             ),
         )
         con.execute(

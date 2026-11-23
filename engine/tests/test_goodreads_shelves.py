@@ -267,7 +267,8 @@ def test_goodreads_imports_delete_matching_items_from_both_shelves_using_title_a
 def test_import_goodreads_csv_stores_and_updates_additional_authors_preserving_metadata(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from afterword_engine.ingestion import _read_metadata_identity_hash, import_goodreads_csv
+    from afterword_engine.identity import read_metadata_identity_hash
+    from afterword_engine.ingestion import import_goodreads_csv
     from afterword_engine.scoring import score_all
 
     db_path = tmp_path / "csv_coauthors.db"
@@ -297,7 +298,7 @@ def test_import_goodreads_csv_stores_and_updates_additional_authors_preserving_m
                 "/works/OL262458W",
                 "openlibrary",
                 "/works/OL262458W",
-                _read_metadata_identity_hash(read_row),
+                read_metadata_identity_hash(read_row),
                 "Cached synopsis that must survive additional_authors updates.",
             ),
         )
