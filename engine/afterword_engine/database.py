@@ -988,6 +988,13 @@ MIGRATIONS = [
     (
         26,
         """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
+    (
+        27,
+        """
         CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_visible
             ON recommendation_impressions(candidate_id, visible_at)
             WHERE visible_at IS NOT NULL;
