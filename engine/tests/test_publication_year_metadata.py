@@ -8,6 +8,7 @@ import pytest
 
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, normalize_key, transaction
+from afterword_engine.identity import read_metadata_identity_hash
 from afterword_engine.publication_year_metadata import attach_publication_years
 
 
@@ -86,15 +87,7 @@ def _insert_read(con, title, work_id, *, read_at="2024-01-01", release_date="198
             }
         }
     }
-    identity = {
-        "title": normalize_key(title, ""),
-        "author": normalize_key("", "A Reader"),
-        "source_isbn": "",
-        "isbn13": "",
-        "isbn10": "",
-        "openlibrary_work_id": work_id,
-    }
-    identity_hash = _hash(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+    identity_hash = read_metadata_identity_hash(read)
     con.execute(
         "INSERT INTO read_metadata(read_id,verified_work_id,identity_hash,release_date,metadata_provenance) "
         "VALUES(?,?,?,?,?)",
@@ -236,3 +229,26 @@ def test_conflicting_verified_work_years_fail_closed(database):
         attach_publication_years(con, [], [candidate])
 
     assert candidate["first_publication_year"] is None
+
+
+def test_attach_publication_years_coerces_none_read_fields_consistently(database):
+    work_id = "/works/OL777W"
+    with transaction() as con:
+        read = _insert_read(con, "", work_id)
+        partial_read = {
+            "id": read["id"],
+            "title": None,
+            "author": None,
+            "isbn": None,
+            "read_at": "2024-01-01",
+            "openlibrary_work_id": work_id,
+        }
+        con.execute(
+            "UPDATE read_metadata SET identity_hash=? WHERE read_id=?",
+            (read_metadata_identity_hash(partial_read), read["id"]),
+        )
+        attach_publication_years(con, [partial_read], [])
+
+    assert partial_read["first_publication_year"] == 1984
+    assert partial_read["publication_work_id"] == work_id
+
