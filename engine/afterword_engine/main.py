@@ -9,8 +9,9 @@ import sqlite3
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx

@@ -15,9 +15,10 @@ import os
 import re
 import statistics
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 
 LEARNING_EVENT_TYPES = {

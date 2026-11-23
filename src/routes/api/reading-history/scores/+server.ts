@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engineStatus, engine } from "#lib/server/engine.js";
 
@@ -24,15 +23,15 @@ export const GET: RequestHandler = async ({ url }) => {
     limit < 1 ||
     limit > MAX_SCORE_LIMIT
   ) {
-    return json({ message: "Invalid reading history score range." }, { status: 400 });
+    return Response.json({ message: "Invalid reading history score range." }, { status: 400 });
   }
 
   try {
     const scores = await engine<ReadingHistoryScore[]>(
       `/api/reading-history/scores?offset=${offset}&limit=${limit}`,
     );
-    return json({ scores });
+    return Response.json({ scores });
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };
