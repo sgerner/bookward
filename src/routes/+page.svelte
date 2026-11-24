@@ -38,16 +38,22 @@
     Upload,
     X,
   } from "@lucide/svelte";
+  import ChipToggle from "#lib/components/ChipToggle.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
-  import ChipToggle from "#lib/components/ChipToggle.svelte";
-  import RadioGroup from "#lib/components/RadioGroup.svelte";
-  import SwitchControl from "#lib/components/SwitchControl.svelte";
+  import StarRating from "#lib/components/StarRating.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import {
+    canRunDigestNow,
+    canTestDigestChannel,
+    hasUnsavedDigestChanges,
+    shouldShowDigestTestButton,
+  } from "#lib/digest-ui.js";
   import {
     applyLlmRerankFormOverrides,
     llmCardStatus,
@@ -66,6 +72,7 @@
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
+  import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "decisions" | "sources" | "settings";
@@ -84,6 +91,21 @@
     undo_id?: number;
     undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
+    sourcePreview?: {
+      id: number;
+      url: string;
+      count: number;
+      rawCount: number;
+      includeGenres: string;
+      excludeGenres: string;
+    };
+    zeroMatchConfirm?: {
+      id: number;
+      url: string;
+      rawCount: number;
+      includeGenres: string;
+      excludeGenres: string;
+    };
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
   type SourceFilter = "all" | "permanent" | "one_time";
@@ -112,7 +134,6 @@
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
-  let markReadRatingGroup = $state<{ focusFirst: () => void } | null>(null);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -201,6 +222,22 @@
   let digestOnlyNewOverride = $state<boolean | null>(null);
   let digestDiscordOverride = $state<boolean | null>(null);
   let digestEmailOverride = $state<boolean | null>(null);
+  let digestDayOverride = $state<number | null>(null);
+  let digestTimeOverride = $state<string | null>(null);
+  let digestTimezoneOverride = $state<string | null>(null);
+  let digestMinimumScoreOverride = $state<string | null>(null);
+  let digestMaximumBooksOverride = $state<string | null>(null);
+  let digestAppUrlOverride = $state<string | null>(null);
+  let digestEmailToOverride = $state<string | null>(null);
+  let digestEmailFromOverride = $state<string | null>(null);
+  let digestSmtpHostOverride = $state<string | null>(null);
+  let digestSmtpPortOverride = $state<string | null>(null);
+  let digestSmtpSecurityOverride = $state<"none" | "starttls" | "ssl" | null>(null);
+  let digestDiscordWebhook = $state("");
+  let digestClearDiscord = $state(false);
+  let digestSmtpUsername = $state("");
+  let digestSmtpPassword = $state("");
+  let digestClearSmtpCredentials = $state(false);
   let apiTokenCopyMessage = $state<string | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
@@ -699,6 +736,48 @@
   const digestEmail = $derived(
     digestEmailOverride ?? digestSettings.channels.includes("email"),
   );
+  const digestDay = $derived(digestDayOverride ?? digestSettings.day);
+  const digestTime = $derived(digestTimeOverride ?? digestSettings.time);
+  const digestTimezone = $derived(digestTimezoneOverride ?? digestSettings.timezone);
+  const digestMinimumScore = $derived(
+    digestMinimumScoreOverride ?? String(digestSettings.minimum_score),
+  );
+  const digestMaximumBooks = $derived(
+    digestMaximumBooksOverride ?? String(digestSettings.maximum_books),
+  );
+  const digestAppUrl = $derived(digestAppUrlOverride ?? digestSettings.app_url);
+  const digestEmailTo = $derived(digestEmailToOverride ?? digestSettings.email_to);
+  const digestEmailFrom = $derived(digestEmailFromOverride ?? digestSettings.email_from);
+  const digestSmtpHost = $derived(digestSmtpHostOverride ?? digestSettings.smtp_host);
+  const digestSmtpPort = $derived(
+    digestSmtpPortOverride ?? String(digestSettings.smtp_port),
+  );
+  const digestSmtpSecurity = $derived(
+    digestSmtpSecurityOverride ?? digestSettings.smtp_security,
+  );
+  const digestDraft = $derived({
+    enabled: digestEnabled,
+    discord: digestDiscord,
+    email: digestEmail,
+    day: digestDay,
+    time: digestTime,
+    timezone: digestTimezone,
+    minimumScore: digestMinimumScore,
+    maximumBooks: digestMaximumBooks,
+    onlyNew: digestOnlyNew,
+    appUrl: digestAppUrl,
+    discordWebhook: digestDiscordWebhook,
+    clearDiscord: digestClearDiscord,
+    emailTo: digestEmailTo,
+    emailFrom: digestEmailFrom,
+    smtpHost: digestSmtpHost,
+    smtpPort: digestSmtpPort,
+    smtpSecurity: digestSmtpSecurity,
+    smtpUsername: digestSmtpUsername,
+    smtpPassword: digestSmtpPassword,
+    clearSmtpCredentials: digestClearSmtpCredentials,
+  });
+  const digestDirty = $derived(hasUnsavedDigestChanges(digestSettings, digestDraft));
   const hasMoreDiscoverBooks = $derived(
     activeView === "discover" &&
       (discoverViewVisibleBooks.length < discoverViewBooks.length ||
@@ -1312,6 +1391,23 @@
   }
 
   function optimisticDigestSettings(formData: FormData) {
+    const previousOverrides = {
+      enabled: digestEnabledOverride,
+      onlyNew: digestOnlyNewOverride,
+      discord: digestDiscordOverride,
+      email: digestEmailOverride,
+      day: digestDayOverride,
+      time: digestTimeOverride,
+      timezone: digestTimezoneOverride,
+      minimumScore: digestMinimumScoreOverride,
+      maximumBooks: digestMaximumBooksOverride,
+      appUrl: digestAppUrlOverride,
+      emailTo: digestEmailToOverride,
+      emailFrom: digestEmailFromOverride,
+      smtpHost: digestSmtpHostOverride,
+      smtpPort: digestSmtpPortOverride,
+      smtpSecurity: digestSmtpSecurityOverride,
+    };
     const nextEnabled = formData.get("enabled") === "on";
     const nextOnlyNew = formData.get("onlyNew") === "on";
     const channels = formData.getAll("channels");
@@ -1321,16 +1417,45 @@
     digestOnlyNewOverride = nextOnlyNew;
     digestDiscordOverride = nextDiscord;
     digestEmailOverride = nextEmail;
-    const clear = () => {
-      digestEnabledOverride = null;
-      digestOnlyNewOverride = null;
-      digestDiscordOverride = null;
-      digestEmailOverride = null;
-    };
     return {
-      commit: clear,
+      commit: () => {
+        digestEnabledOverride = null;
+        digestOnlyNewOverride = null;
+        digestDiscordOverride = null;
+        digestEmailOverride = null;
+        digestDayOverride = null;
+        digestTimeOverride = null;
+        digestTimezoneOverride = null;
+        digestMinimumScoreOverride = null;
+        digestMaximumBooksOverride = null;
+        digestAppUrlOverride = null;
+        digestEmailToOverride = null;
+        digestEmailFromOverride = null;
+        digestSmtpHostOverride = null;
+        digestSmtpPortOverride = null;
+        digestSmtpSecurityOverride = null;
+        digestDiscordWebhook = "";
+        digestClearDiscord = false;
+        digestSmtpUsername = "";
+        digestSmtpPassword = "";
+        digestClearSmtpCredentials = false;
+      },
       rollback: () => {
-        clear();
+        digestEnabledOverride = previousOverrides.enabled;
+        digestOnlyNewOverride = previousOverrides.onlyNew;
+        digestDiscordOverride = previousOverrides.discord;
+        digestEmailOverride = previousOverrides.email;
+        digestDayOverride = previousOverrides.day;
+        digestTimeOverride = previousOverrides.time;
+        digestTimezoneOverride = previousOverrides.timezone;
+        digestMinimumScoreOverride = previousOverrides.minimumScore;
+        digestMaximumBooksOverride = previousOverrides.maximumBooks;
+        digestAppUrlOverride = previousOverrides.appUrl;
+        digestEmailToOverride = previousOverrides.emailTo;
+        digestEmailFromOverride = previousOverrides.emailFrom;
+        digestSmtpHostOverride = previousOverrides.smtpHost;
+        digestSmtpPortOverride = previousOverrides.smtpPort;
+        digestSmtpSecurityOverride = previousOverrides.smtpSecurity;
       },
     };
   }
@@ -1679,18 +1804,7 @@
   }
 
   function formatSourceScan(value: string | null, status: string | null) {
-    if (status?.startsWith("error:")) {
-      const detail = status.slice("error:".length).trim().replace(/\s+/g, " ");
-      if (!detail) return "Needs attention";
-      const clipped = detail.length > 140 ? `${detail.slice(0, 139)}…` : detail;
-      return `Needs attention: ${clipped}`;
-    }
-    if (!value) return "Not scanned yet";
-    const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
-    const date = new Date(normalized);
-    return Number.isNaN(date.valueOf())
-      ? "Scanned"
-      : `Scanned ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+    return formatSourceScanStatus(value, status);
   }
 
   function formatDeliveryDate(value: string | null | undefined) {
@@ -3093,18 +3207,14 @@
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
                       >
                         <ProfileField profileId={data.user?.profile_id} />
-                        <button
+                        <SwitchControl
                           type="submit"
-                          class={`relative h-7 w-12 rounded-full p-1 transition ${defaultSourceEnabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                          role="switch"
-                          aria-label="Toggle Bookward demo books"
-                          aria-checked={defaultSourceEnabled}
+                          tone="primary"
+                          checked={defaultSourceEnabled}
+                          ariaLabel="Toggle Bookward demo books"
                           disabled={isPending("toggle-default")}
-                          aria-busy={isPending("toggle-default")}
-                          ><span
-                            class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${defaultSourceEnabled ? "translate-x-5" : ""}`}
-                          ></span></button
-                        >
+                          busy={isPending("toggle-default")}
+                        />
                       </form>
                     </div>
                   {/if}
@@ -3149,7 +3259,33 @@
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
                               {#if source.lifecycle === "one_time"}
-                                One-time import · {formatSourceScan(source.last_scanned_at, source.last_status)}
+                                One-time import
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <span aria-hidden="true"> · </span>
+                                  <form
+                                    class="inline-flex"
+                                    method="POST"
+                                    action="?/switchSourceToPermanent"
+                                    use:enhance={setPending(`source-lifecycle-${source.id}`)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <button
+                                      class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      type="submit"
+                                      disabled={isPending(`source-lifecycle-${source.id}`)}
+                                      aria-busy={isPending(`source-lifecycle-${source.id}`)}
+                                    >Switch to Permanent Feed</button>
+                                  </form>
+                                {/if}
+                                <span aria-hidden="true"> · </span>
+                                <span
+                                  class={sourceScanTone(source.last_scanned_at, source.last_status) === "error"
+                                    ? "font-medium text-error-600-400"
+                                    : sourceScanTone(source.last_scanned_at, source.last_status) === "warning"
+                                      ? "font-medium text-warning-700-300"
+                                      : ""}
+                                >{formatSourceScan(source.last_scanned_at, source.last_status)}</span>
                               {:else}
                                 Permanent feed
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
@@ -3171,12 +3307,21 @@
                                   </form>
                                 {/if}
                                 <span aria-hidden="true"> · </span>
-                                {formatSourceScan(source.last_scanned_at, source.last_status)}
+                                <span
+                                  class={sourceScanTone(source.last_scanned_at, source.last_status) === "error"
+                                    ? "font-medium text-error-600-400"
+                                    : sourceScanTone(source.last_scanned_at, source.last_status) === "warning"
+                                      ? "font-medium text-warning-700-300"
+                                      : ""}
+                                >{formatSourceScan(source.last_scanned_at, source.last_status)}</span>
                               {/if}
                             </span>
-                            <details class="mt-2 w-full max-w-full">
+                            <details
+                              class="mt-2 w-full max-w-full"
+                              open={formState?.sourcePreview?.id === source.id || formState?.zeroMatchConfirm?.id === source.id || undefined}
+                            >
                               <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
-                                Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
+                                {source.kind !== "association" && source.kind !== "builtin" ? "URL & filters" : "Filters"}{source.filters.include_genres.length || source.filters.exclude_genres.length
                                   ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                   : ""}
                               </summary>
@@ -3188,12 +3333,34 @@
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
+                                <input type="hidden" name="currentUrl" value={source.url} />
+                                {#if source.kind !== "association" && source.kind !== "builtin"}
+                                  <label class="block text-xs font-medium text-surface-800-200">
+                                    Feed URL
+                                    <input
+                                      class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                      name="url"
+                                      type="url"
+                                      required
+                                      value={formState?.sourcePreview?.id === source.id
+                                        ? formState.sourcePreview.url
+                                        : formState?.zeroMatchConfirm?.id === source.id
+                                          ? formState.zeroMatchConfirm.url
+                                          : source.url}
+                                      placeholder="https://example.com/books/rss"
+                                    />
+                                  </label>
+                                {/if}
                                 <label class="block text-xs font-medium text-surface-800-200">
                                   Include genres
                                   <input
                                     class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="includeGenres"
-                                    value={source.filters.include_genres.join(", ")}
+                                    value={formState?.sourcePreview?.id === source.id
+                                      ? formState.sourcePreview.includeGenres
+                                      : formState?.zeroMatchConfirm?.id === source.id
+                                        ? formState.zeroMatchConfirm.includeGenres
+                                        : source.filters.include_genres.join(", ")}
                                     placeholder="science fiction, fantasy"
                                   />
                                 </label>
@@ -3202,19 +3369,67 @@
                                   <input
                                     class="input mt-1 w-full min-w-0 max-w-full text-sm"
                                     name="excludeGenres"
-                                    value={source.filters.exclude_genres.join(", ")}
+                                    value={formState?.sourcePreview?.id === source.id
+                                      ? formState.sourcePreview.excludeGenres
+                                      : formState?.zeroMatchConfirm?.id === source.id
+                                        ? formState.zeroMatchConfirm.excludeGenres
+                                        : source.filters.exclude_genres.join(", ")}
                                     placeholder="romance, cookbook"
                                   />
                                 </label>
                                 <p class="text-xs leading-5 text-surface-600-400">
                                   Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
                                 </p>
-                                <button
-                                  class="btn btn-sm min-h-9 preset-tonal-secondary"
-                                  type="submit"
-                                  disabled={isPending(`source-filters-${source.id}`)}
-                                  aria-busy={isPending(`source-filters-${source.id}`)}
-                                >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                                {#if formState?.sourcePreview?.id === source.id}
+                                  <div
+                                    class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
+                                    role="status"
+                                  >
+                                    {#if formState.sourcePreview.count === 0}
+                                      Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
+                                    {:else}
+                                      Preview matched {formState.sourcePreview.count} of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}.
+                                    {/if}
+                                  </div>
+                                {/if}
+                                {#if formState?.zeroMatchConfirm?.id === source.id}
+                                  <div
+                                    class="space-y-2 border-l-2 border-warning-500 preset-tonal-warning p-3 text-xs leading-5"
+                                    role="alert"
+                                  >
+                                    <p class="font-medium">
+                                      0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
+                                    </p>
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-filled-warning-500"
+                                      type="submit"
+                                      name="confirmZeroMatch"
+                                      value="1"
+                                      disabled={isPending(`source-filters-${source.id}`)}
+                                      aria-busy={isPending(`source-filters-${source.id}`)}
+                                    ><TriangleAlert size={14} /> Confirm & save zero-match filters</button>
+                                  </div>
+                                {/if}
+                                <div class="flex flex-wrap items-center gap-2">
+                                  {#if source.kind !== "association" && source.kind !== "builtin"}
+                                    <button
+                                      class="btn btn-sm min-h-9 preset-tonal-surface"
+                                      type="submit"
+                                      name="intent"
+                                      value="preview"
+                                      disabled={isPending(`source-filters-${source.id}`)}
+                                      aria-busy={isPending(`source-filters-${source.id}`)}
+                                    ><Search size={14} /> Preview matches</button>
+                                  {/if}
+                                  <button
+                                    class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                    type="submit"
+                                    name="intent"
+                                    value="save"
+                                    disabled={isPending(`source-filters-${source.id}`)}
+                                    aria-busy={isPending(`source-filters-${source.id}`)}
+                                  >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} {source.kind !== "association" && source.kind !== "builtin" ? (source.enabled ? "Save & rescan" : "Save URL & filters") : "Save filters"}</button>
+                                </div>
                               </form>
                             </details>
                           </div>
@@ -3229,18 +3444,14 @@
                               type="hidden"
                               name="id"
                               value={source.id}
-                            /><button
+                            /><SwitchControl
                               type="submit"
-                              class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                              role="switch"
-                              aria-label={`Toggle ${source.label}`}
-                              aria-checked={sourceEnabled(source)}
+                              tone="primary"
+                              checked={sourceEnabled(source)}
+                              ariaLabel={`Toggle ${source.label}`}
                               disabled={isPending(`toggle-source-${source.id}`)}
-                              aria-busy={isPending(`toggle-source-${source.id}`)}
-                              ><span
-                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
-                              ></span></button
-                            >
+                              busy={isPending(`toggle-source-${source.id}`)}
+                            />
                           </form>
                         </div>{/each}
                     {:else}
@@ -4229,7 +4440,7 @@
                     />
                   </div>
 
-                  {#if digestEnabled}<div in:slide={{ duration: motionDuration(240) }} out:fade={{ duration: motionDuration(160) }} class="mt-6">
+                  <div class="mt-6">
                     <div class="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
                       <section class="preset-tonal-surface p-4 sm:p-5">
                         <div class="mb-4 flex items-center justify-between gap-3">
@@ -4237,22 +4448,22 @@
                             <h3 class="font-semibold text-surface-950-50">Schedule</h3>
                             <p class="mt-1 text-sm text-surface-700-300">When should Bookward check in?</p>
                           </div>
-                          <span class="badge preset-tonal-secondary">Automatic</span>
+                          <span class="badge preset-tonal-secondary">{digestEnabled ? "Automatic" : "Paused"}</span>
                         </div>
                         <div class="grid gap-4 sm:grid-cols-2">
-                          <label class="block text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day">
-                            <option value="1" selected={digestSettings.day === 1}>Monday</option>
-                            <option value="2" selected={digestSettings.day === 2}>Tuesday</option>
-                            <option value="3" selected={digestSettings.day === 3}>Wednesday</option>
-                            <option value="4" selected={digestSettings.day === 4}>Thursday</option>
-                            <option value="5" selected={digestSettings.day === 5}>Friday</option>
-                            <option value="6" selected={digestSettings.day === 6}>Saturday</option>
-                            <option value="7" selected={digestSettings.day === 7}>Sunday</option>
+                          <label class="block text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day" value={String(digestDay)} onchange={(event) => (digestDayOverride = Number((event.currentTarget as HTMLSelectElement).value))}>
+                            <option value="1" selected={digestDay === 1}>Monday</option>
+                            <option value="2" selected={digestDay === 2}>Tuesday</option>
+                            <option value="3" selected={digestDay === 3}>Wednesday</option>
+                            <option value="4" selected={digestDay === 4}>Thursday</option>
+                            <option value="5" selected={digestDay === 5}>Friday</option>
+                            <option value="6" selected={digestDay === 6}>Saturday</option>
+                            <option value="7" selected={digestDay === 7}>Sunday</option>
                           </select></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestSettings.time} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestSettings.timezone} placeholder="America/Phoenix" required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestSettings.minimum_score} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestSettings.maximum_books} required /></label>
+                          <label class="block text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestTime} oninput={(event) => (digestTimeOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestTimezone} oninput={(event) => (digestTimezoneOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="America/Phoenix" required /></label>
+                          <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestMinimumScore} oninput={(event) => (digestMinimumScoreOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestMaximumBooks} oninput={(event) => (digestMaximumBooksOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
                         </div>
                         <div class="mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
                           <label for="digest-only-new" class="cursor-pointer">
@@ -4272,7 +4483,7 @@
                       <section class="preset-tonal-surface p-4 sm:p-5">
                         <div class="mb-4">
                           <h3 class="font-semibold text-surface-950-50">Delivery</h3>
-                          <p class="mt-1 text-sm text-surface-700-300">Choose one or both places to receive it.</p>
+                          <p class="mt-1 text-sm text-surface-700-300">Configure and test one or both channels before turning on the schedule.</p>
                         </div>
                         <div class="grid gap-3">
                           <div class="relative border border-surface-300-700/50 p-4">
@@ -4291,8 +4502,8 @@
                               />
                             </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
-                              <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
-                              {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
+                              <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" value={digestDiscordWebhook} oninput={(event) => (digestDiscordWebhook = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
+                              {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" checked={digestClearDiscord} onchange={(event) => (digestClearDiscord = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
@@ -4309,52 +4520,49 @@
                                 checked={digestEmail}
                                 ariaLabel="Send digest by email"
                                 activeClass="preset-filled-tertiary-500"
-                                focusClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
                                 onToggle={(next) => (digestEmailOverride = next)}
                               />
                             </div>
                             {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
                               <div class="grid gap-4 sm:grid-cols-2">
-                                <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestSettings.email_to} placeholder="you@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestSettings.email_from} placeholder="bookward@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSettings.smtp_host} placeholder="smtp.example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSettings.smtp_port} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity"><option value="starttls" selected={digestSettings.smtp_security === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSettings.smtp_security === "ssl"}>SSL / TLS</option><option value="none" selected={digestSettings.smtp_security === "none"}>None</option></select></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value="" placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
+                                <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestEmailTo} oninput={(event) => (digestEmailToOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="you@example.com" /></label>
+                                <label class="block text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestEmailFrom} oninput={(event) => (digestEmailFromOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="bookward@example.com" /></label>
+                                <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSmtpHost} oninput={(event) => (digestSmtpHostOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="smtp.example.com" /></label>
+                                <label class="block text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSmtpPort} oninput={(event) => (digestSmtpPortOverride = (event.currentTarget as HTMLInputElement).value)} /></label>
+                                <label class="block text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity" value={digestSmtpSecurity} onchange={(event) => (digestSmtpSecurityOverride = (event.currentTarget as HTMLSelectElement).value as "none" | "starttls" | "ssl")}><option value="starttls" selected={digestSmtpSecurity === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSmtpSecurity === "ssl"}>SSL / TLS</option><option value="none" selected={digestSmtpSecurity === "none"}>None</option></select></label>
+                                <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value={digestSmtpUsername} oninput={(event) => (digestSmtpUsername = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
+                                <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" value={digestSmtpPassword} oninput={(event) => (digestSmtpPassword = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
-                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
-                            </div>{:else}<input type="hidden" name="emailTo" value={digestSettings.email_to} /><input type="hidden" name="emailFrom" value={digestSettings.email_from} /><input type="hidden" name="smtpHost" value={digestSettings.smtp_host} /><input type="hidden" name="smtpPort" value={digestSettings.smtp_port} /><input type="hidden" name="smtpSecurity" value={digestSettings.smtp_security} />{/if}
+                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" checked={digestClearSmtpCredentials} onchange={(event) => (digestClearSmtpCredentials = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved credentials</label>{/if}
+                            </div>{:else}<input type="hidden" name="emailTo" value={digestEmailTo} /><input type="hidden" name="emailFrom" value={digestEmailFrom} /><input type="hidden" name="smtpHost" value={digestSmtpHost} /><input type="hidden" name="smtpPort" value={digestSmtpPort} /><input type="hidden" name="smtpSecurity" value={digestSmtpSecurity} />{/if}
                           </div>
                         </div>
                       </section>
                     </div>
-                    <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestSettings.app_url} placeholder="https://bookward.example.com" required /></label>
+                    <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
-                  {:else}
-                    <input type="hidden" name="day" value={digestSettings.day} /><input type="hidden" name="time" value={digestSettings.time} /><input type="hidden" name="timezone" value={digestSettings.timezone} /><input type="hidden" name="minimumScore" value={digestSettings.minimum_score} /><input type="hidden" name="maximumBooks" value={digestSettings.maximum_books} /><input type="hidden" name="appUrl" value={digestSettings.app_url} /><input type="hidden" name="smtpPort" value={digestSettings.smtp_port} /><input type="hidden" name="smtpSecurity" value={digestSettings.smtp_security} />
-                    {#if digestOnlyNew}<input type="hidden" name="onlyNew" value="on" />{/if}
-                    {#if digestDiscord}<input type="hidden" name="channels" value="discord" />{/if}
-                    {#if digestEmail}<input type="hidden" name="channels" value="email" />{/if}
-                    <input type="hidden" name="emailTo" value={digestSettings.email_to} /><input type="hidden" name="emailFrom" value={digestSettings.email_from} /><input type="hidden" name="smtpHost" value={digestSettings.smtp_host} />
-                  {/if}
                   <div class="mt-6 flex flex-col gap-3 border-t border-surface-300-700/40 pt-5 sm:flex-row sm:items-center sm:justify-between">
-                    {#if digestEnabled}<p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>{:else}<p in:fade={{ duration: motionDuration(180) }} class="text-sm text-surface-700-300">Turn on the digest to choose a schedule and delivery channel.</p>{/if}
+                    {#if digestDirty}
+                      <p class="text-sm font-medium text-warning-700-300" role="status">Save digest settings to apply your edits before sending a test or running the digest.</p>
+                    {:else if digestEnabled}
+                      <p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>
+                    {:else}
+                      <p in:fade={{ duration: motionDuration(180) }} class="text-sm text-surface-700-300">Weekly schedule is off. Save a channel below to test delivery before turning on automatic digests.</p>
+                    {/if}
                     <button class="btn min-h-11 w-full preset-filled-secondary-500 sm:w-auto" type="submit" disabled={isPending("digest-settings")} aria-busy={isPending("digest-settings")}>{#if isPending("digest-settings")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save digest settings</button>
                   </div>
                 </form>
                 <div class="mt-5 flex flex-wrap items-center gap-2 border-t border-surface-300-700/40 pt-5">
-                  {#each ["discord", "email"] as channel}
-                    {@const configured = channel === "discord" ? digestDiscord : digestEmail}
-                    {#if configured}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
+                  {#each ["discord", "email"] as const as channel}
+                    {#if shouldShowDigestTestButton(digestSettings, digestDraft, channel)}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="channel" value={channel} />
-                      <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
+                      <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={!canTestDigestChannel(digestSettings, digestDraft, channel) || isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
                     </form>{/if}
                   {/each}
                   <form method="POST" action="?/runDigest" use:enhance={setPending("digest-run")} class="ml-auto">
                     <ProfileField profileId={data.user?.profile_id} />
-                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!digestEnabled || (!digestDiscord && !digestEmail) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
+                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
                 {#if digestSettings.last_delivery}
@@ -4523,33 +4731,7 @@
                 <p id="mark-read-rating-label" class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
                 <span class="text-xs text-surface-600-400">Optional</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-center gap-2">
-                <RadioGroup
-                  bind:this={markReadRatingGroup}
-                  items={[1, 2, 3, 4, 5]}
-                  value={markReadRating > 0 ? markReadRating : null}
-                  labelledBy="mark-read-rating-label"
-                  columns={1}
-                  selectOnMove
-                  clearable
-                  class="flex flex-wrap items-center gap-2"
-                  onSelect={(rating) => (markReadRating = rating)}
-                  onClear={() => (markReadRating = 0)}
-                >
-                  {#snippet item(rating, radio)}
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
-                      aria-checked={radio.checked}
-                      tabindex={radio.tabIndex}
-                      class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
-                      onclick={radio.select}
-                    ><span aria-hidden="true">★</span></button>
-                  {/snippet}
-                </RadioGroup>
-                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => { markReadRating = 0; markReadRatingGroup?.focusFirst(); }}>Clear rating</button>{/if}
-              </div>
+              <StarRating bind:value={markReadRating} labelledBy="mark-read-rating-label" />
             </div>
           </div>
 
@@ -4621,7 +4803,7 @@
             <label
               class="input flex min-h-12 min-w-0 flex-1 cursor-text items-center gap-2 py-0!"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch focus:outline-none focus:ring-0"
+                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"

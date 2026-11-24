@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # the internal engine URL so Docker installs can link to the web service.
     public_url: str = "http://localhost:5173"
     librarr_allowed_hosts: str = "librarr"
+    smtp_allowed_hosts: str = ""
     # Exploration is deliberately opt-in.  The ranking path and response
     # order remain deterministic until an operator enables this flag.
     exploration_enabled: bool = False
