@@ -53,6 +53,8 @@ function resolveColorExpr(expr: string, vars: Record<string, string>, mode: Mode
 
 	if (trimmed.startsWith('var(') && trimmed.endsWith(')')) {
 		const varName = trimmed.slice(4, -1).trim();
+		const target = vars[varName];
+		if (target) return resolveColorExpr(target, vars, mode);
 		if (varName === '--color-surface-50-950') {
 			return resolveColorExpr(
 				mode === 'light' ? 'var(--color-surface-50)' : 'var(--color-surface-950)',
@@ -60,9 +62,7 @@ function resolveColorExpr(expr: string, vars: Record<string, string>, mode: Mode
 				mode,
 			);
 		}
-		const target = vars[varName];
-		if (!target) throw new Error(`Unknown CSS variable ${varName}`);
-		return resolveColorExpr(target, vars, mode);
+		throw new Error(`Unknown CSS variable ${varName}`);
 	}
 
 	if (trimmed.startsWith('light-dark(') && trimmed.endsWith(')')) {
@@ -92,6 +92,17 @@ function resolveColorExpr(expr: string, vars: Record<string, string>, mode: Mode
 			a: first.color.a * w1 + second.color.a * w2,
 			b: first.color.b * w1 + second.color.b * w2,
 		};
+	}
+
+	const relativeOklchClampMatch = trimmed.match(
+		/^oklch\(\s*from\s+(.+?)\s+clamp\(\s*0\s*,\s*\(\s*([0-9.]+)\s*-\s*l\s*\)\s*\*\s*([0-9.]+)\s*,\s*1\s*\)\s+0\s+0\s*\)$/i,
+	);
+	if (relativeOklchClampMatch) {
+		const origin = resolveColorExpr(relativeOklchClampMatch[1].trim(), vars, mode);
+		const threshold = parseFloat(relativeOklchClampMatch[2]);
+		const scale = parseFloat(relativeOklchClampMatch[3]);
+		const L = Math.max(0, Math.min(1, (threshold - origin.L) * scale));
+		return { L, a: 0, b: 0 };
 	}
 
 	const oklchMatch = trimmed.match(
@@ -144,15 +155,34 @@ function parseCssVars(css: string): Record<string, string> {
 	return vars;
 }
 
+function parseScopedLayoutVars(css: string, theme: SkeletonThemeName): Record<string, string> {
+	const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+	const vars: Record<string, string> = {};
+	for (const block of stripped.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
+		const selectors = block[1]
+			.split(',')
+			.map((part) => part.trim())
+			.filter(Boolean);
+		const matchesGlobal = selectors.some((sel) => sel === ':root' || sel === '[data-theme]');
+		const matchesTheme = selectors.some(
+			(sel) => sel === `[data-theme='${theme}']` || sel === `[data-theme="${theme}"]`,
+		);
+		if (matchesGlobal || matchesTheme) {
+			Object.assign(vars, parseCssVars(block[2]));
+		}
+	}
+	return vars;
+}
+
 const layoutCss = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
-const semanticVars = parseCssVars(layoutCss);
+const semanticVars = parseScopedLayoutVars(layoutCss, 'cerberus');
 
 function loadThemeVars(theme: SkeletonThemeName): Record<string, string> {
 	const themeCss = readFileSync(
 		join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme}.css`),
 		'utf8',
 	);
-	return { ...parseCssVars(themeCss), ...semanticVars };
+	return { ...parseCssVars(themeCss), ...parseScopedLayoutVars(layoutCss, theme) };
 }
 
 const themeModePairs = THEMES.flatMap((theme) => [
@@ -166,6 +196,7 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 		for (const token of [
 			'--control-border',
 			'--focus-ring-inner',
+			'--focus-ring-swatch-inner',
 			'--focus-ring-outer',
 			'--switch-track-off',
 			'--switch-thumb-off',
@@ -183,6 +214,8 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 		}
 		expect(layoutCss).toContain('.input-ghost');
 		expect(layoutCss).toContain('.input:has(.input-ghost:focus)');
+		expect(layoutCss).not.toContain("a[href]");
+		expect(layoutCss).not.toContain('button:not(.input-ghost)');
 	});
 
 	it.each(themeModePairs)(
@@ -255,6 +288,7 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 		({ theme, mode }) => {
 			const vars = loadThemeVars(theme);
 			const focusInner = resolveColorExpr('var(--focus-ring-inner)', vars, mode);
+			const swatchFocusInner = resolveColorExpr('var(--focus-ring-swatch-inner)', vars, mode);
 			const focusOuter = resolveColorExpr('var(--focus-ring-outer)', vars, mode);
 			const dialogSurface = resolveColorExpr('var(--color-surface-50-950)', vars, mode);
 			const rootBg = resolveColorExpr(
@@ -267,12 +301,7 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 			expect(contrastRatio(focusInner, focusOuter)).toBeGreaterThanOrEqual(3);
 			expect(contrastRatio(focusOuter, dialogSurface)).toBeGreaterThanOrEqual(3);
 			expect(contrastRatio(focusOuter, rootBg)).toBeGreaterThanOrEqual(3);
-			expect(
-				Math.max(
-					contrastRatio(focusInner, activeSwatchFill),
-					contrastRatio(focusOuter, activeSwatchFill),
-				),
-			).toBeGreaterThanOrEqual(3);
+			expect(contrastRatio(swatchFocusInner, activeSwatchFill)).toBeGreaterThanOrEqual(3);
 		},
 	);
 });

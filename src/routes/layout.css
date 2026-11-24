@@ -37,6 +37,7 @@ html:has([data-sticky-shell]) {
 
 	/* WCAG 2.2 SC 2.4.7 / C40 / G195 two-color focus indicator tokens. */
 	--focus-ring-inner: light-dark(#ffffff, #000000);
+	--focus-ring-swatch-inner: oklch(from var(--color-primary-500) clamp(0, (0.62 - l) * 1000, 1) 0 0);
 	--focus-ring-outer: light-dark(
 		color-mix(in oklab, var(--color-primary-700) 38%, black),
 		color-mix(in oklab, var(--color-primary-200) 55%, white)
@@ -153,8 +154,7 @@ html:has([data-sticky-shell]) {
 /* Two-color focus indicator (SC 2.4.7, G195, C40) paired with CSS outline fallback. */
 :where(input, select, textarea):is(.input, .select, .textarea):not(:disabled):focus-visible,
 .input:has(.input-ghost:focus),
-.checkbox:not(:disabled):focus-visible,
-:where(a[href], button:not(.input-ghost), summary, [role='button'], [role='switch']):not(:disabled):focus-visible {
+.checkbox:not(:disabled):focus-visible {
 	outline: 2px solid var(--focus-ring-outer);
 	outline-offset: 2px;
 	box-shadow:
@@ -185,8 +185,7 @@ html:has([data-sticky-shell]) {
 
 	:where(input, select, textarea):is(.input, .select, .textarea):not(:disabled):focus-visible,
 	.input:has(.input-ghost:focus),
-	.checkbox:not(:disabled):focus-visible,
-	:where(a[href], button:not(.input-ghost), summary, [role='button'], [role='switch']):not(:disabled):focus-visible {
+	.checkbox:not(:disabled):focus-visible {
 		outline: 2px solid Highlight;
 		outline-offset: 2px;
 	}

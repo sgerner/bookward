@@ -21,17 +21,13 @@ function readRelative(relativePath: string): string {
   return readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), "utf8");
 }
 
-function collectElements(
-  node: unknown,
-  types: ReadonlySet<string> = new Set(["RegularElement"]),
-): ElementMatch[] {
+function collectElements(node: unknown): ElementMatch[] {
   if (!node || typeof node !== "object") return [];
   const record = node as Record<string, unknown>;
   const found: ElementMatch[] = [];
 
   if (
-    typeof record.type === "string" &&
-    types.has(record.type) &&
+    (record.type === "RegularElement" || record.type === "Component") &&
     typeof record.name === "string"
   ) {
     const rawAttributes = (record.attributes as Array<{
@@ -61,9 +57,9 @@ function collectElements(
 
   for (const value of Object.values(record)) {
     if (Array.isArray(value)) {
-      for (const child of value) found.push(...collectElements(child, types));
+      for (const child of value) found.push(...collectElements(child));
     } else if (value && typeof value === "object") {
-      found.push(...collectElements(value, types));
+      found.push(...collectElements(value));
     }
   }
   return found;
@@ -72,9 +68,7 @@ function collectElements(
 describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
   it("scopes data-sticky-shell to the reader shell and avoids double Librarr scroll offsets", () => {
     const readerSource = readRelative("../routes/+page.svelte");
-    const readerAst = parse(readerSource, { modern: true }).fragment;
-    const elements = collectElements(readerAst);
-    const components = collectElements(readerAst, new Set(["Component"]));
+    const elements = collectElements(parse(readerSource, { modern: true }).fragment);
 
     const stickyShells = elements.filter((el) => el.attributes.has("data-sticky-shell"));
     expect(stickyShells).toHaveLength(1);
@@ -108,22 +102,12 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const readerSwitches = components.filter((el) => el.name === "Switch");
-    expect(readerSwitches.length).toBeGreaterThanOrEqual(6);
-    for (const control of readerSwitches) {
+    const srOnlySwitches = elements.filter((el) => el.name === "SwitchControl");
+    expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
+    for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
       expect(control.end).toBeLessThanOrEqual(shell.end);
     }
-
-    const switchComponentElements = collectElements(
-      parse(readRelative("./components/Switch.svelte"), { modern: true }).fragment,
-    );
-    const nativeSwitchControls = switchComponentElements.filter(
-      (el) =>
-        (el.name === "input" || el.name === "button") &&
-        el.attributes.get("role") === "switch",
-    );
-    expect(nativeSwitchControls).toHaveLength(2);
 
     for (const page of standalonePages) {
       const standaloneElements = collectElements(

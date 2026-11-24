@@ -3,29 +3,32 @@ import { render } from 'svelte/server';
 import StarRating from './StarRating.svelte';
 
 describe('shared StarRating component', () => {
-	it('renders five Tab-focusable star buttons without roving tabindex or clear button when unrated', () => {
+	it('renders a RadioGroup of five star radios with a single tabindex="0" stop and no clear button when unrated', () => {
 		const { body } = render(StarRating, {
-			props: { value: 0 },
+			props: { value: 0, labelledBy: 'mark-read-rating-label' },
 		});
 
-		expect(body).toContain('role="group"');
-		expect(body).toContain('aria-label="Optional book rating"');
+		expect(body).toContain('role="radiogroup"');
+		expect(body).toContain('aria-labelledby="mark-read-rating-label"');
 		expect(body).toContain('aria-label="1 star"');
 		expect(body).toContain('aria-label="5 stars"');
-		expect(body).not.toContain('tabindex="-1"');
+		expect(body.match(/role="radio"/g)).toHaveLength(5);
+		expect(body.match(/aria-checked="true"/g)).toBeNull();
+		expect(body.match(/tabindex="0"/g)).toHaveLength(1);
+		expect(body.match(/tabindex="-1"/g)).toHaveLength(4);
 		expect(body).not.toContain('Clear rating');
 		expect((body.match(/data-active="false"/g) ?? []).length).toBe(5);
 	});
 
-	it('marks active stars up to the selected rating, sets aria-pressed on the exact rating, and shows Clear rating', () => {
+	it('marks active star glyphs up to the selected rating, sets aria-checked on the selected radio, and shows Clear rating', () => {
 		const { body } = render(StarRating, {
-			props: { value: 4 },
+			props: { value: 4, labelledBy: 'mark-read-rating-label' },
 		});
 
 		expect((body.match(/data-active="true"/g) ?? []).length).toBe(4);
 		expect((body.match(/data-active="false"/g) ?? []).length).toBe(1);
-		expect(body).toContain('aria-label="4 stars" aria-pressed="true"');
-		expect(body).toContain('aria-label="3 stars" aria-pressed="false"');
+		expect(body).toContain('aria-label="4 stars" aria-checked="true" tabindex="0"');
+		expect(body).toContain('aria-label="3 stars" aria-checked="false" tabindex="-1"');
 		expect(body).toContain('Clear rating');
 	});
 });

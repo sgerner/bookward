@@ -11,7 +11,7 @@ describe('ThemePicker focus and template invariants', () => {
 		expect(body).toContain('aria-haspopup="dialog"');
 	});
 
-	it('uses offset two-color focus rings on mode and palette buttons without 0px primary-500 outlines', () => {
+	it('uses offset two-color focus rings on mode and palette radios without 0px primary-500 outlines', () => {
 		const source = readFileSync(
 			join(process.cwd(), 'src/lib/components/ThemePicker.svelte'),
 			'utf8',
@@ -20,17 +20,18 @@ describe('ThemePicker focus and template invariants', () => {
 		expect(source).toContain('theme-picker-option');
 		expect(source).toContain('outline-offset: 2px');
 		expect(source).toContain('var(--focus-ring-inner)');
+		expect(source).toContain('var(--focus-ring-swatch-inner)');
 		expect(source).toContain('var(--focus-ring-outer)');
 	});
 
-	it('replaces all six inline switches and star buttons in +page.svelte with shared components', () => {
+	it('replaces all six inline switches and star buttons in +page.svelte with SwitchControl and StarRating', () => {
 		const pageSource = readFileSync(
 			join(process.cwd(), 'src/routes/+page.svelte'),
 			'utf8',
 		);
 		expect(pageSource).not.toContain('role="switch"');
 		expect(pageSource).not.toContain('text-amber-300');
-		expect((pageSource.match(/<Switch\b/g) ?? []).length).toBe(6);
+		expect((pageSource.match(/<SwitchControl\b/g) ?? []).length).toBe(6);
 		expect((pageSource.match(/<StarRating\b/g) ?? []).length).toBe(1);
 	});
 });
