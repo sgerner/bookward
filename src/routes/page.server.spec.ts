@@ -1,8 +1,10 @@
+import { isHttpError } from "@sveltejs/kit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "./+page.server";
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -184,6 +186,32 @@ describe("page actions", () => {
     ]);
     expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
+  });
+
+  it("throws a 503 string error without deprecation warnings when the engine is unavailable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:8000"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    let thrown: unknown;
+    try {
+      await load({
+        url: new URL("http://afterword.test/"),
+        locals: { user: null },
+      } as never);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(isHttpError(thrown, 503)).toBe(true);
+    if (isHttpError(thrown, 503)) {
+      expect(thrown.body.message).toBe(
+        "Bookward's recommendation engine is unavailable. connect ECONNREFUSED 127.0.0.1:8000",
+      );
+    }
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("marks a recommended book as read with an optional rating and no device session", async () => {
@@ -481,34 +509,12 @@ describe("page actions", () => {
   });
 
   it("preserves an existing Librarr key while changing the default format", async () => {
-    const overview = {
-      sources: [],
-      recommendations: [],
-      history: [],
-      settings: {
-        embedding_backend: "local",
-        embedding_model: "hashing-768",
-        embedding_url: "",
-        embedding_api_key_set: false,
-        librarr_url: "http://librarr:5050",
-        librarr_api_key_set: true,
-        librarr_media_type: "audiobook",
-      },
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(overview), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ saved: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
     body.set("url", "http://librarr:5050");
@@ -518,8 +524,12 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
     expect(result).toEqual({ message: "Librarr connection saved for ebooks." });
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
-    expect(JSON.parse(String(request.body))).toMatchObject({
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      librarr_url: "http://librarr:5050",
       librarr_api_key: "",
       librarr_media_type: "ebook",
     });
@@ -1082,5 +1092,99 @@ describe("page actions", () => {
         request: new Request("http://afterword.test", { method: "POST", body: validForm }),
       } as never),
     ).resolves.toEqual({ message: "Imported 3 Goodreads books." });
+  });
+
+  it("forwards missing initial Librarr API key validation from the engine without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ detail: "Enter a Librarr API key for the first connection." }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "http://librarr:5050");
+    body.set("apiKey", "");
+    body.set("mediaType", "audiobook");
+    const result = (await actions.configureLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(result.status).toBe(400);
+    expect(result.data).toEqual({
+      message: "Enter a Librarr API key for the first connection.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+  });
+
+  it("saves embedding settings in a single partial PUT request without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true, embedding: { ok: true, checked: true } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("backend", "ollama");
+    body.set("model", "qwen3-embedding:0.6b");
+    body.set("url", "http://ollama:11434");
+    body.set("apiKey", "embed-secret");
+    const result = await actions.configureEmbeddings!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Embedding provider saved and checked." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      embedding_backend: "ollama",
+      embedding_model: "qwen3-embedding:0.6b",
+      embedding_url: "http://ollama:11434",
+      embedding_api_key: "embed-secret",
+    });
+  });
+
+  it("toggles the default source in one engine request and forwards 404 when absent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 1, enabled: 0, job_id: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Default source not found." }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const toggled = await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never);
+    expect(toggled).toEqual({ message: "Upcoming-book source updated." });
+
+    const missing = (await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(missing.status).toBe(404);
+    expect(missing.data).toEqual({
+      message: "Default source not found.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
   });
 });

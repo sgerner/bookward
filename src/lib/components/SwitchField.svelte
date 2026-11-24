@@ -1,65 +1,53 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import type { HTMLInputAttributes } from 'svelte/elements';
+	import SwitchControl from './SwitchControl.svelte';
 
 	type Props = {
 		label: string;
 		description?: string;
 		checked?: boolean;
 		id?: string;
+		name?: string;
+		value?: string;
+		disabled?: boolean;
 		class?: string;
 		labelClass?: string;
 		descriptionClass?: string;
 		activeTrackClass?: string;
+		focusTrackClass?: string;
 		heading?: 'h2' | 'h3';
 		icon?: Snippet;
 		badge?: Snippet;
-	} & Omit<
-		HTMLInputAttributes,
-		| 'type'
-		| 'role'
-		| 'checked'
-		| 'id'
-		| 'class'
-		| 'aria-label'
-		| 'aria-labelledby'
-		| 'aria-describedby'
-		| 'children'
-	>;
+		onToggle?: (nextChecked: boolean) => void;
+	};
 
 	let {
 		label,
 		description,
 		checked = $bindable(false),
 		id,
+		name,
+		value = 'on',
+		disabled = false,
 		class: className = '',
 		labelClass = 'font-medium text-surface-950-50',
 		descriptionClass = 'mt-0.5 text-xs font-normal text-surface-700-300',
 		activeTrackClass = 'preset-filled-secondary-500',
+		focusTrackClass,
 		heading,
 		icon,
 		badge,
-		disabled,
-		...rest
+		onToggle,
 	}: Props = $props();
 
 	const fallbackId = $props.id();
 	const inputId = $derived(id ?? `${fallbackId}-switch`);
+	const labelId = $derived(`${inputId}-label`);
 	const descriptionId = $derived(`${inputId}-description`);
 	const interactiveCursor = $derived(disabled ? 'cursor-not-allowed' : 'cursor-pointer');
 </script>
 
 <div class={`relative flex items-center gap-3 ${className}`.trim()}>
-	<input
-		{...rest}
-		{disabled}
-		id={inputId}
-		class="sr-only"
-		type="checkbox"
-		role="switch"
-		bind:checked
-		aria-describedby={description ? descriptionId : undefined}
-	/>
 	{#if icon}
 		{@render icon()}
 	{/if}
@@ -69,6 +57,7 @@
 				{#if heading === 'h2'}
 					<h2 class={labelClass}>
 						<label
+							id={labelId}
 							for={inputId}
 							class={`${interactiveCursor} after:absolute after:inset-0 after:z-10 after:content-['']`}
 						>{label}</label>
@@ -76,12 +65,14 @@
 				{:else if heading === 'h3'}
 					<h3 class={labelClass}>
 						<label
+							id={labelId}
 							for={inputId}
 							class={`${interactiveCursor} after:absolute after:inset-0 after:z-10 after:content-['']`}
 						>{label}</label>
 					</h3>
 				{:else}
 					<label
+						id={labelId}
 						for={inputId}
 						class={`${interactiveCursor} after:absolute after:inset-0 after:z-10 after:content-[''] ${labelClass}`}
 					>{label}</label>
@@ -92,6 +83,7 @@
 			</div>
 		{:else}
 			<label
+				id={labelId}
 				for={inputId}
 				class={`block ${interactiveCursor} after:absolute after:inset-0 after:z-10 after:content-[''] ${labelClass}`}
 			>{label}</label>
@@ -100,12 +92,16 @@
 			<p id={descriptionId} class={descriptionClass}>{description}</p>
 		{/if}
 	</div>
-	<span
-		aria-hidden="true"
-		class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${checked ? activeTrackClass : 'preset-filled-surface-500'}`}
-	>
-		<span
-			class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${checked ? 'translate-x-5' : ''}`}
-		></span>
-	</span>
+	<SwitchControl
+		id={inputId}
+		{name}
+		{value}
+		{disabled}
+		bind:checked
+		ariaLabelledBy={labelId}
+		ariaDescribedBy={description ? descriptionId : undefined}
+		activeClass={activeTrackClass}
+		focusClass={focusTrackClass}
+		{onToggle}
+	/>
 </div>

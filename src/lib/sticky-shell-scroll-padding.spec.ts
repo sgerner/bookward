@@ -114,6 +114,9 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
     const inlineSrOnlySwitches = elements.filter(isSrOnlySwitchInput);
+    const switchControlUsages = elements.filter(
+      (el) => el.type === "Component" && el.name === "SwitchControl",
+    );
     const switchFieldUsages = elements.filter(
       (el) => el.type === "Component" && el.name === "SwitchField",
     );
@@ -122,12 +125,18 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
         parse(readRelative("./components/SwitchField.svelte"), { modern: true }).fragment,
       );
       expect(
-        switchFieldElements.filter(isSrOnlySwitchInput),
-        "SwitchField should render an input.sr-only[role='switch'] control",
+        switchFieldElements.filter(
+          (el) => el.type === "Component" && el.name === "SwitchControl",
+        ),
+        "SwitchField should render a SwitchControl primitive",
       ).toHaveLength(1);
     }
 
-    const srOnlySwitches = [...inlineSrOnlySwitches, ...switchFieldUsages];
+    const srOnlySwitches = [
+      ...inlineSrOnlySwitches,
+      ...switchControlUsages,
+      ...switchFieldUsages,
+    ];
     expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
     for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
