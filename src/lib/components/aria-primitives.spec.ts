@@ -3,15 +3,18 @@ import { fileURLToPath } from 'node:url';
 import { createRawSnippet } from 'svelte';
 import { parse } from 'svelte/compiler';
 import { render } from 'svelte/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { THEMES } from '#lib/theme.js';
 import ChipToggle, { nextChipPressed } from './ChipToggle.svelte';
 import RadioGroup, { type RadioItemState } from './RadioGroup.svelte';
-import SwitchControl, { nextSwitchChecked, toggleSwitchState } from './SwitchControl.svelte';
+import SwitchControl, { nextSwitchChecked } from './SwitchControl.svelte';
+import { CdpBrowserSession, compileSvelteClientBundle } from './svelte-dom-test-harness';
 
 type AstElement = {
 	type: 'RegularElement' | 'Component';
 	name: string;
+	start: number;
+	end: number;
 	attributes: Array<{
 		type: string;
 		name?: string;
@@ -30,6 +33,8 @@ function collectAstElements(node: unknown): AstElement[] {
 		found.push({
 			type: record.type,
 			name: record.name,
+			start: (record.start as number) ?? 0,
+			end: (record.end as number) ?? 0,
 			attributes: (record.attributes as AstElement['attributes']) ?? [],
 		});
 	}
@@ -83,7 +88,14 @@ describe('ChipToggle primitive', () => {
 });
 
 describe('SwitchControl primitive', () => {
-	it('renders a type="button" role="switch" with labelledby/describedby associations, default focus ring, and hidden form input only when checked', () => {
+	it('renders a type="button" role="switch" with labelledby/describedby associations and hidden form input only when checked', () => {
+		const switchSource = readFileSync(
+			fileURLToPath(new URL('./SwitchControl.svelte', import.meta.url)),
+			'utf8',
+		);
+		expect(switchSource).toContain('.switch-control.switch-control:not(:disabled):focus-visible');
+		expect(switchSource).toContain('var(--focus-ring-outer)');
+
 		const unchecked = render(SwitchControl, {
 			props: {
 				id: 'digest-enabled',
@@ -100,7 +112,7 @@ describe('SwitchControl primitive', () => {
 		expect(unchecked.body).not.toContain('aria-label=');
 		expect(unchecked.body).toContain('aria-labelledby="digest-enabled-label"');
 		expect(unchecked.body).toContain('aria-describedby="digest-enabled-description"');
-		expect(unchecked.body).toContain('focus-visible:outline-secondary-500');
+		expect(unchecked.body).toContain('switch-control');
 		expect(unchecked.body).not.toContain('<input');
 
 		const checked = render(SwitchControl, {
@@ -147,65 +159,188 @@ describe('SwitchControl primitive', () => {
 		expect(nextSwitchChecked(false)).toBe(true);
 		expect(nextSwitchChecked(true)).toBe(false);
 	});
+});
 
-	it('round-trips bound checked state and onToggle callbacks across clicks while guarding disabled switches', () => {
-		let boundChecked = false;
-		const onToggle = vi.fn<(nextChecked: boolean) => void>();
+describe('SwitchControl real Svelte 5 client DOM interactions', () => {
+	let session: CdpBrowserSession;
 
-		const firstPass = render(SwitchControl, {
-			props: {
-				id: 'digest-only-new',
-				name: 'onlyNew',
-				checked: boundChecked,
-				ariaLabelledBy: 'digest-only-new-label',
+	beforeAll(async () => {
+		const bundle = await compileSvelteClientBundle({
+			entryFile: 'src/lib/components/__virtual_switch_entry.ts',
+			files: {
+				'src/lib/components/__virtual_SwitchHost.svelte': `
+					<script lang="ts">
+						import SwitchControl from './SwitchControl.svelte';
+
+						let directChecked = $state(false);
+						let derivedOverride = $state<boolean | null>(null);
+						const derivedChecked = $derived(derivedOverride ?? false);
+						let disabledChecked = $state(false);
+						let toggleEvents = $state<boolean[]>([]);
+					</script>
+
+					<div id="discord-row">
+						<label id="digest-discord-label" for="digest-discord">Discord</label>
+						<p id="digest-discord-description">Post to a webhook</p>
+						<SwitchControl
+							id="digest-discord"
+							name="channels"
+							value="discord"
+							ariaLabelledBy="digest-discord-label"
+							ariaDescribedBy="digest-discord-description"
+							bind:checked={directChecked}
+							onToggle={(next) => toggleEvents.push(next)}
+						/>
+						<output id="direct-state">{String(directChecked)}:{toggleEvents.join(',')}</output>
+					</div>
+
+					<div id="fn-row">
+						<label id="digest-only-new-label" for="digest-only-new">Only send new books</label>
+						<p id="digest-only-new-description">Skip recommendations already included in a digest.</p>
+						<SwitchControl
+							id="digest-only-new"
+							name="onlyNew"
+							ariaLabelledBy="digest-only-new-label"
+							ariaDescribedBy="digest-only-new-description"
+							bind:checked={() => derivedChecked, (next) => (derivedOverride = next)}
+						/>
+						<output id="fn-state">{String(derivedChecked)}</output>
+					</div>
+
+					<div id="disabled-row">
+						<label id="disabled-label" for="disabled-switch">Locked switch</label>
+						<SwitchControl
+							id="disabled-switch"
+							name="locked"
+							disabled={true}
+							ariaLabelledBy="disabled-label"
+							bind:checked={disabledChecked}
+							onToggle={(next) => toggleEvents.push(next)}
+						/>
+						<output id="disabled-state">{String(disabledChecked)}</output>
+					</div>
+				`,
+				'src/lib/components/__virtual_switch_entry.ts': `
+					import { flushSync, mount } from 'svelte';
+					import SwitchHost from './__virtual_SwitchHost.svelte';
+
+					mount(SwitchHost, { target: document.getElementById('app')! });
+					(window as unknown as { __flush: typeof flushSync }).__flush = flushSync;
+				`,
 			},
 		});
-		expect(firstPass.body).toContain('aria-checked="false"');
-		expect(firstPass.body).not.toContain('<input type="hidden"');
+		session = await CdpBrowserSession.launch();
+		await session.loadBundle(bundle);
+	}, 30_000);
 
-		toggleSwitchState({
-			checked: boundChecked,
-			setChecked: (next) => {
-				boundChecked = next;
-			},
-			onToggle,
-		});
-		expect(boundChecked).toBe(true);
-		expect(onToggle).toHaveBeenCalledTimes(1);
-		expect(onToggle).toHaveBeenLastCalledWith(true);
+	afterAll(async () => {
+		await session?.close();
+	});
 
-		const secondPass = render(SwitchControl, {
-			props: {
-				id: 'digest-only-new',
-				name: 'onlyNew',
-				checked: boundChecked,
-				ariaLabelledBy: 'digest-only-new-label',
-			},
+	it('toggles aria-checked, hidden FormData inputs, bound checked state, and AXTree properties via button and label clicks', async () => {
+		const initialAx = await session.getAxSummary('#digest-discord');
+		expect(initialAx).toEqual({
+			role: 'switch',
+			name: 'Discord',
+			description: 'Post to a webhook',
+			checked: 'false',
 		});
-		expect(secondPass.body).toContain('aria-checked="true"');
-		expect(secondPass.body).toContain('<input type="hidden" name="onlyNew" value="on"');
 
-		toggleSwitchState({
-			checked: boundChecked,
-			setChecked: (next) => {
-				boundChecked = next;
-			},
-			onToggle,
+		const afterButtonClick = await session.evaluate<{
+			ariaChecked: string | null;
+			hasHiddenInput: boolean;
+			output: string;
+		}>(`
+			(() => {
+				const btn = document.getElementById('digest-discord');
+				btn.click();
+				window.__flush();
+				const hidden = document.querySelector('#discord-row input[type="hidden"][name="channels"][value="discord"]');
+				return {
+					ariaChecked: btn.getAttribute('aria-checked'),
+					hasHiddenInput: Boolean(hidden),
+					output: document.getElementById('direct-state').textContent ?? '',
+				};
+			})()
+		`);
+		expect(afterButtonClick).toEqual({
+			ariaChecked: 'true',
+			hasHiddenInput: true,
+			output: 'true:true',
 		});
-		expect(boundChecked).toBe(false);
-		expect(onToggle).toHaveBeenCalledTimes(2);
-		expect(onToggle).toHaveBeenLastCalledWith(false);
 
-		toggleSwitchState({
-			checked: boundChecked,
-			disabled: true,
-			setChecked: (next) => {
-				boundChecked = next;
-			},
-			onToggle,
+		const checkedAx = await session.getAxSummary('#digest-discord');
+		expect(checkedAx.checked).toBe('true');
+
+		// Clicking the associated <label for="digest-discord"> toggles back to false and removes hidden input
+		const afterLabelClick = await session.evaluate<{
+			ariaChecked: string | null;
+			hasHiddenInput: boolean;
+			output: string;
+		}>(`
+			(() => {
+				const label = document.getElementById('digest-discord-label');
+				label.click();
+				window.__flush();
+				const btn = document.getElementById('digest-discord');
+				const hidden = document.querySelector('#discord-row input[type="hidden"]');
+				return {
+					ariaChecked: btn.getAttribute('aria-checked'),
+					hasHiddenInput: Boolean(hidden),
+					output: document.getElementById('direct-state').textContent ?? '',
+				};
+			})()
+		`);
+		expect(afterLabelClick).toEqual({
+			ariaChecked: 'false',
+			hasHiddenInput: false,
+			output: 'false:true,false',
 		});
-		expect(boundChecked).toBe(false);
-		expect(onToggle).toHaveBeenCalledTimes(2);
+
+		// Verify Svelte 5 getter/setter bind:checked={() => ..., (next) => ...} round-trips on label + button click
+		const fnRoundTrip = await session.evaluate<{
+			afterFirst: string;
+			afterSecond: string;
+		}>(`
+			(() => {
+				const label = document.getElementById('digest-only-new-label');
+				const btn = document.getElementById('digest-only-new');
+				label.click();
+				window.__flush();
+				const afterFirst = \`\${btn.getAttribute('aria-checked')}:\${document.getElementById('fn-state').textContent}\`;
+				btn.click();
+				window.__flush();
+				const afterSecond = \`\${btn.getAttribute('aria-checked')}:\${document.getElementById('fn-state').textContent}\`;
+				return { afterFirst, afterSecond };
+			})()
+		`);
+		expect(fnRoundTrip).toEqual({
+			afterFirst: 'true:true',
+			afterSecond: 'false:false',
+		});
+
+		// Verify disabled switch ignores both button and label clicks
+		const disabledResult = await session.evaluate<{
+			ariaChecked: string | null;
+			stateText: string;
+			toggleLog: string;
+		}>(`
+			(() => {
+				document.getElementById('disabled-switch').click();
+				document.getElementById('disabled-label').click();
+				window.__flush();
+				return {
+					ariaChecked: document.getElementById('disabled-switch').getAttribute('aria-checked'),
+					stateText: document.getElementById('disabled-state').textContent ?? '',
+					toggleLog: document.getElementById('direct-state').textContent ?? '',
+				};
+			})()
+		`);
+		expect(disabledResult).toEqual({
+			ariaChecked: 'false',
+			stateText: 'false',
+			toggleLog: 'false:true,false',
+		});
 	});
 });
 
@@ -273,6 +408,21 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 		expect(themePickerSource).toContain('labelledBy="appearance-theme-legend"');
 		expect(themePickerSource.match(/<RadioGroup/g)).toHaveLength(2);
 
+		const switchControlAst = collectAstElements(
+			parse(
+				readFileSync(fileURLToPath(new URL('./SwitchControl.svelte', import.meta.url)), 'utf8'),
+				{ modern: true },
+			).fragment,
+		);
+		expect(
+			switchControlAst.filter(
+				(el) =>
+					el.type === 'RegularElement' &&
+					el.name === 'button' &&
+					getStaticAttr(el, 'role') === 'switch',
+			),
+		).toHaveLength(1);
+
 		const pageSource = readFileSync(
 			fileURLToPath(new URL('../../routes/+page.svelte', import.meta.url)),
 			'utf8',
@@ -280,25 +430,36 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 		expect(pageSource).toContain('<ChipToggle');
 		expect(pageSource).toContain('id="mark-read-rating-label"');
 		expect(pageSource).toContain('labelledBy="mark-read-rating-label"');
-		expect(pageSource.match(/<SwitchControl/g)).toHaveLength(4);
+		expect(pageSource.match(/<SwitchControl\b/g)).toHaveLength(6);
 		expect(pageSource).not.toContain('SwitchField');
 		expect(pageSource).not.toMatch(/<input[^>]*role="switch"/);
 
 		const pageElements = collectAstElements(parse(pageSource, { modern: true }).fragment);
+		const stickyShell = pageElements.find(
+			(el) => getStaticAttr(el, 'data-sticky-shell') !== undefined,
+		);
+		expect(stickyShell).toBeDefined();
+
 		const switchControls = pageElements.filter(
 			(el) => el.type === 'Component' && el.name === 'SwitchControl',
 		);
-		expect(switchControls).toHaveLength(4);
+		expect(switchControls).toHaveLength(6);
+		for (const sw of switchControls) {
+			expect(sw.start).toBeGreaterThanOrEqual(stickyShell!.start);
+			expect(sw.end).toBeLessThanOrEqual(stickyShell!.end);
+		}
 
-		const expectedSwitchIds = [
+		const digestSwitches = switchControls.filter((sw) =>
+			(getStaticAttr(sw, 'id') ?? '').startsWith('digest-'),
+		);
+		expect(digestSwitches.map((sw) => getStaticAttr(sw, 'id'))).toEqual([
 			'digest-enabled',
 			'digest-only-new',
 			'digest-discord',
 			'digest-email',
-		];
-		expect(switchControls.map((sw) => getStaticAttr(sw, 'id'))).toEqual(expectedSwitchIds);
+		]);
 
-		for (const sw of switchControls) {
+		for (const sw of digestSwitches) {
 			const id = getStaticAttr(sw, 'id')!;
 			expect(getStaticAttr(sw, 'ariaLabel')).toBeUndefined();
 			expect(getStaticAttr(sw, 'ariaLabelledBy')).toBe(`${id}-label`);

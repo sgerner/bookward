@@ -1,9 +1,3 @@
-<script module lang="ts">
-	export function nextCoverExpanded(expanded: boolean): boolean {
-		return !expanded;
-	}
-</script>
-
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import { scale } from 'svelte/transition';
@@ -27,9 +21,9 @@
 		hasCover = false,
 		expanded = false,
 		id,
-		class: className = '',
+		class: className = 'aspect-[2/3] self-start',
 		onclick,
-		children
+		children,
 	}: Props = $props();
 
 	const fallbackId = $props.id();
@@ -44,7 +38,7 @@
 </script>
 
 <div
-	class={`${hasCover ? 'pointer-events-none absolute inset-0 z-0' : 'hidden'} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-[''] ${className}`.trim()}
+	class={`${hasCover ? 'pointer-events-none absolute inset-0 z-0' : 'hidden'} h-full w-full overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-[''] ${className}`.trim()}
 >
 	<span
 		class="pointer-events-none absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex"

@@ -1,41 +1,28 @@
-<script module lang="ts">
-	import type { ChangeEventHandler } from 'svelte/elements';
-
-	export function applySelectValueChange<Value extends string>(options: {
-		event: Parameters<ChangeEventHandler<HTMLSelectElement>>[0];
-		setValue: (nextValue: Value) => void;
-		onChange?: ChangeEventHandler<HTMLSelectElement> | null;
-	}): Value {
-		const next = options.event.currentTarget.value as Value;
-		options.setValue(next);
-		options.onChange?.(options.event);
-		return next;
-	}
-</script>
-
 <script lang="ts" generics="Value extends string = string">
 	import type { Snippet } from 'svelte';
 	import type { HTMLSelectAttributes } from 'svelte/elements';
 
 	type Props = {
 		label: string;
-		context?: string;
+		srLabel?: string | null;
 		value?: Value;
 		id?: string;
+		describedBy?: string | Array<string | null | undefined | false> | null;
 		class?: string;
 		labelClass?: string;
 		selectClass?: string;
 		children: Snippet;
 	} & Omit<
 		HTMLSelectAttributes,
-		'value' | 'id' | 'class' | 'aria-label' | 'aria-labelledby' | 'children'
+		'value' | 'id' | 'class' | 'aria-label' | 'aria-labelledby' | 'aria-describedby' | 'children'
 	>;
 
 	let {
 		label,
-		context,
+		srLabel = null,
 		value = $bindable(),
 		id,
+		describedBy = null,
 		class: className = '',
 		labelClass = 'block',
 		selectClass = 'select mt-1 min-h-11 w-full preset-tonal-surface',
@@ -46,29 +33,37 @@
 
 	const fallbackId = $props.id();
 	const selectId = $derived(id ?? `${fallbackId}-select`);
-	const labelId = $derived(`${selectId}-label`);
-	const contextId = $derived(`${selectId}-context`);
+	const cleanSrLabel = $derived(
+		typeof srLabel === 'string' && srLabel.trim() ? srLabel.trim() : '',
+	);
+	const describedByAttr = $derived.by(() => {
+		const raw = Array.isArray(describedBy)
+			? describedBy
+			: typeof describedBy === 'string'
+				? describedBy.split(/\s+/)
+				: [];
+		const tokens: string[] = [];
+		for (const item of raw) {
+			if (typeof item !== 'string') continue;
+			for (const token of item.trim().split(/\s+/)) {
+				if (token && !tokens.includes(token)) tokens.push(token);
+			}
+		}
+		return tokens.length > 0 ? tokens.join(' ') : undefined;
+	});
 </script>
 
 <div class={className}>
-	<label id={labelId} for={selectId} class={labelClass}>{label}</label>
-	{#if context}
-		<span id={contextId} class="sr-only">{context}</span>
-	{/if}
+	<label for={selectId} class={labelClass}
+		>{label}{#if cleanSrLabel}<span class="sr-only">{` ${cleanSrLabel}`}</span>{/if}</label
+	>
 	<select
 		{...rest}
 		id={selectId}
 		bind:value
-		onchange={(event) =>
-			applySelectValueChange({
-				event,
-				setValue: (next) => {
-					value = next;
-				},
-				onChange: onchange,
-			})}
+		{onchange}
 		class={selectClass}
-		aria-labelledby={context ? `${labelId} ${contextId}` : labelId}
+		aria-describedby={describedByAttr}
 	>
 		{@render children()}
 	</select>

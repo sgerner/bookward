@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import { parse } from "svelte/compiler";
 
 type ElementMatch = {
-  type: "RegularElement" | "Component";
   name: string;
   start: number;
   end: number;
@@ -49,7 +48,6 @@ function collectElements(node: unknown): ElementMatch[] {
       }
     }
     found.push({
-      type: record.type,
       name: record.name,
       start: record.start as number,
       end: record.end as number,
@@ -104,23 +102,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const switchControlElements = collectElements(
-      parse(readRelative("./components/SwitchControl.svelte"), { modern: true }).fragment,
-    );
-    expect(
-      switchControlElements.filter(
-        (el) =>
-          el.type === "RegularElement" &&
-          el.name === "button" &&
-          el.attributes.get("type") === "button" &&
-          el.attributes.get("role") === "switch",
-      ),
-      "SwitchControl should render a real button[role='switch'] element",
-    ).toHaveLength(1);
-
-    const srOnlySwitches = elements.filter(
-      (el) => el.type === "Component" && el.name === "SwitchControl",
-    );
+    const srOnlySwitches = elements.filter((el) => el.name === "SwitchControl");
     expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
     for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
@@ -136,7 +118,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     }
   });
 
-  it("defines scoped root scroll-padding and sr-only switch scroll-margin-block rules in layout.css", () => {
+  it("defines scoped root scroll-padding and switch scroll-margin-block rules in layout.css", () => {
     const css = readRelative("../routes/layout.css");
 
     expect(css).toMatch(
@@ -146,7 +128,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
       /@media\s*\(min-width:\s*48rem\)\s*\{\s*html:has\(\[data-sticky-shell\]\)\s*\{\s*scroll-padding-bottom:\s*0;\s*\}\s*\}/s,
     );
     expect(css).toMatch(
-      /\[data-sticky-shell\]\s+input\.sr-only\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
+      /\[data-sticky-shell\]\s+\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
     );
     expect(css).not.toMatch(/(?:^|\n)\s*html\s*\{[^}]*scroll-padding/s);
   });
