@@ -30,6 +30,7 @@ from .config import settings
 LOGGER = logging.getLogger(__name__)
 SESSION_IDLE_HOURS = 24
 SESSION_ABSOLUTE_DAYS = 7
+ENROLLMENT_VERIFICATION_MINUTES = 10
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
 
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     profile_id TEXT NOT NULL UNIQUE REFERENCES profiles(id),
     username TEXT NOT NULL,
     normalized_username TEXT NOT NULL UNIQUE,
+    has_local_username INTEGER NOT NULL DEFAULT 1 CHECK(has_local_username IN (0,1)),
     display_name TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
     password_hash TEXT,
@@ -72,7 +74,8 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     last_seen_at TEXT NOT NULL,
     idle_expires_at TEXT NOT NULL,
     absolute_expires_at TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    enrollment_verified_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_account ON auth_sessions(account_id, revoked_at);
 CREATE TABLE IF NOT EXISTS auth_transactions (
@@ -80,7 +83,7 @@ CREATE TABLE IF NOT EXISTS auth_transactions (
     csrf_hash TEXT NOT NULL,
     nonce TEXT NOT NULL,
     code_verifier TEXT NOT NULL,
-    purpose TEXT NOT NULL CHECK(purpose IN ('login','link')),
+    purpose TEXT NOT NULL CHECK(purpose IN ('login','link','enroll')),
     account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
     session_hash TEXT,
     expires_at TEXT NOT NULL,
@@ -143,11 +146,56 @@ def normalize_username(value: str) -> str:
     return value.strip().casefold()
 
 
+def oidc_surrogate_username(issuer: str, subject: str) -> str:
+    return RESERVED_USERNAME_PREFIX + hashlib.sha256(f"{issuer}\0{subject}".encode()).hexdigest()[:40]
+
+
 def has_local_username(username: str | None) -> bool:
     if not username:
         return False
     normalized = normalize_username(username)
     return bool(normalized) and not normalized.startswith(RESERVED_USERNAME_PREFIX)
+
+
+def _row_has_local_username(row) -> bool:
+    if "has_local_username" in row.keys():
+        return bool(row["has_local_username"])
+    return has_local_username(row["username"])
+
+
+def is_enrollment_verified(value: str | None, *, now: datetime | None = None) -> bool:
+    if not value:
+        return False
+    try:
+        verified_at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    if verified_at.tzinfo is None:
+        verified_at = verified_at.replace(tzinfo=timezone.utc)
+    reference = now or utc_now()
+    age = reference - verified_at
+    return timedelta(seconds=-60) <= age <= timedelta(minutes=ENROLLMENT_VERIFICATION_MINUTES)
+
+
+def _backfill_has_local_username(con) -> None:
+    candidates = con.execute(
+        "SELECT id,normalized_username,password_hash FROM accounts WHERE normalized_username LIKE 'oidc:%'"
+    ).fetchall()
+    for candidate in candidates:
+        identities = con.execute(
+            "SELECT issuer,subject FROM oidc_identities WHERE account_id=?",
+            (candidate["id"],),
+        ).fetchall()
+        matches_surrogate = any(
+            candidate["normalized_username"]
+            == oidc_surrogate_username(identity["issuer"], identity["subject"])
+            for identity in identities
+        )
+        if candidate["password_hash"] is None or matches_surrogate:
+            con.execute(
+                "UPDATE accounts SET has_local_username=0 WHERE id=?",
+                (candidate["id"],),
+            )
 
 
 def validate_username(username: str) -> str:
@@ -173,9 +221,50 @@ def initialize_auth() -> None:
         account_columns = {row[1] for row in con.execute("PRAGMA table_info(accounts)")}
         if "must_change_password" not in account_columns:
             con.execute("ALTER TABLE accounts ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        if "has_local_username" not in account_columns:
+            con.execute(
+                "ALTER TABLE accounts ADD COLUMN has_local_username INTEGER NOT NULL DEFAULT 1 "
+                "CHECK(has_local_username IN (0,1))"
+            )
+            _backfill_has_local_username(con)
+        session_columns = {row[1] for row in con.execute("PRAGMA table_info(auth_sessions)")}
+        if "enrollment_verified_at" not in session_columns:
+            con.execute("ALTER TABLE auth_sessions ADD COLUMN enrollment_verified_at TEXT")
+        transaction_sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='auth_transactions'"
+        ).fetchone()
         transaction_columns = {row[1] for row in con.execute("PRAGMA table_info(auth_transactions)")}
-        if "session_hash" not in transaction_columns:
-            con.execute("ALTER TABLE auth_transactions ADD COLUMN session_hash TEXT")
+        if transaction_sql and (
+            "'enroll'" not in (transaction_sql[0] or "") or "session_hash" not in transaction_columns
+        ):
+            session_expr = "session_hash" if "session_hash" in transaction_columns else "NULL"
+            con.execute("ALTER TABLE auth_transactions RENAME TO auth_transactions_legacy")
+            con.execute(
+                """
+                CREATE TABLE auth_transactions (
+                    state_hash TEXT PRIMARY KEY,
+                    csrf_hash TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    code_verifier TEXT NOT NULL,
+                    purpose TEXT NOT NULL CHECK(purpose IN ('login','link','enroll')),
+                    account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+                    session_hash TEXT,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            con.execute(
+                f"""
+                INSERT INTO auth_transactions(
+                    state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, session_hash, expires_at, created_at
+                )
+                SELECT state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, {session_expr}, expires_at, created_at
+                FROM auth_transactions_legacy
+                WHERE purpose IN ('login', 'link', 'enroll')
+                """
+            )
+            con.execute("DROP TABLE auth_transactions_legacy")
         con.execute(
             "INSERT OR IGNORE INTO profiles(id,display_name) VALUES('legacy','My profile')"
         )
@@ -250,57 +339,55 @@ def create_account(username: str, password: str, display_name: str = "", role: s
 def update_password(account_id: str, password: str, username: str | None = None) -> None:
     if len(password) < 12 or len(password) > 1024:
         raise ValueError("Use a password between 12 and 1024 characters.")
-    supplied_username = username.strip() if username is not None else ""
-    if supplied_username:
-        supplied_username = validate_username(supplied_username)
+    raw_username = username.strip() if username is not None else ""
     with auth_connect() as con:
         current = con.execute(
-            "SELECT username,status FROM accounts WHERE id=?", (account_id,)
+            "SELECT username,has_local_username,status FROM accounts WHERE id=?", (account_id,)
         ).fetchone()
         if not current or current["status"] != "active":
             raise LookupError("Account not found.")
-        if not has_local_username(current["username"]) and not supplied_username:
-            raise ValueError("Choose a username for local sign-in.")
-        if (
-            has_local_username(current["username"])
-            and supplied_username
-            and normalize_username(supplied_username) != normalize_username(current["username"])
-        ):
-            raise ValueError("Username cannot be changed once set.")
+        currently_local = _row_has_local_username(current)
+        if currently_local:
+            if raw_username and normalize_username(raw_username) != normalize_username(current["username"]):
+                raise ValueError("Username cannot be changed once set.")
+            claimed_username = ""
+        else:
+            if not raw_username:
+                raise ValueError("Choose a username for local sign-in.")
+            claimed_username = validate_username(raw_username)
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        current = con.execute(
-            "SELECT username,status FROM accounts WHERE id=?", (account_id,)
-        ).fetchone()
-        if not current or current["status"] != "active":
+        try:
+            current = con.execute(
+                "SELECT username,has_local_username,status FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if not current or current["status"] != "active":
+                raise LookupError("Account not found.")
+            if _row_has_local_username(current):
+                if raw_username and normalize_username(raw_username) != normalize_username(current["username"]):
+                    raise ValueError("Username cannot be changed once set.")
+                con.execute(
+                    "UPDATE accounts SET password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND status='active'",
+                    (password_hash, account_id),
+                )
+            else:
+                if not raw_username:
+                    raise ValueError("Choose a username for local sign-in.")
+                claimed_username = claimed_username or validate_username(raw_username)
+                con.execute(
+                    "UPDATE accounts SET username=?,normalized_username=?,has_local_username=1,password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND status='active'",
+                    (claimed_username, normalize_username(claimed_username), password_hash, account_id),
+                )
+            con.execute(
+                "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL",
+                (account_id,),
+            )
+        except Exception:
             con.rollback()
-            raise LookupError("Account not found.")
-        if has_local_username(current["username"]):
-            if (
-                supplied_username
-                and normalize_username(supplied_username) != normalize_username(current["username"])
-            ):
-                con.rollback()
-                raise ValueError("Username cannot be changed once set.")
-            con.execute(
-                "UPDATE accounts SET password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status='active'",
-                (password_hash, account_id),
-            )
-        else:
-            if not supplied_username:
-                con.rollback()
-                raise ValueError("Choose a username for local sign-in.")
-            con.execute(
-                "UPDATE accounts SET username=?,normalized_username=?,password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status='active'",
-                (supplied_username, normalize_username(supplied_username), password_hash, account_id),
-            )
-        con.execute(
-            "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL",
-            (account_id,),
-        )
+            raise
 
 
 def reset_password(account_id: str, password: str) -> None:
@@ -308,29 +395,31 @@ def reset_password(account_id: str, password: str) -> None:
         raise ValueError("Use a password between 12 and 1024 characters.")
     with auth_connect() as con:
         target = con.execute(
-            "SELECT username,status FROM accounts WHERE id=?", (account_id,)
+            "SELECT username,has_local_username,status FROM accounts WHERE id=?", (account_id,)
         ).fetchone()
         if not target or target["status"] != "active":
             raise LookupError("Account not found.")
-        if not has_local_username(target["username"]):
+        if not _row_has_local_username(target):
             raise ValueError("SSO-only accounts must choose a local username before a password can be reset.")
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        target = con.execute(
-            "SELECT username,status FROM accounts WHERE id=?", (account_id,)
-        ).fetchone()
-        if not target or target["status"] != "active":
+        try:
+            target = con.execute(
+                "SELECT username,has_local_username,status FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if not target or target["status"] != "active":
+                raise LookupError("Account not found.")
+            if not _row_has_local_username(target):
+                raise ValueError("SSO-only accounts must choose a local username before a password can be reset.")
+            con.execute(
+                "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='active'", (password_hash, account_id)
+            )
+            con.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL", (account_id,))
+        except Exception:
             con.rollback()
-            raise LookupError("Account not found.")
-        if not has_local_username(target["username"]):
-            con.rollback()
-            raise ValueError("SSO-only accounts must choose a local username before a password can be reset.")
-        con.execute(
-            "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND status='active'", (password_hash, account_id)
-        )
-        con.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL", (account_id,))
+            raise
 
 
 def _account(row) -> dict:
@@ -338,7 +427,7 @@ def _account(row) -> dict:
         "id": row["id"],
         "profile_id": row["profile_id"],
         "username": row["username"],
-        "has_local_username": has_local_username(row["username"]),
+        "has_local_username": _row_has_local_username(row),
         "display_name": row["display_name"],
         "role": row["role"],
         "status": row["status"],
@@ -374,14 +463,10 @@ def authenticate_local(username: str, password: str, remote_address: str = ""):
         if recent >= 10:
             con.rollback()
             return None
-        found = (
-            con.execute(
-                "SELECT * FROM accounts WHERE normalized_username=? AND status='active'",
-                (normalized,),
-            ).fetchone()
-            if has_local_username(normalized)
-            else None
-        )
+        found = con.execute(
+            "SELECT * FROM accounts WHERE normalized_username=? AND status='active' AND has_local_username=1",
+            (normalized,),
+        ).fetchone()
         valid = False
         con.execute("DELETE FROM login_attempts WHERE attempted_at<?", (iso(utc_now() - timedelta(days=1)),))
         if found and found["password_hash"]:
@@ -444,7 +529,8 @@ def resolve_session(raw: str | None):
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
         found = con.execute(
-            "SELECT a.*,s.token_hash,s.created_at session_created_at,s.idle_expires_at,s.absolute_expires_at,s.auth_version session_auth_version "
+            "SELECT a.*,s.token_hash,s.created_at session_created_at,s.idle_expires_at,s.absolute_expires_at,"
+            "s.auth_version session_auth_version,s.enrollment_verified_at "
             "FROM auth_sessions s JOIN accounts a ON a.id=s.account_id "
             "JOIN profiles p ON p.id=a.profile_id "
             "WHERE s.token_hash=? AND s.revoked_at IS NULL AND a.status='active' AND p.status='active'",
@@ -464,7 +550,22 @@ def resolve_session(raw: str | None):
         con.commit()
         account = _account(found)
         account["session_created_at"] = found["session_created_at"]
+        account["enrollment_verified_at"] = found["enrollment_verified_at"]
+        account["enrollment_verified"] = is_enrollment_verified(found["enrollment_verified_at"], now=now)
         return account
+
+
+def mark_session_enrollment_verified(raw: str | None) -> bool:
+    if not raw or len(raw) > 256:
+        return False
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    now = iso(utc_now())
+    with auth_connect() as con:
+        updated = con.execute(
+            "UPDATE auth_sessions SET enrollment_verified_at=? WHERE token_hash=? AND revoked_at IS NULL",
+            (now, digest),
+        ).rowcount
+        return bool(updated)
 
 
 def revoke_session(raw: str | None):
@@ -529,7 +630,7 @@ def link_oidc_identity(account_id: str, issuer: str, subject: str, email: str = 
 
 def auth_methods(account_id: str):
     with auth_connect() as con:
-        account = con.execute("SELECT username,password_hash FROM accounts WHERE id=?", (account_id,)).fetchone()
+        account = con.execute("SELECT username,has_local_username,password_hash FROM accounts WHERE id=?", (account_id,)).fetchone()
         if not account:
             raise LookupError("Account not found.")
         identities = [dict(row) for row in con.execute(
@@ -538,7 +639,7 @@ def auth_methods(account_id: str):
         )]
         return {
             "password_enabled": bool(account["password_hash"]),
-            "has_local_username": has_local_username(account["username"]),
+            "has_local_username": _row_has_local_username(account),
             "oidc_identities": identities,
         }
 
@@ -546,7 +647,7 @@ def auth_methods(account_id: str):
 def unlink_oidc_identity(account_id: str, identity_id: int):
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        account = con.execute("SELECT username,password_hash FROM accounts WHERE id=?", (account_id,)).fetchone()
+        account = con.execute("SELECT username,has_local_username,password_hash FROM accounts WHERE id=?", (account_id,)).fetchone()
         identity = con.execute(
             "SELECT id FROM oidc_identities WHERE id=? AND account_id=?", (identity_id, account_id)
         ).fetchone()
@@ -556,7 +657,7 @@ def unlink_oidc_identity(account_id: str, identity_id: int):
         if not account or not identity:
             con.rollback()
             raise LookupError("Login method not found.")
-        local_login_ready = bool(account["password_hash"]) and has_local_username(account["username"])
+        local_login_ready = bool(account["password_hash"]) and _row_has_local_username(account)
         if not local_login_ready and not others:
             con.rollback()
             raise ValueError("Add another login method before removing this one.")
@@ -578,7 +679,7 @@ def create_oidc_account(issuer: str, subject: str, email: str = "", display_name
     profile_id = uuid.uuid4().hex
     account_id = uuid.uuid4().hex
     display = (display_name.strip() or email.strip() or "SSO user")[:160]
-    stable_login = "oidc:" + hashlib.sha256(f"{issuer}\0{subject}".encode()).hexdigest()[:40]
+    stable_login = oidc_surrogate_username(issuer, subject)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
         existing = con.execute(
@@ -593,8 +694,8 @@ def create_oidc_account(issuer: str, subject: str, email: str = "", display_name
             return _account(existing)
         con.execute("INSERT INTO profiles(id,display_name) VALUES(?,?)", (profile_id, display))
         con.execute(
-            "INSERT INTO accounts(id,profile_id,username,normalized_username,display_name,role,password_hash) "
-            "VALUES(?,?,?,?,?,'user',NULL)",
+            "INSERT INTO accounts(id,profile_id,username,normalized_username,has_local_username,display_name,role,password_hash) "
+            "VALUES(?,?,?,?,0,?,'user',NULL)",
             (account_id, profile_id, stable_login, stable_login, display),
         )
         con.execute(
@@ -608,8 +709,9 @@ def create_oidc_account(issuer: str, subject: str, email: str = "", display_name
 def create_oidc_transaction(*, state: str, csrf: str, nonce: str, verifier: str,
                             purpose: str, account_id: str | None,
                             session_token: str | None = None):
-    if (purpose not in {"login", "link"} or (purpose == "link") != bool(account_id)
-            or (purpose == "link") != bool(session_token)):
+    session_bound = purpose in {"link", "enroll"}
+    if (purpose not in {"login", "link", "enroll"} or session_bound != bool(account_id)
+            or session_bound != bool(session_token)):
         raise ValueError("Invalid identity transaction.")
     session_hash = hashlib.sha256(session_token.encode()).hexdigest() if session_token else None
     with auth_connect() as con:
@@ -639,7 +741,7 @@ def consume_oidc_transaction(state: str, csrf: str, session_token: str | None = 
         if not found:
             con.rollback()
             return None
-        if found["purpose"] == "link":
+        if found["purpose"] in {"link", "enroll"}:
             presented = hashlib.sha256(session_token.encode()).hexdigest() if session_token else ""
             if not found["session_hash"] or not hmac.compare_digest(found["session_hash"], presented):
                 con.rollback()

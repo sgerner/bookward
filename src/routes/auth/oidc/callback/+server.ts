@@ -3,11 +3,12 @@ import type { RequestHandler } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { safeNext } from '#lib/server/safe-next.js';
 
-type CallbackResult = { linked?: boolean; session_token?: string; max_age?: number };
+type CallbackResult = { linked?: boolean; enroll_verified?: boolean; session_token?: string; max_age?: number };
 
 export const GET: RequestHandler = async ({ url, cookies }) => {
 	const stateCookie = cookies.get('oidc_state');
-	const intent = cookies.get('oidc_intent') === 'link' ? 'link' : 'login';
+	const rawIntent = cookies.get('oidc_intent');
+	const intent = rawIntent === 'link' || rawIntent === 'enroll' ? rawIntent : 'login';
 	const next = intent === 'login' ? safeNext(cookies.get('oidc_next')) : '/';
 	cookies.delete('oidc_state', { path: '/auth/oidc' });
 	cookies.delete('oidc_intent', { path: '/auth/oidc' });
@@ -17,14 +18,15 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		if (next !== '/') query.set('next', next);
 		return `/login?${query}`;
 	};
+	const accountErrorLocation = intent === 'enroll' ? '/account?enroll_error=1' : '/account?link_error=1';
 	const providerError = url.searchParams.get('error');
 	if (providerError) {
-		throw redirect(303, intent === 'link' ? '/account?link_error=1' : loginLocation('sso'));
+		throw redirect(303, intent === 'login' ? loginLocation('sso') : accountErrorLocation);
 	}
 	const code = url.searchParams.get('code');
 	const state = url.searchParams.get('state');
 	if (!stateCookie || !code || !state) {
-		throw redirect(303, intent === 'link' ? '/account?link_error=1' : loginLocation('sso'));
+		throw redirect(303, intent === 'login' ? loginLocation('sso') : accountErrorLocation);
 	}
 	try {
 		const query = new URLSearchParams({ code, state });
@@ -39,10 +41,11 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 			throw redirect(303, next);
 		}
 		if (result.linked) throw redirect(303, '/account?linked=1');
+		if (result.enroll_verified) throw redirect(303, '/account?enroll=1');
 		throw redirect(303, loginLocation('sso'));
 	} catch (error) {
 		if (error && typeof error === 'object' && 'status' in error && 'location' in error) throw error;
-		if (intent === 'link') throw redirect(303, '/account?link_error=1');
+		if (intent !== 'login') throw redirect(303, accountErrorLocation);
 		if (error instanceof EngineError && error.status === 403) throw redirect(303, loginLocation('unlinked'));
 		throw redirect(303, loginLocation('sso'));
 	}

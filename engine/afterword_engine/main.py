@@ -179,6 +179,11 @@ def _require_recent_authentication(account):
         raise HTTPException(401, "Sign in again before adding a login method")
 
 
+def _require_enrollment_verification(account):
+    if not identity_store.is_enrollment_verified(account.get("enrollment_verified_at")):
+        raise HTTPException(401, "Confirm with single sign-on before adding a local password")
+
+
 def _mark_private_no_store(response: Response) -> None:
     """Prevent shared/private caching while preserving stream directives."""
     content_type = response.headers.get("content-type", "").lower()
@@ -803,8 +808,16 @@ def initial_admin_setup(payload: InitialAdminIn):
 def auth_me(request: Request):
     account = _principal(request)
     return {
-        **{key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")},
-        "has_local_username": identity_store.has_local_username(account.get("username")),
+        key: account[key]
+        for key in (
+            "id",
+            "profile_id",
+            "username",
+            "has_local_username",
+            "display_name",
+            "role",
+            "must_change_password",
+        )
     }
 
 
@@ -818,7 +831,7 @@ def auth_logout(request: Request):
 def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
-    local_username = identity_store.has_local_username(account.get("username"))
+    local_username = bool(methods["has_local_username"])
     if methods["password_enabled"] and local_username:
         verified = identity_store.authenticate_local(
             account["username"], payload.current_password,
@@ -827,7 +840,7 @@ def change_password(payload: PasswordChangeIn, request: Request):
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
-        _require_recent_authentication(account)
+        _require_enrollment_verification(account)
     try:
         identity_store.update_password(account["id"], payload.new_password, payload.username)
     except sqlite3.IntegrityError as exc:
@@ -852,7 +865,7 @@ def auth_identities(request: Request):
     methods = identity_store.auth_methods(account["id"])
     return {
         **methods,
-        "has_local_username": identity_store.has_local_username(account.get("username")),
+        "enrollment_verified": bool(account.get("enrollment_verified")),
     }
 
 
@@ -870,12 +883,7 @@ def auth_unlink_identity(identity_id: int, request: Request):
 @app.get("/admin/accounts")
 def admin_accounts(request: Request):
     _require_admin(request)
-    return {
-        "accounts": [
-            {**item, "has_local_username": identity_store.has_local_username(item.get("username"))}
-            for item in identity_store.accounts_list()
-        ]
-    }
+    return {"accounts": identity_store.accounts_list()}
 
 
 @app.post("/admin/accounts")
@@ -896,8 +904,8 @@ def admin_create_account(payload: AccountCreateIn, request: Request):
         LOGGER.exception("Could not initialize profile database for account %s", account["id"])
         raise HTTPException(500, "The account was created but its profile could not be initialized") from exc
     return {
-        **{key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")},
-        "has_local_username": identity_store.has_local_username(account.get("username")),
+        key: account[key]
+        for key in ("id", "profile_id", "username", "has_local_username", "display_name", "role", "status")
     }
 
 
@@ -996,23 +1004,30 @@ async def _oidc_metadata():
 
 
 @app.get("/auth/oidc/start")
-async def oidc_start(request: Request, intent: Literal["login", "link"] = "login"):
+async def oidc_start(request: Request, intent: Literal["login", "link", "enroll"] = "login"):
     account = getattr(request.state, "account", None)
     if intent == "link" and not account:
         raise HTTPException(401, "Sign in before linking an SSO identity")
+    if intent == "enroll" and not account:
+        raise HTTPException(401, "Sign in before confirming single sign-on")
     if intent == "link":
         _require_recent_authentication(account)
+    if intent == "enroll":
+        methods = identity_store.auth_methods(account["id"])
+        if not methods["oidc_identities"]:
+            raise HTTPException(400, "Link a single sign-on identity before confirming with SSO")
     issuer, redirect_uri, metadata = await _oidc_metadata()
     state = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    session_bound = intent in {"link", "enroll"}
     try:
         identity_store.create_oidc_transaction(
             state=state, csrf=csrf, nonce=nonce, verifier=verifier,
-            purpose=intent, account_id=account["id"] if intent == "link" else None,
-            session_token=request.headers.get("x-bookward-session") if intent == "link" else None,
+            purpose=intent, account_id=account["id"] if session_bound else None,
+            session_token=request.headers.get("x-bookward-session") if session_bound else None,
         )
     except RuntimeError as exc:
         raise HTTPException(429, "Too many pending SSO sign-ins. Try again shortly.") from exc
@@ -1026,6 +1041,8 @@ async def oidc_start(request: Request, intent: Literal["login", "link"] = "login
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
+    if intent == "enroll":
+        query_values["prompt"] = "login"
     authorization_endpoint = urlparse(metadata["authorization_endpoint"])
     query = urlencode(
         {**dict(parse_qsl(authorization_endpoint.query, keep_blank_values=True)), **query_values}
@@ -1097,6 +1114,17 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject or len(subject) > 255:
             raise ValueError("Invalid subject")
+        if transaction_record["purpose"] == "enroll" and claims.get("auth_time") is not None:
+            auth_time = claims.get("auth_time")
+            now_epoch = time.time()
+            max_age_seconds = identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60 + 60
+            if (
+                isinstance(auth_time, bool)
+                or not isinstance(auth_time, (int, float))
+                or auth_time < now_epoch - max_age_seconds
+                or auth_time > now_epoch + 60
+            ):
+                raise ValueError("Stale authentication time")
     except Exception as exc:
         LOGGER.info("Rejected OIDC callback: %s", type(exc).__name__)
         raise HTTPException(401, "The SSO provider could not verify this sign-in") from exc
@@ -1114,6 +1142,16 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         except PermissionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"linked": True, "account": current}
+    if transaction_record["purpose"] == "enroll":
+        current = getattr(request.state, "account", None)
+        if not current or current["id"] != transaction_record["account_id"]:
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        matched = identity_store.account_for_oidc_identity(issuer, subject)
+        if not matched or matched["id"] != current["id"]:
+            raise HTTPException(403, "Sign in with an SSO identity already linked to this account")
+        if not identity_store.mark_session_enrollment_verified(request.headers.get("x-bookward-session")):
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        return {"enroll_verified": True, "account": current}
 
     account = identity_store.account_for_oidc_identity(issuer, subject)
     if not account and settings.oidc_auto_provision:

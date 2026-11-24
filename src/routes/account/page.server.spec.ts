@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { engine } = vi.hoisted(() => ({
-	engine: vi.fn(),
+	engine: vi.fn()
 }));
 
 vi.mock('#lib/server/engine.js', () => ({
@@ -13,7 +13,7 @@ vi.mock('#lib/server/engine.js', () => ({
 			super(message);
 		}
 	},
-	engine,
+	engine
 }));
 
 import { actions, load } from './+page.server';
@@ -21,82 +21,105 @@ import { actions, load } from './+page.server';
 describe('account page server', () => {
 	beforeEach(() => engine.mockReset());
 
-	it('derives forcePasswordChange from locals.user.must_change_password and clears stale query flags', async () => {
+	it('propagates enrollment verification state for SSO-only accounts while hiding surrogate usernames', async () => {
 		engine
-			.mockResolvedValueOnce({ password_enabled: true, has_local_username: true, oidc_identities: [] })
-			.mockResolvedValueOnce({ oidc_enabled: false });
+			.mockResolvedValueOnce({
+				password_enabled: false,
+				has_local_username: false,
+				enrollment_verified: true,
+				oidc_identities: [{ id: 1, issuer: 'https://idp.example', email: 'sso@example.test', created_at: '2026-10-01T00:00:00Z' }]
+			})
+			.mockResolvedValueOnce({ oidc_enabled: true });
 
-		const forced = await load({
+		const loaded = await load({
 			locals: {
 				user: {
-					id: 'reader-1',
-					profile_id: 'profile-1',
-					username: 'reader',
-					has_local_username: true,
-					display_name: 'Reader',
+					id: 'sso-1',
+					profile_id: 'sso-profile',
+					username: 'oidc:1234567890abcdef',
+					has_local_username: false,
+					display_name: 'SSO Reader',
 					role: 'user',
-					must_change_password: true,
-				},
+					must_change_password: false
+				}
 			},
-			url: new URL('https://bookward.test/account'),
+			url: new URL('https://bookward.test/account?enroll=1')
 		} as never);
 
-		expect(forced).toMatchObject({ forcePasswordChange: true });
-
-		await expect(
-			load({
-				locals: {
-					user: {
-						id: 'reader-1',
-						profile_id: 'profile-1',
-						username: 'reader',
-						has_local_username: true,
-						display_name: 'Reader',
-						role: 'user',
-						must_change_password: false,
-					},
-				},
-				url: new URL('https://bookward.test/account?force_password_change=1'),
-			} as never)
-		).rejects.toMatchObject({ status: 303, location: '/account' });
+		expect(loaded).toMatchObject({
+			user: { username: '', has_local_username: false },
+			enrollmentVerified: true,
+			enrollConfirmed: true,
+			enrollError: false
+		});
 	});
 
-	it('redirects away from ?force_password_change=1 into the workspace after completing a forced password update', async () => {
-		engine.mockResolvedValueOnce({ session_token: 'rotated-session', max_age: 86400 });
+	it('preserves legacy oidc:-prefixed local accounts when has_local_username is true', async () => {
+		engine
+			.mockResolvedValueOnce({
+				password_enabled: true,
+				has_local_username: true,
+				enrollment_verified: false,
+				oidc_identities: []
+			})
+			.mockResolvedValueOnce({ oidc_enabled: false });
+
+		const loaded = await load({
+			locals: {
+				user: {
+					id: 'legacy-1',
+					profile_id: 'legacy-profile',
+					username: 'oidc:legacy-reader',
+					has_local_username: true,
+					display_name: 'Legacy Reader',
+					role: 'user',
+					must_change_password: false
+				}
+			},
+			url: new URL('https://bookward.test/account')
+		} as never);
+
+		expect(loaded).toMatchObject({
+			user: { username: 'oidc:legacy-reader', has_local_username: true },
+			enrollmentVerified: false
+		});
+
 		const cookies = { set: vi.fn() };
-		const form = new URLSearchParams({
-			current_password: 'temporary-password-123',
-			new_password: 'personal-password-456',
-		});
-		const request = new Request('https://bookward.test/account?/changePassword', {
-			method: 'POST',
-			headers: { 'content-type': 'application/x-www-form-urlencoded' },
-			body: form,
-		});
+		engine.mockResolvedValueOnce({ session_token: 'rotated-legacy-session', max_age: 86400 });
+		const updated = await actions.changePassword({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				headers: { 'content-type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({
+					current_password: 'legacy-password-123',
+					new_password: 'updated-password-456'
+				})
+			}),
+			cookies,
+			url: new URL('https://bookward.test/account?/changePassword'),
+			locals: {
+				user: {
+					id: 'legacy-1',
+					profile_id: 'legacy-profile',
+					username: 'oidc:legacy-reader',
+					has_local_username: true,
+					display_name: 'Legacy Reader',
+					role: 'user',
+					must_change_password: false
+				}
+			}
+		} as never);
 
-		await expect(
-			actions.changePassword({
-				request,
-				cookies,
-				url: new URL(request.url),
-				locals: {
-					user: {
-						id: 'reader-1',
-						profile_id: 'profile-1',
-						username: 'reader',
-						has_local_username: true,
-						display_name: 'Reader',
-						role: 'user',
-						must_change_password: true,
-					},
-				},
-			} as never)
-		).rejects.toMatchObject({ status: 303, location: '/' });
-
-		expect(cookies.set).toHaveBeenCalledWith(
-			'bookward_session',
-			'rotated-session',
-			expect.objectContaining({ httpOnly: true, path: '/', maxAge: 86400 })
+		expect(updated).toEqual({ message: 'Password updated.' });
+		expect(engine).toHaveBeenLastCalledWith(
+			'/auth/password/change',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({
+					current_password: 'legacy-password-123',
+					new_password: 'updated-password-456'
+				})
+			})
 		);
 	});
 
@@ -110,19 +133,19 @@ describe('account page server', () => {
 				has_local_username: false,
 				display_name: 'SSO Reader',
 				role: 'user',
-				must_change_password: false,
-			},
+				must_change_password: false
+			}
 		};
 
 		const missingUsername = await actions.changePassword({
 			request: new Request('https://bookward.test/account?/changePassword', {
 				method: 'POST',
 				headers: { 'content-type': 'application/x-www-form-urlencoded' },
-				body: new URLSearchParams({ new_password: 'personal-password-456' }),
+				body: new URLSearchParams({ new_password: 'personal-password-456' })
 			}),
 			cookies,
 			url: new URL('https://bookward.test/account?/changePassword'),
-			locals: ssoLocals,
+			locals: ssoLocals
 		} as never);
 		expect(missingUsername).toMatchObject({ status: 400 });
 
@@ -130,11 +153,11 @@ describe('account page server', () => {
 			request: new Request('https://bookward.test/account?/changePassword', {
 				method: 'POST',
 				headers: { 'content-type': 'application/x-www-form-urlencoded' },
-				body: new URLSearchParams({ username: 'oidc:custom', new_password: 'personal-password-456' }),
+				body: new URLSearchParams({ username: 'oidc:custom', new_password: 'personal-password-456' })
 			}),
 			cookies,
 			url: new URL('https://bookward.test/account?/changePassword'),
-			locals: ssoLocals,
+			locals: ssoLocals
 		} as never);
 		expect(reservedUsername).toMatchObject({ status: 400 });
 
@@ -143,11 +166,11 @@ describe('account page server', () => {
 			request: new Request('https://bookward.test/account?/changePassword', {
 				method: 'POST',
 				headers: { 'content-type': 'application/x-www-form-urlencoded' },
-				body: new URLSearchParams({ username: 'chosen-reader', new_password: 'personal-password-456' }),
+				body: new URLSearchParams({ username: 'chosen-reader', new_password: 'personal-password-456' })
 			}),
 			cookies,
 			url: new URL('https://bookward.test/account?/changePassword'),
-			locals: ssoLocals,
+			locals: ssoLocals
 		} as never);
 
 		expect(enrolled).toEqual({ message: 'Password updated.' });
@@ -158,8 +181,8 @@ describe('account page server', () => {
 				body: JSON.stringify({
 					username: 'chosen-reader',
 					current_password: '',
-					new_password: 'personal-password-456',
-				}),
+					new_password: 'personal-password-456'
+				})
 			})
 		);
 	});

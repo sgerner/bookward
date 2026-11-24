@@ -116,7 +116,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 			return jsonError(403, 'Request origin could not be verified');
 		}
 	}
-	if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
+	const oidcIntent = path === '/auth/oidc/start' ? event.url.searchParams.get('intent') : null;
+	const sessionBoundOidcStart = oidcIntent === 'link' || oidcIntent === 'enroll';
+	if (session && sessionBoundOidcStart) {
 		const origin = event.request.headers.get('origin');
 		const fetchSite = event.request.headers.get('sec-fetch-site');
 		if ((origin && origin !== event.url.origin) || (!origin && fetchSite !== 'same-origin')) {
@@ -124,7 +126,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 		}
 	}
 
-	if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'login') {
+	if (path === '/auth/oidc/start' && oidcIntent === 'login') {
 		return withSecurityHeaders(await resolve(event));
 	}
 
@@ -151,8 +153,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 		if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
 		throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
 	}
-	const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
-		(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
+	const boundProfile = event.request.headers.has('x-bookward-profile') || mutation || sessionBoundOidcStart;
 	if (boundProfile) {
 		let expected = '';
 		try {
