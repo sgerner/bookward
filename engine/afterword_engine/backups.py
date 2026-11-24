@@ -265,7 +265,7 @@ def auth_backup_is_due(now: datetime | None = None) -> bool:
 def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=None, error=None) -> None:
     """Persist safe backup telemetry without making it part of profile data."""
 
-    from .profiles import auth_connect, auth_path, restrict_auth_files
+    from .profiles import auth_path
 
     path = auth_path()
     if not path.is_file():
@@ -282,7 +282,8 @@ def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=
     elif error is not None:
         values[AUTH_BACKUP_ERROR_KEY] = safe_error_message(error, limit=300)
     try:
-        with auth_connect(timeout=30) as con:
+        con = sqlite3.connect(path, timeout=30)
+        try:
             for key, value in values.items():
                 con.execute(
                     "INSERT INTO auth_meta(key,value) VALUES(?,?) "
@@ -290,7 +291,8 @@ def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=
                     (key, value),
                 )
             con.commit()
-            restrict_auth_files(path)
+        finally:
+            con.close()
     except sqlite3.Error:
         LOGGER.exception("Could not persist identity-registry backup status")
 
@@ -298,31 +300,27 @@ def _record_auth_backup_state(*, attempted_at=None, success_at=None, restore_at=
 def identity_backup_status() -> dict:
     """Return identity-registry backup metadata without exposing its contents."""
 
-    from .profiles import auth_path, auth_shared_lock, restrict_auth_files
+    from .profiles import auth_path
 
     state = {}
     registry = auth_path()
     try:
         if registry.is_file():
-            with auth_shared_lock(registry):
-                restrict_auth_files(registry)
-                con = sqlite3.connect(registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
-                try:
-                    con.execute("PRAGMA busy_timeout=5000")
-                    state = dict(
-                        con.execute(
-                            "SELECT key,value FROM auth_meta WHERE key IN (?,?,?,?)",
-                            (
-                                AUTH_BACKUP_ERROR_KEY,
-                                AUTH_BACKUP_ATTEMPT_KEY,
-                                AUTH_BACKUP_SUCCESS_KEY,
-                                AUTH_BACKUP_RESTORE_KEY,
-                            ),
-                        ).fetchall()
-                    )
-                finally:
-                    con.close()
-                    restrict_auth_files(registry)
+            con = sqlite3.connect(registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+            try:
+                state = dict(
+                    con.execute(
+                        "SELECT key,value FROM auth_meta WHERE key IN (?,?,?,?)",
+                        (
+                            AUTH_BACKUP_ERROR_KEY,
+                            AUTH_BACKUP_ATTEMPT_KEY,
+                            AUTH_BACKUP_SUCCESS_KEY,
+                            AUTH_BACKUP_RESTORE_KEY,
+                        ),
+                    ).fetchall()
+                )
+            finally:
+                con.close()
     except sqlite3.Error:
         state[AUTH_BACKUP_ERROR_KEY] = "Identity backup status is temporarily unavailable."
 
@@ -366,7 +364,7 @@ def identity_backup_status() -> dict:
 
 def create_auth_backup(*, prune: bool = True) -> dict:
     """Snapshot the account/profile registry alongside personal database backups."""
-    from .profiles import auth_path, auth_shared_lock, restrict_auth_files
+    from .profiles import auth_path
 
     source_path = auth_path()
     if not source_path.is_file():
@@ -387,24 +385,15 @@ def create_auth_backup(*, prune: bool = True) -> dict:
             os.fchmod(descriptor, 0o600)
         finally:
             os.close(descriptor)
-        with auth_shared_lock(source_path):
-            restrict_auth_files(source_path)
-            source = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
-            try:
-                source.execute("PRAGMA busy_timeout=5000")
-                target = sqlite3.connect(temporary, timeout=30)
-                source.backup(target)
-            finally:
-                source.close()
-                source = None
-                restrict_auth_files(source_path)
-        target.execute("PRAGMA journal_mode=DELETE")
+        source = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        target = sqlite3.connect(temporary, timeout=30)
+        source.backup(target)
         integrity = target.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok" or target.execute("PRAGMA foreign_key_check").fetchone():
             raise BackupError("The identity registry backup could not be verified.")
         target.commit()
         target.close(); target = None
-        _remove_sidecars(temporary)
+        source.close(); source = None
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
@@ -431,7 +420,6 @@ def create_auth_backup(*, prune: bool = True) -> dict:
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
-                _remove_sidecars(temporary)
             except OSError:
                 LOGGER.exception("Could not remove an incomplete identity-registry backup")
         raise
@@ -440,8 +428,6 @@ def create_auth_backup(*, prune: bool = True) -> dict:
             target.close()
         if source is not None:
             source.close()
-        if temporary is not None:
-            _remove_sidecars(temporary)
 
 
 def _validate_auth_snapshot(path: Path) -> None:
@@ -468,31 +454,28 @@ def _validate_auth_snapshot(path: Path) -> None:
 
 
 def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
-    from .profiles import auth_lock, invalidate_auth_caches, restrict_auth_files
+    from .profiles import invalidate_auth_caches
 
-    with auth_lock(live):
-        if live.is_file():
-            checkpoint = sqlite3.connect(live, timeout=30)
-            try:
-                checkpoint.execute("PRAGMA busy_timeout=5000")
-                result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                if result and result[0] != 0:
-                    raise BackupError("The active identity registry could not be safely closed for restore.")
-            finally:
-                checkpoint.close()
-        _remove_sidecars(live)
-        os.replace(staged, live)
-        os.chmod(live, 0o600)
-        restrict_auth_files(live)
-        invalidate_auth_caches(clear_all=True)
-        clear_auth_registry_key_cache()
-        if on_replace is not None:
-            on_replace()
-        directory_fd = os.open(live.parent, os.O_RDONLY)
+    if live.is_file():
+        checkpoint = sqlite3.connect(live, timeout=30)
         try:
-            os.fsync(directory_fd)
+            result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if result and result[0] != 0:
+                raise BackupError("The active identity registry could not be safely closed for restore.")
         finally:
-            os.close(directory_fd)
+            checkpoint.close()
+    _remove_sidecars(live)
+    os.replace(staged, live)
+    invalidate_auth_caches(clear_all=True)
+    clear_auth_registry_key_cache()
+    if on_replace is not None:
+        on_replace()
+    os.chmod(live, 0o600)
+    directory_fd = os.open(live.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def restore_auth_backup(backup_id: str) -> dict:
@@ -508,7 +491,7 @@ def restore_auth_backup(backup_id: str) -> dict:
     if path.is_symlink() or not path.is_file() or path.resolve().parent != directory.resolve():
         raise BackupError("That identity-registry snapshot is unavailable.")
     _validate_auth_snapshot(path)
-    from .profiles import auth_lock, auth_path, invalidate_auth_caches
+    from .profiles import auth_path
 
     live = auth_path()
     live.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -538,36 +521,27 @@ def restore_auth_backup(backup_id: str) -> dict:
             con.execute("DELETE FROM login_attempts")
             con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
             con.commit()
-            con.execute("PRAGMA journal_mode=DELETE")
             integrity = con.execute("PRAGMA integrity_check").fetchone()
             if not integrity or integrity[0] != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():
                 raise BackupError("The restored identity registry failed integrity checks.")
         finally:
             con.close()
-        _remove_sidecars(staged)
-        os.chmod(staged, 0o600)
         with staged.open("rb") as handle:
             os.fsync(handle.fileno())
-        with auth_lock(live):
-            # Protect the selected snapshot from retention pruning before taking
-            # the safety copy, and preserve the operator safety copy itself.
-            safety_backup = create_auth_backup(prune=False) if live.is_file() else None
-            _replace_auth_registry(staged, live, on_replace=mark_replaced)
-            _record_auth_backup_state(restore_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-            invalidate_auth_caches(clear_all=True)
-            clear_auth_registry_key_cache()
+        # Protect the selected snapshot from retention pruning before taking
+        # the safety copy, and preserve the operator safety copy itself.
+        safety_backup = create_auth_backup(prune=False) if live.is_file() else None
+        _replace_auth_registry(staged, live, on_replace=mark_replaced)
+        _record_auth_backup_state(restore_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         return {"restored": True, "sessions_revoked": True, "api_tokens_revoked": True}
     except Exception as exc:
         if replaced and safety_backup:
             safety_path = directory / f"{safety_backup['id']}.sqlite3"
             rollback = None
             try:
-                with auth_lock(live):
-                    rollback = _copy_to_stage(safety_path, live.parent)
-                    _replace_auth_registry(rollback, live)
-                    rollback = None
-                    invalidate_auth_caches(clear_all=True)
-                    clear_auth_registry_key_cache()
+                rollback = _copy_to_stage(safety_path, live.parent)
+                _replace_auth_registry(rollback, live)
+                rollback = None
             except Exception:
                 LOGGER.exception("Failed to roll back an unsuccessful identity-registry restore")
             finally:
