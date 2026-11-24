@@ -107,7 +107,6 @@
   let expandedRecommendationDetails = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
-  const INITIAL_DISCOVER_LIMIT = 24;
   const DECISION_PAGE_SIZE = 24;
   const FORM_NOTIFICATION_DISMISS_MS = 5000;
   const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
@@ -115,7 +114,7 @@
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let discoverHasMoreOverride = $state<boolean | null>(null);
+  let discoverHasMore = $state(true);
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
   let decisionsHasMoreOverride = $state<boolean | null>(null);
@@ -258,11 +257,6 @@
       return status === undefined ? book : { ...book, status };
     }),
   );
-  const discoverHasMore = $derived(
-    discoverHasMoreOverride ??
-      data.books.filter((book) => book.status === "recommended").length >=
-        INITIAL_DISCOVER_LIMIT,
-  );
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
@@ -366,33 +360,8 @@
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
   const digestSettings = $derived(data.profile.digest);
-  const defaultSourceAvailable = $derived(
-    Boolean(data.profile.default_source_available),
-  );
   const defaultSourceEnabled = $derived(
-    defaultSourceAvailable &&
-      (defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled)),
-  );
-  const personalReadCount = $derived(
-    Math.max(0, data.readCount - (data.demoReadCount ?? 0)),
-  );
-  const nonDemoCandidateCount = $derived(
-    Math.max(0, (data.candidateCount ?? 0) - (data.demoCandidateCount ?? 0)),
-  );
-  const hasDemoDiscoverBooks = $derived(
-    discoverBooks.some((book) => book.published_kind === "demo"),
-  );
-  const showSampleBanner = $derived(
-    defaultSourceEnabled &&
-      ((data.demoReadCount ?? 0) > 0 || hasDemoDiscoverBooks),
-  );
-  const isColdStartProfile = $derived(
-    !defaultSourceEnabled &&
-      personalReadCount === 0 &&
-      nonDemoCandidateCount === 0 &&
-      shortlistTotalCount === 0 &&
-      data.decisions.length === 0 &&
-      additionalDecisionBooks.length === 0,
+    defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
   );
   const sourceSyncIntervalHours = $derived(
     sourceScheduleOverride ?? data.profile.source_sync_interval_hours,
@@ -749,19 +718,6 @@
       pushState(url, {});
     }
   }
-  async function goToImportSettings() {
-    go("settings");
-    await tick();
-    const section = document.getElementById("goodreads-import-settings");
-    if (!section) return;
-    section.scrollIntoView({
-      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
-        ? "auto"
-        : "smooth",
-      block: "start",
-    });
-    section.focus({ preventScroll: true });
-  }
   async function goToLibrarrSettings() {
     go("settings");
     await tick();
@@ -849,8 +805,7 @@
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
-              key === "goodreads-csv" ||
-              key === "toggle-default")
+              key === "goodreads-csv")
           ) {
             readingHistory = [];
             readingHistoryState = "idle";
@@ -1157,7 +1112,7 @@
         ...additionalDiscoverBooks,
         ...payload.items.filter((book) => !existing.has(book.id)),
       ];
-      discoverHasMoreOverride = payload.has_more === true;
+      discoverHasMore = payload.has_more === true;
       discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
       discoverLoadError = error instanceof Error ? error.message : "Recommendations could not be loaded.";
@@ -1416,7 +1371,7 @@
     if (previousDataBooks === nextBooks) return;
     previousDataBooks = nextBooks;
     additionalDiscoverBooks = [];
-    discoverHasMoreOverride = null;
+    discoverHasMore = true;
     discoverLoadError = "";
   });
 
@@ -2048,33 +2003,6 @@
               <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={exitDigestMode}>View all</button>
             </div>
           </section>
-        {:else if view === "discover" && showSampleBanner}
-          <section
-            in:fade={{ duration: motionDuration(260) }}
-            class="mb-6 flex flex-col gap-4 border border-tertiary-500/25 preset-tonal-tertiary p-4 sm:flex-row sm:items-center sm:justify-between"
-            aria-label="Sample catalog"
-          >
-            <div class="flex items-start gap-3">
-              <span class="grid size-10 shrink-0 place-items-center preset-filled-tertiary-500"><Sparkles size={18} /></span>
-              <div>
-                <p class="font-semibold text-surface-950-50">Exploring sample recommendations</p>
-                <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  {personalReadCount === 0
-                    ? "These sample books and ratings preview how Bookward ranks upcoming releases. Import your reading history to personalize rankings, or turn off sample books whenever you are ready."
-                    : "Sample upcoming books are still included alongside your personal reading history. Turn off sample books when you only want live source recommendations."}
-                </p>
-              </div>
-            </div>
-            <div class="flex flex-wrap gap-2 sm:shrink-0">
-              <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={goToImportSettings}><Upload size={15} /> Import reading history</button>
-              <form method="POST" action="?/toggleDefault" use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}>
-                <ProfileField profileId={data.user?.profile_id} />
-                <button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" disabled={isPending("toggle-default")} aria-busy={isPending("toggle-default")}>
-                  {#if isPending("toggle-default")}<RefreshCw size={15} class="animate-spin" />{:else}<X size={15} />{/if} Turn off sample books
-                </button>
-              </form>
-            </div>
-          </section>
         {/if}
         <section
           class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
@@ -2137,7 +2065,7 @@
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
                   {#each book.genres.slice(0, 2) as genre (genre)}<button in:scale={{ duration: motionDuration(150) }} type="button" class="badge badge-sm preset-tonal-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500" aria-label={`${genre} filter`} aria-pressed={genreFilter.toLowerCase() === genre.toLowerCase()} onclick={() => (genreFilter = genre)}>{genre}</button>{/each}
-                  {#if book.published_kind !== "demo" && typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
+                  {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
                       class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
@@ -2252,18 +2180,6 @@
                 </div>
               </div>
             </article>
-          {:else}{#if view === "discover" && !filter && !genreFilter && !digestVisible && isColdStartProfile}
-            <div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
-              <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><Sparkles size={24} /></span>
-              <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">Set up your personal book feed</h2>
-                <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">Import your reading history so Bookward can learn your taste, then review or add sources to scan for upcoming books.</p>
-              </div>
-              <div class="flex flex-wrap items-center justify-center gap-3">
-                <button type="button" class="btn min-h-11 preset-filled-primary-500" onclick={goToImportSettings}><Upload size={16} /> Import reading history</button>
-                <button type="button" class="btn min-h-11 preset-tonal-secondary" onclick={() => go("sources")}><Link2 size={16} /> Choose sources</button>
-              </div>
-            </div>
           {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
               <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
               <div>
@@ -2277,7 +2193,7 @@
                   {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
                 </button>
               </form>{/if}
-            </div>{/if}{/each}
+            </div>{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex justify-center pt-1">
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
@@ -2521,7 +2437,7 @@
                   </div>
                 </div>
                 <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
-                  {#if sourceFilter === "all" && defaultSourceAvailable}
+                  {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
                       class="flex min-h-24 items-center gap-4 py-4"
@@ -3003,14 +2919,12 @@
                 {/if}
               </form>
               <form
-                id="goodreads-import-settings"
-                tabindex="-1"
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
                   delay: motionDelay(1),
                 }}
-                class="card scroll-mt-4 preset-tonal-surface p-5 sm:p-6"
+                class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/importGoodreadsCsv"
                 enctype="multipart/form-data"

@@ -1550,12 +1550,6 @@ def overview_payload(
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
             for name in ("reads", "candidates", "sources")
         }
-        counts["demo_reads"] = connection.execute(
-            "SELECT COUNT(*) count FROM reads WHERE source='demo'"
-        ).fetchone()["count"]
-        counts["demo_candidates"] = connection.execute(
-            "SELECT COUNT(*) count FROM candidates c JOIN sources s ON s.id=c.source_id WHERE s.is_default=1"
-        ).fetchone()["count"]
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
         recommendations, run_id = tracked_recommendations(
@@ -1581,8 +1575,7 @@ def overview_payload(
             "decisions_has_more": decisions_has_more,
             "recommendation_run_id": run_id,
             "sources": [source_payload(item) for item in connection.execute(
-                "SELECT s.*,(SELECT COUNT(*) FROM candidates c WHERE c.source_id=s.id) AS candidate_count "
-                "FROM sources s ORDER BY s.is_default DESC,s.name"
+                "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()],
             "history": [dict(item) for item in connection.execute(
                 "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
@@ -1943,8 +1936,10 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
+    already_present = existing is not None
     existing_is_real = bool(existing and existing["source"] != "demo")
     saved_rating = rating if rating is not None else existing["rating"] if existing_is_real else None
+    purge_demo_reads(con)
     read_at = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
@@ -1956,10 +1951,9 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "VALUES(?,?,?,?,?,'manual',?,"
         "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
         "ON CONFLICT(title,author) DO UPDATE SET "
-        "rating=CASE WHEN reads.source='demo' THEN excluded.rating ELSE COALESCE(excluded.rating,reads.rating) END,"
-        "read_at=CASE WHEN reads.source='demo' THEN excluded.read_at ELSE COALESCE(reads.read_at,excluded.read_at) END,"
-        "isbn=CASE WHEN reads.source='demo' THEN excluded.isbn ELSE COALESCE(reads.isbn,excluded.isbn) END,"
-        "source=CASE WHEN reads.source='demo' THEN excluded.source ELSE reads.source END",
+        "rating=COALESCE(excluded.rating,reads.rating),"
+        "read_at=COALESCE(reads.read_at,excluded.read_at),"
+        "isbn=COALESCE(reads.isbn,excluded.isbn)",
         (
             candidate["title"],
             candidate["author"],
@@ -1970,7 +1964,6 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             openlibrary_work_id,
         ),
     )
-    purge_demo_reads(con)
     read = con.execute(
         "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
         "FROM reads WHERE title=? AND author=?",
@@ -2027,7 +2020,7 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return read, existing_is_real
+    return read, already_present
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2491,7 +2484,7 @@ def add_source(payload: SourceIn):
 
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
-    purged_demo = False
+    purged_demo = 0
     with transaction() as con:
         source = con.execute("SELECT url,enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
@@ -2511,11 +2504,10 @@ def toggle_source(source_id:int):
                 (source_id,),
             )
             if is_builtin_demo:
-                purge_demo_reads(con)
-                purged_demo = True
+                purged_demo = purge_demo_reads(con)
     if became_enabled and source["kind"] not in {"builtin", "association"}:
         job_id = enqueue_job(f"source:{source_id}", dedupe=True)
-    elif is_builtin_demo and (purged_demo or became_enabled):
+    elif is_builtin_demo and (purged_demo > 0 or became_enabled):
         job_id = enqueue_job("score", dedupe=True)
     else:
         job_id = None
@@ -3287,10 +3279,7 @@ async def api_import_librarr(candidate_id: int):
 def api_sources():
     return [
         {**source, "filters": normalize_source_filters(source.get("filters"))}
-        for source in rows(
-            "SELECT s.*,(SELECT COUNT(*) FROM candidates c WHERE c.source_id=s.id) AS candidate_count "
-            "FROM sources s ORDER BY s.is_default DESC,s.name"
-        )
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
     ]
 
 

@@ -63,6 +63,7 @@ from afterword_engine.main import (
     source_sync_due_sources,
     source_sync_is_due,
     sync,
+    tracked_recommendations,
 )
 from afterword_engine.digest import digest_is_due, digest_preview, send_digest, validate_digest_config
 
@@ -3350,46 +3351,17 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
     }
 
 
-def test_disabling_builtin_demo_source_purges_demo_reads_retains_source_and_queues_score(database):
-    assert asyncio.run(score_all("local", "hashing-768")) == 4
-    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
-    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+def _seed_demo_derived_artifacts_for_test():
+    """Populate scoring batches, serving snapshots, outcomes, and stale read status from demo reads."""
+    from datetime import datetime, timedelta, timezone
+    from afterword_engine.learning import attribute_read_outcomes
 
-    with TestClient(app, headers=authenticated_headers()) as client:
-        initial_overview = client.get("/api/overview").json()
-        assert initial_overview["counts"]["demo_reads"] == 4
-        assert initial_overview["counts"]["demo_candidates"] == 4
-        builtin = next(item for item in initial_overview["sources"] if item["is_default"])
-        assert builtin["enabled"] == 1
-        assert builtin["candidate_count"] == 4
-
-        toggled = client.put(f"/api/sources/{builtin['id']}/toggle")
-        assert toggled.status_code == 200
-        job_id = toggled.json()["job_id"]
-        assert job_id is not None
-
-        updated_overview = client.get("/api/overview").json()
-
-    assert row("SELECT kind,status FROM jobs WHERE id=?", (job_id,)) == {
-        "kind": "score",
-        "status": "queued",
-    }
-    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
-    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
-    assert row("SELECT enabled,is_default FROM sources WHERE url='builtin://upcoming'") == {
-        "enabled": 0,
-        "is_default": 1,
-    }
-    assert updated_overview["counts"]["demo_reads"] == 0
-    assert updated_overview["recommendations"] == []
-
-
-def test_goodreads_csv_import_updates_matching_demo_title_and_surfaces_unread_demo_candidates(database):
+    past_ts = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     with transaction() as con:
         web_source_id = con.execute(
             "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
         ).fetchone()[0]
-        piranesi_id = con.execute(
+        piranesi_candidate_id = con.execute(
             "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
             "VALUES(?,?,?,?,?,80,'recommended',?)",
             (
@@ -3404,10 +3376,126 @@ def test_goodreads_csv_import_updates_matching_demo_title_and_surfaces_unread_de
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
             "WHERE candidate_id=?",
-            (piranesi_id,),
+            (piranesi_candidate_id,),
         )
 
-    # While synthetic demo reads are active, Piranesi is suppressed as already read.
+    assert asyncio.run(score_all("local", "hashing-768")) >= 4
+    served, run_id = tracked_recommendations()
+    assert served and run_id
+
+    # Create an exposure for Piranesi preceding the demo read timestamp so
+    # attribute_read_outcomes() records a synthetic demo outcome + read event.
+    with transaction() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO recommendation_impressions"
+            "(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES(?,?,99,80.0,1.0,?,?)",
+            (run_id, piranesi_candidate_id, past_ts, past_ts),
+        )
+        # Simulate the pre-fix mark-read state where a candidate's status became
+        # 'read' while its matching reads row remained source='demo'.
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (piranesi_candidate_id,),
+        )
+
+    attributed = attribute_read_outcomes()
+    assert attributed["reads_attributed"] >= 1
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] >= 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] >= 4
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] >= 1
+    return piranesi_candidate_id, run_id
+
+
+def test_disabling_builtin_demo_source_purges_demo_reads_derived_evidence_and_preserves_toggle_off(
+    database,
+):
+    from afterword_engine.database import initialize as init_db
+
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
+    with transaction() as con:
+        builtin_candidate_id = con.execute(
+            "SELECT c.id FROM candidates c JOIN sources s ON s.id=c.source_id "
+            "WHERE s.url='builtin://upcoming' ORDER BY c.id LIMIT 1"
+        ).fetchone()[0]
+        demo_read_id = con.execute(
+            "SELECT id FROM reads WHERE source='demo' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (builtin_candidate_id,),
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
+            "VALUES(?,?,'read',5.0,'manual_read',?)",
+            (
+                f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
+                builtin_candidate_id,
+                json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
+            ),
+        )
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+
+    client = TestClient(app, headers=authenticated_headers())
+    initial_overview = client.get("/api/overview").json()
+    builtin = next(item for item in initial_overview["sources"] if item["is_default"])
+    assert builtin["enabled"] == 1
+
+    toggled = client.put(f"/api/sources/{builtin['id']}/toggle")
+    assert toggled.status_code == 200
+    job_id = toggled.json()["job_id"]
+    assert job_id is not None
+
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (job_id,)) == {
+        "kind": "score",
+        "status": "queued",
+    }
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_events")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_vectors")["count"] == 0
+    assert row("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1")["used_bytes"] == 0
+    assert row("SELECT status,score FROM candidates WHERE id=?", (builtin_candidate_id,)) == {
+        "status": "new",
+        "score": 0.0,
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT enabled,is_default FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+        "is_default": 1,
+    }
+
+    updated_overview = client.get("/api/overview").json()
+    assert "Piranesi" in {item["title"] for item in updated_overview["recommendations"]}
+
+    # Even if both candidates and reads are empty, re-running initialize(seed_demo=True)
+    # must respect the user's toggle-off and never re-enable or re-seed demo data.
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+    init_db(seed_demo=True)
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+    }
+    assert row("SELECT COUNT(*) count FROM candidates")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+
+
+def test_goodreads_csv_import_updates_matching_demo_title_and_cleans_derived_artifacts(
+    database,
+):
+    piranesi_id, _run_id = _seed_demo_derived_artifacts_for_test()
+
+    # While synthetic demo reads and status='read' are present, Piranesi is hidden.
     assert "Piranesi" not in {item["title"] for item in recommendation_list()}
 
     csv_payload = (
@@ -3417,6 +3505,9 @@ def test_goodreads_csv_import_updates_matching_demo_title_and_surfaces_unread_de
     )
     assert import_goodreads_csv(csv_payload) == 2
     assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
     assert row(
         "SELECT rating,source,isbn FROM reads WHERE title='Sea of Tranquility'"
     ) == {
@@ -3425,12 +3516,16 @@ def test_goodreads_csv_import_updates_matching_demo_title_and_surfaces_unread_de
         "isbn": "9780593321447",
     }
     assert row("SELECT COUNT(*) count FROM reads")["count"] == 2
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_id,)) == {
+        "status": "recommended",
+    }
+    assert "Piranesi" in {item["title"] for item in recommendation_list()}
 
     asyncio.run(score_all("local", "hashing-768"))
     assert "Piranesi" in {item["title"] for item in recommendation_list()}
 
 
-def test_goodreads_rss_and_manual_read_replace_demo_source_and_purge_remaining_demo_reads(
+def test_goodreads_rss_and_manual_read_replace_demo_source_preserve_already_present_and_reset_candidates(
     database, monkeypatch
 ):
     async def fake_fetch_bytes(*_args, **_kwargs):
@@ -3467,8 +3562,9 @@ def test_goodreads_rss_and_manual_read_replace_demo_source_and_purge_remaining_d
         "isbn": "9781635575637",
     }
 
-    # Re-seed synthetic demo reads on a fresh candidate to verify Mark Read atomically
-    # replaces a matching demo row without inheriting its synthetic rating and purges others.
+    # Re-seed synthetic demo reads to verify Mark Read preserves already_present=True
+    # for a matching demo row without inheriting its synthetic rating, purges other
+    # demo reads, and resets stale status='read' on other demo-backed candidates.
     with transaction() as con:
         con.execute("DELETE FROM reads")
         con.execute(
@@ -3484,28 +3580,42 @@ def test_goodreads_rss_and_manual_read_replace_demo_source_and_purge_remaining_d
             "VALUES('Sea of Tranquility','Emily St. John Mandel',?,82,'recommended',?)",
             (web_source_id, normalize_key("Sea of Tranquility", "Emily St. John Mandel")),
         ).lastrowid
+        fifth_season_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,source_id,score,status,normalized_key) "
+            "VALUES('The Fifth Season','N. K. Jemisin',?,85,'read',?)",
+            (web_source_id, normalize_key("The Fifth Season", "N. K. Jemisin")),
+        ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
-            (candidate_id,),
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id IN (?,?)",
+            (candidate_id, fifth_season_candidate_id),
         )
 
-    with TestClient(app, headers=authenticated_headers()) as client:
-        marked = client.post(f"/api/recommendations/{candidate_id}/read", json={})
+    client = TestClient(app, headers=authenticated_headers())
+    marked = client.post(f"/api/recommendations/{candidate_id}/read", json={})
 
     assert marked.status_code == 200
-    assert marked.json()["already_present"] is False
+    assert marked.json()["already_present"] is True
     assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
     assert row("SELECT rating,source FROM reads WHERE title='Sea of Tranquility'") == {
         "rating": None,
         "source": "manual",
     }
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,)) == {
+        "status": "read",
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (fifth_season_candidate_id,)) == {
+        "status": "recommended",
+    }
 
 
-def test_migration_27_purges_stale_demo_reads_and_stops_falsified_explanations(tmp_path, monkeypatch):
+def test_migration_27_purges_stale_demo_reads_derived_rows_and_is_idempotent(
+    tmp_path, monkeypatch
+):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-27.db"))
     init_db(seed_demo=True)
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
 
     with transaction() as con:
         web_source_id = con.execute(
@@ -3540,6 +3650,8 @@ def test_migration_27_purges_stale_demo_reads_and_stops_falsified_explanations(t
         row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
     )
     assert "You rated a book by this author highly" in pre_upgrade_reasons
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] >= 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] >= 5
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
@@ -3549,6 +3661,14 @@ def test_migration_27_purges_stale_demo_reads_and_stops_falsified_explanations(t
 
     assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune' AND source='goodreads_csv'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
 
     asyncio.run(score_all("local", "hashing-768"))
@@ -3556,3 +3676,112 @@ def test_migration_27_purges_stale_demo_reads_and_stops_falsified_explanations(t
         row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
     )
     assert "You rated a book by this author highly" not in post_upgrade_reasons
+
+    # Re-running initialize() and re-applying migration 27 must be idempotent and
+    # preserve post-upgrade real scoring batches without queuing duplicate jobs.
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+
+    with transaction() as con:
+        con.execute("DELETE FROM schema_migrations WHERE version=27")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+
+
+def test_migration_27_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
+    tmp_path, monkeypatch
+):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(
+        settings, "db", str(tmp_path / "upgrade-migration-27-disabled-builtin.db")
+    )
+    init_db(seed_demo=True)
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
+
+    with transaction() as con:
+        builtin_candidate_id = con.execute(
+            "SELECT c.id FROM candidates c JOIN sources s ON s.id=c.source_id "
+            "WHERE s.url='builtin://upcoming' ORDER BY c.id LIMIT 1"
+        ).fetchone()[0]
+        demo_read_id = con.execute(
+            "SELECT id FROM reads WHERE source='demo' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (builtin_candidate_id,),
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
+            "VALUES(?,?,'read',5.0,'manual_read',?)",
+            (
+                f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
+                builtin_candidate_id,
+                json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
+            ),
+        )
+        con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=27")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT status,score FROM candidates WHERE id=?", (builtin_candidate_id,)) == {
+        "status": "new",
+        "score": 0.0,
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+    }
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
+
+    # Re-running migration 27 when already clean is a no-op.
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=27")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+
+
+def test_migration_27_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(
+        settings, "db", str(tmp_path / "upgrade-migration-27-keep-demo.db")
+    )
+    init_db(seed_demo=True)
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    served, run_id = tracked_recommendations()
+    assert len(served) == 4 and run_id
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=27")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 1,
+    }
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0

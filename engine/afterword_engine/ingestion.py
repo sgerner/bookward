@@ -797,6 +797,8 @@ def import_goodreads_csv(content: bytes):
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
     with transaction() as con:
+        if count > 0:
+            purge_demo_reads(con)
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
@@ -823,12 +825,9 @@ def import_goodreads_csv(content: bytes):
                 "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
                 "AND excluded.isbn IS NOT reads.isbn THEN NULL "
                 "ELSE reads.openlibrary_lookup_attempted_at END,"
-                "isbn=COALESCE(excluded.isbn,reads.isbn),"
-                "source=CASE WHEN reads.source='demo' THEN excluded.source ELSE reads.source END",
+                "isbn=COALESCE(excluded.isbn,reads.isbn)",
                 values,
             )
-        if count > 0:
-            purge_demo_reads(con)
     # Importing a history is also the point at which naturally supplied
     # ratings can become outcomes for recommendations shown earlier. Import
     # lazily to keep the ingestion module independent of the telemetry module
@@ -2098,6 +2097,8 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        if count > 0:
+            purge_demo_reads(con)
         con.executemany(
             "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
             ((item[0], item[1]) for item in read_rows),
@@ -2112,12 +2113,9 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             "openlibrary_lookup_attempted_at=CASE WHEN excluded.isbn IS NOT NULL "
             "AND excluded.isbn IS NOT reads.isbn THEN NULL "
             "ELSE reads.openlibrary_lookup_attempted_at END,"
-            "isbn=COALESCE(excluded.isbn,reads.isbn),"
-            "source=CASE WHEN reads.source='demo' THEN excluded.source ELSE reads.source END",
+            "isbn=COALESCE(excluded.isbn,reads.isbn)",
             read_rows,
         )
-        if count > 0:
-            purge_demo_reads(con)
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
     return count

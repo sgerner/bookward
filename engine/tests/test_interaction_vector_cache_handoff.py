@@ -28,7 +28,7 @@ def test_interaction_vectors_use_candidate_ids_in_both_request_contexts(
 ):
     with transaction() as con:
         source_id = con.execute(
-            "SELECT id FROM sources WHERE enabled=1 LIMIT 1"
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
         ).fetchone()[0]
         candidates = [
             ("Visible candidate one", "Author One", "recommended"),

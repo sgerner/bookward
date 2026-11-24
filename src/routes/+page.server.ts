@@ -26,13 +26,7 @@ type BackupStatus = {
 };
 
 type Overview = {
-  counts?: {
-    reads?: number;
-    candidates?: number;
-    sources?: number;
-    demo_reads?: number;
-    demo_candidates?: number;
-  };
+  counts?: { reads?: number };
   recommendation_run_id?: string;
   recommendations: Array<{
     id: number;
@@ -66,7 +60,6 @@ type Overview = {
     enabled: number;
     kind: string;
     is_default: number;
-    candidate_count?: number;
     lifecycle: "permanent" | "one_time";
     filters: SourceFilters;
     last_status: string | null;
@@ -165,15 +158,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
-  const demoCatalogAvailable =
-    typeof overview.counts?.demo_candidates === "number"
-      ? overview.counts.demo_candidates > 0
-      : typeof builtIn?.candidate_count === "number"
-        ? builtIn.candidate_count > 0
-        : Boolean(builtIn);
-  const defaultSourceEnabled = demoCatalogAvailable
-    ? (builtIn?.enabled ?? 0)
-    : 0;
   let digestPeriod = url.searchParams.get("digest_period");
   let digestReviewIds: number[] = [];
   if (digestPeriod) {
@@ -207,11 +191,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     decisions_has_more: overview.decisions_has_more === true,
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
-    demoReadCount: overview.counts?.demo_reads ?? 0,
-    candidateCount:
-      overview.counts?.candidates ?? overview.recommendations.length,
-    demoCandidateCount:
-      overview.counts?.demo_candidates ?? (builtIn?.candidate_count ?? 0),
     backupStatus,
     digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
     sources: overview.sources
@@ -223,8 +202,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       goodreads_rss_last_status: overview.settings.goodreads_rss_last_status ?? "",
       goodreads_rss_last_attempt_at: overview.settings.goodreads_rss_last_attempt_at ?? "",
       goodreads_rss_last_error: overview.settings.goodreads_rss_last_error ?? "",
-      default_source_available: demoCatalogAvailable,
-      default_source_enabled: defaultSourceEnabled,
+      default_source_enabled: builtIn?.enabled ?? 1,
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,
       ...overview.settings,
