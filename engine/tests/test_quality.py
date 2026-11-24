@@ -7,7 +7,6 @@ import httpx
 import pytest
 import respx
 
-from afterword_engine import covers
 from afterword_engine.covers import GOOGLE_BOOKS_SEARCH, OPEN_LIBRARY_SEARCH
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, rows, transaction
@@ -29,14 +28,6 @@ from afterword_engine.quality import (
     has_candidate_quality_audit_candidates,
     local_flags,
 )
-
-
-@pytest.fixture(autouse=True)
-def no_real_rate_limit_wait(monkeypatch):
-    async def advance_without_wait(delay):
-        return None
-
-    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_without_wait)
 
 
 @pytest.fixture()
@@ -444,8 +435,11 @@ def test_isbn_recovery_does_not_reaudit_accepted_candidates(database):
 
 
 def test_audit_rejects_malformed_candidate_without_catalog_request(database):
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
     candidate_id = add_candidate("Coming soon", "Unknown author")
-    asyncio.run(audit_candidates(only_pending=False))
+    result = asyncio.run(audit_candidates(only_pending=False))
+    assert result["audited"] == 1
     quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
     assert quality["quality_status"] == "rejected"
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "rejected"
