@@ -40,6 +40,9 @@
   } from "@lucide/svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
+  import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import RadioGroup from "#lib/components/RadioGroup.svelte";
+  import SwitchControl from "#lib/components/SwitchControl.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
@@ -101,6 +104,7 @@
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
+  let markReadRatingGroup = $state<{ focusFirst: () => void } | null>(null);
   let filter = $state("");
   let genreFilter = $state("");
   let shortlistSort = $state<"score" | "title" | "author">("score");
@@ -2044,7 +2048,7 @@
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
-                  {#each book.genres.slice(0, 2) as genre (genre)}<button in:scale={{ duration: motionDuration(150) }} type="button" class="badge badge-sm preset-tonal-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500" aria-label={`${genre} filter`} aria-pressed={genreFilter.toLowerCase() === genre.toLowerCase()} onclick={() => (genreFilter = genre)}>{genre}</button>{/each}
+                  {#each book.genres.slice(0, 2) as genre (genre)}{@const genrePressed = genreFilter.trim().toLowerCase() === genre.trim().toLowerCase()}<ChipToggle pressed={genrePressed} label={genre} ariaLabel={`${genre} filter`} onToggle={(next) => { genreFilter = next ? (bookGenres.find((item) => item.toLowerCase() === genre.trim().toLowerCase()) ?? genre.trim()) : ""; }} />{/each}
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
@@ -3533,8 +3537,7 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <div class="flex flex-wrap items-center gap-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-4 focus-within:ring-offset-surface-950">
-                    <input id="digest-enabled" class="sr-only" type="checkbox" name="enabled" checked={digestEnabled} role="switch" aria-label="Enable weekly digest" onchange={(event) => (digestEnabledOverride = (event.currentTarget as HTMLInputElement).checked)} />
+                  <div class="flex flex-wrap items-center gap-4">
                     <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-3">
@@ -3543,10 +3546,13 @@
                       </div>
                       <p class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
                     </div>
-                    <label for="digest-enabled" class="flex cursor-pointer items-center gap-3 text-sm font-semibold text-surface-950-50">
-                      <span class="sr-only">Enable weekly digest</span>
-                      <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEnabled ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEnabled ? "translate-x-5" : ""}`}></span></span>
-                    </label>
+                    <SwitchControl
+                      id="digest-enabled"
+                      name="enabled"
+                      checked={digestEnabled}
+                      ariaLabel="Enable weekly digest"
+                      onToggle={(next) => (digestEnabledOverride = next)}
+                    />
                   </div>
 
                   {#if digestEnabled}<div in:slide={{ duration: motionDuration(240) }} out:fade={{ duration: motionDuration(160) }} class="mt-6">
@@ -3574,10 +3580,19 @@
                           <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestSettings.minimum_score} required /></label>
                           <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestSettings.maximum_books} required /></label>
                         </div>
-                        <label class="mt-4 flex cursor-pointer items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
-                          <span><span class="block text-surface-950-50">Only send new books</span><span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span></span>
-                          <span class="relative shrink-0 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950"><input class="sr-only" type="checkbox" name="onlyNew" checked={digestOnlyNew} role="switch" aria-label="Only send new books" onchange={(event) => (digestOnlyNewOverride = (event.currentTarget as HTMLInputElement).checked)} /><span class={`block h-7 w-12 rounded-full p-1 transition ${digestOnlyNew ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestOnlyNew ? "translate-x-5" : ""}`}></span></span></span>
-                        </label>
+                        <div class="mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
+                          <label for="digest-only-new" class="cursor-pointer">
+                            <span class="block text-surface-950-50">Only send new books</span>
+                            <span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span>
+                          </label>
+                          <SwitchControl
+                            id="digest-only-new"
+                            name="onlyNew"
+                            checked={digestOnlyNew}
+                            ariaLabel="Only send new books"
+                            onToggle={(next) => (digestOnlyNewOverride = next)}
+                          />
+                        </div>
                       </section>
 
                       <section class="preset-tonal-surface p-4 sm:p-5">
@@ -3586,26 +3601,44 @@
                           <p class="mt-1 text-sm text-surface-700-300">Choose one or both places to receive it.</p>
                         </div>
                         <div class="grid gap-3">
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-discord" class="sr-only" type="checkbox" name="channels" value="discord" checked={digestDiscord} role="switch" aria-label="Send digest to Discord" onchange={(event) => (digestDiscordOverride = (event.currentTarget as HTMLInputElement).checked)} />
-                            <label for="digest-discord" class="flex cursor-pointer items-center gap-3">
-                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
-                              <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestDiscord ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestDiscord ? "translate-x-5" : ""}`}></span></span>
-                            </label>
+                          <div class="relative border border-surface-300-700/50 p-4">
+                            <div class="flex items-center gap-3">
+                              <label for="digest-discord" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
+                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
+                              </label>
+                              <SwitchControl
+                                id="digest-discord"
+                                name="channels"
+                                value="discord"
+                                checked={digestDiscord}
+                                ariaLabel="Send digest to Discord"
+                                onToggle={(next) => (digestDiscordOverride = next)}
+                              />
+                            </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
                               <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
                               {#if digestSettings.discord_webhook_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-tertiary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-email" class="sr-only" type="checkbox" name="channels" value="email" checked={digestEmail} role="switch" aria-label="Send digest by email" onchange={(event) => (digestEmailOverride = (event.currentTarget as HTMLInputElement).checked)} />
-                            <label for="digest-email" class="flex cursor-pointer items-center gap-3">
-                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
-                              <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEmail ? "preset-filled-tertiary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEmail ? "translate-x-5" : ""}`}></span></span>
-                            </label>
+                          <div class="relative border border-surface-300-700/50 p-4">
+                            <div class="flex items-center gap-3">
+                              <label for="digest-email" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
+                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
+                              </label>
+                              <SwitchControl
+                                id="digest-email"
+                                name="channels"
+                                value="email"
+                                checked={digestEmail}
+                                ariaLabel="Send digest by email"
+                                activeClass="preset-filled-tertiary-500"
+                                focusClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
+                                onToggle={(next) => (digestEmailOverride = next)}
+                              />
+                            </div>
                             {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
                               <div class="grid gap-4 sm:grid-cols-2">
                                 <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestSettings.email_to} placeholder="you@example.com" /></label>
@@ -3813,20 +3846,35 @@
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">
-                <p class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
+                <p id="mark-read-rating-label" class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
                 <span class="text-xs text-surface-600-400">Optional</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-center gap-2" role="group" aria-label="Optional book rating">
-                {#each [1, 2, 3, 4, 5] as rating (rating)}
-                  <button
-                    type="button"
-                    class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
-                    aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
-                    aria-pressed={markReadRating === rating}
-                    onclick={() => (markReadRating = rating)}
-                  ><span aria-hidden="true">★</span></button>
-                {/each}
-                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => (markReadRating = 0)}>Clear rating</button>{/if}
+              <div class="mt-3 flex flex-wrap items-center gap-2">
+                <RadioGroup
+                  bind:this={markReadRatingGroup}
+                  items={[1, 2, 3, 4, 5]}
+                  value={markReadRating > 0 ? markReadRating : null}
+                  labelledBy="mark-read-rating-label"
+                  columns={1}
+                  selectOnMove
+                  clearable
+                  class="flex flex-wrap items-center gap-2"
+                  onSelect={(rating) => (markReadRating = rating)}
+                  onClear={() => (markReadRating = 0)}
+                >
+                  {#snippet item(rating, radio)}
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
+                      aria-checked={radio.checked}
+                      tabindex={radio.tabIndex}
+                      class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
+                      onclick={radio.select}
+                    ><span aria-hidden="true">★</span></button>
+                  {/snippet}
+                </RadioGroup>
+                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => { markReadRating = 0; markReadRatingGroup?.focusFirst(); }}>Clear rating</button>{/if}
               </div>
             </div>
           </div>
