@@ -269,23 +269,23 @@ def test_rated_read_vector_cache_evicts_least_recently_used_entry_past_8_entries
     assert read_vector_computations == 10
 
 
-def test_reading_history_scores_partial_batch_error_logs_once_and_retries_from_failed_offset(
+def test_reading_history_scores_second_request_at_offset_200_logs_once_and_retries(
     database, monkeypatch, caplog
 ):
     _seed_reads(230)
     read_vector_computations = 0
-    fail_next_candidate_batch = False
+    fail_next_request = False
     real_cached_vectors = main.cached_vectors
 
     async def fault_injecting_cached_vectors(
         embedder, entity_type, items, expected_dimensions=None
     ):
-        nonlocal read_vector_computations, fail_next_candidate_batch
+        nonlocal read_vector_computations, fail_next_request
         if entity_type == "read":
             read_vector_computations += 1
-        if entity_type == "read_candidate" and fail_next_candidate_batch:
-            fail_next_candidate_batch = False
-            raise RuntimeError("Transient embedding failure on second batch")
+        if entity_type == "read_candidate" and fail_next_request:
+            fail_next_request = False
+            raise RuntimeError("Transient embedding failure on second request at offset 200")
         return await real_cached_vectors(
             embedder,
             entity_type,
@@ -309,7 +309,7 @@ def test_reading_history_scores_partial_batch_error_logs_once_and_retries_from_f
         assert read_vector_computations == 1
         reading_history_score_offset += 200
 
-        fail_next_candidate_batch = True
+        fail_next_request = True
         caplog.clear()
         with caplog.at_level(logging.ERROR, logger=main.LOGGER.name):
             failed_response = client.get(
@@ -335,4 +335,24 @@ def test_reading_history_scores_partial_batch_error_logs_once_and_retries_from_f
         assert len(retry_scores) == 30
         assert read_vector_computations == 1
         assert len({item["id"] for item in [*first_scores, *retry_scores]}) == 230
+
+
+def test_reading_history_scores_db_connect_error_not_logged_as_score_calculation_failure(
+    database, monkeypatch, caplog
+):
+    def broken_connect():
+        raise sqlite3.OperationalError("Database unavailable before scoring")
+
+    monkeypatch.setattr(main, "connect", broken_connect)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=main.LOGGER.name):
+        with pytest.raises(sqlite3.OperationalError, match="Database unavailable"):
+            asyncio.run(main.reading_history_scores(offset=0, limit=20))
+    assert not [
+        record
+        for record in caplog.records
+        if "Could not calculate current-profile reading history scores"
+        in record.getMessage()
+    ]
+
 

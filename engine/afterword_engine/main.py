@@ -1860,6 +1860,8 @@ def reading_history():
 
 READING_HISTORY_SCORE_MAX_LIMIT = 200
 _RATED_READ_VECTOR_CACHE_MAX_ENTRIES = 8
+# Bounded by entry count (8 LRU profiles/states); individual entries are not
+# size-capped and hold one frozen float64 vector per rated read in that profile.
 _RATED_READ_VECTOR_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, ...]] = OrderedDict()
 
 
@@ -1884,6 +1886,17 @@ def _rated_read_state_digest(rated_reads: Sequence[dict[str, Any]]) -> str:
     return digest.hexdigest()
 
 
+def _format_read_embedding_digest(entries: Sequence[Any]) -> str:
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
 def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
     query = (
         "SELECT entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
@@ -1895,14 +1908,7 @@ def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
         if connection is not None
         else rows(query, (backend, model))
     )
-    digest = hashlib.sha256()
-    for entry in entries:
-        digest.update(
-            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
-                "utf-8"
-            )
-        )
-    return digest.hexdigest()
+    return _format_read_embedding_digest(entries)
 
 
 async def _cached_rated_read_vectors(
@@ -1956,74 +1962,85 @@ async def reading_history_scores(
     ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
-    try:
-        with connect() as connection:
-            items = [dict(item) for item in connection.execute(
-                "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-                "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
+    with connect() as connection:
+        items = [dict(item) for item in connection.execute(
+            "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
+            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()]
+        if not items:
+            return []
+        candidate_keys = list(dict.fromkeys(
+            normalize_key(item["title"], item["author"]) for item in items
+        ))
+        placeholders = ",".join("?" for _ in candidate_keys)
+        existing_candidates = (
+            [dict(item) for item in connection.execute(
+                "SELECT c.title,c.author,c.description,c.genres,c.status,"
+                "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
+                "FROM candidates c "
+                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                "LEFT JOIN sources s ON s.id=c.source_id "
+                f"WHERE c.status!='new' AND c.normalized_key IN ({placeholders}) "
+                "ORDER BY c.updated_at DESC,c.id DESC",
+                candidate_keys,
             ).fetchall()]
-            if not items:
-                return []
-            candidate_keys = list(dict.fromkeys(
-                normalize_key(item["title"], item["author"]) for item in items
-            ))
-            placeholders = ",".join("?" for _ in candidate_keys)
-            existing_candidates = (
-                [dict(item) for item in connection.execute(
-                    "SELECT c.title,c.author,c.description,c.genres,c.status,"
-                    "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
-                    "FROM candidates c "
-                    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
-                    f"WHERE c.status!='new' AND c.normalized_key IN ({placeholders}) "
-                    "ORDER BY c.updated_at DESC,c.id DESC",
-                    candidate_keys,
-                ).fetchall()]
-                if candidate_keys else []
+            if candidate_keys else []
+        )
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+        read_embedding_rows = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+            ).fetchall()
+        ]
+    candidates_by_identity = {}
+    for candidate in existing_candidates:
+        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+        candidates_by_identity.setdefault(key, candidate)
+    virtual_candidates = []
+    for item in items:
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        matched = candidates_by_identity.get(key)
+        virtual = {
+            "id": -int(item["id"]),
+            "title": item["title"],
+            "author": item["author"],
+            "description": matched.get("description", "") if matched else "",
+            "genres": matched.get("genres", "[]") if matched else "[]",
+            "source_weight": (matched.get("source_weight") or 1) if matched else 1,
+        }
+        if matched:
+            quality_score = float(matched.get("quality_score") or 0)
+            virtual["catalog_confidence"] = (
+                quality_score
+                if quality_score > 0
+                else 0.85 if matched.get("quality_status") == "accepted" else 0
             )
-            config = private_settings(connection)
-            rated_reads = [
-                dict(item)
-                for item in connection.execute(
-                    "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-                ).fetchall()
-            ]
-            embedder = get_embedder(
-                config.get("embedding_backend"),
-                config.get("embedding_model"),
-                config.get("embedding_url"),
-                config.get("embedding_api_key"),
-            )
-            embedding_cache_digest = _read_embedding_cache_digest(
-                connection, embedder.name, embedder.model
-            )
-        candidates_by_identity = {}
-        for candidate in existing_candidates:
-            key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-            candidates_by_identity.setdefault(key, candidate)
-        virtual_candidates = []
-        for item in items:
-            key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
-            matched = candidates_by_identity.get(key)
-            virtual = {
-                "id": -int(item["id"]),
-                "title": item["title"],
-                "author": item["author"],
-                "description": matched.get("description", "") if matched else "",
-                "genres": matched.get("genres", "[]") if matched else "[]",
-                "source_weight": (matched.get("source_weight") or 1) if matched else 1,
-            }
-            if matched:
-                quality_score = float(matched.get("quality_score") or 0)
-                virtual["catalog_confidence"] = (
-                    quality_score
-                    if quality_score > 0
-                    else 0.85 if matched.get("quality_status") == "accepted" else 0
-                )
-                virtual["source_name"] = matched.get("source_name") or ""
-            virtual_candidates.append(virtual)
+            virtual["source_name"] = matched.get("source_name") or ""
+        virtual_candidates.append(virtual)
 
+    try:
+        embedder = get_embedder(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        embedding_cache_digest = _format_read_embedding_digest(
+            [
+                entry
+                for entry in read_embedding_rows
+                if entry["backend"] == embedder.name and entry["model"] == embedder.model
+            ]
+        )
         read_vectors = await _cached_rated_read_vectors(
             embedder, config, rated_reads, embedding_cache_digest
         )
