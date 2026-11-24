@@ -45,7 +45,7 @@
   import ProfileField from "#lib/components/ProfileField.svelte";
   import RadioGroup from "#lib/components/RadioGroup.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
-  import SwitchField from "#lib/components/SwitchField.svelte";
+  import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
@@ -1955,15 +1955,17 @@
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
-              <div class="input flex min-h-11 w-full min-w-0 items-center gap-2 sm:flex-1">
-                <Search size={17} class="shrink-0 text-surface-600-400" />
-                <input
-                  bind:value={filter}
-                  class="input-ghost min-w-0 flex-1"
-                  aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
-                  placeholder={view === "saved" ? "Search shortlist" : "Search books"}
-                />
-                {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+              <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
+                <label class="flex min-h-11 min-w-0 flex-1 cursor-text items-center gap-2 self-stretch pl-3 pr-2">
+                  <Search size={17} class="shrink-0 text-surface-600-400" />
+                  <input
+                    bind:value={filter}
+                    class="input-ghost min-h-11 min-w-0 flex-1 self-stretch"
+                    aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
+                    placeholder={view === "saved" ? "Search shortlist" : "Search books"}
+                  />
+                </label>
+                {#if filter}<button type="button" class="btn-icon btn-icon-sm mr-1.5 min-h-8 min-w-8 shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
               </div>
               {#if bookGenres.length && !(view === "decisions" && decisionFilter === "read")}
                 <LabeledSelect
@@ -2049,17 +2051,6 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              {#if view === "discover" && digestVisible && book.status === "recommended"}
-                <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
-                  <input
-                    class="checkbox size-5 accent-secondary-500"
-                    type="checkbox"
-                    checked={selectedDigestIds.has(book.id)}
-                    onchange={() => toggleDigestBook(book.id)}
-                    aria-label={`Select ${book.title} for shortlist`}
-                  />
-                </label>
-              {/if}
               <BookCoverTrigger
                 title={book.title}
                 score={book.score}
@@ -2079,8 +2070,19 @@
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
               </BookCoverTrigger>
-              <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
+              <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
+                  {#if view === "discover" && digestVisible && book.status === "recommended"}
+                    <label class="grid size-8 shrink-0 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg sm:absolute sm:left-3 sm:top-3 sm:z-30" title={`Select ${book.title}`}>
+                      <input
+                        class="checkbox size-6 accent-secondary-500"
+                        type="checkbox"
+                        checked={selectedDigestIds.has(book.id)}
+                        onchange={() => toggleDigestBook(book.id)}
+                        aria-label={`Select ${book.title} for shortlist`}
+                      />
+                    </label>
+                  {/if}
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
@@ -2089,7 +2091,7 @@
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
-                      class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
+                      class="btn btn-icon btn-xs min-h-8 min-w-8 preset-tonal-surface shrink-0"
                       href={book.source_url}
                       target="_blank"
                       rel="noreferrer"
@@ -2550,7 +2552,7 @@
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
                                   <span aria-hidden="true"> · </span>
                                   <form
-                                    class="inline"
+                                    class="inline-flex"
                                     method="POST"
                                     action="?/switchSourceToOneTime"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
@@ -2558,7 +2560,7 @@
                                     <ProfileField profileId={data.user?.profile_id} />
                                     <input type="hidden" name="id" value={source.id} />
                                     <button
-                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
                                       disabled={isPending(`source-lifecycle-${source.id}`)}
                                       aria-busy={isPending(`source-lifecycle-${source.id}`)}
@@ -2569,8 +2571,8 @@
                                 {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {/if}
                             </span>
-                            <details class="mt-3 w-full max-w-full">
-                              <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                            <details class="mt-2 w-full max-w-full">
+                              <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                 Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
                                   ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                   : ""}
@@ -2747,7 +2749,7 @@
                       <option value="one_time">One-time import · scan once</option>
                     </select></label
                   ><details class="mt-4 border-l-2 border-tertiary-500/30 pl-3">
-                    <summary class="cursor-pointer text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
+                    <summary class="min-h-8 cursor-pointer py-2 text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
                       Optional filters
                     </summary>
                     <div class="mt-3 space-y-3">
@@ -3237,7 +3239,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Add a Google Books API key to prevent rate-limit throttling when verifying and enriching new book candidates.
                   <a
-                    class="inline-flex items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://developers.google.com/books/docs/v1/using"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3263,8 +3265,8 @@
                   >
                   {#if data.profile.google_books_api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clear" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clear" />
                       Clear saved API key</label
                     >
                   {/if}
@@ -3308,7 +3310,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Optionally rerank top recommendations with an OpenAI-compatible LLM. Pick a provider and model from
                   <a
-                    class="font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://models.dev"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3408,9 +3410,9 @@
                   <ProfileField profileId={data.user?.profile_id} />
                   <input type="hidden" name="provider" value={llmProvider} />
                   <label
-                    class="flex items-center gap-3 text-sm font-medium text-surface-800-200"
+                    class="flex min-h-11 cursor-pointer items-center gap-3 text-sm font-medium text-surface-800-200"
                     ><input
-                      class="checkbox"
+                      class="checkbox size-6 shrink-0"
                       type="checkbox"
                       name="enabled"
                       checked={llmEnabled}
@@ -3458,8 +3460,8 @@
                   >
                   {#if llmRerank.api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clearApiKey" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clearApiKey" />
                       Clear saved LLM API key</label
                     >
                   {/if}
@@ -3575,24 +3577,26 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <SwitchField
-                    id="digest-enabled"
-                    name="enabled"
-                    label="Weekly digest"
-                    description="A short list of your strongest new matches, on your schedule."
-                    heading="h2"
-                    class="flex-wrap gap-4"
-                    labelClass="text-lg font-semibold text-surface-950-50"
-                    descriptionClass="mt-1 text-sm text-surface-700-300"
-                    bind:checked={() => digestEnabled, (next) => (digestEnabledOverride = next)}
-                  >
-                    {#snippet icon()}
-                      <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><Bell size={20} /></span>
-                    {/snippet}
-                    {#snippet badge()}
-                      <span class="badge preset-tonal-surface">{digestEnabled ? "On" : "Off"}</span>
-                    {/snippet}
-                  </SwitchField>
+                  <div class="relative flex flex-wrap items-center gap-4">
+                    <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><Bell size={20} /></span>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center gap-3">
+                        <h2 class="text-lg font-semibold text-surface-950-50">
+                          <label id="digest-enabled-label" for="digest-enabled" class="cursor-pointer after:absolute after:inset-0 after:z-10 after:content-['']">Weekly digest</label>
+                        </h2>
+                        <span class="badge preset-tonal-surface">{digestEnabled ? "On" : "Off"}</span>
+                      </div>
+                      <p id="digest-enabled-description" class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
+                    </div>
+                    <SwitchControl
+                      id="digest-enabled"
+                      name="enabled"
+                      ariaLabelledBy="digest-enabled-label"
+                      ariaDescribedBy="digest-enabled-description"
+                      class="z-20"
+                      bind:checked={() => digestEnabled, (next) => (digestEnabledOverride = next)}
+                    />
+                  </div>
 
                   {#if digestEnabled}<div in:slide={{ duration: motionDuration(240) }} out:fade={{ duration: motionDuration(160) }} class="mt-6">
                     <div class="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
@@ -3619,16 +3623,20 @@
                           <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestSettings.minimum_score} required /></label>
                           <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestSettings.maximum_books} required /></label>
                         </div>
-                        <SwitchField
-                          id="digest-only-new"
-                          name="onlyNew"
-                          label="Only send new books"
-                          description="Skip recommendations already included in a digest."
-                          class="mt-4 justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200"
-                          labelClass="text-surface-950-50"
-                          descriptionClass="mt-1 text-xs font-normal text-surface-700-300"
-                          bind:checked={() => digestOnlyNew, (next) => (digestOnlyNewOverride = next)}
-                        />
+                        <div class="relative mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
+                          <div class="min-w-0 flex-1">
+                            <label id="digest-only-new-label" for="digest-only-new" class="block cursor-pointer text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Only send new books</label>
+                            <p id="digest-only-new-description" class="mt-1 text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</p>
+                          </div>
+                          <SwitchControl
+                            id="digest-only-new"
+                            name="onlyNew"
+                            ariaLabelledBy="digest-only-new-label"
+                            ariaDescribedBy="digest-only-new-description"
+                            class="z-20"
+                            bind:checked={() => digestOnlyNew, (next) => (digestOnlyNewOverride = next)}
+                          />
+                        </div>
                       </section>
 
                       <section class="preset-tonal-surface p-4 sm:p-5">
@@ -3638,39 +3646,47 @@
                         </div>
                         <div class="grid gap-3">
                           <div class="relative border border-surface-300-700/50 p-4">
-                            <SwitchField
-                              id="digest-discord"
-                              name="channels"
-                              value="discord"
-                              label="Discord"
-                              description="Post to a webhook"
-                              bind:checked={() => digestDiscord, (next) => (digestDiscordOverride = next)}
-                            >
-                              {#snippet icon()}
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><MessageCircle size={17} /></span>
-                              {/snippet}
-                            </SwitchField>
+                            <div class="relative flex items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><MessageCircle size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-discord-label" for="digest-discord" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Discord</label>
+                                <p id="digest-discord-description" class="mt-0.5 text-xs text-surface-700-300">Post to a webhook</p>
+                              </div>
+                              <SwitchControl
+                                id="digest-discord"
+                                name="channels"
+                                value="discord"
+                                ariaLabelledBy="digest-discord-label"
+                                ariaDescribedBy="digest-discord-description"
+                                class="z-20"
+                                bind:checked={() => digestDiscord, (next) => (digestDiscordOverride = next)}
+                              />
+                            </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
                               <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
-                              {#if digestSettings.discord_webhook_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
+                              {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
                           <div class="relative border border-surface-300-700/50 p-4">
-                            <SwitchField
-                              id="digest-email"
-                              name="channels"
-                              value="email"
-                              label="Email"
-                              description="Send through your SMTP server"
-                              activeTrackClass="preset-filled-tertiary-500"
-                              focusTrackClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
-                              bind:checked={() => digestEmail, (next) => (digestEmailOverride = next)}
-                            >
-                              {#snippet icon()}
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary" aria-hidden="true"><Mail size={17} /></span>
-                              {/snippet}
-                            </SwitchField>
+                            <div class="relative flex items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary" aria-hidden="true"><Mail size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-email-label" for="digest-email" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Email</label>
+                                <p id="digest-email-description" class="mt-0.5 text-xs text-surface-700-300">Send through your SMTP server</p>
+                              </div>
+                              <SwitchControl
+                                id="digest-email"
+                                name="channels"
+                                value="email"
+                                ariaLabelledBy="digest-email-label"
+                                ariaDescribedBy="digest-email-description"
+                                activeClass="preset-filled-tertiary-500"
+                                focusClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
+                                class="z-20"
+                                bind:checked={() => digestEmail, (next) => (digestEmailOverride = next)}
+                              />
+                            </div>
                             {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
                               <div class="grid gap-4 sm:grid-cols-2">
                                 <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestSettings.email_to} placeholder="you@example.com" /></label>
@@ -3681,7 +3697,7 @@
                                 <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value="" placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
                                 <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
-                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
+                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
                             </div>{:else}<input type="hidden" name="emailTo" value={digestSettings.email_to} /><input type="hidden" name="emailFrom" value={digestSettings.email_from} /><input type="hidden" name="smtpHost" value={digestSettings.smtp_host} /><input type="hidden" name="smtpPort" value={digestSettings.smtp_port} /><input type="hidden" name="smtpSecurity" value={digestSettings.smtp_security} />{/if}
                           </div>
                         </div>
@@ -3840,7 +3856,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm shrink-0 rounded-full preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 rounded-full preset-tonal-surface"
             aria-label="Close Mark Read dialog"
             data-modal-initial-focus
             onclick={closeMarkRead}
@@ -3939,7 +3955,7 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 flex card max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="relative m-0 card flex max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         aria-modal="true"
         onclick={(event) => event.stopPropagation()}
@@ -3963,7 +3979,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface"
             aria-label="Close Librarr search"
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
@@ -3977,9 +3993,9 @@
             }}
           >
             <label
-              class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
+              class="input flex min-h-12 min-w-0 flex-1 cursor-text items-center gap-2 py-0!"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
+                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch focus:outline-none focus:ring-0"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"
@@ -4064,7 +4080,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -4114,7 +4130,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}

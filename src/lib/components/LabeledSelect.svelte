@@ -1,3 +1,18 @@
+<script module lang="ts">
+	import type { ChangeEventHandler } from 'svelte/elements';
+
+	export function applySelectValueChange<Value extends string>(options: {
+		event: Parameters<ChangeEventHandler<HTMLSelectElement>>[0];
+		setValue: (nextValue: Value) => void;
+		onChange?: ChangeEventHandler<HTMLSelectElement> | null;
+	}): Value {
+		const next = options.event.currentTarget.value as Value;
+		options.setValue(next);
+		options.onChange?.(options.event);
+		return next;
+	}
+</script>
+
 <script lang="ts" generics="Value extends string = string">
 	import type { Snippet } from 'svelte';
 	import type { HTMLSelectAttributes } from 'svelte/elements';
@@ -24,6 +39,7 @@
 		class: className = '',
 		labelClass = 'block',
 		selectClass = 'select mt-1 min-h-11 w-full preset-tonal-surface',
+		onchange,
 		children,
 		...rest
 	}: Props = $props();
@@ -43,6 +59,14 @@
 		{...rest}
 		id={selectId}
 		bind:value
+		onchange={(event) =>
+			applySelectValueChange({
+				event,
+				setValue: (next) => {
+					value = next;
+				},
+				onChange: onchange,
+			})}
 		class={selectClass}
 		aria-labelledby={context ? `${labelId} ${contextId}` : labelId}
 	>

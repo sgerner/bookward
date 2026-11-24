@@ -67,15 +67,6 @@ function collectElements(node: unknown): ElementMatch[] {
   return found;
 }
 
-function isSrOnlySwitchInput(el: ElementMatch): boolean {
-  return (
-    el.type === "RegularElement" &&
-    el.name === "input" &&
-    (el.attributes.get("class") ?? "").split(/\s+/).includes("sr-only") &&
-    el.attributes.get("role") === "switch"
-  );
-}
-
 describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
   it("scopes data-sticky-shell to the reader shell and avoids double Librarr scroll offsets", () => {
     const readerSource = readRelative("../routes/+page.svelte");
@@ -113,30 +104,23 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const inlineSrOnlySwitches = elements.filter(isSrOnlySwitchInput);
-    const switchControlUsages = elements.filter(
+    const switchControlElements = collectElements(
+      parse(readRelative("./components/SwitchControl.svelte"), { modern: true }).fragment,
+    );
+    expect(
+      switchControlElements.filter(
+        (el) =>
+          el.type === "RegularElement" &&
+          el.name === "button" &&
+          el.attributes.get("type") === "button" &&
+          el.attributes.get("role") === "switch",
+      ),
+      "SwitchControl should render a real button[role='switch'] element",
+    ).toHaveLength(1);
+
+    const srOnlySwitches = elements.filter(
       (el) => el.type === "Component" && el.name === "SwitchControl",
     );
-    const switchFieldUsages = elements.filter(
-      (el) => el.type === "Component" && el.name === "SwitchField",
-    );
-    if (switchFieldUsages.length > 0) {
-      const switchFieldElements = collectElements(
-        parse(readRelative("./components/SwitchField.svelte"), { modern: true }).fragment,
-      );
-      expect(
-        switchFieldElements.filter(
-          (el) => el.type === "Component" && el.name === "SwitchControl",
-        ),
-        "SwitchField should render a SwitchControl primitive",
-      ).toHaveLength(1);
-    }
-
-    const srOnlySwitches = [
-      ...inlineSrOnlySwitches,
-      ...switchControlUsages,
-      ...switchFieldUsages,
-    ];
     expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
     for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);

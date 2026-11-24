@@ -1,16 +1,20 @@
+<script module lang="ts">
+	export function nextCoverExpanded(expanded: boolean): boolean {
+		return !expanded;
+	}
+</script>
+
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { fade, scale } from 'svelte/transition';
+	import { scale } from 'svelte/transition';
 	import { BookOpen } from '@lucide/svelte';
 	import type { MouseEventHandler } from 'svelte/elements';
 
 	type Props = {
 		title: string;
 		score: number;
-		coverUrl?: string | null;
 		hasCover?: boolean;
 		expanded?: boolean;
-		loading?: 'lazy' | 'eager';
 		id?: string;
 		class?: string;
 		onclick?: MouseEventHandler<HTMLButtonElement>;
@@ -20,10 +24,8 @@
 	let {
 		title,
 		score,
-		coverUrl = '',
-		hasCover,
+		hasCover = false,
 		expanded = false,
-		loading = 'lazy',
 		id,
 		class: className = '',
 		onclick,
@@ -34,7 +36,6 @@
 	const baseId = $derived(id ?? fallbackId);
 	const titleId = $derived(`${baseId}-title`);
 	const actionId = $derived(`${baseId}-action`);
-	const showMobileBackdrop = $derived(hasCover ?? Boolean(coverUrl));
 
 	function motionDuration(duration: number) {
 		if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return duration;
@@ -43,7 +44,7 @@
 </script>
 
 <div
-	class={`${showMobileBackdrop ? 'pointer-events-none absolute inset-0 z-0' : 'hidden'} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-[''] ${className}`.trim()}
+	class={`${hasCover ? 'pointer-events-none absolute inset-0 z-0' : 'hidden'} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-[''] ${className}`.trim()}
 >
 	<span
 		class="pointer-events-none absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex"
@@ -54,17 +55,6 @@
 	</span>
 	{#if children}
 		{@render children()}
-	{:else if coverUrl}
-		<img
-			in:fade={{ duration: motionDuration(340) }}
-			class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px] sm:scale-100 sm:opacity-100 sm:blur-none sm:transition sm:duration-500 sm:group-hover:scale-[1.05]"
-			src={coverUrl}
-			alt=""
-			width="160"
-			height="240"
-			{loading}
-			onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
-		/>
 	{/if}
 	<div
 		class="pointer-events-none absolute inset-0 preset-filled-surface-50-950 opacity-[0.82] sm:hidden"

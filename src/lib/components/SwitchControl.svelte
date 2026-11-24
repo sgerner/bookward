@@ -2,6 +2,19 @@
 	export function nextSwitchChecked(checked: boolean): boolean {
 		return !checked;
 	}
+
+	export function toggleSwitchState(options: {
+		checked: boolean;
+		disabled?: boolean;
+		setChecked: (nextChecked: boolean) => void;
+		onToggle?: (nextChecked: boolean) => void;
+	}): boolean {
+		if (options.disabled) return options.checked;
+		const next = nextSwitchChecked(options.checked);
+		options.setChecked(next);
+		options.onToggle?.(next);
+		return next;
+	}
 </script>
 
 <script lang="ts">
@@ -36,10 +49,14 @@
 	} = $props();
 
 	function handleClick() {
-		if (disabled) return;
-		const next = nextSwitchChecked(checked);
-		checked = next;
-		onToggle?.(next);
+		toggleSwitchState({
+			checked,
+			disabled,
+			setChecked: (next) => {
+				checked = next;
+			},
+			onToggle,
+		});
 	}
 </script>
 

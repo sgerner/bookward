@@ -1,12 +1,55 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createRawSnippet } from 'svelte';
+import { parse } from 'svelte/compiler';
 import { render } from 'svelte/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { THEMES } from '#lib/theme.js';
 import ChipToggle, { nextChipPressed } from './ChipToggle.svelte';
 import RadioGroup, { type RadioItemState } from './RadioGroup.svelte';
-import SwitchControl, { nextSwitchChecked } from './SwitchControl.svelte';
+import SwitchControl, { nextSwitchChecked, toggleSwitchState } from './SwitchControl.svelte';
+
+type AstElement = {
+	type: 'RegularElement' | 'Component';
+	name: string;
+	attributes: Array<{
+		type: string;
+		name?: string;
+		value?: true | Array<{ type?: string; data?: string }> | { type?: string };
+	}>;
+};
+
+function collectAstElements(node: unknown): AstElement[] {
+	if (!node || typeof node !== 'object') return [];
+	const record = node as Record<string, unknown>;
+	const found: AstElement[] = [];
+	if (
+		(record.type === 'RegularElement' || record.type === 'Component') &&
+		typeof record.name === 'string'
+	) {
+		found.push({
+			type: record.type,
+			name: record.name,
+			attributes: (record.attributes as AstElement['attributes']) ?? [],
+		});
+	}
+	for (const [key, value] of Object.entries(record)) {
+		if (key === 'attributes') continue;
+		if (Array.isArray(value)) {
+			for (const child of value) found.push(...collectAstElements(child));
+		} else if (value && typeof value === 'object') {
+			found.push(...collectAstElements(value));
+		}
+	}
+	return found;
+}
+
+function getStaticAttr(el: AstElement, name: string): string | undefined {
+	const attr = el.attributes.find((item) => item.type === 'Attribute' && item.name === name);
+	if (!attr) return undefined;
+	if (attr.value === true || !Array.isArray(attr.value)) return '';
+	return attr.value.map((part) => part.data ?? '').join('');
+}
 
 describe('ChipToggle primitive', () => {
 	it('renders inactive and active aria-pressed states with matching Skeleton fill classes', () => {
@@ -40,19 +83,24 @@ describe('ChipToggle primitive', () => {
 });
 
 describe('SwitchControl primitive', () => {
-	it('renders a type="button" role="switch" with hidden form input only when checked', () => {
+	it('renders a type="button" role="switch" with labelledby/describedby associations, default focus ring, and hidden form input only when checked', () => {
 		const unchecked = render(SwitchControl, {
 			props: {
 				id: 'digest-enabled',
 				name: 'enabled',
 				checked: false,
-				ariaLabel: 'Enable weekly digest',
+				ariaLabelledBy: 'digest-enabled-label',
+				ariaDescribedBy: 'digest-enabled-description',
 			},
 		});
 		expect(unchecked.body).toContain('id="digest-enabled"');
 		expect(unchecked.body).toContain('type="button"');
 		expect(unchecked.body).toContain('role="switch"');
 		expect(unchecked.body).toContain('aria-checked="false"');
+		expect(unchecked.body).not.toContain('aria-label=');
+		expect(unchecked.body).toContain('aria-labelledby="digest-enabled-label"');
+		expect(unchecked.body).toContain('aria-describedby="digest-enabled-description"');
+		expect(unchecked.body).toContain('focus-visible:outline-secondary-500');
 		expect(unchecked.body).not.toContain('<input');
 
 		const checked = render(SwitchControl, {
@@ -61,7 +109,8 @@ describe('SwitchControl primitive', () => {
 				name: 'channels',
 				value: 'discord',
 				checked: true,
-				ariaLabel: 'Send digest to Discord',
+				ariaLabelledBy: 'digest-discord-label',
+				ariaDescribedBy: 'digest-discord-description',
 			},
 		});
 		expect(checked.body).toContain('type="button"');
@@ -76,7 +125,8 @@ describe('SwitchControl primitive', () => {
 				name: 'channels',
 				value: 'email',
 				checked: true,
-				ariaLabel: 'Send digest by email',
+				ariaLabelledBy: 'digest-email-label',
+				ariaDescribedBy: 'digest-email-description',
 				activeClass: 'preset-filled-tertiary-500',
 			},
 		});
@@ -96,6 +146,66 @@ describe('SwitchControl primitive', () => {
 
 		expect(nextSwitchChecked(false)).toBe(true);
 		expect(nextSwitchChecked(true)).toBe(false);
+	});
+
+	it('round-trips bound checked state and onToggle callbacks across clicks while guarding disabled switches', () => {
+		let boundChecked = false;
+		const onToggle = vi.fn<(nextChecked: boolean) => void>();
+
+		const firstPass = render(SwitchControl, {
+			props: {
+				id: 'digest-only-new',
+				name: 'onlyNew',
+				checked: boundChecked,
+				ariaLabelledBy: 'digest-only-new-label',
+			},
+		});
+		expect(firstPass.body).toContain('aria-checked="false"');
+		expect(firstPass.body).not.toContain('<input type="hidden"');
+
+		toggleSwitchState({
+			checked: boundChecked,
+			setChecked: (next) => {
+				boundChecked = next;
+			},
+			onToggle,
+		});
+		expect(boundChecked).toBe(true);
+		expect(onToggle).toHaveBeenCalledTimes(1);
+		expect(onToggle).toHaveBeenLastCalledWith(true);
+
+		const secondPass = render(SwitchControl, {
+			props: {
+				id: 'digest-only-new',
+				name: 'onlyNew',
+				checked: boundChecked,
+				ariaLabelledBy: 'digest-only-new-label',
+			},
+		});
+		expect(secondPass.body).toContain('aria-checked="true"');
+		expect(secondPass.body).toContain('<input type="hidden" name="onlyNew" value="on"');
+
+		toggleSwitchState({
+			checked: boundChecked,
+			setChecked: (next) => {
+				boundChecked = next;
+			},
+			onToggle,
+		});
+		expect(boundChecked).toBe(false);
+		expect(onToggle).toHaveBeenCalledTimes(2);
+		expect(onToggle).toHaveBeenLastCalledWith(false);
+
+		toggleSwitchState({
+			checked: boundChecked,
+			disabled: true,
+			setChecked: (next) => {
+				boundChecked = next;
+			},
+			onToggle,
+		});
+		expect(boundChecked).toBe(false);
+		expect(onToggle).toHaveBeenCalledTimes(2);
 	});
 });
 
@@ -151,7 +261,7 @@ describe('RadioGroup primitive', () => {
 });
 
 describe('ThemePicker and +page.svelte ARIA wiring', () => {
-	it('replaces stuck aria-pressed grids and sr-only checkbox switches with shared primitives', () => {
+	it('replaces stuck aria-pressed grids and sr-only checkbox switches with shared primitives and label/description bindings', () => {
 		const themePickerSource = readFileSync(
 			fileURLToPath(new URL('./ThemePicker.svelte', import.meta.url)),
 			'utf8',
@@ -163,13 +273,6 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 		expect(themePickerSource).toContain('labelledBy="appearance-theme-legend"');
 		expect(themePickerSource.match(/<RadioGroup/g)).toHaveLength(2);
 
-		const switchFieldSource = readFileSync(
-			fileURLToPath(new URL('./SwitchField.svelte', import.meta.url)),
-			'utf8',
-		);
-		expect(switchFieldSource).toContain('<SwitchControl');
-		expect(switchFieldSource).not.toMatch(/<input[^>]*role="switch"/);
-
 		const pageSource = readFileSync(
 			fileURLToPath(new URL('../../routes/+page.svelte', import.meta.url)),
 			'utf8',
@@ -177,7 +280,49 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 		expect(pageSource).toContain('<ChipToggle');
 		expect(pageSource).toContain('id="mark-read-rating-label"');
 		expect(pageSource).toContain('labelledBy="mark-read-rating-label"');
-		expect(pageSource.match(/<SwitchField/g)).toHaveLength(4);
+		expect(pageSource.match(/<SwitchControl/g)).toHaveLength(4);
+		expect(pageSource).not.toContain('SwitchField');
 		expect(pageSource).not.toMatch(/<input[^>]*role="switch"/);
+
+		const pageElements = collectAstElements(parse(pageSource, { modern: true }).fragment);
+		const switchControls = pageElements.filter(
+			(el) => el.type === 'Component' && el.name === 'SwitchControl',
+		);
+		expect(switchControls).toHaveLength(4);
+
+		const expectedSwitchIds = [
+			'digest-enabled',
+			'digest-only-new',
+			'digest-discord',
+			'digest-email',
+		];
+		expect(switchControls.map((sw) => getStaticAttr(sw, 'id'))).toEqual(expectedSwitchIds);
+
+		for (const sw of switchControls) {
+			const id = getStaticAttr(sw, 'id')!;
+			expect(getStaticAttr(sw, 'ariaLabel')).toBeUndefined();
+			expect(getStaticAttr(sw, 'ariaLabelledBy')).toBe(`${id}-label`);
+			expect(getStaticAttr(sw, 'ariaDescribedBy')).toBe(`${id}-description`);
+			expect(
+				sw.attributes.some((attr) => attr.type === 'BindDirective' && attr.name === 'checked'),
+			).toBe(true);
+
+			const matchingLabel = pageElements.find(
+				(el) =>
+					el.type === 'RegularElement' &&
+					el.name === 'label' &&
+					getStaticAttr(el, 'id') === `${id}-label` &&
+					getStaticAttr(el, 'for') === id,
+			);
+			expect(matchingLabel, `missing <label id="${id}-label" for="${id}">`).toBeDefined();
+
+			const matchingDescription = pageElements.find(
+				(el) =>
+					el.type === 'RegularElement' &&
+					el.name === 'p' &&
+					getStaticAttr(el, 'id') === `${id}-description`,
+			);
+			expect(matchingDescription, `missing <p id="${id}-description">`).toBeDefined();
+		}
 	});
 });
