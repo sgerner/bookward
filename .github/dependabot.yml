@@ -14,17 +14,28 @@ updates:
       - dependency-name: typescript
         versions:
           - ">=7.0.0"
+      - dependency-name: "@types/node"
+        versions:
+          - ">=25.0.0"
 
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: /engine
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
     groups:
       engine-runtime:
-        dependency-type: production
+        patterns:
+          - "*"
+        exclude-patterns:
+          - pytest
+          - respx
+          - sentence-transformers
       engine-tooling:
-        dependency-type: development
+        patterns:
+          - pytest
+          - respx
+          - sentence-transformers
 
   - package-ecosystem: github-actions
     directory: /
@@ -33,5 +44,34 @@ updates:
     open-pull-requests-limit: 10
     groups:
       actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /engine
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      containers:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: node
+        versions:
+          - ">=25.0.0"
+      - dependency-name: python
+        versions:
+          - ">=3.13.0"
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      compose:
         patterns:
           - "*"

@@ -25,7 +25,6 @@ from afterword_engine.covers import (
     fallback_cover_url,
     is_weak_cover_url,
     resolve_book_metadata,
-    resolve_cover_url,
     safe_cover_url,
 )
 from afterword_engine.ingestion import (
@@ -36,6 +35,7 @@ from afterword_engine.ingestion import (
     enrich_goodreads_blog_items,
     fetch_bytes,
     filter_source_items,
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     normalize_source_filters,
@@ -135,6 +135,39 @@ def test_database_indexes_cover_recent_history_and_job_queue(database):
     )
     assert any("idx_reads_recent" in item["detail"] for item in history_plan)
     assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
+
+
+def test_database_indexes_cover_goodreads_shelf_deletes(database):
+    indexes = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
+            ("idx_goodreads_shelf_items_shelf", "idx_goodreads_shelf_items_title_author"),
+        )
+    }
+
+    assert indexes == {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    delete_by_book_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("Project Hail Mary", "Andy Weir"),
+    )
+    delete_by_shelf_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+        ("to-read",),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in delete_by_book_plan
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf"
+        in item["detail"]
+        for item in delete_by_shelf_plan
+    )
 
 
 def test_startup_quality_audit_ignores_rejected_legacy_candidates(database):
@@ -1224,7 +1257,7 @@ def test_goodreads_rss_scheduler_retries_failed_daily_job_with_a_cap(database):
 
 
 def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
-    async def fail(_url):
+    async def fail(_url, client=None):
         raise RuntimeError("feed unavailable")
 
     monkeypatch.setattr("afterword_engine.main.import_goodreads_rss", fail)
@@ -1236,6 +1269,157 @@ def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
     assert configured["goodreads_rss_last_attempt_at"]
     assert configured["goodreads_rss_last_error"] == "feed unavailable"
     assert configured["goodreads_rss_last_sync_at"] == ""
+
+
+def test_sync_goodreads_rss_reuses_single_client_with_3_way_concurrency(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Finished From Private Shelf', 'Author A')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Still Reading Private', 'Author B')"
+        )
+
+    read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Finished From Private Shelf</title>
+        <author_name>Author A</author_name>
+        <user_rating>5</user_rating>
+        <isbn13>9780593135204</isbn13>
+      </item>
+    </channel></rss>"""
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Queued Book</title>
+        <author_name>Author C</author_name>
+      </item>
+    </channel></rss>"""
+
+    in_flight = 0
+    max_in_flight = 0
+    seen_hosts: list[str] = []
+    created_clients: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        seen_hosts.append(request.headers.get("Host", ""))
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.15)
+            shelf = request.url.params.get("shelf")
+            if shelf == "read":
+                return httpx.Response(200, content=read_xml, headers={"content-type": "application/rss+xml"})
+            if shelf == "to-read":
+                return httpx.Response(200, content=to_read_xml, headers={"content-type": "application/rss+xml"})
+            if shelf == "currently-reading":
+                return httpx.Response(404, content=b"Not Found", headers={"content-type": "text/plain"})
+            raise AssertionError(f"Unexpected shelf: {shelf}")
+        finally:
+            in_flight -= 1
+
+    def fake_source_client() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(ingestion, "_source_client", fake_source_client)
+
+    result = asyncio.run(
+        main._sync_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+
+    assert len(created_clients) == 1
+    assert max_in_flight == 3
+    assert seen_hosts == ["www.goodreads.com", "www.goodreads.com", "www.goodreads.com"]
+    assert result["imported"] == 1
+    assert result["shelves"] == {"to-read": 1, "currently-reading": 0}
+    assert safe_settings(include_api_tokens=False)["goodreads_rss_last_status"] == "succeeded"
+    assert row(
+        "SELECT COUNT(*) count FROM reads WHERE title='Finished From Private Shelf'"
+    )["count"] == 1
+    shelf_items = [
+        (item["shelf"], item["title"], item["author"])
+        for item in rows("SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf, title")
+    ]
+    assert shelf_items == [
+        ("currently-reading", "Still Reading Private", "Author B"),
+        ("to-read", "Queued Book", "Author C"),
+    ]
+
+
+def test_sync_goodreads_rss_read_failure_rolls_back_and_skips_shelf_writes(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Existing Shelf Book', 'Existing Author')"
+        )
+
+    shelf_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Replacement Book</title>
+        <author_name>New Author</author_name>
+      </item>
+    </channel></rss>"""
+
+    completed_shelves: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        shelf = request.url.params.get("shelf")
+        if shelf == "read":
+            await asyncio.sleep(0.02)
+            return httpx.Response(500, content=b"Server Error", headers={"content-type": "text/plain"})
+        await asyncio.sleep(0.06)
+        completed_shelves.append(str(shelf))
+        return httpx.Response(200, content=shelf_xml, headers={"content-type": "application/rss+xml"})
+
+    monkeypatch.setattr(
+        ingestion,
+        "_source_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(
+            main._sync_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+        )
+
+    assert sorted(completed_shelves) == ["currently-reading", "to-read"]
+    assert safe_settings(include_api_tokens=False)["goodreads_rss_last_status"] == "failed"
+    shelf_items = [
+        (item["shelf"], item["title"], item["author"])
+        for item in rows("SELECT shelf, title, author FROM goodreads_shelf_items")
+    ]
+    assert shelf_items == [("to-read", "Existing Shelf Book", "Existing Author")]
 
 
 def test_goodreads_csv_import_is_idempotent(database):
@@ -1610,6 +1794,132 @@ def test_settings_encrypt_and_preserve_api_keys(database):
     assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
 
 
+def test_partial_settings_updates_preserve_sibling_fields_and_require_initial_librarr_key(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        missing_key = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert missing_key.status_code == 400
+        assert missing_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        omitted_key = client.put(
+            "/api/settings",
+            json={"librarr_url": "http://librarr:5050"},
+        )
+        assert omitted_key.status_code == 400
+        assert omitted_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        saved_librarr = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "librarr-initial-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert saved_librarr.status_code == 200
+
+        saved_embeddings = client.put(
+            "/api/settings",
+            json={
+                "embedding_backend": "local",
+                "embedding_model": "hashing-768",
+                "embedding_url": "",
+                "embedding_api_key": "embedding-initial-secret",
+            },
+        )
+        assert saved_embeddings.status_code == 200
+
+        def reject_embedding_check(*_args, **_kwargs):
+            raise AssertionError("unchanged embedding settings should not be checked")
+
+        monkeypatch.setattr(main_module, "get_embedder", reject_embedding_check)
+        updated_format = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "audiobook",
+            },
+        )
+        assert updated_format.status_code == 200
+        assert updated_format.json()["embedding"]["checked"] is False
+
+    private = main_module.private_settings()
+    assert private["librarr_url"] == "http://librarr:5050"
+    assert private["librarr_api_key"] == "librarr-initial-secret"
+    assert private["librarr_media_type"] == "audiobook"
+    assert private["embedding_api_key"] == "embedding-initial-secret"
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+
+
+def test_settings_reject_private_librarr_host_even_with_a_key(database):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        rejected = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://10.0.0.1:5050",
+                "librarr_api_key": "librarr-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert rejected.status_code == 400
+    private = main_module.private_settings()
+    assert private.get("librarr_url", "") == ""
+    assert private.get("librarr_api_key", "") == ""
+
+
+def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
+    default_source = row("SELECT id, enabled FROM sources WHERE is_default=1")
+    assert default_source["enabled"] == 1
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        disabled = client.put("/api/sources/default/toggle")
+        assert disabled.status_code == 200
+        assert disabled.json() == {
+            "id": default_source["id"],
+            "enabled": 0,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 0
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM candidates WHERE source_id=? AND status='recommended'",
+                (default_source["id"],),
+            )["count"]
+            == 0
+        )
+
+        reenabled = client.put("/api/sources/default/toggle")
+        assert reenabled.status_code == 200
+        assert reenabled.json() == {
+            "id": default_source["id"],
+            "enabled": 1,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 1
+
+        with transaction() as con:
+            con.execute("UPDATE sources SET is_default=0 WHERE is_default=1")
+
+        missing = client.put("/api/sources/default/toggle")
+        assert missing.status_code == 404
+        assert missing.json()["detail"] == "Default source not found."
+
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+
+
 def test_nyt_books_key_is_encrypted_and_only_added_to_outgoing_requests(database):
     with TestClient(app, headers=authenticated_headers()) as client:
         assert client.get("/api/settings/nyt").json() == {"api_key_set": False}
@@ -1853,28 +2163,318 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("https://tracking.example/cover.jpg", "https://books.example/list") == ""
     assert fallback_cover_url("A Book", "An Author").startswith("https://placehold.co/")
 
-@respx.mock
-def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
-    route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(200, json={"docs": [{"title": "A Book", "author_name": ["An Author"], "cover_i": 12345}]})
-    )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author", "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg"))
-    assert cover == "https://covers.openlibrary.org/b/id/12345-L.jpg"
-    assert route.called
 
-@respx.mock
-def test_cover_lookup_falls_back_to_google_books_then_placeholder():
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
-    google = respx.get(GOOGLE_BOOKS_SEARCH).mock(
-        return_value=httpx.Response(200, json={"items": [{"volumeInfo": {"title": "A Book", "authors": ["An Author"], "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=x"}}}]})
+def test_cover_and_source_url_helpers_deduplicate_parses_and_preserve_edge_cases(monkeypatch):
+    import afterword_engine.covers as covers_module
+
+    # Credentials, uppercase/trailing-dot hosts, subdomains, and fragment stripping
+    assert safe_cover_url("https://user:pass@covers.openlibrary.org/b/id/42-L.jpg") == ""
+    assert (
+        safe_cover_url("https://COVERS.OPENLIBRARY.ORG./b/id/42-L.jpg#preview")
+        == "https://covers.openlibrary.org./b/id/42-L.jpg"
     )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author"))
-    assert cover == "https://books.google.com/books/content?id=x"
-    assert google.called
-    respx.reset()
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(503))
-    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
-    assert asyncio.run(resolve_cover_url("No Match", "Nobody")).startswith("https://placehold.co/")
+    assert (
+        safe_cover_url("https://is1-ssl.MZSTATIC.com/image/thumb/cover.jpg#")
+        == "https://is1-ssl.mzstatic.com/image/thumb/cover.jpg"
+    )
+    assert (
+        safe_cover_url(
+            "https://BOOKS.EXAMPLE./art/cover.jpg#top",
+            "https://books.example/list",
+        )
+        == "https://books.example./art/cover.jpg"
+    )
+
+    # Weak covers fall back to placeholder_cover_url
+    expected_placeholder = covers_module.placeholder_cover_url("A Book", "An Author")
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg",
+            "https://openlibrary.org/works/OL1W",
+        )
+        == expected_placeholder
+    )
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://placehold.co/640x960?text=Old",
+            "https://books.example/list",
+        )
+        == expected_placeholder
+    )
+
+    # Known CDN cover without '#' parses supplied once and skips source_url + copy_with
+    httpx_calls = []
+    real_httpx_url = covers_module.httpx.URL
+
+    def counting_httpx_url(value, *args, **kwargs):
+        httpx_calls.append(value)
+        return real_httpx_url(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", counting_httpx_url)
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/id/42-L.jpg",
+            "https://books.example/list",
+        )
+        == "https://covers.openlibrary.org/b/id/42-L.jpg"
+    )
+    assert httpx_calls == ["https://covers.openlibrary.org/b/id/42-L.jpg"]
+
+    # canonical_book_source_url parses source_url once and promotes Open Library list links when work ID exists
+    urlparse_calls = []
+    real_urlparse = covers_module.urlparse
+
+    def counting_urlparse(value, *args, **kwargs):
+        urlparse_calls.append(value)
+        return real_urlparse(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module, "urlparse", counting_urlparse)
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://www.openlibrary.org./people/reader/lists/OL2L",
+            item={"quality_work_id": "/works/OL99W", "quality_provider": "openlibrary"},
+        )
+        == "https://openlibrary.org/works/OL99W"
+    )
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://openlibrary.org/people/reader/lists/OL2L",
+            item={"quality_work_id": "", "quality_provider": ""},
+        )
+        == "https://openlibrary.org/search?title=A+Book&author=A+Writer"
+    )
+    assert len(urlparse_calls) == 2
+
+
+def test_tracked_recommendations_defers_url_formatting_until_after_pagination(database, monkeypatch):
+    import afterword_engine.covers as covers_module
+    import afterword_engine.main as main_module
+    from afterword_engine.decision_evidence import load_decision_evidence
+
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+        con.execute("DELETE FROM candidate_quality")
+        source_id = con.execute("SELECT id FROM sources WHERE enabled=1 LIMIT 1").fetchone()["id"]
+        special_cases = [
+            (
+                "Top Promoted List Book",
+                "Writer One",
+                "https://covers.openlibrary.org/b/id/501-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL10L",
+                "recommended",
+                99.0,
+                "/works/OL501W",
+            ),
+            (
+                "Top Unpromoted List Book",
+                "Writer Two",
+                "https://covers.openlibrary.org/b/isbn/9780000000002-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL11L",
+                "recommended",
+                98.0,
+                "",
+            ),
+            (
+                "Top Fragment Publisher Book",
+                "Writer Three",
+                "https://BOOKS.EXAMPLE./covers/three.jpg#hero",
+                "https://books.example/list/three",
+                "recommended",
+                97.0,
+                "",
+            ),
+            (
+                "Top ISBN Search Book",
+                "Writer Four",
+                "https://placehold.co/600x900",
+                "https://openlibrary.org/isbn/9780000000004",
+                "recommended",
+                96.0,
+                "",
+            ),
+        ]
+        for idx in range(196):
+            special_cases.append(
+                (
+                    f"Pool Tail Book {idx}",
+                    f"Tail Author {idx}",
+                    f"https://covers.openlibrary.org/b/id/{1000 + idx}-L.jpg",
+                    f"https://openlibrary.org/people/reader/lists/OL{1000 + idx}L",
+                    "recommended",
+                    round(90.0 - idx * 0.1, 3),
+                    "",
+                )
+            )
+        special_cases.extend(
+            [
+                (
+                    "Saved Weak Cover Book",
+                    "Saved Author",
+                    "https://covers.openlibrary.org/b/isbn/9780000000099-L.jpg",
+                    "https://openlibrary.org/isbn/9780000000099",
+                    "saved",
+                    85.0,
+                    "",
+                ),
+                (
+                    "Rejected List Book",
+                    "Rejected Author",
+                    "https://covers.openlibrary.org/b/id/900-L.jpg#frag",
+                    "https://openlibrary.org/people/reader/lists/OL900L",
+                    "rejected",
+                    40.0,
+                    "/works/OL900W",
+                ),
+            ]
+        )
+        for title, author, cover_url, source_url, status, score_val, work_id in special_cases:
+            cur = con.execute(
+                """INSERT INTO candidates(
+                    title,author,description,cover_url,source_url,source_id,
+                    release_date,date_kind,genres,score,explanation,status,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    author,
+                    f"Summary for {title}",
+                    cover_url,
+                    source_url,
+                    source_id,
+                    "2026-02-01",
+                    "day",
+                    json.dumps(["Fiction"]),
+                    score_val,
+                    json.dumps(["Matched"]),
+                    status,
+                    normalize_key(title, author),
+                ),
+            )
+            con.execute(
+                """INSERT OR REPLACE INTO candidate_quality(
+                    candidate_id,quality_status,quality_score,audit_version,metadata_version,work_id,provider
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    cur.lastrowid,
+                    "accepted",
+                    1.0,
+                    "builtin-curated-v1",
+                    "catalog-metadata-v1",
+                    work_id,
+                    "openlibrary" if work_id else "",
+                ),
+            )
+            if status == "rejected":
+                con.execute(
+                    "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                    (cur.lastrowid, "reject"),
+                )
+
+    unformatted = recommendation_list(status="recommended", limit=4, format_urls=False)
+    assert unformatted[0]["genres"] == ["Fiction"]
+    assert unformatted[0]["explanation"] == ["Matched"]
+    assert unformatted[0]["source_url"] == "https://openlibrary.org/people/reader/lists/OL10L"
+
+    httpx_calls = 0
+    urlparse_calls = 0
+    real_httpx_url = covers_module.httpx.URL
+    real_covers_urlparse = covers_module.urlparse
+    real_main_urlparse = main_module.urlparse
+
+    def count_httpx_url(*args, **kwargs):
+        nonlocal httpx_calls
+        httpx_calls += 1
+        return real_httpx_url(*args, **kwargs)
+
+    def count_covers_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_covers_urlparse(*args, **kwargs)
+
+    def count_main_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_main_urlparse(*args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", count_httpx_url)
+    monkeypatch.setattr(covers_module, "urlparse", count_covers_urlparse)
+    monkeypatch.setattr(main_module, "urlparse", count_main_urlparse)
+
+    served, run_id = main_module.tracked_recommendations(status="recommended", limit=8, offset=0)
+    assert len(served) == 8
+    # Only the 8 served recommendations are URL-formatted (8 source URLs; 8 covers + 1 source-host check)
+    assert urlparse_calls == 8
+    assert httpx_calls == 9
+
+    assert served[0]["cover_url"] == "https://covers.openlibrary.org/b/id/501-L.jpg"
+    assert served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert served[1]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[1]["source_url"]
+        == "https://openlibrary.org/search?title=Top+Unpromoted+List+Book&author=Writer+Two"
+    )
+    assert served[2]["cover_url"] == "https://books.example./covers/three.jpg"
+    assert served[2]["source_url"] == "https://books.example/list/three"
+    assert served[3]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[3]["source_url"]
+        == "https://openlibrary.org/search?title=Top+ISBN+Search+Book&author=Writer+Four"
+    )
+
+    with main_module.connect() as con:
+        evidence = load_decision_evidence(con, run_id)
+    assert evidence is not None and evidence["capture_status"] == "complete"
+    assert len(evidence["decision"]["pools"]["base"]) == 200
+    assert len(evidence["decision"]["pools"]["final"]) == 200
+    assert "cover_url" not in evidence["decision"]["pools"]["final"][0]
+    assert "source_url" not in evidence["decision"]["pools"]["final"][0]
+    assert len(evidence["served_exposures"]) == 8
+    exposure_snapshot = json.loads(evidence["served_exposures"][0]["candidate_snapshot_json"])
+    assert "cover_url" not in exposure_snapshot
+    assert "source_url" not in exposure_snapshot
+
+    # Non-personalized path (can_personalize is False) still formats URLs for the returned slice
+    saved_items, _ = main_module.tracked_recommendations(status="saved", limit=8, offset=0)
+    assert len(saved_items) == 1
+    assert saved_items[0]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        saved_items[0]["source_url"]
+        == "https://openlibrary.org/search?title=Saved+Weak+Cover+Book&author=Saved+Author"
+    )
+
+    decisions = recommendation_list(status="decisions", limit=8)
+    assert len(decisions) == 1
+    assert decisions[0]["cover_url"] == "https://covers.openlibrary.org/b/id/900-L.jpg"
+    assert decisions[0]["source_url"] == "https://openlibrary.org/works/OL900W"
+
+    # Overview path (status=None, recommended_limit=4) formats only 4 recommended + 1 saved
+    httpx_calls = 0
+    urlparse_calls = 0
+    overview_slice, _ = main_module.tracked_recommendations(limit=24, recommended_limit=4)
+    assert len(overview_slice) == 5
+    assert urlparse_calls == 5
+
+    # Personalization failure fallback still formats URLs for the returned slice
+    def broken_personalize(*_args, **_kwargs):
+        raise RuntimeError("simulated personalization failure")
+
+    monkeypatch.setattr(main_module, "personalize_recommendations", broken_personalize)
+    httpx_calls = 0
+    urlparse_calls = 0
+    fallback_served, _ = main_module.tracked_recommendations(status="recommended", limit=4, offset=0)
+    assert len(fallback_served) == 4
+    assert urlparse_calls == 4
+    assert fallback_served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert fallback_served[2]["cover_url"] == "https://books.example./covers/three.jpg"
 
 @respx.mock
 def test_book_metadata_lookup_supplies_summary_and_year():
@@ -2620,6 +3220,99 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
 
 
+def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(tmp_path, monkeypatch):
+    settings.db = str(tmp_path / "v25.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version > 25:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 26))
+        assert (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_goodreads_shelf_items_title_author'"
+            ).fetchone()
+            is None
+        )
+        pre_upgrade_plan = [
+            item[3]
+            for item in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("CSV Promoted", "Author One"),
+            )
+        ]
+        assert any("SCAN goodreads_shelf_items" in detail for detail in pre_upgrade_plan)
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) VALUES(?, ?, ?)",
+            [
+                ("to-read", "CSV Promoted", "Author One"),
+                ("currently-reading", "CSV Promoted", "Author One"),
+                ("to-read", "RSS Promoted", "Author Two"),
+                ("currently-reading", "RSS Promoted", "Author Two"),
+                ("to-read", "Still Queued", "Author Three"),
+            ],
+        )
+
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+    assert row("SELECT 1 FROM schema_migrations WHERE version=26") is not None
+    post_upgrade_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("CSV Promoted", "Author One"),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in post_upgrade_plan
+    )
+
+    # Rerunning initialize() remains idempotent with IF NOT EXISTS.
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+
+    csv_count = import_goodreads_csv(
+        b"Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        b"CSV Promoted,Author One,5,2026/03/01,2026/02/01,read,=\"9780593135204\"\n"
+    )
+    assert csv_count == 1
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM goodreads_shelf_items WHERE title=? AND author=?",
+            ("CSV Promoted", "Author One"),
+        )["count"]
+        == 0
+    )
+
+    async def fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [
+            {
+                "title": "RSS Promoted",
+                "author_name": "Author Two",
+                "user_rating": "4",
+                "user_read_at": "2026/03/02",
+                "isbn13": "9781635575637",
+            }
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+    rss_count = asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    )
+    assert rss_count == 1
+    remaining = rows("SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf, title")
+    assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
+
+
 def test_initialize_removes_retired_llm_data_from_v11_database(tmp_path):
     settings.db = str(tmp_path / "retired-model.db")
     import sqlite3
@@ -3060,3 +3753,112 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def test_storygraph_csv_imports_completed_books_fractional_ratings_dates_and_isbns(database):
+    payload = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        '"This Is How You Lose the Time War","Amal El-Mohtar, Max Gladstone",,9781534431003,hardcover,read,2024/01/01,2024/01/18,2024/01/05-2024/01/18,4.75\n'
+        '"A Canticle for Leibowitz","Walter M. Miller, Jr.",,0553273817,paperback,read,2023/06/01,,2021/03/01-2021/03/10; 2023/06/02-2023/06/19,4.25\n'
+        '"Indie Digital Book",Solo Writer,,B08FHBV4ZX,digital,read,2024/02/01,,2024/02/10-,3.5\n'
+        '"UUID Edition",Another Writer,,a1b2c3d4-e5f6-4789-abcd-ef0123456789,audio,read,2024/03/01,2024-03-15,,\n'
+    ).encode("utf-8")
+
+    result = import_csv(payload)
+    assert result == {"imported": 4, "source": "storygraph_csv"}
+
+    imported_rows = rows(
+        "SELECT title, author, rating, read_at, isbn, source "
+        "FROM reads WHERE source='storygraph_csv' ORDER BY title"
+    )
+    assert imported_rows == [
+        {
+            "title": "A Canticle for Leibowitz",
+            "author": "Walter M. Miller, Jr.",
+            "rating": 4.25,
+            "read_at": "2023/06/19",
+            "isbn": "9780553273816",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "Indie Digital Book",
+            "author": "Solo Writer",
+            "rating": 3.5,
+            "read_at": None,
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar, Max Gladstone".split(",")[0],
+            "rating": 4.75,
+            "read_at": "2024/01/18",
+            "isbn": "9781534431003",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "UUID Edition",
+            "author": "Another Writer",
+            "rating": None,
+            "read_at": "2024-03-15",
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+    ]
+
+
+def test_invalid_storygraph_rating_rolls_back_all_rows(database):
+    payload = (
+        "Title,Authors,Read Status,Star Rating\n"
+        "First Book,Writer One,read,4.5\n"
+        "Out Of Range,Writer Two,read,5.25\n"
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="CSV row 3.*Out Of Range.*No books were imported"):
+        import_csv(payload)
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='storygraph_csv'")["count"] == 0
+
+
+def test_unsupported_csv_headers_name_supported_formats(database):
+    payload = b"Heading,Writer,Rating\nSome Book,Someone,4\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(payload)
+    calibre_like = b"Title,Authors,Publisher\nSome Book,Someone,Press\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(calibre_like)
+
+
+def test_csv_upload_routes_handle_storygraph_and_goodreads(database):
+    storygraph_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Piranesi,Susanna Clarke,9781635575637,read,2025/08/12,4.75\n"
+    ).encode("utf-8")
+    goodreads_csv_bytes = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Dune,Frank Herbert,5,2025/07/01,read\n"
+    ).encode("utf-8")
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        sg_res = client.post(
+            "/api/import/csv",
+            files={"file": ("storygraph.csv", storygraph_csv, "text/csv")},
+        )
+        assert sg_res.status_code == 200
+        assert sg_res.json()["imported"] == 1
+        assert sg_res.json()["source"] == "storygraph_csv"
+        assert sg_res.json()["job_id"]
+
+        gr_res = client.post(
+            "/api/import/goodreads/csv",
+            files={"file": ("goodreads.csv", goodreads_csv_bytes, "text/csv")},
+        )
+        assert gr_res.status_code == 200
+        assert gr_res.json()["imported"] == 1
+        assert gr_res.json()["source"] == "goodreads_csv"
+
+        bad_res = client.post(
+            "/api/import/csv",
+            files={"file": ("other.csv", b"Name,Price\nTea,5\n", "text/csv")},
+        )
+        assert bad_res.status_code == 400
+        assert "StoryGraph" in bad_res.json()["detail"]
+

@@ -38,12 +38,27 @@
     Upload,
     X,
   } from "@lucide/svelte";
-  import ThemePicker from "#lib/components/ThemePicker.svelte";
+  import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
+  import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import RadioGroup from "#lib/components/RadioGroup.svelte";
+  import SwitchControl from "#lib/components/SwitchControl.svelte";
+  import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
-  import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
+  import {
+    buildLibrarrDownloadPayload,
+    canRetryLibrarrSearch,
+    finalizeLibrarrStreamState,
+    librarrFormatChangeAction,
+    readLibrarrSearchStream,
+    resolveLibrarrResultFormat,
+    shouldShowLibrarrEmptyBanner,
+  } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
@@ -60,6 +75,7 @@
     token?: string;
     id?: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
@@ -89,12 +105,11 @@
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
+  let markReadRatingGroup = $state<{ focusFirst: () => void } | null>(null);
   let filter = $state("");
   let genreFilter = $state("");
   let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
-  let profileMenuRoot = $state<HTMLDivElement | null>(null);
-  let profileMenuButton = $state<HTMLButtonElement | null>(null);
   let expandedRecommendationDetails = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
@@ -139,6 +154,7 @@
   } | null>(null);
   let librarrQuery = $state("");
   let librarrMediaType = $state<MediaType>("audiobook");
+  let librarrSearchedMediaType = $state<MediaType>("audiobook");
   let librarrResults = $state<LibrarrResult[]>([]);
   let librarrSearchState = $state<"idle" | "searching" | "ready" | "error">(
     "idle",
@@ -168,6 +184,7 @@
     error: boolean;
     id: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null>(null);
   let optimisticNotificationId = 0;
@@ -241,12 +258,22 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
-  const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
+  const allBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const merged: PageBook[] = [];
+    for (const book of [
+      ...data.books,
+      ...data.decisions,
+      ...additionalDiscoverBooks,
+      ...additionalDecisionBooks,
+    ]) {
+      if (seen.has(book.id)) continue;
+      seen.add(book.id);
       const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
-  );
+      merged.push(status === undefined ? book : { ...book, status });
+    }
+    return merged;
+  });
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
@@ -349,6 +376,18 @@
       : filteredBooks,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
+  const selectedDigestRunId = $derived.by(() => {
+    if (!selectedDigestIds.size) return "";
+    const booksById = new Map(allBooks.map((book) => [book.id, book]));
+    let sharedRunId = "";
+    for (const id of selectedDigestIds) {
+      const runId = booksById.get(id)?.recommendation_run_id?.trim() ?? "";
+      if (runId.length < 8) return "";
+      if (!sharedRunId) sharedRunId = runId;
+      else if (sharedRunId !== runId) return "";
+    }
+    return sharedRunId;
+  });
   const digestSettings = $derived(data.profile.digest);
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
@@ -582,7 +621,7 @@
 
     formNotificationDismissDelay = currentForm?.error
       ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id
+      : currentForm?.undo_id || currentForm?.undo_decisions?.length
         ? 0
         : FORM_NOTIFICATION_DISMISS_MS;
     scheduleFormNotificationDismiss();
@@ -683,12 +722,7 @@
     expandedRecommendationDetails = next;
   }
   function readingSourceLabel(source: string) {
-    return ({
-      goodreads_csv: "Goodreads CSV export",
-      goodreads_rss: "Goodreads read shelf RSS",
-      manual: "Added in Bookward",
-      demo: "Demo data",
-    } as Record<string, string>)[source] ?? (source || "Unknown source");
+    return formatReadingSourceLabel(source);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -750,22 +784,6 @@
     formNotificationDismissed = true;
   }
 
-  function actionResultMessage(result: {
-    type: string;
-    data?: unknown;
-    error?: unknown;
-  }) {
-    if (result.data && typeof result.data === "object" && "message" in result.data) {
-      const message = (result.data as { message?: unknown }).message;
-      if (typeof message === "string" && message.trim()) return message;
-    }
-    if (result.error && typeof result.error === "object" && "message" in result.error) {
-      const message = (result.error as { message?: unknown }).message;
-      if (typeof message === "string" && message.trim()) return message;
-    }
-    return "The request could not be completed. Your change was reverted.";
-  }
-
   function withPending(key: string, add: boolean) {
     const next = new Set(pendingActions);
     if (add) next.add(key);
@@ -802,12 +820,16 @@
             announceActionError(actionResultMessage(result));
             return;
           }
+          if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
+          optimisticNotificationTimer = null;
+          optimisticNotification = null;
           await update();
           if (
             succeeded &&
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
+              key === "csv-import" ||
               key === "goodreads-csv")
           ) {
             readingHistory = [];
@@ -1259,11 +1281,7 @@
     );
   }
   function resultFormat(result: LibrarrResult) {
-    return resultText(
-      result,
-      ["media_type", "format", "type"],
-      librarrMediaType,
-    );
+    return resolveLibrarrResultFormat(result, librarrSearchedMediaType);
   }
   function resultScore(result: LibrarrResult) {
     const value = result.score;
@@ -1295,7 +1313,9 @@
     librarrSearchBook = book;
     librarrQuery = `${book.title} ${book.author}`.trim().slice(0, 200);
     librarrMediaType = configuredLibrarrMediaType;
+    librarrSearchedMediaType = configuredLibrarrMediaType;
     librarrResults = [];
+    librarrSearchState = "idle";
     librarrSearchError = "";
     librarrSearchMessage = "";
     librarrAdded = new Set();
@@ -1437,6 +1457,26 @@
     observer.observe(sentinel);
     return () => observer.disconnect();
   });
+  function handleLibrarrMediaTypeChange(event: Event) {
+    const nextMediaType: MediaType =
+      (event.currentTarget as HTMLSelectElement).value === "ebook"
+        ? "ebook"
+        : "audiobook";
+    librarrMediaType = nextMediaType;
+    librarrSearchAbortController?.abort();
+    librarrSearchAbortController = null;
+    const action = librarrFormatChangeAction(librarrQuery, nextMediaType);
+    if (action.shouldSearch) {
+      void searchLibrarr();
+      return;
+    }
+    librarrSearchedMediaType = action.searchedMediaType;
+    librarrResults = [];
+    librarrAdded = new Set();
+    librarrSearchState = action.state;
+    librarrSearchError = "";
+    librarrSearchMessage = "";
+  }
   async function searchLibrarr() {
     const query = librarrQuery.trim();
     librarrSearchAbortController?.abort();
@@ -1446,6 +1486,8 @@
       librarrSearchError = "Enter at least two characters.";
       return;
     }
+    const searchedMediaType = librarrMediaType;
+    librarrSearchedMediaType = searchedMediaType;
     const controller = new AbortController();
     librarrSearchAbortController = controller;
     librarrResults = [];
@@ -1456,7 +1498,7 @@
     try {
       const params = new URLSearchParams({
         q: query,
-        media_type: librarrMediaType,
+        media_type: searchedMediaType,
       });
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
       let response = await fetch(`/api/librarr/search/stream?${params.toString()}`, {
@@ -1488,6 +1530,9 @@
               Boolean(item && typeof item === "object" && !Array.isArray(item)),
             )
           : [];
+        if (librarrSearchAbortController === controller) {
+          librarrSearchState = "ready";
+        }
       } else {
         if (!response.ok) {
           const payload = (await response.json().catch(() => ({}))) as {
@@ -1500,12 +1545,12 @@
           if (librarrSearchAbortController === controller) librarrResults = results;
         });
         if (librarrSearchAbortController !== controller) return;
-        if (!progress.completed) {
-          librarrSearchError = "Librarr ended the stream before search finished. Showing any results received.";
-        }
-      }
-      if (librarrSearchAbortController === controller) {
-        librarrSearchState = "ready";
+        const outcome = finalizeLibrarrStreamState(
+          progress.completed,
+          librarrResults.length,
+        );
+        librarrSearchState = outcome.state;
+        librarrSearchError = outcome.error;
       }
     } catch (error) {
       if (controller.signal.aborted || librarrSearchAbortController !== controller) return;
@@ -1526,17 +1571,26 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
+      const runId = librarrSearchBook
+        ? String(allBooks.find((book) => book.id === librarrSearchBook?.id)?.recommendation_run_id || "").trim()
+        : "";
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
-        body: JSON.stringify({ media_type: librarrMediaType, candidate_id: librarrSearchBook?.id, result }),
+        body: JSON.stringify(
+          buildLibrarrDownloadPayload(
+            librarrSearchedMediaType,
+            result,
+            librarrSearchBook?.id,
+            runId,
+          ),
+        ),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -1598,21 +1652,9 @@
         openReadMenuId = null;
         document.querySelector<HTMLButtonElement>(`[data-read-menu-trigger="${menuId}"]`)?.focus();
       }
-      if (event.key === "Escape" && profileMenuOpen) {
-        profileMenuOpen = false;
-        profileMenuButton?.focus();
-      }
     };
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target;
-      if (
-        profileMenuOpen &&
-        profileMenuRoot &&
-        target instanceof Node &&
-        !profileMenuRoot.contains(target)
-      ) {
-        profileMenuOpen = false;
-      }
       if (openReadMenuId !== null && target instanceof Node) {
         const menuRoot = document.querySelector<HTMLElement>(`[data-read-menu-root="${openReadMenuId}"]`);
         if (menuRoot && !menuRoot.contains(target)) openReadMenuId = null;
@@ -1717,6 +1759,7 @@
 >
 
 <div
+  data-sticky-shell
   class="relative isolate min-h-screen overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
 >
   <header
@@ -1730,7 +1773,7 @@
         class="flex min-h-11 shrink-0 items-center gap-3 text-surface-950-50 no-underline"
         aria-label="Bookward home"
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
-          ><img src={bookwardMark} alt="" class="size-full object-cover" aria-hidden="true" /></span
+          ><img src={bookwardMark} alt="" width="128" height="128" class="size-full object-cover" aria-hidden="true" /></span
         ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
           >Bookward</span
         ></a
@@ -1767,38 +1810,33 @@
               /></button
             >
           </form>{/if}
-        <div bind:this={profileMenuRoot} class="relative">
-          <button
-            bind:this={profileMenuButton}
-            type="button"
-            class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface"
-            aria-label="Open profile menu"
-            title="Profile"
-            aria-expanded={profileMenuOpen}
-            aria-controls="profile-menu-panel"
-            onclick={() => (profileMenuOpen = !profileMenuOpen)}
-          ><CircleUserRound size={19} strokeWidth={1.8} /></button>
-          {#if profileMenuOpen}
-            <div
-              id="profile-menu-panel"
-              class="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
-            >
-              <div class="border-b border-surface-300-700/40 px-2 pb-3">
-                <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
-                {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
-              </div>
-              <div class="grid gap-1 py-2">
-                <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} />Account settings</a>
-                {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} />Manage accounts</a>{/if}
-                <ThemePicker compact />
-              </div>
-              <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
-                <ProfileField profileId={data.user?.profile_id} />
-                <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} />Sign out</button>
-              </form>
+        <PopoverDialog
+          bind:open={profileMenuOpen}
+          panelId="profile-menu-panel"
+          triggerLabel="Open profile menu"
+          triggerTitle="Profile"
+          dialogLabel="Profile"
+          panelClass="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
+        >
+          {#snippet trigger()}
+            <CircleUserRound size={19} strokeWidth={1.8} aria-hidden="true" />
+          {/snippet}
+          {#snippet children()}
+            <div class="border-b border-surface-300-700/40 px-2 pb-3">
+              <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+              {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
-          {/if}
-        </div>
+            <div class="grid gap-1 py-2">
+              <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} aria-hidden="true" />Account settings</a>
+              {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
+              <ThemePicker compact />
+            </div>
+            <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
+              <ProfileField profileId={data.user?.profile_id} />
+              <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} aria-hidden="true" />Sign out</button>
+            </form>
+          {/snippet}
+        </PopoverDialog>
       </div>
     </div>
   </header>
@@ -1814,7 +1852,15 @@
         aria-atomic="true"
       >{visibleNotification?.message ?? ""}</div>
       {#if visibleNotification}
-        {#key visibleNotification.id ?? visibleNotification.message}
+        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
+          ? visibleNotification.undo_decisions
+          : visibleNotification.undo_id && visibleNotification.id
+            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
+            : []}
+        {@const notificationUndoKey = notificationUndoDecisions.length
+          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
+          : null}
+        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
           <div
             class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
           >
@@ -1858,24 +1904,26 @@
                   <p class="leading-relaxed text-surface-900-100">
                     {visibleNotification.message}
                   </p>
-                  {#if visibleNotification.undo_id && visibleNotification.id}
+                  {#if notificationUndoDecisions.length && notificationUndoKey}
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(notificationUndoKey)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={visibleNotification.id} />
-                      <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                        <input type="hidden" name="id" value={item.id} />
+                        <input type="hidden" name="decision_id" value={item.decision_id} />
+                      {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(`undo-${visibleNotification.undo_id}`)}
-                        aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                        disabled={isPending(notificationUndoKey)}
+                        aria-busy={isPending(notificationUndoKey)}
                         aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
@@ -1966,6 +2014,7 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -1978,7 +2027,7 @@
           </section>
         {/if}
         <section
-          class="grid gap-3 sm:gap-4 lg:grid-cols-2"
+          class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
           aria-live="polite"
         >
           {#each viewVisibleBooks as book, index (book.id)}
@@ -1992,19 +2041,6 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              {#if book.cover_url}
-                <div class="pointer-events-none absolute inset-0 z-0 overflow-hidden rounded-[inherit] sm:hidden" aria-hidden="true">
-                  <img
-                    class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px]"
-                    src={book.cover_url}
-                    alt=""
-                    loading={index > 2 ? "lazy" : "eager"}
-                    onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
-                  />
-                  <div class="absolute inset-0 preset-filled-surface-50-950 opacity-[0.82]"></div>
-                  <div class="absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15"></div>
-                </div>
-              {/if}
               {#if view === "discover" && digestVisible && book.status === "recommended"}
                 <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
                   <input
@@ -2016,33 +2052,41 @@
                   />
                 </label>
               {/if}
-              <button
-                type="button"
-                class={`relative hidden h-full w-full self-stretch overflow-hidden preset-tonal-surface text-left before:pointer-events-none before:absolute before:inset-0 before:z-10 before:bg-gradient-to-t before:from-primary-950/30 before:via-transparent before:to-secondary-500/10 before:content-[''] sm:block`}
-                onclick={() => toggleRecommendationDetails(book.id)}
-                aria-label={`View details for ${book.title}`}
-                aria-expanded={expandedRecommendationDetails.has(book.id)}
+              <div
+                class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
               >
-                <span class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400">
+                <span class="absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex" aria-hidden="true">
                   <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
                 </span>
                 {#if book.cover_url}<img
                     in:fade={{ duration: motionDuration(340) }}
-                    class="absolute inset-0 h-full w-full object-cover transition duration-500 group-hover:scale-[1.05]"
+                    class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px] sm:scale-100 sm:opacity-100 sm:blur-none sm:transition sm:duration-500 sm:group-hover:scale-[1.05]"
                     src={book.cover_url}
-                    alt={`Cover of ${book.title}`}
+                    alt=""
+                    width="160"
+                    height="240"
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 z-20 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
-              </button>
+                <div class="pointer-events-none absolute inset-0 preset-filled-surface-50-950 opacity-[0.82] sm:hidden" aria-hidden="true"></div>
+                <div class="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15 sm:hidden" aria-hidden="true"></div>
+                <button
+                  type="button"
+                  class="hidden text-left sm:absolute sm:inset-0 sm:z-20 sm:block focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-500"
+                  onclick={() => toggleRecommendationDetails(book.id)}
+                  aria-label={`View details for ${book.title}`}
+                  aria-expanded={expandedRecommendationDetails.has(book.id)}
+                >
+                  <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                </button>
+              </div>
               <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
-                  {#each book.genres.slice(0, 2) as genre (genre)}<button in:scale={{ duration: motionDuration(150) }} type="button" class="badge badge-sm preset-tonal-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500" aria-label={`${genre} filter`} aria-pressed={genreFilter.toLowerCase() === genre.toLowerCase()} onclick={() => (genreFilter = genre)}>{genre}</button>{/each}
+                  {#each book.genres.slice(0, 2) as genre (genre)}{@const genrePressed = genreFilter.trim().toLowerCase() === genre.trim().toLowerCase()}<ChipToggle pressed={genrePressed} label={genre} ariaLabel={`${genre} filter`} onToggle={(next) => { genreFilter = next ? (bookGenres.find((item) => item.toLowerCase() === genre.trim().toLowerCase()) ?? genre.trim()) : ""; }} />{/each}
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
@@ -2118,14 +2162,16 @@
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
-                      </form>
-                    {:else}
+                      {#if book.status === "saved"}
+                        <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                          <ProfileField profileId={data.user?.profile_id} />
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        </form>
+                      {/if}
+                    {:else if book.status === "saved"}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
@@ -2135,20 +2181,10 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                      </form>
-                    {/if}
-                  {:else if book.status === "imported"}
-                    <button
-                      in:fly={{ y: 8, duration: motionDuration(180) }}
-                      type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
-                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                      onclick={() => openMarkRead(book)}
-                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                    </form>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -2252,53 +2288,56 @@
                       <div class="flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
-                          <span class="badge preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
+                          <StarRatingBadge rating={item.rating} />
                         {:else}
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
                     </div>
-                    <div class="mt-3 border-t border-surface-300-700/40 pt-2">
-                      <button
-                        type="button"
-                        class="flex min-h-9 w-full items-center gap-2 text-left text-sm font-medium text-primary-600-400"
-                        aria-label={`Show reading details for ${item.title} by ${item.author}`}
-                        aria-expanded={expandedReadingDetails.includes(item.id)}
-                        aria-controls={`reading-details-${item.id}`}
-                        onclick={() => toggleReadingDetails(item.id)}
+                    <details
+                      class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
+                      open={expandedReadingDetails.includes(item.id)}
+                      ontoggle={(event) => {
+                        const open = (event.currentTarget as HTMLDetailsElement).open;
+                        const isExpanded = expandedReadingDetails.includes(item.id);
+                        if (open !== isExpanded) toggleReadingDetails(item.id);
+                      }}
+                    >
+                      <summary
+                        class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-left text-sm font-medium text-primary-600-400 [&::-webkit-details-marker]:hidden"
+                        aria-label={`Reading details for ${item.title} by ${item.author}`}
                       >
-                        Reading details <ChevronDown size={15} class={`ml-auto transition ${expandedReadingDetails.includes(item.id) ? "rotate-180" : ""}`} />
-                      </button>
-                      {#if expandedReadingDetails.includes(item.id)}
-                        <div id={`reading-details-${item.id}`} class="pt-2" transition:slide={{ duration: motionDuration(220) }}>
-                          <dl class="grid gap-2 text-xs">
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
-                          </dl>
-                          <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
-                            {#if item.algorithm_score !== null}
-                              <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
-                              <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
-                              {#if item.algorithm_explanation.length}
-                                <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
-                                  {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
-                                </ul>
-                              {:else}
-                                <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
-                              {/if}
+                        <span>Reading details</span>
+                        <ChevronDown size={15} aria-hidden="true" class="ml-auto transition group-open/details:rotate-180" />
+                      </summary>
+                      <div class="pt-2">
+                        <dl class="grid gap-2 text-xs">
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
+                        </dl>
+                        <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
+                          {#if item.algorithm_score !== null}
+                            <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
+                            <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
+                            {#if item.algorithm_explanation.length}
+                              <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
+                                {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
+                              </ul>
                             {:else}
-                              <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
+                              <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
                             {/if}
-                            {#if item.rank_score !== null}
-                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
-                            {:else}
-                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
-                            {/if}
-                          </div>
+                          {:else}
+                            <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
+                          {/if}
+                          {#if item.rank_score !== null}
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
+                          {:else}
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
+                          {/if}
                         </div>
-                      {/if}
-                    </div>
+                      </div>
+                    </details>
                   </article>
                 {/each}
               </div>
@@ -2310,7 +2349,7 @@
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
                   <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -2904,9 +2943,9 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
-                action="?/importGoodreadsCsv"
+                action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("goodreads-csv")}
+                use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex items-center justify-between gap-4">
@@ -2918,7 +2957,7 @@
                     <h2
                       class="truncate text-lg font-semibold text-surface-950-50"
                     >
-                      Goodreads export
+                      CSV library export
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
@@ -2926,11 +2965,11 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import the books on your Goodreads read shelf, with their ratings and read dates.
+                  Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
-                  >Goodreads CSV<input
+                  >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
                     type="file"
@@ -2940,9 +2979,9 @@
                 ><button
                   class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
-                  disabled={isPending("goodreads-csv")}
-                  aria-busy={isPending("goodreads-csv")}
-                  >{#if isPending("goodreads-csv")}<RefreshCw
+                  disabled={isPending("csv-import")}
+                  aria-busy={isPending("csv-import")}
+                  >{#if isPending("csv-import")}<RefreshCw
                       size={16}
                       class="animate-spin"
                     />{:else}<Upload size={16} />{/if} Import CSV</button
@@ -2956,7 +2995,7 @@
                   duration: motionDuration(300),
                   delay: motionDelay(2),
                 }}
-                class="card scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
+                class="card scroll-mt-4 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
@@ -3528,8 +3567,7 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <div class="flex flex-wrap items-center gap-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-4 focus-within:ring-offset-surface-950">
-                    <input id="digest-enabled" class="sr-only" type="checkbox" name="enabled" checked={digestEnabled} role="switch" aria-label="Enable weekly digest" onchange={(event) => (digestEnabledOverride = (event.currentTarget as HTMLInputElement).checked)} />
+                  <div class="flex flex-wrap items-center gap-4">
                     <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-3">
@@ -3538,10 +3576,13 @@
                       </div>
                       <p class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
                     </div>
-                    <label for="digest-enabled" class="flex cursor-pointer items-center gap-3 text-sm font-semibold text-surface-950-50">
-                      <span class="sr-only">Enable weekly digest</span>
-                      <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEnabled ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEnabled ? "translate-x-5" : ""}`}></span></span>
-                    </label>
+                    <SwitchControl
+                      id="digest-enabled"
+                      name="enabled"
+                      checked={digestEnabled}
+                      ariaLabel="Enable weekly digest"
+                      onToggle={(next) => (digestEnabledOverride = next)}
+                    />
                   </div>
 
                   {#if digestEnabled}<div in:slide={{ duration: motionDuration(240) }} out:fade={{ duration: motionDuration(160) }} class="mt-6">
@@ -3569,10 +3610,19 @@
                           <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestSettings.minimum_score} required /></label>
                           <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestSettings.maximum_books} required /></label>
                         </div>
-                        <label class="mt-4 flex cursor-pointer items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
-                          <span><span class="block text-surface-950-50">Only send new books</span><span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span></span>
-                          <span class="relative shrink-0 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950"><input class="sr-only" type="checkbox" name="onlyNew" checked={digestOnlyNew} role="switch" aria-label="Only send new books" onchange={(event) => (digestOnlyNewOverride = (event.currentTarget as HTMLInputElement).checked)} /><span class={`block h-7 w-12 rounded-full p-1 transition ${digestOnlyNew ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestOnlyNew ? "translate-x-5" : ""}`}></span></span></span>
-                        </label>
+                        <div class="mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
+                          <label for="digest-only-new" class="cursor-pointer">
+                            <span class="block text-surface-950-50">Only send new books</span>
+                            <span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span>
+                          </label>
+                          <SwitchControl
+                            id="digest-only-new"
+                            name="onlyNew"
+                            checked={digestOnlyNew}
+                            ariaLabel="Only send new books"
+                            onToggle={(next) => (digestOnlyNewOverride = next)}
+                          />
+                        </div>
                       </section>
 
                       <section class="preset-tonal-surface p-4 sm:p-5">
@@ -3581,26 +3631,44 @@
                           <p class="mt-1 text-sm text-surface-700-300">Choose one or both places to receive it.</p>
                         </div>
                         <div class="grid gap-3">
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-discord" class="sr-only" type="checkbox" name="channels" value="discord" checked={digestDiscord} role="switch" aria-label="Send digest to Discord" onchange={(event) => (digestDiscordOverride = (event.currentTarget as HTMLInputElement).checked)} />
-                            <label for="digest-discord" class="flex cursor-pointer items-center gap-3">
-                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
-                              <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestDiscord ? "preset-filled-secondary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestDiscord ? "translate-x-5" : ""}`}></span></span>
-                            </label>
+                          <div class="relative border border-surface-300-700/50 p-4">
+                            <div class="flex items-center gap-3">
+                              <label for="digest-discord" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
+                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
+                              </label>
+                              <SwitchControl
+                                id="digest-discord"
+                                name="channels"
+                                value="discord"
+                                checked={digestDiscord}
+                                ariaLabel="Send digest to Discord"
+                                onToggle={(next) => (digestDiscordOverride = next)}
+                              />
+                            </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
                               <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
                               {#if digestSettings.discord_webhook_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
-                          <div class="relative border border-surface-300-700/50 p-4 focus-within:ring-2 focus-within:ring-tertiary-500 focus-within:ring-offset-2 focus-within:ring-offset-surface-950">
-                            <input id="digest-email" class="sr-only" type="checkbox" name="channels" value="email" checked={digestEmail} role="switch" aria-label="Send digest by email" onchange={(event) => (digestEmailOverride = (event.currentTarget as HTMLInputElement).checked)} />
-                            <label for="digest-email" class="flex cursor-pointer items-center gap-3">
-                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
-                              <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
-                              <span class={`relative h-7 w-12 shrink-0 rounded-full p-1 transition ${digestEmail ? "preset-filled-tertiary-500" : "preset-filled-surface-500"}`}><span class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition-transform ${digestEmail ? "translate-x-5" : ""}`}></span></span>
-                            </label>
+                          <div class="relative border border-surface-300-700/50 p-4">
+                            <div class="flex items-center gap-3">
+                              <label for="digest-email" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
+                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
+                              </label>
+                              <SwitchControl
+                                id="digest-email"
+                                name="channels"
+                                value="email"
+                                checked={digestEmail}
+                                ariaLabel="Send digest by email"
+                                activeClass="preset-filled-tertiary-500"
+                                focusClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
+                                onToggle={(next) => (digestEmailOverride = next)}
+                              />
+                            </div>
                             {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
                               <div class="grid gap-4 sm:grid-cols-2">
                                 <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestSettings.email_to} placeholder="you@example.com" /></label>
@@ -3693,11 +3761,10 @@
                             >{item.author}</small
                           >
                         </div>
-                        {#if item.rating}<span
-                            in:scale={{ duration: motionDuration(150) }}
+                        {#if item.rating}<StarRatingBadge
+                            rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
-                            >{item.rating} ★</span
-                          >{/if}
+                          />{/if}
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
@@ -3753,7 +3820,7 @@
         tabindex="-1"
         in:scale={{ duration: motionDuration(260), start: 0.94 }}
         out:scale={{ duration: motionDuration(170), start: 0.97 }}
-        class="relative isolate w-full max-w-xl overflow-hidden rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
+        class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-full max-w-xl overflow-x-hidden overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
       >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
@@ -3785,11 +3852,17 @@
             <input type="hidden" name="rating" value={markReadRating || ""} />
 
             <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
-              <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
+              <div class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
+                <BookOpen size={22} class="text-surface-600-400" aria-hidden="true" />
                 {#if markReadBook.cover_url}
-                  <img src={markReadBook.cover_url} alt="" class="h-full w-full object-cover" />
-                {:else}
-                  <BookOpen size={24} class="text-surface-600-400" />
+                  <img
+                    src={markReadBook.cover_url}
+                    alt=""
+                    width="48"
+                    height="72"
+                    class="absolute inset-0 h-full w-full object-cover"
+                    onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
+                  />
                 {/if}
               </div>
               <div class="min-w-0">
@@ -3803,20 +3876,35 @@
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">
-                <p class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
+                <p id="mark-read-rating-label" class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
                 <span class="text-xs text-surface-600-400">Optional</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-center gap-2" role="group" aria-label="Optional book rating">
-                {#each [1, 2, 3, 4, 5] as rating (rating)}
-                  <button
-                    type="button"
-                    class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
-                    aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
-                    aria-pressed={markReadRating === rating}
-                    onclick={() => (markReadRating = rating)}
-                  ><span aria-hidden="true">★</span></button>
-                {/each}
-                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => (markReadRating = 0)}>Clear rating</button>{/if}
+              <div class="mt-3 flex flex-wrap items-center gap-2">
+                <RadioGroup
+                  bind:this={markReadRatingGroup}
+                  items={[1, 2, 3, 4, 5]}
+                  value={markReadRating > 0 ? markReadRating : null}
+                  labelledBy="mark-read-rating-label"
+                  columns={1}
+                  selectOnMove
+                  clearable
+                  class="flex flex-wrap items-center gap-2"
+                  onSelect={(rating) => (markReadRating = rating)}
+                  onClear={() => (markReadRating = 0)}
+                >
+                  {#snippet item(rating, radio)}
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
+                      aria-checked={radio.checked}
+                      tabindex={radio.tabIndex}
+                      class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
+                      onclick={radio.select}
+                    ><span aria-hidden="true">★</span></button>
+                  {/snippet}
+                </RadioGroup>
+                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => { markReadRating = 0; markReadRatingGroup?.focusFirst(); }}>Clear rating</button>{/if}
               </div>
             </div>
           </div>
@@ -3849,13 +3937,13 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 card max-h-[min(44rem,calc(100vh-2rem))] w-full max-w-2xl justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="relative m-0 flex card max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         aria-modal="true"
         onclick={(event) => event.stopPropagation()}
       >
         <div
-          class="flex items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
+          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium text-primary-600-400">
@@ -3878,7 +3966,7 @@
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
         </div>
-        <div class="max-h-[calc(100vh-11rem)] overflow-y-auto p-5 sm:p-6">
+        <div class="max-h-[calc(100dvh-11rem)] min-h-0 flex-1 overflow-y-auto p-5 sm:p-6">
           <form
             class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
@@ -3901,6 +3989,7 @@
               id="librarr-media-type"
               class="select min-h-12 sm:mx-1 sm:w-40"
               bind:value={librarrMediaType}
+              onchange={handleLibrarrMediaTypeChange}
               ><option value="audiobook">Audiobook</option><option value="ebook"
                 >Ebook</option
               ></select
@@ -3925,11 +4014,22 @@
             </div>{/if}
           {#if librarrSearchError}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
-              class="mt-4 flex items-start gap-2 preset-tonal-error p-3 text-sm"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3 preset-tonal-error p-3 text-sm"
               role="alert"
             >
-              <CircleHelp size={16} class="mt-0.5 shrink-0" />
-              <span>{librarrSearchError}</span>
+              <div class="flex min-w-0 flex-1 items-start gap-2">
+                <CircleHelp size={16} class="mt-0.5 shrink-0" />
+                <span>{librarrSearchError}</span>
+              </div>
+              {#if canRetryLibrarrSearch(librarrSearchState, librarrQuery)}
+                <button
+                  type="button"
+                  class="btn btn-sm min-h-9 shrink-0 preset-tonal-surface"
+                  onclick={() => void searchLibrarr()}
+                >
+                  <RefreshCw size={14} /> Retry
+                </button>
+              {/if}
             </div>{/if}
           {#if librarrSearchState === "searching" && librarrResults.length === 0}
             <div
@@ -3949,14 +4049,14 @@
               Searching Librarr… {librarrResults.length} matches so far
             </div>
           {/if}
-          {#if librarrSearchState === "ready" && librarrResults.length === 0}
+          {#if shouldShowLibrarrEmptyBanner(librarrSearchState, librarrResults.length, librarrSearchError)}
             <div
               in:fade={{ duration: motionDuration(160) }}
               class="grid min-h-48 place-items-center text-center text-sm text-surface-700-300"
             >
               <div>
                 <BookOpen size={24} class="mx-auto mb-3 text-primary-500" />
-                <p>No {librarrMediaType} results found.</p>
+                <p>No {librarrSearchedMediaType} results found.</p>
                 <p class="mt-1">Try a title, author, or a shorter search.</p>
               </div>
             </div>
@@ -3975,20 +4075,24 @@
                   class="flex items-center gap-4 preset-tonal-surface p-3 sm:p-4"
                 >
                   <div
-                    class="grid size-16 shrink-0 place-items-center overflow-hidden preset-filled-surface-500 sm:size-20"
+                    class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
                   >
+                    <BookOpen
+                      size={22}
+                      class="text-surface-600-400"
+                      aria-hidden="true"
+                    />
                     {#if cover}<img
                         in:fade={{ duration: motionDuration(180) }}
-                        class="h-full w-full object-cover"
+                        class="absolute inset-0 h-full w-full object-cover"
                         src={cover}
                         alt={`Cover of ${resultTitle(result)}`}
+                        width="48"
+                        height="72"
                         loading="lazy"
                         onerror={(event) =>
                           ((event.currentTarget as HTMLImageElement).hidden =
                             true)}
-                      />{:else}<BookOpen
-                        size={22}
-                        class="text-surface-600-400"
                       />{/if}
                   </div>
                   <div class="min-w-0 flex-1">

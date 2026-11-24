@@ -1,7 +1,12 @@
+import { isHttpError } from "@sveltejs/kit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "./+page.server";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("page actions", () => {
   it("keeps the Settings view compatible with an engine before the token migration", async () => {
@@ -36,9 +41,53 @@ describe("page actions", () => {
   });
 
   it("loads recommendations without creating or forwarding a device cookie", async () => {
+    const pageBookKeys = [
+      "author",
+      "cover_url",
+      "genres",
+      "id",
+      "metadata_confidence",
+      "published_kind",
+      "published_on",
+      "reason",
+      "recommendation_run_id",
+      "score",
+      "source_url",
+      "status",
+      "synopsis",
+      "title",
+    ];
     const overview = {
           recommendation_run_id: "run-1234",
-          recommendations: [],
+          recommendations: [
+            {
+              id: 5,
+              title: "Recommended book",
+              author: "First Writer",
+              description: "Recommended summary",
+              cover_url: "https://covers.example/recommended.jpg",
+              source_url: "https://books.example/recommended",
+              source_id: 1,
+              release_date: "2026-11-15",
+              date_kind: "day",
+              genres: ["Science Fiction"],
+              score: 94,
+              metadata_confidence: 0.92,
+              explanation: ["Matches rated books", "Trusted list"],
+              status: "recommended",
+              normalized_key: "recommended-book::first-writer",
+              created_at: "2026-10-01 00:00:00",
+              updated_at: "2026-10-02 00:00:00",
+              isbn13: "9780000000005",
+              isbn10: "0000000005",
+              score_batch_id: "batch-5",
+              source_name: "A source",
+              quality_work_id: "/works/OL5W",
+              quality_provider: "openlibrary",
+              quality_isbn13: "9780000000005",
+              quality_isbn10: "0000000005",
+            },
+          ],
           decisions: [
             {
               id: 9,
@@ -47,6 +96,7 @@ describe("page actions", () => {
               description: "A description",
               cover_url: "https://covers.example/deferred.jpg",
               source_url: "https://books.example/deferred",
+              source_id: 2,
               release_date: null,
               date_kind: "unknown",
               genres: ["Fantasy"],
@@ -54,7 +104,17 @@ describe("page actions", () => {
               metadata_confidence: 0.8,
               explanation: ["A good match"],
               status: "maybe_later",
+              normalized_key: "deferred-book::a-writer",
+              created_at: "2026-09-01 00:00:00",
+              updated_at: "2026-09-02 00:00:00",
+              isbn13: "9780000000009",
+              isbn10: "0000000009",
+              score_batch_id: "batch-9",
               source_name: "A source",
+              quality_work_id: "/works/OL9W",
+              quality_provider: "openlibrary",
+              quality_isbn13: "9780000000009",
+              quality_isbn10: "0000000009",
             },
           ],
           history: [],
@@ -82,18 +142,76 @@ describe("page actions", () => {
       locals: { user: null },
     } as never)) as {
       recommendation_run_id: string;
-      decisions: Array<{ id: number; status: string; reason: string }>;
+      books: Array<Record<string, unknown>>;
+      decisions: Array<Record<string, unknown>>;
     };
     expect(result.recommendation_run_id).toBe("run-1234");
+    expect(Object.keys(result.books[0]).sort()).toEqual(pageBookKeys);
+    expect(result.books).toEqual([
+      {
+        id: 5,
+        recommendation_run_id: "run-1234",
+        title: "Recommended book",
+        author: "First Writer",
+        cover_url: "https://covers.example/recommended.jpg",
+        source_url: "https://books.example/recommended",
+        published_on: "2026-11-15",
+        published_kind: "day",
+        genres: ["Science Fiction"],
+        score: 94,
+        metadata_confidence: 0.92,
+        synopsis: "Recommended summary",
+        reason: "Matches rated books · Trusted list",
+        status: "recommended",
+      },
+    ]);
+    expect(Object.keys(result.decisions[0]).sort()).toEqual(pageBookKeys);
     expect(result.decisions).toEqual([
-      expect.objectContaining({
+      {
         id: 9,
-        status: "maybe_later",
+        recommendation_run_id: "",
+        title: "Deferred book",
+        author: "A Writer",
+        cover_url: "https://covers.example/deferred.jpg",
+        source_url: "https://books.example/deferred",
+        published_on: null,
+        published_kind: "unknown",
+        genres: ["Fantasy"],
+        score: 81,
+        metadata_confidence: 0.8,
+        synopsis: "A description",
         reason: "A good match",
-      }),
+        status: "maybe_later",
+      },
     ]);
     expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
+  });
+
+  it("throws a 503 string error without deprecation warnings when the engine is unavailable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:8000"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    let thrown: unknown;
+    try {
+      await load({
+        url: new URL("http://afterword.test/"),
+        locals: { user: null },
+      } as never);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(isHttpError(thrown, 503)).toBe(true);
+    if (isHttpError(thrown, 503)) {
+      expect(thrown.body.message).toBe(
+        "Bookward's recommendation engine is unavailable. connect ECONNREFUSED 127.0.0.1:8000",
+      );
+    }
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("marks a recommended book as read with an optional rating and no device session", async () => {
@@ -285,6 +403,118 @@ describe("page actions", () => {
     );
   });
 
+  it("exposes a restore Undo token when returning a book to Discover", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, status: "recommended", decision_id: 61 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "recommended");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 61,
+      id: 9,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+    });
+  });
+
+  it("routes multi-item Undo requests to bulk-undo and propagates 409 conflicts", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ undone: 2 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Only the latest decision can be undone" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.append("id", "7");
+    body.append("decision_id", "21");
+    body.append("id", "8");
+    body.append("decision_id", "22");
+    const result = await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Decisions undone." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/bulk-undo",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+      }),
+    );
+
+    const conflict = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: boolean } };
+    expect(conflict.status).toBe(409);
+    expect(conflict.data).toEqual({
+      message: "Only the latest decision can be undone",
+      error: true,
+    });
+
+    const invalid = new FormData();
+    invalid.append("id", "7");
+    invalid.append("id", "8");
+    invalid.append("decision_id", "21");
+    const badRequest = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalid }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(badRequest.status).toBe(400);
+  });
+
+  it("rejects an invalid URL when adding a custom source without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidUrl of [
+      "not-a-url",
+      "",
+      null,
+      new File(["https://books.example/list"], "url.txt"),
+    ]) {
+      const body = new FormData();
+      body.set("label", "Invalid source");
+      if (invalidUrl !== null) body.set("url", invalidUrl);
+
+      const result = await actions.source!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Add a valid name and public URL.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not save a custom source when preview finds no books", async () => {
     const fetchMock = vi
       .fn()
@@ -421,34 +651,12 @@ describe("page actions", () => {
   });
 
   it("preserves an existing Librarr key while changing the default format", async () => {
-    const overview = {
-      sources: [],
-      recommendations: [],
-      history: [],
-      settings: {
-        embedding_backend: "local",
-        embedding_model: "hashing-768",
-        embedding_url: "",
-        embedding_api_key_set: false,
-        librarr_url: "http://librarr:5050",
-        librarr_api_key_set: true,
-        librarr_media_type: "audiobook",
-      },
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(overview), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ saved: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
     body.set("url", "http://librarr:5050");
@@ -458,8 +666,12 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
     expect(result).toEqual({ message: "Librarr connection saved for ebooks." });
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
-    expect(JSON.parse(String(request.body))).toMatchObject({
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      librarr_url: "http://librarr:5050",
       librarr_api_key: "",
       librarr_media_type: "ebook",
     });
@@ -495,6 +707,301 @@ describe("page actions", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://127.0.0.1:8000/api/jobs/job-123",
     );
+  });
+
+  it("returns 502 when an embedding rebuild job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Embedder unreachable.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Connection refused"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedder unreachable.", error: true },
+    });
+
+    const secondPromise = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Embedding rebuild failed.", error: true },
+    });
+
+    await expect(actions.rebuildEmbeddings!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Connection refused", error: true },
+    });
+  });
+
+  it("stops polling an embedding rebuild after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/embeddings/rebuild")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "job-1234567890" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.rebuildEmbeddings!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Embedding rebuild is still running (job-1234).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+  });
+
+  it("queues a sync job and waits for completion", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"errors":[]}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sync",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/sync-123",
+    );
+  });
+
+  it("reports singular and plural source error counts when a sync completes with errors", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-err-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ errors: ["Feed timed out", "404 Not Found"] }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const singlePromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(singlePromise).resolves.toEqual({
+      message: "Sources refreshed with 1 source needing attention.",
+    });
+
+    const multiPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(multiPromise).resolves.toEqual({
+      message: "Sources refreshed with 2 sources needing attention.",
+    });
+  });
+
+  it("ignores malformed JSON in a completed sync job result", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-bad-json" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: "{not-valid-json",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(pending).resolves.toEqual({
+      message: "Sources scanned and recommendations refreshed.",
+    });
+  });
+
+  it("returns 502 when a sync job fails or throws", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: "Database locked.",
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "sync-fail-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "failed",
+            error: null,
+            result: null,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockRejectedValueOnce(new Error("Sync unreachable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(firstPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Database locked.", error: true },
+    });
+
+    const secondPromise = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(secondPromise).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Recommendation refresh failed.", error: true },
+    });
+
+    await expect(actions.runSync!({} as never)).resolves.toMatchObject({
+      status: 502,
+      data: { message: "Sync unreachable", error: true },
+    });
+  });
+
+  it("stops polling a sync job after 20 attempts and reports it running", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/api/sync")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ job_id: "sync-123456" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = actions.runSync!({} as never);
+    await vi.advanceTimersByTimeAsync(20 * 500);
+    const result = await pending;
+
+    expect(result).toEqual({
+      message: "Refresh is still running (sync-123).",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
   });
 
   it("persists digest timing and channel settings without sending blank secrets", async () => {
@@ -542,6 +1049,73 @@ describe("page actions", () => {
     });
   });
 
+  it("retries a digest delivery when given a valid delivery UUID", async () => {
+    const deliveryId = "550e8400-e29b-41d4-a716-446655440000";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ job_id: "job-456" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: '{"status":"sent"}',
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", deliveryId);
+    const result = await actions.retryDigest!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Digest delivery retry queued." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:8000/api/digest/deliveries/${deliveryId}/retry`,
+      expect.objectContaining({
+        method: "POST",
+        body: "{}",
+      }),
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/jobs/job-456",
+    );
+  });
+
+  it("rejects an invalid delivery UUID in retryDigest without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const invalidId of [
+      "not-a-uuid",
+      "",
+      null,
+      new File(["550e8400-e29b-41d4-a716-446655440000"], "id.txt"),
+    ]) {
+      const body = new FormData();
+      if (invalidId !== null) body.set("id", invalidId);
+
+      const result = await actions.retryDigest!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+
+      expect(result).toMatchObject({
+        status: 400,
+        data: { message: "Invalid delivery.", error: true },
+      });
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("shortlists a selected digest batch in one engine call", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ updated: 2 }), {
@@ -563,5 +1137,404 @@ describe("page actions", () => {
     });
   });
 
+  it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "12");
+    body.set("status", "recommended");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
 
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 77,
+      id: 12,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+      run_id: "run-shortlist-1",
+    });
+  });
+
+  it("forwards run_id when importing a shortlisted book to the Librarr wishlist", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "imported", remote_id: "remote-12" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "12");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.importLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Book added to the Librarr wishlist." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/12/import",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ run_id: "run-shortlist-1" }),
+      }),
+    );
+  });
+
+  it("forwards a shared run_id and returns batch undo tokens for shortlistBulk", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          updated: 2,
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("run_id", "run-digest-1");
+    body.append("ids", "7");
+    body.append("ids", "8");
+    const result = await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "2 books added to your shortlist.",
+      undo_decisions: [
+        { id: 7, decision_id: 21 },
+        { id: 8, decision_id: 22 },
+      ],
+      undo_label: "shortlisting 2 books",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+      run_id: "run-digest-1",
+    });
+  });
+
+  it("imports a StoryGraph CSV export through the unified CSV action and names The StoryGraph", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ imported: 3, source: "storygraph_csv", job_id: "job-sg" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set(
+      "file",
+      new File(
+        ["Title,Authors,Read Status,Star Rating\nPiranesi,Susanna Clarke,read,4.75\n"],
+        "storygraph.csv",
+        { type: "text/csv" },
+      ),
+    );
+    const result = await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Imported 3 books from The StoryGraph.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/import/csv",
+    );
+  });
+
+  it("retains importGoodreadsCsv compatibility and surfaces 400 format errors clearly", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ imported: 1, source: "goodreads_csv", job_id: "job-gr" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "CSV must match Goodreads or The StoryGraph export format",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const validBody = new FormData();
+    validBody.set(
+      "file",
+      new File(["Title,Author,My Rating\nDune,Frank Herbert,5\n"], "goodreads.csv", {
+        type: "text/csv",
+      }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "Imported 1 book from Goodreads.",
+    });
+
+    const invalidBody = new FormData();
+    invalidBody.set(
+      "file",
+      new File(["Heading,Amount\nSomething,10\n"], "budget.csv", {
+        type: "text/csv",
+      }),
+    );
+    const failed = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalidBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(failed.status).toBe(400);
+    expect(failed.data.message).toContain("Goodreads or The StoryGraph");
+
+    const emptyResult = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: new FormData() }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(emptyResult.status).toBe(400);
+    expect(emptyResult.data.message).toBe(
+      "Choose a Goodreads or StoryGraph CSV export.",
+    );
+  });
+
+  it("validates CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const emptyForm = new FormData();
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: emptyForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: { message: "Choose a Goodreads or StoryGraph CSV export.", error: true },
+    });
+
+    const oversizedForm = new FormData();
+    oversizedForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "goodreads.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: oversizedForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const oversizedStoryGraphForm = new FormData();
+    oversizedStoryGraphForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "storygraph.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importCsv!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: oversizedStoryGraphForm,
+        }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const streamErrorRequest = new Request("http://afterword.test", {
+      method: "POST",
+      // @ts-expect-error Node fetch requires half-duplex for streaming request bodies
+      duplex: "half",
+      headers: {
+        "x-bookward-profile": "alice-profile",
+        "content-type": "multipart/form-data; boundary=----bookward",
+      },
+      body: new ReadableStream({
+        start(controller) {
+          controller.error(Object.assign(new Error("Payload Too Large"), { status: 413 }));
+        },
+      }),
+    });
+    await expect(
+      actions.importGoodreadsCsv!({ request: streamErrorRequest } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ detail: "CSV must match Goodreads or The StoryGraph export format" }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    const invalidCsvForm = new FormData();
+    invalidCsvForm.set("file", new File(["bad,csv\n"], "bad.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: invalidCsvForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 400,
+      data: {
+        message: "CSV must match Goodreads or The StoryGraph export format",
+        error: true,
+      },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "CSV is larger than 10 MB" }), {
+        status: 413,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const engine413Form = new FormData();
+    engine413Form.set("file", new File(["Title,Author\nDune,Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: engine413Form }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: "CSV is larger than 10 MB", error: true },
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ imported: 3, source: "goodreads_csv" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const validForm = new FormData();
+    validForm.set("file", new File(["Title,Author\nDune,Frank Herbert\n"], "goodreads.csv", { type: "text/csv" }));
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validForm }),
+      } as never),
+    ).resolves.toEqual({ message: "Imported 3 books from Goodreads." });
+  });
+
+  it("forwards missing initial Librarr API key validation from the engine without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ detail: "Enter a Librarr API key for the first connection." }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "http://librarr:5050");
+    body.set("apiKey", "");
+    body.set("mediaType", "audiobook");
+    const result = (await actions.configureLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(result.status).toBe(400);
+    expect(result.data).toEqual({
+      message: "Enter a Librarr API key for the first connection.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+  });
+
+  it("saves embedding settings in a single partial PUT request without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true, embedding: { ok: true, checked: true } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("backend", "ollama");
+    body.set("model", "qwen3-embedding:0.6b");
+    body.set("url", "http://ollama:11434");
+    body.set("apiKey", "embed-secret");
+    const result = await actions.configureEmbeddings!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Embedding provider saved and checked." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      embedding_backend: "ollama",
+      embedding_model: "qwen3-embedding:0.6b",
+      embedding_url: "http://ollama:11434",
+      embedding_api_key: "embed-secret",
+    });
+  });
+
+  it("toggles the default source in one engine request and forwards 404 when absent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 1, enabled: 0, job_id: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Default source not found." }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const toggled = await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never);
+    expect(toggled).toEqual({ message: "Upcoming-book source updated." });
+
+    const missing = (await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(missing.status).toBe(404);
+    expect(missing.data).toEqual({
+      message: "Default source not found.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
+  });
 });

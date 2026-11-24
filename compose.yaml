@@ -10,7 +10,7 @@ services:
       ENGINE_URL: http://engine:8000
       ENGINE_SERVICE_SECRET: ${ENGINE_SERVICE_SECRET:-}
       OIDC_AUTO_LOGIN: ${OIDC_AUTO_LOGIN:-false}
-      BODY_SIZE_LIMIT: 12M
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-12M}
     depends_on:
       engine:
         condition: service_healthy
@@ -54,7 +54,7 @@ services:
     networks: ["books"]
 
   ollama:
-    image: ollama/ollama:0.34.1@sha256:0c0a83210471fb50226bcdc2d6611d20ab13ae87e024cc304c94a6a5765c5e65
+    image: ollama/ollama:0.40.17@sha256:ccc42bcd3d5fcf7ab0d532b300382154e1a4da56fc666bdb313b78ebdd912754
     profiles: ["ollama"]
     restart: unless-stopped
     volumes: ["ollama-models:/root/.ollama"]

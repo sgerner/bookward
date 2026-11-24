@@ -1,6 +1,12 @@
 import { error as httpError, fail as kitFail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
-import { engine, engineStatus } from "#lib/server/engine.js";
+import {
+  GOODREADS_CSV_LIMIT_MESSAGE,
+  GOODREADS_CSV_MAX_BYTES,
+  engine,
+  engineStatus,
+  isPayloadTooLarge,
+} from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -145,9 +151,10 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   try {
     overview = await overviewRequest;
   } catch (cause) {
-    throw httpError(503, {
-      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    });
+    throw httpError(
+      503,
+      `Bookward's recommendation engine is unavailable. ${message(cause)}`,
+    );
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
@@ -211,7 +218,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 };
 
 const idSchema = z.coerce.number().int().positive();
-const urlSchema = z.string().url();
+const urlSchema = z.url();
 const fail = (statusCode: number, data: { message: string }) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
@@ -240,6 +247,36 @@ const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
 };
+async function handleCsvImport(request: Request) {
+  let incoming: FormData;
+  try {
+    incoming = await request.formData();
+  } catch (error) {
+    if (isPayloadTooLarge(error)) {
+      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+    }
+    throw error;
+  }
+  const file = incoming.get("file");
+  if (!(file instanceof File) || file.size === 0)
+    return fail(400, { message: "Choose a Goodreads or StoryGraph CSV export." });
+  if (file.size > GOODREADS_CSV_MAX_BYTES)
+    return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+  const body = new FormData();
+  body.set("file", file, file.name);
+  try {
+    const result = await engine<{ imported: number; source?: string }>(
+      "/api/import/csv",
+      { method: "POST", body },
+    );
+    const provider =
+      result.source === "storygraph_csv" ? "The StoryGraph" : "Goodreads";
+    const noun = result.imported === 1 ? "book" : "books";
+    return { message: `Imported ${result.imported} ${noun} from ${provider}.` };
+  } catch (error) {
+    return fail(engineStatus(error), { message: message(error) });
+  }
+}
 export const actions: Actions = {
   createBackup: async () => {
     try {
@@ -354,16 +391,35 @@ export const actions: Actions = {
   },
   undoDecision: async ({ request }) => {
     const data = await request.formData();
-    const id = idSchema.safeParse(data.get("id"));
-    const decisionId = idSchema.safeParse(data.get("decision_id"));
-    if (!id.success || !decisionId.success)
+    const rawIds = data.getAll("id");
+    const rawDecisionIds = data.getAll("decision_id");
+    if (!rawIds.length || rawIds.length !== rawDecisionIds.length)
       return fail(400, { message: "This decision can no longer be undone." });
+    const seen = new Set<string>();
+    const decisions: Array<{ id: number; decision_id: number }> = [];
+    for (let index = 0; index < rawIds.length; index += 1) {
+      const id = idSchema.safeParse(rawIds[index]);
+      const decisionId = idSchema.safeParse(rawDecisionIds[index]);
+      if (!id.success || !decisionId.success)
+        return fail(400, { message: "This decision can no longer be undone." });
+      const key = `${id.data}:${decisionId.data}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      decisions.push({ id: id.data, decision_id: decisionId.data });
+    }
     try {
-      await engine(`/api/recommendations/${id.data}/undo`, {
+      if (decisions.length === 1) {
+        await engine(`/api/recommendations/${decisions[0].id}/undo`, {
+          method: "POST",
+          body: JSON.stringify({ decision_id: decisions[0].decision_id }),
+        });
+        return { message: "Decision undone." };
+      }
+      await engine("/api/recommendations/bulk-undo", {
         method: "POST",
-        body: JSON.stringify({ decision_id: decisionId.data }),
+        body: JSON.stringify({ decisions }),
       });
-      return { message: "Decision undone." };
+      return { message: "Decisions undone." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -512,12 +568,9 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  toggleDefault: async ({ request }) => {
+  toggleDefault: async () => {
     try {
-      const overview = await engine<Overview>("/api/overview");
-      const source = overview.sources.find((item) => item.is_default);
-      if (!source) return fail(404, { message: "Default source not found." });
-      await engine(`/api/sources/${source.id}/toggle`, {
+      await engine("/api/sources/default/toggle", {
         method: "PUT",
         body: "{}",
       });
@@ -579,22 +632,11 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
+  importCsv: async ({ request }) => {
+    return handleCsvImport(request);
+  },
   importGoodreadsCsv: async ({ request }) => {
-    const incoming = await request.formData();
-    const file = incoming.get("file");
-    if (!(file instanceof File) || file.size === 0)
-      return fail(400, { message: "Choose a Goodreads CSV export." });
-    const body = new FormData();
-    body.set("file", file, file.name);
-    try {
-      const result = await engine<{ imported: number }>(
-        "/api/import/goodreads/csv",
-        { method: "POST", body },
-      );
-      return { message: `Imported ${result.imported} Goodreads books.` };
-    } catch (error) {
-      return fail(502, { message: message(error) });
-    }
+    return handleCsvImport(request);
   },
   configureLibrar: async ({ request }) => {
     const data = await request.formData();
@@ -613,18 +655,9 @@ export const actions: Actions = {
         message: "Enter a valid Librarr URL, API key, and media type.",
       });
     try {
-      const overview = await engine<Overview>("/api/overview");
-      if (!key.data && !overview.settings.librarr_api_key_set)
-        return fail(400, {
-          message: "Enter a Librarr API key for the first connection.",
-        });
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
-          embedding_backend: overview.settings.embedding_backend,
-          embedding_model: overview.settings.embedding_model,
-          embedding_url: overview.settings.embedding_url,
-          embedding_api_key: "",
           librarr_url: url.data,
           librarr_api_key: key.data,
           librarr_media_type: mediaType.data,
@@ -638,16 +671,24 @@ export const actions: Actions = {
     }
   },
   importLibrar: async ({ request }) => {
-    const id = idSchema.safeParse((await request.formData()).get("id"));
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const runId = z
+      .string()
+      .trim()
+      .max(128)
+      .or(z.literal(""))
+      .catch("")
+      .parse(data.get("run_id"));
     if (!id.success) return fail(400, { message: "Invalid book." });
     try {
       await engine(`/api/recommendations/${id.data}/import`, {
         method: "POST",
-        body: "{}",
+        body: JSON.stringify(runId ? { run_id: runId } : {}),
       });
       return { message: "Book added to the Librarr wishlist." };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureEmbeddings: async ({ request }) => {
@@ -659,7 +700,6 @@ export const actions: Actions = {
     if (!backend.success || !model.success)
       return fail(400, { message: "Choose an embedding backend and model." });
     try {
-      const overview = await engine<Overview>("/api/overview");
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -667,9 +707,6 @@ export const actions: Actions = {
           embedding_model: model.data,
           embedding_url: String(data.get("url") || ""),
           embedding_api_key: String(data.get("apiKey") || ""),
-          librarr_url: overview.settings.librarr_url,
-          librarr_api_key: "",
-          librarr_media_type: overview.settings.librarr_media_type,
         }),
       });
       return { message: "Embedding provider saved and checked." };
@@ -734,22 +771,15 @@ export const actions: Actions = {
         "/api/embeddings/rebuild",
         { method: "POST", body: "{}" },
       );
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        const job = await engine<{
-          status: string;
-          error: string | null;
-          result: string | null;
-        }>(`/api/jobs/${result.job_id}`);
-        if (job.status === "complete")
-          return {
-            message: "Embeddings rebuilt and recommendations refreshed.",
-          };
-        if (job.status === "failed")
-          return fail(502, {
-            message: job.error || "Embedding rebuild failed.",
-          });
-      }
+      const job = await waitForJob(result.job_id, 20);
+      if (job.status === "complete")
+        return {
+          message: "Embeddings rebuilt and recommendations refreshed.",
+        };
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Embedding rebuild failed.",
+        });
       return {
         message: `Embedding rebuild is still running (${result.job_id.slice(0, 8)}).`,
       };
@@ -763,29 +793,22 @@ export const actions: Actions = {
         method: "POST",
         body: "{}",
       });
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        const job = await engine<{
-          status: string;
-          error: string | null;
-          result: string | null;
-        }>(`/api/jobs/${result.job_id}`);
-        if (job.status === "complete") {
-          try {
-            const result = job.result ? JSON.parse(job.result) as { errors?: unknown[] } : {};
-            if (Array.isArray(result.errors) && result.errors.length)
-              return { message: `Sources refreshed with ${result.errors.length} source${result.errors.length === 1 ? "" : "s"} needing attention.` };
-          } catch {
-            // A malformed optional result should not turn a completed sync into
-            // a failed UI action.
-          }
-          return { message: "Sources scanned and recommendations refreshed." };
+      const job = await waitForJob(result.job_id, 20);
+      if (job.status === "complete") {
+        try {
+          const parsed = job.result ? JSON.parse(job.result) as { errors?: unknown[] } : {};
+          if (Array.isArray(parsed.errors) && parsed.errors.length)
+            return { message: `Sources refreshed with ${parsed.errors.length} source${parsed.errors.length === 1 ? "" : "s"} needing attention.` };
+        } catch {
+          // A malformed optional result should not turn a completed sync into
+          // a failed UI action.
         }
-        if (job.status === "failed")
-          return fail(502, {
-            message: job.error || "Recommendation refresh failed.",
-          });
+        return { message: "Sources scanned and recommendations refreshed." };
       }
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Recommendation refresh failed.",
+        });
       return {
         message: `Refresh is still running (${result.job_id.slice(0, 8)}).`,
       };
@@ -923,7 +946,7 @@ export const actions: Actions = {
     }
   },
   retryDigest: async ({ request }) => {
-    const id = z.string().uuid().safeParse((await request.formData()).get("id"));
+    const id = z.uuid().safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid delivery." });
     try {
       const queued = await engine<{ job_id: string }>(
@@ -959,7 +982,10 @@ export const actions: Actions = {
     const uniqueIds = [...new Set(ids)];
     if (!uniqueIds.length) return fail(400, { message: "Select at least one book first." });
     try {
-      const result = await engine<{ updated?: number }>(
+      const result = await engine<{
+        updated?: number;
+        decisions?: Array<{ id: number; decision_id: number }>;
+      }>(
         "/api/recommendations/bulk-feedback",
         {
           method: "POST",
@@ -970,15 +996,32 @@ export const actions: Actions = {
           }),
         },
       );
-      return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
+      const count = result.updated ?? uniqueIds.length;
+      const undoDecisions = (result.decisions ?? []).filter(
+        (item) =>
+          idSchema.safeParse(item?.id).success &&
+          idSchema.safeParse(item?.decision_id).success,
+      );
+      return {
+        message: `${count} book${count === 1 ? "" : "s"} added to your shortlist.`,
+        ...(undoDecisions.length
+          ? {
+              undo_decisions: undoDecisions,
+              undo_label:
+                undoDecisions.length === 1
+                  ? "shortlisting this book"
+                  : `shortlisting ${undoDecisions.length} books`,
+            }
+          : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
 };
 
-async function waitForJob(jobId: string) {
-  for (let attempt = 0; attempt < 30; attempt++) {
+async function waitForJob(jobId: string, maxAttempts = 30) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     const job = await engine<{
       status: string;
