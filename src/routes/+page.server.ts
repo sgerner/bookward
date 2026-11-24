@@ -1024,7 +1024,7 @@ export const actions: Actions = {
         return fail(502, { message: job.error || "Digest could not be delivered." });
       const deliveryError = digestJobFailure(job.result);
       if (deliveryError) return fail(502, { message: deliveryError });
-      return { message: "Digest run queued; configured channels will receive it shortly." };
+      return { message: digestRunMessage(job.result, queued.job_id, job.status) };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -1044,7 +1044,9 @@ export const actions: Actions = {
       if (deliveryError) return fail(502, { message: deliveryError });
       if (job.status !== "complete")
         return { message: `Digest retry is still running (${queued.job_id.slice(0, 8)}).` };
-      return { message: "Digest delivery retry queued." };
+      const parsed = parseDigestJobResult(job.result);
+      if (parsed?.duplicate) return { message: "Digest delivery was already sent." };
+      return { message: "Digest delivery sent." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -1117,19 +1119,67 @@ async function waitForJob(jobId: string, maxAttempts = 30) {
   return { status: "queued", error: null, result: null };
 }
 
-function digestJobFailure(result: string | null) {
+type DigestJobResult = {
+  status?: string;
+  reason?: string;
+  period?: string;
+  items?: number;
+  duplicate?: boolean;
+  error?: string;
+  deliveries?: Array<{ status?: string; error?: string }>;
+};
+
+function parseDigestJobResult(result: string | null): DigestJobResult | null {
   if (!result) return null;
   try {
-    const parsed = JSON.parse(result) as {
-      status?: string;
-      deliveries?: Array<{ status?: string; error?: string }>;
-    };
-    if (parsed.status !== "failed") return null;
-    return (
-      parsed.deliveries?.find((delivery) => delivery.status === "failed")?.error ||
-      "The digest channel could not deliver the message."
-    );
+    const parsed = JSON.parse(result);
+    return parsed && typeof parsed === "object" ? (parsed as DigestJobResult) : null;
   } catch {
     return null;
   }
+}
+
+function digestRunMessage(result: string | null, jobId: string, jobStatus: string) {
+  if (jobStatus !== "complete") {
+    return `Digest is still running (${jobId.slice(0, 8)}).`;
+  }
+  const parsed = parseDigestJobResult(result);
+  if (parsed?.status === "skipped") {
+    if (parsed.reason === "no_new_recommendations") {
+      return "Digest skipped: no new recommendations matched your minimum score.";
+    }
+    if (parsed.reason === "already_delivered") {
+      return parsed.period
+        ? `Digest skipped: ${parsed.period} was already delivered.`
+        : "Digest skipped: this week's digest was already delivered.";
+    }
+    if (parsed.reason === "no_channels") {
+      return "Digest skipped: enable and save at least one delivery channel first.";
+    }
+    return "Digest skipped.";
+  }
+  if (parsed?.status === "sent") {
+    const count = typeof parsed.items === "number" ? parsed.items : 0;
+    return `Digest sent with ${count} book${count === 1 ? "" : "s"}.`;
+  }
+  return "Digest run completed.";
+}
+
+function digestJobFailure(result: string | null) {
+  const parsed = parseDigestJobResult(result);
+  if (!parsed || parsed.status !== "failed") return null;
+  if (typeof parsed.error === "string" && parsed.error.trim()) {
+    return parsed.error.trim();
+  }
+  const deliveryError = parsed.deliveries?.find(
+    (delivery) =>
+      delivery.status === "failed" &&
+      typeof delivery.error === "string" &&
+      delivery.error.trim(),
+  )?.error;
+  if (deliveryError) return deliveryError.trim();
+  if (parsed.reason === "retry_limit_reached") {
+    return "Digest delivery reached the automatic retry limit.";
+  }
+  return "The digest channel could not deliver the message.";
 }

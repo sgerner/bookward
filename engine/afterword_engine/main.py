@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     RecoveryHoldError,
@@ -1227,7 +1227,7 @@ class DigestSettingsIn(BaseModel):
     minimum_score: float = Field(default=80, ge=0, le=100)
     maximum_books: int = Field(default=5, ge=1, le=20)
     only_new: bool = True
-    app_url: str = "http://localhost:5173"
+    app_url: str | None = None
     # Optional secrets preserve the existing value when omitted and clear it
     # when explicitly sent as an empty string.
     discord_webhook_url: str | None = None
@@ -3079,9 +3079,20 @@ def _save_digest_settings(updates: dict):
     existing = digest_config(current)
     merged = {**existing, **updates}
     try:
-        validate_digest_config(merged)
+        validate_digest_config(merged, previous=existing)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
+    next_app_url = str(merged["app_url"] or "").strip().rstrip("/")
+    prev_app_url = str(existing["app_url"] or "").strip().rstrip("/")
+    default_public_url = str(settings.public_url or "").strip().rstrip("/")
+    if "digest_app_url_custom" in current:
+        prev_custom = str(current["digest_app_url_custom"]) == "1"
+    else:
+        prev_custom = bool(prev_app_url and prev_app_url not in DEFAULT_DIGEST_APP_URLS)
+    if "app_url" in updates and next_app_url != prev_app_url:
+        app_url_custom = next_app_url != default_public_url
+    else:
+        app_url_custom = prev_custom
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -3091,7 +3102,8 @@ def _save_digest_settings(updates: dict):
         "digest_minimum_score": str(merged["minimum_score"]),
         "digest_maximum_books": str(merged["maximum_books"]),
         "digest_only_new": "1" if merged["only_new"] else "0",
-        "digest_app_url": merged["app_url"],
+        "digest_app_url": next_app_url,
+        "digest_app_url_custom": "1" if app_url_custom else "0",
         "digest_discord_webhook_url": merged["discord_webhook_url"],
         "digest_email_to": merged["email_to"],
         "digest_email_from": merged["email_from"],
