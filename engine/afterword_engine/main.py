@@ -1128,6 +1128,7 @@ async def oidc_start(request: Request, intent: Literal["login", "link", "enroll"
     }
     if intent == "enroll":
         query_values["prompt"] = "login"
+        query_values["max_age"] = str(identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60)
     authorization_endpoint = urlparse(metadata["authorization_endpoint"])
     query = urlencode(
         {**dict(parse_qsl(authorization_endpoint.query, keep_blank_values=True)), **query_values}
@@ -1199,17 +1200,17 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject or len(subject) > 255:
             raise ValueError("Invalid subject")
-        if transaction_record["purpose"] == "enroll" and claims.get("auth_time") is not None:
+        if transaction_record["purpose"] == "enroll":
             auth_time = claims.get("auth_time")
             now_epoch = time.time()
             max_age_seconds = identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60 + 60
             if (
-                isinstance(auth_time, bool)
+                auth_time is None
+                or isinstance(auth_time, bool)
                 or not isinstance(auth_time, (int, float))
-                or auth_time < now_epoch - max_age_seconds
-                or auth_time > now_epoch + 60
+                or not (now_epoch - max_age_seconds <= auth_time <= now_epoch + 60)
             ):
-                raise ValueError("Stale authentication time")
+                raise ValueError("Missing or stale authentication time")
     except Exception as exc:
         LOGGER.info("Rejected OIDC callback: %s", type(exc).__name__)
         raise HTTPException(401, "The SSO provider could not verify this sign-in") from exc

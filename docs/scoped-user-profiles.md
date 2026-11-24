@@ -43,7 +43,7 @@ On a new install, the first person to complete setup at `/login` chooses the adm
 
 Passwords are stored as salted Argon2id hashes through a maintained library. The implementation applies login throttling, bounded input sizes, generic login errors, and secret redaction. See [OWASP password storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
 
-Password changes verify the current password when one is set; SSO-only accounts must have signed in within the last 10 minutes to add a local password. Administrator resets set a new temporary password and revoke existing sessions; the next login must change it. Email recovery is not included. The last usable login method and last active administrator are protected from removal or disabling.
+Password changes verify the current password when a local username and password are already set; SSO-only accounts must complete a fresh OIDC confirmation (`intent=enroll` with `prompt=login`, `max_age=600`, and a mandatory `auth_time` within 10 minutes) to enroll a unique local username and password. Password changes and administrator resets revoke existing browser sessions while leaving personal API tokens active; administrator resets require an existing local username, and after an administrator reset, the next login must change the temporary password. Email recovery is not included. The last usable login method and last active administrator are protected from removal or disabling.
 
 ### SSO
 
@@ -97,7 +97,7 @@ Every existing personal table lives in the profile file: candidates, reads, sour
 
 The identity registry maps the special `legacy` profile ID to the already deployed database, so existing data files do not need a destructive table rewrite. Startup creates the registry once, hashes configured legacy credentials into the administrator account when available, and moves legacy API token records into the registry with their profile owner. If no password is configured, the first person to complete `/login` setup creates the administrator; a database write lock and a second account-count check ensure that only one request can succeed. New accounts get independent database files. Every database runs its own normal schema migrations when initialized.
 
-API token hashes and profile ownership live centrally because the profile must be known before the engine opens a profile database. Listing or revoking a token is restricted to the active profile. Disabled accounts revoke their sessions and tokens, disable the profile, and stop its scheduled work. Account management can provision, disable, re-enable, and reset passwords; it does not impersonate or merge profiles.
+API token hashes and profile ownership live centrally because the profile must be known before the engine opens a profile database. Personal API tokens survive password changes, local credential enrollment, and administrator password resets until explicitly revoked or the account is disabled. Listing or revoking a token is restricted to the active profile. Disabled accounts revoke their sessions and tokens, disable the profile, and stop its scheduled work. Account management can provision, disable, re-enable, and reset passwords for accounts with a local username; it does not impersonate or merge profiles.
 
 All settings are stored per profile database in this implementation, including embedding provider configuration. Environment values seed defaults; a profile's changes do not alter another profile. This means users may choose different embedding providers. Installation OIDC configuration and service credentials remain environment-level settings.
 
@@ -126,11 +126,11 @@ Proposed browser-facing routes:
 | Route | Purpose |
 | --- | --- |
 | `GET /login`, `POST /auth/login` | Local sign-in and enabled SSO choice |
-| `GET /auth/oidc/start`, `GET /auth/oidc/callback` | Bound OIDC login/link transaction |
+| `GET /auth/oidc/start`, `GET /auth/oidc/callback` | Bound OIDC login/link/enroll transaction |
 | `POST /auth/logout` | Revoke session and clear browser state |
 | `GET /auth/me` | Current identity, role, profile display name, session state |
-| `POST /auth/password/change` | Reauthenticated password change |
-| `GET /auth/oidc/start?intent=link`, `DELETE /auth/identities/{id}` | Explicit login-method management |
+| `POST /auth/password/change` | Reauthenticated password change or OIDC-confirmed local credential enrollment |
+| `GET /auth/oidc/start?intent=link\|enroll`, `DELETE /auth/identities/{id}` | Explicit login-method management and SSO enrollment confirmation |
 | `/admin/accounts/*` | Create/invite, disable, reset access; server-enforced administrator role |
 
 Corresponding engine authentication routes require the backend service credential; authenticated operations also require the current session. Login/setup/callback completion have narrowly defined pre-authentication exceptions, with throttling and transaction validation. Return 401 for invalid/expired credentials, 403 for forbidden administrative operations, and 404 for unavailable personal objects. Redirect browser page loads to login; JSON/SSE consumers receive structured authentication failures rather than login HTML.

@@ -1,5 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
+import { oidcCookieDeleteOptions, oidcCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { safeNext } from '#lib/server/safe-next.js';
 
@@ -39,18 +40,13 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		if (intent === 'login') throw redirect(303, loginErrorLocation(next));
 		throw new Error('The SSO provider returned an invalid authorization URL.');
 	}
-	cookies.set('oidc_state', result.csrf, {
-		httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/auth/oidc', maxAge: 600
-	});
-	cookies.set('oidc_intent', intent, {
-		httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/auth/oidc', maxAge: 600
-	});
+	const cookieOptions = oidcCookieOptions(url);
+	cookies.set('oidc_state', result.csrf, cookieOptions);
+	cookies.set('oidc_intent', intent, cookieOptions);
 	if (intent === 'login') {
-		cookies.set('oidc_next', next, {
-			httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/auth/oidc', maxAge: 600
-		});
+		cookies.set('oidc_next', next, cookieOptions);
 	} else {
-		cookies.delete('oidc_next', { path: '/auth/oidc' });
+		cookies.delete('oidc_next', oidcCookieDeleteOptions(url));
 	}
 	throw redirect(302, destination.toString(), { external: true });
 };

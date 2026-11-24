@@ -32,7 +32,7 @@ describe('OIDC enrollment verification routes', () => {
 			delete: vi.fn()
 		};
 		engine.mockResolvedValueOnce({
-			authorization_url: 'https://idp.example/authorize?state=s1&prompt=login',
+			authorization_url: 'https://idp.example/authorize?state=s1&prompt=login&max_age=600',
 			csrf: 'csrf-token'
 		});
 
@@ -43,16 +43,21 @@ describe('OIDC enrollment verification routes', () => {
 			} as never)
 		).rejects.toMatchObject({
 			status: 302,
-			location: 'https://idp.example/authorize?state=s1&prompt=login'
+			location: 'https://idp.example/authorize?state=s1&prompt=login&max_age=600'
 		});
 
 		expect(engine).toHaveBeenCalledWith('/auth/oidc/start?intent=enroll');
 		expect(cookies.set).toHaveBeenCalledWith(
 			'oidc_intent',
 			'enroll',
-			expect.objectContaining({ httpOnly: true, path: '/auth/oidc' })
+			expect.objectContaining({ httpOnly: true, secure: true, sameSite: 'lax', path: '/auth/oidc' })
 		);
-		expect(cookies.delete).toHaveBeenCalledWith('oidc_next', { path: '/auth/oidc' });
+		expect(cookies.delete).toHaveBeenCalledWith('oidc_next', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/auth/oidc'
+		});
 
 		engine.mockRejectedValueOnce(new MockEngineError('Authentication required', 401));
 		await expect(

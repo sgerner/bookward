@@ -1,5 +1,7 @@
 from pathlib import Path
 import asyncio
+from datetime import timedelta
+import hashlib
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Thread
@@ -1074,6 +1076,222 @@ def test_existing_oidc_transactions_gain_the_session_binding_column(identity_sto
     assert "session_hash" in columns
 
 
+def test_populated_auth_registry_upgrades_transactions_sessions_and_accounts_on_startup(
+    identity_store,
+):
+    reader = profiles.create_account("upgrade-reader", "upgrade-reader-password-long")
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "upgrade-sso-sub", "upgrade@example.test", "Upgrade SSO"
+    )
+    reader_session, _ = profiles.create_session(reader["id"])
+    other_session, _ = profiles.create_session(reader["id"])
+    sso_session, _ = profiles.create_session(sso_reader["id"])
+
+    future_expiry = profiles.iso(profiles.utc_now() + timedelta(minutes=9))
+    created_stamp = "2026-10-01T12:00:00+00:00"
+    login_state_hash = hashlib.sha256(b"preupgrade-login-state").hexdigest()
+    login_csrf_hash = hashlib.sha256(b"preupgrade-login-csrf").hexdigest()
+    link_state_hash = hashlib.sha256(b"preupgrade-link-state").hexdigest()
+    link_csrf_hash = hashlib.sha256(b"preupgrade-link-csrf").hexdigest()
+    reader_session_hash = hashlib.sha256(reader_session.encode()).hexdigest()
+
+    # Downgrade a populated auth registry to the pre-PR schema on `main`:
+    # - `accounts` without `has_local_username`
+    # - `auth_sessions` without `enrollment_verified_at`
+    # - `auth_transactions` with `CHECK(purpose IN ('login','link'))` and populated in-flight rows
+    with profiles.auth_connect() as con:
+        con.execute("ALTER TABLE accounts DROP COLUMN has_local_username")
+        con.execute("ALTER TABLE auth_sessions DROP COLUMN enrollment_verified_at")
+        con.execute("DROP TABLE auth_transactions")
+        con.execute(
+            """
+            CREATE TABLE auth_transactions (
+                state_hash TEXT PRIMARY KEY,
+                csrf_hash TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                purpose TEXT NOT NULL CHECK(purpose IN ('login','link')),
+                account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+                session_hash TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO auth_transactions(
+                state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, session_hash, expires_at, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?), (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                login_state_hash,
+                login_csrf_hash,
+                "login-nonce",
+                "login-verifier",
+                "login",
+                None,
+                None,
+                future_expiry,
+                created_stamp,
+            )
+            + (
+                link_state_hash,
+                link_csrf_hash,
+                "link-nonce",
+                "link-verifier",
+                "link",
+                reader["id"],
+                reader_session_hash,
+                future_expiry,
+                created_stamp,
+            ),
+        )
+
+    # Run startup initialization twice to verify both populated migration and idempotence.
+    profiles.initialize_auth()
+    profiles.initialize_auth()
+
+    with profiles.auth_connect() as con:
+        legacy_table = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_transactions_legacy'"
+        ).fetchone()
+        table_sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='auth_transactions'"
+        ).fetchone()[0]
+        rows = con.execute(
+            "SELECT state_hash, purpose, account_id, session_hash, created_at FROM auth_transactions"
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                """
+                INSERT INTO auth_transactions(
+                    state_hash, csrf_hash, nonce, code_verifier, purpose, expires_at
+                ) VALUES ('bad-state', 'bad-csrf', 'n', 'v', 'bogus', ?)
+                """,
+                (future_expiry,),
+            )
+
+    assert legacy_table is None
+    assert "'enroll'" in table_sql
+    assert len(rows) == 2
+    assert profiles.account_by_id(reader["id"])["has_local_username"] is True
+    assert profiles.account_by_id(sso_reader["id"])["has_local_username"] is False
+
+    # Pre-upgrade login and session-bound link transactions survive intact and enforce session binding.
+    consumed_login = profiles.consume_oidc_transaction(
+        "preupgrade-login-state", "preupgrade-login-csrf"
+    )
+    assert consumed_login is not None
+    assert consumed_login["purpose"] == "login"
+    assert consumed_login["nonce"] == "login-nonce"
+    assert consumed_login["created_at"] == created_stamp
+
+    assert (
+        profiles.consume_oidc_transaction(
+            "preupgrade-link-state", "preupgrade-link-csrf", other_session
+        )
+        is None
+    )
+    consumed_link = profiles.consume_oidc_transaction(
+        "preupgrade-link-state", "preupgrade-link-csrf", reader_session
+    )
+    assert consumed_link is not None
+    assert consumed_link["purpose"] == "link"
+    assert consumed_link["account_id"] == reader["id"]
+    assert consumed_link["session_hash"] == reader_session_hash
+
+    # Newly supported `enroll` transactions and `ON DELETE CASCADE` work after the rebuild.
+    profiles.create_oidc_transaction(
+        state="postupgrade-enroll-state",
+        csrf="postupgrade-enroll-csrf",
+        nonce="enroll-nonce",
+        verifier="enroll-verifier",
+        purpose="enroll",
+        account_id=sso_reader["id"],
+        session_token=sso_session,
+    )
+    consumed_enroll = profiles.consume_oidc_transaction(
+        "postupgrade-enroll-state", "postupgrade-enroll-csrf", sso_session
+    )
+    assert consumed_enroll is not None
+    assert consumed_enroll["purpose"] == "enroll"
+    assert consumed_enroll["account_id"] == sso_reader["id"]
+
+    profiles.create_oidc_transaction(
+        state="cascade-enroll-state",
+        csrf="cascade-enroll-csrf",
+        nonce="cascade-nonce",
+        verifier="cascade-verifier",
+        purpose="enroll",
+        account_id=sso_reader["id"],
+        session_token=sso_session,
+    )
+    with profiles.auth_connect() as con:
+        con.execute("DELETE FROM accounts WHERE id=?", (sso_reader["id"],))
+        remaining = con.execute(
+            "SELECT COUNT(*) FROM auth_transactions WHERE account_id=?", (sso_reader["id"],)
+        ).fetchone()[0]
+    assert remaining == 0
+
+    # Also cover upgrading an even older pre-`session_hash` table containing a populated login row
+    # alongside a dangling `account_id` row from before foreign-key enforcement.
+    orphan_login_state = hashlib.sha256(b"legacy-nosession-login").hexdigest()
+    orphan_login_csrf = hashlib.sha256(b"legacy-nosession-csrf").hexdigest()
+    with profiles.auth_connect() as con:
+        con.execute("DROP TABLE auth_transactions")
+        con.execute(
+            """
+            CREATE TABLE auth_transactions (
+                state_hash TEXT PRIMARY KEY,
+                csrf_hash TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                account_id TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO auth_transactions(
+                state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, expires_at
+            ) VALUES (?,?,?,?,?,?,?), (?,?,?,?,?,?,?)
+            """,
+            (
+                orphan_login_state,
+                orphan_login_csrf,
+                "legacy-nonce",
+                "legacy-verifier",
+                "login",
+                None,
+                future_expiry,
+            )
+            + (
+                hashlib.sha256(b"dangling-link").hexdigest(),
+                hashlib.sha256(b"dangling-csrf").hexdigest(),
+                "dangling-nonce",
+                "dangling-verifier",
+                "link",
+                "deleted-account-id",
+                future_expiry,
+            ),
+        )
+
+    profiles.initialize_auth()
+
+    recovered_login = profiles.consume_oidc_transaction(
+        "legacy-nosession-login", "legacy-nosession-csrf"
+    )
+    assert recovered_login is not None
+    assert recovered_login["purpose"] == "login"
+    assert recovered_login["session_hash"] is None
+    with profiles.auth_connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM auth_transactions").fetchone()[0] == 0
+
+
 def test_profile_api_token_authentication_uses_the_shared_registry_key(identity_store):
     alice = profiles.create_account("alice", "alice-password-with-enough-length")
     bob = profiles.create_account("bob", "bob-password-with-enough-length")
@@ -1595,6 +1813,11 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
     sso_reader = profiles.create_oidc_account(
         issuer, "enroll-subject-1", "sso@example.test", "SSO Reader"
     )
+    with profile_scope(sso_reader["profile_id"]):
+        initialize(seed_demo=False)
+    sso_api_token = profiles.create_profile_api_token(
+        sso_reader["profile_id"], "SSO Personal Token"
+    )["token"]
     existing_local = profiles.create_account("taken-name", "taken-reader-password-long")
     assert sso_reader["has_local_username"] is False
     assert existing_local["has_local_username"] is True
@@ -1668,6 +1891,7 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         assert mismatch_start.status_code == 200
         mismatch_auth = parse_qs(urlparse(mismatch_start.json()["authorization_url"]).query)
         assert mismatch_auth["prompt"] == ["login"]
+        assert mismatch_auth["max_age"] == ["600"]
         mismatch_callback = client.get(
             "/auth/oidc/callback",
             params={"code": "unused-code", "state": mismatch_auth["state"][0]},
@@ -1720,6 +1944,36 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         )
         assert stale_auth_callback.status_code == 401
 
+        # Missing auth_time is also rejected during intent=enroll callback (mandatory freshness proof).
+        missing_auth_time_start = client.get(
+            "/auth/oidc/start?intent=enroll",
+            headers={"x-bookward-session": enroll_session},
+        )
+        missing_auth_time_query = parse_qs(
+            urlparse(missing_auth_time_start.json()["authorization_url"]).query
+        )
+        assert missing_auth_time_query["prompt"] == ["login"]
+        assert missing_auth_time_query["max_age"] == ["600"]
+        token_specs["missing-auth-time-code"] = {
+            "sub": "enroll-subject-1",
+            "nonce": missing_auth_time_query["nonce"][0],
+        }
+        missing_auth_time_callback = client.get(
+            "/auth/oidc/callback",
+            params={"code": "missing-auth-time-code", "state": missing_auth_time_query["state"][0]},
+            headers={
+                "x-bookward-session": enroll_session,
+                "x-oidc-state": missing_auth_time_start.json()["csrf"],
+            },
+        )
+        assert missing_auth_time_callback.status_code == 401
+        assert (
+            client.get("/auth/identities", headers={"x-bookward-session": enroll_session}).json()[
+                "enrollment_verified"
+            ]
+            is False
+        )
+
         def confirm_enrollment(code_name: str) -> None:
             start = client.get(
                 "/auth/oidc/start?intent=enroll",
@@ -1728,6 +1982,7 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
             assert start.status_code == 200
             auth_query = parse_qs(urlparse(start.json()["authorization_url"]).query)
             assert auth_query["prompt"] == ["login"]
+            assert auth_query["max_age"] == ["600"]
             token_specs[code_name] = {
                 "sub": "enroll-subject-1",
                 "nonce": auth_query["nonce"][0],
@@ -1838,6 +2093,27 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         )
         assert local_login.status_code == 200
         assert local_login.json()["account"]["profile_id"] == sso_reader["profile_id"]
+
+        # Personal API tokens survive local credential enrollment and admin password resets
+        # while browser sessions are revoked (matching #281).
+        token_after_enroll = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+        )
+        assert token_after_enroll.status_code == 200
+        assert token_after_enroll.json()["profile_id"] == sso_reader["profile_id"]
+
+        admin_reset_after_enroll = client.post(
+            f"/admin/accounts/{sso_reader['id']}/password",
+            headers={"x-bookward-session": admin_session},
+            json={"password": "admin-reset-enrolled-password-long"},
+        )
+        assert admin_reset_after_enroll.status_code == 200
+        assert client.get("/auth/me", headers={"x-bookward-session": rotated_session}).status_code == 401
+        token_after_reset = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+        )
+        assert token_after_reset.status_code == 200
+        assert token_after_reset.json()["profile_id"] == sso_reader["profile_id"]
 
 
 def test_legacy_oidc_prefixed_local_account_migrates_and_retains_login_and_reset(identity_store):

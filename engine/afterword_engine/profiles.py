@@ -238,33 +238,43 @@ def initialize_auth() -> None:
             "'enroll'" not in (transaction_sql[0] or "") or "session_hash" not in transaction_columns
         ):
             session_expr = "session_hash" if "session_hash" in transaction_columns else "NULL"
-            con.execute("ALTER TABLE auth_transactions RENAME TO auth_transactions_legacy")
-            con.execute(
-                """
-                CREATE TABLE auth_transactions (
-                    state_hash TEXT PRIMARY KEY,
-                    csrf_hash TEXT NOT NULL,
-                    nonce TEXT NOT NULL,
-                    code_verifier TEXT NOT NULL,
-                    purpose TEXT NOT NULL CHECK(purpose IN ('login','link','enroll')),
-                    account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
-                    session_hash TEXT,
-                    expires_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            if con.in_transaction:
+                con.commit()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                con.execute("DROP TABLE IF EXISTS auth_transactions_legacy")
+                con.execute("ALTER TABLE auth_transactions RENAME TO auth_transactions_legacy")
+                con.execute(
+                    """
+                    CREATE TABLE auth_transactions (
+                        state_hash TEXT PRIMARY KEY,
+                        csrf_hash TEXT NOT NULL,
+                        nonce TEXT NOT NULL,
+                        code_verifier TEXT NOT NULL,
+                        purpose TEXT NOT NULL CHECK(purpose IN ('login','link','enroll')),
+                        account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+                        session_hash TEXT,
+                        expires_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
                 )
-                """
-            )
-            con.execute(
-                f"""
-                INSERT INTO auth_transactions(
-                    state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, session_hash, expires_at, created_at
+                con.execute(
+                    f"""
+                    INSERT INTO auth_transactions(
+                        state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, session_hash, expires_at, created_at
+                    )
+                    SELECT state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, {session_expr}, expires_at, created_at
+                    FROM auth_transactions_legacy
+                    WHERE purpose IN ('login', 'link', 'enroll')
+                      AND (account_id IS NULL OR account_id IN (SELECT id FROM accounts))
+                    """
                 )
-                SELECT state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, {session_expr}, expires_at, created_at
-                FROM auth_transactions_legacy
-                WHERE purpose IN ('login', 'link', 'enroll')
-                """
-            )
-            con.execute("DROP TABLE auth_transactions_legacy")
+                con.execute("DROP TABLE auth_transactions_legacy")
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
         con.execute(
             "INSERT OR IGNORE INTO profiles(id,display_name) VALUES('legacy','My profile')"
         )

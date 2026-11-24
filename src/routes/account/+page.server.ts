@@ -1,5 +1,6 @@
 import { fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
+import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
@@ -53,7 +54,7 @@ export const actions: Actions = {
 		const username = String(form.get('username') || '').trim();
 		const current_password = String(form.get('current_password') || '');
 		const new_password = String(form.get('new_password') || '');
-		const hasLocalUsername = locals.user
+		const hasLocalUsername = locals?.user
 			? ownsLocalUsername(locals.user.username, locals.user.has_local_username)
 			: Boolean(!username);
 		if (!hasLocalUsername) {
@@ -66,7 +67,7 @@ export const actions: Actions = {
 			if (username.toLowerCase().startsWith('oidc:')) {
 				return fail(400, { message: "Usernames cannot start with 'oidc:'." });
 			}
-		} else if (username && username.toLowerCase() !== (locals.user?.username || '').trim().toLowerCase()) {
+		} else if (username && username.toLowerCase() !== (locals?.user?.username || '').trim().toLowerCase()) {
 			return fail(400, { message: 'Username cannot be changed once set.' });
 		}
 		if (new_password.length < 12 || new_password.length > 1024) {
@@ -80,9 +81,7 @@ export const actions: Actions = {
 				method: 'POST',
 				body: JSON.stringify(payload)
 			});
-			cookies.set('bookward_session', result.session_token, {
-				httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/', maxAge: result.max_age
-			});
+			cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 			return { message: 'Password updated.' };
 		} catch (error) {
 			return fail(error instanceof EngineError ? error.status : 503, {

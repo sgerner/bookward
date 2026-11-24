@@ -1,5 +1,10 @@
 import { redirect } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
+import {
+	SESSION_COOKIE,
+	oidcCookieDeleteOptions,
+	sessionCookieOptions
+} from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { safeNext } from '#lib/server/safe-next.js';
 
@@ -10,9 +15,10 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	const rawIntent = cookies.get('oidc_intent');
 	const intent = rawIntent === 'link' || rawIntent === 'enroll' ? rawIntent : 'login';
 	const next = intent === 'login' ? safeNext(cookies.get('oidc_next')) : '/';
-	cookies.delete('oidc_state', { path: '/auth/oidc' });
-	cookies.delete('oidc_intent', { path: '/auth/oidc' });
-	cookies.delete('oidc_next', { path: '/auth/oidc' });
+	const oidcDeleteOptions = oidcCookieDeleteOptions(url);
+	cookies.delete('oidc_state', oidcDeleteOptions);
+	cookies.delete('oidc_intent', oidcDeleteOptions);
+	cookies.delete('oidc_next', oidcDeleteOptions);
 	const loginLocation = (error: 'sso' | 'unlinked') => {
 		const query = new URLSearchParams({ error });
 		if (next !== '/') query.set('next', next);
@@ -34,10 +40,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 			headers: { 'x-oidc-state': stateCookie }
 		});
 		if (result.session_token) {
-			cookies.set('bookward_session', result.session_token, {
-				httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/',
-				maxAge: result.max_age
-			});
+			cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 			throw redirect(303, next);
 		}
 		if (result.linked) throw redirect(303, '/account?linked=1');
