@@ -75,6 +75,7 @@
     token?: string;
     id?: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
@@ -206,6 +207,7 @@
     error: boolean;
     id: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null>(null);
   let optimisticNotificationId = 0;
@@ -560,6 +562,18 @@
     readingHistory.filter((item) => item.algorithm_score !== null).length,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
+  const selectedDigestRunId = $derived.by(() => {
+    if (!selectedDigestIds.size) return "";
+    const booksById = new Map(allBooks.map((book) => [book.id, book]));
+    let sharedRunId = "";
+    for (const id of selectedDigestIds) {
+      const runId = booksById.get(id)?.recommendation_run_id?.trim() ?? "";
+      if (runId.length < 8) return "";
+      if (!sharedRunId) sharedRunId = runId;
+      else if (sharedRunId !== runId) return "";
+    }
+    return sharedRunId;
+  });
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
   );
@@ -789,7 +803,7 @@
 
     formNotificationDismissDelay = currentForm?.error
       ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id
+      : currentForm?.undo_id || currentForm?.undo_decisions?.length
         ? 0
         : FORM_NOTIFICATION_DISMISS_MS;
     scheduleFormNotificationDismiss();
@@ -2388,7 +2402,15 @@
         aria-atomic="true"
       >{visibleNotification?.message ?? ""}</div>
       {#if visibleNotification}
-        {#key visibleNotification.id ?? visibleNotification.message}
+        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
+          ? visibleNotification.undo_decisions
+          : visibleNotification.undo_id && visibleNotification.id
+            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
+            : []}
+        {@const notificationUndoKey = notificationUndoDecisions.length
+          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
+          : null}
+        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
           <div
             class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
           >
@@ -2432,24 +2454,26 @@
                   <p class="leading-relaxed text-surface-900-100">
                     {visibleNotification.message}
                   </p>
-                  {#if visibleNotification.undo_id && visibleNotification.id}
+                  {#if notificationUndoDecisions.length && notificationUndoKey}
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(notificationUndoKey)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={visibleNotification.id} />
-                      <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                        <input type="hidden" name="id" value={item.id} />
+                        <input type="hidden" name="decision_id" value={item.decision_id} />
+                      {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(`undo-${visibleNotification.undo_id}`)}
-                        aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                        disabled={isPending(notificationUndoKey)}
+                        aria-busy={isPending(notificationUndoKey)}
                         aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
@@ -2551,6 +2575,7 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
