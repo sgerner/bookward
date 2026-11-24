@@ -20,7 +20,7 @@ from threadpoolctl import threadpool_limits
 import evaluate_ordinal_interests as ordinal
 from evaluate_historical_ratings import whole_day_cuts
 from evaluate_ranking import load_corpus, prepare
-from afterword_engine.identity import book_identity
+from afterword_engine.identity import book_author_identity_key
 from afterword_engine.ranking import rank_candidates
 
 
@@ -73,7 +73,15 @@ def build_features(corpus_path, output_dir, backend, model):
     later_mask = usable >= cuts[1]
     train_stop = int(train_mask.sum())
     folds = development_folds(eligible_days, train_stop)
-    author_keys = [book_identity("", items[i].get("author", "")) for i in usable]
+    author_keys = [
+        (
+            key
+            if (key := book_author_identity_key(items[i].get("author", "")))
+            and key != "unknown author"
+            else f"__missing_author_{items[i].get('id', i)}"
+        )
+        for i in usable
+    ]
     author_map = {key: index for index, key in enumerate(sorted(set(author_keys)))}
     arrays = {
         "read_ids": np.asarray([items[i]["id"] for i in usable], dtype=np.int64),
