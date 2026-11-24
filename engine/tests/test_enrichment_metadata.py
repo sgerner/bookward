@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 from urllib.parse import parse_qs, urlparse
 
@@ -237,7 +238,37 @@ def test_publishers_weekly_grid_parser_scopes_covers_skips_cta_and_recovers_isbn
     assert by_title["Single Row Fallback"]["isbn10"] == "0306406152"
 
     assert isbn_parts_from_source((), "https://publishersweekly.com/978-0-306-40615-7") == ("9780306406157", "")
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/reviews/review.html?isbn=978-0-306-40615-7",
+        )
+        == ("9780306406157", "")
+    )
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/reviews?isbn10=0-06-112008-1",
+        )
+        == ("9780061120084", "0061120081")
+    )
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/reviews/review.html?isbn=9780306406150",
+        )
+        == ("", "")
+    )
     assert isbn_parts_from_source((), "https://www.publishersweekly.com/pw/by-topic/industry-news/article/9780306406157.html") == ("", "")
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/by-topic/industry-news/article.html?isbn=9780306406157",
+        )
+        == ("", "")
+    )
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/search?isbn=9780306406157") == ("", "")
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/?isbn=9780306406157") == ("", "")
     assert isbn_parts_from_source((), "https://publishersweekly.com.evil.example/9780306406157") == ("", "")
     assert isbn_parts_from_source((), "https://example.com/9780306406157") == ("", "")
 
@@ -310,7 +341,7 @@ def test_publishers_weekly_cta_skip_allows_catalog_synopsis_and_keeps_curated_co
     assert curated_provenance["provider"] == "source"
 
 
-def test_scan_source_chunks_all_incomplete_items_and_hydrates_stored_metadata(tmp_path, monkeypatch):
+def test_scan_source_bounds_chunked_enrichment_and_hydrates_stored_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "db", str(tmp_path / "batch-scan.db"))
     initialize(seed_demo=False)
     batch_size = ingestion.SOURCE_METADATA_ENRICHMENT_BATCH_SIZE
@@ -426,86 +457,235 @@ def test_scan_source_chunks_all_incomplete_items_and_hydrates_stored_metadata(tm
     assert catalog_batches == [["Brand New Release"]]
 
 
-def test_refresh_missing_candidate_metadata_retries_penguin_random_house_product_pages(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "db", str(tmp_path / "prh-refresh.db"))
+def test_scan_source_warm_rescan_skips_items_missing_genres_or_release_date(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "warm-rescan-sparse.db"))
     initialize(seed_demo=False)
-    product_url = "https://www.penguinrandomhouse.com/books/777/retry-work-by-ada-writer"
-    expected_isbn = "9780306406157"
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    prh_product_url = "https://www.penguinrandomhouse.com/books/777/genreless-prh-book/"
+    markup = f"""<table>
+      <tr>
+        <td class="starredreview-grid">
+          <img src="/cover/genreless.jpg">
+          <h3><a href="/9780306406157">Genreless Starred Book</a></h3>
+          <h4>Ada Writer. Press One, $28 ISBN 978-0-306-40615-7</h4>
+          <p><a href="/9780306406157">Complete Review »</a></p>
+        </td>
+        <td class="starredreview-grid">
+          <img src="/cover/dateless.jpg">
+          <h3><a href="/0061120081">Dateless Starred Book</a></h3>
+          <h4>Grace Author. Press Two, $27 ISBN 0-06-112008-1</h4>
+          <p>Editorial blurb without publication date.</p>
+        </td>
+        <td class="starredreview-grid">
+          <img src="https://images.penguinrandomhouse.com/cover/9780143127741">
+          <h3><a href="{prh_product_url}">Genreless PRH Book</a></h3>
+          <h4>By Solo Author</h4>
+          <p>Publisher blurb already present, cover present, genres absent.</p>
+        </td>
+      </tr>
+    </table>""".encode("utf-8")
 
-    with transaction() as con:
-        source_id = row(
-            "SELECT id FROM sources WHERE url='https://www.penguinrandomhouse.com/books/new-releases/'"
-        )["id"]
-        candidate_id = con.execute(
-            """INSERT INTO candidates(
-                title,author,description,cover_url,release_date,date_kind,genres,source_url,source_id,normalized_key
-            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (
-                "Retry Work",
-                "Ada Writer",
-                "",
-                "https://images.penguinrandomhouse.com/cover/777",
-                "2026-08-01",
-                "day",
-                "[]",
-                product_url,
-                source_id,
-                normalize_key("Retry Work", "Ada Writer"),
-            ),
-        ).lastrowid
-        con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
-            (candidate_id,),
-        )
-
-    product_html = json.dumps({
-        "@context": "https://schema.org",
-        "@type": "Book",
-        "name": "Retry Work",
-        "author": {"@type": "Person", "name": "Ada Writer"},
-        "isbn": expected_isbn,
-        "genre": ["Science fiction"],
-    }).encode()
-    page = (
-        b'<html><head><meta name="Tealium" data-book-title="Retry Work" '
-        b'data-book-authors="Ada Writer" data-book-isbn="9780306406157">'
-        b'<script type="application/ld+json">'
-        + product_html
-        + b'</script></head><body><div id="book-description-copy">'
-        b'<div class="copy-height">Recovered publisher synopsis after retry.</div>'
-        b'</div></body></html>'
-    )
+    product_fetches = []
+    catalog_requests = []
 
     async def fake_fetch(url, client=None):
-        assert url == product_url
-        return page, "text/html"
+        if url == source_url:
+            return markup, "text/html"
+        product_fetches.append(url)
+        return b"<html></html>", "text/html"
 
-    def empty_catalog_handler(request):
+    def provider_handler(request):
+        catalog_requests.append(str(request.url))
         if request.url.host == "openlibrary.org":
-            return httpx.Response(200, json={"docs": []})
-        return httpx.Response(200, json={"items": []})
+            isbn_param = request.url.params.get("isbn", "")
+            if isbn_param == "9780306406157":
+                # Supplies synopsis and release_date, but never genres.
+                return httpx.Response(
+                    200,
+                    json={"docs": [{
+                        "key": "/works/OLGENRELESS1W",
+                        "title": "Genreless Starred Book",
+                        "author_name": ["Ada Writer"],
+                        "isbn": ["9780306406157"],
+                        "description": "Catalog synopsis without subjects.",
+                        "subject": [],
+                        "first_publish_year": 2026,
+                    }]},
+                )
+            if isbn_param == "9780061120084":
+                # Supplies genres, but never release_date.
+                return httpx.Response(
+                    200,
+                    json={"docs": [{
+                        "key": "/works/OLDATELESS1W",
+                        "title": "Dateless Starred Book",
+                        "author_name": ["Grace Author"],
+                        "isbn": ["9780061120084"],
+                        "subject": ["Literary fiction"],
+                    }]},
+                )
+        return httpx.Response(200, json={"docs": [], "items": []})
 
     monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
-    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(empty_catalog_handler))
+    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(provider_handler))
 
-    assert asyncio.run(ingestion.refresh_missing_candidate_metadata()) == 1
-    candidate = row("SELECT description,isbn13,genres FROM candidates WHERE id=?", (candidate_id,))
-    quality = row(
-        "SELECT metadata_provider,metadata_provider_id,isbn13 FROM candidate_quality WHERE candidate_id=?",
-        (candidate_id,),
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert catalog_requests
+    # PRH book already has description and non-weak cover, so PRH product page is not fetched for missing genres.
+    assert product_fetches == []
+
+    genreless = row(
+        "SELECT c.id,c.genres,c.release_date,q.metadata_checked_at,q.metadata_version "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.title='Genreless Starred Book'"
     )
-    provenance = row(
-        "SELECT provider,provider_id FROM metadata_field_provenance "
-        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
-        (candidate_id,),
+    dateless = row(
+        "SELECT c.id,c.genres,c.release_date,q.metadata_checked_at,q.metadata_version "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.title='Dateless Starred Book'"
     )
-    assert candidate["description"] == "Recovered publisher synopsis after retry."
-    assert candidate["isbn13"] == expected_isbn
-    assert json.loads(candidate["genres"]) == ["Science fiction"]
-    assert quality["metadata_provider"] == "penguinrandomhouse"
-    assert quality["metadata_provider_id"] == product_url
-    assert quality["isbn13"] == expected_isbn
-    assert provenance == {"provider": "penguinrandomhouse", "provider_id": product_url}
+    assert json.loads(genreless["genres"]) == []
+    assert genreless["release_date"] == "2026-01-01"
+    assert genreless["metadata_checked_at"]
+    assert genreless["metadata_version"] == covers.METADATA_NORMALIZATION_VERSION
+    assert json.loads(dateless["genres"]) == ["Literary fiction"]
+    assert dateless["release_date"] is None
+    assert dateless["metadata_checked_at"]
+
+    # Warm rescan within retry window must make zero PRH or catalog enrichment calls.
+    catalog_requests.clear()
+
+    async def fail_if_enriched(_items):
+        raise AssertionError("warm rescan should not re-enrich recently checked sparse items")
+
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", fail_if_enriched)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", fail_if_enriched)
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert catalog_requests == []
+    assert product_fetches == []
+
+    # Once metadata_checked_at ages past CANDIDATE_METADATA_RETRY_DAYS, item becomes eligible again.
+    expired_checked_at = (
+        datetime.now(timezone.utc)
+        - timedelta(days=ingestion.CANDIDATE_METADATA_RETRY_DAYS + 1)
+    ).isoformat(timespec="microseconds")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET metadata_checked_at=? WHERE candidate_id=?",
+            (expired_checked_at, genreless["id"]),
+        )
+
+    retried_titles = []
+
+    async def passthrough_prh(items):
+        return items
+
+    async def record_retry(items):
+        retried_titles.extend(item["title"] for item in items)
+        return items
+
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough_prh)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", record_retry)
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert retried_titles == ["Genreless Starred Book"]
+
+
+def test_scan_source_commits_completed_chunks_before_mid_scan_failure_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "chunk-failure.db"))
+    initialize(seed_demo=False)
+    monkeypatch.setattr(ingestion, "SOURCE_METADATA_ENRICHMENT_BATCH_SIZE", 2)
+    monkeypatch.setattr(ingestion, "SOURCE_METADATA_ENRICHMENT_MAX_BATCHES", 2)
+
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    with transaction() as con:
+        con.execute(
+            """INSERT INTO candidates(
+                title,author,description,cover_url,source_url,source_id,status,normalized_key
+            ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                "Stale Prior Candidate",
+                "Prior Writer",
+                "Prior blurb.",
+                "https://www.publishersweekly.com/cover/stale.jpg",
+                source_url,
+                source["id"],
+                "new",
+                normalize_key("Stale Prior Candidate", "Prior Writer"),
+            ),
+        )
+
+    # 5 incomplete items in inline HTML -> capped to 2 batches * 2 = 4 items on first scan.
+    cards_html = "\n".join(
+        f"""<tr><td class="starredreview-grid">
+          <img src="/cover/book-{idx}.jpg">
+          <h3><a href="/books/book-{idx}">Chunk Book {idx}</a></h3>
+          <h4>By Author {idx}</h4>
+          <p>Complete Review »</p>
+        </td></tr>"""
+        for idx in range(5)
+    )
+    markup = f"<table>{cards_html}</table>".encode("utf-8")
+
+    async def fake_fetch(_url, client=None):
+        return markup, "text/html"
+
+    seen_batches = []
+    fail_second_chunk = True
+
+    async def passthrough_prh(items):
+        return items
+
+    async def flaky_catalog_enrich(items):
+        titles = [item["title"] for item in items]
+        seen_batches.append(titles)
+        if fail_second_chunk and len(seen_batches) == 2:
+            raise RuntimeError("transient catalog timeout in chunk 2")
+        return [
+            {
+                **item,
+                "description": f"Enriched synopsis for {item['title']}.",
+                "genres": ["Literary fiction"],
+            }
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough_prh)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", flaky_catalog_enrich)
+
+    with pytest.raises(RuntimeError, match="transient catalog timeout in chunk 2"):
+        asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source["id"],))))
+
+    assert seen_batches == [["Chunk Book 0", "Chunk Book 1"], ["Chunk Book 2", "Chunk Book 3"]]
+    persisted_after_failure = rows(
+        "SELECT c.title,c.description,q.metadata_checked_at "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.source_id=? ORDER BY c.title",
+        (source["id"],),
+    )
+    persisted_by_title = {item["title"]: item for item in persisted_after_failure}
+    # Chunk 1 committed its two enriched books; stale candidate was NOT prematurely deleted; last_status stayed unset.
+    assert set(persisted_by_title) == {"Chunk Book 0", "Chunk Book 1", "Stale Prior Candidate"}
+    assert persisted_by_title["Chunk Book 0"]["description"] == "Enriched synopsis for Chunk Book 0."
+    assert persisted_by_title["Chunk Book 0"]["metadata_checked_at"]
+    assert persisted_by_title["Chunk Book 1"]["metadata_checked_at"]
+    assert row("SELECT last_status FROM sources WHERE id=?", (source["id"],))["last_status"] is None
+
+    # Retry scan after transient failure clears: Chunk 0 & 1 are skipped via metadata_checked_at,
+    # remaining unchecked books (Chunk Book 2, 3, 4) are enriched, and stale candidate is cleaned up.
+    seen_batches.clear()
+    fail_second_chunk = False
+    collected = asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source["id"],))))
+    assert collected == 5
+    assert seen_batches == [["Chunk Book 2", "Chunk Book 3"], ["Chunk Book 4"]]
+    final_titles = {
+        item["title"]
+        for item in rows("SELECT title FROM candidates WHERE source_id=?", (source["id"],))
+    }
+    assert final_titles == {f"Chunk Book {idx}" for idx in range(5)}
+    assert row("SELECT last_status FROM sources WHERE id=?", (source["id"],))["last_status"] == "ok:5"
 
 
 def test_source_description_is_preserved_and_legacy_opening_upgrade_is_exact_record_only():

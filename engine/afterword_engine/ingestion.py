@@ -67,6 +67,7 @@ CANDIDATE_METADATA_BATCH_SIZE = 50
 CANDIDATE_METADATA_RETRY_DAYS = 30
 CANDIDATE_METADATA_COVER_RETRY_DAYS = 7
 SOURCE_METADATA_ENRICHMENT_BATCH_SIZE = 50
+SOURCE_METADATA_ENRICHMENT_MAX_BATCHES = 3
 READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
 
@@ -2927,10 +2928,9 @@ async def enrich_penguin_random_house_items(items):
             record["normalized_key"]: {
                 "description": record.get("description", ""),
                 "cover_url": record.get("cover_url", ""),
-                "genres": record.get("genres", "[]"),
             }
             for record in rows(
-                "SELECT normalized_key,description,cover_url,genres FROM candidates "
+                "SELECT normalized_key,description,cover_url FROM candidates "
                 f"WHERE normalized_key IN ({placeholders})",
                 tuple(book_keys),
             )
@@ -2947,11 +2947,7 @@ async def enrich_penguin_random_house_items(items):
             cover and not is_weak_cover_url(cover)
             for cover in (item.get("cover_url"), existing.get("cover_url"))
         )
-        has_genres = bool(
-            _stored_genre_values(item.get("genres"))
-            or _stored_genre_values(existing.get("genres"))
-        )
-        return description_missing, not has_cover, not has_genres
+        return description_missing, not has_cover
 
     linked_items = [
         item
@@ -2974,8 +2970,8 @@ async def enrich_penguin_random_house_items(items):
 
         async def enrich(item):
             key = normalize_key(item.get("title", ""), item.get("author", ""))
-            need_description, need_cover, need_genres = missing_detail_fields(item)
-            if not need_description and not need_cover and not need_genres:
+            need_description, need_cover = missing_detail_fields(item)
+            if not need_description and not need_cover:
                 return item
             url = str(item.get("source_url") or "")
             if not _penguin_random_house_book_url(url):
@@ -3250,8 +3246,7 @@ async def refresh_missing_candidate_metadata():
             item["_expected_provider_id"] = candidate.get("_legacy_metadata_provider_id") or ""
             item["_prefer_catalog_synopsis"] = True
         inputs.append(item)
-    publisher_inputs = await enrich_penguin_random_house_items(inputs)
-    enriched = await enrich_book_metadata(_clean_parsed_subjects(publisher_inputs))
+    enriched = await enrich_book_metadata(inputs)
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
@@ -3274,22 +3269,12 @@ async def refresh_missing_candidate_metadata():
             cover_url = item.get("cover_url", "")
             release_date = item.get("release_date") or None
             date_kind = item.get("date_kind") or previous.get("date_kind") or "unknown"
-            isbn13, isbn10 = isbn_parts_from_source(
-                [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-                item.get("source_url", ""),
-            )
             previous_genres = _stored_genre_values(previous.get("genres", []))
             item_genres = normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT)
             genres = normalize_subjects(previous_genres + item_genres, limit=METADATA_GENRE_LIMIT)
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
             metadata_provider = str(item.get("_metadata_provider", "") or "")
             metadata_provider_id = str(item.get("_metadata_provider_id", "") or "")
-            description_provider = str(
-                item.get("_description_provider") or metadata_provider or ""
-            )
-            description_provider_id = str(
-                item.get("_description_provider_id") or metadata_provider_id or ""
-            )
             cover_changed = bool(
                 cover_url
                 and not is_weak_cover_url(cover_url)
@@ -3311,8 +3296,6 @@ async def refresh_missing_candidate_metadata():
                 release_date=COALESCE(release_date, ?),
                 date_kind=CASE WHEN release_date IS NULL AND ? IS NOT NULL THEN ? ELSE date_kind END,
                 genres=CASE WHEN ?!='[]' THEN ? ELSE genres END,
-                isbn13=CASE WHEN isbn13='' AND ?!='' THEN ? ELSE isbn13 END,
-                isbn10=CASE WHEN isbn10='' AND ?!='' THEN ? ELSE isbn10 END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (
                     description,
@@ -3325,10 +3308,6 @@ async def refresh_missing_candidate_metadata():
                     date_kind,
                     genres_json,
                     genres_json,
-                    isbn13,
-                    isbn13,
-                    isbn10,
-                    isbn10,
                     item["id"],
                 ),
             )
@@ -3353,27 +3332,36 @@ async def refresh_missing_candidate_metadata():
                 """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,
                     metadata_provider=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider END,
                     metadata_provider_id=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider_id END,
-                    isbn13=CASE WHEN isbn13='' AND ?!='' THEN ? ELSE isbn13 END,
-                    isbn10=CASE WHEN isbn10='' AND ?!='' THEN ? ELSE isbn10 END,
                     updated_at=CURRENT_TIMESTAMP
                     WHERE candidate_id=? AND quality_status='accepted'""",
                 (
                     datetime.now(timezone.utc).isoformat(timespec="microseconds"),
                     METADATA_NORMALIZATION_VERSION,
                     int(description_changed),
-                    description_provider,
-                    description_provider,
+                    metadata_provider,
+                    metadata_provider,
                     int(description_changed),
-                    description_provider_id,
-                    description_provider_id,
-                    isbn13,
-                    isbn13,
-                    isbn10,
-                    isbn10,
+                    metadata_provider_id,
+                    metadata_provider_id,
                     item["id"],
                 )
             )
     return changed + normalized_catalog_dates
+
+
+def _parse_utc_timestamp(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _scan_item_needs_enrichment(item):
@@ -3385,6 +3373,178 @@ def _scan_item_needs_enrichment(item):
         and str(item.get("release_date") or "").strip()
         and _stored_genre_values(item.get("genres"))
     )
+
+
+def _scan_item_due_for_enrichment(
+    item,
+    stored=None,
+    *,
+    now: datetime | None = None,
+    has_new_source_isbn: bool = False,
+) -> bool:
+    if not _scan_item_needs_enrichment(item):
+        return False
+    if has_new_source_isbn or not stored:
+        return True
+    if str(stored.get("metadata_version") or "") != METADATA_NORMALIZATION_VERSION:
+        return True
+    checked_at = _parse_utc_timestamp(stored.get("metadata_checked_at"))
+    if checked_at is None:
+        return True
+    reference_now = now or datetime.now(timezone.utc)
+    cover_url = str(item.get("cover_url") or "")
+    has_cover = bool(cover_url and not is_weak_cover_url(cover_url))
+    retry_days = (
+        CANDIDATE_METADATA_RETRY_DAYS
+        if has_cover
+        else min(CANDIDATE_METADATA_RETRY_DAYS, CANDIDATE_METADATA_COVER_RETRY_DAYS)
+    )
+    return checked_at <= reference_now - timedelta(days=max(1, int(retry_days)))
+
+
+def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: str | None = None):
+    for item in batch_items:
+        key = normalize_key(item["title"], item.get("author", "Unknown author"))
+        isbn13, isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        existing = con.execute(
+            "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+            (key,),
+        ).fetchone()
+        genres = normalize_subjects(
+            _stored_genre_values(existing["genres"] if existing else [])
+            + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
+            limit=METADATA_GENRE_LIMIT,
+        )
+        genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
+        con.execute(
+            """INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
+            description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
+            cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
+            source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
+            release_date=COALESCE(excluded.release_date, release_date),
+            date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
+            genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
+            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
+            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
+            updated_at=CURRENT_TIMESTAMP""",
+            (
+                item["title"],
+                item.get("author", "Unknown author"),
+                item.get("description", ""),
+                item.get("cover_url", ""),
+                item.get("source_url", source["url"]),
+                source["id"],
+                item.get("release_date"),
+                item.get("date_kind", "source"),
+                genres_json,
+                isbn13,
+                isbn10,
+                key,
+            ),
+        )
+        candidate = con.execute(
+            "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+            (key,),
+        ).fetchone()
+        if candidate:
+            description_added = bool(
+                item.get("description")
+                and not (existing["description"] if existing else "")
+                and candidate["description"] == item.get("description")
+            )
+            cover_added = bool(
+                item.get("cover_url")
+                and not is_weak_cover_url(item.get("cover_url"))
+                and candidate["cover_url"] == item.get("cover_url")
+                and (not existing or existing["cover_url"] != candidate["cover_url"])
+            )
+            release_added = bool(
+                item.get("release_date")
+                and not (existing["release_date"] if existing else "")
+                and candidate["release_date"] == item.get("release_date")
+            )
+            previous_genres = _stored_genre_values(existing["genres"] if existing else [])
+            genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
+            source_fields = set(item.get("_source_provided_fields", []))
+            source_provenance = {
+                "metadata_provenance": {
+                    "fields": {
+                        field: {
+                            "provider": "source",
+                            "provider_id": str(source["id"]),
+                            "kind": "source_item",
+                        }
+                        for field in source_fields
+                    },
+                    "source_payloads": [],
+                }
+            }
+            contributed = {
+                "description": description_added,
+                "cover_url": cover_added,
+                "release_date": release_added,
+                "genres": genres_added,
+            }
+            for field, applied in contributed.items():
+                if not applied:
+                    continue
+                source_provided = field in source_fields and not (
+                    field == "cover_url" and item.get("_cover_url_provider")
+                )
+                if source_provided:
+                    _persist_metadata_field_provenance(
+                        con,
+                        "candidate",
+                        int(candidate["id"]),
+                        field,
+                        source_provenance,
+                        default_provider="source",
+                        default_provider_id=str(source["id"]),
+                        default_confidence=1.0,
+                    )
+                _persist_metadata_field_provenance(
+                    con,
+                    "candidate",
+                    int(candidate["id"]),
+                    field,
+                    item,
+                )
+        if candidate and (isbn13 or isbn10):
+            con.execute(
+                """UPDATE candidate_quality SET
+                    isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
+                    isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=?""",
+                (isbn13, isbn10, candidate["id"]),
+            )
+        if candidate and checked_at:
+            con.execute(
+                """UPDATE candidate_quality SET
+                    metadata_checked_at=?,
+                    metadata_version=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=?""",
+                (checked_at, METADATA_NORMALIZATION_VERSION, candidate["id"]),
+            )
+        isbn_added = bool(
+            (isbn13 and not (existing["isbn13"] if existing else ""))
+            or (isbn10 and not (existing["isbn10"] if existing else ""))
+        )
+        if existing and isbn_added:
+            # A newly discovered ISBN is evidence for a retry, not proof
+            # of identity. Requeue only quarantined rows; accepted rows
+            # remain untouched and therefore cannot change ranking here.
+            con.execute(
+                """UPDATE candidate_quality SET quality_status='pending',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=? AND quality_status='quarantine'""",
+                (candidate["id"],),
+            )
 
 
 async def preview_source(url, filters=None):
@@ -3427,8 +3587,9 @@ async def scan_source(source):
         possible = filter_source_items(cleaned, configured_filters)
 
     # A prior scan or quality pass may already know identifiers and catalog
-    # fields that the current feed omits. Hydrate stored metadata first so warm
-    # scans only enrich genuinely incomplete items.
+    # fields that the current feed omits. Hydrate stored metadata first and
+    # skip recently checked items so warm scans do not repeat sparse lookups.
+    scan_started_at = datetime.now(timezone.utc)
     possible_keys = list(
         dict.fromkeys(
             normalize_key(item["title"], item.get("author", "Unknown author"))
@@ -3444,12 +3605,14 @@ async def scan_source(source):
         for candidate in rows(
             "SELECT c.normalized_key,c.description,c.cover_url,c.release_date,c.date_kind,c.genres,"
             "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10 "
+            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
+            "q.metadata_checked_at,q.metadata_version "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             f"WHERE c.normalized_key IN ({placeholders})",
             tuple(key_batch),
         ):
             stored_candidates[candidate["normalized_key"]] = candidate
+    due_for_enrichment_ids = set()
     for item_index, item in enumerate(possible):
         item["_scan_enrichment_id"] = item_index
         item["_source_provided_fields"] = [
@@ -3468,6 +3631,9 @@ async def scan_source(source):
         source_isbn13, source_isbn10 = isbn_parts_from_source(
             [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
             item.get("source_url", source["url"]),
+        )
+        has_new_source_isbn = bool(
+            (source_isbn13 or source_isbn10) and not (known_isbn13 or known_isbn10)
         )
         source_matches_known_isbn = _returned_identifiers_match_read(
             [source_isbn13, source_isbn10], known_isbn13, known_isbn10
@@ -3506,9 +3672,21 @@ async def scan_source(source):
         if stored_cover and not is_weak_cover_url(stored_cover) and (
             not item.get("cover_url")
             or is_weak_cover_url(item.get("cover_url"))
-            or not _scan_item_needs_enrichment({**item, "cover_url": stored_cover})
+            or not _scan_item_due_for_enrichment(
+                {**item, "cover_url": stored_cover},
+                stored,
+                now=scan_started_at,
+                has_new_source_isbn=has_new_source_isbn,
+            )
         ):
             item["cover_url"] = stored_cover
+        if _scan_item_due_for_enrichment(
+            item,
+            stored,
+            now=scan_started_at,
+            has_new_source_isbn=has_new_source_isbn,
+        ):
+            due_for_enrichment_ids.add(item_index)
 
     def enrichment_priority(item):
         isbn13, isbn10 = isbn_parts_from_source(
@@ -3522,145 +3700,64 @@ async def scan_source(source):
             bool(source_cover),
         )
 
+    batch_size = max(1, int(SOURCE_METADATA_ENRICHMENT_BATCH_SIZE))
+    max_enrichment_items = batch_size * max(1, int(SOURCE_METADATA_ENRICHMENT_MAX_BATCHES))
     enrichment_pool = sorted(
-        (item for item in possible if _scan_item_needs_enrichment(item)),
+        (
+            item
+            for item in possible
+            if item.get("_scan_enrichment_id") in due_for_enrichment_ids
+        ),
         key=enrichment_priority,
-    )
+    )[:max_enrichment_items]
     enriched_by_id = {}
-    for start in range(0, len(enrichment_pool), SOURCE_METADATA_ENRICHMENT_BATCH_SIZE):
-        batch = enrichment_pool[start : start + SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+    persisted_enrichment_ids = set()
+    for start in range(0, len(enrichment_pool), batch_size):
+        batch = enrichment_pool[start : start + batch_size]
         publisher_batch = await enrich_penguin_random_house_items(batch)
         enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
-        for item in enriched_batch:
-            if "_scan_enrichment_id" in item:
-                enriched_by_id[item["_scan_enrichment_id"]] = item
-    items = [
+        cleaned_chunk = _clean_parsed_subjects(enriched_batch)
+        for source_item, enriched_item in zip(batch, cleaned_chunk):
+            enrichment_id = enriched_item.get(
+                "_scan_enrichment_id", source_item.get("_scan_enrichment_id")
+            )
+            if enrichment_id is not None:
+                enriched_by_id[enrichment_id] = enriched_item
+                persisted_enrichment_ids.add(enrichment_id)
+        chunk_accepted = filter_source_items(cleaned_chunk, configured_filters)
+        if chunk_accepted:
+            chunk_checked_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            chunk_to_persist = [
+                {k: v for k, v in item.items() if k != "_scan_enrichment_id"}
+                for item in chunk_accepted
+            ]
+            with transaction() as con:
+                _persist_scanned_candidate_items(
+                    con,
+                    source,
+                    chunk_to_persist,
+                    checked_at=chunk_checked_at,
+                )
+
+    merged_items = [
         enriched_by_id.get(item.get("_scan_enrichment_id"), item)
         for item in possible
     ]
-    for item in items:
+    unpersisted_items = [
+        {k: v for k, v in item.items() if k != "_scan_enrichment_id"}
+        for item in merged_items
+        if item.get("_scan_enrichment_id") not in persisted_enrichment_ids
+    ]
+    for item in merged_items:
         item.pop("_scan_enrichment_id", None)
-    items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
+    items = filter_source_items(_clean_parsed_subjects(merged_items), configured_filters)
+    remaining_items = filter_source_items(_clean_parsed_subjects(unpersisted_items), configured_filters)
     with transaction() as con:
-        seen = []
-        for item in items:
-            key = normalize_key(item["title"], item.get("author", "Unknown author"))
-            seen.append(key)
-            isbn13, isbn10 = isbn_parts_from_source(
-                [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-                item.get("source_url", source["url"]),
-            )
-            existing = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
-                (key,),
-            ).fetchone()
-            genres = normalize_subjects(
-                _stored_genre_values(existing["genres"] if existing else [])
-                + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
-                limit=METADATA_GENRE_LIMIT,
-            )
-            genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
-            con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
-            description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
-            cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
-            source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
-            release_date=COALESCE(excluded.release_date, release_date),
-            date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
-            genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
-            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
-            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
-            candidate = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
-                (key,),
-            ).fetchone()
-            if candidate:
-                description_added = bool(
-                    item.get("description")
-                    and not (existing["description"] if existing else "")
-                    and candidate["description"] == item.get("description")
-                )
-                cover_added = bool(
-                    item.get("cover_url")
-                    and not is_weak_cover_url(item.get("cover_url"))
-                    and candidate["cover_url"] == item.get("cover_url")
-                    and (not existing or existing["cover_url"] != candidate["cover_url"])
-                )
-                release_added = bool(
-                    item.get("release_date")
-                    and not (existing["release_date"] if existing else "")
-                    and candidate["release_date"] == item.get("release_date")
-                )
-                previous_genres = _stored_genre_values(existing["genres"] if existing else [])
-                genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
-                source_fields = set(item.get("_source_provided_fields", []))
-                source_provenance = {
-                    "metadata_provenance": {
-                        "fields": {
-                            field: {
-                                "provider": "source",
-                                "provider_id": str(source["id"]),
-                                "kind": "source_item",
-                            }
-                            for field in source_fields
-                        },
-                        "source_payloads": [],
-                    }
-                }
-                contributed = {
-                    "description": description_added,
-                    "cover_url": cover_added,
-                    "release_date": release_added,
-                    "genres": genres_added,
-                }
-                for field, applied in contributed.items():
-                    if not applied:
-                        continue
-                    source_provided = field in source_fields and not (
-                        field == "cover_url" and item.get("_cover_url_provider")
-                    )
-                    if source_provided:
-                        _persist_metadata_field_provenance(
-                            con,
-                            "candidate",
-                            int(candidate["id"]),
-                            field,
-                            source_provenance,
-                            default_provider="source",
-                            default_provider_id=str(source["id"]),
-                            default_confidence=1.0,
-                        )
-                    _persist_metadata_field_provenance(
-                        con,
-                        "candidate",
-                        int(candidate["id"]),
-                        field,
-                        item,
-                    )
-            if candidate and (isbn13 or isbn10):
-                con.execute(
-                    """UPDATE candidate_quality SET
-                        isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
-                        isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE candidate_id=?""",
-                    (isbn13, isbn10, candidate["id"]),
-                )
-            isbn_added = bool(
-                (isbn13 and not (existing["isbn13"] if existing else ""))
-                or (isbn10 and not (existing["isbn10"] if existing else ""))
-            )
-            if existing and isbn_added:
-                # A newly discovered ISBN is evidence for a retry, not proof
-                # of identity. Requeue only quarantined rows; accepted rows
-                # remain untouched and therefore cannot change ranking here.
-                con.execute(
-                    """UPDATE candidate_quality SET quality_status='pending',
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE candidate_id=? AND quality_status='quarantine'""",
-                    (candidate["id"],),
-                )
+        _persist_scanned_candidate_items(con, source, remaining_items)
+        seen = [
+            normalize_key(item["title"], item.get("author", "Unknown author"))
+            for item in items
+        ]
         if seen:
             placeholders = ",".join("?" for _ in seen)
             con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))

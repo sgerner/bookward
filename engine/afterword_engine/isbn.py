@@ -84,6 +84,10 @@ _PUBLISHERS_WEEKLY_REVIEW_RE = re.compile(
     r"^/(?:(?:pw/)?reviews?/(?:[^/?#]+/)?)?([0-9Xx][0-9Xx-]{8,16})(?:\.html)?/?$",
     re.IGNORECASE,
 )
+_PUBLISHERS_WEEKLY_REVIEW_QUERY_PATH_RE = re.compile(
+    r"^/(?:pw/)?reviews?(?:/[^/?#]+){0,2}/?$",
+    re.IGNORECASE,
+)
 
 
 def isbn_parts_from_amazon_url(value: object) -> tuple[str, str]:
@@ -133,6 +137,8 @@ def isbn_parts_from_publishers_weekly_url(value: object) -> tuple[str, str]:
         isbn13, isbn10 = isbn_parts(match.group(1))
         if isbn13 or isbn10:
             return isbn13, isbn10
+    if not _PUBLISHERS_WEEKLY_REVIEW_QUERY_PATH_RE.match(path):
+        return "", ""
     query = parse_qs(parsed.query, keep_blank_values=False)
     for key, values in query.items():
         if key.casefold() not in {"isbn", "isbn13", "isbn10"}:
@@ -155,8 +161,6 @@ def isbn_parts_from_source(values: object = (), source_url: object = "") -> tupl
         isbn_parts_from_publishers_weekly_url,
     ):
         url_isbn13, url_isbn10 = extractor(source_url)
-        isbn13 = isbn13 or url_isbn13
-        isbn10 = isbn10 or url_isbn10
-        if isbn13 and isbn10:
-            break
+        if url_isbn13 or url_isbn10:
+            return isbn_parts(isbn13, isbn10, url_isbn13, url_isbn10)
     return isbn13, isbn10
