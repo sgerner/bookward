@@ -926,7 +926,18 @@ def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_s
             )
             assert bad_mode_test.status_code == 400
 
-            # Same mode + same origin with use_saved_key=True reuses saved key
+            bad_path_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/tenant-b/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "use_saved_key": True,
+                },
+            )
+            assert bad_path_test.status_code == 400
+
+            # Same mode + same canonical endpoint with use_saved_key=True reuses saved key
             same_origin_test = client.post(
                 "/api/llm/test",
                 json={
@@ -966,7 +977,7 @@ def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_s
             assert "authorization" not in attacker_models.calls[-1].request.headers
             attacker_models.calls.clear()
 
-            # POST /api/llm/models defaults use_saved_key=False and blocks changed origin when True
+            # POST /api/llm/models defaults use_saved_key=False and blocks changed origin/path when True
             post_default_models = client.post(
                 "/api/llm/models",
                 json={
@@ -989,6 +1000,16 @@ def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_s
             assert post_attacker_saved_key.status_code == 400
             assert len(attacker_models.calls) == 0
 
+            post_changed_path_saved_key = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/tenant-b/v1",
+                    "use_saved_key": True,
+                },
+            )
+            assert post_changed_path_saved_key.status_code == 400
+
             post_same_origin_saved_key = client.post(
                 "/api/llm/models",
                 json={
@@ -1003,7 +1024,7 @@ def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_s
                 == "Bearer sk-saved-secret"
             )
 
-            # 3. PUT /api/settings/llm-rerank rejects blank key when URL origin or mode changes (enabled or disabled)
+            # 3. PUT /api/settings/llm-rerank rejects blank key when URL origin, path, or mode changes (enabled or disabled)
             for enabled_flag in (True, False):
                 changed_url_save = client.put(
                     "/api/settings/llm-rerank",
@@ -1017,6 +1038,18 @@ def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_s
                 )
                 assert changed_url_save.status_code == 400
                 assert len(attacker_chat.calls) == 0
+
+                changed_path_save = client.put(
+                    "/api/settings/llm-rerank",
+                    json={
+                        "enabled": enabled_flag,
+                        "mode": "openai-compatible",
+                        "api_url": "https://api.openai.com/tenant-b/v1/chat/completions",
+                        "model": "gpt-4o-mini",
+                        "api_key": "",
+                    },
+                )
+                assert changed_path_save.status_code == 400
 
             changed_mode_save = client.put(
                 "/api/settings/llm-rerank",

@@ -53,8 +53,8 @@ from .llm_reranker import (
     DEFAULT_CLOUD_LLM_URL,
     DEFAULT_OLLAMA_URL,
     can_reuse_saved_llm_key,
+    canonical_llm_endpoint_key,
     discover_local_llm_models,
-    llm_url_origin,
     normalize_llm_rerank_mode,
     validate_llm_rerank_url,
     verify_llm_reranker,
@@ -3611,8 +3611,9 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
     elif (
         settings.llm_rerank_api_key.strip()
         and mode == env_mode
-        and llm_url_origin(api_url) is not None
-        and llm_url_origin(api_url) == llm_url_origin(env_url)
+        and canonical_llm_endpoint_key(api_url, mode) is not None
+        and canonical_llm_endpoint_key(api_url, mode)
+        == canonical_llm_endpoint_key(env_url, env_mode)
     ):
         api_key = settings.llm_rerank_api_key
     else:

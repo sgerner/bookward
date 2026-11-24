@@ -269,7 +269,7 @@ def llm_url_origin(url: str) -> tuple[str, str, int] | None:
         scheme = parsed.scheme.lower()
         if scheme not in {"http", "https"} or not parsed.hostname:
             return None
-        if parsed.username or parsed.password:
+        if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
             return None
         host = parsed.hostname.lower().rstrip(".")
         port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
@@ -280,22 +280,54 @@ def llm_url_origin(url: str) -> tuple[str, str, int] | None:
     return (scheme, host, int(port))
 
 
+def canonical_llm_endpoint_key(
+    url: str, mode: str = "cloud"
+) -> tuple[str, str, int, str] | None:
+    """Return normalized (scheme, host, port, canonical_path) for saved-key matching."""
+    origin = llm_url_origin(url)
+    if origin is None:
+        return None
+    scheme, host, port = origin
+    parsed = urlparse(str(url or "").strip())
+    raw_path = parsed.path or ""
+    unquoted_path = unquote(raw_path)
+    if (
+        "%" in raw_path
+        or "\\" in unquoted_path
+        or ".." in raw_path.split("/")
+        or ".." in unquoted_path.split("/")
+        or not _SAFE_OPTIONAL_PATH_RE.fullmatch(raw_path)
+    ):
+        return None
+    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    canonical_input = f"{scheme}://{authority}{raw_path}"
+    resolved_mode = str(mode or "cloud").strip().lower()
+    if resolved_mode == "ollama":
+        canonical_path = urlparse(_normalize_ollama_base_url(canonical_input)).path.rstrip("/")
+    else:
+        canonical_path = urlparse(_normalize_chat_url(canonical_input)).path
+    return (scheme, host, port, canonical_path)
+
+
 def can_reuse_saved_llm_key(
     existing: Mapping[str, Any],
     *,
     mode: str,
     api_url: str,
 ) -> bool:
-    """Return True only when a non-empty saved key exists and target mode + origin match saved ones."""
+    """Return True only when a non-empty saved key exists and target mode + canonical endpoint match saved ones."""
     saved_key = str(existing.get("api_key") or "").strip()
     if not saved_key:
         return False
     saved_mode = str(existing.get("mode") or "").strip().lower()
-    if mode.strip().lower() != saved_mode:
+    target_mode = mode.strip().lower()
+    if target_mode != saved_mode:
         return False
-    target_origin = llm_url_origin(api_url)
-    saved_origin = llm_url_origin(str(existing.get("api_url") or ""))
-    return target_origin is not None and target_origin == saved_origin
+    target_endpoint = canonical_llm_endpoint_key(api_url, target_mode)
+    saved_endpoint = canonical_llm_endpoint_key(
+        str(existing.get("api_url") or ""), saved_mode
+    )
+    return target_endpoint is not None and target_endpoint == saved_endpoint
 
 
 def _validate_and_split_llm_origin(

@@ -654,17 +654,48 @@
         ? "OpenAI-compatible"
         : "Cloud",
   );
-  function normalizedLlmOrigin(raw: string): string | null {
+  function normalizedLlmEndpointKey(raw: string, mode: LlmRerankMode): string | null {
     const trimmed = raw.trim();
-    if (!trimmed) return null;
+    if (!trimmed || trimmed.includes("\\")) return null;
     try {
       const parsed = new URL(trimmed);
       const scheme = parsed.protocol.toLowerCase();
       if (scheme !== "http:" && scheme !== "https:") return null;
-      if (!parsed.hostname || parsed.username || parsed.password) return null;
+      if (
+        !parsed.hostname ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        return null;
+      }
+      const rawPath = parsed.pathname || "";
+      if (rawPath.includes("%") || rawPath.split("/").includes("..")) return null;
       const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
       const port = parsed.port || (scheme === "https:" ? "443" : "80");
-      return `${scheme}//${host}:${port}`;
+      let path = rawPath.replace(/\/+$/, "");
+      if (mode === "ollama") {
+        for (const suffix of [
+          "/api/chat",
+          "/api/tags",
+          "/api/generate",
+          "/v1/chat/completions",
+          "/v1/models",
+          "/api",
+          "/v1",
+        ]) {
+          if (path.endsWith(suffix)) {
+            path = path.slice(0, -suffix.length).replace(/\/+$/, "");
+            break;
+          }
+        }
+      } else if (!path) {
+        path = "/v1/chat/completions";
+      } else if (path.endsWith("/v1") || path.endsWith("/openai")) {
+        path = `${path}/chat/completions`;
+      }
+      return `${scheme}//${host}:${port}${path}`;
     } catch {
       return null;
     }
@@ -676,9 +707,12 @@
     if (!llmRerank.api_key_set || llmClearApiKey) return false;
     const savedMode = (llmRerank.mode ?? "cloud") as LlmRerankMode;
     if (llmMode !== savedMode) return false;
-    const targetOrigin = normalizedLlmOrigin(effectiveLlmApiUrl);
-    const savedOrigin = normalizedLlmOrigin(llmRerank.api_url ?? "");
-    return Boolean(targetOrigin && targetOrigin === savedOrigin);
+    const targetEndpoint = normalizedLlmEndpointKey(effectiveLlmApiUrl, llmMode);
+    const savedEndpoint = normalizedLlmEndpointKey(
+      llmRerank.api_url ?? "",
+      savedMode,
+    );
+    return Boolean(targetEndpoint && targetEndpoint === savedEndpoint);
   });
   const filteredLocalLlmModels = $derived.by(() => {
     const q = llmLocalModelSearch.trim().toLowerCase();
