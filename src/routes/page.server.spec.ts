@@ -407,7 +407,7 @@ describe("page actions", () => {
     );
   });
 
-  it("returns the server-restored status from undoDecision and importLibrar without guessing", async () => {
+  it("returns the server-restored status from single and bulk undoDecision without guessing", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -417,10 +417,19 @@ describe("page actions", () => {
         }),
       )
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ id: 12, status: "imported" }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({
+            undone: 2,
+            items: [
+              { id: 7, status: "recommended" },
+              { id: 8, status: "imported" },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -439,19 +448,109 @@ describe("page actions", () => {
       status: "imported",
     });
 
-    const importBody = new FormData();
-    importBody.set("id", "12");
-    const importResult = await actions.importLibrar!({
-      request: new Request("http://afterword.test/?view=saved", {
+    const bulkUndoBody = new FormData();
+    bulkUndoBody.append("id", "7");
+    bulkUndoBody.append("decision_id", "21");
+    bulkUndoBody.append("id", "8");
+    bulkUndoBody.append("decision_id", "22");
+    const bulkUndoResult = await actions.undoDecision!({
+      request: new Request("http://afterword.test", {
         method: "POST",
-        body: importBody,
+        body: bulkUndoBody,
       }),
     } as never);
-    expect(importResult).toEqual({
-      message: "Book added to the Librarr wishlist.",
-      id: 12,
-      status: "imported",
+    expect(bulkUndoResult).toEqual({
+      message: "Decisions undone.",
+      items: [
+        { id: 7, status: "recommended" },
+        { id: 8, status: "imported" },
+      ],
     });
+  });
+
+  it("exposes a restore Undo token when returning a book to Discover", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, status: "recommended", decision_id: 61 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "recommended");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 61,
+      id: 9,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+    });
+  });
+
+  it("routes multi-item Undo requests to bulk-undo and propagates 409 conflicts", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ undone: 2 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Only the latest decision can be undone" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.append("id", "7");
+    body.append("decision_id", "21");
+    body.append("id", "8");
+    body.append("decision_id", "22");
+    const result = await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Decisions undone." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/bulk-undo",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+      }),
+    );
+
+    const conflict = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: boolean } };
+    expect(conflict.status).toBe(409);
+    expect(conflict.data).toEqual({
+      message: "Only the latest decision can be undone",
+      error: true,
+    });
+
+    const invalid = new FormData();
+    invalid.append("id", "7");
+    invalid.append("id", "8");
+    invalid.append("decision_id", "21");
+    const badRequest = (await actions.undoDecision!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalid }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(badRequest.status).toBe(400);
   });
 
   it("rejects an invalid URL when adding a custom source without contacting the engine", async () => {
@@ -500,6 +599,63 @@ describe("page actions", () => {
     expect(result.status).toBe(400);
     expect(result.data.message).toContain("No recognizable books");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists the resolved feed URL from preview while keeping the website hostname as default name", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 3,
+            url: "https://feeds.newsletter.example/books.atom",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 12, job_id: 4 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "https://www.newsletter.example");
+    const result = await actions.source!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message:
+        "Permanent source added; its first scan is queued (3 books detected).",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8000/api/sources/preview",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://www.newsletter.example",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8000/api/sources",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          name: "newsletter.example",
+          url: "https://feeds.newsletter.example/books.atom",
+          lifecycle: "permanent",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
   });
 
   it("saves normalized source genre filters", async () => {
@@ -560,34 +716,12 @@ describe("page actions", () => {
   });
 
   it("preserves an existing Librarr key while changing the default format", async () => {
-    const overview = {
-      sources: [],
-      recommendations: [],
-      history: [],
-      settings: {
-        embedding_backend: "local",
-        embedding_model: "hashing-768",
-        embedding_url: "",
-        embedding_api_key_set: false,
-        librarr_url: "http://librarr:5050",
-        librarr_api_key_set: true,
-        librarr_media_type: "audiobook",
-      },
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(overview), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ saved: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
     body.set("url", "http://librarr:5050");
@@ -597,8 +731,12 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
     expect(result).toEqual({ message: "Librarr connection saved for ebooks." });
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
-    expect(JSON.parse(String(request.body))).toMatchObject({
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      librarr_url: "http://librarr:5050",
       librarr_api_key: "",
       librarr_media_type: "ebook",
     });
@@ -1064,28 +1202,6 @@ describe("page actions", () => {
     });
   });
 
-  it("forwards run_id when shortlisting a selected digest batch", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ updated: 2 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const body = new FormData();
-    body.append("ids", "7");
-    body.append("ids", "8");
-    body.set("run_id", "run-digest-1234");
-    await actions.shortlistBulk!({
-      request: new Request("http://afterword.test", { method: "POST", body }),
-    } as never);
-    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
-      ids: [7, 8],
-      action: "save",
-      run_id: "run-digest-1234",
-    });
-  });
-
   it("gates recommendation run creation on non-Discover views", async () => {
     const overview = {
       recommendation_run_id: "",
@@ -1193,47 +1309,192 @@ describe("page actions", () => {
     });
   });
 
-  it("uses track_run=false when configuration actions inspect overview state", async () => {
-    const overview = {
-      sources: [{ id: 1, is_default: 1, enabled: 1 }],
-      recommendations: [],
-      history: [],
-      settings: {
-        embedding_backend: "local",
-        embedding_model: "hashing-768",
-        embedding_url: "",
-        embedding_api_key_set: false,
-        librarr_url: "http://librarr:5050",
-        librarr_api_key_set: true,
-        librarr_media_type: "audiobook",
-      },
-    };
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(overview), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ saved: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-      );
+  it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
-    body.set("enabled", "0");
-    await actions.toggleDefault!({
+    body.set("id", "12");
+    body.set("status", "recommended");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.decide!({
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:8000/api/overview?track_run=false",
+
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 77,
+      id: 12,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+      run_id: "run-shortlist-1",
+    });
+  });
+
+  it("forwards run_id when importing a shortlisted book to the Librarr wishlist", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "imported", remote_id: "remote-12" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "12");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.importLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Book added to the Librarr wishlist." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/12/import",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ run_id: "run-shortlist-1" }),
+      }),
     );
   });
 
-  it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
+  it("forwards a shared run_id and returns batch undo tokens for shortlistBulk", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          updated: 2,
+          decisions: [
+            { id: 7, decision_id: 21 },
+            { id: 8, decision_id: 22 },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("run_id", "run-digest-1");
+    body.append("ids", "7");
+    body.append("ids", "8");
+    const result = await actions.shortlistBulk!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "2 books added to your shortlist.",
+      undo_decisions: [
+        { id: 7, decision_id: 21 },
+        { id: 8, decision_id: 22 },
+      ],
+      undo_label: "shortlisting 2 books",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      ids: [7, 8],
+      action: "save",
+      run_id: "run-digest-1",
+    });
+  });
+
+  it("imports a StoryGraph CSV export through the unified CSV action and names The StoryGraph", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ imported: 3, source: "storygraph_csv", job_id: "job-sg" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set(
+      "file",
+      new File(
+        ["Title,Authors,Read Status,Star Rating\nPiranesi,Susanna Clarke,read,4.75\n"],
+        "storygraph.csv",
+        { type: "text/csv" },
+      ),
+    );
+    const result = await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Imported 3 books from The StoryGraph.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/import/csv",
+    );
+  });
+
+  it("retains importGoodreadsCsv compatibility and surfaces 400 format errors clearly", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ imported: 1, source: "goodreads_csv", job_id: "job-gr" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "CSV must match Goodreads or The StoryGraph export format",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const validBody = new FormData();
+    validBody.set(
+      "file",
+      new File(["Title,Author,My Rating\nDune,Frank Herbert,5\n"], "goodreads.csv", {
+        type: "text/csv",
+      }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "Imported 1 book from Goodreads.",
+    });
+
+    const invalidBody = new FormData();
+    invalidBody.set(
+      "file",
+      new File(["Heading,Amount\nSomething,10\n"], "budget.csv", {
+        type: "text/csv",
+      }),
+    );
+    const failed = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalidBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(failed.status).toBe(400);
+    expect(failed.data.message).toContain("Goodreads or The StoryGraph");
+
+    const emptyResult = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: new FormData() }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(emptyResult.status).toBe(400);
+    expect(emptyResult.data.message).toBe(
+      "Choose a Goodreads or StoryGraph CSV export.",
+    );
+  });
+
+  it("validates CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -1244,7 +1505,7 @@ describe("page actions", () => {
       } as never),
     ).resolves.toMatchObject({
       status: 400,
-      data: { message: "Choose a Goodreads CSV export.", error: true },
+      data: { message: "Choose a Goodreads or StoryGraph CSV export.", error: true },
     });
 
     const oversizedForm = new FormData();
@@ -1255,6 +1516,23 @@ describe("page actions", () => {
     await expect(
       actions.importGoodreadsCsv!({
         request: new Request("http://afterword.test", { method: "POST", body: oversizedForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const oversizedStoryGraphForm = new FormData();
+    oversizedStoryGraphForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "storygraph.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importCsv!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: oversizedStoryGraphForm,
+        }),
       } as never),
     ).resolves.toMatchObject({
       status: 413,
@@ -1284,10 +1562,13 @@ describe("page actions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
 
     fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "This does not look like a Goodreads export" }), {
-        status: 400,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({ detail: "CSV must match Goodreads or The StoryGraph export format" }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
     );
     const invalidCsvForm = new FormData();
     invalidCsvForm.set("file", new File(["bad,csv\n"], "bad.csv", { type: "text/csv" }));
@@ -1297,7 +1578,10 @@ describe("page actions", () => {
       } as never),
     ).resolves.toMatchObject({
       status: 400,
-      data: { message: "This does not look like a Goodreads export", error: true },
+      data: {
+        message: "CSV must match Goodreads or The StoryGraph export format",
+        error: true,
+      },
     });
 
     fetchMock.mockResolvedValueOnce(
@@ -1318,7 +1602,7 @@ describe("page actions", () => {
     });
 
     fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ imported: 3 }), {
+      new Response(JSON.stringify({ imported: 3, source: "goodreads_csv" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -1329,6 +1613,100 @@ describe("page actions", () => {
       actions.importGoodreadsCsv!({
         request: new Request("http://afterword.test", { method: "POST", body: validForm }),
       } as never),
-    ).resolves.toEqual({ message: "Imported 3 Goodreads books." });
+    ).resolves.toEqual({ message: "Imported 3 books from Goodreads." });
+  });
+
+  it("forwards missing initial Librarr API key validation from the engine without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ detail: "Enter a Librarr API key for the first connection." }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "http://librarr:5050");
+    body.set("apiKey", "");
+    body.set("mediaType", "audiobook");
+    const result = (await actions.configureLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(result.status).toBe(400);
+    expect(result.data).toEqual({
+      message: "Enter a Librarr API key for the first connection.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+  });
+
+  it("saves embedding settings in a single partial PUT request without pre-fetching overview", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ saved: true, embedding: { ok: true, checked: true } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("backend", "ollama");
+    body.set("model", "qwen3-embedding:0.6b");
+    body.set("url", "http://ollama:11434");
+    body.set("apiKey", "embed-secret");
+    const result = await actions.configureEmbeddings!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "Embedding provider saved and checked." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/settings");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/api/overview");
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      embedding_backend: "ollama",
+      embedding_model: "qwen3-embedding:0.6b",
+      embedding_url: "http://ollama:11434",
+      embedding_api_key: "embed-secret",
+    });
+  });
+
+  it("toggles the default source in one engine request and forwards 404 when absent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 1, enabled: 0, job_id: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Default source not found." }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const toggled = await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never);
+    expect(toggled).toEqual({ message: "Upcoming-book source updated." });
+
+    const missing = (await actions.toggleDefault!({
+      request: new Request("http://afterword.test", { method: "POST" }),
+    } as never)) as { status: number; data: { message: string; error: true } };
+    expect(missing.status).toBe(404);
+    expect(missing.data).toEqual({
+      message: "Default source not found.",
+      error: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
   });
 });

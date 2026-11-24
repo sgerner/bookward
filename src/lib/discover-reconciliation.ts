@@ -69,6 +69,34 @@ export function extractActionBookId(
   return fallbackId;
 }
 
+export function extractActionRestoredItems(
+  result: ActionResultLike | undefined,
+  fallbackIds: number[] = [],
+): Array<{ id: number; status: string }> {
+  if (!result || result.type !== "success" || !result.data || typeof result.data !== "object") {
+    return [];
+  }
+  const data = result.data as Record<string, unknown>;
+  if (Array.isArray(data.items)) {
+    return data.items
+      .filter(
+        (item): item is { id: number; status: string } =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).id === "number" &&
+          Number.isInteger((item as Record<string, unknown>).id) &&
+          ((item as Record<string, unknown>).id as number) > 0 &&
+          typeof (item as Record<string, unknown>).status === "string" &&
+          Boolean(((item as Record<string, unknown>).status as string).trim()),
+      )
+      .map((item) => ({ id: item.id, status: item.status.trim() }));
+  }
+  const singleStatus = extractActionBookStatus(result);
+  if (!singleStatus) return [];
+  const singleId = extractActionBookId(result, fallbackIds[0] ?? 0);
+  return singleId > 0 ? [{ id: singleId, status: singleStatus }] : [];
+}
+
 export function createOptimisticBookStatus(
   deps: {
     hasBook: (id: number) => boolean;
@@ -429,6 +457,7 @@ export function createPendingSubmit(deps: {
           (key.startsWith("read-") ||
             key.startsWith("shortlist-read-") ||
             key === "goodreads-rss" ||
+            key === "csv-import" ||
             key === "goodreads-csv")
         ) {
           onResetReadingHistory?.();
