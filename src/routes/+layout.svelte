@@ -64,7 +64,8 @@
 	<link rel="manifest" href="/site.webmanifest" />
 	<meta name="application-name" content="Bookward" />
 	<meta name="apple-mobile-web-app-title" content="Bookward" />
-	<meta name="theme-color" content="#7169f5" />
+	<meta name="theme-color" content={data.themeColor} />
 	<meta name="color-scheme" content="light dark" />
+	{#if data.themeCss}{@html `<style data-bookward-theme="${data.theme}">${data.themeCss.replace(/<\/style/gi, '<\\/style')}</style>`}{/if}
 </svelte:head>
 {@render children()}
