@@ -998,6 +998,11 @@ MIGRATIONS = [
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_APP_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1007,7 +1012,7 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_minimum_score": "80",
     "digest_maximum_books": "5",
     "digest_only_new": "1",
-    "digest_app_url": settings.public_url,
+    "digest_app_url": "http://localhost:5173",
     "digest_discord_webhook_url": "",
     "digest_email_to": "",
     "digest_email_from": "",
@@ -1381,10 +1386,18 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        existing_digest_app_url_row = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url'"
+        ).fetchone()
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (
+                (settings.public_url or default_value).rstrip("/")
+                if key == "digest_app_url"
+                else default_value
+            )
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1397,13 +1410,41 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
+        # Seed digest_app_url_custom for existing rows that predate the flag so
+        # an operator-configured URL (including custom loopback ports such as
+        # http://localhost:3000) is preserved across restarts.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        custom_flag = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+        ).fetchone()
+        if custom_flag is None:
+            if existing_digest_app_url_row is None:
+                custom_value = "0"
+            else:
+                existing_app_url = (
+                    str(existing_digest_app_url_row[0] or "").strip().rstrip("/")
+                )
+                custom_value = (
+                    "1"
+                    if existing_app_url and existing_app_url not in DEFAULT_DIGEST_APP_URLS
+                    else "0"
+                )
             con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
+                "INSERT INTO settings(key,value,secret) VALUES('digest_app_url_custom',?,0)",
+                (custom_value,),
+            )
+        else:
+            custom_value = str(custom_flag[0] or "0")
+        # Upgrade an untouched loopback default (http://localhost:5173 or
+        # Docker's http://127.0.0.1:3000) when the deployment advertises a
+        # different public origin, without overwriting a custom URL.
+        if configured_public_url and custom_value != "1":
+            placeholders = ",".join("?" for _ in DEFAULT_DIGEST_APP_URLS)
+            con.execute(
+                f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                f"AND RTRIM(value,'/')!=?",
+                (configured_public_url, *DEFAULT_DIGEST_APP_URLS, configured_public_url),
             )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
