@@ -1439,6 +1439,13 @@ def test_openlibrary_work_dates_outrank_storefront_edition_dates(
 
     complete_match, match, cover_match = asyncio.run(run())
 
+    assert [
+        (trace["provider"], trace["query_kind"])
+        for trace in complete_match["metadata_provenance"]["fetch_trace"]
+    ] == [
+        ("openlibrary", "isbn"),
+        ("google_books", "isbn"),
+    ]
     for quality_result in (complete_match, match):
         assert quality_result is not None
         assert quality_result["release_date"] == expected_date

@@ -1143,6 +1143,137 @@ def test_scan_source_preserves_verified_release_date_and_applies_feed_correction
     assert mutable[1]["publication_work_id"] == mixed_work_id
 
 
+def test_scan_source_preserves_legacy_release_dates_without_provenance_rows(database, monkeypatch):
+    """Legacy catalog/manual dates with no provenance rows must not be overwritten by feed rescans."""
+    from datetime import datetime, timezone
+
+    legacy_day_title = "The Catcher in the Rye"
+    legacy_day_author = "J. D. Salinger"
+    legacy_year_title = "Lord of the Flies"
+    legacy_year_author = "William Golding"
+    source_owned_title = "Upcoming Debut"
+    source_owned_author = "New Novelist"
+
+    year_feed_date = ["1954-01-01", "day"]
+    source_feed_date = ["2026-09-01", "month"]
+
+    async def fake_fetch(_url):
+        return "application/json", [
+            {
+                "title": legacy_day_title,
+                "author": legacy_day_author,
+                "release_date": "2024-10-15",
+                "date_kind": "day",
+                "genres": ["Fiction"],
+            },
+            {
+                "title": legacy_year_title,
+                "author": legacy_year_author,
+                "release_date": year_feed_date[0],
+                "date_kind": year_feed_date[1],
+                "genres": ["Fiction"],
+            },
+            {
+                "title": source_owned_title,
+                "author": source_owned_author,
+                "release_date": source_feed_date[0],
+                "date_kind": source_feed_date[1],
+                "genres": ["Fiction"],
+            },
+        ]
+
+    async def passthrough(items):
+        return items
+
+    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", passthrough)
+    # Force one-item enrichment chunks so per-chunk commits and unenriched
+    # remaining_items commits both run during scan_source.
+    monkeypatch.setattr(ingestion, "SOURCE_METADATA_ENRICHMENT_BATCH_SIZE", 1)
+
+    legacy_day_key = ingestion.normalize_key(legacy_day_title, legacy_day_author)
+    legacy_year_key = ingestion.normalize_key(legacy_year_title, legacy_year_author)
+    source_owned_key = ingestion.normalize_key(source_owned_title, source_owned_author)
+    fresh_checked_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,filters) VALUES(?,?,?)",
+            ("Fiction feed", "https://example.com/fiction", "{}"),
+        ).lastrowid
+        legacy_day_id = con.execute(
+            "INSERT INTO candidates(title,author,release_date,date_kind,genres,source_id,status,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (legacy_day_title, legacy_day_author, "1951-07-16", "day", json.dumps(["Fiction"]), source_id, "recommended", legacy_day_key),
+        ).lastrowid
+        legacy_year_id = con.execute(
+            "INSERT INTO candidates(title,author,description,cover_url,release_date,date_kind,genres,source_id,status,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                legacy_year_title,
+                legacy_year_author,
+                "Existing synopsis.",
+                "https://images.example.com/lotf.jpg",
+                "1954-01-01",
+                "year",
+                json.dumps(["Fiction"]),
+                source_id,
+                "recommended",
+                legacy_year_key,
+            ),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,metadata_checked_at,metadata_version,audit_version) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+            "metadata_checked_at=excluded.metadata_checked_at,metadata_version=excluded.metadata_version",
+            (legacy_year_id, "accepted", 0.95, fresh_checked_at, ingestion.METADATA_NORMALIZATION_VERSION, "test"),
+        )
+
+    source_row = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    assert asyncio.run(ingestion.scan_source(source_row)) == 3
+
+    # Neither legacy candidate has provenance rows, so neither date nor date_kind
+    # may be overwritten or claimed by source provenance (even when scan 1 sent
+    # the matching date string 1954-01-01 for legacy_year_id).
+    assert row("SELECT release_date,date_kind FROM candidates WHERE id=?", (legacy_day_id,)) == {
+        "release_date": "1951-07-16",
+        "date_kind": "day",
+    }
+    assert row("SELECT release_date,date_kind FROM candidates WHERE id=?", (legacy_year_id,)) == {
+        "release_date": "1954-01-01",
+        "date_kind": "year",
+    }
+    assert row("SELECT release_date,date_kind FROM candidates WHERE normalized_key=?", (source_owned_key,)) == {
+        "release_date": "2026-09-01",
+        "date_kind": "month",
+    }
+
+    # Rescan with updated feed dates: source-owned candidate updates, while both
+    # no-provenance candidates stay untouched with zero release_date provenance rows.
+    year_feed_date[:] = ["2025-03-01", "day"]
+    source_feed_date[:] = ["2026-11-15", "day"]
+    assert asyncio.run(ingestion.scan_source(source_row)) == 3
+
+    assert row("SELECT release_date,date_kind FROM candidates WHERE id=?", (legacy_day_id,)) == {
+        "release_date": "1951-07-16",
+        "date_kind": "day",
+    }
+    assert row("SELECT release_date,date_kind FROM candidates WHERE id=?", (legacy_year_id,)) == {
+        "release_date": "1954-01-01",
+        "date_kind": "year",
+    }
+    assert rows(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id IN (?,?) AND field='release_date'",
+        (legacy_day_id, legacy_year_id),
+    ) == []
+    assert row("SELECT release_date,date_kind FROM candidates WHERE normalized_key=?", (source_owned_key,)) == {
+        "release_date": "2026-11-15",
+        "date_kind": "day",
+    }
+
+
 def test_migration_adds_enrichment_storage_without_changing_existing_user_data(tmp_path):
     settings.db = str(tmp_path / "legacy-v17.db")
     con = sqlite3.connect(settings.db)

@@ -3869,6 +3869,10 @@ def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: st
                 (existing["id"],),
             ).fetchall()
         } if existing and existing_release_date else set()
+        # Require an explicit source-only provenance row before letting a feed
+        # overwrite an existing release_date so legacy catalog/manual rows with
+        # no metadata_field_provenance entries (e.g. date_kind day/month/year)
+        # remain protected alongside catalog-verified and mixed-provenance rows.
         allow_release_update = bool(
             incoming_release_date
             and (
@@ -3876,7 +3880,7 @@ def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: st
                 or (
                     "release_date" in source_fields
                     and existing_date_kind not in {"manual", "demo", "catalog"}
-                    and not (existing_release_providers - {"source"})
+                    and existing_release_providers == {"source"}
                 )
             )
         )
@@ -3926,10 +3930,15 @@ def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: st
                 and (not existing or existing["cover_url"] != candidate["cover_url"])
             )
             stored_release_date = str(candidate["release_date"] or "").strip()
+            stored_date_kind = str(candidate["date_kind"] or "").strip().lower()
             release_added = bool(
                 incoming_release_date
                 and stored_release_date == incoming_release_date
-                and (not existing_release_date or existing_release_date != stored_release_date)
+                and (
+                    not existing_release_date
+                    or existing_release_date != stored_release_date
+                    or (allow_release_update and existing_date_kind != stored_date_kind)
+                )
             )
             previous_genres = _stored_genre_values(existing["genres"] if existing else [])
             genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
