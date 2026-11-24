@@ -984,17 +984,17 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
 
 
-def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+def test_migration_28_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
     from afterword_engine.identity import ReadIdentityIndex
     from afterword_engine.main import recommendation_list
 
-    settings.db = str(tmp_path / "legacy-v26.db")
+    settings.db = str(tmp_path / "legacy-v27.db")
     con = sqlite3.connect(settings.db)
     con.execute(
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     for version, script in MIGRATIONS:
-        if version >= 27:
+        if version >= 28:
             break
         con.executescript(script)
         con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -1176,6 +1176,19 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
     saved_row = insert_legacy("Saved Shortlist Book", status="saved", q_isbn13="9780345538376")
     imported_row = insert_legacy("Imported Book", status="imported", q_isbn13="9780345538376")
     read_row = insert_legacy("Completed Read Book", status="read", q_isbn13="9780345538376")
+    amazon_979_pending = insert_legacy(
+        "Amazon 979 Pending Backfill",
+        source_url="https://www.amazon.com/dp/9791032305690",
+        q_status="pending",
+    )
+    amazon_requeued_conflict = insert_legacy(
+        "Amazon URL With Conflicting Quality ISBN",
+        status="rejected",
+        source_url="https://www.amazon.com/dp/0307474275",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
     con.execute(
         "INSERT INTO reads(title,author,rating,isbn,source) VALUES('Different Read Title','Different Author',5,'9780143127550','goodreads_csv')"
     )
@@ -1184,7 +1197,7 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
 
     initialize(seed_demo=False)
 
-    assert row("SELECT version FROM schema_migrations WHERE version=27") == {"version": 27}
+    assert row("SELECT version FROM schema_migrations WHERE version=28") == {"version": 28}
     assert row(
         "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
         (ol_verified,),
@@ -1287,6 +1300,23 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
     assert row("SELECT status FROM candidates WHERE id=?", (saved_row,)) == {"status": "saved"}
     assert row("SELECT status FROM candidates WHERE id=?", (imported_row,)) == {"status": "imported"}
     assert row("SELECT status FROM candidates WHERE id=?", (read_row,)) == {"status": "read"}
+    assert row(
+        "SELECT isbn13,isbn10,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (amazon_979_pending,),
+    ) == {"isbn13": "9791032305690", "isbn10": "", "isbn_verified": 1}
+    assert row(
+        "SELECT status,isbn13,isbn10 FROM candidates WHERE id=?",
+        (amazon_requeued_conflict,),
+    ) == {"status": "new", "isbn13": "9780307474278", "isbn10": "0307474275"}
+    assert row(
+        "SELECT quality_status,isbn13,isbn10,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (amazon_requeued_conflict,),
+    ) == {
+        "quality_status": "pending",
+        "isbn13": "9780345538376",
+        "isbn10": "",
+        "isbn_verified": 0,
+    }
 
     # Pre-v6 accepted row keeps catalog-ISBN dedupe active until v6 re-audit, while pending requeued row does not
     visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
@@ -1314,18 +1344,18 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
             "WHERE candidate_id=?",
             (QUALITY_VERSION, requeued_dup),
         )
-    snapshot_candidates = rows("SELECT id,status,isbn13,isbn10 FROM candidates ORDER BY id")
+    snapshot_candidates = rows("SELECT id,status,isbn13,isbn10,updated_at FROM candidates ORDER BY id")
     snapshot_quality = rows(
-        "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version "
+        "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version,updated_at "
         "FROM candidate_quality ORDER BY candidate_id"
     )
 
     initialize(seed_demo=False)
 
-    assert rows("SELECT id,status,isbn13,isbn10 FROM candidates ORDER BY id") == snapshot_candidates
+    assert rows("SELECT id,status,isbn13,isbn10,updated_at FROM candidates ORDER BY id") == snapshot_candidates
     assert (
         rows(
-            "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version "
+            "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version,updated_at "
             "FROM candidate_quality ORDER BY candidate_id"
         )
         == snapshot_quality
@@ -1496,4 +1526,3 @@ def test_boot_worker_throttles_quality_recovery_across_multiple_profiles(tmp_pat
                     "SELECT COUNT(*) FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'"
                 ).fetchone()[0]
         assert queued_continuations == 2
-
