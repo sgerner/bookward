@@ -6,24 +6,9 @@ import {
 	engine,
 	isPayloadTooLarge
 } from '#lib/server/engine.js';
-import { withSessionToken } from '#lib/server/request-context.js';
+import { requestFormData, withSessionToken } from '#lib/server/request-context.js';
 
 const SESSION_COOKIE = 'bookward_session';
-const formDataByRequest = new WeakMap<Request, Promise<FormData>>();
-
-function requestFormData(request: Request): Promise<FormData> {
-	let cached = formDataByRequest.get(request);
-	if (!cached) {
-		const parse = request.formData.bind(request);
-		cached = parse();
-		formDataByRequest.set(request, cached);
-		Object.defineProperty(request, 'formData', {
-			configurable: true,
-			value: () => cached!
-		});
-	}
-	return cached;
-}
 
 function jsonError(status: number, detail: string) {
 	return withSecurityHeaders(new Response(JSON.stringify({ detail, message: detail }), {
@@ -78,13 +63,21 @@ async function sessionUser(token: string) {
 }
 
 async function submittedProfile(request: Request): Promise<string> {
+	const contentType = request.headers.get('content-type') || '';
+	const isFormBody =
+		contentType.includes('multipart/form-data') ||
+		contentType.includes('application/x-www-form-urlencoded');
 	const header = request.headers.get('x-bookward-profile');
-	if (header) return header;
+	if (header) {
+		if (isFormBody) {
+			void requestFormData(request).catch(() => undefined);
+		}
+		return header;
+	}
 	const requestUrl = new URL(request.url);
 	if (requestUrl.pathname === '/auth/oidc/start') return requestUrl.searchParams.get('profile_id') || '';
-	const contentType = request.headers.get('content-type') || '';
 	try {
-		if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
+		if (isFormBody) {
 			const form = await requestFormData(request);
 			return String(form.get('__profile_id') || '');
 		}

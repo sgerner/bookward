@@ -14,6 +14,11 @@ const querySchema = z.object({
   ]).default("recommended"),
   limit: z.coerce.number().int().min(1).max(24).default(8),
   offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+  seed_run_id: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/)
+    .optional(),
 });
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Recommendations could not be loaded.";
@@ -26,6 +31,7 @@ export const GET: RequestHandler = async ({ url }) => {
     status: parsed.data.status,
     limit: String(parsed.data.limit),
     offset: String(parsed.data.offset),
+    ...(parsed.data.seed_run_id ? { seed_run_id: parsed.data.seed_run_id } : {}),
   });
   try {
     const { data: items, headers } = await engineWithHeaders<Recommendation[]>(
@@ -37,7 +43,7 @@ export const GET: RequestHandler = async ({ url }) => {
         ? true
         : hasMoreHeader === "false"
           ? false
-          : items.length > parsed.data.limit;
+          : items.length >= parsed.data.limit;
     const responseHeaders = new Headers();
     if (hasMoreHeader === "true" || hasMoreHeader === "false") {
       responseHeaders.set("X-Bookward-Has-More", hasMoreHeader);

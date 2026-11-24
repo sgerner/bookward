@@ -282,4 +282,85 @@ describe("recommendations endpoint", () => {
     );
     expect(payload.has_more).toBe(true);
   });
+
+  it("defensively trims items to limit if an upstream response returns extra rows", async () => {
+    engineWithHeadersMock.mockResolvedValue({
+      data: Array.from({ length: 25 }, (_, index) => recommendation(index + 1)),
+      headers: new Headers({ "x-bookward-has-more": "true" }),
+    });
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=decisions&limit=24&offset=0",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.items).toHaveLength(24);
+    expect(payload.items.map((item: { id: number }) => item.id)).toEqual(
+      Array.from({ length: 24 }, (_, index) => index + 1),
+    );
+    expect(payload.has_more).toBe(true);
+  });
+
+  it("falls back to page-size comparison when X-Bookward-Has-More header is absent", async () => {
+    engineWithHeadersMock.mockResolvedValueOnce({
+      data: Array.from({ length: 8 }, (_, index) => recommendation(index + 1)),
+      headers: new Headers(),
+    });
+
+    const fullPage = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=24",
+      ),
+    } as never);
+    const fullPayload = await fullPage.json();
+    expect(fullPage.status).toBe(200);
+    expect(fullPage.headers.get("X-Bookward-Has-More")).toBeNull();
+    expect(fullPayload.items).toHaveLength(8);
+    expect(fullPayload.has_more).toBe(true);
+
+    engineWithHeadersMock.mockResolvedValueOnce({
+      data: Array.from({ length: 3 }, (_, index) => recommendation(index + 1)),
+      headers: new Headers(),
+    });
+
+    const partialPage = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=32",
+      ),
+    } as never);
+    const partialPayload = await partialPage.json();
+    expect(partialPage.status).toBe(200);
+    expect(partialPage.headers.get("X-Bookward-Has-More")).toBeNull();
+    expect(partialPayload.items).toHaveLength(3);
+    expect(partialPayload.has_more).toBe(false);
+  });
+
+  it("forwards valid seed_run_id to the engine and rejects malformed seed_run_id", async () => {
+    engineWithHeadersMock.mockResolvedValue({
+      data: [],
+      headers: new Headers({ "x-bookward-has-more": "false" }),
+    });
+
+    const okResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=24&seed_run_id=run-root-1234",
+      ),
+    } as never);
+    expect(okResponse.status).toBe(200);
+    expect(engineWithHeadersMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=recommended&limit=8&offset=24&seed_run_id=run-root-1234",
+    );
+
+    engineWithHeadersMock.mockClear();
+    const badResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=24&seed_run_id=bad",
+      ),
+    } as never);
+    expect(badResponse.status).toBe(400);
+    expect(engineWithHeadersMock).not.toHaveBeenCalled();
+  });
 });

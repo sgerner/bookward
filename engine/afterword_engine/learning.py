@@ -105,7 +105,15 @@ def _validate_value(value: float | None) -> float | None:
 
 DISCOVERY_RUN_STATUSES = frozenset({"", "recommended", "all"})
 NON_DISCOVERY_ITEM_STATUSES = frozenset(
-    {"saved", "imported", "rejected", "maybe_later", "decisions", "excluded", "read"}
+    {
+        "saved",
+        "imported",
+        "rejected",
+        "maybe_later",
+        "decisions",
+        "excluded",
+        "read",
+    }
 )
 
 
@@ -134,7 +142,9 @@ def is_discovery_run_metadata(raw_metadata: Any) -> bool:
 def create_recommendation_run(
     recommendations: Iterable[dict[str, Any]],
     *,
+    run_id: str | None = None,
     session_id: str = "",
+    exploration_seed: str | None = None,
     status: str | None = None,
     limit: int | None = None,
     offset: int = 0,
@@ -148,8 +158,12 @@ def create_recommendation_run(
     exploration policy.  Deterministic responses default to one.
     """
 
+    if run_id is not None:
+        _validate_identifier(run_id, "recommendation run")
     if session_id:
         _validate_identifier(session_id, "session identifier")
+    if exploration_seed:
+        _validate_identifier(exploration_seed, "exploration seed")
     if isinstance(offset, bool) or int(offset) < 0:
         raise ValueError("Recommendation offset must be a non-negative integer")
     if status is not None and (
@@ -166,9 +180,11 @@ def create_recommendation_run(
             raise ValueError(
                 "Recommendation exposure runs may not log shortlist, imported, or archived items"
             )
-    run_id = str(uuid.uuid4())
+    resolved_run_id = run_id or str(uuid.uuid4())
     page_offset = int(offset)
     metadata: dict[str, Any] = {"status": "recommended", "offset": page_offset}
+    if exploration_seed:
+        metadata["exploration_seed"] = exploration_seed
     if status and status != "recommended":
         metadata["request_status"] = status
     if limit is not None:
@@ -183,7 +199,7 @@ def create_recommendation_run(
             "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
             "VALUES(?,?,?,?,?,?,?)",
             (
-                run_id,
+                resolved_run_id,
                 POLICY,
                 POLICY_VERSION,
                 session_id,
@@ -202,13 +218,13 @@ def create_recommendation_run(
             con.execute(
                 "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
+                (resolved_run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
             )
         try:
             con.execute("SAVEPOINT archive_served_exposures")
             archive_served_exposures(
                 con,
-                run_id=run_id,
+                run_id=resolved_run_id,
                 recommendations=items,
                 presented_at=now,
                 offset=page_offset,
@@ -221,13 +237,13 @@ def create_recommendation_run(
         if decision_evidence is not None:
             try:
                 con.execute("SAVEPOINT persist_decision_evidence")
-                persist_run_evidence(con, run_id=run_id, evidence=decision_evidence)
+                persist_run_evidence(con, run_id=resolved_run_id, evidence=decision_evidence)
                 con.execute("RELEASE SAVEPOINT persist_decision_evidence")
             except Exception:
                 con.execute("ROLLBACK TO SAVEPOINT persist_decision_evidence")
                 con.execute("RELEASE SAVEPOINT persist_decision_evidence")
                 LOGGER.warning("Recommendation decision evidence persistence failed")
-    return run_id
+    return resolved_run_id
 
 
 def _candidate_exists(con, candidate_id: int) -> bool:
@@ -236,8 +252,11 @@ def _candidate_exists(con, candidate_id: int) -> bool:
 
 def _run_impression(con, run_id: str, candidate_id: int):
     return con.execute(
-        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-        "FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+        "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+        "r.metadata AS run_metadata "
+        "FROM recommendation_impressions i "
+        "LEFT JOIN recommendation_runs r ON r.id=i.run_id "
+        "WHERE i.run_id=? AND i.candidate_id=?",
         (run_id, candidate_id),
     ).fetchone()
 
@@ -272,7 +291,9 @@ def _existing_event_matches(
 
 def _find_latest_impression(con, candidate_id: int, run_id: str | None = None):
     if run_id:
-        return _run_impression(con, run_id, candidate_id)
+        matched = _run_impression(con, run_id, candidate_id)
+        if matched is not None and is_discovery_run_metadata(matched["run_metadata"]):
+            return matched
     rows = con.execute(
         "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
         "r.metadata AS run_metadata "

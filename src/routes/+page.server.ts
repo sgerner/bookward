@@ -8,6 +8,7 @@ import {
   isPayloadTooLarge,
 } from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
+import { hasCachedFormData, requestFormData } from "#lib/server/request-context.js";
 import { z } from "zod";
 
 type SourceFilters = {
@@ -132,6 +133,50 @@ type DigestSettings = {
   } | null;
 };
 
+const NON_DISCOVER_VIEWS = new Set(["saved", "decisions", "sources", "settings"]);
+
+async function shouldTrackDiscoverImpressions(
+  url: URL,
+  request: Request | undefined,
+): Promise<boolean> {
+  let explicitView = url.searchParams.get("view")?.trim() || null;
+  if (!explicitView && request?.method === "POST") {
+    const contentType = request.headers?.get("content-type") || "";
+    const isFormBody =
+      contentType.includes("multipart/form-data") ||
+      contentType.includes("application/x-www-form-urlencoded");
+    if (isFormBody && (!request.bodyUsed || hasCachedFormData(request))) {
+      try {
+        const form = await requestFormData(request);
+        const submittedView = form.get("view");
+        if (typeof submittedView === "string" && submittedView.trim()) {
+          explicitView = submittedView.trim();
+        }
+      } catch {
+        explicitView = null;
+      }
+    }
+  }
+  const isInvalidatedDataRequest = (() => {
+    if (url.searchParams.has("x-sveltekit-invalidated")) return true;
+    if (!request?.url) return false;
+    try {
+      return new URL(request.url).searchParams.has("x-sveltekit-invalidated");
+    } catch {
+      return false;
+    }
+  })();
+  const isMutationOrRevalidation =
+    Boolean(request?.method && !["GET", "HEAD"].includes(request.method)) ||
+    isInvalidatedDataRequest;
+  if (explicitView) {
+    if (explicitView === "discover") return true;
+    if (NON_DISCOVER_VIEWS.has(explicitView)) return false;
+    return !isMutationOrRevalidation;
+  }
+  return !isMutationOrRevalidation;
+}
+
 export const load: PageServerLoad = async ({ url, request, locals }) => {
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
@@ -142,34 +187,7 @@ export const load: PageServerLoad = async ({ url, request, locals }) => {
     next_backup_at: null,
     backups: [],
   };
-  let requestedView = url.searchParams.get("view");
-  const isInvalidatedDataRequest = (() => {
-    if (!request?.url) return false;
-    try {
-      return new URL(request.url).searchParams.has("x-sveltekit-invalidated");
-    } catch {
-      return false;
-    }
-  })();
-  if (
-    !requestedView &&
-    (request?.method === "POST" ||
-      isInvalidatedDataRequest ||
-      Array.from(url.searchParams.keys()).some((key) => key.startsWith("/")))
-  ) {
-    const referer = request?.headers?.get("referer");
-    if (referer) {
-      try {
-        requestedView = new URL(referer).searchParams.get("view");
-      } catch {
-        requestedView = null;
-      }
-    }
-  }
-  const isDiscoverView =
-    !requestedView ||
-    requestedView === "discover" ||
-    !["saved", "decisions", "sources", "settings"].includes(requestedView);
+  const isDiscoverView = await shouldTrackDiscoverImpressions(url, request);
   const overviewPath = isDiscoverView
     ? "/api/overview?recommendation_limit=24&decision_limit=24"
     : "/api/overview?recommendation_limit=24&decision_limit=24&track_impressions=false";

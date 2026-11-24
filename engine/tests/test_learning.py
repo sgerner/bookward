@@ -1289,3 +1289,401 @@ def test_shortlist_read_attribution_credits_discovery_exposure_over_non_discover
         "label": 1.0,
         "label_kind": "rating_positive",
     }
+
+
+def test_paginated_discovery_forms_stable_exploration_partition_with_exact_propensities(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(35):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Partition Book {index + 1}",
+                    f"Partition Author {index + 1}",
+                    round(99.0 - index * 0.5, 2),
+                    source_id,
+                    f"partition-book-{index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    monkeypatch.setattr(settings, "exploration_enabled", True)
+    monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
+    monkeypatch.setattr(settings, "exploration_stable_top_k", 8)
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        overview_res = client.get("/api/overview?recommendation_limit=24")
+        assert overview_res.status_code == 200
+        overview_body = overview_res.json()
+        run_0 = overview_body["recommendation_run_id"]
+        assert run_0
+        page_0_ids = [
+            item["id"]
+            for item in overview_body["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert len(page_0_ids) == 24
+
+        page_1_res = client.get(
+            f"/api/recommendations?status=recommended&limit=8&offset=24&seed_run_id={run_0}"
+        )
+        assert page_1_res.status_code == 200
+        assert page_1_res.headers.get("X-Bookward-Has-More") == "true"
+        run_24 = page_1_res.headers.get("X-Bookward-Recommendation-Run")
+        assert run_24 and run_24 != run_0
+        page_1_ids = [item["id"] for item in page_1_res.json()]
+        assert len(page_1_ids) == 8
+
+        # Chaining seed_run_id from page 2's run resolves back to the root exploration seed.
+        page_2_res = client.get(
+            f"/api/recommendations?status=recommended&limit=8&offset=32&seed_run_id={run_24}"
+        )
+        assert page_2_res.status_code == 200
+        assert page_2_res.headers.get("X-Bookward-Has-More") == "false"
+        page_2_ids = [item["id"] for item in page_2_res.json()]
+        assert len(page_2_ids) == 3
+
+        combined = page_0_ids + page_1_ids + page_2_ids
+        assert len(combined) == 35
+        assert len(set(combined)) == 35
+
+        # Window-based fallback without seed_run_id also reuses the recent discovery seed.
+        window_p1 = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24"
+        ).json()
+        window_p2 = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=32"
+        ).json()
+        assert [item["id"] for item in window_p1] == page_1_ids
+        assert [item["id"] for item in window_p2] == page_2_ids
+
+    # Exact marginal propensities at epsilon=1.0: top 8 = 1.0, all 27 tail slots = 1/27.
+    expected_tail_propensity = 1.0 / (35 - 8)
+    with connect() as con:
+        p0_imps = con.execute(
+            "SELECT rank,propensity FROM recommendation_impressions WHERE run_id=? ORDER BY rank",
+            (run_0,),
+        ).fetchall()
+        p1_imps = con.execute(
+            "SELECT rank,propensity FROM recommendation_impressions WHERE run_id=? ORDER BY rank",
+            (run_24,),
+        ).fetchall()
+    assert [r["rank"] for r in p0_imps] == list(range(1, 25))
+    assert all(r["propensity"] == pytest.approx(1.0) for r in p0_imps[:8])
+    assert all(
+        r["propensity"] == pytest.approx(expected_tail_propensity)
+        for r in p0_imps[8:]
+    )
+    assert [r["rank"] for r in p1_imps] == list(range(25, 33))
+    assert all(
+        r["propensity"] == pytest.approx(expected_tail_propensity)
+        for r in p1_imps
+    )
+
+    # Independent offset=0 runs draw fresh exploration permutations across refreshes.
+    tail_orders = set()
+    for _ in range(6):
+        fresh_items, fresh_run = tracked_recommendations(
+            status="recommended", limit=35, offset=0
+        )
+        assert fresh_run
+        tail_orders.add(tuple(item["id"] for item in fresh_items[8:]))
+    assert len(tail_orders) > 1
+
+    # Personalization failure fallback branch also honors seed_run_id across pages.
+    def broken_personalize(*_args, **_kwargs):
+        raise RuntimeError("simulated ranking failure")
+
+    monkeypatch.setattr(main_module, "personalize_recommendations", broken_personalize)
+    fb_p0, fb_seed_run, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=24, offset=0
+    )
+    fb_p1, _, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=8, offset=24, seed_run_id=fb_seed_run
+    )
+    fb_p2, _, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=8, offset=32, seed_run_id=fb_seed_run
+    )
+    fb_ids = [item["id"] for item in [*fb_p0, *fb_p1, *fb_p2]]
+    assert len(fb_ids) == 35
+    assert len(set(fb_ids)) == 35
+
+
+def test_empty_run_id_feedback_falls_back_to_latest_discovery_impression(database):
+    recommendations, discovery_run_id = tracked_recommendations(status="recommended")
+    target = recommendations[0]
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        save_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "save", "run_id": discovery_run_id},
+        )
+        assert save_res.status_code == 200
+
+        shortlist_items = client.get(
+            "/api/recommendations?status=saved&limit=8&offset=0"
+        ).json()
+        shortlisted = next(
+            item for item in shortlist_items if item["id"] == target["id"]
+        )
+        assert shortlisted["recommendation_run_id"] == ""
+
+        # Shortlist/history forms submit recommendation_run_id="" (or omit run_id).
+        restore_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "restore", "run_id": ""},
+        )
+        assert restore_res.status_code == 200
+
+        reject_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "reject", "run_id": ""},
+        )
+        assert reject_res.status_code == 200
+        reject_decision_id = reject_res.json()["decision_id"]
+
+    event = row(
+        "SELECT id,run_id,event_type FROM recommendation_events WHERE event_key=?",
+        (f"feedback:{reject_decision_id}",),
+    )
+    assert event["run_id"] is None
+    assert event["event_type"] == "reject"
+    outcome = row(
+        "SELECT i.run_id,i.rank,o.label,o.label_kind,o.confidence "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "WHERE o.event_id=?",
+        (event["id"],),
+    )
+    assert outcome == {
+        "run_id": discovery_run_id,
+        "rank": 1,
+        "label": 0.0,
+        "label_kind": "explicit_feedback",
+        "confidence": 0.5,
+    }
+
+
+def test_create_recommendation_run_guards_and_non_discovery_caller_skip(database):
+    from afterword_engine.main import tracked_recommendations_page
+
+    candidate_id = row("SELECT id FROM candidates LIMIT 1")["id"]
+
+    for bad_status in (
+        "saved",
+        "decisions",
+        "rejected",
+        "maybe_later",
+        "imported",
+        "new",
+        "read",
+    ):
+        with pytest.raises(
+            ValueError, match="only be created for discovery slates"
+        ):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": "recommended"}],
+                status=bad_status,
+            )
+
+    for bad_item_status in (
+        "saved",
+        "imported",
+        "rejected",
+        "maybe_later",
+        "decisions",
+        "excluded",
+        "read",
+    ):
+        with pytest.raises(
+            ValueError,
+            match="may not log shortlist, imported, or archived items",
+        ):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": bad_item_status}],
+                status="recommended",
+            )
+
+    for bad_offset in (-1, True):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": "recommended"}],
+                offset=bad_offset,
+            )
+
+    before_runs = row("SELECT COUNT(*) count FROM recommendation_runs")["count"]
+    for non_discovery in ("saved", "decisions", "rejected", "maybe_later"):
+        _items, skipped_run_id, _more = tracked_recommendations_page(
+            status=non_discovery, limit=8, offset=0
+        )
+        assert skipped_run_id == ""
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == before_runs
+
+
+def test_legacy_saved_runs_are_excluded_without_discovery_run_and_with_explicit_run_id(
+    database,
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        only_saved_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Legacy Saved Only','Legacy Author',75.0,'saved',?,?)",
+            (source_id, "legacy-saved-only"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (only_saved_id,),
+        )
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+            "VALUES('legacy-saved-only','legacy','v0','',1,'{\"status\":\"saved\"}','2025-01-01T00:00:00+00:00')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES('legacy-saved-only',?,1,75.0,1.0,'2025-01-01T00:00:00+00:00','2025-01-01T00:01:00+00:00')",
+            (only_saved_id,),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        # Feedback without run_id, with empty run_id, and with explicit legacy run_id
+        # must all refuse to attribute an outcome to a non-discovery "saved" run.
+        r1 = client.post(
+            f"/api/recommendations/{only_saved_id}/feedback",
+            json={"action": "reject", "run_id": ""},
+        )
+        assert r1.status_code == 200
+        r2 = client.post(
+            f"/api/recommendations/{only_saved_id}/feedback",
+            json={"action": "save", "run_id": "legacy-saved-only"},
+        )
+        assert r2.status_code == 200
+        r3 = client.post(
+            f"/api/recommendations/{only_saved_id}/read",
+            json={"rating": 5},
+        )
+        assert r3.status_code == 200
+
+    csv_payload = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Legacy Saved Only,Legacy Author,5,2099/01/02,read\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_payload) == 1
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes o "
+            "JOIN recommendation_impressions i ON i.id=o.impression_id "
+            "WHERE i.candidate_id=?",
+            (only_saved_id,),
+        )["count"]
+        == 0
+    )
+
+    # When both a discovery run and a newer legacy saved run exist, even passing
+    # run_id="legacy-saved-both" falls back to the discovery impression rather than
+    # crediting the non-discovery saved run.
+    recommendations, discovery_run_id = tracked_recommendations(status="recommended")
+    both_book = recommendations[0]
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+            "VALUES('legacy-saved-both','legacy','v0','',1,'{\"status\":\"saved\"}','2098-01-01T00:00:00+00:00')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES('legacy-saved-both',?,1,75.0,1.0,'2098-01-01T00:00:00+00:00','2098-01-01T00:01:00+00:00')",
+            (both_book["id"],),
+        )
+    with TestClient(app, headers=authenticated_headers()) as client:
+        res = client.post(
+            f"/api/recommendations/{both_book['id']}/feedback",
+            json={"action": "save", "run_id": "legacy-saved-both"},
+        )
+        assert res.status_code == 200
+        decision_id = res.json()["decision_id"]
+
+    credited = row(
+        "SELECT i.run_id FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "WHERE e.event_key=?",
+        (f"feedback:{decision_id}",),
+    )
+    assert credited == {"run_id": discovery_run_id}
+
+
+def test_internal_settings_and_sources_endpoints_enforce_auth_and_mask_secrets(
+    database, monkeypatch
+):
+    from afterword_engine.secrets import seal
+
+    with transaction() as con:
+        for key, raw in (
+            ("librarr_api_key", "super-secret-librarr"),
+            ("embedding_api_key", "super-secret-embed"),
+            ("nyt_api_key", "super-secret-nyt"),
+            ("association_google_books_api_key", "super-secret-gbooks"),
+            ("llm_rerank_api_key", "super-secret-llm"),
+            ("digest_discord_webhook_url", "https://discord.example/secret-webhook"),
+            ("digest_smtp_password", "super-secret-smtp"),
+        ):
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+                (key, seal(raw)),
+            )
+
+    # Unauthenticated requests are rejected with 401.
+    with TestClient(app) as unauth_client:
+        for path in ("/api/settings", "/api/sources"):
+            res = unauth_client.get(path)
+            assert res.status_code == 401
+
+    # When service_secret is configured, missing/wrong x-bookward-service is rejected with 401.
+    auth_headers = authenticated_headers()
+    monkeypatch.setattr(settings, "service_secret", "shared-engine-secret")
+    with TestClient(app, headers=auth_headers) as missing_service_client:
+        for path in ("/api/settings", "/api/sources"):
+            res = missing_service_client.get(path)
+            assert res.status_code == 401
+
+    with TestClient(
+        app,
+        headers={**auth_headers, "x-bookward-service": "shared-engine-secret"},
+    ) as client:
+        settings_res = client.get("/api/settings")
+        sources_res = client.get("/api/sources")
+        overview_res = client.get("/api/overview?track_impressions=false")
+
+    assert settings_res.status_code == 200
+    assert sources_res.status_code == 200
+    assert "no-store" in settings_res.headers.get("cache-control", "")
+    assert "private" in settings_res.headers.get("cache-control", "")
+    assert "no-store" in sources_res.headers.get("cache-control", "")
+    assert "private" in sources_res.headers.get("cache-control", "")
+
+    settings_payload = settings_res.json()
+    serialized = json.dumps(settings_payload)
+    assert "super-secret" not in serialized
+    assert "secret-webhook" not in serialized
+    assert "api_tokens" not in settings_payload
+    assert settings_payload["librarr_api_key_set"] is True
+    assert settings_payload["embedding_api_key_set"] is True
+    assert settings_payload["nyt_api_key_set"] is True
+    assert settings_payload["google_books_api_key_set"] is True
+    assert settings_payload["llm_rerank"]["api_key_set"] is True
+    assert settings_payload["digest"]["discord_webhook_set"] is True
+    assert settings_payload["digest"]["smtp_password_set"] is True
+    assert sources_res.json() == overview_res.json()["sources"]

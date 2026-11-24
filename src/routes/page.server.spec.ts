@@ -1210,25 +1210,112 @@ describe("page actions", () => {
     } as never);
     expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
 
+    // POST without explicit view fails closed even if Referer is missing or points to Discover.
     fetchMock.mockClear();
     await load({
       url: new URL("http://afterword.test/?/configureEmbeddings"),
       request: new Request("http://afterword.test/?/configureEmbeddings", {
-        headers: { referer: "http://afterword.test/?view=settings" },
+        method: "POST",
+        headers: { referer: "http://afterword.test/?view=discover" },
       }),
       locals: { user: null },
     } as never);
     expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    // Invalidated data reload without explicit ?view= fails closed regardless of Referer.
     fetchMock.mockClear();
     await load({
       url: new URL("http://afterword.test/"),
       request: new Request(
         "http://afterword.test/__data.json?x-sveltekit-trailing-slash=1&x-sveltekit-invalidated=11",
-        { headers: { referer: "http://afterword.test/?view=settings" } },
+        { headers: { referer: "http://afterword.test/" } },
       ),
       locals: { user: null },
     } as never);
     expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    // Invalidated data reload with explicit ?view=discover tracks impressions; ?view=saved does not.
+    fetchMock.mockClear();
+    await load({
+      url: new URL("http://afterword.test/?view=discover"),
+      request: new Request(
+        "http://afterword.test/__data.json?view=discover&x-sveltekit-invalidated=11",
+      ),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).not.toContain("track_impressions=false");
+
+    fetchMock.mockClear();
+    await load({
+      url: new URL("http://afterword.test/?view=saved"),
+      request: new Request(
+        "http://afterword.test/__data.json?view=saved&x-sveltekit-invalidated=11",
+      ),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    // Non-JS POST form submissions read explicit view from FormData (discover vs settings).
+    fetchMock.mockClear();
+    const settingsForm = new FormData();
+    settingsForm.set("view", "settings");
+    await load({
+      url: new URL("http://afterword.test/?/configureEmbeddings"),
+      request: new Request("http://afterword.test/?/configureEmbeddings", {
+        method: "POST",
+        body: settingsForm,
+      }),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    fetchMock.mockClear();
+    const discoverForm = new FormData();
+    discoverForm.set("view", "discover");
+    await load({
+      url: new URL("http://afterword.test/?/decide"),
+      request: new Request("http://afterword.test/?/decide", {
+        method: "POST",
+        body: discoverForm,
+      }),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).not.toContain("track_impressions=false");
+  });
+
+  it("omits empty run_id on shortlist and history decide actions so engine fallback attribution applies", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 17, status: "rejected", decision_id: 99 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "17");
+    body.set("status", "rejected");
+    body.set("run_id", "");
+
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test/?/decide&view=saved", {
+        method: "POST",
+        body,
+      }),
+    } as never);
+
+    expect(result).toMatchObject({
+      message: "Passed on this recommendation.",
+      undo_id: 99,
+      id: 17,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/recommendations/17/feedback"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "reject" }),
+      }),
+    );
   });
 
   it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {

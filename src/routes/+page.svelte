@@ -1,6 +1,6 @@
 <script lang="ts">
   import { applyAction, deserialize, enhance, type SubmitFunction } from "$app/forms";
-  import { goto, invalidateAll, pushState } from "$app/navigation";
+  import { goto, pushState } from "$app/navigation";
   import { page } from "$app/state";
   import { onMount, tick, untrack } from "svelte";
   import { flip } from "svelte/animate";
@@ -739,6 +739,13 @@
       pushState(url, {});
     }
   }
+  async function refreshCurrentView() {
+    if (typeof window === "undefined") return;
+    const refreshUrl = new URL(window.location.href);
+    refreshUrl.searchParams.set("view", activeView);
+    if (activeView !== "discover") refreshUrl.searchParams.delete("digest");
+    await goto(refreshUrl, { replace: true, reset: false, refreshAll: true });
+  }
   async function goToLibrarrSettings() {
     go("settings");
     await tick();
@@ -792,7 +799,9 @@
     key: string,
     optimistic?: OptimisticFactory,
   ): SubmitFunction {
-    return ({ formData }) => {
+    return ({ action, formData }) => {
+      action.searchParams.set("view", activeView);
+      if (!formData.has("view")) formData.set("view", activeView);
       withPending(key, true);
       let change: OptimisticChange | void;
       try {
@@ -820,7 +829,14 @@
           if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
           optimisticNotificationTimer = null;
           optimisticNotification = null;
-          await update();
+          if (result.type === "redirect") {
+            await update();
+          } else {
+            if (result.type === "success") {
+              await refreshCurrentView();
+            }
+            await update({ refreshAll: false, navigate: false });
+          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -1113,11 +1129,17 @@
     discoverLoading = true;
     discoverLoadError = "";
     const offset = allBooks.filter((book) => book.status === "recommended").length;
+    const seedRunId =
+      data.recommendation_run_id ||
+      additionalDiscoverBooks.find((book) => book.recommendation_run_id)
+        ?.recommendation_run_id ||
+      "";
     try {
       const params = new URLSearchParams({
         status: "recommended",
         limit: String(DISCOVER_PAGE_SIZE),
         offset: String(offset),
+        ...(seedRunId.length >= 8 ? { seed_run_id: seedRunId } : {}),
       });
       const response = await fetch(`/api/recommendations?${params.toString()}`, { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
@@ -1569,7 +1591,7 @@
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
         closeLibrarrSearch();
-        await invalidateAll();
+        await refreshCurrentView();
       }
       return true;
     } catch (error) {
@@ -1601,11 +1623,11 @@
     if (failed) {
       librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
-      if (added) await invalidateAll();
+      if (added) await refreshCurrentView();
     } else if (added) {
       announceActionSuccess(`${added} high-confidence match${added === 1 ? "" : "es"} added to Librarr.`);
       closeLibrarrSearch();
-      await invalidateAll();
+      await refreshCurrentView();
     }
   }
 
@@ -1675,11 +1697,14 @@
               const body = new URLSearchParams({
                 id: String(id),
                 status: "saved",
+                view: activeView,
                 run_id: String(allBooks.find((book) => book.id === id)?.recommendation_run_id || ""),
               });
               const change = optimisticBookStatus(id, "saved");
               try {
-                const response = await fetch("?/decide", {
+                const actionUrl = new URL("?/decide", window.location.href);
+                actionUrl.searchParams.set("view", activeView);
+                const response = await fetch(actionUrl, {
                   method: "POST",
                   headers: {
                     accept: "application/json",
@@ -1689,10 +1714,11 @@
                   body,
                 });
                 if (!response.ok) throw new Error("Could not shortlist that book.");
-                await applyAction(deserialize(await response.text()));
-                await invalidateAll();
-                change?.commit?.();
+                const actionResult = deserialize(await response.text());
                 go("saved");
+                await refreshCurrentView();
+                await applyAction(actionResult);
+                change?.commit?.();
                 return { id, status: "saved" };
               } catch (error) {
                 change?.rollback?.();
@@ -1772,7 +1798,7 @@
             in:fade={{ duration: motionDuration(180) }}
             out:fade={{ duration: motionDuration(120) }}
           >
-          <ProfileField profileId={data.user?.profile_id} />
+          <ProfileField profileId={data.user?.profile_id} view={activeView} />
             <button
               class="btn btn-icon min-h-11 min-w-11 preset-tonal-primary"
               type="submit"
@@ -1877,7 +1903,7 @@
                       class="mt-3"
                       use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
                     >
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="id" value={visibleNotification.id} />
                       <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
                       <button
@@ -1977,7 +2003,7 @@
               <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -2090,15 +2116,15 @@
                   {#if book.status === "recommended"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
                     <div class="relative z-50 ml-auto shrink-0" data-read-menu-root={book.id}>
@@ -2129,7 +2155,7 @@
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
                       <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
+                        <ProfileField profileId={data.user?.profile_id} view={activeView} />
                         <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                       </form>
                     {:else}
@@ -2144,7 +2170,7 @@
                     ><Check size={15} /> Mark Read</button>
                     {#if book.status === "saved"}
                       <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
+                        <ProfileField profileId={data.user?.profile_id} view={activeView} />
                         <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                       </form>
                     {/if}
@@ -2158,7 +2184,7 @@
                     ><Check size={15} /> Mark Read</button>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
                   {/if}
@@ -2173,7 +2199,7 @@
               </div>
               {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
               {#if view === "discover" && !filter && !genreFilter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
-                <ProfileField profileId={data.user?.profile_id} />
+                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                 <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                   {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
                 </button>
@@ -2450,7 +2476,7 @@
                         action="?/toggleDefault"
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
                       >
-                        <ProfileField profileId={data.user?.profile_id} />
+                        <ProfileField profileId={data.user?.profile_id} view={activeView} />
                         <button
                           type="submit"
                           class={`relative h-7 w-12 rounded-full p-1 transition ${defaultSourceEnabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
@@ -2518,7 +2544,7 @@
                                     action="?/switchSourceToOneTime"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
                                   >
-                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <ProfileField profileId={data.user?.profile_id} view={activeView} />
                                     <input type="hidden" name="id" value={source.id} />
                                     <button
                                       class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
@@ -2544,7 +2570,7 @@
                                 action="?/configureSourceFilters"
                                 use:enhance={setPending(`source-filters-${source.id}`)}
                               >
-                                <ProfileField profileId={data.user?.profile_id} />
+                                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                                 <input type="hidden" name="id" value={source.id} />
                                 <label class="block text-xs font-medium text-surface-800-200">
                                   Include genres
@@ -2582,7 +2608,7 @@
                             action="?/toggleSource"
                             use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
                           >
-                            <ProfileField profileId={data.user?.profile_id} />
+                            <ProfileField profileId={data.user?.profile_id} view={activeView} />
                             <input
                               type="hidden"
                               name="id"
@@ -2625,7 +2651,7 @@
                   action="?/configureSourceSchedule"
                   use:enhance={setPending("source-schedule", optimisticSourceSchedule)}
                 >
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <div class="mb-4 flex items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
@@ -2677,7 +2703,7 @@
                   action="?/source"
                   use:enhance={setPending("source")}
                 >
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <div class="flex items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
@@ -2792,7 +2818,7 @@
                 <div class="grid gap-5 lg:grid-cols-2">
                   <div>
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
                         {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
                       </button>
@@ -2816,7 +2842,7 @@
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
                     {#if data.backupStatus.backups.length}
                       <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
-                        <ProfileField profileId={data.user?.profile_id} />
+                        <ProfileField profileId={data.user?.profile_id} view={activeView} />
                         <label class="block text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
                           {#each data.backupStatus.backups as backup (backup.id)}
                             <option value={backup.id}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
@@ -2844,7 +2870,7 @@
                 action="?/connectGoodreads"
                 use:enhance={setPending("goodreads-rss")}
               >
-                <ProfileField profileId={data.user?.profile_id} />
+                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                 <div class="mb-5 flex items-center justify-between gap-4">
                   <div class="flex min-w-0 items-center gap-3">
                     <span
@@ -2918,7 +2944,7 @@
                 enctype="multipart/form-data"
                 use:enhance={setPending("goodreads-csv")}
               >
-                <ProfileField profileId={data.user?.profile_id} />
+                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                 <div class="mb-5 flex items-center justify-between gap-4">
                   <div class="flex min-w-0 items-center gap-3">
                     <span
@@ -2971,7 +2997,7 @@
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
               >
-                <ProfileField profileId={data.user?.profile_id} />
+                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                 <div class="mb-5 flex items-center justify-between gap-4">
                   <div class="flex min-w-0 items-center gap-3">
                     <span
@@ -3072,7 +3098,7 @@
                   action="?/configureEmbeddings"
                   use:enhance={setPending("embeddings", optimisticEmbeddings)}
                 >
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <label class="block text-sm font-medium text-surface-800-200"
                     >Provider<select class="select mt-2" name="backend"
                       ><option
@@ -3156,7 +3182,7 @@
                     use:enhance={setPending("rebuild-embeddings")}
                     class="w-full"
                   >
-                    <ProfileField profileId={data.user?.profile_id} />
+                    <ProfileField profileId={data.user?.profile_id} view={activeView} />
                     <button
                       class="btn min-h-11 w-full preset-filled-warning-500"
                       type="submit"
@@ -3213,7 +3239,7 @@
                   action="?/configureGoogleBooks"
                   use:enhance={setPending("google-books")}
                 >
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <label class="block text-sm font-medium text-surface-800-200"
                     >API key<input
                       class="input mt-2"
@@ -3368,7 +3394,7 @@
                   action="?/configureLlmRerank"
                   use:enhance={setPending("llm-rerank")}
                 >
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <input type="hidden" name="provider" value={llmProvider} />
                   <label
                     class="flex items-center gap-3 text-sm font-medium text-surface-800-200"
@@ -3488,7 +3514,7 @@
                 {/if}
 
                 <form method="POST" action="?/createApiToken" use:enhance={setPending("create-api-token")} class="flex flex-col gap-3 sm:flex-row sm:items-end">
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <label class="block min-w-0 flex-1 text-sm font-medium text-surface-800-200">
                     Token name
                     <input class="input mt-2" name="name" maxlength="100" placeholder="Home Assistant" required />
@@ -3515,7 +3541,7 @@
                             <details>
                               <summary class="btn btn-sm min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
                               <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)} class="mt-2 grid max-w-xs justify-items-start gap-2">
-                                <ProfileField profileId={data.user?.profile_id} />
+                                <ProfileField profileId={data.user?.profile_id} view={activeView} />
                                 <input type="hidden" name="id" value={token.id} />
                                 <p class="text-xs text-surface-700-300">Apps using this token will lose access to Bookward.</p>
                                 <button class="btn btn-sm min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
@@ -3537,7 +3563,7 @@
                 class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2"
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
-                  <ProfileField profileId={data.user?.profile_id} />
+                  <ProfileField profileId={data.user?.profile_id} view={activeView} />
                   <div class="flex flex-wrap items-center gap-4 focus-within:ring-2 focus-within:ring-secondary-500 focus-within:ring-offset-4 focus-within:ring-offset-surface-950">
                     <input id="digest-enabled" class="sr-only" type="checkbox" name="enabled" checked={digestEnabled} role="switch" aria-label="Enable weekly digest" onchange={(event) => (digestEnabledOverride = (event.currentTarget as HTMLInputElement).checked)} />
                     <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
@@ -3645,13 +3671,13 @@
                   {#each ["discord", "email"] as channel}
                     {@const configured = channel === "discord" ? digestDiscord : digestEmail}
                     {#if configured}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
-                      <ProfileField profileId={data.user?.profile_id} />
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} />
                       <input type="hidden" name="channel" value={channel} />
                       <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
                     </form>{/if}
                   {/each}
                   <form method="POST" action="?/runDigest" use:enhance={setPending("digest-run")} class="ml-auto">
-                    <ProfileField profileId={data.user?.profile_id} />
+                    <ProfileField profileId={data.user?.profile_id} view={activeView} />
                     <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!digestEnabled || (!digestDiscord && !digestEmail) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
@@ -3661,7 +3687,7 @@
                     {#if delivery.status === "sent"}<Check size={16} class="shrink-0" />{:else if delivery.status === "failed"}<TriangleAlert size={16} class="shrink-0" />{:else}<RefreshCw size={16} class="shrink-0 animate-spin" />{/if}
                     <span class="min-w-0 flex-1">Last {delivery.channel} delivery: <strong>{delivery.status}</strong>{#if delivery.sent_at} · {formatDeliveryDate(delivery.sent_at)}{:else if delivery.updated_at} · {formatDeliveryDate(delivery.updated_at)}{/if}{#if delivery.error}<span class="mt-1 block text-xs">{delivery.error}</span>{/if}</span>
                     {#if delivery.status === "failed"}<form method="POST" action="?/retryDigest" use:enhance={setPending("digest-retry")}>
-                      <ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="id" value={delivery.id} /><button class="btn btn-sm min-h-9 preset-tonal-secondary" type="submit" disabled={isPending("digest-retry")} aria-busy={isPending("digest-retry")}><RefreshCw size={14} /> Retry</button></form>{/if}
+                      <ProfileField profileId={data.user?.profile_id} view={activeView} /><input type="hidden" name="id" value={delivery.id} /><button class="btn btn-sm min-h-9 preset-tonal-secondary" type="submit" disabled={isPending("digest-retry")} aria-busy={isPending("digest-retry")}><RefreshCw size={14} /> Retry</button></form>{/if}
                   </div>
                 {/if}
               </section>
@@ -3789,7 +3815,7 @@
 
         <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
           <div class="p-5 sm:p-7">
-            <ProfileField profileId={data.user?.profile_id} />
+            <ProfileField profileId={data.user?.profile_id} view={activeView} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
 

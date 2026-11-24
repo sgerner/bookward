@@ -4,6 +4,7 @@ import asyncio
 import logging
 import base64
 import hmac
+import random
 import secrets
 import sqlite3
 import time
@@ -83,6 +84,7 @@ from .learning import (
     _impression_precedes,
     _read_label,
     _read_time,
+    _validate_identifier,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -1208,9 +1210,20 @@ class SourcePreviewIn(UrlIn):
     filters: SourceFilters = Field(default_factory=SourceFilters)
 
 
+def _normalize_optional_run_id(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 class FeedbackIn(BaseModel):
     action: Literal["save", "reject", "maybe_later", "restore"]
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
 
 class UndoFeedbackIn(BaseModel):
@@ -1235,6 +1248,11 @@ class TelemetryEventIn(BaseModel):
     value: float | None = None
     source: str = Field(default="ui", min_length=1, max_length=32)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
     @field_validator("event_type")
     @classmethod
@@ -1261,6 +1279,11 @@ class BulkFeedbackIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["save", "reject", "restore"]
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
 
 class ApiTokenCreateIn(BaseModel):
@@ -1362,6 +1385,96 @@ def _slice_discovery_pool(
     return recommendations, discovery_slice, has_more, start, limit
 
 
+EXPLORATION_SEED_WINDOW_SECONDS = 1800
+
+
+def _extract_run_exploration_seed(raw_metadata: Any) -> str | None:
+    if not raw_metadata or not isinstance(raw_metadata, str):
+        return None
+    try:
+        parsed = json.loads(raw_metadata)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    seed = parsed.get("exploration_seed")
+    if isinstance(seed, str) and seed:
+        try:
+            return _validate_identifier(seed, "exploration seed")
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_exploration_seed(
+    connection,
+    *,
+    planned_run_id: str,
+    offset: int,
+    ranking_at: datetime,
+    session_id: str = "",
+    seed_run_id: str | None = None,
+    track_impressions: bool = True,
+) -> str:
+    if seed_run_id:
+        validated_seed = _validate_identifier(
+            seed_run_id, "seed recommendation run"
+        )
+        run_row = (
+            connection.execute(
+                "SELECT metadata FROM recommendation_runs WHERE id=?",
+                (validated_seed,),
+            ).fetchone()
+            if connection is not None
+            else row(
+                "SELECT metadata FROM recommendation_runs WHERE id=?",
+                (validated_seed,),
+            )
+        )
+        if run_row is not None and is_discovery_run_metadata(run_row["metadata"]):
+            return _extract_run_exploration_seed(run_row["metadata"]) or validated_seed
+        return validated_seed
+    if int(offset) <= 0:
+        return planned_run_id
+    recent_runs = (
+        connection.execute(
+            "SELECT id,session_id,metadata,created_at FROM recommendation_runs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 20"
+        ).fetchall()
+        if connection is not None
+        else rows(
+            "SELECT id,session_id,metadata,created_at FROM recommendation_runs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 20"
+        )
+    )
+    for candidate_run in recent_runs:
+        if not is_discovery_run_metadata(candidate_run["metadata"]):
+            continue
+        if session_id and candidate_run["session_id"] != session_id:
+            continue
+        created_time, _ = _read_time(candidate_run["created_at"])
+        if (
+            created_time is not None
+            and abs((ranking_at - created_time).total_seconds())
+            <= EXPLORATION_SEED_WINDOW_SECONDS
+        ):
+            return (
+                _extract_run_exploration_seed(candidate_run["metadata"])
+                or str(candidate_run["id"])
+            )
+    if track_impressions:
+        return planned_run_id
+    bucket = int(ranking_at.timestamp()) // EXPLORATION_SEED_WINDOW_SECONDS
+    return f"window:{bucket:010d}"
+
+
+def _exploration_rng(scope: str, exploration_seed: str) -> random.Random:
+    digest = hashlib.sha256(
+        f"bookward-tail-explore:v1:{scope}:{exploration_seed}".encode("utf-8")
+    ).digest()
+    return random.Random(int.from_bytes(digest, "big"))
+
+
 def tracked_recommendations_page(
     *,
     status: str | None = None,
@@ -1373,7 +1486,13 @@ def tracked_recommendations_page(
     include_imported: bool = False,
     private: dict | None = None,
     track_impressions: bool = True,
+    session_id: str = "",
+    seed_run_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str, bool]:
+    if isinstance(status, str):
+        status = status.strip()
+    if session_id:
+        _validate_identifier(session_id, "session identifier")
     can_personalize = status in (None, "", "all", "recommended")
     if not can_personalize:
         fetch_limit = None if limit is None else max(0, int(limit)) + 1
@@ -1393,6 +1512,17 @@ def tracked_recommendations_page(
         return _format_recommendation_urls(batch[:cap]), "", len(batch) > cap
 
     ranking_at = datetime.now(timezone.utc)
+    planned_run_id = str(uuid.uuid4())
+    exploration_seed = _resolve_exploration_seed(
+        connection,
+        planned_run_id=planned_run_id,
+        offset=offset,
+        ranking_at=ranking_at,
+        session_id=session_id,
+        seed_run_id=seed_run_id,
+        track_impressions=track_impressions,
+    )
+    exploration_scope = f"{current_profile_id() or 'legacy'}:{session_id}"
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
     cached_vectors = {}
@@ -1502,6 +1632,7 @@ def tracked_recommendations_page(
                     diversified,
                     epsilon=settings.exploration_epsilon,
                     stable_top_k=settings.exploration_stable_top_k,
+                    rng=_exploration_rng(exploration_scope, exploration_seed),
                 )
             recommended = diversified
         else:
@@ -1551,6 +1682,7 @@ def tracked_recommendations_page(
                 fallback_recommended,
                 epsilon=settings.exploration_epsilon,
                 stable_top_k=settings.exploration_stable_top_k,
+                rng=_exploration_rng(exploration_scope, exploration_seed),
             )
         (
             recommendations,
@@ -1604,6 +1736,7 @@ def tracked_recommendations_page(
                 "exploration_enabled": settings.exploration_enabled,
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
+                "exploration_seed": exploration_seed,
             },
         )
     else:
@@ -1615,6 +1748,9 @@ def tracked_recommendations_page(
         }
     run_id = create_recommendation_run(
         discovery_slice,
+        run_id=planned_run_id,
+        session_id=session_id,
+        exploration_seed=exploration_seed,
         decision_evidence=decision_evidence,
         status=status,
         limit=run_limit,
@@ -1635,6 +1771,8 @@ def tracked_recommendations(
     identity_context=None,
     include_imported: bool = False,
     private: dict | None = None,
+    session_id: str = "",
+    seed_run_id: str | None = None,
 ):
     recommendations, run_id, _has_more = tracked_recommendations_page(
         status=status,
@@ -1645,6 +1783,8 @@ def tracked_recommendations(
         identity_context=identity_context,
         include_imported=include_imported,
         private=private,
+        session_id=session_id,
+        seed_run_id=seed_run_id,
     )
     return recommendations, run_id
 
@@ -2038,6 +2178,12 @@ def recommendations(
     status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
+    seed_run_id: str | None = Query(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+    ),
 ):
     with connect() as connection:
         values, run_id, has_more = tracked_recommendations_page(
@@ -2045,6 +2191,7 @@ def recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            seed_run_id=seed_run_id,
         )
     for item in values:
         item["recommendation_run_id"] = (
@@ -3381,8 +3528,14 @@ def api_recommendations(
     status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
+    seed_run_id: str | None = Query(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+    ),
 ):
-    return recommendations(response, status, limit, offset)
+    return recommendations(response, status, limit, offset, seed_run_id)
 
 
 @api_v1.post("/recommendations/bulk-feedback")
@@ -3412,10 +3565,7 @@ async def api_import_librarr(candidate_id: int):
 
 @api_v1.get("/sources")
 def api_sources():
-    return [
-        {**source, "filters": normalize_source_filters(source.get("filters"))}
-        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
-    ]
+    return list_sources()
 
 
 @api_v1.post("/sources/preview")
