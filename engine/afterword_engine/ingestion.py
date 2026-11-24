@@ -2,7 +2,9 @@ import asyncio
 import csv
 import hashlib
 import html
+import inspect
 import io
+import ipaddress
 import json
 import re
 import math
@@ -35,7 +37,14 @@ from .identity import (
     read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
-from .security import resolve_public_target
+from .read_dates import read_day
+from .security import (
+    BLOCKED_HOSTS,
+    redact_url,
+    resolve_public_target,
+    sanitize_pinned_error_message,
+    validate_public_url,
+)
 from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
@@ -56,6 +65,18 @@ PENGUIN_RANDOM_HOUSE_HOSTS = frozenset(
     {"penguinrandomhouse.com", "www.penguinrandomhouse.com"}
 )
 SOURCE_MAX_REDIRECTS = 4
+SOURCE_MAX_DISCOVERED_FEEDS = 3
+SOURCE_MAX_DISCOVERED_CANDIDATES = 12
+FEED_AUTODISCOVERY_TYPES = frozenset(
+    {
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/rdf+xml",
+        "text/rss+xml",
+        "text/atom+xml",
+    }
+)
+COMMENT_FEED_RE = re.compile(r"(?:^|[\W_])comments?(?:$|[\W_\d])", re.I)
 SOURCE_FILTER_MAX_GENRES = 12
 SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 READ_WORK_IDENTITY_BATCH_SIZE = 25
@@ -66,7 +87,9 @@ READ_METADATA_TRANSIENT_RETRY_HOURS = 24
 CANDIDATE_METADATA_BATCH_SIZE = 50
 CANDIDATE_METADATA_RETRY_DAYS = 30
 CANDIDATE_METADATA_COVER_RETRY_DAYS = 7
+CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS = 24
 SOURCE_METADATA_ENRICHMENT_BATCH_SIZE = 50
+SOURCE_METADATA_ENRICHMENT_MAX_BATCHES = 3
 READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
 
@@ -745,15 +768,97 @@ def metadata_url(value, fallback=""):
             return str(parsed)
     return ""
 
-def import_goodreads_csv(content: bytes):
+STORYGRAPH_IDENTIFYING_HEADERS = frozenset(
+    {"Read Status", "ISBN/UID", "Star Rating", "Last Date Read", "Dates Read"}
+)
+_STORYGRAPH_AUTHOR_SUFFIXES = frozenset(
+    {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
+)
+_STORYGRAPH_ISBN_CANDIDATE_RE = re.compile(r"^[0-9\s-]+[0-9Xx]?$")
+
+
+def _detect_csv_source(fieldnames) -> str:
+    headers = {str(name).strip() for name in (fieldnames or ()) if name is not None}
+    if {"Title", "Author"}.issubset(headers):
+        return "goodreads_csv"
+    if {"Title", "Authors"}.issubset(headers) and (headers & STORYGRAPH_IDENTIFYING_HEADERS):
+        return "storygraph_csv"
+    raise ValueError("CSV must match Goodreads or The StoryGraph export format")
+
+
+def _storygraph_primary_author(value) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    if not parts:
+        return ""
+    primary = parts[0]
+    if len(parts) > 1 and parts[1].casefold() in _STORYGRAPH_AUTHOR_SUFFIXES:
+        primary = f"{primary}, {parts[1]}"
+    return primary[:300]
+
+
+def _storygraph_isbn(value) -> str | None:
+    cleaned = str(value or "").strip().strip('="').strip()
+    if not cleaned or not _STORYGRAPH_ISBN_CANDIDATE_RE.fullmatch(cleaned):
+        return None
+    return canonical_isbn(cleaned) or None
+
+
+def _storygraph_completion_date_from_entry(entry: str) -> str | None:
+    direct = _read_date_value(entry)
+    if direct is not None:
+        return direct
+    explicit_range = re.fullmatch(
+        r"(.+?)\s*(?:\.\.|[–—]|\bto\b)\s*(.*)", entry, flags=re.IGNORECASE
+    )
+    if explicit_range:
+        return _read_date_value(explicit_range.group(2))
+    iso_range = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}\s*-\s*(.*)", entry)
+    if iso_range:
+        return _read_date_value(iso_range.group(1))
+    if "-" in entry:
+        return _read_date_value(entry.rsplit("-", 1)[1])
+    return None
+
+
+def _storygraph_read_date(last_date_read, dates_read) -> str | None:
+    direct = _read_date_value(last_date_read)
+    if direct is not None:
+        return direct
+    raw_ranges = str(dates_read or "").strip()
+    if not raw_ranges:
+        return None
+    whole = _read_date_value(raw_ranges)
+    if whole is not None:
+        return whole
+    best_date = None
+    best_day = None
+    for part in re.split(r"[,;]", raw_ranges):
+        entry = part.strip()
+        if not entry:
+            continue
+        candidate = _storygraph_completion_date_from_entry(entry)
+        if candidate is None:
+            continue
+        day = read_day(candidate)
+        if best_date is None or (day is not None and (best_day is None or day >= best_day)):
+            best_date = candidate
+            best_day = day
+    return best_date
+
+
+def import_csv(content: bytes) -> dict[str, int | str]:
     if len(content) > 10_000_000: raise ValueError("CSV is larger than 10 MB")
     try:
         text = content.decode("utf-8-sig", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError("CSV must be UTF-8 encoded") from exc
     reader = csv.DictReader(io.StringIO(text))
-    required = {"Title", "Author"}
-    if not reader.fieldnames or not required.issubset(reader.fieldnames): raise ValueError("This does not look like a Goodreads export")
+    if reader.fieldnames:
+        reader.fieldnames = [
+            name.strip() if isinstance(name, str) else name
+            for name in reader.fieldnames
+        ]
+    source = _detect_csv_source(reader.fieldnames)
     count = 0
     batches: list[tuple[str, list[tuple]]] = []
     try:
@@ -761,10 +866,22 @@ def import_goodreads_csv(content: bytes):
             if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
             # DictReader uses None for fields omitted from a truncated row.
             title = str(source_row.get("Title") or "").strip()[:500]
-            author = str(source_row.get("Author") or "").strip()[:300]
+            if source == "storygraph_csv":
+                author = _storygraph_primary_author(source_row.get("Authors"))
+                shelf = str(source_row.get("Read Status") or "").strip().lower()
+                isbn = _storygraph_isbn(source_row.get("ISBN/UID"))
+                rating_raw = str(source_row.get("Star Rating") or "").strip()
+                read_at = _storygraph_read_date(
+                    source_row.get("Last Date Read"),
+                    source_row.get("Dates Read"),
+                )
+            else:
+                author = str(source_row.get("Author") or "").strip()[:300]
+                shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                rating_raw = str(source_row.get("My Rating") or "").strip()
+                read_at = _read_date_value(source_row.get("Date Read"))
             if not title or not author: continue
-            shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
-            isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
             if shelf in {"to-read", "currently-reading"}:
                 kind = "shelf"
                 values = (
@@ -777,7 +894,7 @@ def import_goodreads_csv(content: bytes):
             else:
                 if shelf and shelf != "read": continue
                 try:
-                    rating = float(source_row.get("My Rating") or 0) or None
+                    rating = float(rating_raw or 0) or None
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be numeric and between 0 and 5. No books were imported.") from exc
                 if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
@@ -787,8 +904,9 @@ def import_goodreads_csv(content: bytes):
                     title,
                     author,
                     rating,
-                    _read_date_value(source_row.get("Date Read")),
+                    read_at,
                     isbn,
+                    source,
                 )
                 count += 1
             if not batches or batches[-1][0] != kind:
@@ -815,7 +933,7 @@ def import_goodreads_csv(content: bytes):
             )
             con.executemany(
                 "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,'goodreads_csv') "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(title,author) DO UPDATE SET "
                 "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
                 "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
@@ -832,7 +950,11 @@ def import_goodreads_csv(content: bytes):
     # during application startup.
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
-    return count
+    return {"imported": count, "source": source}
+
+
+def import_goodreads_csv(content: bytes):
+    return int(import_csv(content)["imported"])
 
 def _source_client():
     return httpx.AsyncClient(
@@ -852,13 +974,29 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
     pinned = original.copy_with(host=address)
     default_port = 443 if original.scheme == "https" else 80
     host_header = hostname if original.port in (None, default_port) else f"{hostname}:{original.port}"
-    return await client.request(
-        method,
-        pinned,
-        params=params,
-        headers={"Host": host_header},
-        extensions={"sni_hostname": hostname},
-    )
+    unpinned_url = client.build_request(method, original, params=params).url
+    public_request = client.build_request(method, redact_url(unpinned_url))
+    try:
+        response = await client.request(
+            method,
+            pinned,
+            params=params,
+            headers={"Host": host_header},
+            extensions={"sni_hostname": hostname},
+        )
+    except httpx.RequestError as exc:
+        sanitized = sanitize_pinned_error_message(
+            exc,
+            address=address,
+            hostname=hostname,
+        )
+        try:
+            rewritten = type(exc)(sanitized, request=public_request)
+        except TypeError:
+            rewritten = httpx.RequestError(sanitized, request=public_request)
+        raise rewritten from None
+    response.request = public_request
+    return response
 
 
 async def _request_openlibrary_edition(client, isbn13: str):
@@ -1169,7 +1307,13 @@ def _read_metadata_attempt_is_due(read, retry_before):
         provenance = {}
     attempt = provenance.get("last_attempt", provenance) if isinstance(provenance, dict) else {}
     traces = attempt.get("fetch_trace", []) if isinstance(attempt, dict) else []
-    transient_statuses = {"request_error", "http_error", "rate_limited", "server_error", "timeout", "provider_unavailable"}
+    transient_statuses = {
+        "request_error",
+        "rate_limited",
+        "server_error",
+        "timeout",
+        "provider_unavailable",
+    }
     transient = bool(
         isinstance(attempt, dict)
         and (attempt.get("error_type") or attempt.get("attempt_status") in {"request_error", "provider_unavailable"})
@@ -1626,7 +1770,13 @@ async def refresh_read_metadata(
                     "provider_unavailable"
                     if any(
                         isinstance(trace, dict)
-                        and trace.get("status") in {"request_error", "http_error", "rate_limited", "server_error", "timeout"}
+                        and trace.get("status")
+                        in {
+                            "request_error",
+                            "rate_limited",
+                            "server_error",
+                            "timeout",
+                        }
                         for trace in attempt_provenance.get("fetch_trace", [])
                     )
                     else "no_verified_record"
@@ -1775,7 +1925,9 @@ async def refresh_read_metadata(
         "remaining": read_metadata_refresh_remaining(),
     }
 
-async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
+async def _fetch_bytes_with_client(
+    client, url: str, allow_goodreads_http=False, *, return_url=False
+):
     current_url = str(url)
     for _ in range(SOURCE_MAX_REDIRECTS + 1):
         response = await _request_pinned(
@@ -1803,15 +1955,39 @@ async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False)
             if size > settings.source_max_bytes:
                 raise ValueError("Source response is too large")
             chunks.append(chunk)
-        return b"".join(chunks), content_type
+        payload = b"".join(chunks)
+        if return_url:
+            return payload, content_type, current_url
+        return payload, content_type
     raise ValueError("Source returned too many redirects")
 
 
-async def fetch_bytes(url: str, allow_goodreads_http=False, client=None):
+async def fetch_bytes(url: str, allow_goodreads_http=False, client=None, *, return_url=False):
     if client is not None:
-        return await _fetch_bytes_with_client(client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            client, url, allow_goodreads_http, return_url=return_url
+        )
     async with _source_client() as owned_client:
-        return await _fetch_bytes_with_client(owned_client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            owned_client, url, allow_goodreads_http, return_url=return_url
+        )
+
+
+async def _call_fetch_bytes(url: str, *, client=None):
+    params = inspect.signature(fetch_bytes).parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    kwargs = {}
+    if client is not None and ("client" in params or accepts_kwargs):
+        kwargs["client"] = client
+    if "return_url" in params:
+        kwargs["return_url"] = True
+    result = await fetch_bytes(url, **kwargs)
+    if isinstance(result, tuple) and len(result) == 3:
+        return result
+    content, content_type = result
+    return content, content_type, str(url)
 
 
 def _goodreads_tooltip_params(resource_ids):
@@ -1929,23 +2105,57 @@ def _clean_parsed_subjects(items):
     ]
 
 
-async def _fetch_and_parse_source(url):
+async def _fetch_and_parse_source(url, *, include_resolved_url=False):
     request_url = _nyt_request_url(_apple_artwork_request_url(url))
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
-            content, content_type = await fetch_bytes(url, client=client)
+            content, content_type, _ = await _call_fetch_bytes(url, client=client)
             items = parse_book_items(content, content_type, url)
             items = await enrich_goodreads_blog_items(items, client)
-            return content_type, _clean_parsed_subjects(items)
+            cleaned = _clean_parsed_subjects(items)
+            return (content_type, cleaned, url) if include_resolved_url else (content_type, cleaned)
+    used_transformed_url = request_url != url
     try:
-        content, content_type = await fetch_bytes(request_url)
+        content, content_type, final_url = await _call_fetch_bytes(request_url)
     except (httpx.HTTPError, ValueError):
         if request_url == url:
             raise
-        content, content_type = await fetch_bytes(url)
-    return content_type, _clean_parsed_subjects(
-        parse_book_items(content, content_type, url)
-    )
+        used_transformed_url = False
+        content, content_type, final_url = await _call_fetch_bytes(url)
+    items = _clean_parsed_subjects(parse_book_items(content, content_type, url))
+    page_url = url if used_transformed_url else final_url
+    if not items and _should_discover_html_feeds(content, content_type, url):
+        candidates = discover_feed_urls(content, page_url, original_url=url)
+        if candidates:
+            fetched_feeds = 0
+            async with _source_client() as client:
+                for candidate_url in candidates[:SOURCE_MAX_DISCOVERED_CANDIDATES]:
+                    if fetched_feeds >= SOURCE_MAX_DISCOVERED_FEEDS:
+                        break
+                    try:
+                        validate_public_url(candidate_url)
+                    except ValueError:
+                        continue
+                    fetched_feeds += 1
+                    try:
+                        feed_content, feed_content_type, feed_final_url = await _call_fetch_bytes(
+                            candidate_url, client=client
+                        )
+                    except (httpx.HTTPError, ValueError):
+                        continue
+                    if not _is_feed_response(feed_content, feed_content_type):
+                        continue
+                    resolved_feed_url = _strip_url_fragment(feed_final_url) or candidate_url
+                    feed_items = _clean_parsed_subjects(
+                        parse_book_items(feed_content, feed_content_type, resolved_feed_url)
+                    )
+                    if feed_items:
+                        return (
+                            (feed_content_type, feed_items, resolved_feed_url)
+                            if include_resolved_url
+                            else (feed_content_type, feed_items)
+                        )
+    return (content_type, items, url) if include_resolved_url else (content_type, items)
 
 def validate_goodreads_rss_url(url: str) -> str:
     try:
@@ -2355,13 +2565,53 @@ def _generic_container_cover(container, source_url):
     return ""
 
 
+def _container_has_cover_candidate(container):
+    if not container:
+        return False
+    attributes = (
+        "data-lazy-src",
+        "data-src",
+        "data-original",
+        "data-srcset",
+        "src",
+        "srcset",
+        "content",
+    )
+    for node in container.select(
+        "img, [itemprop='image'], meta[property='og:image'], meta[name='twitter:image']"
+    ):
+        for attribute in attributes:
+            image = node.get(attribute)
+            if not image:
+                continue
+            if "srcset" in attribute:
+                image = image.split(",", 1)[0].strip().split(" ", 1)[0]
+            if image and not image.startswith("data:"):
+                return True
+    return False
+
+
 def _generic_card_container(heading):
     for ancestor in heading.parents:
         if not ancestor or ancestor.name in ("body", "html"):
             break
+        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
+        if ancestor.name == "td" and "starredreview-grid" in classes:
+            row_node = ancestor.find_parent("tr")
+            shares_row = bool(
+                row_node
+                and (
+                    len(row_node.select("td.starredreview-grid")) > 1
+                    or any(
+                        cell is not ancestor and cell.select_one("h1, h2, h3, h4")
+                        for cell in row_node.find_all(["td", "th"], recursive=False)
+                    )
+                )
+            )
+            if _container_has_cover_candidate(ancestor) or shares_row:
+                return ancestor
         if ancestor.name == "tr" and ancestor.select_one("td.starredreview-grid"):
             return ancestor
-        classes = {str(value).casefold() for value in (ancestor.get("class") or [])}
         itemtype = str(ancestor.get("itemtype") or "").casefold()
         if ancestor.name in ("article", "li") or "book" in itemtype or classes.intersection(
             {"book", "book-card", "book-item", "book-listing", "book-blurb", "card", "listing"}
@@ -2438,26 +2688,66 @@ def _parse_generic_book_cards(soup, source_url):
     return items
 
 
-def _generic_author_from_line(value):
+_GENERIC_CTA_PARAGRAPH_RE = re.compile(
+    r"(?:(?:read|see|view)\s+(?:the\s+)?)?"
+    r"(?:(?:complete|full|entire)\s+(?:review|article|story)|review|more|read\s+more|"
+    r"continue(?:\s+reading)?|more\s+info(?:rmation)?|learn\s+more|details|full\s+synopsis)"
+    r"[\s.!?:;»›→>…-]*",
+    re.I,
+)
+_GENERIC_METADATA_ISBN_TOKEN_RE = re.compile(
+    r"(?:97[89](?:[-\s]?[0-9]){10}|(?:[0-9][-\s]?){9}[0-9Xx])\b"
+)
+
+
+def _is_generic_cta_paragraph(value):
+    text = _clean_text(value, 200)
+    return bool(text and _GENERIC_CTA_PARAGRAPH_RE.fullmatch(text))
+
+
+def _generic_heading_pair_description(node):
+    if not node or node.name != "p":
+        return ""
+    description = _clean_text(node, 4000)
+    if not description or _is_generic_cta_paragraph(description):
+        return ""
+    links = node.find_all("a")
+    if links:
+        trailing_cta = _clean_text(links[-1], 200)
+        if _is_generic_cta_paragraph(trailing_cta) and description.endswith(trailing_cta):
+            description = description[: -len(trailing_cta)].strip()
+    return description
+
+
+def _generic_metadata_from_line(value):
     text = _clean_text(value, 600)
     if not text:
-        return ""
+        return "", ""
     leading_by = bool(re.match(r"^(?:by|written\s+by|author)\s+", text, re.I))
     text = re.sub(r"^(?:by|written\s+by|author)\s*:?[\s]+", "", text, flags=re.I).strip()
-    isbn_match = re.search(r"\bISBN(?:-\d+)?\s*[:#]?\s*[0-9Xx][0-9Xx -]{8,17}", text, re.I)
+    isbn_match = re.search(r"\bISBN(?:-\d+)?\s*[:#]?\s*([0-9Xx][0-9Xx -]{8,17})", text, re.I)
     if isbn_match:
-        text = text[: isbn_match.start()].strip(" .,-")
+        token_match = _GENERIC_METADATA_ISBN_TOKEN_RE.search(text[isbn_match.start(1) :])
+        raw_isbn = token_match.group(0) if token_match else isbn_match.group(1)
+        isbn13, isbn10 = isbn_parts(raw_isbn)
+        isbn = isbn10 or isbn13
+        text = text[: isbn_match.start()].strip(" .,-(;:")
         price_match = re.search(r"\s[$€£]\s*[\d,.]+", text)
         if price_match:
-            text = text[: price_match.start()].strip(" .,-")
+            text = text[: price_match.start()].strip(" .,-(;:")
         parts = re.split(r"\.\s+", text, maxsplit=1)
-        return _clean_text(parts[0], 300) if parts else ""
+        return (_clean_text(parts[0], 300) if parts else ""), isbn
     parenthesized = re.fullmatch(r"(.+?)\s+\([^()]+\)", text)
     if parenthesized:
-        return _clean_text(parenthesized.group(1), 300)
+        return _clean_text(parenthesized.group(1), 300), ""
     if leading_by and text:
-        return _clean_text(text, 300)
-    return ""
+        return _clean_text(text, 300), ""
+    return "", ""
+
+
+def _generic_author_from_line(value):
+    author, _ = _generic_metadata_from_line(value)
+    return author
 
 
 def _parse_generic_heading_pairs(soup, source_url):
@@ -2483,12 +2773,12 @@ def _parse_generic_heading_pairs(soup, source_url):
             continue
         if metadata and metadata.name == heading.name and heading.name in ("h1", "h2", "h3"):
             continue
-        author = _generic_author_from_line(metadata.get_text(" ", strip=True) if metadata else "")
+        author, isbn = _generic_metadata_from_line(metadata.get_text(" ", strip=True) if metadata else "")
         if not title or not author:
             continue
         href = link.get("href", "") if link else ""
         description_node = metadata.find_next_sibling() if metadata else None
-        description = _clean_text(description_node, 4000) if description_node and description_node.name == "p" else ""
+        description = _generic_heading_pair_description(description_node)
         _merge_book_item(
             items,
             {
@@ -2497,6 +2787,7 @@ def _parse_generic_heading_pairs(soup, source_url):
                 "description": description,
                 "cover_url": _generic_container_cover(book_container, source_url),
                 "source_url": metadata_url(urljoin(source_url, href), source_url),
+                "isbn": isbn,
                 "release_date": None,
                 "date_kind": "",
                 "genres": [],
@@ -2516,8 +2807,129 @@ def _parse_generic_html(soup, source_url):
             break
     return items[: settings.source_max_items]
 
+def _strip_url_fragment(url: str) -> str:
+    try:
+        return str(httpx.URL(str(url)).copy_with(fragment=None))
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+
+
+def _comparable_url_key(url: str) -> str:
+    try:
+        parsed = httpx.URL(str(url)).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    return str(parsed.copy_with(path=parsed.path or "/"))
+
+
+def _canonical_feed_candidate_url(raw_href: str, base_url: str) -> str:
+    href = str(raw_href or "").strip()
+    if not href:
+        return ""
+    try:
+        resolved = httpx.URL(str(base_url)).join(href).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    if resolved.scheme != "https" or not resolved.host or resolved.username or resolved.password:
+        return ""
+    # httpx reports the scheme default (443) as None; a page author must not be
+    # able to point discovery at an arbitrary port on a public host.
+    if resolved.port is not None:
+        return ""
+    host = resolved.host.lower().rstrip(".")
+    if host in BLOCKED_HOSTS or host.endswith(".local"):
+        return ""
+    if host == "api.nytimes.com" and any(
+        key.casefold() == "api-key" for key, _ in resolved.params.multi_items()
+    ):
+        return ""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        return ""
+    return str(resolved)
+
+
+def _is_feed_response(content: bytes, content_type: str) -> bool:
+    lowered_type = str(content_type or "").lower()
+    stripped = content.lstrip()
+    if stripped.startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:")):
+        return True
+    if "xhtml" in lowered_type:
+        return False
+    return any(kind in lowered_type for kind in ("xml", "rss", "atom"))
+
+
+def _should_discover_html_feeds(content: bytes, content_type: str, source_url: str) -> bool:
+    if (
+        _is_goodreads_blog_source(source_url)
+        or _source_matches(source_url, "goodreads.com", "/genres/")
+        or _source_matches(source_url, "www.goodreads.com", "/genres/")
+    ):
+        return False
+    lowered_type = str(content_type or "").lower()
+    if "html" not in lowered_type:
+        return False
+    return not _is_feed_response(content, content_type)
+
+
+def discover_feed_urls(content: bytes, page_url: str, original_url: str = "") -> list[str]:
+    """Extract alternate RSS and Atom feed URLs per the RSS Autodiscovery spec."""
+    soup = BeautifulSoup(content, "html.parser")
+    excluded = {
+        key
+        for key in (_comparable_url_key(page_url), _comparable_url_key(original_url))
+        if key
+    }
+    primary_feeds: list[str] = []
+    comment_feeds: list[str] = []
+    for link in soup.find_all("link", href=True):
+        raw_rel = link.get("rel")
+        rels = {
+            part.casefold()
+            for part in (
+                raw_rel if isinstance(raw_rel, (list, tuple)) else str(raw_rel or "").split()
+            )
+            if part
+        }
+        if "alternate" not in rels or "stylesheet" in rels:
+            continue
+        mime_type = str(link.get("type") or "").split(";", 1)[0].strip().casefold()
+        if mime_type not in FEED_AUTODISCOVERY_TYPES:
+            continue
+        candidate = _canonical_feed_candidate_url(link.get("href", ""), page_url)
+        if not candidate:
+            continue
+        if _comparable_url_key(candidate) in excluded:
+            continue
+        parsed = urlparse(candidate)
+        title = str(link.get("title") or "")
+        is_comment = bool(
+            COMMENT_FEED_RE.search(title)
+            or COMMENT_FEED_RE.search(f"{parsed.path}?{parsed.query}")
+        )
+        (comment_feeds if is_comment else primary_feeds).append(candidate)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in [*primary_feeds, *comment_feeds]:
+        key = _comparable_url_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
+
+
 def parse_book_items(content: bytes, content_type: str, source_url: str):
-    if "xml" in content_type or "rss" in content_type or content.lstrip().startswith(b"<?xml"):
+    lowered_type = str(content_type or "").lower()
+    if (
+        "xml" in lowered_type
+        or "rss" in lowered_type
+        or "atom" in lowered_type
+        or content.lstrip().startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:"))
+    ):
         feed = feedparser.parse(content)
         if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
@@ -2527,7 +2939,10 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
                     "title": str(e.get("title", ""))[:500],
                     "author": str(e.get("author", "Unknown author"))[:300],
                     "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000],
-                    "source_url": metadata_url(e.get("link"), source_url),
+                    "source_url": metadata_url(
+                        urljoin(source_url, str(e.get("link"))) if e.get("link") else "",
+                        source_url,
+                    ),
                 },
                 [e.get(key) for key in ("isbn13", "isbn10", "isbn")],
             )
@@ -2536,7 +2951,7 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         ]
     payloads = []
     soup = None
-    if "json" in content_type or "javascript" in content_type:
+    if "json" in lowered_type or "javascript" in lowered_type:
         try: payloads = [json.loads(content)]
         except (json.JSONDecodeError, UnicodeDecodeError): return []
         payload = payloads[0]
@@ -3061,21 +3476,92 @@ def _persist_metadata_field_provenance(
     )
 
 
+_TRANSIENT_METADATA_TRACE_STATUSES = frozenset(
+    {
+        "rate_limited",
+        "server_error",
+        "request_error",
+        "timeout",
+        "provider_unavailable",
+    }
+)
+
+
+def _trace_failure_is_transient(trace: dict) -> bool:
+    status = trace.get("status")
+    if status in _TRANSIENT_METADATA_TRACE_STATUSES:
+        return True
+    if status in {"credential_error", "http_error"}:
+        return False
+    http_status = trace.get("http_status")
+    return isinstance(http_status, int) and (
+        http_status in {408, 429} or http_status >= 500
+    )
+
+
+def _candidate_metadata_retry_status(item: dict) -> str:
+    provenance = item.get("_metadata_provenance")
+    if not isinstance(provenance, dict):
+        return ""
+    traces = provenance.get("fetch_trace")
+    if not isinstance(traces, list):
+        return ""
+    has_transient = False
+    has_google_transient = False
+    has_google_credential_error = False
+    for trace in traces:
+        if not isinstance(trace, dict):
+            continue
+        is_google = trace.get("provider") == "google_books"
+        if _trace_failure_is_transient(trace):
+            has_transient = True
+            if is_google:
+                has_google_transient = True
+            continue
+        http_status = trace.get("http_status")
+        if is_google and (
+            trace.get("status") == "credential_error"
+            or (isinstance(http_status, int) and http_status in {400, 401, 403})
+        ):
+            has_google_credential_error = True
+    if has_google_transient:
+        return "google_books_transient"
+    if has_transient:
+        return "transient"
+    if has_google_credential_error:
+        return "google_books_error"
+    return ""
+
+
+def _candidate_metadata_failure_is_transient(item: dict) -> bool:
+    return _candidate_metadata_retry_status(item) in {
+        "transient",
+        "google_books_transient",
+    }
+
+
 def candidate_metadata_refresh_remaining(
     retry_days: int = CANDIDATE_METADATA_RETRY_DAYS,
+    *,
+    now: datetime | None = None,
 ) -> int:
     """Count accepted candidates due for a sparse-field or version refresh."""
 
-    now = datetime.now(timezone.utc)
-    retry_before = (now - timedelta(days=max(1, int(retry_days)))).isoformat(
-        timespec="seconds"
-    )
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    retry_before = (
+        reference_time - timedelta(days=max(1, int(retry_days)))
+    ).isoformat(timespec="seconds")
     cover_retry_days = min(
         max(1, int(retry_days)), CANDIDATE_METADATA_COVER_RETRY_DAYS
     )
-    cover_retry_before = (now - timedelta(days=cover_retry_days)).isoformat(
-        timespec="seconds"
-    )
+    cover_retry_before = (
+        reference_time - timedelta(days=cover_retry_days)
+    ).isoformat(timespec="seconds")
+    transient_retry_before = (
+        reference_time - timedelta(hours=CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS)
+    ).isoformat(timespec="seconds")
     result = row(
         """SELECT COUNT(*) AS count FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
@@ -3091,6 +3577,7 @@ def candidate_metadata_refresh_remaining(
             q.metadata_version!=?
             OR q.metadata_checked_at IS NULL
             OR q.metadata_checked_at<=CASE
+              WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ?
               WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%'
                 OR c.cover_url LIKE 'https://placehold.co/%'
               THEN ? ELSE ? END
@@ -3098,6 +3585,7 @@ def candidate_metadata_refresh_remaining(
         (
             METADATA_NORMALIZATION_VERSION,
             METADATA_NORMALIZATION_VERSION,
+            transient_retry_before,
             cover_retry_before,
             retry_before,
         ),
@@ -3105,11 +3593,14 @@ def candidate_metadata_refresh_remaining(
     return int(result["count"] if result else 0)
 
 
-async def refresh_missing_candidate_metadata():
+async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
     """Backfill sparse metadata for catalog-accepted candidates only."""
 
     normalize_stored_candidate_subjects()
     normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
@@ -3125,7 +3616,9 @@ async def refresh_missing_candidate_metadata():
         "OR cover_url LIKE 'https://placehold.co/%' OR description='' OR release_date IS NULL "
         "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
         "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR "
-        "q.metadata_checked_at<=CASE WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
+        "q.metadata_checked_at<=CASE "
+        "WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ? "
+        "WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
         "OR c.cover_url LIKE 'https://placehold.co/%' THEN ? ELSE ? END) "
         "ORDER BY CASE WHEN q.metadata_version!=? THEN 0 ELSE 1 END,"
         "q.metadata_checked_at ASC,c.score DESC,c.id LIMIT ?",
@@ -3133,11 +3626,15 @@ async def refresh_missing_candidate_metadata():
             METADATA_NORMALIZATION_VERSION,
             METADATA_NORMALIZATION_VERSION,
             (
-                datetime.now(timezone.utc)
+                reference_time
+                - timedelta(hours=CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS)
+            ).isoformat(timespec="seconds"),
+            (
+                reference_time
                 - timedelta(days=CANDIDATE_METADATA_COVER_RETRY_DAYS)
             ).isoformat(timespec="seconds"),
             (
-                datetime.now(timezone.utc)
+                reference_time
                 - timedelta(days=CANDIDATE_METADATA_RETRY_DAYS)
             ).isoformat(timespec="seconds"),
             METADATA_NORMALIZATION_VERSION,
@@ -3246,15 +3743,37 @@ async def refresh_missing_candidate_metadata():
                         default_provider_id=metadata_provider_id,
                         default_confidence=1.0,
                     )
+            effective_description = (
+                description
+                if (not previous.get("description") and description) or description_upgrade
+                else (previous.get("description") or "")
+            )
+            effective_cover = (
+                cover_url if cover_changed else (previous.get("cover_url") or "")
+            )
+            effective_release_date = previous.get("release_date") or release_date
+            still_sparse = bool(
+                not effective_cover
+                or is_weak_cover_url(effective_cover)
+                or str(effective_cover).startswith("https://placehold.co/")
+                or not effective_description
+                or not effective_release_date
+                or not genres
+            )
+            metadata_retry_status = (
+                _candidate_metadata_retry_status(item) if still_sparse else ""
+            )
             con.execute(
                 """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,
+                    metadata_retry_status=?,
                     metadata_provider=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider END,
                     metadata_provider_id=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider_id END,
                     updated_at=CURRENT_TIMESTAMP
                     WHERE candidate_id=? AND quality_status='accepted'""",
                 (
-                    datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    reference_time.isoformat(timespec="microseconds"),
                     METADATA_NORMALIZATION_VERSION,
+                    metadata_retry_status,
                     int(description_changed),
                     metadata_provider,
                     metadata_provider,
@@ -3262,16 +3781,221 @@ async def refresh_missing_candidate_metadata():
                     metadata_provider_id,
                     metadata_provider_id,
                     item["id"],
-                )
+                ),
             )
     return changed + normalized_catalog_dates
 
 
+def _parse_utc_timestamp(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _scan_item_needs_enrichment(item):
+    cover_url = str(item.get("cover_url") or "")
+    has_cover = bool(cover_url and not is_weak_cover_url(cover_url))
+    return not (
+        _clean_text(item.get("description"), 4000)
+        and has_cover
+        and str(item.get("release_date") or "").strip()
+        and _stored_genre_values(item.get("genres"))
+    )
+
+
+def _scan_item_due_for_enrichment(
+    item,
+    stored=None,
+    *,
+    now: datetime | None = None,
+    has_new_source_isbn: bool = False,
+) -> bool:
+    if not _scan_item_needs_enrichment(item):
+        return False
+    if has_new_source_isbn or not stored:
+        return True
+    if str(stored.get("metadata_version") or "") != METADATA_NORMALIZATION_VERSION:
+        return True
+    checked_at = _parse_utc_timestamp(stored.get("metadata_checked_at"))
+    if checked_at is None:
+        return True
+    reference_now = now or datetime.now(timezone.utc)
+    cover_url = str(item.get("cover_url") or "")
+    has_cover = bool(cover_url and not is_weak_cover_url(cover_url))
+    retry_days = (
+        CANDIDATE_METADATA_RETRY_DAYS
+        if has_cover
+        else min(CANDIDATE_METADATA_RETRY_DAYS, CANDIDATE_METADATA_COVER_RETRY_DAYS)
+    )
+    return checked_at <= reference_now - timedelta(days=max(1, int(retry_days)))
+
+
+def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: str | None = None):
+    for item in batch_items:
+        key = normalize_key(item["title"], item.get("author", "Unknown author"))
+        isbn13, isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        existing = con.execute(
+            "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+            (key,),
+        ).fetchone()
+        genres = normalize_subjects(
+            _stored_genre_values(existing["genres"] if existing else [])
+            + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
+            limit=METADATA_GENRE_LIMIT,
+        )
+        genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
+        con.execute(
+            """INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
+            description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
+            cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
+            source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
+            release_date=COALESCE(excluded.release_date, release_date),
+            date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
+            genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
+            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
+            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
+            updated_at=CURRENT_TIMESTAMP""",
+            (
+                item["title"],
+                item.get("author", "Unknown author"),
+                item.get("description", ""),
+                item.get("cover_url", ""),
+                item.get("source_url", source["url"]),
+                source["id"],
+                item.get("release_date"),
+                item.get("date_kind", "source"),
+                genres_json,
+                isbn13,
+                isbn10,
+                key,
+            ),
+        )
+        candidate = con.execute(
+            "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+            (key,),
+        ).fetchone()
+        if candidate:
+            description_added = bool(
+                item.get("description")
+                and not (existing["description"] if existing else "")
+                and candidate["description"] == item.get("description")
+            )
+            cover_added = bool(
+                item.get("cover_url")
+                and not is_weak_cover_url(item.get("cover_url"))
+                and candidate["cover_url"] == item.get("cover_url")
+                and (not existing or existing["cover_url"] != candidate["cover_url"])
+            )
+            release_added = bool(
+                item.get("release_date")
+                and not (existing["release_date"] if existing else "")
+                and candidate["release_date"] == item.get("release_date")
+            )
+            previous_genres = _stored_genre_values(existing["genres"] if existing else [])
+            genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
+            source_fields = set(item.get("_source_provided_fields", []))
+            source_provenance = {
+                "metadata_provenance": {
+                    "fields": {
+                        field: {
+                            "provider": "source",
+                            "provider_id": str(source["id"]),
+                            "kind": "source_item",
+                        }
+                        for field in source_fields
+                    },
+                    "source_payloads": [],
+                }
+            }
+            contributed = {
+                "description": description_added,
+                "cover_url": cover_added,
+                "release_date": release_added,
+                "genres": genres_added,
+            }
+            for field, applied in contributed.items():
+                if not applied:
+                    continue
+                source_provided = field in source_fields and not (
+                    field == "cover_url" and item.get("_cover_url_provider")
+                )
+                if source_provided:
+                    _persist_metadata_field_provenance(
+                        con,
+                        "candidate",
+                        int(candidate["id"]),
+                        field,
+                        source_provenance,
+                        default_provider="source",
+                        default_provider_id=str(source["id"]),
+                        default_confidence=1.0,
+                    )
+                _persist_metadata_field_provenance(
+                    con,
+                    "candidate",
+                    int(candidate["id"]),
+                    field,
+                    item,
+                )
+        if candidate and (isbn13 or isbn10):
+            con.execute(
+                """UPDATE candidate_quality SET
+                    isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
+                    isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=?""",
+                (isbn13, isbn10, candidate["id"]),
+            )
+        if candidate and checked_at:
+            con.execute(
+                """UPDATE candidate_quality SET
+                    metadata_checked_at=?,
+                    metadata_version=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=?""",
+                (checked_at, METADATA_NORMALIZATION_VERSION, candidate["id"]),
+            )
+        isbn_added = bool(
+            (isbn13 and not (existing["isbn13"] if existing else ""))
+            or (isbn10 and not (existing["isbn10"] if existing else ""))
+        )
+        if existing and isbn_added:
+            # A newly discovered ISBN is evidence for a retry, not proof
+            # of identity. Requeue only quarantined rows; accepted rows
+            # remain untouched and therefore cannot change ranking here.
+            con.execute(
+                """UPDATE candidate_quality SET quality_status='pending',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE candidate_id=? AND quality_status='quarantine'""",
+                (candidate["id"],),
+            )
+
+
 async def preview_source(url, filters=None):
-    content_type, items = await _fetch_and_parse_source(url)
+    params = inspect.signature(_fetch_and_parse_source).parameters
+    if "include_resolved_url" in params:
+        content_type, items, resolved_url = await _fetch_and_parse_source(
+            url, include_resolved_url=True
+        )
+    else:
+        content_type, items = await _fetch_and_parse_source(url)
+        resolved_url = url
     filtered = filter_source_items(items, filters)
     return {
-        "url": url,
+        "url": resolved_url,
         "content_type": content_type,
         "count": len(filtered),
         "raw_count": len(items),
@@ -3306,42 +4030,54 @@ async def scan_source(source):
     else:
         possible = filter_source_items(cleaned, configured_filters)
 
-    # A prior scan or quality pass may already know an ISBN even when the
-    # current feed item omits it. Carry that identifier into catalog cover
-    # verification before deciding whether the source image is trustworthy.
+    # A prior scan or quality pass may already know identifiers and catalog
+    # fields that the current feed omits. Hydrate stored metadata first and
+    # skip recently checked items so warm scans do not repeat sparse lookups.
+    scan_started_at = datetime.now(timezone.utc)
     possible_keys = list(
         dict.fromkeys(
             normalize_key(item["title"], item.get("author", "Unknown author"))
             for item in possible
         )
     )
-    known_isbns = {}
+    stored_candidates = {}
     for start in range(0, len(possible_keys), 400):
         key_batch = possible_keys[start : start + 400]
         if not key_batch:
             continue
         placeholders = ",".join("?" for _ in key_batch)
         for candidate in rows(
-            "SELECT c.normalized_key,"
+            "SELECT c.normalized_key,c.description,c.cover_url,c.release_date,c.date_kind,c.genres,"
             "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10 "
+            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
+            "q.metadata_checked_at,q.metadata_version "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             f"WHERE c.normalized_key IN ({placeholders})",
             tuple(key_batch),
         ):
-            known_isbns[candidate["normalized_key"]] = (
-                candidate.get("isbn13", ""),
-                candidate.get("isbn10", ""),
-            )
+            stored_candidates[candidate["normalized_key"]] = candidate
+    due_for_enrichment_ids = set()
     for item_index, item in enumerate(possible):
-        known_isbn13, known_isbn10 = known_isbns.get(
+        item["_scan_enrichment_id"] = item_index
+        item["_source_provided_fields"] = [
+            field for field in ("description", "cover_url", "release_date", "genres")
+            if item.get(field)
+        ]
+        item["_source_provider_id"] = str(source["id"])
+        stored = stored_candidates.get(
             normalize_key(item["title"], item.get("author", "Unknown author")),
-            ("", ""),
+            {},
         )
-        known_isbn13, known_isbn10 = isbn_parts(known_isbn13, known_isbn10)
+        known_isbn13, known_isbn10 = isbn_parts(
+            stored.get("isbn13", ""),
+            stored.get("isbn10", ""),
+        )
         source_isbn13, source_isbn10 = isbn_parts_from_source(
             [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
             item.get("source_url", source["url"]),
+        )
+        has_new_source_isbn = bool(
+            (source_isbn13 or source_isbn10) and not (known_isbn13 or known_isbn10)
         )
         source_matches_known_isbn = _returned_identifiers_match_read(
             [source_isbn13, source_isbn10], known_isbn13, known_isbn10
@@ -3364,12 +4100,37 @@ async def scan_source(source):
             item["isbn13"] = isbn13
         if isbn10:
             item["isbn10"] = isbn10
-        item["_scan_enrichment_id"] = item_index
-        item["_source_provided_fields"] = [
-            field for field in ("description", "cover_url", "release_date", "genres")
-            if item.get(field)
-        ]
-        item["_source_provider_id"] = str(source["id"])
+        if not _clean_text(item.get("description"), 4000) and _clean_text(stored.get("description"), 4000):
+            item["description"] = stored["description"]
+        if not item.get("release_date") and stored.get("release_date"):
+            item["release_date"] = stored["release_date"]
+            if not item.get("date_kind") and stored.get("date_kind"):
+                item["date_kind"] = stored["date_kind"]
+        stored_genres = _stored_genre_values(stored.get("genres", []))
+        if stored_genres:
+            item["genres"] = normalize_subjects(
+                stored_genres + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
+                limit=METADATA_GENRE_LIMIT,
+            )
+        stored_cover = str(stored.get("cover_url") or "")
+        if stored_cover and not is_weak_cover_url(stored_cover) and (
+            not item.get("cover_url")
+            or is_weak_cover_url(item.get("cover_url"))
+            or not _scan_item_due_for_enrichment(
+                {**item, "cover_url": stored_cover},
+                stored,
+                now=scan_started_at,
+                has_new_source_isbn=has_new_source_isbn,
+            )
+        ):
+            item["cover_url"] = stored_cover
+        if _scan_item_due_for_enrichment(
+            item,
+            stored,
+            now=scan_started_at,
+            has_new_source_isbn=has_new_source_isbn,
+        ):
+            due_for_enrichment_ids.add(item_index)
 
     def enrichment_priority(item):
         isbn13, isbn10 = isbn_parts_from_source(
@@ -3383,154 +4144,81 @@ async def scan_source(source):
             bool(source_cover),
         )
 
-    enrichment_pool = sorted(possible, key=enrichment_priority)
-    publisher_batch = await enrich_penguin_random_house_items(
-        enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
-    )
-    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
-    enriched_by_id = {
-        item["_scan_enrichment_id"]: item
-        for item in enriched_batch
-        if "_scan_enrichment_id" in item
-    }
-    items = [
+    batch_size = max(1, int(SOURCE_METADATA_ENRICHMENT_BATCH_SIZE))
+    max_enrichment_items = batch_size * max(1, int(SOURCE_METADATA_ENRICHMENT_MAX_BATCHES))
+    enrichment_pool = sorted(
+        (
+            item
+            for item in possible
+            if item.get("_scan_enrichment_id") in due_for_enrichment_ids
+        ),
+        key=enrichment_priority,
+    )[:max_enrichment_items]
+    enriched_by_id = {}
+    persisted_enrichment_ids = set()
+    for start in range(0, len(enrichment_pool), batch_size):
+        batch = enrichment_pool[start : start + batch_size]
+        publisher_batch = await enrich_penguin_random_house_items(batch)
+        enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
+        cleaned_chunk = _clean_parsed_subjects(enriched_batch)
+        for source_item, enriched_item in zip(batch, cleaned_chunk):
+            enrichment_id = enriched_item.get(
+                "_scan_enrichment_id", source_item.get("_scan_enrichment_id")
+            )
+            if enrichment_id is not None:
+                enriched_by_id[enrichment_id] = enriched_item
+                persisted_enrichment_ids.add(enrichment_id)
+        chunk_accepted = filter_source_items(cleaned_chunk, configured_filters)
+        if chunk_accepted:
+            chunk_checked_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            chunk_to_persist = [
+                {k: v for k, v in item.items() if k != "_scan_enrichment_id"}
+                for item in chunk_accepted
+            ]
+            with transaction() as con:
+                _persist_scanned_candidate_items(
+                    con,
+                    source,
+                    chunk_to_persist,
+                    checked_at=chunk_checked_at,
+                )
+
+    merged_items = [
         enriched_by_id.get(item.get("_scan_enrichment_id"), item)
         for item in possible
     ]
-    for item in items:
+    unpersisted_items = [
+        {k: v for k, v in item.items() if k != "_scan_enrichment_id"}
+        for item in merged_items
+        if item.get("_scan_enrichment_id") not in persisted_enrichment_ids
+    ]
+    for item in merged_items:
         item.pop("_scan_enrichment_id", None)
-    items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
+    items = filter_source_items(_clean_parsed_subjects(merged_items), configured_filters)
+    remaining_items = filter_source_items(_clean_parsed_subjects(unpersisted_items), configured_filters)
     with transaction() as con:
-        seen = []
-        for item in items:
-            key = normalize_key(item["title"], item.get("author", "Unknown author"))
-            seen.append(key)
-            isbn13, isbn10 = isbn_parts_from_source(
-                [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-                item.get("source_url", source["url"]),
-            )
-            existing = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
-                (key,),
-            ).fetchone()
-            genres = normalize_subjects(
-                _stored_genre_values(existing["genres"] if existing else [])
-                + normalize_subjects(item.get("genres", []), limit=METADATA_GENRE_LIMIT),
-                limit=METADATA_GENRE_LIMIT,
-            )
-            genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
-            con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
-            description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
-            cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
-            source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
-            release_date=COALESCE(excluded.release_date, release_date),
-            date_kind=CASE WHEN excluded.release_date IS NOT NULL AND release_date IS NULL THEN excluded.date_kind ELSE date_kind END,
-            genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
-            isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
-            isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
-            candidate = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
-                (key,),
-            ).fetchone()
-            if candidate:
-                description_added = bool(
-                    item.get("description")
-                    and not (existing["description"] if existing else "")
-                    and candidate["description"] == item.get("description")
-                )
-                cover_added = bool(
-                    item.get("cover_url")
-                    and not is_weak_cover_url(item.get("cover_url"))
-                    and candidate["cover_url"] == item.get("cover_url")
-                    and (not existing or existing["cover_url"] != candidate["cover_url"])
-                )
-                release_added = bool(
-                    item.get("release_date")
-                    and not (existing["release_date"] if existing else "")
-                    and candidate["release_date"] == item.get("release_date")
-                )
-                previous_genres = _stored_genre_values(existing["genres"] if existing else [])
-                genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
-                source_fields = set(item.get("_source_provided_fields", []))
-                source_provenance = {
-                    "metadata_provenance": {
-                        "fields": {
-                            field: {
-                                "provider": "source",
-                                "provider_id": str(source["id"]),
-                                "kind": "source_item",
-                            }
-                            for field in source_fields
-                        },
-                        "source_payloads": [],
-                    }
-                }
-                contributed = {
-                    "description": description_added,
-                    "cover_url": cover_added,
-                    "release_date": release_added,
-                    "genres": genres_added,
-                }
-                for field, applied in contributed.items():
-                    if not applied:
-                        continue
-                    source_provided = field in source_fields and not (
-                        field == "cover_url" and item.get("_cover_url_provider")
-                    )
-                    if source_provided:
-                        _persist_metadata_field_provenance(
-                            con,
-                            "candidate",
-                            int(candidate["id"]),
-                            field,
-                            source_provenance,
-                            default_provider="source",
-                            default_provider_id=str(source["id"]),
-                            default_confidence=1.0,
-                        )
-                    _persist_metadata_field_provenance(
-                        con,
-                        "candidate",
-                        int(candidate["id"]),
-                        field,
-                        item,
-                    )
-            if candidate and (isbn13 or isbn10):
-                con.execute(
-                    """UPDATE candidate_quality SET
-                        isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
-                        isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE candidate_id=?""",
-                    (isbn13, isbn10, candidate["id"]),
-                )
-            isbn_added = bool(
-                (isbn13 and not (existing["isbn13"] if existing else ""))
-                or (isbn10 and not (existing["isbn10"] if existing else ""))
-            )
-            if existing and isbn_added:
-                # A newly discovered ISBN is evidence for a retry, not proof
-                # of identity. Requeue only quarantined rows; accepted rows
-                # remain untouched and therefore cannot change ranking here.
-                con.execute(
-                    """UPDATE candidate_quality SET quality_status='pending',
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE candidate_id=? AND quality_status='quarantine'""",
-                    (candidate["id"],),
-                )
+        _persist_scanned_candidate_items(con, source, remaining_items)
+        seen = [
+            normalize_key(item["title"], item.get("author", "Unknown author"))
+            for item in items
+        ]
         if seen:
             placeholders = ",".join("?" for _ in seen)
-            con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
-        elif raw_count:
             con.execute(
-                "DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended')",
-                (source["id"],),
+                f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})",
+                (source["id"], *seen),
             )
-        # An empty response can be a transient block page, parser mismatch,
-        # or upstream outage. It is not safe to interpret it as proof that a
-        # source no longer contains any books, so retain existing candidates.
-        status = f"ok:{len(items)}" if items else "empty:0"
-        con.execute("UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP WHERE id=?", (status, source["id"]))
+            con.execute(
+                "UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"ok:{len(items)}", source["id"]),
+            )
+        else:
+            # An empty upstream response or a zero-match filter run must not
+            # delete previously discovered candidates or overwrite the age of
+            # the last good scan.
+            status = "filtered:0" if raw_count else "empty:0"
+            con.execute(
+                "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, source["id"]),
+            )
     return len(items)

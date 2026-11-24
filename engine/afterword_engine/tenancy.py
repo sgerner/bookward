@@ -8,12 +8,17 @@ import re
 from .config import settings
 
 _profile_id: ContextVar[str | None] = ContextVar("bookward_profile_id", default=None)
+_session_id: ContextVar[str | None] = ContextVar("bookward_session_id", default=None)
 _database_override: ContextVar[Path | None] = ContextVar("bookward_database_override", default=None)
 _PROFILE_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
 def current_profile_id() -> str | None:
     return _profile_id.get()
+
+
+def current_session_id() -> str | None:
+    return _session_id.get()
 
 
 @contextmanager
@@ -23,6 +28,15 @@ def profile_scope(profile_id: str):
         yield
     finally:
         _profile_id.reset(token)
+
+
+@contextmanager
+def session_scope(session_id: str | None):
+    token = _session_id.set(session_id or None)
+    try:
+        yield
+    finally:
+        _session_id.reset(token)
 
 
 def profile_database_path(profile_id: str | None = None) -> Path:

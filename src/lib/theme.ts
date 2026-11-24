@@ -52,6 +52,44 @@ export type ThemeSwatch = {
 	tertiary: string;
 };
 
+export type ThemeColors = {
+	light: string;
+	dark: string;
+};
+
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+
+/**
+ * Resolved light/dark root background hex pairs (`--color-root-bg-light` and
+ * `--color-root-bg-dark`) for `<meta name="theme-color">`.
+ */
+export const THEME_COLORS: Record<SkeletonThemeName, ThemeColors> = {
+	catppuccin: { light: '#ffffff', dark: '#1e1e2e' },
+	cerberus: { light: '#fcfcfc', dark: '#121212' },
+	concord: { light: '#ffffff', dark: '#2b2b30' },
+	crimson: { light: '#ffffff', dark: '#0c0e17' },
+	dracula: { light: '#f5f8ff', dark: '#292b36' },
+	fennec: { light: '#b9c0bc', dark: '#212227' },
+	hamlindigo: { light: '#ffffff', dark: '#293247' },
+	legacy: { light: '#ffffff', dark: '#1f2741' },
+	mint: { light: '#89a89b', dark: '#1d3d36' },
+	modern: { light: '#e0e0fe', dark: '#292e6e' },
+	mona: { light: '#ffffff', dark: '#141d2b' },
+	nosh: { light: '#f7f7f7', dark: '#030303' },
+	nouveau: { light: '#fbf7fe', dark: '#070010' },
+	pine: { light: '#d8dbd4', dark: '#1d2218' },
+	reign: { light: '#cacaca', dark: '#3c3c3c' },
+	rocket: { light: '#ffffff', dark: '#2c3645' },
+	rose: { light: '#f7f2f9', dark: '#252228' },
+	rosepine: { light: '#f9f4ee', dark: '#181625' },
+	sahara: { light: '#fbe9ed', dark: '#66202c' },
+	seafoam: { light: '#cbf1f7', dark: '#1f4052' },
+	terminus: { light: '#fcfcfc', dark: '#131313' },
+	vintage: { light: '#e3e3e3', dark: '#181410' },
+	vox: { light: '#e7e3f9', dark: '#3b2a51' },
+	wintry: { light: '#ffffff', dark: '#091224' },
+};
+
 /**
  * Small preview tokens for the picker. These are intentionally separate from
  * the deferred theme styles: the picker can show every palette without
@@ -119,19 +157,43 @@ const themeLoads = new Map<SkeletonThemeName, Promise<void>>([
 	[DEFAULT_THEME, Promise.resolve()],
 ]);
 
+function extractStylesheet(theme: SkeletonThemeName, module: unknown): string | null {
+	const stylesheet = typeof module === 'string'
+		? module
+		: (module as { default?: unknown } | null | undefined)?.default;
+	if (typeof stylesheet !== 'string' || !stylesheet) return null;
+	return stylesheet.replace(
+		`[data-theme="${theme}"]`,
+		`:root[data-theme="${theme}"], [data-theme="${theme}"]`,
+	);
+}
+
+/** Resolve raw CSS text for non-default themes during SSR. */
+export async function loadThemeCss(theme: SkeletonThemeName): Promise<string | null> {
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	if (nextTheme === DEFAULT_THEME) return null;
+	return extractStylesheet(nextTheme, await THEME_LOADERS[nextTheme]());
+}
+
 /** Load a palette stylesheet once before applying its data-theme attribute. */
 export function loadTheme(theme: SkeletonThemeName): Promise<void> {
 	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	if (nextTheme === DEFAULT_THEME) return Promise.resolve();
+	if (
+		typeof document !== 'undefined' &&
+		typeof document.head?.querySelector === 'function' &&
+		document.head.querySelector(`style[data-bookward-theme="${nextTheme}"]`)
+	) {
+		return Promise.resolve();
+	}
 	const existing = themeLoads.get(nextTheme);
 	if (existing) return existing;
 
 	const pending = THEME_LOADERS[nextTheme]().then(
 		(module) => {
-			if (nextTheme === DEFAULT_THEME || typeof document === 'undefined') return;
+			if (typeof document === 'undefined') return;
 			if (document.head.querySelector(`style[data-bookward-theme="${nextTheme}"]`)) return;
-			const stylesheet = typeof module === 'string'
-				? module
-				: (module as { default?: unknown }).default;
+			const stylesheet = extractStylesheet(nextTheme, module);
 			if (typeof stylesheet !== 'string') throw new Error(`Theme stylesheet for ${nextTheme} was unavailable`);
 			const style = document.createElement('style');
 			style.dataset.bookwardTheme = nextTheme;
@@ -153,6 +215,30 @@ export function isThemeName(value: unknown): value is SkeletonThemeName {
 
 export function isThemeMode(value: unknown): value is ThemeMode {
 	return value === 'light' || value === 'dark' || value === 'system';
+}
+
+export function getThemeColor(theme: SkeletonThemeName, resolvedMode: Exclude<ThemeMode, 'system'>): string {
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	const palette = THEME_COLORS[nextTheme];
+	return resolvedMode === 'light' ? palette.light : palette.dark;
+}
+
+export function readCookie(cookieHeader: string | undefined, name: string): string | null {
+	if (!cookieHeader) return null;
+	for (const part of cookieHeader.split(';')) {
+		const trimmed = part.trim();
+		const eq = trimmed.indexOf('=');
+		if (eq < 0) continue;
+		if (trimmed.slice(0, eq) === name) {
+			const value = trimmed.slice(eq + 1);
+			try {
+				return decodeURIComponent(value);
+			} catch {
+				return value;
+			}
+		}
+	}
+	return null;
 }
 
 export function getSystemMode(): Exclude<ThemeMode, 'system'> {
@@ -177,9 +263,12 @@ export function getStoredPreferences(): { theme: SkeletonThemeName; mode: ThemeM
 		const legacyTheme = window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY);
 		const storedMode = window.localStorage.getItem(MODE_STORAGE_KEY);
 		const legacyMode = window.localStorage.getItem(LEGACY_MODE_STORAGE_KEY);
+		const rawCookies = typeof document !== 'undefined' && typeof document.cookie === 'string' ? document.cookie : undefined;
+		const cookieTheme = storedTheme === null && legacyTheme === null ? readCookie(rawCookies, THEME_STORAGE_KEY) : null;
+		const cookieMode = storedMode === null && legacyMode === null ? readCookie(rawCookies, MODE_STORAGE_KEY) : null;
 		return {
-			theme: isThemeName(storedTheme) ? storedTheme : isThemeName(legacyTheme) ? legacyTheme : DEFAULT_THEME,
-			mode: isThemeMode(storedMode) ? storedMode : isThemeMode(legacyMode) ? legacyMode : DEFAULT_MODE,
+			theme: isThemeName(storedTheme) ? storedTheme : isThemeName(legacyTheme) ? legacyTheme : isThemeName(cookieTheme) ? cookieTheme : DEFAULT_THEME,
+			mode: isThemeMode(storedMode) ? storedMode : isThemeMode(legacyMode) ? legacyMode : isThemeMode(cookieMode) ? cookieMode : DEFAULT_MODE,
 		};
 	} catch {
 		// Private browsing and embedded webviews can deny localStorage access.
@@ -204,16 +293,40 @@ export function applyTheme(theme: SkeletonThemeName, mode: ThemeMode): Exclude<T
 	root.dataset.colorScheme = resolved;
 	root.classList.toggle('dark', resolved === 'dark');
 	root.style.colorScheme = resolved;
+
+	const meta =
+		typeof document.querySelector === 'function'
+			? document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+			: typeof document.head?.querySelector === 'function'
+				? document.head.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+				: null;
+	if (meta) {
+		const color = getThemeColor(nextTheme, resolved);
+		if ('content' in meta) meta.content = color;
+		if (typeof meta.setAttribute === 'function') meta.setAttribute('content', color);
+	}
 	return resolved;
 }
 
 export function persistPreferences(theme: SkeletonThemeName, mode: ThemeMode): void {
+	if (typeof window === 'undefined') return;
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	const nextMode = isThemeMode(mode) ? mode : DEFAULT_MODE;
 	try {
-		if (typeof window === 'undefined') return;
-		window.localStorage.setItem(THEME_STORAGE_KEY, isThemeName(theme) ? theme : DEFAULT_THEME);
-		window.localStorage.setItem(MODE_STORAGE_KEY, isThemeMode(mode) ? mode : DEFAULT_MODE);
+		window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+		window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
 	} catch {
-		// Applying the current preference remains useful even when it cannot persist.
+		// Applying the current preference remains useful even when localStorage cannot persist.
+	}
+	try {
+		if (typeof document !== 'undefined') {
+			const secure = window.location?.protocol === 'https:' ? '; Secure' : '';
+			const suffix = `; Path=/; Max-Age=${COOKIE_MAX_AGE}; SameSite=Lax${secure}`;
+			document.cookie = `${THEME_STORAGE_KEY}=${nextTheme}${suffix}`;
+			document.cookie = `${MODE_STORAGE_KEY}=${nextMode}${suffix}`;
+		}
+	} catch {
+		// Sandboxed contexts can also block cookie writes.
 	}
 }
 

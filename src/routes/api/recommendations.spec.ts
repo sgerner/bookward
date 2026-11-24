@@ -200,6 +200,21 @@ describe("recommendations endpoint", () => {
           status: "saved",
           source_name: "A source",
         },
+        {
+          id: 9,
+          title: "An Imported Book",
+          author: "A Reader",
+          description: "",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: [],
+          score: 70,
+          explanation: [],
+          status: "imported",
+          source_name: "A source",
+        },
       ],
       headers: new Headers({ "x-bookward-has-more": "false" }),
     });
@@ -214,11 +229,46 @@ describe("recommendations endpoint", () => {
       "/api/recommendations?status=saved&limit=8&offset=0",
     );
     expect(response.headers.get("X-Bookward-Recommendation-Run")).toBeNull();
-    expect((await response.json()).items[0]).toMatchObject({
-      id: 8,
-      status: "saved",
-      recommendation_run_id: "",
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 8, status: "saved", recommendation_run_id: "" }),
+      expect.objectContaining({ id: 9, status: "imported", recommendation_run_id: "" }),
+    ]);
+  });
+
+  it("allows filtering shortlist books by status=imported", async () => {
+    engineWithHeadersMock.mockResolvedValue({
+      data: [
+        {
+          id: 9,
+          title: "An Imported Book",
+          author: "A Reader",
+          description: "",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: [],
+          score: 70,
+          explanation: [],
+          status: "imported",
+          source_name: "A source",
+        },
+      ],
+      headers: new Headers({ "x-bookward-has-more": "false" }),
     });
+
+    const response = await GET({
+      url: new URL("http://bookward.test/api/recommendations?status=imported&limit=8&offset=0"),
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(engineWithHeadersMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=imported&limit=8&offset=0",
+    );
+    expect(response.headers.get("X-Bookward-Recommendation-Run")).toBeNull();
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 9, status: "imported", recommendation_run_id: "" }),
+    ]);
   });
 
   it("allows the browser to request the past decisions archive with exact limit", async () => {
@@ -361,6 +411,60 @@ describe("recommendations endpoint", () => {
       ),
     } as never);
     expect(badResponse.status).toBe(400);
+    expect(engineWithHeadersMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards trimmed search and genre filters across unread and decision statuses", async () => {
+    engineWithHeadersMock.mockResolvedValue({
+      data: [recommendation(35)],
+      headers: new Headers({ "x-bookward-has-more": "false" }),
+    });
+
+    const discoverResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=0&search=%20quasar%20cipher%20&genre=%20Science%20Fiction%20",
+      ),
+    } as never);
+    expect(discoverResponse.status).toBe(200);
+    expect(engineWithHeadersMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=recommended&limit=8&offset=0&search=quasar+cipher&genre=Science+Fiction",
+    );
+
+    const deferredResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=maybe_later&limit=8&offset=8&search=solarpunk",
+      ),
+    } as never);
+    expect(deferredResponse.status).toBe(200);
+    expect(engineWithHeadersMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=maybe_later&limit=8&offset=8&search=solarpunk",
+    );
+
+    const passedResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=rejected&limit=8&offset=0&genre=Mystery&search=%20%20",
+      ),
+    } as never);
+    expect(passedResponse.status).toBe(200);
+    expect(engineWithHeadersMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=rejected&limit=8&offset=0&genre=Mystery",
+    );
+  });
+
+  it("rejects oversized search or genre filters before contacting the engine", async () => {
+    const longSearch = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&search=${"a".repeat(201)}`,
+      ),
+    } as never);
+    expect(longSearch.status).toBe(400);
+
+    const longGenre = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&genre=${"g".repeat(101)}`,
+      ),
+    } as never);
+    expect(longGenre.status).toBe(400);
     expect(engineWithHeadersMock).not.toHaveBeenCalled();
   });
 });

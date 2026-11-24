@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from auth_helpers import authenticated_headers
 
 from afterword_engine.config import settings
-from afterword_engine.database import connect, initialize, row, transaction
+from afterword_engine.database import connect, initialize, row, rows, transaction
 from afterword_engine.ingestion import import_goodreads_csv
 from afterword_engine.learning import (
     attribute_read_outcomes,
@@ -555,6 +555,229 @@ def test_only_the_latest_feedback_can_be_undone(database):
     assert stale.status_code == 409
     assert latest.status_code == 200
     assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "saved"
+
+
+@pytest.mark.parametrize(
+    ("initial_action", "initial_status", "expected_compensation", "expected_observed"),
+    [
+        ("save", "saved", "save", 1),
+        ("reject", "rejected", "reject", 1),
+        ("maybe_later", "maybe_later", "maybe_later", 0),
+    ],
+)
+def test_undo_reverses_restore_and_restores_compensation_signal(
+    database, initial_action, initial_status, expected_compensation, expected_observed
+):
+    recommendations, run_id = tracked_recommendations()
+    candidate_id = recommendations[0]["id"]
+    with TestClient(app, headers=authenticated_headers()) as client:
+        client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": initial_action, "run_id": run_id},
+        )
+        restored = client.post(
+            f"/api/recommendations/{candidate_id}/feedback",
+            json={"action": "restore"},
+        )
+        assert restored.status_code == 200
+        restore_payload = restored.json()
+        assert restore_payload["status"] == "recommended"
+        assert restore_payload["decision_id"] > 0
+
+        _, neutral_learning = personalize_recommendations(
+            [],
+            [
+                item for item in load_interaction_events()
+                if item["candidate_id"] == candidate_id
+            ],
+        )
+        assert neutral_learning["observed_books"] == 0
+
+        undone = client.post(
+            f"/api/recommendations/{candidate_id}/undo",
+            json={"decision_id": restore_payload["decision_id"]},
+        )
+
+    assert undone.status_code == 200
+    assert undone.json() == {"id": candidate_id, "status": initial_status}
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == initial_status
+    assert row("SELECT undone_at FROM feedback WHERE id=?", (restore_payload["decision_id"],))["undone_at"]
+    assert row(
+        "SELECT event_type FROM recommendation_events WHERE event_key=?",
+        (f"undo-feedback:{restore_payload['decision_id']}",),
+    )["event_type"] == expected_compensation
+    _, reverted_learning = personalize_recommendations(
+        [],
+        [
+            item for item in load_interaction_events()
+            if item["candidate_id"] == candidate_id
+        ],
+    )
+    assert reverted_learning["observed_books"] == expected_observed
+
+
+def test_restore_undo_rejects_empty_previous_status_and_completed_reads(database):
+    recommendations, _ = tracked_recommendations()
+    read_candidate_id = recommendations[0]["id"]
+    legacy_candidate_id = recommendations[1]["id"]
+    with TestClient(app, headers=authenticated_headers()) as client:
+        marked = client.post(f"/api/recommendations/{read_candidate_id}/read", json={"rating": 4})
+        assert marked.status_code == 200
+
+        restored_from_read = client.post(
+            f"/api/recommendations/{read_candidate_id}/feedback",
+            json={"action": "restore"},
+        )
+        assert restored_from_read.status_code == 200
+        assert "decision_id" not in restored_from_read.json()
+        read_restore_id = row(
+            "SELECT id FROM feedback WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
+            (read_candidate_id,),
+        )["id"]
+        undo_read_restore = client.post(
+            f"/api/recommendations/{read_candidate_id}/undo",
+            json={"decision_id": read_restore_id},
+        )
+        assert undo_read_restore.status_code == 404
+
+        with transaction() as con:
+            legacy_decision_id = con.execute(
+                "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
+                (legacy_candidate_id, "restore", ""),
+            ).lastrowid
+        undo_legacy = client.post(
+            f"/api/recommendations/{legacy_candidate_id}/undo",
+            json={"decision_id": legacy_decision_id},
+        )
+        assert undo_legacy.status_code == 404
+
+
+def test_bulk_feedback_records_run_attribution_and_supports_v1_bulk_undo(database):
+    recommendations, run_id = tracked_recommendations()
+    batch_ids = [recommendations[0]["id"], recommendations[1]["id"]]
+    with TestClient(app, headers=authenticated_headers()) as client:
+        bulk = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": batch_ids, "action": "save", "run_id": run_id},
+        )
+        assert bulk.status_code == 200
+        payload = bulk.json()
+        assert payload["updated"] == 2
+        assert payload["skipped"] == 0
+        assert payload["status"] == "saved"
+        assert payload["ids"] == sorted(batch_ids)
+        assert [item["id"] for item in payload["decisions"]] == batch_ids
+
+        for item in payload["decisions"]:
+            feedback_row = row(
+                "SELECT previous_status,undone_at FROM feedback WHERE id=?",
+                (item["decision_id"],),
+            )
+            assert feedback_row == {"previous_status": "recommended", "undone_at": None}
+            outcome = row(
+                "SELECT o.label,o.confidence FROM recommendation_outcomes o "
+                "JOIN recommendation_events e ON e.id=o.event_id WHERE e.event_key=?",
+                (f"feedback:{item['decision_id']}",),
+            )
+            assert outcome == {"label": 1.0, "confidence": 0.8}
+
+        token = client.post("/api/settings/api-tokens", json={"name": "Batch Undo"}).json()["token"]
+        undone = client.post(
+            "/api/v1/recommendations/bulk-undo",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"decisions": payload["decisions"]},
+        )
+        stale = client.post(
+            "/api/recommendations/bulk-undo",
+            json={"decisions": payload["decisions"]},
+        )
+
+    assert undone.status_code == 200
+    assert undone.json() == {
+        "undone": 2,
+        "items": [{"id": candidate_id, "status": "recommended"} for candidate_id in batch_ids],
+    }
+    assert stale.status_code == 409
+    for item in payload["decisions"]:
+        assert row("SELECT status FROM candidates WHERE id=?", (item["id"],))["status"] == "recommended"
+        assert row("SELECT undone_at FROM feedback WHERE id=?", (item["decision_id"],))["undone_at"]
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id="
+            "(SELECT id FROM recommendation_events WHERE event_key=?)",
+            (f"feedback:{item['decision_id']}",),
+        )["count"] == 0
+        assert row(
+            "SELECT event_type FROM recommendation_events WHERE event_key=?",
+            (f"undo-feedback:{item['decision_id']}",),
+        )["event_type"] == "restore"
+
+
+def test_bulk_feedback_offers_no_undo_for_books_that_were_already_read(database):
+    recommendations, _run_id = tracked_recommendations()
+    read_id = recommendations[0]["id"]
+    other_id = recommendations[1]["id"]
+    single_read_id = recommendations[2]["id"]
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id IN (?,?)", (read_id, single_read_id)
+        )
+    with TestClient(app, headers=authenticated_headers()) as client:
+        bulk = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [read_id, other_id], "action": "save"},
+        )
+        single = client.post(
+            f"/api/recommendations/{single_read_id}/feedback", json={"action": "reject"}
+        )
+    assert bulk.status_code == 200
+    assert [item["id"] for item in bulk.json()["decisions"]] == [other_id]
+    assert single.status_code == 200
+    assert "decision_id" not in single.json()
+
+
+def test_bulk_undo_rolls_back_atomically_on_conflict(database):
+    recommendations, run_id = tracked_recommendations()
+    first_id, second_id, third_id, fourth_id = [item["id"] for item in recommendations[:4]]
+    with TestClient(app, headers=authenticated_headers()) as client:
+        first_batch = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [first_id, second_id], "action": "save", "run_id": run_id},
+        ).json()
+        client.post(
+            f"/api/recommendations/{second_id}/feedback",
+            json={"action": "reject", "run_id": run_id},
+        )
+        newer_conflict = client.post(
+            "/api/recommendations/bulk-undo",
+            json={"decisions": first_batch["decisions"]},
+        )
+        assert newer_conflict.status_code == 409
+        first_decision_id = first_batch["decisions"][0]["decision_id"]
+        assert row("SELECT status FROM candidates WHERE id=?", (first_id,))["status"] == "saved"
+        assert row("SELECT undone_at FROM feedback WHERE id=?", (first_decision_id,))["undone_at"] is None
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id="
+            "(SELECT id FROM recommendation_events WHERE event_key=?)",
+            (f"feedback:{first_decision_id}",),
+        )["count"] == 1
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_events WHERE event_key=?",
+            (f"undo-feedback:{first_decision_id}",),
+        )["count"] == 0
+
+        second_batch = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [third_id, fourth_id], "action": "save", "run_id": run_id},
+        ).json()
+        client.post(f"/api/recommendations/{fourth_id}/read", json={"rating": 5})
+        status_conflict = client.post(
+            "/api/recommendations/bulk-undo",
+            json={"decisions": second_batch["decisions"]},
+        )
+        assert status_conflict.status_code == 409
+        third_decision_id = second_batch["decisions"][0]["decision_id"]
+        assert row("SELECT status FROM candidates WHERE id=?", (third_id,))["status"] == "saved"
+        assert row("SELECT undone_at FROM feedback WHERE id=?", (third_decision_id,))["undone_at"] is None
 
 
 def test_read_attribution_requires_prior_exposure_and_updates_rating(database):
@@ -1687,3 +1910,184 @@ def test_internal_settings_and_sources_endpoints_enforce_auth_and_mask_secrets(
     assert settings_payload["digest"]["discord_webhook_set"] is True
     assert settings_payload["digest"]["smtp_password_set"] is True
     assert sources_res.json() == overview_res.json()["sources"]
+
+
+@pytest.mark.parametrize("read_at", [None, "not-a-date"], ids=["missing-date", "invalid-date"])
+def test_storygraph_undated_imports_do_not_use_import_time_as_completion_time(database, read_at):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-01-01T12:00:00+00:00")
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                candidate["title"],
+                candidate["author"],
+                4.5,
+                read_at,
+                "storygraph_csv",
+                "2099-01-02T12:00:00+00:00",
+            ),
+        )
+
+    assert attribute_read_outcomes()["reads_attributed"] == 0
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_events "
+        "WHERE event_type='read' AND candidate_id=?",
+        (candidate["id"],),
+    )["count"] == 0
+
+
+def test_storygraph_csv_import_attributes_dated_fractional_rating_outcomes(database):
+    from afterword_engine.ingestion import import_csv
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        con.execute(
+            "INSERT INTO candidates(title,author,status,source_id,normalized_key) VALUES(?,?,'recommended',?,?)",
+            ("StoryGraph Pick", "Primary Writer", source_id, "storygraph pick primary writer"),
+        )
+        candidate_id = con.execute(
+            "SELECT id FROM candidates WHERE title='StoryGraph Pick'"
+        ).fetchone()[0]
+    recommendations, run_id = tracked_recommendations()
+    assert candidate_id in {item["id"] for item in recommendations}
+
+    payload = (
+        "Title,Authors,Read Status,Last Date Read,Dates Read,Star Rating\n"
+        '"StoryGraph Pick","Primary Writer, Coauthor",read,,2099/01/02-2099/01/10,4.25\n'
+    ).encode("utf-8")
+    assert import_csv(payload) == {"imported": 1, "source": "storygraph_csv"}
+
+    event = row(
+        "SELECT * FROM recommendation_events WHERE event_key LIKE 'read:%' AND candidate_id=?",
+        (candidate_id,),
+    )
+    outcome = row("SELECT * FROM recommendation_outcomes WHERE event_id=?", (event["id"],))
+    assert event["run_id"] == run_id
+    assert event["value"] == 4.25
+    assert event["occurred_at"] == "2099/01/10"
+    assert outcome["label"] == 1.0
+    assert outcome["label_kind"] == "rating_positive"
+
+
+def test_authenticated_http_discovery_isolates_exploration_seed_per_session(
+    database, monkeypatch
+):
+    monkeypatch.setattr(settings, "exploration_enabled", True)
+    monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
+    monkeypatch.setattr(settings, "exploration_stable_top_k", 3)
+
+    headers_a = authenticated_headers()
+    headers_b = authenticated_headers()
+    assert headers_a["x-bookward-session"] != headers_b["x-bookward-session"]
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(40):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Session Pool {index + 1}",
+                    f"Author {index + 1}",
+                    round(100.0 - index, 2),
+                    source_id,
+                    f"session pool {index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    with TestClient(app) as client:
+        token = client.post(
+            "/api/settings/api-tokens",
+            headers=headers_a,
+            json={"name": "Session Isolation CLI"},
+        ).json()["token"]
+        v1_headers = {"Authorization": f"Bearer {token}"}
+
+        ov_a = client.get(
+            "/api/overview?recommendation_limit=24&decision_limit=24",
+            headers=headers_a,
+        )
+        assert ov_a.status_code == 200
+        run_a0 = ov_a.json()["recommendation_run_id"]
+        ids_a0 = [
+            item["id"]
+            for item in ov_a.json()["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert run_a0
+
+        ov_b = client.get(
+            "/api/overview?recommendation_limit=24&decision_limit=24",
+            headers=headers_b,
+        )
+        assert ov_b.status_code == 200
+        run_b0 = ov_b.json()["recommendation_run_id"]
+        ids_b0 = [
+            item["id"]
+            for item in ov_b.json()["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert run_b0
+        assert run_b0 != run_a0
+
+        # Session B acted more recently than Session A; an unseeded offset=24
+        # request from Session A must reuse Session A's own seed (run_a0), not
+        # Session B's more recent run_b0, and return a disjoint tail slice.
+        page_a = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24",
+            headers=headers_a,
+        )
+        assert page_a.status_code == 200
+        run_a1 = page_a.headers["X-Bookward-Recommendation-Run"]
+        ids_a1 = [item["id"] for item in page_a.json()]
+        assert set(ids_a0).isdisjoint(ids_a1)
+
+        page_b = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24",
+            headers=headers_b,
+        )
+        assert page_b.status_code == 200
+        run_b1 = page_b.headers["X-Bookward-Recommendation-Run"]
+        ids_b1 = [item["id"] for item in page_b.json()]
+        assert set(ids_b0).isdisjoint(ids_b1)
+
+        # An API token caller also gets its own api-token:* session_id rather
+        # than inheriting either browser session's recent seed.
+        v1_page = client.get(
+            "/api/v1/recommendations?status=recommended&limit=8&offset=24",
+            headers=v1_headers,
+        )
+        assert v1_page.status_code == 200
+        run_v1 = v1_page.headers["X-Bookward-Recommendation-Run"]
+
+    runs_by_id = {
+        item["id"]: item
+        for item in rows(
+            "SELECT id, session_id, metadata FROM recommendation_runs WHERE id IN (?, ?, ?, ?, ?)",
+            (run_a0, run_b0, run_a1, run_b1, run_v1),
+        )
+    }
+    assert runs_by_id[run_a0]["session_id"].startswith("sess:")
+    assert runs_by_id[run_b0]["session_id"].startswith("sess:")
+    assert runs_by_id[run_a0]["session_id"] != runs_by_id[run_b0]["session_id"]
+    assert runs_by_id[run_a1]["session_id"] == runs_by_id[run_a0]["session_id"]
+    assert runs_by_id[run_b1]["session_id"] == runs_by_id[run_b0]["session_id"]
+    assert runs_by_id[run_v1]["session_id"].startswith("api-token:")
+
+    meta_a1 = json.loads(runs_by_id[run_a1]["metadata"])
+    meta_b1 = json.loads(runs_by_id[run_b1]["metadata"])
+    meta_v1 = json.loads(runs_by_id[run_v1]["metadata"])
+    assert meta_a1["exploration_seed"] == run_a0
+    assert meta_b1["exploration_seed"] == run_b0
+    assert meta_v1["exploration_seed"] == run_v1
+
