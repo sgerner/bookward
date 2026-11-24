@@ -520,6 +520,21 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
                 ("alice_secret", seal("alice-key-material")),
             )
+            alice_source_id = con.execute(
+                "INSERT INTO sources(name,url,enabled,weight) VALUES(?,?,1,1)",
+                ("Alice Source", "https://example.test/alice-feed"),
+            ).lastrowid
+            alice_candidate_id = con.execute(
+                "INSERT INTO candidates(source_id,title,author,normalized_key,status) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    alice_source_id,
+                    "Write during staging",
+                    "Concurrent Reader",
+                    "write during staging::concurrent reader",
+                    "saved",
+                ),
+            ).lastrowid
 
     with profile_scope(bob["profile_id"]):
         initialize(seed_demo=False)
@@ -528,6 +543,21 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
                 ("Bob independent book", "Octavia E. Butler", 5, "test"),
             )
+            bob_source_id = con.execute(
+                "INSERT INTO sources(name,url,enabled,weight) VALUES(?,?,1,1)",
+                ("Bob Source", "https://example.test/bob-feed"),
+            ).lastrowid
+            bob_candidate_id = con.execute(
+                "INSERT INTO candidates(source_id,title,author,normalized_key,status) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    bob_source_id,
+                    "Bob concurrent write",
+                    "Octavia E. Butler",
+                    "bob concurrent write::octavia e. butler",
+                    "saved",
+                ),
+            ).lastrowid
 
     alice_path = profile_database_path(alice["profile_id"])
     original_snapshot = backups._create_snapshot_unlocked
@@ -565,14 +595,36 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
             assert release_cutover.wait(timeout=5)
         return original_replace_live(staged, key_source)
 
+    async def fake_resolve_book_metadata(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "afterword_engine.ingestion.resolve_book_metadata",
+        fake_resolve_book_metadata,
+    )
     monkeypatch.setattr(backups, "_create_snapshot_unlocked", controlled_snapshot)
     monkeypatch.setattr(backups, "_copy_to_stage", controlled_copy_to_stage)
     monkeypatch.setattr(backups, "_replace_live_database", controlled_replace_live)
 
+    from afterword_engine import main as main_module
+    from afterword_engine.main import handle_job
+
+    rater_loads = 0
+    original_rater_inputs = main_module._load_reading_history_rater_inputs
+
+    def counting_rater_inputs():
+        nonlocal rater_loads
+        rater_loads += 1
+        return original_rater_inputs()
+
+    monkeypatch.setattr(
+        main_module, "_load_reading_history_rater_inputs", counting_rater_inputs
+    )
+
     async def run_integration():
-        nonlocal pause_backup, pause_staging, pause_cutover
+        nonlocal pause_backup, pause_staging, pause_cutover, rater_loads
         stop = asyncio.Event()
-        worker = asyncio.create_task(worker_loop(lambda _kind: asyncio.sleep(0), stop))
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://testserver"
@@ -586,18 +638,26 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert await asyncio.to_thread(backup_entered.wait, 3)
                 assert not database_lock(alice_path).is_locked()
 
-                health_res, bob_overview, alice_overview, alice_scores = (
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            client.get("/api/health"),
-                            client.get("/api/overview", headers=bob_headers),
-                            client.get("/api/overview", headers=alice_headers),
-                            client.get(
-                                "/api/reading-history/scores", headers=alice_headers
-                            ),
+                (
+                    health_res,
+                    bob_overview,
+                    alice_overview,
+                    alice_scores,
+                    empty_page_scores,
+                ) = await asyncio.wait_for(
+                    asyncio.gather(
+                        client.get("/api/health"),
+                        client.get("/api/overview", headers=bob_headers),
+                        client.get("/api/overview", headers=alice_headers),
+                        client.get(
+                            "/api/reading-history/scores", headers=alice_headers
                         ),
-                        timeout=2,
-                    )
+                        client.get(
+                            "/api/reading-history/scores?offset=100",
+                            headers=alice_headers,
+                        ),
+                    ),
+                    timeout=2,
                 )
                 assert health_res.status_code == 200
                 assert health_res.json() == {"ok": True}
@@ -605,6 +665,10 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert alice_overview.status_code == 200
                 assert alice_scores.status_code == 200
                 assert len(alice_scores.json()) == 1
+                assert empty_page_scores.status_code == 200
+                assert empty_page_scores.json() == []
+                # Only the non-empty page should load rated_reads / embedder inputs.
+                assert rater_loads == 1
 
                 pause_backup = False
                 release_backup.set()
@@ -618,8 +682,9 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                         ("Transient post-backup book", "Temporary Author", 4, "test"),
                     )
 
-                # 2. Restore staging on Alice runs before acquiring the live profile lock,
-                #    then cutover holds the exclusive lock only for safety snapshot + swap.
+                # 2. Restore on Alice holds the exclusive profile lock across staging
+                #    and cutover so live writes arriving during staging wait and commit
+                #    onto the restored database instead of being silently discarded.
                 pause_staging = True
                 pause_cutover = True
                 restore_task = asyncio.create_task(
@@ -630,34 +695,50 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                     )
                 )
                 assert await asyncio.to_thread(staging_entered.wait, 3)
-                assert not database_lock(alice_path).is_locked()
-
-                staged_health, staged_bob, staged_alice = await asyncio.wait_for(
-                    asyncio.gather(
-                        client.get("/api/health"),
-                        client.get("/api/overview", headers=bob_headers),
-                        client.get("/api/overview", headers=alice_headers),
-                    ),
-                    timeout=2,
-                )
-                assert staged_health.status_code == 200
-                assert staged_bob.status_code == 200
-                assert staged_alice.status_code == 200
-
-                pause_staging = False
-                release_staging.set()
-                assert await asyncio.to_thread(cutover_entered.wait, 5)
                 assert database_lock(alice_path).is_locked()
 
-                # Start contended same-profile requests while exclusive cutover lock is held.
+                # Start a live write and contended reads on Alice during staging.
+                staged_alice_write = asyncio.create_task(
+                    client.post(
+                        f"/api/recommendations/{alice_candidate_id}/read",
+                        json={"rating": 5},
+                        headers=alice_headers,
+                    )
+                )
                 contended_scores = asyncio.create_task(
                     client.get("/api/reading-history/scores", headers=alice_headers)
                 )
                 contended_overview = asyncio.create_task(
                     client.get("/api/overview", headers=alice_headers)
                 )
+
+                staged_health, staged_bob, staged_bob_write = await asyncio.wait_for(
+                    asyncio.gather(
+                        client.get("/api/health"),
+                        client.get("/api/overview", headers=bob_headers),
+                        client.post(
+                            f"/api/recommendations/{bob_candidate_id}/read",
+                            json={"rating": 4},
+                            headers=bob_headers,
+                        ),
+                    ),
+                    timeout=2,
+                )
+                assert staged_health.status_code == 200
+                assert staged_bob.status_code == 200
+                assert staged_bob_write.status_code == 200
+                assert not staged_alice_write.done()
+                assert not contended_scores.done()
+                assert not contended_overview.done()
+
+                pause_staging = False
+                release_staging.set()
+                assert await asyncio.to_thread(cutover_entered.wait, 5)
+                assert database_lock(alice_path).is_locked()
+
                 # Let worker_loop complete a 0.5s poll while Alice is exclusively locked.
                 await asyncio.sleep(0.6)
+                assert not staged_alice_write.done()
                 assert not contended_scores.done()
                 assert not contended_overview.done()
 
@@ -682,21 +763,39 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert cutover_bob_scores.status_code == 200
                 assert {
                     item["title"] for item in cutover_bob_overview.json()["history"]
-                } == {"Bob independent book"}
+                } == {"Bob independent book", "Bob concurrent write"}
 
                 pause_cutover = False
                 release_cutover.set()
-                restored_res, scores_res, overview_res = await asyncio.wait_for(
-                    asyncio.gather(restore_task, contended_scores, contended_overview),
-                    timeout=5,
+                restored_res, write_res, scores_res, overview_res = (
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            restore_task,
+                            staged_alice_write,
+                            contended_scores,
+                            contended_overview,
+                        ),
+                        timeout=5,
+                    )
                 )
                 assert restored_res.status_code == 200
+                assert write_res.status_code == 200
                 assert scores_res.status_code == 200
-                assert len(scores_res.json()) == 1
                 assert overview_res.status_code == 200
-                assert {
-                    item["title"] for item in overview_res.json()["history"]
-                } == {"Alice snapshot book"}
+
+                final_overview = await asyncio.wait_for(
+                    client.get("/api/overview", headers=alice_headers),
+                    timeout=2,
+                )
+                assert final_overview.status_code == 200
+                final_titles = {
+                    item["title"] for item in final_overview.json()["history"]
+                }
+                assert "Transient post-backup book" not in final_titles
+                assert final_titles == {
+                    "Alice snapshot book",
+                    "Write during staging",
+                }
             finally:
                 release_backup.set()
                 release_staging.set()
@@ -709,8 +808,187 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
         assert private_setting("alice_secret") == "alice-key-material"
 
 
+def test_backup_and_restore_failures_leave_profile_unlocked_and_writable(
+    database, monkeypatch
+):
+    from afterword_engine.database import database_lock
+    from afterword_engine.tenancy import profile_database_path
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    live_path = profile_database_path()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+            ("Baseline book", "Ursula K. Le Guin", 5, "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("failure_test_secret", seal("keep-writable")),
+        )
+
+    baseline = backups.create_backup()
+
+    def assert_unlocked_and_writable(marker_title: str) -> None:
+        assert not database_lock(live_path).is_locked()
+        with backups._profile_backup_lock(live_path).try_acquire() as acquired:
+            assert acquired is True
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                (marker_title, "Recovery Check", 4, "test"),
+            )
+        assert row("SELECT 1 FROM reads WHERE title=?", (marker_title,)) is not None
+
+    # 1. Failure inside create_backup releases both backup and shared DB locks.
+    original_snapshot = backups._create_snapshot_unlocked
+    monkeypatch.setattr(
+        backups,
+        "_create_snapshot_unlocked",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected snapshot failure")),
+    )
+    with pytest.raises(backups.BackupError, match="injected snapshot failure"):
+        backups.create_backup()
+    monkeypatch.setattr(backups, "_create_snapshot_unlocked", original_snapshot)
+    assert_unlocked_and_writable("Writable after backup failure")
+
+    # 2. Failure during restore staging releases exclusive DB lock and leaves live DB intact.
+    original_finalize = backups._finalize_staged_database
+    monkeypatch.setattr(
+        backups,
+        "_finalize_staged_database",
+        lambda _staged: (_ for _ in ()).throw(
+            backups.BackupError("injected staging failure")
+        ),
+    )
+    with pytest.raises(backups.BackupError, match="injected staging failure"):
+        backups.restore_backup(baseline["id"])
+    monkeypatch.setattr(backups, "_finalize_staged_database", original_finalize)
+    assert (
+        row("SELECT 1 FROM reads WHERE title='Writable after backup failure'")
+        is not None
+    )
+    assert_unlocked_and_writable("Writable after staging failure")
+
+    # 3. Failure during cutover after replacing live DB rolls back inside the lock
+    #    and leaves the profile unlocked and writable.
+    original_clear_journal = backups._clear_restore_journal
+    clear_calls = 0
+
+    def fail_first_journal_clear():
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise OSError("injected cutover failure")
+        original_clear_journal()
+
+    monkeypatch.setattr(backups, "_clear_restore_journal", fail_first_journal_clear)
+    with pytest.raises(backups.BackupError, match="previous database remains active"):
+        backups.restore_backup(baseline["id"])
+    monkeypatch.setattr(backups, "_clear_restore_journal", original_clear_journal)
+
+    assert clear_calls == 2
+    assert (
+        row("SELECT 1 FROM reads WHERE title='Writable after staging failure'")
+        is not None
+    )
+    assert private_setting("failure_test_secret") == "keep-writable"
+    assert_unlocked_and_writable("Writable after cutover rollback")
+    assert backups.create_backup()["id"]
+
+
+def test_cross_profile_restore_key_swap_does_not_corrupt_concurrent_backup_sidecar(
+    database, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from cryptography.fernet import Fernet
+
+    from afterword_engine import profiles
+    from afterword_engine.secrets import installation_key, installation_key_path
+    from afterword_engine.tenancy import profile_scope
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    if profiles.account_count() == 0:
+        profiles.create_first_admin("key-owner", "key-owner-password-long")
+    bob = profiles.create_account("key-bob", "key-bob-password-long")
+
+    with profile_scope("legacy"):
+        legacy_key_path = installation_key_path()
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+                ("legacy_secret", seal("legacy-secret-value")),
+            )
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        bob_key_path = installation_key_path()
+        assert bob_key_path != legacy_key_path
+        assert bob_key_path.name == f"{bob['profile_id']}.sqlite3.secret.key"
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+                ("bob_secret", seal("bob-original-secret")),
+            )
+        bob_v1 = backups.create_backup()
+
+        # Rotate Bob's per-profile key and secret so restoring bob_v1 swaps Bob's key file.
+        rotated_key = Fernet.generate_key()
+        bob_key_path.write_bytes(rotated_key)
+        assert installation_key() == rotated_key
+        with transaction() as con:
+            con.execute(
+                "UPDATE settings SET value=? WHERE key='bob_secret'",
+                (seal("bob-rotated-secret"),),
+            )
+
+    original_write_sidecar = backups._write_generated_key_sidecar
+    legacy_sidecar_ready = Event()
+    allow_legacy_sidecar = Event()
+
+    def coordinated_write_sidecar(backup_path):
+        if installation_key_path() == legacy_key_path:
+            legacy_sidecar_ready.set()
+            assert allow_legacy_sidecar.wait(timeout=5)
+        return original_write_sidecar(backup_path)
+
+    monkeypatch.setattr(
+        backups, "_write_generated_key_sidecar", coordinated_write_sidecar
+    )
+
+    def backup_legacy():
+        with profile_scope("legacy"):
+            return backups.create_backup()
+
+    def restore_bob():
+        with profile_scope(bob["profile_id"]):
+            return backups.restore_backup(bob_v1["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        legacy_future = executor.submit(backup_legacy)
+        assert legacy_sidecar_ready.wait(timeout=3)
+        bob_future = executor.submit(restore_bob)
+        assert bob_future.result(timeout=5)["restored_backup"] == bob_v1["id"]
+        allow_legacy_sidecar.set()
+        legacy_backup = legacy_future.result(timeout=5)
+
+    with profile_scope("legacy"):
+        assert private_setting("legacy_secret") == "legacy-secret-value"
+        sidecar = backups.backup_directory() / f"{legacy_backup['id']}.secret.key"
+        assert sidecar.read_bytes().strip() == installation_key()
+
+    with profile_scope(bob["profile_id"]):
+        assert private_setting("bob_secret") == "bob-original-secret"
+
+
 def test_concurrent_backups_and_restores_serialize_per_profile(database, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
+
+    from afterword_engine.database import database_lock
+    from afterword_engine.tenancy import profile_database_path
 
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     with transaction() as con:
@@ -727,20 +1005,50 @@ def test_concurrent_backups_and_restores_serialize_per_profile(database, monkeyp
     monkeypatch.setattr(settings, "backup_retention_count", 6)
 
     def run_mixed_op(index: int):
-        if index % 2 == 0:
+        if index % 3 == 0:
             return backups.create_backup()["id"]
-        return backups.restore_backup(baseline["id"])["restored_backup"]
+        if index % 3 == 1:
+            return backups.restore_backup(baseline["id"])["restored_backup"]
+        for write_idx in range(3):
+            with transaction() as con:
+                con.execute(
+                    "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                    (f"Concurrent write {index}-{write_idx}", "Writer", 4, "test"),
+                )
+        return f"writes-{index}"
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(run_mixed_op, idx) for idx in range(4)]
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(run_mixed_op, idx) for idx in range(6)]
         for future in futures:
             assert future.result(timeout=15)
 
     monkeypatch.setattr(settings, "backup_retention_count", 2)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        prune_futures = [executor.submit(backups.create_backup) for _ in range(4)]
+
+    def run_prune_or_write(index: int):
+        if index % 2 == 0:
+            return backups.create_backup()["id"]
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+                (f"Prune concurrent write {index}", "Writer", 5, "test"),
+            )
+        return f"prune-write-{index}"
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        prune_futures = [executor.submit(run_prune_or_write, idx) for idx in range(6)]
         for future in prune_futures:
-            assert future.result(timeout=15)["id"]
+            assert future.result(timeout=15)
+
+    assert not database_lock(profile_database_path()).is_locked()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+            ("Final post-concurrency write", "Author", 5, "test"),
+        )
+    assert (
+        row("SELECT 1 FROM reads WHERE title='Final post-concurrency write'")
+        is not None
+    )
 
     retained = backups.list_backups()
     assert len(retained) == 2

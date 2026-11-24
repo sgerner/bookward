@@ -2,7 +2,9 @@ import asyncio
 import csv
 import hashlib
 import html
+import inspect
 import io
+import ipaddress
 import json
 import re
 import math
@@ -35,7 +37,8 @@ from .identity import (
     read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
-from .security import resolve_public_target
+from .read_dates import read_day
+from .security import BLOCKED_HOSTS, resolve_public_target, validate_public_url
 from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
@@ -56,6 +59,18 @@ PENGUIN_RANDOM_HOUSE_HOSTS = frozenset(
     {"penguinrandomhouse.com", "www.penguinrandomhouse.com"}
 )
 SOURCE_MAX_REDIRECTS = 4
+SOURCE_MAX_DISCOVERED_FEEDS = 3
+SOURCE_MAX_DISCOVERED_CANDIDATES = 12
+FEED_AUTODISCOVERY_TYPES = frozenset(
+    {
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/rdf+xml",
+        "text/rss+xml",
+        "text/atom+xml",
+    }
+)
+COMMENT_FEED_RE = re.compile(r"(?:^|[\W_])comments?(?:$|[\W_\d])", re.I)
 SOURCE_FILTER_MAX_GENRES = 12
 SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 READ_WORK_IDENTITY_BATCH_SIZE = 25
@@ -745,15 +760,97 @@ def metadata_url(value, fallback=""):
             return str(parsed)
     return ""
 
-def import_goodreads_csv(content: bytes):
+STORYGRAPH_IDENTIFYING_HEADERS = frozenset(
+    {"Read Status", "ISBN/UID", "Star Rating", "Last Date Read", "Dates Read"}
+)
+_STORYGRAPH_AUTHOR_SUFFIXES = frozenset(
+    {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
+)
+_STORYGRAPH_ISBN_CANDIDATE_RE = re.compile(r"^[0-9\s-]+[0-9Xx]?$")
+
+
+def _detect_csv_source(fieldnames) -> str:
+    headers = {str(name).strip() for name in (fieldnames or ()) if name is not None}
+    if {"Title", "Author"}.issubset(headers):
+        return "goodreads_csv"
+    if {"Title", "Authors"}.issubset(headers) and (headers & STORYGRAPH_IDENTIFYING_HEADERS):
+        return "storygraph_csv"
+    raise ValueError("CSV must match Goodreads or The StoryGraph export format")
+
+
+def _storygraph_primary_author(value) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    if not parts:
+        return ""
+    primary = parts[0]
+    if len(parts) > 1 and parts[1].casefold() in _STORYGRAPH_AUTHOR_SUFFIXES:
+        primary = f"{primary}, {parts[1]}"
+    return primary[:300]
+
+
+def _storygraph_isbn(value) -> str | None:
+    cleaned = str(value or "").strip().strip('="').strip()
+    if not cleaned or not _STORYGRAPH_ISBN_CANDIDATE_RE.fullmatch(cleaned):
+        return None
+    return canonical_isbn(cleaned) or None
+
+
+def _storygraph_completion_date_from_entry(entry: str) -> str | None:
+    direct = _read_date_value(entry)
+    if direct is not None:
+        return direct
+    explicit_range = re.fullmatch(
+        r"(.+?)\s*(?:\.\.|[–—]|\bto\b)\s*(.*)", entry, flags=re.IGNORECASE
+    )
+    if explicit_range:
+        return _read_date_value(explicit_range.group(2))
+    iso_range = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}\s*-\s*(.*)", entry)
+    if iso_range:
+        return _read_date_value(iso_range.group(1))
+    if "-" in entry:
+        return _read_date_value(entry.rsplit("-", 1)[1])
+    return None
+
+
+def _storygraph_read_date(last_date_read, dates_read) -> str | None:
+    direct = _read_date_value(last_date_read)
+    if direct is not None:
+        return direct
+    raw_ranges = str(dates_read or "").strip()
+    if not raw_ranges:
+        return None
+    whole = _read_date_value(raw_ranges)
+    if whole is not None:
+        return whole
+    best_date = None
+    best_day = None
+    for part in re.split(r"[,;]", raw_ranges):
+        entry = part.strip()
+        if not entry:
+            continue
+        candidate = _storygraph_completion_date_from_entry(entry)
+        if candidate is None:
+            continue
+        day = read_day(candidate)
+        if best_date is None or (day is not None and (best_day is None or day >= best_day)):
+            best_date = candidate
+            best_day = day
+    return best_date
+
+
+def import_csv(content: bytes) -> dict[str, int | str]:
     if len(content) > 10_000_000: raise ValueError("CSV is larger than 10 MB")
     try:
         text = content.decode("utf-8-sig", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError("CSV must be UTF-8 encoded") from exc
     reader = csv.DictReader(io.StringIO(text))
-    required = {"Title", "Author"}
-    if not reader.fieldnames or not required.issubset(reader.fieldnames): raise ValueError("This does not look like a Goodreads export")
+    if reader.fieldnames:
+        reader.fieldnames = [
+            name.strip() if isinstance(name, str) else name
+            for name in reader.fieldnames
+        ]
+    source = _detect_csv_source(reader.fieldnames)
     count = 0
     batches: list[tuple[str, list[tuple]]] = []
     try:
@@ -761,10 +858,22 @@ def import_goodreads_csv(content: bytes):
             if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
             # DictReader uses None for fields omitted from a truncated row.
             title = str(source_row.get("Title") or "").strip()[:500]
-            author = str(source_row.get("Author") or "").strip()[:300]
+            if source == "storygraph_csv":
+                author = _storygraph_primary_author(source_row.get("Authors"))
+                shelf = str(source_row.get("Read Status") or "").strip().lower()
+                isbn = _storygraph_isbn(source_row.get("ISBN/UID"))
+                rating_raw = str(source_row.get("Star Rating") or "").strip()
+                read_at = _storygraph_read_date(
+                    source_row.get("Last Date Read"),
+                    source_row.get("Dates Read"),
+                )
+            else:
+                author = str(source_row.get("Author") or "").strip()[:300]
+                shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                rating_raw = str(source_row.get("My Rating") or "").strip()
+                read_at = _read_date_value(source_row.get("Date Read"))
             if not title or not author: continue
-            shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
-            isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
             if shelf in {"to-read", "currently-reading"}:
                 kind = "shelf"
                 values = (
@@ -777,7 +886,7 @@ def import_goodreads_csv(content: bytes):
             else:
                 if shelf and shelf != "read": continue
                 try:
-                    rating = float(source_row.get("My Rating") or 0) or None
+                    rating = float(rating_raw or 0) or None
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be numeric and between 0 and 5. No books were imported.") from exc
                 if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
@@ -787,8 +896,9 @@ def import_goodreads_csv(content: bytes):
                     title,
                     author,
                     rating,
-                    _read_date_value(source_row.get("Date Read")),
+                    read_at,
                     isbn,
+                    source,
                 )
                 count += 1
             if not batches or batches[-1][0] != kind:
@@ -815,7 +925,7 @@ def import_goodreads_csv(content: bytes):
             )
             con.executemany(
                 "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,'goodreads_csv') "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(title,author) DO UPDATE SET "
                 "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
                 "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
@@ -832,7 +942,11 @@ def import_goodreads_csv(content: bytes):
     # during application startup.
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
-    return count
+    return {"imported": count, "source": source}
+
+
+def import_goodreads_csv(content: bytes):
+    return int(import_csv(content)["imported"])
 
 def _source_client():
     return httpx.AsyncClient(
@@ -928,17 +1042,9 @@ def _openlibrary_work_from_edition(payload, requested_isbn13: str) -> str:
     return next(iter(work_ids)) if len(work_ids) == 1 else ""
 
 
-async def refresh_read_work_identities(
-    limit: int = READ_WORK_IDENTITY_BATCH_SIZE,
-) -> dict[str, int]:
-    """Cache verified Open Library work IDs for reads that could collide.
-
-    ISBN lookups are limited to reads by an author with an active, accepted
-    Open Library candidate whose title/edition identity does not already match.
-    This keeps requests focused and lets the exact work key, rather than fuzzy
-    title translation, decide whether two rows describe one work.
-    """
-
+def _select_read_work_identity_batch(
+    limit: int,
+) -> tuple[list[tuple[float, dict]], int]:
     reads = rows("SELECT * FROM reads ORDER BY id")
     candidates = rows(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
@@ -1004,6 +1110,32 @@ async def refresh_read_work_identities(
         targets.values(),
         key=lambda item: (-item[0], int(item[1]["id"])),
     )[:batch_size]
+    return batch, len(targets)
+
+
+def _persist_read_work_identity_updates(updates: list[tuple[str, str, int]]) -> None:
+    with transaction() as con:
+        con.executemany(
+            "UPDATE reads SET openlibrary_work_id=?,"
+            "openlibrary_lookup_attempted_at=? WHERE id=?",
+            updates,
+        )
+
+
+async def refresh_read_work_identities(
+    limit: int = READ_WORK_IDENTITY_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache verified Open Library work IDs for reads that could collide.
+
+    ISBN lookups are limited to reads by an author with an active, accepted
+    Open Library candidate whose title/edition identity does not already match.
+    This keeps requests focused and lets the exact work key, rather than fuzzy
+    title translation, decide whether two rows describe one work.
+    """
+
+    batch, total_targets = await asyncio.to_thread(
+        _select_read_work_identity_batch, limit
+    )
     if not batch:
         return {"checked": 0, "matched": 0, "lookup_failures": 0, "remaining": 0}
 
@@ -1034,17 +1166,12 @@ async def refresh_read_work_identities(
             )
             matched += bool(work_id)
 
-    with transaction() as con:
-        con.executemany(
-            "UPDATE reads SET openlibrary_work_id=?,"
-            "openlibrary_lookup_attempted_at=? WHERE id=?",
-            updates,
-        )
+    await asyncio.to_thread(_persist_read_work_identity_updates, updates)
     return {
         "checked": len(batch),
         "matched": int(matched),
         "lookup_failures": lookup_failures,
-        "remaining": max(0, len(targets) - len(batch)),
+        "remaining": max(0, total_targets - len(batch)),
     }
 
 
@@ -1540,11 +1667,7 @@ def _read_metadata_provenance_for_storage(existing, attempt, fields_added, verif
     return combined
 
 
-async def refresh_read_metadata(
-    limit: int = READ_METADATA_BATCH_SIZE,
-) -> dict[str, int]:
-    """Cache exact-identity public metadata without editing reads or ratings."""
-
+def _load_due_read_metadata_batch(limit: int) -> tuple[list[dict], str]:
     retry_before = datetime.now(timezone.utc) - timedelta(days=READ_METADATA_RETRY_DAYS)
     due = [
         read for read in _read_metadata_rows()
@@ -1553,12 +1676,170 @@ async def refresh_read_metadata(
     batch_size = max(1, min(int(limit), READ_METADATA_BATCH_SIZE))
     batch = due[:batch_size]
     if not batch:
+        return [], ""
+    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
+    return batch, google_books_api_key
+
+
+def _persist_read_metadata_attempt(
+    read_id: int,
+    identity_hash: str,
+    work_id: str,
+    metadata: dict,
+    identity_evidence: dict,
+    verified_work_id: str,
+    identity_provider: str,
+    identity_provider_id: str,
+    metadata_provenance: dict,
+    description: str,
+    description_kind: str,
+    genres: list[str],
+    cover_url: str,
+    release_date: str,
+    date_kind: str,
+    checked_timestamp: str,
+) -> int:
+    with transaction() as con:
+        current = con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone()
+        if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
+            # A title, author, or ISBN edit landed while fetching.
+            return 0
+        if book_openlibrary_work_id(dict(current)) != work_id:
+            # Do not attach work-specific metadata after identity
+            # verification changed in another job.
+            return 0
+        existing = con.execute("SELECT * FROM read_metadata WHERE read_id=?", (read_id,)).fetchone()
+        if existing and existing["identity_hash"] != identity_hash:
+            con.execute(
+                "DELETE FROM metadata_field_provenance WHERE entity_type='read' AND entity_id=?",
+                (read_id,),
+            )
+            con.execute("DELETE FROM read_metadata WHERE read_id=?", (read_id,))
+            existing = None
+
+        previous_genres = normalize_subjects(existing["genres"] if existing else [], limit=METADATA_GENRE_LIMIT)
+        merged_genres = normalize_subjects(previous_genres + genres, limit=METADATA_GENRE_LIMIT)
+        previous_description = existing["description"] if existing else ""
+        previous_cover = existing["cover_url"] if existing else ""
+        previous_release = existing["release_date"] if existing else ""
+        description_upgrade = _read_description_upgrade_allowed(
+            con,
+            read_id,
+            existing,
+            metadata,
+            description,
+            description_kind,
+        )
+        new_description = (
+            description
+            if not previous_description or description_upgrade
+            else previous_description
+        )
+        new_description_kind = (
+            description_kind
+            if not previous_description or description_upgrade
+            else existing["description_kind"]
+        )
+        new_cover = cover_url if cover_url and (not previous_cover or is_weak_cover_url(previous_cover)) else previous_cover
+        new_release = previous_release or release_date
+        new_date_kind = existing["date_kind"] if existing and previous_release else date_kind
+        fields_added = {
+            "description": bool(description and (not previous_description or description_upgrade)),
+            "genres": merged_genres != previous_genres,
+            "cover_url": bool(new_cover and new_cover != previous_cover),
+            "release_date": bool(release_date and not previous_release),
+        }
+        try:
+            existing_identity_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_identity_evidence = {}
+        preserve_identity = bool(
+            existing
+            and not identity_evidence
+            and existing["identity_provider"]
+            and existing["identity_provider_id"]
+            and isinstance(existing_identity_evidence, dict)
+            and existing_identity_evidence
+        )
+        stored_identity_provider = (
+            identity_provider if identity_evidence else str(existing["identity_provider"] or "") if preserve_identity else ""
+        )
+        stored_identity_provider_id = (
+            identity_provider_id if identity_evidence else str(existing["identity_provider_id"] or "") if preserve_identity else ""
+        )
+        stored_verified_work_id = (
+            verified_work_id if identity_evidence else str(existing["verified_work_id"] or "") if preserve_identity else ""
+        )
+        stored_identity_evidence = (
+            identity_evidence
+            if identity_evidence
+            else existing_identity_evidence if preserve_identity
+            else {}
+        )
+        stored_provenance = _read_metadata_provenance_for_storage(
+            existing,
+            metadata_provenance,
+            fields_added,
+            bool(identity_evidence),
+        )
+        con.execute(
+            """INSERT INTO read_metadata(
+                read_id,verified_work_id,identity_provider,identity_provider_id,
+                identity_evidence,metadata_provenance,identity_hash,
+                description,description_kind,genres,cover_url,release_date,
+                date_kind,metadata_checked_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(read_id) DO UPDATE SET
+                verified_work_id=excluded.verified_work_id,
+                identity_provider=excluded.identity_provider,
+                identity_provider_id=excluded.identity_provider_id,
+                identity_evidence=excluded.identity_evidence,
+                metadata_provenance=excluded.metadata_provenance,
+                identity_hash=excluded.identity_hash,
+                description=excluded.description,description_kind=excluded.description_kind,
+                genres=excluded.genres,cover_url=excluded.cover_url,
+                release_date=excluded.release_date,date_kind=excluded.date_kind,
+                metadata_checked_at=excluded.metadata_checked_at""",
+            (
+                read_id, stored_verified_work_id, stored_identity_provider, stored_identity_provider_id,
+                json.dumps(stored_identity_evidence, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(stored_provenance, ensure_ascii=False, separators=(",", ":")),
+                identity_hash, new_description, new_description_kind,
+                json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":")),
+                new_cover, new_release, new_date_kind, checked_timestamp,
+            ),
+        )
+        provenance_item = dict(metadata)
+        provenance_item["_metadata_provenance"] = metadata.get("metadata_provenance", {})
+        for field, contributed in fields_added.items():
+            if contributed:
+                _persist_metadata_field_provenance(
+                    con,
+                    "read",
+                    read_id,
+                    field,
+                    provenance_item,
+                    default_provider=identity_provider,
+                    default_provider_id=identity_provider_id,
+                    default_confidence=1.0,
+                )
+        return int(any(fields_added.values()))
+
+
+async def refresh_read_metadata(
+    limit: int = READ_METADATA_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache exact-identity public metadata without editing reads or ratings."""
+
+    batch, google_books_api_key = await asyncio.to_thread(
+        _load_due_read_metadata_batch, limit
+    )
+    if not batch:
         return {"checked": 0, "updated": 0, "lookup_failures": 0, "remaining": 0}
 
     checked_at = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
     updated = 0
     lookup_failures = 0
-    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         for read in batch:
             read_isbn13, read_isbn10 = isbn_parts(read.get("isbn"))
@@ -1642,140 +1923,37 @@ async def refresh_read_metadata(
             release_date = str(metadata.get("release_date") or "")
             date_kind = str(metadata.get("date_kind") or "")
 
-            with transaction() as con:
-                current = con.execute("SELECT * FROM reads WHERE id=?", (read["id"],)).fetchone()
-                if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
-                    # A title, author, or ISBN edit landed while fetching.
-                    continue
-                if book_openlibrary_work_id(dict(current)) != work_id:
-                    # Do not attach work-specific metadata after identity
-                    # verification changed in another job.
-                    continue
-                existing = con.execute("SELECT * FROM read_metadata WHERE read_id=?", (read["id"],)).fetchone()
-                if existing and existing["identity_hash"] != identity_hash:
-                    con.execute(
-                        "DELETE FROM metadata_field_provenance WHERE entity_type='read' AND entity_id=?",
-                        (read["id"],),
-                    )
-                    con.execute("DELETE FROM read_metadata WHERE read_id=?", (read["id"],))
-                    existing = None
+            updated += await asyncio.to_thread(
+                _persist_read_metadata_attempt,
+                int(read["id"]),
+                identity_hash,
+                work_id,
+                metadata,
+                identity_evidence,
+                verified_work_id,
+                identity_provider,
+                identity_provider_id,
+                metadata_provenance,
+                description,
+                description_kind,
+                genres,
+                cover_url,
+                release_date,
+                date_kind,
+                checked_at(),
+            )
 
-                previous_genres = normalize_subjects(existing["genres"] if existing else [], limit=METADATA_GENRE_LIMIT)
-                merged_genres = normalize_subjects(previous_genres + genres, limit=METADATA_GENRE_LIMIT)
-                previous_description = existing["description"] if existing else ""
-                previous_cover = existing["cover_url"] if existing else ""
-                previous_release = existing["release_date"] if existing else ""
-                description_upgrade = _read_description_upgrade_allowed(
-                    con,
-                    int(read["id"]),
-                    existing,
-                    metadata,
-                    description,
-                    description_kind,
-                )
-                new_description = (
-                    description
-                    if not previous_description or description_upgrade
-                    else previous_description
-                )
-                new_description_kind = (
-                    description_kind
-                    if not previous_description or description_upgrade
-                    else existing["description_kind"]
-                )
-                new_cover = cover_url if cover_url and (not previous_cover or is_weak_cover_url(previous_cover)) else previous_cover
-                new_release = previous_release or release_date
-                new_date_kind = existing["date_kind"] if existing and previous_release else date_kind
-                fields_added = {
-                    "description": bool(description and (not previous_description or description_upgrade)),
-                    "genres": merged_genres != previous_genres,
-                    "cover_url": bool(new_cover and new_cover != previous_cover),
-                    "release_date": bool(release_date and not previous_release),
-                }
-                try:
-                    existing_identity_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    existing_identity_evidence = {}
-                preserve_identity = bool(
-                    existing
-                    and not identity_evidence
-                    and existing["identity_provider"]
-                    and existing["identity_provider_id"]
-                    and isinstance(existing_identity_evidence, dict)
-                    and existing_identity_evidence
-                )
-                stored_identity_provider = (
-                    identity_provider if identity_evidence else str(existing["identity_provider"] or "") if preserve_identity else ""
-                )
-                stored_identity_provider_id = (
-                    identity_provider_id if identity_evidence else str(existing["identity_provider_id"] or "") if preserve_identity else ""
-                )
-                stored_verified_work_id = (
-                    verified_work_id if identity_evidence else str(existing["verified_work_id"] or "") if preserve_identity else ""
-                )
-                stored_identity_evidence = (
-                    identity_evidence
-                    if identity_evidence
-                    else existing_identity_evidence if preserve_identity
-                    else {}
-                )
-                metadata_provenance = _read_metadata_provenance_for_storage(
-                    existing,
-                    metadata_provenance,
-                    fields_added,
-                    bool(identity_evidence),
-                )
-                con.execute(
-                    """INSERT INTO read_metadata(
-                        read_id,verified_work_id,identity_provider,identity_provider_id,
-                        identity_evidence,metadata_provenance,identity_hash,
-                        description,description_kind,genres,cover_url,release_date,
-                        date_kind,metadata_checked_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(read_id) DO UPDATE SET
-                        verified_work_id=excluded.verified_work_id,
-                        identity_provider=excluded.identity_provider,
-                        identity_provider_id=excluded.identity_provider_id,
-                        identity_evidence=excluded.identity_evidence,
-                        metadata_provenance=excluded.metadata_provenance,
-                        identity_hash=excluded.identity_hash,
-                        description=excluded.description,description_kind=excluded.description_kind,
-                        genres=excluded.genres,cover_url=excluded.cover_url,
-                        release_date=excluded.release_date,date_kind=excluded.date_kind,
-                        metadata_checked_at=excluded.metadata_checked_at""",
-                    (
-                        read["id"], stored_verified_work_id, stored_identity_provider, stored_identity_provider_id,
-                        json.dumps(stored_identity_evidence, ensure_ascii=False, separators=(",", ":")),
-                        json.dumps(metadata_provenance, ensure_ascii=False, separators=(",", ":")),
-                        identity_hash, new_description, new_description_kind,
-                        json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":")),
-                        new_cover, new_release, new_date_kind, checked_at(),
-                    ),
-                )
-                provenance_item = dict(metadata)
-                provenance_item["_metadata_provenance"] = metadata.get("metadata_provenance", {})
-                for field, contributed in fields_added.items():
-                    if contributed:
-                        _persist_metadata_field_provenance(
-                            con,
-                            "read",
-                            int(read["id"]),
-                            field,
-                            provenance_item,
-                            default_provider=identity_provider,
-                            default_provider_id=identity_provider_id,
-                            default_confidence=1.0,
-                        )
-                updated += int(any(fields_added.values()))
-
+    remaining = await asyncio.to_thread(read_metadata_refresh_remaining)
     return {
         "checked": len(batch),
         "updated": updated,
         "lookup_failures": lookup_failures,
-        "remaining": read_metadata_refresh_remaining(),
+        "remaining": remaining,
     }
 
-async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
+async def _fetch_bytes_with_client(
+    client, url: str, allow_goodreads_http=False, *, return_url=False
+):
     current_url = str(url)
     for _ in range(SOURCE_MAX_REDIRECTS + 1):
         response = await _request_pinned(
@@ -1803,15 +1981,39 @@ async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False)
             if size > settings.source_max_bytes:
                 raise ValueError("Source response is too large")
             chunks.append(chunk)
-        return b"".join(chunks), content_type
+        payload = b"".join(chunks)
+        if return_url:
+            return payload, content_type, current_url
+        return payload, content_type
     raise ValueError("Source returned too many redirects")
 
 
-async def fetch_bytes(url: str, allow_goodreads_http=False, client=None):
+async def fetch_bytes(url: str, allow_goodreads_http=False, client=None, *, return_url=False):
     if client is not None:
-        return await _fetch_bytes_with_client(client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            client, url, allow_goodreads_http, return_url=return_url
+        )
     async with _source_client() as owned_client:
-        return await _fetch_bytes_with_client(owned_client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            owned_client, url, allow_goodreads_http, return_url=return_url
+        )
+
+
+async def _call_fetch_bytes(url: str, *, client=None):
+    params = inspect.signature(fetch_bytes).parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    kwargs = {}
+    if client is not None and ("client" in params or accepts_kwargs):
+        kwargs["client"] = client
+    if "return_url" in params:
+        kwargs["return_url"] = True
+    result = await fetch_bytes(url, **kwargs)
+    if isinstance(result, tuple) and len(result) == 3:
+        return result
+    content, content_type = result
+    return content, content_type, str(url)
 
 
 def _goodreads_tooltip_params(resource_ids):
@@ -1929,27 +2131,57 @@ def _clean_parsed_subjects(items):
     ]
 
 
-async def _fetch_and_parse_source(url):
-    apple_url = _apple_artwork_request_url(url)
-    if (urlparse(apple_url).hostname or "").casefold().rstrip(".") == "api.nytimes.com":
-        request_url = await asyncio.to_thread(_nyt_request_url, apple_url)
-    else:
-        request_url = apple_url
+async def _fetch_and_parse_source(url, *, include_resolved_url=False):
+    request_url = _nyt_request_url(_apple_artwork_request_url(url))
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
-            content, content_type = await fetch_bytes(url, client=client)
+            content, content_type, _ = await _call_fetch_bytes(url, client=client)
             items = parse_book_items(content, content_type, url)
             items = await enrich_goodreads_blog_items(items, client)
-            return content_type, _clean_parsed_subjects(items)
+            cleaned = _clean_parsed_subjects(items)
+            return (content_type, cleaned, url) if include_resolved_url else (content_type, cleaned)
+    used_transformed_url = request_url != url
     try:
-        content, content_type = await fetch_bytes(request_url)
+        content, content_type, final_url = await _call_fetch_bytes(request_url)
     except (httpx.HTTPError, ValueError):
         if request_url == url:
             raise
-        content, content_type = await fetch_bytes(url)
-    return content_type, _clean_parsed_subjects(
-        parse_book_items(content, content_type, url)
-    )
+        used_transformed_url = False
+        content, content_type, final_url = await _call_fetch_bytes(url)
+    items = _clean_parsed_subjects(parse_book_items(content, content_type, url))
+    page_url = url if used_transformed_url else final_url
+    if not items and _should_discover_html_feeds(content, content_type, url):
+        candidates = discover_feed_urls(content, page_url, original_url=url)
+        if candidates:
+            fetched_feeds = 0
+            async with _source_client() as client:
+                for candidate_url in candidates[:SOURCE_MAX_DISCOVERED_CANDIDATES]:
+                    if fetched_feeds >= SOURCE_MAX_DISCOVERED_FEEDS:
+                        break
+                    try:
+                        validate_public_url(candidate_url)
+                    except ValueError:
+                        continue
+                    fetched_feeds += 1
+                    try:
+                        feed_content, feed_content_type, feed_final_url = await _call_fetch_bytes(
+                            candidate_url, client=client
+                        )
+                    except (httpx.HTTPError, ValueError):
+                        continue
+                    if not _is_feed_response(feed_content, feed_content_type):
+                        continue
+                    resolved_feed_url = _strip_url_fragment(feed_final_url) or candidate_url
+                    feed_items = _clean_parsed_subjects(
+                        parse_book_items(feed_content, feed_content_type, resolved_feed_url)
+                    )
+                    if feed_items:
+                        return (
+                            (feed_content_type, feed_items, resolved_feed_url)
+                            if include_resolved_url
+                            else (feed_content_type, feed_items)
+                        )
+    return (content_type, items, url) if include_resolved_url else (content_type, items)
 
 def validate_goodreads_rss_url(url: str) -> str:
     try:
@@ -2520,8 +2752,129 @@ def _parse_generic_html(soup, source_url):
             break
     return items[: settings.source_max_items]
 
+def _strip_url_fragment(url: str) -> str:
+    try:
+        return str(httpx.URL(str(url)).copy_with(fragment=None))
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+
+
+def _comparable_url_key(url: str) -> str:
+    try:
+        parsed = httpx.URL(str(url)).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    return str(parsed.copy_with(path=parsed.path or "/"))
+
+
+def _canonical_feed_candidate_url(raw_href: str, base_url: str) -> str:
+    href = str(raw_href or "").strip()
+    if not href:
+        return ""
+    try:
+        resolved = httpx.URL(str(base_url)).join(href).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    if resolved.scheme != "https" or not resolved.host or resolved.username or resolved.password:
+        return ""
+    # httpx reports the scheme default (443) as None; a page author must not be
+    # able to point discovery at an arbitrary port on a public host.
+    if resolved.port is not None:
+        return ""
+    host = resolved.host.lower().rstrip(".")
+    if host in BLOCKED_HOSTS or host.endswith(".local"):
+        return ""
+    if host == "api.nytimes.com" and any(
+        key.casefold() == "api-key" for key, _ in resolved.params.multi_items()
+    ):
+        return ""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        return ""
+    return str(resolved)
+
+
+def _is_feed_response(content: bytes, content_type: str) -> bool:
+    lowered_type = str(content_type or "").lower()
+    stripped = content.lstrip()
+    if stripped.startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:")):
+        return True
+    if "xhtml" in lowered_type:
+        return False
+    return any(kind in lowered_type for kind in ("xml", "rss", "atom"))
+
+
+def _should_discover_html_feeds(content: bytes, content_type: str, source_url: str) -> bool:
+    if (
+        _is_goodreads_blog_source(source_url)
+        or _source_matches(source_url, "goodreads.com", "/genres/")
+        or _source_matches(source_url, "www.goodreads.com", "/genres/")
+    ):
+        return False
+    lowered_type = str(content_type or "").lower()
+    if "html" not in lowered_type:
+        return False
+    return not _is_feed_response(content, content_type)
+
+
+def discover_feed_urls(content: bytes, page_url: str, original_url: str = "") -> list[str]:
+    """Extract alternate RSS and Atom feed URLs per the RSS Autodiscovery spec."""
+    soup = BeautifulSoup(content, "html.parser")
+    excluded = {
+        key
+        for key in (_comparable_url_key(page_url), _comparable_url_key(original_url))
+        if key
+    }
+    primary_feeds: list[str] = []
+    comment_feeds: list[str] = []
+    for link in soup.find_all("link", href=True):
+        raw_rel = link.get("rel")
+        rels = {
+            part.casefold()
+            for part in (
+                raw_rel if isinstance(raw_rel, (list, tuple)) else str(raw_rel or "").split()
+            )
+            if part
+        }
+        if "alternate" not in rels or "stylesheet" in rels:
+            continue
+        mime_type = str(link.get("type") or "").split(";", 1)[0].strip().casefold()
+        if mime_type not in FEED_AUTODISCOVERY_TYPES:
+            continue
+        candidate = _canonical_feed_candidate_url(link.get("href", ""), page_url)
+        if not candidate:
+            continue
+        if _comparable_url_key(candidate) in excluded:
+            continue
+        parsed = urlparse(candidate)
+        title = str(link.get("title") or "")
+        is_comment = bool(
+            COMMENT_FEED_RE.search(title)
+            or COMMENT_FEED_RE.search(f"{parsed.path}?{parsed.query}")
+        )
+        (comment_feeds if is_comment else primary_feeds).append(candidate)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in [*primary_feeds, *comment_feeds]:
+        key = _comparable_url_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
+
+
 def parse_book_items(content: bytes, content_type: str, source_url: str):
-    if "xml" in content_type or "rss" in content_type or content.lstrip().startswith(b"<?xml"):
+    lowered_type = str(content_type or "").lower()
+    if (
+        "xml" in lowered_type
+        or "rss" in lowered_type
+        or "atom" in lowered_type
+        or content.lstrip().startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:"))
+    ):
         feed = feedparser.parse(content)
         if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
@@ -2531,7 +2884,10 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
                     "title": str(e.get("title", ""))[:500],
                     "author": str(e.get("author", "Unknown author"))[:300],
                     "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000],
-                    "source_url": metadata_url(e.get("link"), source_url),
+                    "source_url": metadata_url(
+                        urljoin(source_url, str(e.get("link"))) if e.get("link") else "",
+                        source_url,
+                    ),
                 },
                 [e.get(key) for key in ("isbn13", "isbn10", "isbn")],
             )
@@ -2540,7 +2896,7 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         ]
     payloads = []
     soup = None
-    if "json" in content_type or "javascript" in content_type:
+    if "json" in lowered_type or "javascript" in lowered_type:
         try: payloads = [json.loads(content)]
         except (json.JSONDecodeError, UnicodeDecodeError): return []
         payload = payloads[0]
@@ -2587,7 +2943,9 @@ async def enrich_book_metadata(items):
         return []
     semaphore = asyncio.Semaphore(8)
     lookup_cache = {}
-    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
+    google_books_api_key = (
+        await asyncio.to_thread(private_setting, "association_google_books_api_key", "")
+    ).strip()
 
     async with metadata_client() as client:
         async def enrich(item):
@@ -2846,16 +3204,18 @@ async def enrich_penguin_random_house_items(items):
     existing_metadata = {}
     if book_keys:
         placeholders = ",".join("?" for _ in book_keys)
+        existing_rows = await asyncio.to_thread(
+            rows,
+            "SELECT normalized_key,description,cover_url FROM candidates "
+            f"WHERE normalized_key IN ({placeholders})",
+            tuple(book_keys),
+        )
         existing_metadata = {
             record["normalized_key"]: {
                 "description": record.get("description", ""),
                 "cover_url": record.get("cover_url", ""),
             }
-            for record in rows(
-                "SELECT normalized_key,description,cover_url FROM candidates "
-                f"WHERE normalized_key IN ({placeholders})",
-                tuple(book_keys),
-            )
+            for record in existing_rows
         }
     def missing_detail_fields(item):
         existing = existing_metadata.get(
@@ -3109,9 +3469,7 @@ def candidate_metadata_refresh_remaining(
     return int(result["count"] if result else 0)
 
 
-async def refresh_missing_candidate_metadata():
-    """Backfill sparse metadata for catalog-accepted candidates only."""
-
+def _prepare_missing_candidate_metadata_inputs() -> tuple[int, list[dict], list[dict]]:
     normalize_stored_candidate_subjects()
     normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
 
@@ -3149,7 +3507,7 @@ async def refresh_missing_candidate_metadata():
         ),
     )
     if not candidates:
-        return normalized_catalog_dates
+        return normalized_catalog_dates, [], []
     inputs = []
     for candidate in candidates:
         item = {**candidate, "genres": _stored_genre_values(candidate.get("genres"))}
@@ -3168,7 +3526,12 @@ async def refresh_missing_candidate_metadata():
             item["_expected_provider_id"] = candidate.get("_legacy_metadata_provider_id") or ""
             item["_prefer_catalog_synopsis"] = True
         inputs.append(item)
-    enriched = await enrich_book_metadata(inputs)
+    return normalized_catalog_dates, candidates, inputs
+
+
+def _persist_missing_candidate_metadata(
+    candidates: list[dict], enriched: list[dict]
+) -> int:
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
@@ -3268,57 +3631,43 @@ async def refresh_missing_candidate_metadata():
                     item["id"],
                 )
             )
+    return changed
+
+
+async def refresh_missing_candidate_metadata():
+    """Backfill sparse metadata for catalog-accepted candidates only."""
+
+    normalized_catalog_dates, candidates, inputs = await asyncio.to_thread(
+        _prepare_missing_candidate_metadata_inputs
+    )
+    if not candidates:
+        return normalized_catalog_dates
+    enriched = await enrich_book_metadata(inputs)
+    changed = await asyncio.to_thread(
+        _persist_missing_candidate_metadata, candidates, enriched
+    )
     return changed + normalized_catalog_dates
 
 
 async def preview_source(url, filters=None):
-    content_type, items = await _fetch_and_parse_source(url)
+    params = inspect.signature(_fetch_and_parse_source).parameters
+    if "include_resolved_url" in params:
+        content_type, items, resolved_url = await _fetch_and_parse_source(
+            url, include_resolved_url=True
+        )
+    else:
+        content_type, items = await _fetch_and_parse_source(url)
+        resolved_url = url
     filtered = filter_source_items(items, filters)
     return {
-        "url": url,
+        "url": resolved_url,
         "content_type": content_type,
         "count": len(filtered),
         "raw_count": len(items),
         "sample": filtered[:5],
     }
 
-async def scan_source(source):
-    _, items = await _fetch_and_parse_source(source["url"])
-    raw_count = len(items)
-    configured_filters = normalize_source_filters(source.get("filters"))
-    cleaned = _clean_parsed_subjects(items)
-    if configured_filters["include_genres"]:
-        # Keep untagged rows in the candidate pool until the catalog has had a
-        # chance to supply subjects. Known non-matches can still be removed
-        # before the expensive provider pass.
-        possible = [
-            item for item in cleaned
-            if not item.get("genres")
-            or (
-                any(
-                    _genre_matches(wanted, genre)
-                    for wanted in configured_filters["include_genres"]
-                    for genre in item.get("genres", [])
-                )
-                and not any(
-                    _genre_matches(blocked, genre)
-                    for blocked in configured_filters["exclude_genres"]
-                    for genre in item.get("genres", [])
-                )
-            )
-        ]
-    else:
-        possible = filter_source_items(cleaned, configured_filters)
-
-    # A prior scan or quality pass may already know an ISBN even when the
-    # current feed item omits it. Carry that identifier into catalog cover
-    # verification before deciding whether the source image is trustworthy.
-    possible_keys = list(
-        dict.fromkeys(
-            normalize_key(item["title"], item.get("author", "Unknown author"))
-            for item in possible
-        )
-    )
+def _load_known_candidate_isbns(possible_keys: list[str]) -> dict[str, tuple[str, str]]:
     known_isbns = {}
     for start in range(0, len(possible_keys), 400):
         key_batch = possible_keys[start : start + 400]
@@ -3337,73 +3686,10 @@ async def scan_source(source):
                 candidate.get("isbn13", ""),
                 candidate.get("isbn10", ""),
             )
-    for item_index, item in enumerate(possible):
-        known_isbn13, known_isbn10 = known_isbns.get(
-            normalize_key(item["title"], item.get("author", "Unknown author")),
-            ("", ""),
-        )
-        known_isbn13, known_isbn10 = isbn_parts(known_isbn13, known_isbn10)
-        source_isbn13, source_isbn10 = isbn_parts_from_source(
-            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-            item.get("source_url", source["url"]),
-        )
-        source_matches_known_isbn = _returned_identifiers_match_read(
-            [source_isbn13, source_isbn10], known_isbn13, known_isbn10
-        )
-        if (
-            (known_isbn13 or known_isbn10)
-            and (source_isbn13 or source_isbn10)
-            and not source_matches_known_isbn
-        ):
-            # Candidate rows are keyed by title and author, so a source can
-            # occasionally expose another edition ISBN for the same book.
-            # Keep the stored candidate's identifier as the cover identity.
-            isbn13, isbn10 = known_isbn13, known_isbn10
-        else:
-            isbn13, isbn10 = isbn_parts_from_source(
-                [item.get("isbn13"), item.get("isbn10"), item.get("isbn"), known_isbn13, known_isbn10],
-                item.get("source_url", source["url"]),
-            )
-        if isbn13:
-            item["isbn13"] = isbn13
-        if isbn10:
-            item["isbn10"] = isbn10
-        item["_scan_enrichment_id"] = item_index
-        item["_source_provided_fields"] = [
-            field for field in ("description", "cover_url", "release_date", "genres")
-            if item.get(field)
-        ]
-        item["_source_provider_id"] = str(source["id"])
+    return known_isbns
 
-    def enrichment_priority(item):
-        isbn13, isbn10 = isbn_parts_from_source(
-            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
-            item.get("source_url", source["url"]),
-        )
-        source_cover = safe_cover_url(item.get("cover_url", ""), item.get("source_url", ""))
-        return (
-            bool(item.get("genres")) if configured_filters["include_genres"] else False,
-            not bool(isbn13 or isbn10),
-            bool(source_cover),
-        )
 
-    enrichment_pool = sorted(possible, key=enrichment_priority)
-    publisher_batch = await enrich_penguin_random_house_items(
-        enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
-    )
-    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
-    enriched_by_id = {
-        item["_scan_enrichment_id"]: item
-        for item in enriched_batch
-        if "_scan_enrichment_id" in item
-    }
-    items = [
-        enriched_by_id.get(item.get("_scan_enrichment_id"), item)
-        for item in possible
-    ]
-    for item in items:
-        item.pop("_scan_enrichment_id", None)
-    items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
+def _persist_scanned_source_items(source: dict, items: list[dict], raw_count: int) -> None:
     with transaction() as con:
         seen = []
         for item in items:
@@ -3537,4 +3823,116 @@ async def scan_source(source):
         # source no longer contains any books, so retain existing candidates.
         status = f"ok:{len(items)}" if items else "empty:0"
         con.execute("UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP WHERE id=?", (status, source["id"]))
+
+
+async def scan_source(source):
+    _, items = await _fetch_and_parse_source(source["url"])
+    raw_count = len(items)
+    configured_filters = normalize_source_filters(source.get("filters"))
+    cleaned = _clean_parsed_subjects(items)
+    if configured_filters["include_genres"]:
+        # Keep untagged rows in the candidate pool until the catalog has had a
+        # chance to supply subjects. Known non-matches can still be removed
+        # before the expensive provider pass.
+        possible = [
+            item for item in cleaned
+            if not item.get("genres")
+            or (
+                any(
+                    _genre_matches(wanted, genre)
+                    for wanted in configured_filters["include_genres"]
+                    for genre in item.get("genres", [])
+                )
+                and not any(
+                    _genre_matches(blocked, genre)
+                    for blocked in configured_filters["exclude_genres"]
+                    for genre in item.get("genres", [])
+                )
+            )
+        ]
+    else:
+        possible = filter_source_items(cleaned, configured_filters)
+
+    # A prior scan or quality pass may already know an ISBN even when the
+    # current feed item omits it. Carry that identifier into catalog cover
+    # verification before deciding whether the source image is trustworthy.
+    possible_keys = list(
+        dict.fromkeys(
+            normalize_key(item["title"], item.get("author", "Unknown author"))
+            for item in possible
+        )
+    )
+    known_isbns = (
+        await asyncio.to_thread(_load_known_candidate_isbns, possible_keys)
+        if possible_keys
+        else {}
+    )
+    for item_index, item in enumerate(possible):
+        known_isbn13, known_isbn10 = known_isbns.get(
+            normalize_key(item["title"], item.get("author", "Unknown author")),
+            ("", ""),
+        )
+        known_isbn13, known_isbn10 = isbn_parts(known_isbn13, known_isbn10)
+        source_isbn13, source_isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        source_matches_known_isbn = _returned_identifiers_match_read(
+            [source_isbn13, source_isbn10], known_isbn13, known_isbn10
+        )
+        if (
+            (known_isbn13 or known_isbn10)
+            and (source_isbn13 or source_isbn10)
+            and not source_matches_known_isbn
+        ):
+            # Candidate rows are keyed by title and author, so a source can
+            # occasionally expose another edition ISBN for the same book.
+            # Keep the stored candidate's identifier as the cover identity.
+            isbn13, isbn10 = known_isbn13, known_isbn10
+        else:
+            isbn13, isbn10 = isbn_parts_from_source(
+                [item.get("isbn13"), item.get("isbn10"), item.get("isbn"), known_isbn13, known_isbn10],
+                item.get("source_url", source["url"]),
+            )
+        if isbn13:
+            item["isbn13"] = isbn13
+        if isbn10:
+            item["isbn10"] = isbn10
+        item["_scan_enrichment_id"] = item_index
+        item["_source_provided_fields"] = [
+            field for field in ("description", "cover_url", "release_date", "genres")
+            if item.get(field)
+        ]
+        item["_source_provider_id"] = str(source["id"])
+
+    def enrichment_priority(item):
+        isbn13, isbn10 = isbn_parts_from_source(
+            [item.get("isbn13"), item.get("isbn10"), item.get("isbn")],
+            item.get("source_url", source["url"]),
+        )
+        source_cover = safe_cover_url(item.get("cover_url", ""), item.get("source_url", ""))
+        return (
+            bool(item.get("genres")) if configured_filters["include_genres"] else False,
+            not bool(isbn13 or isbn10),
+            bool(source_cover),
+        )
+
+    enrichment_pool = sorted(possible, key=enrichment_priority)
+    publisher_batch = await enrich_penguin_random_house_items(
+        enrichment_pool[:SOURCE_METADATA_ENRICHMENT_BATCH_SIZE]
+    )
+    enriched_batch = await enrich_book_metadata(_clean_parsed_subjects(publisher_batch))
+    enriched_by_id = {
+        item["_scan_enrichment_id"]: item
+        for item in enriched_batch
+        if "_scan_enrichment_id" in item
+    }
+    items = [
+        enriched_by_id.get(item.get("_scan_enrichment_id"), item)
+        for item in possible
+    ]
+    for item in items:
+        item.pop("_scan_enrichment_id", None)
+    items = filter_source_items(_clean_parsed_subjects(items), configured_filters)
+    await asyncio.to_thread(_persist_scanned_source_items, source, items, raw_count)
     return len(items)

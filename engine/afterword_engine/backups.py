@@ -40,7 +40,13 @@ class BackupError(ValueError):
 
 
 class _ProfileBackupLock:
-    """Serialize backup, restore, key-sidecar, and retention work per profile."""
+    """Serialize backup, restore, and retention pruning for one profile DB.
+
+    Note: ``installation_key_path()`` resolves to a per-profile
+    ``profiles/<id>.sqlite3.secret.key`` for secondary profiles and the root
+    ``secret.key`` only for ``legacy``; key-file reads and swaps are also
+    guarded by ``_key_file_lock`` on the resolved key path.
+    """
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -65,6 +71,9 @@ class _ProfileBackupLock:
 _BACKUP_LOCKS: weakref.WeakValueDictionary[str, _ProfileBackupLock] = (
     weakref.WeakValueDictionary()
 )
+_KEY_FILE_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
 _BACKUP_LOCKS_GUARD = threading.Lock()
 
 
@@ -72,6 +81,12 @@ def _profile_backup_lock(path: str | Path | None = None) -> _ProfileBackupLock:
     key = str(Path(path) if path is not None else profile_database_path())
     with _BACKUP_LOCKS_GUARD:
         return _BACKUP_LOCKS.setdefault(key, _ProfileBackupLock())
+
+
+def _key_file_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve(strict=False))
+    with _BACKUP_LOCKS_GUARD:
+        return _KEY_FILE_LOCKS.setdefault(key, threading.RLock())
 
 
 def backup_directory() -> Path:
@@ -161,7 +176,9 @@ def _write_generated_key_sidecar(backup_path: Path) -> None:
 
     if _has_configured_key():
         return
-    key = installation_key()
+    key_path = installation_key_path()
+    with _key_file_lock(key_path):
+        key = installation_key()
     Fernet(key)
     sidecar = _key_sidecar(backup_path)
     descriptor, name = tempfile.mkstemp(
@@ -783,7 +800,6 @@ def recover_interrupted_restore() -> bool:
     if not journal.exists():
         return False
     live_path = profile_database_path()
-    staged = None
     try:
         with _profile_backup_lock(live_path):
             if not journal.exists():
@@ -794,11 +810,15 @@ def recover_interrupted_restore() -> bool:
             _validate_snapshot(safety_path)
             safety_key = _restore_key_sidecar(safety_path)
             _validate_snapshot_key(safety_path, safety_key)
-            live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            staged = _copy_to_stage(safety_path, live_path.parent)
             with database_lock(live_path):
-                _replace_live_database(staged, safety_key)
-                staged = None
+                live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                staged = _copy_to_stage(safety_path, live_path.parent)
+                try:
+                    _replace_live_database(staged, safety_key)
+                except Exception:
+                    staged.unlink(missing_ok=True)
+                    _remove_sidecars(staged)
+                    raise
                 _clear_restore_journal()
                 _set_last_error("An interrupted restore was rolled back to its safety backup.")
         return True
@@ -807,10 +827,6 @@ def recover_interrupted_restore() -> bool:
         raise BackupError(
             "An interrupted restore needs its safety backup and matching encryption key."
         ) from exc
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
-            _remove_sidecars(staged)
 
 
 def _restore_key_sidecar(backup_path: Path) -> Path | None:
@@ -897,9 +913,13 @@ def _replace_live_database(staged: Path, key_source: Path | None = None) -> None
             checkpoint.close()
         _remove_sidecars(live)
         if staged_key is not None:
+            # Secondary profiles resolve to `profiles/<id>.sqlite3.secret.key`
+            # while `legacy` resolves to the root `secret.key`; guard swaps on
+            # the resolved key path so concurrent readers never observe a race.
             key_path = installation_key_path()
-            os.replace(staged_key, key_path)
-            os.chmod(key_path, 0o600)
+            with _key_file_lock(key_path):
+                os.replace(staged_key, key_path)
+                os.chmod(key_path, 0o600)
         os.replace(staged, live)
         os.chmod(live, 0o600)
         directory_fd = os.open(live.parent, os.O_RDONLY)
@@ -941,27 +961,6 @@ def _finalize_staged_database(staged: Path) -> None:
     _remove_sidecars(staged)
 
 
-def _rollback_failed_restore(live_path: Path, safety_backup: Path | None) -> bool:
-    if not safety_backup:
-        return True
-    rollback = None
-    try:
-        rollback_key = _restore_key_sidecar(safety_backup)
-        rollback = _copy_to_stage(safety_backup, live_path.parent)
-        with database_lock(live_path):
-            _replace_live_database(rollback, rollback_key)
-            rollback = None
-            _clear_restore_journal()
-        return False
-    except Exception:
-        LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-        return True
-    finally:
-        if rollback is not None:
-            rollback.unlink(missing_ok=True)
-            _remove_sidecars(rollback)
-
-
 def restore_backup(backup_id: str) -> dict:
     selected_key = None
     safety_backup = None
@@ -971,33 +970,60 @@ def restore_backup(backup_id: str) -> dict:
     live_path = profile_database_path()
     with _profile_backup_lock(live_path):
         source = _backup_path(backup_id)
+        rollback_failed = False
         try:
-            _validate_snapshot(source)
-            selected_key = _restore_key_sidecar(source)
-            _validate_snapshot_key(source, selected_key)
-            live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            staged = _copy_to_stage(source, live_path.parent)
-
-            # Apply this release's migrations on the staged copy first. If
-            # staging fails, neither the live database nor key is touched.
-            from .database import initialize
-            from .tenancy import database_path_override
-
-            with database_path_override(staged):
-                initialize(seed_demo=False)
-            _finalize_staged_database(staged)
-            _validate_snapshot(staged)
-
             with database_lock(live_path):
-                safety_backup = _create_snapshot_unlocked()
-                _write_restore_journal(safety_backup, source)
-                replaced = True
-                _replace_live_database(staged, selected_key)
-                staged = None
-                with transaction() as con:
-                    con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
-                _clear_restore_journal()
-                replaced = False
+                try:
+                    _validate_snapshot(source)
+                    selected_key = _restore_key_sidecar(source)
+                    _validate_snapshot_key(source, selected_key)
+                    live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    staged = _copy_to_stage(source, live_path.parent)
+
+                    # Apply this release's migrations on the staged copy first.
+                    # Holding the exclusive profile lock across staging keeps live
+                    # writes waiting until cutover completes so acknowledged writes
+                    # are never discarded by replacing the live database.
+                    from .database import initialize
+                    from .tenancy import database_path_override
+
+                    with database_path_override(staged):
+                        initialize(seed_demo=False)
+                    _finalize_staged_database(staged)
+                    _validate_snapshot(staged)
+
+                    safety_backup = _create_snapshot_unlocked()
+                    _write_restore_journal(safety_backup, source)
+                    replaced = True
+                    _replace_live_database(staged, selected_key)
+                    staged = None
+                    with transaction() as con:
+                        con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
+                    _clear_restore_journal()
+                    replaced = False
+                except Exception:
+                    if replaced:
+                        if safety_backup:
+                            rollback = None
+                            try:
+                                rollback = _copy_to_stage(safety_backup, live_path.parent)
+                                _replace_live_database(
+                                    rollback, _restore_key_sidecar(safety_backup)
+                                )
+                                rollback = None
+                                _clear_restore_journal()
+                            except Exception:
+                                rollback_failed = True
+                                LOGGER.exception(
+                                    "Failed to roll back an unsuccessful Bookward restore"
+                                )
+                            finally:
+                                if rollback is not None:
+                                    rollback.unlink(missing_ok=True)
+                                    _remove_sidecars(rollback)
+                        else:
+                            rollback_failed = True
+                    raise
             safety_record = _backup_record(safety_backup)
             _prune_backups()
             return {
@@ -1007,9 +1033,6 @@ def restore_backup(backup_id: str) -> dict:
         except Exception as exc:
             if not isinstance(exc, BackupError):
                 LOGGER.exception("Bookward restore failed")
-            rollback_failed = (
-                _rollback_failed_restore(live_path, safety_backup) if replaced else False
-            )
             detail = safe_error_message(exc, limit=200)
             if rollback_failed:
                 message = f"Restore failed; automatic rollback did not complete. {detail}"

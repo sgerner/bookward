@@ -1102,17 +1102,22 @@ class _ProfileDatabaseLock:
         owner = threading.get_ident()
         with self._condition:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
-            if self._writer not in (None, owner) or (
-                self._waiting_writers
-                and self._writer != owner
-                and not owns_connection
-            ):
-                yield False
-                return
-            self._connections += 1
-            self._connections_by_thread[owner] = (
-                self._connections_by_thread.get(owner, 0) + 1
+            acquired = not (
+                self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
             )
+            if acquired:
+                self._connections += 1
+                self._connections_by_thread[owner] = (
+                    self._connections_by_thread.get(owner, 0) + 1
+                )
+        if not acquired:
+            yield False
+            return
         try:
             yield True
         finally:

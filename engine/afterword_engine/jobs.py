@@ -195,17 +195,26 @@ async def worker_loop(handler, stop):
                 heartbeat.start()
                 try:
                     with profile_scope(profile_id):
-                        result = await handler(job["kind"])
+                        handler_task = asyncio.create_task(handler(job["kind"]))
+                    result = await handler_task
                     await asyncio.to_thread(
                         _complete_job, profile_id, job["id"], lease_token, result
                     )
+                except asyncio.CancelledError:
+                    handler_task.cancel()
+                    await asyncio.gather(handler_task, return_exceptions=True)
+                    raise
                 except Exception as exc:
                     await asyncio.to_thread(
                         _fail_job, profile_id, job["id"], lease_token, exc
                     )
                 finally:
                     heartbeat_stop.set()
-                    await asyncio.to_thread(heartbeat.join)
+                    try:
+                        await asyncio.to_thread(heartbeat.join)
+                    except asyncio.CancelledError:
+                        heartbeat.join(timeout=1.0)
+                        raise
             except Exception:
                 ready_profiles.discard(profile_id)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
@@ -230,6 +239,10 @@ def _heartbeat(
         try:
             with profile_scope(profile_id), database_lock().try_shared() as acquired:
                 if not acquired:
+                    LOGGER.info(
+                        "Deferred lease renewal for job %s while profile database lock is held",
+                        job_id,
+                    )
                     continue
                 with transaction() as con:
                     updated = con.execute(

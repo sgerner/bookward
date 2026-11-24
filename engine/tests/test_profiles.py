@@ -841,6 +841,253 @@ def test_event_loop_timer_stays_responsive_during_exclusive_profile_lock(
     ]
 
 
+def test_try_shared_releases_condition_before_yielding(identity_store):
+    alice = profiles.create_account("try-shared-alice", "try-shared-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+
+    with lock.try_shared() as acquired:
+        assert acquired is True
+        assert not lock._condition._is_owned()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(lock.is_locked).result(timeout=2) is False
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive():
+        with lock:
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    try:
+        assert lock_held.wait(timeout=2)
+        with lock.try_shared() as acquired:
+            assert acquired is False
+            assert not lock._condition._is_owned()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(lock.is_locked).result(timeout=2) is True
+    finally:
+        release_lock.set()
+        holder.join(timeout=2)
+
+
+def test_worker_heartbeat_logs_deferred_lease_renewal_when_profile_locked(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    alice = profiles.create_account("hb-alice", "hb-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("read_metadata")
+
+    state, _, _, claimed = jobs._poll_and_claim_job(
+        alice["profile_id"], need_init=False, need_reap=False
+    )
+    assert state == "claimed" and claimed is not None
+    claimed_job, lease_token = claimed
+    assert claimed_job["id"] == job_id
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_held = Event()
+    release_lock = Event()
+    hb_stop = Event()
+
+    def hold_exclusive():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    heartbeat = Thread(
+        target=jobs._heartbeat,
+        args=(alice["profile_id"], job_id, lease_token, hb_stop),
+        daemon=True,
+    )
+    try:
+        assert lock_held.wait(timeout=2)
+        with caplog.at_level(logging.INFO, logger="afterword_engine.jobs"):
+            heartbeat.start()
+            deadline = time.monotonic() + 2.0
+            while (
+                f"Deferred lease renewal for job {job_id}" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            hb_stop.set()
+            heartbeat.join(timeout=2)
+    finally:
+        hb_stop.set()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert (
+        f"Deferred lease renewal for job {job_id} while profile database lock is held"
+        in caplog.text
+    )
+
+
+def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
+    identity_store, monkeypatch
+):
+    from afterword_engine.main import handle_job
+
+    alice = profiles.create_account("real-job-alice", "real-job-alice-password-long")
+    bob = profiles.create_account("real-job-bob", "real-job-bob-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                (
+                    "The Left Hand of Darkness",
+                    "Ursula K. Le Guin",
+                    5,
+                    "9780441478125",
+                    "test",
+                ),
+            )
+        alice_job_id = enqueue_job("read_metadata")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                ("Kindred", "Octavia E. Butler", 5, "9780807083697", "test"),
+            )
+        bob_job_id = enqueue_job("read_metadata")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    alice_lookup_entered = Event()
+    release_alice_lookup = asyncio.Event()
+    cancel_lookup_entered = Event()
+    lock_acquired = Event()
+    release_lock = Event()
+    pause_cancel_lookup = False
+
+    async def fake_resolve_book_metadata(title, author, **_kwargs):
+        if title == "The Left Hand of Darkness":
+            alice_lookup_entered.set()
+            await release_alice_lookup.wait()
+        elif pause_cancel_lookup and title == "Parable of the Sower":
+            cancel_lookup_entered.set()
+            await asyncio.Event().wait()
+        return {}
+
+    monkeypatch.setattr(
+        "afterword_engine.ingestion.resolve_book_metadata",
+        fake_resolve_book_metadata,
+    )
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def job_status(profile_id: str, job_id: str) -> str:
+        with profile_scope(profile_id), connect() as con:
+            found = con.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return str(found["status"]) if found else ""
+
+    async def run_real_worker():
+        nonlocal pause_cancel_lookup
+        stop = asyncio.Event()
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        probe_task = asyncio.create_task(timer_probe())
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(alice_lookup_entered.wait, 3)
+            # Lock Alice's DB while handle_job("read_metadata") is mid-HTTP lookup,
+            # then let the lookup return so _persist_read_metadata_attempt hits
+            # database_lock(alice_path). It must wait in a worker thread rather
+            # than blocking the event loop.
+            lock_thread.start()
+            assert await asyncio.to_thread(lock_acquired.wait, 2)
+            release_alice_lookup.set()
+
+            await asyncio.sleep(0.35)
+            assert len(tick_durations) >= 5
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            await asyncio.to_thread(lock_thread.join, 2)
+
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                alice_state = await asyncio.to_thread(
+                    job_status, alice["profile_id"], alice_job_id
+                )
+                bob_state = await asyncio.to_thread(
+                    job_status, bob["profile_id"], bob_job_id
+                )
+                if alice_state == "complete" and bob_state == "complete":
+                    break
+                await asyncio.sleep(0.05)
+            assert alice_state == "complete"
+            assert bob_state == "complete"
+
+            # Verify cancelling an in-flight worker task cancels handle_job cleanly
+            # without marking the interrupted job as failed.
+            pause_cancel_lookup = True
+            with profile_scope(bob["profile_id"]):
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                        (
+                            "Parable of the Sower",
+                            "Octavia E. Butler",
+                            5,
+                            "9780446675505",
+                            "test",
+                        ),
+                    )
+                cancelled_job_id = enqueue_job("read_metadata")
+
+            assert await asyncio.to_thread(cancel_lookup_entered.wait, 3)
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+            assert (
+                await asyncio.to_thread(
+                    job_status, bob["profile_id"], cancelled_job_id
+                )
+                == "running"
+            )
+        finally:
+            release_lock.set()
+            release_alice_lookup.set()
+            measure_ticks = False
+            stop.set()
+            if not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            await asyncio.gather(probe_task, return_exceptions=True)
+            if lock_thread.is_alive():
+                await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_real_worker())
+
+
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):
     database_path = tmp_path / "upgrade.db"
     monkeypatch.setattr(settings, "db", str(database_path))

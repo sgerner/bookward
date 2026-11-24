@@ -94,10 +94,18 @@ export function buildLibrarrDownloadPayload(
   searchedMediaType: LibrarrMediaType,
   result: LibrarrResult,
   candidateId?: number,
-): { media_type: LibrarrMediaType; candidate_id: number | undefined; result: LibrarrResult } {
+  runId?: string,
+): {
+  media_type: LibrarrMediaType;
+  candidate_id: number | undefined;
+  run_id?: string;
+  result: LibrarrResult;
+} {
+  const normalizedRunId = runId?.trim() ?? '';
   return {
     media_type: searchedMediaType,
     candidate_id: candidateId,
+    ...(normalizedRunId.length >= 8 ? { run_id: normalizedRunId } : {}),
     result,
   };
 }
