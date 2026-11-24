@@ -1078,7 +1078,14 @@ class _ActiveWorkerJob:
 
 
 class _ProfileDatabaseLock:
-    """Allow concurrent connections and let backup/restore take an exclusive lock."""
+    """Coordinate shared readers, exclusive writers, and restore quiescence per profile DB.
+
+    ``shared()``, ``try_shared()``, and ``is_locked()`` allow concurrent readers
+    (including shared online backups) when idle, while refusing new readers both
+    during exclusive writer acquisition and during ``quiesce()``'s drain window
+    (``_restoring_count > 0``). ``acquire(deadline=None)`` blocks without a
+    timeout by default and raises ``BackupError`` when a restore deadline expires.
+    """
 
     def __init__(self):
         self._condition = threading.Condition()

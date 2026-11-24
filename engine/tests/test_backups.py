@@ -1150,7 +1150,7 @@ def test_restore_while_rebuild_embeddings_awaits_vectors_preserves_restored_embe
     assert current_restore_epoch() == 2
 
 
-def test_restore_and_startup_recovery_scrub_unfinished_jobs_and_keep_terminal_rows(database):
+def test_restore_and_startup_recovery_preserve_queued_jobs_and_requeue_running_rows(database):
     today = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
     created_iso = today.isoformat()
     with transaction() as con:
@@ -1203,17 +1203,25 @@ def test_restore_and_startup_recovery_scrub_unfinished_jobs_and_keep_terminal_ro
     result = backups.restore_backup(snapshot["id"])
     assert current_restore_epoch() == 1
     restored_jobs = {
-        item["id"]: item["status"] for item in rows("SELECT id,status FROM jobs")
+        item["id"]: item
+        for item in rows(
+            "SELECT id,status,started_at,heartbeat_at,lease_token,attempts FROM jobs"
+        )
     }
-    assert restored_jobs == {
+    assert {job_id: item["status"] for job_id, item in restored_jobs.items()} == {
+        "job-queued": "queued",
+        "job-running": "queued",
         "job-complete": "complete",
         "job-failed": "failed",
     }
-    # Scrubbing the running goodreads_rss row deleted it instead of marking it failed,
-    # so the scheduler queues a fresh job cleanly rather than replaying a stale row.
-    fresh_job_id = queue_goodreads_rss_if_due(today)
-    assert fresh_job_id is not None
-    assert fresh_job_id != "job-running"
+    assert restored_jobs["job-running"]["started_at"] is None
+    assert restored_jobs["job-running"]["heartbeat_at"] is None
+    assert restored_jobs["job-running"]["lease_token"] is None
+    assert restored_jobs["job-running"]["attempts"] == 0
+    # Requeuing the interrupted goodreads_rss row preserves pending work without
+    # waiting for a dead lease to expire.
+    scheduled_job_id = queue_goodreads_rss_if_due(today)
+    assert scheduled_job_id == "job-running"
 
     # Simulate an interrupted restore rolling back to safety_backup on startup.
     safety_path = database / "backups" / f"{result['safety_backup']['id']}.sqlite3"
@@ -1221,13 +1229,21 @@ def test_restore_and_startup_recovery_scrub_unfinished_jobs_and_keep_terminal_ro
     assert backups.recover_interrupted_restore() is True
     assert current_restore_epoch() == 2
     recovered_jobs = {
-        item["id"]: item["status"] for item in rows("SELECT id,status FROM jobs")
+        item["id"]: item
+        for item in rows(
+            "SELECT id,status,started_at,heartbeat_at,lease_token,attempts FROM jobs"
+        )
     }
-    assert recovered_jobs == {
+    assert {job_id: item["status"] for job_id, item in recovered_jobs.items()} == {
         "safety-queued": "queued",
+        "safety-running": "queued",
         "safety-complete": "complete",
         "safety-failed": "failed",
     }
+    assert recovered_jobs["safety-running"]["started_at"] is None
+    assert recovered_jobs["safety-running"]["heartbeat_at"] is None
+    assert recovered_jobs["safety-running"]["lease_token"] is None
+    assert recovered_jobs["safety-running"]["attempts"] == 0
 
 
 def test_failed_restore_prechecks_preserve_active_jobs_and_restore_epoch(database):
@@ -1467,6 +1483,95 @@ def test_quiesce_timeout_with_live_jobs_finalizes_status_or_fences_post_swap_wri
     assert row("SELECT 1 FROM reads WHERE title='Stale post-quiesce'") is None
     assert row("SELECT id FROM jobs WHERE id=?", (job_id,)) is None
 
+    # 4: Connectionless handler outlives quiesce(0.05) while restore fails in
+    #    _replace_live_database and rolls back to safety_backup: the job's row
+    #    (captured as 'running' in safety_backup) is requeued instead of deleted,
+    #    the stale run's write/completion is fenced, and worker_loop completes
+    #    the requeued job on the rolled-back epoch.
+    rollback_job_id = enqueue_job("outlived_rollback")
+    first_run_started = asyncio.Event()
+    release_first_run = asyncio.Event()
+    stale_write_fenced = asyncio.Event()
+    requeued_run_done = asyncio.Event()
+    stop = asyncio.Event()
+    run_number = 0
+    real_replace = backups._replace_live_database
+    swap_calls = 0
+
+    def fail_primary_swap(staged: Path, key_source: Path | None = None, **kwargs) -> None:
+        nonlocal swap_calls
+        swap_calls += 1
+        if swap_calls == 1:
+            raise OSError("simulated swap failure after quiesce timeout")
+        real_replace(staged, key_source, **kwargs)
+
+    monkeypatch.setattr(backups, "_replace_live_database", fail_primary_swap)
+
+    async def rollback_outliving_handler(kind):
+        nonlocal run_number
+        assert kind == "outlived_rollback"
+        run_number += 1
+        if run_number == 1:
+            first_run_started.set()
+            try:
+                await release_first_run.wait()
+            except asyncio.CancelledError:
+                await release_first_run.wait()
+            try:
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,source) VALUES('Stale rollback write','Reader','test')"
+                    )
+            except RestoreEpochError:
+                stale_write_fenced.set()
+            return {"stale": True}
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Requeued after rollback','Reader','test')"
+            )
+        requeued_run_done.set()
+        stop.set()
+        return {"requeued": True}
+
+    async def run_rollback_outlived():
+        worker = asyncio.create_task(worker_loop(rollback_outliving_handler, stop))
+        try:
+            await asyncio.wait_for(first_run_started.wait(), timeout=2)
+            with pytest.raises(backups.BackupError, match="previous database remains active"):
+                await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+            assert swap_calls == 2
+            assert current_restore_epoch() == 2
+            requeued_state = row(
+                "SELECT status,lease_token,attempts FROM jobs WHERE id=?",
+                (rollback_job_id,),
+            )
+            assert requeued_state == {
+                "status": "queued",
+                "lease_token": None,
+                "attempts": 0,
+            }
+            release_first_run.set()
+            await asyncio.wait_for(requeued_run_done.wait(), timeout=2)
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            release_first_run.set()
+            stop.set()
+
+    try:
+        asyncio.run(run_rollback_outlived())
+    finally:
+        monkeypatch.setattr(backups, "_replace_live_database", real_replace)
+
+    assert stale_write_fenced.is_set()
+    assert row("SELECT 1 FROM reads WHERE title='Stale rollback write'") is None
+    assert row("SELECT 1 FROM reads WHERE title='Requeued after rollback'") is not None
+    final_job = row("SELECT status,result,attempts FROM jobs WHERE id=?", (rollback_job_id,))
+    assert final_job == {
+        "status": "complete",
+        "result": '{"requeued": true}',
+        "attempts": 1,
+    }
+
 
 def test_rollback_after_replace_failure_advances_epoch_migrates_schema_and_preserves_queued_jobs(
     database, monkeypatch
@@ -1531,9 +1636,15 @@ def test_rollback_after_replace_failure_advances_epoch_migrates_schema_and_prese
     assert row("SELECT 1 FROM reads WHERE title='Live before restore'") is not None
     assert row("SELECT 1 FROM reads WHERE title='Fenced pre-rollback'") is None
     rolled_back_jobs = {
-        item["id"]: item["status"] for item in rows("SELECT id,status FROM jobs")
+        item["id"]: item
+        for item in rows("SELECT id,status,lease_token,attempts FROM jobs")
     }
-    assert rolled_back_jobs == {"live-queued": "queued"}
+    assert {job_id: item["status"] for job_id, item in rolled_back_jobs.items()} == {
+        "live-queued": "queued",
+        "live-running": "queued",
+    }
+    assert rolled_back_jobs["live-running"]["lease_token"] is None
+    assert rolled_back_jobs["live-running"]["attempts"] == 0
     assert row("SELECT MAX(version) AS v FROM schema_migrations")["v"] == MIGRATIONS[-1][0]
     assert (
         row(
@@ -1689,3 +1800,88 @@ def test_unexpected_recovery_error_returns_static_503_detail(database, monkeypat
         assert "unexpected internal traceback detail" not in resp.text
     finally:
         journal_path.unlink(missing_ok=True)
+
+
+def test_backup_scheduler_loop_runs_due_checks_off_event_loop_thread(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    alice = profiles.create_account("sched-alice", "sched-alice-password-with-length")
+    bob = profiles.create_account("sched-bob", "sched-bob-password-with-length")
+    from afterword_engine.tenancy import profile_scope
+
+    for profile_id in ("legacy", alice["profile_id"], bob["profile_id"]):
+        with profile_scope(profile_id):
+            initialize(seed_demo=False)
+
+    loop_thread_id: int | None = None
+    observed_threads: dict[str, set[int]] = {
+        "auth_due": set(),
+        "profile_ids": set(),
+        "profile_due": set(),
+    }
+    checked_profiles: list[str] = []
+    stop = asyncio.Event()
+
+    orig_profile_ids = profiles.profile_ids
+
+    def spy_auth_due(now=None):
+        observed_threads["auth_due"].add(threading.get_ident())
+        return False
+
+    def spy_profile_ids(*args, **kwargs):
+        observed_threads["profile_ids"].add(threading.get_ident())
+        return orig_profile_ids(*args, **kwargs)
+
+    def spy_backup_is_due(now=None):
+        observed_threads["profile_due"].add(threading.get_ident())
+        from afterword_engine.tenancy import current_profile_id
+
+        checked_profiles.append(current_profile_id() or "legacy")
+        if len(checked_profiles) >= 2:
+            stop.set()
+        return False
+
+    monkeypatch.setattr(backups, "auth_backup_is_due", spy_auth_due)
+    monkeypatch.setattr(profiles, "profile_ids", spy_profile_ids)
+    monkeypatch.setattr(backups, "backup_is_due", spy_backup_is_due)
+
+    # Hold an exclusive lock on Alice so backup_scheduler_loop skips Alice without blocking.
+    alice_lock = database_lock(backups.profile_database_path(alice["profile_id"]))
+    locked_ready = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_alice():
+        with alice_lock:
+            locked_ready.set()
+            release_lock.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_alice, daemon=True)
+    holder.start()
+    assert locked_ready.wait(timeout=2)
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_initial_wait(coro, timeout):
+        return await orig_wait_for(coro, 0.01 if timeout == 5 else timeout)
+
+    monkeypatch.setattr(backups.asyncio, "wait_for", fast_initial_wait)
+
+    async def run():
+        nonlocal loop_thread_id
+        loop_thread_id = threading.get_ident()
+        await orig_wait_for(backups.backup_scheduler_loop(stop), timeout=2)
+
+    try:
+        asyncio.run(run())
+    finally:
+        stop.set()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert loop_thread_id is not None
+    assert observed_threads["auth_due"] and loop_thread_id not in observed_threads["auth_due"]
+    assert observed_threads["profile_ids"] and loop_thread_id not in observed_threads["profile_ids"]
+    assert observed_threads["profile_due"] and loop_thread_id not in observed_threads["profile_due"]
+    assert alice["profile_id"] not in checked_profiles
+    assert set(checked_profiles) == {"legacy", bob["profile_id"]}

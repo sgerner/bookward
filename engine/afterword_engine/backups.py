@@ -939,7 +939,6 @@ def recover_interrupted_restore() -> bool:
                 live_parent,
                 minimum_epoch=_read_file_restore_epoch(live_path),
                 migrate=True,
-                scrub_queued_jobs=False,
             )
             try:
                 if clear_key:
@@ -1188,7 +1187,6 @@ def _stage_restored_database(
     *,
     minimum_epoch: int,
     migrate: bool = True,
-    scrub_queued_jobs: bool = True,
 ) -> tuple[Path, int]:
     staged = _copy_to_stage(source, directory)
     try:
@@ -1209,10 +1207,23 @@ def _stage_restored_database(
                 )
             }
             if "jobs" in tables:
-                if scrub_queued_jobs:
-                    con.execute("DELETE FROM jobs WHERE status IN ('queued', 'running')")
+                job_columns = {
+                    item[1] for item in con.execute("PRAGMA table_info(jobs)")
+                }
+                if {"started_at", "heartbeat_at", "lease_token", "attempts"} <= job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL, "
+                        "heartbeat_at=NULL, lease_token=NULL, "
+                        "attempts=CASE WHEN COALESCE(attempts, 0) > 0 THEN attempts - 1 ELSE 0 END "
+                        "WHERE status='running'"
+                    )
+                elif "started_at" in job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL "
+                        "WHERE status='running'"
+                    )
                 else:
-                    con.execute("DELETE FROM jobs WHERE status = 'running'")
+                    con.execute("UPDATE jobs SET status='queued' WHERE status='running'")
             con.execute(
                 "CREATE TABLE IF NOT EXISTS settings ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL, "
@@ -1284,15 +1295,15 @@ def restore_backup(backup_id: str) -> dict:
                 selected_key = _restore_key_sidecar(source)
                 _validate_snapshot_key(source, selected_key)
                 live_path.parent.mkdir(parents=True, exist_ok=True)
-                # Apply this release's migrations, scrub stale snapshot jobs, and
-                # advance restore_epoch on the staged copy first. If staging fails,
+                # Apply this release's migrations, requeue any orphaned running
+                # jobs while keeping queued work intact, and advance
+                # restore_epoch on the staged copy first. If staging fails,
                 # neither the live database nor key is touched.
                 staged, next_epoch = _stage_restored_database(
                     source,
                     live_path.parent,
                     minimum_epoch=_read_file_restore_epoch(live_path),
                     migrate=True,
-                    scrub_queued_jobs=True,
                 )
 
                 if had_unrecoverable_journal:
@@ -1341,7 +1352,6 @@ def restore_backup(backup_id: str) -> dict:
                                 live_path.parent,
                                 minimum_epoch=_read_file_restore_epoch(live_path),
                                 migrate=True,
-                                scrub_queued_jobs=False,
                             )
                             if clear_key:
                                 _replace_live_database(
@@ -1393,6 +1403,23 @@ def restore_backup(backup_id: str) -> dict:
             _remove_sidecars(staged)
 
 
+def _run_scheduled_auth_backup() -> dict | None:
+    if auth_backup_is_due():
+        return create_auth_backup()
+    return None
+
+
+def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
+    from .tenancy import profile_scope
+
+    with profile_scope(profile_id):
+        if _has_restore_journal() or database_lock().is_locked():
+            return None
+        if not backup_is_due():
+            return None
+        return create_backup()
+
+
 async def backup_scheduler_loop(stop: asyncio.Event) -> None:
     """Create hourly-polled backups without depending on host cron."""
 
@@ -1402,19 +1429,21 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         pass
     while not stop.is_set():
         from .profiles import profile_ids
-        from .tenancy import profile_scope
+
         try:
-            if auth_backup_is_due():
-                await asyncio.to_thread(create_auth_backup)
+            await asyncio.to_thread(_run_scheduled_auth_backup)
         except Exception:
             LOGGER.exception("Scheduled identity-registry backup failed")
-        for profile_id in profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(profile_ids)
+        except Exception:
+            LOGGER.exception("Could not enumerate profiles for scheduled backups")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    if _has_restore_journal() or database_lock().is_locked():
-                        continue
-                    if await asyncio.to_thread(backup_is_due):
-                        await asyncio.to_thread(create_backup)
+                await asyncio.to_thread(_run_scheduled_profile_backup, profile_id)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:

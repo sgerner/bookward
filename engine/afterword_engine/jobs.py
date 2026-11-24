@@ -239,7 +239,12 @@ async def worker_loop(handler, stop):
 
     while not stop.is_set():
         worked = False
-        for profile_id in profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(profile_ids)
+        except Exception:
+            LOGGER.exception("Worker could not enumerate active profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
             if stop.is_set():
                 break
             current = time.monotonic()
@@ -386,16 +391,19 @@ def _heartbeat(
 
     while not stop.wait(JOB_HEARTBEAT_SECONDS):
         try:
-            with (
-                profile_scope(profile_id),
-                bind_restore_epoch(expected_epoch),
-                transaction() as con,
-            ):
-                updated = con.execute(
-                    "UPDATE jobs SET heartbeat_at=? "
-                    "WHERE id=? AND status='running' AND lease_token=?",
-                    (now(), job_id, lease_token),
-                ).rowcount
+            with profile_scope(profile_id), database_lock().try_shared() as acquired:
+                if not acquired:
+                    LOGGER.info(
+                        "Deferred lease renewal for job %s while profile database lock is held",
+                        job_id,
+                    )
+                    continue
+                with bind_restore_epoch(expected_epoch), transaction() as con:
+                    updated = con.execute(
+                        "UPDATE jobs SET heartbeat_at=? "
+                        "WHERE id=? AND status='running' AND lease_token=?",
+                        (now(), job_id, lease_token),
+                    ).rowcount
         except RestoreEpochError:
             if on_lost_lease is not None:
                 on_lost_lease()

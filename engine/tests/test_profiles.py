@@ -1032,6 +1032,80 @@ def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_
     assert second_job["result"] == '{"after_restore": true}'
 
 
+def test_heartbeat_defers_lease_renewal_while_profile_database_lock_is_held(
+    identity_store, monkeypatch, caplog
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("deferred_heartbeat")
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2026-01-01T00:00:00+00:00',"
+                "heartbeat_at='2026-01-01T00:00:00+00:00',lease_token='lease-1',attempts=1 "
+                "WHERE id=?",
+                (job_id,),
+            )
+        legacy_path = profile_database_path()
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(legacy_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_exclusive_lock)
+    assert lock_held.wait(timeout=2)
+
+    stop = Event()
+    lost_lease = Event()
+    caplog.set_level("INFO", logger=jobs.LOGGER.name)
+    hb_thread = Thread(
+        target=jobs._heartbeat,
+        args=("legacy", job_id, "lease-1", stop, lost_lease.set, 0),
+        daemon=True,
+    )
+    try:
+        hb_thread.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if any(
+                "Deferred lease renewal for job" in record.getMessage()
+                for record in caplog.records
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            "Deferred lease renewal for job" in record.getMessage()
+            for record in caplog.records
+        )
+        assert not lost_lease.is_set()
+
+        # Once the exclusive lock releases, heartbeat renews heartbeat_at cleanly.
+        release_lock.set()
+        future.result(timeout=2)
+        deadline = time.monotonic() + 1.0
+        renewed = None
+        while time.monotonic() < deadline:
+            with profile_scope("legacy"), connect() as con:
+                renewed = con.execute(
+                    "SELECT heartbeat_at FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()[0]
+            if renewed and renewed != "2026-01-01T00:00:00+00:00":
+                break
+            time.sleep(0.01)
+        assert renewed is not None and renewed != "2026-01-01T00:00:00+00:00"
+        assert not lost_lease.is_set()
+    finally:
+        stop.set()
+        release_lock.set()
+        hb_thread.join(timeout=2)
+        holder.shutdown(wait=True)
+
+
 def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants(
     identity_store,
 ):
@@ -1059,11 +1133,11 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
                 "INSERT INTO reads(title,author,source) VALUES('Alice snapshot read','Alice','test')"
             )
             con.execute(
-                "INSERT INTO jobs(id,kind,status) VALUES('alice-stale-queued','sync','queued')"
+                "INSERT INTO jobs(id,kind,status) VALUES('alice-snapshot-queued','alice_snapshot','queued')"
             )
         alice_backup = backups.create_backup()
         with transaction() as con:
-            con.execute("DELETE FROM jobs WHERE id='alice-stale-queued'")
+            con.execute("DELETE FROM jobs WHERE id='alice-snapshot-queued'")
         alice_live_job = enqueue_job("alice_active")
 
     with profile_scope(bob["profile_id"]):
@@ -1071,6 +1145,7 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
 
     alice_started = asyncio.Event()
     alice_cancelled = asyncio.Event()
+    alice_snapshot_done = asyncio.Event()
     alice_hold = asyncio.Event()
     bob_started = asyncio.Event()
     bob_release = asyncio.Event()
@@ -1081,6 +1156,9 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
         if current_profile_id() != alice["profile_id"]:
             await asyncio.sleep(0.05)
             return {}
+        if kind == "alice_snapshot":
+            alice_snapshot_done.set()
+            return {"restored_pending": True}
         assert kind == "alice_active"
         alice_started.set()
         try:
@@ -1140,7 +1218,9 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
                                 "INSERT INTO reads(title,author,source) VALUES('Late Alice write','Alice','test')"
                             )
 
-            # Bob's active job was never canceled or fenced by Alice's restore.
+            # Bob's active job was never canceled or fenced by Alice's restore,
+            # and Alice's pending queued job from the snapshot executes cleanly.
+            await asyncio.wait_for(alice_snapshot_done.wait(), timeout=2)
             bob_release.set()
             await asyncio.wait_for(bob_worker, timeout=2)
             alice_stop.set()
@@ -1161,9 +1241,14 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
         alice_jobs = con.execute(
             "SELECT id,status FROM jobs WHERE status IN ('queued','running')"
         ).fetchall()
+        restored_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id='alice-snapshot-queued'"
+        ).fetchone()
         alice_epoch = current_restore_epoch()
     assert alice_reads == {"Alice snapshot read"}
     assert alice_jobs == []
+    assert restored_job["status"] == "complete"
+    assert restored_job["result"] == '{"restored_pending": true}'
     assert alice_epoch == 1
     assert alice_live_job is not None
 
