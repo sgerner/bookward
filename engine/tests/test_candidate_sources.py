@@ -63,7 +63,7 @@ def database(tmp_path: Path):
 def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources_and_is_idempotent(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "upgrade-v26.db"
+    db_path = tmp_path / "upgrade-v27.db"
     settings.db = str(db_path)
 
     with sqlite3.connect(db_path) as con:
@@ -74,7 +74,7 @@ def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources
             "applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 27:
+            if version >= 28:
                 break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -236,7 +236,7 @@ def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources
 
     initialize(seed_demo=False)
 
-    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {27}
+    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {28}
     assert {
         int(item["source_id"])
         for item in rows(
@@ -782,6 +782,20 @@ def test_chart_pruning_preserves_shared_and_fk_protected_rows_and_maintains_null
     assert feedback_protected["id"] not in audit_ids
     assert chart_saved["id"] in audit_ids
     assert fresh_arrival["id"] in audit_ids
+
+    # A zero-match filter scan records filtered:0 without pruning existing memberships or candidates.
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET filters=? WHERE id=?",
+            (json.dumps({"include_genres": ["Nonexistent Genre"]}), chart_id),
+        )
+    assert asyncio.run(scan_source(row("SELECT * FROM sources WHERE id=?", (chart_id,)))) == 0
+    assert row("SELECT last_status FROM sources WHERE id=?", (chart_id,))["last_status"] == "filtered:0"
+    assert [
+        int(item["source_id"])
+        for item in rows("SELECT source_id FROM candidate_sources WHERE candidate_id=?", (fresh_arrival["id"],))
+    ] == [chart_id]
+    assert row("SELECT source_id FROM candidates WHERE id=?", (fresh_arrival["id"],))["source_id"] == chart_id
 
 
 def test_toggle_source_transfers_shared_candidates_before_demoting_orphans(
