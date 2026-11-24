@@ -91,11 +91,11 @@
 					</div>
 					<form method="POST" action="?/dismissIdentityHold" use:enhance class="space-y-3 border-t border-warning-500/30 pt-3">
 						<ProfileField profileId={data.user?.profile_id} />
-						<label class="flex items-start gap-2 text-xs leading-5">
-							<input class="checkbox mt-0.5 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
+						<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5">
+							<input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
 							<span>Keep this current account registry and resume scheduled identity backups.</span>
 						</label>
-						<button class="btn btn-sm preset-filled-warning-500" type="submit">Keep current account registry &amp; resume backups</button>
+						<button class="btn btn-sm min-h-10 preset-filled-warning-500" type="submit">Keep current account registry &amp; resume backups</button>
 					</form>
 				</div>
 			{/if}

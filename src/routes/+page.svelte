@@ -2833,8 +2833,8 @@
                         </div>
                         <form class="space-y-3 border-t border-warning-500/30 pt-3" method="POST" action="?/dismissRecoveryHold" use:enhance={setPending("dismiss-recovery-hold")}>
                           <ProfileField profileId={data.user?.profile_id} />
-                          <label class="flex items-start gap-2 text-xs leading-5 text-surface-900-100">
-                            <input class="checkbox mt-0.5 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
+                          <label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5 text-surface-900-100">
+                            <input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
                             <span>Keep this new database and resume scheduled backups{#if data.backupStatus.retention_count <= 1} (later snapshots will prune older backups under retention {data.backupStatus.retention_count}){/if}.</span>
                           </label>
                           <button class="btn btn-sm min-h-10 preset-filled-warning-500" type="submit" disabled={isPending("dismiss-recovery-hold")} aria-busy={isPending("dismiss-recovery-hold")}>
@@ -2859,8 +2859,8 @@
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
                       {#if data.backupStatus.recovery_hold}
-                        <label class="mb-3 flex items-start gap-2 text-xs leading-5 text-surface-800-200">
-                          <input class="checkbox mt-0.5 shrink-0" type="checkbox" name="confirmClearHold" value="CONFIRM" required />
+                        <label class="mb-3 flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5 text-surface-800-200">
+                          <input class="checkbox size-6 shrink-0" type="checkbox" name="confirmClearHold" value="CONFIRM" required />
                           <span>Clear the recovery hold and snapshot this current database (existing snapshots stay intact now; later backups prune to {data.backupStatus.retention_count}).</span>
                         </label>
                       {/if}
