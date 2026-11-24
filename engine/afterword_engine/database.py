@@ -15,9 +15,10 @@ from .covers import (
 from .identity import ReadIdentityIndex, book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path
+from .tenancy import profile_database_path, restore_fence_bypassed
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
+SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -995,15 +996,26 @@ MIGRATIONS = [
     (
         27,
         """
-        DROP TABLE IF EXISTS temp._m27_demo_reads;
-        CREATE TEMP TABLE _m27_demo_reads (
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
+    (
+        28,
+        """
+        DROP TABLE IF EXISTS temp._m28_demo_reads;
+        CREATE TEMP TABLE _m28_demo_reads (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             author TEXT NOT NULL,
             isbn TEXT NOT NULL,
             openlibrary_work_id TEXT NOT NULL
         );
-        INSERT INTO temp._m27_demo_reads(id, title, author, isbn, openlibrary_work_id)
+        INSERT INTO temp._m28_demo_reads(id, title, author, isbn, openlibrary_work_id)
         SELECT id, title, author, COALESCE(isbn, ''), COALESCE(openlibrary_work_id, '')
         FROM reads
         WHERE source = 'demo'
@@ -1015,21 +1027,21 @@ MIGRATIONS = [
               )
           );
 
-        DROP TABLE IF EXISTS temp._m27_demo_events;
-        CREATE TEMP TABLE _m27_demo_events (
+        DROP TABLE IF EXISTS temp._m28_demo_events;
+        CREATE TEMP TABLE _m28_demo_events (
             event_id INTEGER,
             event_key TEXT NOT NULL,
             run_id TEXT,
             candidate_id INTEGER
         );
-        INSERT INTO temp._m27_demo_events(event_id, event_key, run_id, candidate_id)
+        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, printf('read:%08d', id), NULL, NULL
-        FROM temp._m27_demo_reads;
-        INSERT INTO temp._m27_demo_events(event_id, event_key, run_id, candidate_id)
+        FROM temp._m28_demo_reads;
+        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT e.id, e.event_key, e.run_id, e.candidate_id
         FROM recommendation_events e
         WHERE EXISTS (
-            SELECT 1 FROM temp._m27_demo_reads r
+            SELECT 1 FROM temp._m28_demo_reads r
             WHERE e.event_key = printf('read:%08d', r.id)
                OR e.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
         )
@@ -1045,54 +1057,54 @@ MIGRATIONS = [
                 )
             )
         );
-        INSERT INTO temp._m27_demo_events(event_id, event_key, run_id, candidate_id)
+        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, ee.event_key, ee.run_id, ee.candidate_id
         FROM recommendation_evidence_events ee
         WHERE EXISTS (
-            SELECT 1 FROM temp._m27_demo_reads r
+            SELECT 1 FROM temp._m28_demo_reads r
             WHERE ee.event_key = printf('read:%08d', r.id)
                OR ee.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
         )
-           OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m27_demo_events);
-        INSERT INTO temp._m27_demo_events(event_id, event_key, run_id, candidate_id)
+           OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, eo.event_key, eo.run_id, eo.candidate_id
         FROM recommendation_evidence_outcomes eo
         WHERE EXISTS (
-            SELECT 1 FROM temp._m27_demo_reads r
+            SELECT 1 FROM temp._m28_demo_reads r
             WHERE eo.event_key = printf('read:%08d', r.id)
                OR eo.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
         )
-           OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m27_demo_events);
+           OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
 
-        DROP TABLE IF EXISTS temp._m27_demo_batches;
-        CREATE TEMP TABLE _m27_demo_batches (batch_id TEXT PRIMARY KEY);
-        INSERT OR IGNORE INTO temp._m27_demo_batches(batch_id)
+        DROP TABLE IF EXISTS temp._m28_demo_batches;
+        CREATE TEMP TABLE _m28_demo_batches (batch_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m28_demo_batches(batch_id)
         SELECT DISTINCT batch_id
         FROM scoring_batch_reads
-        WHERE read_id IN (SELECT id FROM temp._m27_demo_reads);
+        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads);
 
-        DROP TABLE IF EXISTS temp._m27_demo_runs;
-        CREATE TEMP TABLE _m27_demo_runs (run_id TEXT PRIMARY KEY);
-        INSERT OR IGNORE INTO temp._m27_demo_runs(run_id)
+        DROP TABLE IF EXISTS temp._m28_demo_runs;
+        CREATE TEMP TABLE _m28_demo_runs (run_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
         SELECT i.run_id
         FROM recommendation_outcomes o
         JOIN recommendation_impressions i ON i.id = o.impression_id
-        WHERE o.read_id IN (SELECT id FROM temp._m27_demo_reads)
+        WHERE o.read_id IN (SELECT id FROM temp._m28_demo_reads)
           AND i.run_id IS NOT NULL AND i.run_id != '';
-        INSERT OR IGNORE INTO temp._m27_demo_runs(run_id)
-        SELECT run_id FROM temp._m27_demo_events
+        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
+        SELECT run_id FROM temp._m28_demo_events
         WHERE run_id IS NOT NULL AND run_id != '';
-        INSERT OR IGNORE INTO temp._m27_demo_runs(run_id)
+        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
         SELECT run_id FROM recommendation_run_evidence_scoring_batches
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m27_demo_batches)
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches)
           AND run_id IS NOT NULL AND run_id != '';
 
         INSERT INTO jobs(id, kind, status)
-        SELECT 'migration-27-score-' || lower(hex(randomblob(8))), 'score', 'queued'
+        SELECT 'migration-28-score-' || lower(hex(randomblob(8))), 'score', 'queued'
         WHERE (
-            EXISTS (SELECT 1 FROM temp._m27_demo_reads)
-            OR EXISTS (SELECT 1 FROM temp._m27_demo_events WHERE event_id IS NOT NULL)
-            OR EXISTS (SELECT 1 FROM temp._m27_demo_batches)
+            EXISTS (SELECT 1 FROM temp._m28_demo_reads)
+            OR EXISTS (SELECT 1 FROM temp._m28_demo_events WHERE event_id IS NOT NULL)
+            OR EXISTS (SELECT 1 FROM temp._m28_demo_batches)
         )
           AND NOT EXISTS (
               SELECT 1 FROM jobs
@@ -1135,11 +1147,11 @@ MIGRATIONS = [
         WHERE status = 'read'
           AND (
               id IN (
-                  SELECT candidate_id FROM temp._m27_demo_events
+                  SELECT candidate_id FROM temp._m28_demo_events
                   WHERE candidate_id IS NOT NULL
               )
               OR EXISTS (
-                  SELECT 1 FROM temp._m27_demo_reads r
+                  SELECT 1 FROM temp._m28_demo_reads r
                   WHERE (
                       lower(trim(r.title)) = lower(trim(candidates.title))
                       AND replace(replace(lower(trim(r.author)), '.', ''), ' ', '')
@@ -1201,62 +1213,62 @@ MIGRATIONS = [
 
         UPDATE candidates
         SET score_batch_id = NULL
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m27_demo_batches);
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
 
         DELETE FROM recommendation_run_evidence_scoring_batches
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m27_demo_batches)
-           OR run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches)
+           OR run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM scoring_batch_vectors
-        WHERE batch_id IN (SELECT batch_id FROM temp._m27_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
         DELETE FROM scoring_batch_candidates
-        WHERE batch_id IN (SELECT batch_id FROM temp._m27_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
         DELETE FROM scoring_batch_reads
-        WHERE batch_id IN (SELECT batch_id FROM temp._m27_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
         DELETE FROM scoring_batches
-        WHERE id IN (SELECT batch_id FROM temp._m27_demo_batches);
+        WHERE id IN (SELECT batch_id FROM temp._m28_demo_batches);
 
         DELETE FROM recommendation_outcomes
-        WHERE read_id IN (SELECT id FROM temp._m27_demo_reads)
+        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads)
            OR event_id IN (
-               SELECT event_id FROM temp._m27_demo_events WHERE event_id IS NOT NULL
+               SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
            )
            OR impression_id IN (
                SELECT id FROM recommendation_impressions
-               WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs)
+               WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
            )
            OR event_id IN (
                SELECT id FROM recommendation_events
-               WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs)
+               WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
            );
         DELETE FROM recommendation_events
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs)
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
            OR id IN (
-               SELECT event_id FROM temp._m27_demo_events WHERE event_id IS NOT NULL
+               SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
            )
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m27_demo_events);
+           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         DELETE FROM recommendation_impressions
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_run_evidence_vectors
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_run_evidence_candidates
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_evidence_exposures
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_evidence_outcomes
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs)
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m27_demo_events);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
+           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         DELETE FROM recommendation_evidence_events
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs)
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m27_demo_events);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
+           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         DELETE FROM recommendation_run_evidence
-        WHERE run_id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_runs
-        WHERE id IN (SELECT run_id FROM temp._m27_demo_runs);
+        WHERE id IN (SELECT run_id FROM temp._m28_demo_runs);
 
         DELETE FROM recommendation_evidence_vectors
         WHERE (
-            EXISTS (SELECT 1 FROM temp._m27_demo_batches)
-            OR EXISTS (SELECT 1 FROM temp._m27_demo_runs)
+            EXISTS (SELECT 1 FROM temp._m28_demo_batches)
+            OR EXISTS (SELECT 1 FROM temp._m28_demo_runs)
         )
           AND NOT EXISTS (
               SELECT 1 FROM recommendation_run_evidence_vectors r
@@ -1269,21 +1281,21 @@ MIGRATIONS = [
 
         DELETE FROM embeddings
         WHERE entity_type = 'read'
-          AND entity_id IN (SELECT id FROM temp._m27_demo_reads);
+          AND entity_id IN (SELECT id FROM temp._m28_demo_reads);
         DELETE FROM association_evidence
-        WHERE seed_read_id IN (SELECT id FROM temp._m27_demo_reads);
+        WHERE seed_read_id IN (SELECT id FROM temp._m28_demo_reads);
         DELETE FROM read_metadata
-        WHERE read_id IN (SELECT id FROM temp._m27_demo_reads);
+        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads);
         DELETE FROM metadata_field_provenance
         WHERE entity_type = 'read'
-          AND entity_id IN (SELECT id FROM temp._m27_demo_reads);
+          AND entity_id IN (SELECT id FROM temp._m28_demo_reads);
         DELETE FROM reads
-        WHERE id IN (SELECT id FROM temp._m27_demo_reads);
+        WHERE id IN (SELECT id FROM temp._m28_demo_reads);
 
-        DROP TABLE temp._m27_demo_runs;
-        DROP TABLE temp._m27_demo_batches;
-        DROP TABLE temp._m27_demo_events;
-        DROP TABLE temp._m27_demo_reads;
+        DROP TABLE temp._m28_demo_runs;
+        DROP TABLE temp._m28_demo_batches;
+        DROP TABLE temp._m28_demo_events;
+        DROP TABLE temp._m28_demo_reads;
         """,
     ),
 ]
@@ -1292,6 +1304,11 @@ MIGRATIONS = [
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_APP_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1301,7 +1318,7 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_minimum_score": "80",
     "digest_maximum_books": "5",
     "digest_only_new": "1",
-    "digest_app_url": settings.public_url,
+    "digest_app_url": "http://localhost:5173",
     "digest_discord_webhook_url": "",
     "digest_email_to": "",
     "digest_email_from": "",
@@ -1462,6 +1479,13 @@ class _LockedConnection(sqlite3.Connection):
 
 def connect():
     db_path = profile_database_path()
+    if not restore_fence_bypassed():
+        from .backups import has_restore_journal
+
+        if has_restore_journal():
+            raise sqlite3.OperationalError(
+                "Profile database is unavailable until interrupted restore recovery completes."
+            )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if db_path.parent.name == "profiles":
         try:
@@ -1843,10 +1867,18 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        existing_digest_app_url_row = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url'"
+        ).fetchone()
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (
+                (settings.public_url or default_value).rstrip("/")
+                if key == "digest_app_url"
+                else default_value
+            )
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1859,13 +1891,41 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
+        # Seed digest_app_url_custom for existing rows that predate the flag so
+        # an operator-configured URL (including custom loopback ports such as
+        # http://localhost:3000) is preserved across restarts.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        custom_flag = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+        ).fetchone()
+        if custom_flag is None:
+            if existing_digest_app_url_row is None:
+                custom_value = "0"
+            else:
+                existing_app_url = (
+                    str(existing_digest_app_url_row[0] or "").strip().rstrip("/")
+                )
+                custom_value = (
+                    "1"
+                    if existing_app_url and existing_app_url not in DEFAULT_DIGEST_APP_URLS
+                    else "0"
+                )
             con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
+                "INSERT INTO settings(key,value,secret) VALUES('digest_app_url_custom',?,0)",
+                (custom_value,),
+            )
+        else:
+            custom_value = str(custom_flag[0] or "0")
+        # Upgrade an untouched loopback default (http://localhost:5173 or
+        # Docker's http://127.0.0.1:3000) when the deployment advertises a
+        # different public origin, without overwriting a custom URL.
+        if configured_public_url and custom_value != "1":
+            placeholders = ",".join("?" for _ in DEFAULT_DIGEST_APP_URLS)
+            con.execute(
+                f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                f"AND RTRIM(value,'/')!=?",
+                (configured_public_url, *DEFAULT_DIGEST_APP_URLS, configured_public_url),
             )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
@@ -1874,10 +1934,41 @@ def initialize(*, seed_demo: bool = True):
         )
         builtin = con.execute("SELECT id,enabled FROM sources WHERE url='builtin://upcoming'").fetchone()
         builtin_id = builtin["id"]
+        # Track default URLs once seeded so a user's custom source that shares
+        # a default source's display name never blocks seeding that default URL,
+        # while editing an already-seeded starter URL will not re-insert the
+        # original URL on subsequent startups.
+        seeded_row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SEEDED_DEFAULT_SOURCES_KEY,),
+        ).fetchone()
+        try:
+            parsed_seeded = json.loads(seeded_row["value"]) if seeded_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_seeded = []
+        seeded_urls = {
+            str(item)
+            for item in (parsed_seeded if isinstance(parsed_seeded, list) else [])
+            if item
+        }
+        seeded_changed = False
         for name, url, enabled in DEFAULT_SOURCES:
+            if url in seeded_urls:
+                continue
             con.execute(
                 "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
                 (name, url, "web", enabled),
+            )
+            seeded_urls.add(url)
+            seeded_changed = True
+        if seeded_changed:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (
+                    SEEDED_DEFAULT_SOURCES_KEY,
+                    json.dumps(sorted(seeded_urls), separators=(",", ":")),
+                ),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []

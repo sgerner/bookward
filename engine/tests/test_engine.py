@@ -449,6 +449,7 @@ def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pair
             "description": "A collection of fantastic stories.",
             "cover_url": "",
             "source_url": "https://publisher.example/books/call-and-response",
+            "isbn13": "9781966503149",
             "release_date": None,
             "date_kind": "",
             "genres": [],
@@ -1182,11 +1183,13 @@ def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monke
 
 
 def test_failed_permanent_source_retries_after_error_retry_floor(database, monkeypatch):
+    good_scan_at = "2026-04-10T12:00:00+00:00"
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=0")
         cursor = con.execute(
-            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
-            ("Retry permanent", "https://example.com/retry-permanent"),
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_scanned_at,last_attempted_at) "
+            "VALUES(?,?,1,'permanent',?,?)",
+            ("Retry permanent", "https://example.com/retry-permanent", good_scan_at, good_scan_at),
         )
 
     async def fail(_source):
@@ -1197,6 +1200,8 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:")
+    assert source["last_scanned_at"] == good_scan_at
+    assert source["last_attempted_at"] != good_scan_at
     assert source_sync_is_due() is False
 
     retry_at = datetime.now(timezone.utc) - timedelta(
@@ -1204,7 +1209,7 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     )
     with transaction() as con:
         con.execute(
-            "UPDATE sources SET last_scanned_at=? WHERE id=?",
+            "UPDATE sources SET last_attempted_at=? WHERE id=?",
             (retry_at.isoformat(), cursor.lastrowid),
         )
     assert source_sync_is_due() is True
@@ -3647,24 +3652,29 @@ def test_discord_webhook_cannot_be_redirected_to_an_arbitrary_host():
 def test_digest_can_be_disabled_with_stale_provider_settings():
     from afterword_engine.digest import validate_digest_config
 
-    validate_digest_config(
-        {
-            "enabled": False,
-            "channels": ["discord", "email"],
-            "day": 1,
-            "time": "09:00",
-            "timezone": "UTC",
-            "minimum_score": 80,
-            "maximum_books": 5,
-            "only_new": True,
-            "app_url": "https://afterword.example",
-            "discord_webhook_url": "https://not-discord.example/webhook",
-            "email_to": "not-an-email",
-            "email_from": "",
-            "smtp_host": "",
-            "smtp_security": "starttls",
-        }
-    )
+    base = {
+        "enabled": False,
+        "channels": ["discord", "email"],
+        "day": 1,
+        "time": "09:00",
+        "timezone": "UTC",
+        "minimum_score": 80,
+        "maximum_books": 5,
+        "only_new": True,
+        "app_url": "https://afterword.example",
+        "discord_webhook_url": "",
+        "email_to": "",
+        "email_from": "",
+        "smtp_host": "",
+        "smtp_security": "starttls",
+    }
+    validate_digest_config(base)
+
+    with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+        validate_digest_config({**base, "discord_webhook_url": "https://not-discord.example/webhook"})
+
+    with pytest.raises(ValueError, match="Valid email to is required"):
+        validate_digest_config({**base, "email_to": "not-an-email"})
 
 
 def test_digest_rejects_unknown_channels():
@@ -4029,12 +4039,12 @@ def test_goodreads_rss_and_manual_read_replace_demo_source_preserve_already_pres
     }
 
 
-def test_migration_27_purges_stale_demo_reads_derived_rows_and_is_idempotent(
+def test_migration_28_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
-    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-27.db"))
+    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-28.db"))
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
 
@@ -4076,7 +4086,7 @@ def test_migration_27_purges_stale_demo_reads_derived_rows_and_is_idempotent(
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=27")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
 
     init_db(seed_demo=True)
 
@@ -4098,7 +4108,7 @@ def test_migration_27_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     )
     assert "You rated a book by this author highly" not in post_upgrade_reasons
 
-    # Re-running initialize() and re-applying migration 27 must be idempotent and
+    # Re-running initialize() and re-applying migration 28 must be idempotent and
     # preserve post-upgrade real scoring batches without queuing duplicate jobs.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
@@ -4107,20 +4117,20 @@ def test_migration_27_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
     with transaction() as con:
-        con.execute("DELETE FROM schema_migrations WHERE version=27")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune'")["count"] == 1
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
 
-def test_migration_27_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
+def test_migration_28_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-27-disabled-builtin.db")
+        settings, "db", str(tmp_path / "upgrade-migration-28-disabled-builtin.db")
     )
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
@@ -4148,7 +4158,7 @@ def test_migration_27_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
         )
         con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=27")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
 
     init_db(seed_demo=True)
 
@@ -4171,20 +4181,20 @@ def test_migration_27_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
     }
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
 
-    # Re-running migration 27 when already clean is a no-op.
+    # Re-running migration 28 when already clean is a no-op.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=27")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
 
 
-def test_migration_27_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
+def test_migration_28_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-27-keep-demo.db")
+        settings, "db", str(tmp_path / "upgrade-migration-28-keep-demo.db")
     )
     init_db(seed_demo=True)
     assert asyncio.run(score_all("local", "hashing-768")) == 4
@@ -4193,7 +4203,7 @@ def test_migration_27_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monke
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=27")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
 
     init_db(seed_demo=True)
 
