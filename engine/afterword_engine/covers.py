@@ -29,6 +29,7 @@ from .identity import (
     canonical_part,
 )
 from .isbn import canonical_isbn, isbn_parts
+from .security import safe_error_message
 from .subjects import normalize_subjects
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
@@ -64,12 +65,43 @@ SOURCE_PAYLOAD_LIMIT_BYTES = 8192
 OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 _CATALOG_PROVIDER_FAILURE_STATUSES = frozenset({
     "rate_limited",
+    "credential_error",
+    "server_error",
     "http_error",
     "request_error",
     "invalid_json",
     "invalid_response",
 })
 _OPEN_LIBRARY_RATE_LIMITERS = weakref.WeakKeyDictionary()
+
+
+def _classify_catalog_http_error(response: httpx.Response) -> str:
+    status_code = response.status_code
+    if status_code == 429:
+        return "rate_limited"
+    if status_code == 403:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            error_obj = payload["error"]
+            reasons = " ".join(
+                str(entry.get("reason") or "")
+                for entry in (error_obj.get("errors") or [])
+                if isinstance(entry, dict)
+            )
+            combined = f"{reasons} {error_obj.get('message') or ''}".casefold()
+            if "rate" in combined or "quota" in combined:
+                return "rate_limited"
+        return "credential_error"
+    if status_code in {400, 401}:
+        return "credential_error"
+    if status_code == 408:
+        return "timeout"
+    if status_code >= 500:
+        return "server_error"
+    return "http_error"
 
 
 def _utc_now() -> str:
@@ -528,7 +560,7 @@ async def _lookup_open_library_record(
             response = await _openlibrary_request(client, OPEN_LIBRARY_SEARCH, params=params)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
             return {"_fetch_trace": trace}
         try:
             payload = response.json()
@@ -655,7 +687,7 @@ async def _lookup_google_books_record(
             response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "rate_limited" if response.status_code == 429 else "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
             return {"_fetch_trace": trace}
         try:
             payload = response.json()
@@ -899,8 +931,10 @@ async def resolve_book_metadata(
         or not supplied_url
         or (prefer_isbn_cover and has_source_isbn)
     ) and title and author:
-        for lookup in (_lookup_open_library_record, _lookup_google_books_record):
-            async def cached_lookup(query_isbn: str):
+        async def _lookup_provider_with_fallback(lookup):
+            provider_traces: list[dict[str, object]] = []
+
+            async def cached_lookup(query_isbn: str) -> dict[str, object]:
                 kwargs = (
                     {"google_books_api_key": google_books_api_key}
                     if lookup is _lookup_google_books_record
@@ -926,7 +960,7 @@ async def resolve_book_metadata(
             record = await cached_lookup(source_isbn13 or source_isbn10)
             trace = record.get("_fetch_trace")
             if isinstance(trace, dict):
-                traces.append(trace)
+                provider_traces.append(trace)
             if not record.get("provider") and has_source_isbn:
                 # An ISBN miss or contradiction can still be followed by an
                 # identity-verified title/author query. The ISBN result itself
@@ -934,11 +968,11 @@ async def resolve_book_metadata(
                 # Do not repeat a failed provider request immediately with a
                 # broader query; it cannot recover from an outage in this job.
                 if isinstance(trace, dict) and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES:
-                    continue
+                    return None, provider_traces
                 record = await cached_lookup("")
                 trace = record.get("_fetch_trace")
                 if isinstance(trace, dict):
-                    traces.append(trace)
+                    provider_traces.append(trace)
             elif (
                 prefer_isbn_cover
                 and has_source_isbn
@@ -955,7 +989,7 @@ async def resolve_book_metadata(
                 record = await cached_lookup("")
                 trace = record.get("_fetch_trace")
                 if isinstance(trace, dict):
-                    traces.append(trace)
+                    provider_traces.append(trace)
             if (
                 record.get("provider")
                 and
@@ -970,8 +1004,18 @@ async def resolve_book_metadata(
                     and trace.get("query_kind") == "isbn"
                     and trace.get("identifier_verified") is True
                 ):
-                    continue
+                    return None, provider_traces
             if record.get("provider"):
+                return record, provider_traces
+            return None, provider_traces
+
+        provider_outcomes = await asyncio.gather(
+            _lookup_provider_with_fallback(_lookup_open_library_record),
+            _lookup_provider_with_fallback(_lookup_google_books_record),
+        )
+        for record, provider_traces in provider_outcomes:
+            traces.extend(provider_traces)
+            if record is not None:
                 records.append(record)
 
     description_records = [record for record in records if record.get("description")]
@@ -1219,7 +1263,7 @@ async def resolve_openlibrary_work_metadata(
             response = await _openlibrary_request(client, url)
         trace["http_status"] = response.status_code
         if response.is_error:
-            trace["status"] = "http_error"
+            trace["status"] = _classify_catalog_http_error(response)
         else:
             try:
                 payload = response.json()
@@ -1311,3 +1355,64 @@ def fallback_cover_url(title: str, author: str, supplied: object = "", source_ur
     """Synchronous, network-free fallback for API responses and bootstrapping."""
 
     return _usable_cover_url(supplied, source_url) or placeholder_cover_url(title, author)
+
+
+async def validate_google_books_api_key(
+    api_key: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, str]:
+    """Verify a non-empty Google Books API key without blocking on transient outages."""
+
+    key = str(api_key or "").strip()
+    if not key:
+        raise ValueError("Enter a Google Books API key.")
+
+    def _scrub(text: object) -> str:
+        cleaned = str(text or "").replace(key, "[redacted]")
+        return safe_error_message(cleaned, limit=240)
+
+    params = {"q": "intitle:dune", "maxResults": 1, "key": key}
+    try:
+        if client is None:
+            async with metadata_client() as owned_client:
+                response = await owned_client.get(GOOGLE_BOOKS_SEARCH, params=params)
+        else:
+            response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
+    except httpx.HTTPError as exc:
+        return {
+            "status": "deferred",
+            "warning": f"Could not reach Google Books right now ({_scrub(exc)}); key saved for later use.",
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    detail = ""
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        detail = _scrub(payload["error"].get("message") or "").strip()
+
+    error_kind = _classify_catalog_http_error(response) if response.is_error else ""
+    if error_kind == "credential_error":
+        raise ValueError(
+            f"Google Books rejected the API key (HTTP {response.status_code})."
+            if not detail
+            else f"Google Books rejected the API key (HTTP {response.status_code}: {detail})"
+        )
+    if error_kind == "rate_limited":
+        return {
+            "status": "deferred",
+            "warning": f"Google Books rate-limited live verification (HTTP {response.status_code}); key saved.",
+        }
+    if response.is_error:
+        return {
+            "status": "deferred",
+            "warning": f"Google Books returned HTTP {response.status_code} during live verification; key saved.",
+        }
+    if not isinstance(payload, dict) or "error" in payload:
+        return {
+            "status": "deferred",
+            "warning": "Google Books returned an unexpected verification response; key saved.",
+        }
+    return {"status": "verified", "warning": ""}

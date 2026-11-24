@@ -704,17 +704,17 @@ async def resolve_catalog_match(
         matches: list[dict[str, Any]] = []
         query_isbn = source_isbn13 or source_isbn10
 
-        def _record_rate_limits():
+        def _record_rate_limits(traces: list[dict[str, Any]] | None = None):
             if rate_limited_providers is None:
                 return
-            for trace in fetch_trace:
+            for trace in traces if traces is not None else fetch_trace:
                 if trace.get("status") == "rate_limited" and trace.get("provider"):
                     rate_limited_providers.add(str(trace["provider"]))
 
         async def _call_provider(lookup_provider, *, isbn_arg: str = ""):
             provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
             if rate_limited_providers is not None and provider_name in rate_limited_providers:
-                fetch_trace.append(
+                return None, [
                     {
                         "provider": provider_name,
                         "fetched_at": _utc_now(),
@@ -723,18 +723,23 @@ async def resolve_catalog_match(
                         "http_status": 429,
                         "skipped": True,
                     }
-                )
-                return None
+                ]
             kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
-            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
-            _record_rate_limits()
-            return result
+            provider_traces: list[dict[str, Any]] = []
+            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=provider_traces, **kwargs)
+            _record_rate_limits(provider_traces)
+            return result, provider_traces
 
         if query_isbn:
-            # Query both providers so a strong identity record with sparse
-            # fields does not hide useful verified metadata from the other.
-            for lookup_provider in (_open_library_match, _google_books_match):
-                match = await _call_provider(lookup_provider, isbn_arg=query_isbn)
+            # Query both providers concurrently so a strong identity record with
+            # sparse fields does not hide useful verified metadata from the
+            # other and Open Library's 1 req/s lock never stalls Google Books.
+            stage1_results = await asyncio.gather(
+                _call_provider(_open_library_match, isbn_arg=query_isbn),
+                _call_provider(_google_books_match, isbn_arg=query_isbn),
+            )
+            for match, provider_traces in stage1_results:
+                fetch_trace.extend(provider_traces)
                 if match:
                     matches.append(match)
 
@@ -756,13 +761,23 @@ async def resolve_catalog_match(
                 if trace.get("query_kind") == "isbn"
                 and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
             }
-            for lookup_provider in (_open_library_match, _google_books_match):
-                provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
-                if query_isbn and provider_name in unavailable_providers:
-                    continue
-                match = await _call_provider(lookup_provider)
-                if match:
-                    matches.append(match)
+            stage2_providers = [
+                lookup_provider
+                for lookup_provider in (_open_library_match, _google_books_match)
+                if not (
+                    query_isbn
+                    and ("openlibrary" if lookup_provider is _open_library_match else "google_books")
+                    in unavailable_providers
+                )
+            ]
+            if stage2_providers:
+                stage2_results = await asyncio.gather(
+                    *(_call_provider(lookup_provider) for lookup_provider in stage2_providers)
+                )
+                for match, provider_traces in stage2_results:
+                    fetch_trace.extend(provider_traces)
+                    if match:
+                        matches.append(match)
 
         primary_unavailable = any(
             trace.get("provider") in {"openlibrary", "google_books"}
@@ -1252,12 +1267,46 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         metadata_provider = str(candidate.get("_metadata_provider") or "")
         metadata_provider_id = str(candidate.get("_metadata_provider_id") or "")
 
+    quarantine_retry_status = ""
+    if status == "quarantine" and any(
+        flag in flags
+        for flag in ("catalog_provider_unavailable", "catalog_provider_rate_limited")
+    ):
+        provenance = result.get("metadata_provenance")
+        traces = (
+            provenance.get("fetch_trace", [])
+            if isinstance(provenance, dict)
+            else []
+        )
+        if isinstance(traces, list):
+            for trace in traces:
+                if not isinstance(trace, dict) or trace.get("provider") != "google_books":
+                    continue
+                trace_status = trace.get("status")
+                http_status = trace.get("http_status")
+                if trace_status in {
+                    "rate_limited",
+                    "server_error",
+                    "request_error",
+                    "timeout",
+                    "provider_unavailable",
+                } or (
+                    isinstance(http_status, int)
+                    and (http_status in {408, 429} or http_status >= 500)
+                ):
+                    quarantine_retry_status = "google_books_transient"
+                    break
+                if trace_status == "credential_error" or (
+                    isinstance(http_status, int) and http_status in {400, 401, 403}
+                ):
+                    quarantine_retry_status = "google_books_error"
+
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
             work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
-            metadata_provider_id,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            metadata_provider_id,metadata_retry_status,audited_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -1272,6 +1321,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             audit_version=excluded.audit_version,
             metadata_provider=CASE WHEN excluded.metadata_provider!='' THEN excluded.metadata_provider ELSE metadata_provider END,
             metadata_provider_id=CASE WHEN excluded.metadata_provider_id!='' THEN excluded.metadata_provider_id ELSE metadata_provider_id END,
+            metadata_retry_status=CASE WHEN excluded.quality_status='accepted' THEN metadata_retry_status ELSE excluded.metadata_retry_status END,
             audited_at=excluded.audited_at,
             updated_at=CURRENT_TIMESTAMP""",
         (
@@ -1289,6 +1339,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             QUALITY_VERSION,
             metadata_provider,
             metadata_provider_id,
+            quarantine_retry_status,
         ),
     )
     if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
