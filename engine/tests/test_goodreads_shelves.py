@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from auth_helpers import authenticated_headers
+from afterword_engine import database as db_module
 from afterword_engine import ingestion
 from afterword_engine.config import settings
 from afterword_engine.database import (
@@ -20,6 +21,7 @@ from afterword_engine.database import (
     initialize,
     normalize_key,
 )
+from afterword_engine.secrets import seal
 from afterword_engine.digest import digest_preview
 from afterword_engine.ingestion import (
     goodreads_shelf_rss_url,
@@ -104,7 +106,7 @@ def test_import_goodreads_shelves_stores_separately_from_reads(tmp_path: Path, m
     ]
 
 
-def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_recovers_hidden_rows(
+def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses(
     tmp_path: Path, monkeypatch
 ) -> None:
     db_path = tmp_path / "score_shelves.db"
@@ -124,7 +126,7 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
         for cid, title, author, status in [
             (10, "Project Hail Mary", "Andy Weir", "new"),
             (11, "Piranesi", "Susanna Clarke", "new"),
-            (12, "Artemis", "Andy Weir", "hidden"),
+            (12, "Artemis", "Andy Weir", "rejected"),
         ]:
             con.execute(
                 "INSERT INTO candidates(id, source_id, title, author, status, score, normalized_key) "
@@ -136,6 +138,9 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
                 "WHERE candidate_id=?",
                 (cid,),
             )
+        con.execute(
+            "INSERT INTO feedback(candidate_id, action, previous_status) VALUES(12, 'reject', 'recommended')"
+        )
         con.commit()
     finally:
         con.close()
@@ -150,9 +155,8 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
                 "SELECT id, status, score, explanation FROM candidates WHERE id IN (10, 11, 12) ORDER BY id"
             ).fetchall()
         }
-        # Now populate both Goodreads shelves and mark candidate 12 hidden again
-        # to verify score_all neither hides currently-reading nor adds a +10 bonus,
-        # while recovering stranded hidden rows.
+        # Populate both Goodreads shelves to verify score_all neither hides
+        # currently-reading nor adds a +10 bonus, and leaves rejected rows untouched.
         con.execute(
             "INSERT INTO goodreads_shelf_items(shelf, title, author) "
             "VALUES('to-read', 'Project Hail Mary', 'Andy Weir')"
@@ -161,15 +165,11 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
             "INSERT INTO goodreads_shelf_items(shelf, title, author) "
             "VALUES('currently-reading', 'Piranesi', 'Susanna Clarke')"
         )
-        con.execute(
-            "UPDATE candidates SET status='hidden', score=0, explanation='[]' WHERE id=12"
-        )
         con.commit()
     finally:
         con.close()
 
-    assert baseline[12][0] == "recommended"
-    assert baseline[12][1] > 0
+    assert baseline[12][0] == "rejected"
 
     asyncio.run(score_all())
 
@@ -184,14 +184,15 @@ def test_score_all_computes_pure_scores_without_hiding_or_shelf_bonuses_and_reco
     finally:
         con.close()
 
-    for cid in (10, 11, 12):
+    for cid in (10, 11):
         assert with_shelves[cid][0] == "recommended"
         assert with_shelves[cid][1] == baseline[cid][1]
         assert with_shelves[cid][1] > 0
         assert "On your Goodreads to-read shelf" not in with_shelves[cid][2]
+    assert with_shelves[12] == ("rejected", 0.0, [])
 
 
-def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserve_profile_isolation(
+def test_migration_27_recovers_hidden_rows_preserving_user_feedback_dedupes_shelves_and_isolates_profiles(
     tmp_path: Path, monkeypatch
 ) -> None:
     root_db = tmp_path / "afterword.db"
@@ -204,7 +205,8 @@ def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
     profile_a_db.parent.mkdir(parents=True, exist_ok=True)
 
     # Construct a genuine schema-v26 database for profile_a with dual-shelf
-    # stale rows and a stranded status='hidden' candidate.
+    # stale CSV rows, legacy currently-reading status='hidden' candidates, and
+    # user-rejected / user-deferred candidates that must NOT be reset to 'new'.
     con = sqlite3.connect(profile_a_db)
     try:
         con.execute(
@@ -221,13 +223,60 @@ def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
         con.execute(
             "INSERT INTO reads(title, author, rating, source) VALUES('The Martian', 'Andy Weir', 5, 'goodreads_csv')"
         )
+        seeded_candidates = [
+            # 50: legacy currently-reading hidden candidate -> must reset to 'new'
+            (50, "Piranesi", "Susanna Clarke", "hidden", 0.0, "[]"),
+            # 51: user-rejected candidate -> must stay 'rejected'
+            (51, "Rejected Novel", "Author R", "rejected", 79.5, '["Not for me"]'),
+            # 52: user maybe_later candidate -> must stay 'maybe_later'
+            (52, "Deferred Novel", "Author D", "maybe_later", 81.0, '["Later"]'),
+            # 53: hidden candidate that also has an active non-undone user reject -> must NOT reset to 'new'
+            (53, "Hidden After Reject", "Author H", "hidden", 0.0, "[]"),
+            # 54: hidden candidate whose earlier reject was undone -> must reset to 'new'
+            (54, "Undone Reject Novel", "Author U", "hidden", 0.0, "[]"),
+        ]
+        for cid, title, author, status, score, explanation in seeded_candidates:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
+                "VALUES(?, 999, ?, ?, ?, ?, ?, ?)",
+                (cid, title, author, status, score, explanation, normalize_key(title, author)),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 WHERE candidate_id=?",
+                (cid,),
+            )
         con.execute(
-            "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
-            "VALUES(50, 999, 'Piranesi', 'Susanna Clarke', 'hidden', 0, '[]', ?)",
-            (normalize_key("Piranesi", "Susanna Clarke"),),
+            "INSERT INTO feedback(id, candidate_id, action, previous_status) VALUES(1, 51, 'reject', 'recommended')"
         )
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 WHERE candidate_id=50"
+            "INSERT INTO recommendation_events(event_key, candidate_id, event_type, source) "
+            "VALUES('feedback:1', 51, 'reject', 'ui')"
+        )
+        con.execute(
+            "INSERT INTO feedback(id, candidate_id, action, previous_status) VALUES(2, 52, 'maybe_later', 'recommended')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key, candidate_id, event_type, source) "
+            "VALUES('feedback:2', 52, 'maybe_later', 'ui')"
+        )
+        con.execute(
+            "INSERT INTO feedback(id, candidate_id, action, previous_status) VALUES(3, 53, 'reject', 'recommended')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key, candidate_id, event_type, source) "
+            "VALUES('feedback:3', 53, 'reject', 'ui')"
+        )
+        con.execute(
+            "INSERT INTO feedback(id, candidate_id, action, previous_status, undone_at) "
+            "VALUES(4, 54, 'reject', 'recommended', '2026-01-15 00:00:00')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key, candidate_id, event_type, source) "
+            "VALUES('feedback:4', 54, 'reject', 'ui')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key, candidate_id, event_type, source) "
+            "VALUES('undo-feedback:4', 54, 'restore', 'ui_undo')"
         )
         con.execute(
             "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, updated_at) "
@@ -260,27 +309,40 @@ def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
             migrated_shelves = con_a.execute(
                 "SELECT shelf, source, title, author, isbn FROM goodreads_shelf_items"
             ).fetchall()
-            recovered_status = con_a.execute(
-                "SELECT status, score FROM candidates WHERE id=50"
-            ).fetchone()
+            migrated_statuses = {
+                cid: (status, score)
+                for cid, status, score in con_a.execute(
+                    "SELECT id, status, score FROM candidates WHERE id IN (50, 51, 52, 53, 54) ORDER BY id"
+                ).fetchall()
+            }
         finally:
             con_a.close()
 
         assert migrated_shelves == [
             ("to-read", "goodreads_csv", "Piranesi", "Susanna Clarke", "9781635575637")
         ]
-        assert recovered_status == ("new", 0)
+        assert migrated_statuses[50] == ("new", 0.0)
+        assert migrated_statuses[51] == ("rejected", 79.5)
+        assert migrated_statuses[52] == ("maybe_later", 81.0)
+        assert migrated_statuses[53] == ("hidden", 0.0)
+        assert migrated_statuses[54] == ("new", 0.0)
 
         asyncio.run(score_all())
         con_a = sqlite3.connect(profile_a_db)
         try:
-            rescored = con_a.execute(
-                "SELECT status, score FROM candidates WHERE id=50"
-            ).fetchone()
+            rescored = {
+                cid: (status, score)
+                for cid, status, score in con_a.execute(
+                    "SELECT id, status, score FROM candidates WHERE id IN (50, 51, 52, 53, 54) ORDER BY id"
+                ).fetchall()
+            }
         finally:
             con_a.close()
-        assert rescored[0] == "recommended"
-        assert rescored[1] > 0
+        assert rescored[50][0] == "recommended" and rescored[50][1] > 0
+        assert rescored[51] == ("rejected", 79.5)
+        assert rescored[52] == ("maybe_later", 81.0)
+        assert rescored[53] == ("hidden", 0.0)
+        assert rescored[54][0] == "recommended" and rescored[54][1] > 0
 
     # Profile B remains completely isolated.
     con_b = sqlite3.connect(profile_b_db)
@@ -291,6 +353,166 @@ def test_migration_27_and_startup_recover_hidden_rows_dedupe_shelves_and_preserv
     finally:
         con_b.close()
     assert b_shelves == [("currently-reading", "goodreads_csv", "Isolated Book", "Other Author")]
+
+
+def test_migration_27_tags_v26_rss_origin_rows_and_disconnect_clears_exclusions_and_priors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "v26_rss_upgrade.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    rss_url = "https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read"
+
+    # Build a populated schema-v26 database containing RSS-origin shelf rows
+    # (written without a `source` column, matching v26 `_apply_goodreads_shelves`).
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version >= 27:
+                continue
+            _execute_migration_script(con, script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES('goodreads_rss_url', ?, 1)",
+            (seal(rss_url),),
+        )
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES('goodreads_rss_last_sync_at', '2026-11-20T02:00:00+00:00', 0)"
+        )
+        con.execute(
+            "INSERT INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'Curated', 'https://example.com/feed', 'rss', 1)"
+        )
+        # Include both an early CSV read and a subsequent RSS read to reflect a
+        # real installation that imported CSV history and then enabled RSS sync.
+        con.execute(
+            "INSERT INTO reads(title, author, rating, source) VALUES('Old CSV Book', 'Other Writer', 4, 'goodreads_csv')"
+        )
+        con.execute(
+            "INSERT INTO reads(title, author, rating, source) VALUES('The Martian', 'Andy Weir', 5, 'goodreads_rss')"
+        )
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, updated_at) VALUES(?, ?, ?, ?, ?)",
+            [
+                ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204", "2026-11-20 02:00:00"),
+                ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637", "2026-11-20 02:00:00"),
+            ],
+        )
+        for cid, title, author, base_score in [
+            (701, "Project Hail Mary", "Andy Weir", 88.0),
+            (702, "Piranesi", "Susanna Clarke", 86.0),
+            (703, "Artemis", "Andy Weir", 80.0),
+        ]:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, score, explanation, normalized_key) "
+                "VALUES(?, 999, ?, ?, 'recommended', ?, '[\"Baseline match\"]', ?)",
+                (cid, title, author, base_score, normalize_key(title, author)),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    initialize(seed_demo=False)
+
+    con = sqlite3.connect(db_path)
+    try:
+        migrated = con.execute(
+            "SELECT shelf, source, title, author FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+    finally:
+        con.close()
+    assert migrated == [
+        ("currently-reading", "goodreads_rss", "Piranesi", "Susanna Clarke"),
+        ("to-read", "goodreads_rss", "Project Hail Mary", "Andy Weir"),
+    ]
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        # Before disconnecting RSS: Project Hail Mary and Piranesi are dynamically
+        # excluded, and Artemis receives the bounded +0.35 to-read author prior.
+        before_disconnect = client.get("/api/recommendations").json()
+        assert [item["id"] for item in before_disconnect] == [703]
+        assert before_disconnect[0]["score"] == pytest.approx(80.35, abs=0.05)
+        assert any(
+            "Goodreads to-read shelf" in reason
+            for reason in before_disconnect[0]["explanation"]
+        )
+
+        # Disconnect Goodreads RSS: all migrated RSS shelf rows must be removed
+        # immediately so neither stale exclusions nor stale priors persist.
+        disconnect_res = client.put("/api/settings/goodreads-rss", json={"url": ""})
+        assert disconnect_res.status_code == 200
+        assert disconnect_res.json() == {"saved": True, "configured": False}
+
+        after_disconnect = client.get("/api/recommendations").json()
+        by_id = {item["id"]: item for item in after_disconnect}
+        assert set(by_id) == {701, 702, 703}
+        assert by_id[703]["score"] == pytest.approx(80.0, abs=0.01)
+        assert not any(
+            "Goodreads to-read shelf" in reason
+            for reason in by_id[703]["explanation"]
+        )
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining = con.execute("SELECT COUNT(*) FROM goodreads_shelf_items").fetchone()[0]
+    finally:
+        con.close()
+    assert remaining == 0
+
+    # Also verify a v26 DB where RSS had already been disconnected (`goodreads_rss_url=''`)
+    # before upgrading purges orphaned v26 RSS shelf rows during Migration 27.
+    disconnected_v26_db = tmp_path / "v26_already_disconnected.db"
+    monkeypatch.setattr(settings, "db", str(disconnected_v26_db))
+    con = sqlite3.connect(disconnected_v26_db)
+    try:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version >= 27:
+                continue
+            _execute_migration_script(con, script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES('goodreads_rss_url', '', 1)"
+        )
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES('goodreads_rss_last_sync_at', '2026-11-18T02:00:00+00:00', 0)"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Orphaned RSS Book', 'Author X')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    initialize(seed_demo=False)
+    con = sqlite3.connect(disconnected_v26_db)
+    try:
+        orphaned_count = con.execute("SELECT COUNT(*) FROM goodreads_shelf_items").fetchone()[0]
+    finally:
+        con.close()
+    assert orphaned_count == 0
+
+
+def test_initialize_rejects_duplicate_migration_version_numbers(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "db", str(tmp_path / "collision.db"))
+    latest_version = MIGRATIONS[-1][0]
+    monkeypatch.setattr(
+        db_module,
+        "MIGRATIONS",
+        [*MIGRATIONS, (latest_version, "SELECT 1;")],
+    )
+    with pytest.raises(RuntimeError, match="unique sequential versions"):
+        initialize(seed_demo=False)
 
 
 def test_discovery_and_digest_exclude_shelves_across_editions_while_shortlist_and_impressions_stay_clean(

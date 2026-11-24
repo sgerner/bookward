@@ -1003,7 +1003,6 @@ MIGRATIONS = [
             author TEXT NOT NULL,
             isbn TEXT,
             openlibrary_work_id TEXT,
-            openlibrary_lookup_attempted_at TEXT,
             added_at TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(source, title, author)
@@ -1011,11 +1010,35 @@ MIGRATIONS = [
         INSERT INTO goodreads_shelf_items_v2(
             shelf, source, title, author, isbn, openlibrary_work_id, added_at, updated_at
         )
-        SELECT shelf, 'goodreads_csv', title, author, isbn, openlibrary_work_id, added_at, updated_at
+        SELECT
+            shelf,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM settings
+                    WHERE key IN (
+                        'goodreads_rss_url',
+                        'goodreads_rss_last_sync_at',
+                        'goodreads_rss_last_attempt_at',
+                        'goodreads_rss_last_scheduled_date'
+                    )
+                    AND TRIM(value) != ''
+                )
+                OR EXISTS (SELECT 1 FROM jobs WHERE kind = 'goodreads_rss')
+                OR EXISTS (SELECT 1 FROM reads WHERE source = 'goodreads_rss')
+                THEN 'goodreads_rss'
+                ELSE 'goodreads_csv'
+            END,
+            title,
+            author,
+            isbn,
+            openlibrary_work_id,
+            added_at,
+            updated_at
         FROM (
             SELECT shelf, title, author, isbn, openlibrary_work_id, added_at, updated_at
             FROM goodreads_shelf_items
             ORDER BY updated_at ASC, id ASC
+            LIMIT -1
         )
         WHERE 1=1
         ON CONFLICT(source, title, author) DO UPDATE SET
@@ -1024,6 +1047,12 @@ MIGRATIONS = [
             openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id),
             added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
             updated_at=excluded.updated_at;
+        DELETE FROM goodreads_shelf_items_v2
+        WHERE source = 'goodreads_rss'
+          AND EXISTS (
+              SELECT 1 FROM settings
+              WHERE key = 'goodreads_rss_url' AND TRIM(value) = ''
+          );
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
         DROP TABLE goodreads_shelf_items;
@@ -1036,7 +1065,27 @@ MIGRATIONS = [
             ON goodreads_shelf_items(title, author);
         UPDATE candidates
         SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
-        WHERE status='hidden';
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          );
         """,
     ),
 ]
@@ -1395,7 +1444,17 @@ def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
         con.execute(pending)
 
 
+def _validate_migrations() -> None:
+    versions = [version for version, _ in MIGRATIONS]
+    expected = list(range(1, len(MIGRATIONS) + 1))
+    if versions != expected:
+        raise RuntimeError(
+            f"MIGRATIONS must have unique sequential versions 1..{len(MIGRATIONS)}, got {versions}"
+        )
+
+
 def initialize(*, seed_demo: bool = True):
+    _validate_migrations()
     db_path = profile_database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with connect() as con:
@@ -1499,10 +1558,6 @@ def initialize(*, seed_demo: bool = True):
                     con.execute("UPDATE candidates SET source_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (source_value, current["id"]))
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
-        con.execute(
-            "UPDATE candidates SET status='new',score=0,explanation='[]',"
-            "score_batch_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='hidden'"
-        )
         _backfill_source_isbns(con)
     _restrict_database_files()
 

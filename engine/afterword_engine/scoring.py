@@ -214,22 +214,6 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         read_history, read_metadata_rows
     )
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_history)
-    with transaction() as con:
-        con.execute(
-            """UPDATE candidates SET status='new', score=0, explanation='[]',
-            score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
-            WHERE status='hidden'"""
-        )
-        con.execute(
-            """UPDATE candidates SET status='new', score=0, explanation='[]',
-            score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
-            WHERE status='recommended' AND id IN (
-                SELECT c.id FROM candidates c
-                LEFT JOIN sources s ON s.id=c.source_id
-                LEFT JOIN candidate_quality q ON q.candidate_id=c.id
-                WHERE COALESCE(s.enabled, 0)=0 OR COALESCE(q.quality_status, 'pending')!='accepted'
-            )"""
-        )
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.work_id quality_work_id,q.provider quality_provider,"
@@ -245,6 +229,17 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         item for item in candidates
         if not read_identity_index.matches(item)
     ]
+    with transaction() as con:
+        con.execute(
+            """UPDATE candidates SET status='new', score=0, explanation='[]',
+            score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+            WHERE status='recommended' AND id IN (
+                SELECT c.id FROM candidates c
+                LEFT JOIN sources s ON s.id=c.source_id
+                LEFT JOIN candidate_quality q ON q.candidate_id=c.id
+                WHERE COALESCE(s.enabled, 0)=0 OR COALESCE(q.quality_status, 'pending')!='accepted'
+            )"""
+        )
     if not candidates: return 0
     interaction_candidates = rows(
         """SELECT DISTINCT c.* FROM candidates c WHERE c.id IN (

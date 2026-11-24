@@ -2232,7 +2232,8 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
         }[decision["action"]]
         if current["status"] != expected_status:
             raise HTTPException(409, "The recommendation changed after this decision")
-        previous_status = str(decision["previous_status"])
+        raw_previous_status = str(decision["previous_status"])
+        previous_status = "new" if raw_previous_status == "hidden" else raw_previous_status
         con.execute(
             "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (previous_status, candidate_id),
