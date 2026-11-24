@@ -305,3 +305,33 @@ def test_joint_followup_runs_by_explicit_id_and_emits_aggregate_only(tmp_path):
     assert result["selected_metadata_arm_from_validation_only"] == "metadata_combined"
     assert result["later_exploratory"]["arms"]["selected_metadata_plus_ordinal"]["metrics"]["n"] == 10
     assert "book-" not in json.dumps(result)
+
+
+def test_author_clusters_and_slices_merge_generational_suffixes_and_initials():
+    origin = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    items = [
+        {"id": 1, "author": "Kurt Vonnegut"},
+        {"id": 2, "author": "Kurt Vonnegut Jr."},
+        {"id": 3, "author": "R. F. Kuang"},
+        {"id": 4, "author": "R.F. Kuang"},
+        {"id": 5, "author": "Ursula K. Le Guin"},
+    ]
+    records = [
+        (origin + timedelta(days=idx), item, np.zeros(2, dtype=np.float32))
+        for idx, item in enumerate(items)
+    ]
+    indexes = np.arange(len(items), dtype=np.int64)
+    clusters = evaluator.author_clusters(items, indexes)
+    cluster_sets = {frozenset(group.tolist()) for group in clusters}
+    assert cluster_sets == {frozenset({0, 1}), frozenset({2, 3}), frozenset({4})}
+
+    eval_indexes = np.array([1, 3, 4], dtype=np.int64)
+    ratings = np.array([5.0, 2.0, 4.0])
+    baseline_scores = np.array([70.0, 30.0, 60.0])
+    candidate_scores = np.array([75.0, 25.0, 62.0])
+    slices = evaluator.safe_author_slices(
+        records, items, eval_indexes, ratings, baseline_scores, candidate_scores
+    )
+    assert slices["author_seen"]["current"]["n"] == 2
+    assert slices["author_unseen"]["current"]["n"] == 1
+    assert slices["author_unseen_count"] == 1

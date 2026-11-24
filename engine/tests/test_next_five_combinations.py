@@ -99,3 +99,25 @@ def test_three_star_is_neither_tail():
     assert result["high_n"] == 2
     assert result["low_n"] == 2
     assert result["balanced_auc"] == 1.0
+
+
+def test_tied_floor_scores_match_historical_ratings_and_ignore_input_order():
+    from evaluate_historical_ratings import raw_ranking_metrics
+
+    ratings = np.asarray([1, 1, 2, 5, 4] + [3] * 20 + [5, 4, 5, 1, 2], dtype=float)
+    scores = np.asarray([0.0] * 25 + [60.0, 70.0, 80.0, 90.0, 95.0], dtype=float)
+
+    forward_combo = study.metrics(ratings, scores)
+    reversed_combo = study.metrics(ratings[::-1], scores[::-1])
+    forward_hist = raw_ranking_metrics(ratings, scores)
+    reversed_hist = raw_ranking_metrics(ratings[::-1], scores[::-1])
+
+    expected_bottom_count = (20 / 25) * 3
+    expected_bottom_precision = expected_bottom_count / 20
+    assert forward_combo["bottom20_low_precision"] == pytest.approx(expected_bottom_precision)
+    assert reversed_combo["bottom20_low_precision"] == pytest.approx(expected_bottom_precision)
+    assert forward_hist["low_rated_in_bottom_20"] == pytest.approx(expected_bottom_count)
+    assert reversed_hist["low_rated_in_bottom_20"] == pytest.approx(expected_bottom_count)
+    assert forward_combo["low_rated_in_bottom_20"] == pytest.approx(
+        forward_hist["low_rated_in_bottom_20"]
+    )
