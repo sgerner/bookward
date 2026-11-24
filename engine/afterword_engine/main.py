@@ -107,7 +107,6 @@ from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
-    _dedupe_and_hide,
     audit_candidates,
     has_candidate_quality_audit_candidates,
     quality_summary,
@@ -2519,11 +2518,6 @@ def toggle_source(source_id:int):
         recompute_candidate_sources(con, source_id=source_id)
         if not became_enabled:
             demote_orphaned_recommended_candidates(con, source_id=source_id)
-        if con.execute(
-            "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
-            "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
-        ).fetchone():
-            _dedupe_and_hide(con)
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}

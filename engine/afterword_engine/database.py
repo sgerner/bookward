@@ -1031,21 +1031,32 @@ MIGRATIONS = [
         JOIN sources s ON s.url = 'association://' || ae.provider AND s.kind = 'association'
         GROUP BY ae.candidate_id, s.id;
         UPDATE candidates
-        SET source_id = (
-            SELECT cs.source_id
-            FROM candidate_sources cs
-            JOIN sources s ON s.id = cs.source_id
-            WHERE cs.candidate_id = candidates.id
-            ORDER BY
-                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                s.weight DESC,
-                s.id ASC
-            LIMIT 1
-        )
-        WHERE EXISTS (
-            SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id = candidates.id
-        );
+        SET source_id = resolved.next_source_id
+        FROM (
+            SELECT c.id AS candidate_id, best.source_id AS next_source_id
+            FROM candidates c
+            LEFT JOIN (
+                SELECT candidate_id, source_id
+                FROM (
+                    SELECT
+                        cs.candidate_id,
+                        cs.source_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cs.candidate_id
+                            ORDER BY
+                                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.weight DESC,
+                                s.id ASC
+                        ) AS rn
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                )
+                WHERE rn = 1
+            ) AS best ON best.candidate_id = c.id
+            WHERE c.source_id IS NOT best.source_id
+        ) AS resolved
+        WHERE candidates.id = resolved.candidate_id;
         CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_insert
         AFTER INSERT ON candidates
         WHEN NEW.source_id IS NOT NULL
@@ -1065,30 +1076,65 @@ MIGRATIONS = [
         END;
         CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_source_reassign
         AFTER UPDATE OF source_id ON candidates
-        WHEN NEW.source_id IS NOT NULL
-          AND NEW.source_id IS NOT OLD.source_id
-          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
-          AND NOT EXISTS (
-              SELECT 1 FROM candidate_sources cs
-              WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
-          )
+        WHEN NEW.source_id IS NOT OLD.source_id
         BEGIN
             DELETE FROM candidate_sources
             WHERE candidate_id = NEW.id
-              AND OLD.source_id IS NOT NULL
-              AND source_id = OLD.source_id
-              AND (SELECT COUNT(*) FROM candidate_sources WHERE candidate_id = NEW.id) = 1;
+              AND (
+                  NEW.source_id IS NULL
+                  OR (
+                      OLD.source_id IS NOT NULL
+                      AND source_id = OLD.source_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidate_sources cs
+                          WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
+                      )
+                  )
+              );
             INSERT INTO candidate_sources(
                 candidate_id, source_id, source_url, first_seen_at, last_seen_at
             )
-            VALUES (
+            SELECT
                 NEW.id,
                 NEW.source_id,
                 NEW.source_url,
                 COALESCE(NEW.created_at, CURRENT_TIMESTAMP),
                 COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
-            )
-            ON CONFLICT(candidate_id, source_id) DO NOTHING;
+            WHERE NEW.source_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM candidate_sources cs
+                  WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
+              );
+            UPDATE candidates
+            SET source_id = resolved.next_source_id
+            FROM (
+                SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                FROM candidates c
+                LEFT JOIN (
+                    SELECT candidate_id, source_id
+                    FROM (
+                        SELECT
+                            cs.candidate_id,
+                            cs.source_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY cs.candidate_id
+                                ORDER BY
+                                    CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                    CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                    s.weight DESC,
+                                    s.id ASC
+                            ) AS rn
+                        FROM candidate_sources cs
+                        JOIN sources s ON s.id = cs.source_id
+                        WHERE cs.candidate_id = NEW.id
+                    )
+                    WHERE rn = 1
+                ) AS best ON best.candidate_id = c.id
+                WHERE c.id = NEW.id
+                  AND c.source_id IS NOT best.source_id
+            ) AS resolved
+            WHERE candidates.id = resolved.candidate_id;
         END;
         CREATE TRIGGER IF NOT EXISTS candidates_sync_source_after_source_update
         AFTER UPDATE OF enabled, weight, kind ON sources
@@ -1097,40 +1143,32 @@ MIGRATIONS = [
           OR OLD.kind IS NOT NEW.kind
         BEGIN
             UPDATE candidates
-            SET source_id = COALESCE(
-                (
-                    SELECT cs.source_id
+            SET source_id = resolved.next_source_id,
+                updated_at = CURRENT_TIMESTAMP
+            FROM (
+                SELECT candidate_id, source_id AS next_source_id
+                FROM (
+                    SELECT
+                        cs.candidate_id,
+                        cs.source_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cs.candidate_id
+                            ORDER BY
+                                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.weight DESC,
+                                s.id ASC
+                        ) AS rn
                     FROM candidate_sources cs
                     JOIN sources s ON s.id = cs.source_id
-                    WHERE cs.candidate_id = candidates.id
-                    ORDER BY
-                        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                        s.weight DESC,
-                        s.id ASC
-                    LIMIT 1
-                ),
-                candidates.source_id
-            ),
-            updated_at = CURRENT_TIMESTAMP
-            WHERE id IN (
-                SELECT candidate_id FROM candidate_sources WHERE source_id = NEW.id
-            )
-            AND source_id IS NOT COALESCE(
-                (
-                    SELECT cs.source_id
-                    FROM candidate_sources cs
-                    JOIN sources s ON s.id = cs.source_id
-                    WHERE cs.candidate_id = candidates.id
-                    ORDER BY
-                        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
-                        s.weight DESC,
-                        s.id ASC
-                    LIMIT 1
-                ),
-                candidates.source_id
-            );
+                    WHERE cs.candidate_id IN (
+                        SELECT candidate_id FROM candidate_sources WHERE source_id = NEW.id
+                    )
+                )
+                WHERE rn = 1
+            ) AS resolved
+            WHERE candidates.id = resolved.candidate_id
+              AND candidates.source_id IS NOT resolved.next_source_id;
         END;
         """,
     ),
@@ -1496,7 +1534,6 @@ def initialize(*, seed_demo: bool = True):
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
-        applied_now: set[int] = set()
         for version, script in MIGRATIONS:
             if version in applied:
                 continue
@@ -1513,7 +1550,6 @@ def initialize(*, seed_demo: bool = True):
                     "INSERT INTO schema_migrations(version) VALUES(?)", (version,)
                 )
                 con.commit()
-                applied_now.add(version)
             except sqlite3.Error as exc:
                 if con.in_transaction:
                     con.rollback()
@@ -1597,29 +1633,15 @@ def initialize(*, seed_demo: bool = True):
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
-        recompute_candidate_sources(con)
-        if 27 in applied_now or con.execute(
-            "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
-            "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
-        ).fetchone():
-            from .quality import _dedupe_and_hide
-
-            _dedupe_and_hide(con)
     _restrict_database_files()
 
 
-_PRIMARY_SOURCE_SUBQUERY = """(
-    SELECT cs.source_id
-    FROM candidate_sources cs
-    JOIN sources s ON s.id = cs.source_id
-    WHERE cs.candidate_id = candidates.id
-    ORDER BY
-        CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
-        CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
-        s.weight DESC,
-        s.id ASC
-    LIMIT 1
-)"""
+_CANDIDATE_SOURCE_PRIORITY_ORDER = """
+    CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+    CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+    s.weight DESC,
+    s.id ASC
+"""
 
 
 def recompute_candidate_sources(
@@ -1628,9 +1650,8 @@ def recompute_candidate_sources(
     *,
     source_id: int | None = None,
 ) -> int:
-    """Materialize primary candidates.source_id from candidate_sources."""
+    """Materialize primary candidates.source_id strictly from candidate_sources."""
 
-    resolved = f"COALESCE({_PRIMARY_SOURCE_SUBQUERY}, candidates.source_id)"
     if candidate_ids is not None:
         ids = sorted({int(cid) for cid in candidate_ids})
         if not ids:
@@ -1640,26 +1661,105 @@ def recompute_candidate_sources(
             batch = ids[start : start + 500]
             marks = ",".join("?" for _ in batch)
             updated += con.execute(
-                f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
-                f"WHERE id IN ({marks}) AND source_id IS NOT {resolved}",
-                batch,
+                f"""UPDATE candidates
+                SET source_id = resolved.next_source_id,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                    FROM candidates c
+                    LEFT JOIN (
+                        SELECT candidate_id, source_id
+                        FROM (
+                            SELECT
+                                cs.candidate_id,
+                                cs.source_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY cs.candidate_id
+                                    ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
+                                ) AS rn
+                            FROM candidate_sources cs
+                            JOIN sources s ON s.id = cs.source_id
+                            WHERE cs.candidate_id IN ({marks})
+                        )
+                        WHERE rn = 1
+                    ) AS best ON best.candidate_id = c.id
+                    WHERE c.id IN ({marks})
+                      AND c.source_id IS NOT best.source_id
+                ) AS resolved
+                WHERE candidates.id = resolved.candidate_id""",
+                (*batch, *batch),
             ).rowcount
         return max(0, updated)
     if source_id is not None:
+        sid = int(source_id)
         return max(
             0,
             con.execute(
-                f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
-                f"WHERE (id IN (SELECT candidate_id FROM candidate_sources WHERE source_id=?) OR source_id=?) "
-                f"AND source_id IS NOT {resolved}",
-                (int(source_id), int(source_id)),
+                f"""WITH affected(candidate_id) AS (
+                    SELECT candidate_id FROM candidate_sources WHERE source_id = ?
+                    UNION
+                    SELECT id FROM candidates WHERE source_id = ?
+                ),
+                best AS (
+                    SELECT candidate_id, source_id
+                    FROM (
+                        SELECT
+                            cs.candidate_id,
+                            cs.source_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY cs.candidate_id
+                                ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
+                            ) AS rn
+                        FROM candidate_sources cs
+                        JOIN affected a ON a.candidate_id = cs.candidate_id
+                        JOIN sources s ON s.id = cs.source_id
+                    )
+                    WHERE rn = 1
+                ),
+                resolved AS (
+                    SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                    FROM candidates c
+                    JOIN affected a ON a.candidate_id = c.id
+                    LEFT JOIN best ON best.candidate_id = c.id
+                    WHERE c.source_id IS NOT best.source_id
+                )
+                UPDATE candidates
+                SET source_id = resolved.next_source_id,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM resolved
+                WHERE candidates.id = resolved.candidate_id""",
+                (sid, sid),
             ).rowcount,
         )
     return max(
         0,
         con.execute(
-            f"UPDATE candidates SET source_id={resolved}, updated_at=CURRENT_TIMESTAMP "
-            f"WHERE source_id IS NOT {resolved}"
+            f"""WITH best AS (
+                SELECT candidate_id, source_id
+                FROM (
+                    SELECT
+                        cs.candidate_id,
+                        cs.source_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cs.candidate_id
+                            ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
+                        ) AS rn
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                )
+                WHERE rn = 1
+            ),
+            resolved AS (
+                SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                FROM candidates c
+                LEFT JOIN best ON best.candidate_id = c.id
+                WHERE c.source_id IS NOT best.source_id
+            )
+            UPDATE candidates
+            SET source_id = resolved.next_source_id,
+                updated_at = CURRENT_TIMESTAMP
+            FROM resolved
+            WHERE candidates.id = resolved.candidate_id"""
         ).rowcount,
     )
 

@@ -3591,26 +3591,8 @@ async def scan_source(source):
                       )""",
                     batch,
                 )
-                con.execute(
-                    f"""UPDATE candidates
-                    SET source_id=NULL, status='new', score=0, explanation='[]',
-                        score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
-                    WHERE id IN ({id_marks})
-                      AND status IN ('new', 'recommended')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
-                      )""",
-                    batch,
-                )
             recompute_candidate_sources(con, stale_ids)
             demote_orphaned_recommended_candidates(con, stale_ids)
-            if con.execute(
-                "SELECT 1 FROM candidate_quality WHERE quality_status='rejected' "
-                "AND flags_json LIKE '%duplicate_identity%' LIMIT 1"
-            ).fetchone():
-                from .quality import recover_duplicate_identity_candidates
-
-                recover_duplicate_identity_candidates(con)
         # An empty response can be a transient block page, parser mismatch,
         # or upstream outage. It is not safe to interpret it as proof that a
         # source no longer contains any books, so retain existing candidates.
