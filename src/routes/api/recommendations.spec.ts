@@ -185,6 +185,21 @@ describe("recommendations endpoint", () => {
         status: "saved",
         source_name: "A source",
       },
+      {
+        id: 9,
+        title: "An Imported Book",
+        author: "A Reader",
+        description: "",
+        cover_url: "",
+        source_url: "",
+        release_date: null,
+        date_kind: "unknown",
+        genres: [],
+        score: 70,
+        explanation: [],
+        status: "imported",
+        source_name: "A source",
+      },
     ]);
 
     const response = await GET({
@@ -193,10 +208,42 @@ describe("recommendations endpoint", () => {
     } as never);
 
     expect(response.status).toBe(200);
-    expect((await response.json()).items[0]).toMatchObject({
-      id: 8,
-      status: "saved",
-    });
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 8, status: "saved" }),
+      expect.objectContaining({ id: 9, status: "imported" }),
+    ]);
+  });
+
+  it("allows filtering shortlist books by status=imported", async () => {
+    engineMock.mockResolvedValue([
+      {
+        id: 9,
+        title: "An Imported Book",
+        author: "A Reader",
+        description: "",
+        cover_url: "",
+        source_url: "",
+        release_date: null,
+        date_kind: "unknown",
+        genres: [],
+        score: 70,
+        explanation: [],
+        status: "imported",
+        source_name: "A source",
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL("http://bookward.test/api/recommendations?status=imported&limit=8&offset=0"),
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=imported&limit=9&offset=0",
+    );
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 9, status: "imported" }),
+    ]);
   });
 
   it("allows the browser to request the past decisions archive", async () => {
