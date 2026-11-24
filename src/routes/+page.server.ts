@@ -247,6 +247,36 @@ const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
 };
+async function handleCsvImport(request: Request) {
+  let incoming: FormData;
+  try {
+    incoming = await request.formData();
+  } catch (error) {
+    if (isPayloadTooLarge(error)) {
+      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+    }
+    throw error;
+  }
+  const file = incoming.get("file");
+  if (!(file instanceof File) || file.size === 0)
+    return fail(400, { message: "Choose a Goodreads or StoryGraph CSV export." });
+  if (file.size > GOODREADS_CSV_MAX_BYTES)
+    return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+  const body = new FormData();
+  body.set("file", file, file.name);
+  try {
+    const result = await engine<{ imported: number; source?: string }>(
+      "/api/import/csv",
+      { method: "POST", body },
+    );
+    const provider =
+      result.source === "storygraph_csv" ? "The StoryGraph" : "Goodreads";
+    const noun = result.imported === 1 ? "book" : "books";
+    return { message: `Imported ${result.imported} ${noun} from ${provider}.` };
+  } catch (error) {
+    return fail(engineStatus(error), { message: message(error) });
+  }
+}
 export const actions: Actions = {
   createBackup: async () => {
     try {
@@ -361,16 +391,35 @@ export const actions: Actions = {
   },
   undoDecision: async ({ request }) => {
     const data = await request.formData();
-    const id = idSchema.safeParse(data.get("id"));
-    const decisionId = idSchema.safeParse(data.get("decision_id"));
-    if (!id.success || !decisionId.success)
+    const rawIds = data.getAll("id");
+    const rawDecisionIds = data.getAll("decision_id");
+    if (!rawIds.length || rawIds.length !== rawDecisionIds.length)
       return fail(400, { message: "This decision can no longer be undone." });
+    const seen = new Set<string>();
+    const decisions: Array<{ id: number; decision_id: number }> = [];
+    for (let index = 0; index < rawIds.length; index += 1) {
+      const id = idSchema.safeParse(rawIds[index]);
+      const decisionId = idSchema.safeParse(rawDecisionIds[index]);
+      if (!id.success || !decisionId.success)
+        return fail(400, { message: "This decision can no longer be undone." });
+      const key = `${id.data}:${decisionId.data}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      decisions.push({ id: id.data, decision_id: decisionId.data });
+    }
     try {
-      await engine(`/api/recommendations/${id.data}/undo`, {
+      if (decisions.length === 1) {
+        await engine(`/api/recommendations/${decisions[0].id}/undo`, {
+          method: "POST",
+          body: JSON.stringify({ decision_id: decisions[0].decision_id }),
+        });
+        return { message: "Decision undone." };
+      }
+      await engine("/api/recommendations/bulk-undo", {
         method: "POST",
-        body: JSON.stringify({ decision_id: decisionId.data }),
+        body: JSON.stringify({ decisions }),
       });
-      return { message: "Decision undone." };
+      return { message: "Decisions undone." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -406,7 +455,10 @@ export const actions: Actions = {
     const data = await request.formData();
     const url = urlSchema.safeParse(data.get("url"));
     const label = z.preprocess(
-      (value) => typeof value === "string" && !value.trim() ? undefined : value,
+      (value) =>
+        value === null || (typeof value === "string" && !value.trim())
+          ? undefined
+          : value,
       z.string().trim().min(2).max(100).optional(),
     ).safeParse(data.get("label"));
     const lifecycle = z
@@ -418,7 +470,7 @@ export const actions: Actions = {
       return fail(400, { message: "Add a valid name and public URL." });
     const name = label.data ?? new URL(url.data).hostname.replace(/^www\./i, "");
     try {
-      const preview = await engine<{ count: number }>("/api/sources/preview", {
+      const preview = await engine<{ count: number; url?: string }>("/api/sources/preview", {
         method: "POST",
         body: JSON.stringify({ url: url.data, filters }),
       });
@@ -428,11 +480,15 @@ export const actions: Actions = {
             ? "No books matched these filters."
             : "No recognizable books were found at that URL.",
         });
+      const resolvedUrl =
+        typeof preview.url === "string" && preview.url.trim()
+          ? preview.url.trim()
+          : url.data;
       await engine("/api/sources", {
         method: "POST",
         body: JSON.stringify({
           name,
-          url: url.data,
+          url: resolvedUrl,
           lifecycle,
           filters,
         }),
@@ -576,32 +632,11 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
+  importCsv: async ({ request }) => {
+    return handleCsvImport(request);
+  },
   importGoodreadsCsv: async ({ request }) => {
-    let incoming: FormData;
-    try {
-      incoming = await request.formData();
-    } catch (error) {
-      if (isPayloadTooLarge(error)) {
-        return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
-      }
-      throw error;
-    }
-    const file = incoming.get("file");
-    if (!(file instanceof File) || file.size === 0)
-      return fail(400, { message: "Choose a Goodreads CSV export." });
-    if (file.size > GOODREADS_CSV_MAX_BYTES)
-      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
-    const body = new FormData();
-    body.set("file", file, file.name);
-    try {
-      const result = await engine<{ imported: number }>(
-        "/api/import/goodreads/csv",
-        { method: "POST", body },
-      );
-      return { message: `Imported ${result.imported} Goodreads books.` };
-    } catch (error) {
-      return fail(engineStatus(error), { message: message(error) });
-    }
+    return handleCsvImport(request);
   },
   configureLibrar: async ({ request }) => {
     const data = await request.formData();
@@ -636,16 +671,24 @@ export const actions: Actions = {
     }
   },
   importLibrar: async ({ request }) => {
-    const id = idSchema.safeParse((await request.formData()).get("id"));
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const runId = z
+      .string()
+      .trim()
+      .max(128)
+      .or(z.literal(""))
+      .catch("")
+      .parse(data.get("run_id"));
     if (!id.success) return fail(400, { message: "Invalid book." });
     try {
       await engine(`/api/recommendations/${id.data}/import`, {
         method: "POST",
-        body: "{}",
+        body: JSON.stringify(runId ? { run_id: runId } : {}),
       });
       return { message: "Book added to the Librarr wishlist." };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureEmbeddings: async ({ request }) => {
@@ -939,7 +982,10 @@ export const actions: Actions = {
     const uniqueIds = [...new Set(ids)];
     if (!uniqueIds.length) return fail(400, { message: "Select at least one book first." });
     try {
-      const result = await engine<{ updated?: number }>(
+      const result = await engine<{
+        updated?: number;
+        decisions?: Array<{ id: number; decision_id: number }>;
+      }>(
         "/api/recommendations/bulk-feedback",
         {
           method: "POST",
@@ -950,7 +996,24 @@ export const actions: Actions = {
           }),
         },
       );
-      return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
+      const count = result.updated ?? uniqueIds.length;
+      const undoDecisions = (result.decisions ?? []).filter(
+        (item) =>
+          idSchema.safeParse(item?.id).success &&
+          idSchema.safeParse(item?.decision_id).success,
+      );
+      return {
+        message: `${count} book${count === 1 ? "" : "s"} added to your shortlist.`,
+        ...(undoDecisions.length
+          ? {
+              undo_decisions: undoDecisions,
+              undo_label:
+                undoDecisions.length === 1
+                  ? "shortlisting this book"
+                  : `shortlisting ${undoDecisions.length} books`,
+            }
+          : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
