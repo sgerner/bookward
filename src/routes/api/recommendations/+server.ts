@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engineStatus, engine } from "#lib/server/engine.js";
 import { toPageBook, type Recommendation } from "#lib/server/recommendations.js";
@@ -23,7 +22,7 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 
 export const GET: RequestHandler = async ({ url }) => {
   const parsed = querySchema.safeParse(Object.fromEntries(url.searchParams));
-  if (!parsed.success) return json({ message: "Choose a valid recommendation page." }, { status: 400 });
+  if (!parsed.success) return Response.json({ message: "Choose a valid recommendation page." }, { status: 400 });
 
   const params = new URLSearchParams({
     status: parsed.data.status,
@@ -34,11 +33,11 @@ export const GET: RequestHandler = async ({ url }) => {
   if (parsed.data.genre) params.set("genre", parsed.data.genre);
   try {
     const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
-    return json({
+    return Response.json({
       items: items.slice(0, parsed.data.limit).map(toPageBook),
       has_more: items.length > parsed.data.limit,
     });
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };

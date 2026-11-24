@@ -31,6 +31,7 @@ from .backups import (
 )
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
+from . import ingestion
 from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
@@ -1359,30 +1360,14 @@ def _matches_recommendation_filter(
     return True
 
 
-def _format_recommendation_item(item: dict[str, Any]) -> dict[str, Any]:
+def _format_recommendation_item(
+    item: dict[str, Any], *, format_urls: bool = True
+) -> dict[str, Any]:
     formatted = dict(item)
-    formatted["cover_url"] = fallback_cover_url(
-        formatted["title"],
-        formatted["author"],
-        formatted.get("cover_url", ""),
-        formatted.get("source_url", ""),
-    )
-    source_url = formatted.get("source_url", "")
-    parsed_source = urlparse(source_url)
-    if (
-        (parsed_source.hostname or "").casefold().rstrip(".")
-        in {"openlibrary.org", "www.openlibrary.org"}
-        and parsed_source.path.casefold().startswith("/people/")
-        and "/lists/" in parsed_source.path.casefold()
-    ):
-        work_url = book_openlibrary_work_id(formatted)
-        if work_url:
-            source_url = f"https://openlibrary.org{work_url}"
-    formatted["source_url"] = canonical_book_source_url(
-        formatted["title"], formatted["author"], source_url
-    )
     formatted["genres"] = _parse_json_list(formatted.get("genres"))
     formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    if format_urls:
+        _format_recommendation_urls([formatted])
     return formatted
 
 
@@ -1430,6 +1415,7 @@ def tracked_recommendations(
                 offset=0,
                 identity_context=identity_context,
                 include_imported=include_imported,
+                format_urls=False,
             )
             if not is_filtered:
                 base_pool = [dict(item) for item in ranked]
@@ -1535,6 +1521,7 @@ def tracked_recommendations(
                 start = max(0, int(offset))
                 end = None if limit is None else start + max(0, int(limit))
                 recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
         except Exception:
             # Personalization must never take the recommendation service down.
             # On malformed legacy evidence, return the existing champion order.
@@ -1997,6 +1984,24 @@ def _recommendation_rows(
     return visible[offset:end]
 
 
+def _format_recommendation_urls(items):
+    for item in items:
+        source_url = item.get("source_url", "")
+        item["cover_url"] = fallback_cover_url(
+            item["title"],
+            item["author"],
+            item.get("cover_url", ""),
+            source_url,
+        )
+        item["source_url"] = canonical_book_source_url(
+            item["title"],
+            item["author"],
+            source_url,
+            item=item,
+        )
+    return items
+
+
 def recommendation_list(
     connection=None,
     *,
@@ -2008,6 +2013,7 @@ def recommendation_list(
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
+    format_urls: bool = True,
 ):
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
@@ -2047,7 +2053,12 @@ def recommendation_list(
             identity_context=identity_context,
             include_imported=include_imported,
         )
-    return [_format_recommendation_item(item) for item in result]
+    for item in result:
+        item["genres"] = _parse_json_list(item.get("genres"))
+        item["explanation"] = _parse_json_list(item.get("explanation"))
+    if format_urls:
+        _format_recommendation_urls(result)
+    return result
 
 @app.get("/api/recommendations")
 def recommendations(
@@ -2527,8 +2538,18 @@ async def goodreads_csv(file: UploadFile = File(...)):
 
 async def _sync_goodreads_rss(url: str):
     try:
-        count = await import_goodreads_rss(url)
-        shelves = await import_goodreads_shelves(url)
+        async with ingestion._source_client() as client:
+            read_result, shelf_results = await asyncio.gather(
+                import_goodreads_rss(url, client=client),
+                ingestion._fetch_goodreads_shelves(url, client=client),
+                return_exceptions=True,
+            )
+        if isinstance(read_result, BaseException):
+            raise read_result
+        if isinstance(shelf_results, BaseException):
+            raise shelf_results
+        count = read_result
+        shelves = ingestion._apply_goodreads_shelves(shelf_results)
     except Exception as exc:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         message = safe_error_message(exc, limit=300)

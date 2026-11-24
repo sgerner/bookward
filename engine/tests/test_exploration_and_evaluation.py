@@ -1,5 +1,6 @@
 import json
 import math
+import time
 
 import pytest
 
@@ -48,11 +49,115 @@ def _rows():
     return values
 
 
+def _pairwise_ips_auc_reference(
+    rows,
+    *,
+    score_key: str = "score",
+    positive_threshold: float = 0.5,
+) -> float | None:
+    usable = evaluation._weighted_rows(rows, score_key=score_key)
+    positives = [(score, weight) for _, score, label, weight in usable if label > positive_threshold]
+    negatives = [(score, weight) for _, score, label, weight in usable if label < positive_threshold]
+    denominator = sum(left_weight * right_weight for _, left_weight in positives for _, right_weight in negatives)
+    if not positives or not negatives or denominator <= 0:
+        return None
+    numerator = 0.0
+    for positive, positive_weight in positives:
+        for negative, negative_weight in negatives:
+            pair_weight = positive_weight * negative_weight
+            if positive > negative:
+                numerator += pair_weight
+            elif positive == negative:
+                numerator += pair_weight * 0.5
+    return numerator / denominator
+
+
 def test_ips_metrics_weight_propensity_and_ignore_censored_rows():
     rows = _rows()[:2] + [{"run_id": "censored", "rank": 1, "score": 100, "propensity": 0.01, "label": None}]
     assert ips_auc(rows) == 1
     assert ips_precision_at_k(rows, 20) == 0.5
     assert ips_ndcg_at_k(rows, 20) == 1
+
+
+def test_ips_auc_matches_pairwise_reference_across_ties_zero_weights_and_neutral_labels():
+    # Empty, single-class, neutral-only, and zero-denominator cases return None
+    assert ips_auc([]) is None
+    assert ips_auc([{"score": 1.0, "label": 1.0}]) is None
+    assert ips_auc([{"score": 0.0, "label": 0.0}]) is None
+    assert ips_auc([{"score": 1.0, "label": 0.5}, {"score": 0.0, "label": 0.5}]) is None
+    assert ips_auc([
+        {"score": 1.0, "label": 1.0, "confidence": 0.0},
+        {"score": 0.0, "label": 0.0, "confidence": 1.0},
+    ]) is None
+
+    # Signed-zero ties (-0.0 and +0.0) and input-order invariance
+    signed_zero_rows = [
+        {"score": -0.0, "label": 1.0, "propensity": 0.4, "confidence": 0.8},
+        {"score": 0.0, "label": 0.0, "propensity": 0.5, "confidence": 1.0},
+        {"score": -1.0, "label": 0.0, "propensity": 0.25, "confidence": 0.5},
+        {"score": 0.0, "label": 0.5, "propensity": 0.5, "confidence": 1.0},
+    ]
+    ref_zero = _pairwise_ips_auc_reference(signed_zero_rows)
+    assert ref_zero is not None
+    assert abs(ips_auc(signed_zero_rows) - ref_zero) <= 1e-12
+    assert abs(ips_auc(list(reversed(signed_zero_rows))) - ref_zero) <= 1e-12
+
+    # Mixed ties, zero-confidence rows alongside positive weights, neutral labels, and censored rows
+    rng = random.Random(20261121)
+    mixed_rows = []
+    for index in range(300):
+        mixed_rows.append({
+            "run_id": f"run-{index // 15}",
+            "rank": (index % 15) + 1,
+            "score": rng.choice([-0.0, 0.0, 0.25, 0.5, 0.75, 1.0]),
+            "alt_score": round(rng.uniform(-2.0, 2.0), 1),
+            "propensity": rng.choice([0.1, 0.25, 0.5, 1.0]),
+            "confidence": rng.choice([0.0, 0.25, 0.5, 1.0]),
+            "label": rng.choice([None, 0.0, 0.2, 0.5, 0.7, 1.0]),
+        })
+    ref_default = _pairwise_ips_auc_reference(mixed_rows)
+    actual_default = ips_auc((row for row in mixed_rows))
+    assert ref_default is not None and actual_default is not None
+    assert abs(actual_default - ref_default) <= 1e-12
+
+    ref_custom = _pairwise_ips_auc_reference(mixed_rows, score_key="alt_score", positive_threshold=0.7)
+    actual_custom = ips_auc(mixed_rows, score_key="alt_score", positive_threshold=0.7)
+    assert ref_custom is not None and actual_custom is not None
+    assert abs(actual_custom - ref_custom) <= 1e-12
+
+    # Verify cluster_bootstrap matches reference pairwise bootstrap within 1e-12
+    boot_actual = cluster_bootstrap(mixed_rows, iterations=40, seed=99)
+    orig_ips_auc = evaluation.ips_auc
+    try:
+        evaluation.ips_auc = _pairwise_ips_auc_reference
+        boot_ref = cluster_bootstrap(mixed_rows, iterations=40, seed=99)
+    finally:
+        evaluation.ips_auc = orig_ips_auc
+    assert boot_actual["iterations"] == boot_ref["iterations"]
+    assert boot_actual["clusters"] == boot_ref["clusters"]
+    assert abs(boot_actual["estimate"] - boot_ref["estimate"]) <= 1e-12
+    assert abs(boot_actual["lower"] - boot_ref["lower"]) <= 1e-12
+    assert abs(boot_actual["upper"] - boot_ref["upper"]) <= 1e-12
+
+
+def test_ips_auc_sorted_groups_scales_sublinearly_vs_quadratic_pairs():
+    rows_20k = [
+        {
+            "run_id": f"run-{index // 20}",
+            "rank": (index % 20) + 1,
+            "score": float((index * 37) % 500),
+            "propensity": 0.5,
+            "confidence": 1.0,
+            "label": 1.0 if index % 2 == 0 else 0.0,
+        }
+        for index in range(20_000)
+    ]
+    started = time.perf_counter()
+    auc_value = ips_auc(rows_20k)
+    elapsed = time.perf_counter() - started
+    assert auc_value is not None and 0.0 <= auc_value <= 1.0
+    # 20,000 binary rows represent 100M pairs (~15-20s with nested O(P * N) loops, <0.1s with sorted groups)
+    assert elapsed < 1.0
 
 
 def test_cluster_bootstrap_is_run_clustered_and_seeded():
