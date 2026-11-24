@@ -1384,3 +1384,246 @@ def test_cache_key_excludes_sensitive_api_key_material() -> None:
     assert k1 != _build_cache_key(
         **{**base_kwargs, "url": "https://api.groq.com/openai/v1/chat/completions"}
     )
+
+
+def test_filtered_views_skip_llm_reranker(tmp_path: Path, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, row, transaction
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+    from afterword_engine.tenancy import profile_scope
+
+    reranker_module.clear_llm_rerank_cache()
+    monkeypatch.setattr(settings, "db", str(tmp_path / "filtered-skip-llm.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "llm_rerank_enabled", True)
+    monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-env-default-key")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    owner_session, _ = profiles.create_session(admin["id"])
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) VALUES('Dune','Frank Herbert',5.0,'2026-10-01','test')"
+            )
+            source_id = con.execute("SELECT id FROM sources LIMIT 1").fetchone()[0]
+            con.execute("UPDATE sources SET enabled=1 WHERE id=?", (source_id,))
+            seeded = [
+                ("Hyperion", "Dan Simmons", 86.0, ["Space Opera"]),
+                ("Piranesi", "Susanna Clarke", 84.0, ["Fantasy"]),
+                ("Orbital", "Samantha Harvey", 82.0, ["Literary Fiction"]),
+            ]
+            for idx, (title, author, score, genres) in enumerate(seeded, start=1):
+                cur = con.execute(
+                    "INSERT INTO candidates(title,author,score,status,source_id,normalized_key,genres,explanation) "
+                    "VALUES(?,?,?,'recommended',?,?,?,?)",
+                    (
+                        title,
+                        author,
+                        score,
+                        source_id,
+                        f"flt-{idx}",
+                        json.dumps(genres),
+                        json.dumps(["Base match"]),
+                    ),
+                )
+                con.execute(
+                    "INSERT OR REPLACE INTO candidate_quality(candidate_id,quality_status,quality_score) "
+                    "VALUES(?, 'accepted', 1.0)",
+                    (cur.lastrowid,),
+                )
+
+    rerank_calls = 0
+    load_input_calls = 0
+    orig_load_inputs = main_module._load_llm_rerank_inputs
+
+    def counting_load_inputs(*args, **kwargs):
+        nonlocal load_input_calls
+        load_input_calls += 1
+        return orig_load_inputs(*args, **kwargs)
+
+    def counting_rerank(reads, candidates, **kwargs):
+        nonlocal rerank_calls
+        rerank_calls += 1
+        return list(candidates), {"applied": True, "adjusted_count": 0, "cached": False}
+
+    monkeypatch.setattr(main_module, "_load_llm_rerank_inputs", counting_load_inputs)
+    monkeypatch.setattr(reranker_module, "rerank_with_llm_sync", counting_rerank)
+
+    client = TestClient(main_module.app, headers={"x-bookward-session": owner_session})
+
+    # Unfiltered view invokes LLM input loading and rerank_with_llm_sync.
+    unfiltered = client.get("/api/recommendations", params={"status": "recommended"})
+    assert unfiltered.status_code == 200
+    assert len(unfiltered.json()) == 3
+    assert load_input_calls == 1
+    assert rerank_calls == 1
+
+    # Search-filtered and genre-filtered views MUST skip LLM input loading and reranking.
+    by_search = client.get(
+        "/api/recommendations",
+        params={"status": "recommended", "search": "piranesi"},
+    )
+    assert by_search.status_code == 200
+    assert [item["title"] for item in by_search.json()] == ["Piranesi"]
+    assert load_input_calls == 1
+    assert rerank_calls == 1
+    search_run_id = by_search.headers["X-Bookward-Recommendation-Run"]
+    search_meta = json.loads(
+        row("SELECT metadata FROM recommendation_runs WHERE id=?", (search_run_id,))["metadata"]
+    )
+    assert "llm_rerank" not in search_meta["interaction_learning"]
+
+    by_genre = client.get(
+        "/api/recommendations",
+        params={"status": "recommended", "genre": "Space Opera"},
+    )
+    assert by_genre.status_code == 200
+    assert [item["title"] for item in by_genre.json()] == ["Hyperion"]
+    assert load_input_calls == 1
+    assert rerank_calls == 1
+    genre_run_id = by_genre.headers["X-Bookward-Recommendation-Run"]
+    genre_meta = json.loads(
+        row("SELECT metadata FROM recommendation_runs WHERE id=?", (genre_run_id,))["metadata"]
+    )
+    assert "llm_rerank" not in genre_meta["interaction_learning"]
+
+
+def test_serving_runs_llm_rerank_before_diversify_discovery_slate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, row, transaction
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+
+    reranker_module.clear_llm_rerank_cache()
+    monkeypatch.setattr(settings, "db", str(tmp_path / "order-before-diversify.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "llm_rerank_enabled", True)
+    monkeypatch.setattr(settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions")
+    monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-env-order-key")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    )
+
+    initialize(seed_demo=False)
+    book_ids: dict[str, int] = {}
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES('Dune','Frank Herbert',5.0,'2026-10-01','test')"
+        )
+        source_id = con.execute("SELECT id FROM sources LIMIT 1").fetchone()[0]
+        con.execute("UPDATE sources SET enabled=1 WHERE id=?", (source_id,))
+        # Prolific Author starts with two top books (90.0, 89.5) and a third book at 88.2
+        # behind Diverse Author (88.5). When the LLM boosts Prolific Book 3 by +1.0 -> 89.2,
+        # running LLM BEFORE diversify_discovery_slate ensures diversify_discovery_slate sees
+        # all 3 Prolific Author books in the top 3 and swaps Diverse Author (88.5) into slot 2
+        # (preserving MAX_BOOKS_PER_AUTHOR = 2), while retaining the +1.00 LLM score/explanation!
+        seeded = [
+            ("Prolific Book 1", "Prolific Author", 90.0),
+            ("Prolific Book 2", "Prolific Author", 89.5),
+            ("Diverse Pick", "Fresh Voice", 88.5),
+            ("Prolific Book 3", "Prolific Author", 88.2),
+            ("Followup Pick", "Another Voice", 85.0),
+        ]
+        for idx, (title, author, score) in enumerate(seeded, start=1):
+            cur = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key,genres,explanation) "
+                "VALUES(?,?,?,'recommended',?,?,?,?)",
+                (
+                    title,
+                    author,
+                    score,
+                    source_id,
+                    f"ord-{idx}",
+                    json.dumps(["Science Fiction"]),
+                    json.dumps(["Base match"]),
+                ),
+            )
+            cid = int(cur.lastrowid)
+            book_ids[title] = cid
+            con.execute(
+                "INSERT OR REPLACE INTO candidate_quality(candidate_id,quality_status,quality_score) "
+                "VALUES(?, 'accepted', 1.0)",
+                (cid,),
+            )
+
+    class BoostThirdRepeatClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict, json: dict):
+            class Resp:
+                status_code = 200
+                headers: dict[str, str] = {}
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self) -> dict:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": globals()["json"].dumps(
+                                        {
+                                            "adjustments": [
+                                                {
+                                                    "id": book_ids["Prolific Book 3"],
+                                                    "delta": 1.0,
+                                                    "reason": "Strong reader match",
+                                                }
+                                            ]
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+
+            return Resp()
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", BoostThirdRepeatClient)
+
+    recs, run_id = main_module.tracked_recommendations(status="recommended")
+    titles = [item["title"] for item in recs]
+    # Across the 5-book slate (< DEFAULT_SLATE_SIZE=8), diversify_discovery_slate swaps both
+    # qualifying non-redundant books (Diverse Pick at 88.5 and Followup Pick at 85.0, both within
+    # MAX_SCORE_SACRIFICE=5.0 and MAX_DISPLACEMENT=3) ahead of Prolific Book 3 (89.2) so the top 4
+    # contain at most MAX_BOOKS_PER_AUTHOR=2 books by Prolific Author, whereas running LLM after
+    # diversify_discovery_slate would have sorted Prolific Book 3 (89.2) into slot 2 (3 in top 3).
+    assert titles == [
+        "Prolific Book 1",
+        "Prolific Book 2",
+        "Diverse Pick",
+        "Followup Pick",
+        "Prolific Book 3",
+    ]
+    assert sum(1 for item in recs[:4] if item["author"] == "Prolific Author") == 2
+    by_title = {item["title"]: item for item in recs}
+    assert by_title["Prolific Book 3"]["score"] == 89.2
+    assert any(
+        "LLM delta (+1.00): Strong reader match" in exp
+        for exp in by_title["Prolific Book 3"]["explanation"]
+    )
+    run_meta = json.loads(row("SELECT metadata FROM recommendation_runs WHERE id=?", (run_id,))["metadata"])
+    assert run_meta["interaction_learning"]["llm_rerank"]["applied"] is True
+    assert run_meta["discovery_slate"]["author_repeat_swaps"] == 2
+

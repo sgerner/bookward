@@ -9,17 +9,17 @@ import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -30,9 +30,10 @@ from .backups import (
     restore_backup,
 )
 from .embeddings import get_embedder
-from .covers import canonical_book_source_url, fallback_cover_url
+from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
 from .ingestion import (
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     validate_goodreads_rss_url,
@@ -79,6 +80,7 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    validate_candidate_run_id,
     _impression_precedes,
     _read_label,
     _read_time,
@@ -102,13 +104,16 @@ from .quality import (
     has_candidate_quality_audit_candidates,
     quality_summary,
 )
+from . import llm_reranker
 from .llm_reranker import (
     _normalize_chat_url,
     clear_llm_rerank_cache,
     is_custom_llm_endpoint,
-    rerank_with_llm_sync,
+    rerank_with_llm_sync as _default_rerank_with_llm_sync,
     resolve_llm_rerank_credentials,
 )
+
+rerank_with_llm_sync = _default_rerank_with_llm_sync
 from .identity import (
     ReadIdentityIndex,
     book_identity,
@@ -235,12 +240,13 @@ def source_sync_due_sources(now=None):
     )
     due = []
     for source in sources:
-        if not source["last_scanned_at"]:
+        attempt_at = source["last_attempted_at"] or source["last_scanned_at"]
+        if not attempt_at:
             due.append(source)
             continue
         try:
             last = datetime.fromisoformat(
-                str(source["last_scanned_at"]).replace(" ", "T").replace("Z", "+00:00")
+                str(attempt_at).replace(" ", "T").replace("Z", "+00:00")
             )
         except ValueError:
             due.append(source)
@@ -584,7 +590,7 @@ async def handle_job(kind: str):
             return {"skipped": "managed_by_association_provider", "source_id": source_id}
         if not source["enabled"]:
             return {"skipped": "disabled", "source_id": source_id}
-        if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
+        if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
@@ -592,9 +598,7 @@ async def handle_job(kind: str):
             message = safe_error_message(exc)
             with transaction() as con:
                 con.execute(
-                    "UPDATE sources SET last_status=?, "
-                    "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                    "WHERE id=?",
+                    "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                     (f"error:{message}", source_id),
                 )
             raise
@@ -618,7 +622,10 @@ async def handle_job(kind: str):
             sources = rows(
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
-                "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
+                "AND (lifecycle='permanent' OR ("
+                "lifecycle='one_time' AND last_scanned_at IS NULL "
+                "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
+                "))"
             )
         for source in sources:
             try:
@@ -627,9 +634,7 @@ async def handle_job(kind: str):
                 message = safe_error_message(exc)
                 with transaction() as con:
                     con.execute(
-                        "UPDATE sources SET last_status=?, "
-                        "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                        "WHERE id=?",
+                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                         (f"error:{message}", source["id"]),
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
@@ -1170,6 +1175,7 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
+    url: HttpUrl | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
 
@@ -1187,7 +1193,7 @@ class DigestSettingsIn(BaseModel):
     minimum_score: float = Field(default=80, ge=0, le=100)
     maximum_books: int = Field(default=5, ge=1, le=20)
     only_new: bool = True
-    app_url: str = "http://localhost:5173"
+    app_url: str | None = None
     # Optional secrets preserve the existing value when omitted and clear it
     # when explicitly sent as an empty string.
     discord_webhook_url: str | None = None
@@ -1269,6 +1275,15 @@ class BulkFeedbackIn(BaseModel):
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
+class BulkUndoItemIn(BaseModel):
+    id: int = Field(gt=0)
+    decision_id: int = Field(gt=0)
+
+
+class BulkUndoFeedbackIn(BaseModel):
+    decisions: list[BulkUndoItemIn] = Field(min_length=1, max_length=100)
+
+
 class ApiTokenCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
@@ -1282,17 +1297,27 @@ class EngineSettings(BaseModel):
     librarr_api_key: str = ""
     librarr_media_type: str = "audiobook"
 
-    def validate_values(self):
-        if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
-        for label, value in (("embedding",self.embedding_url),("Librarr",self.librarr_url)):
-            parsed = urlparse(value) if value else None
-            if parsed and parsed.scheme not in {"http","https"}: raise ValueError(f"{label} URL must use HTTP or HTTPS")
-            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError(f"{label} URL cannot contain credentials, query parameters, or fragments")
-        if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
-        normalize_media_type(self.librarr_media_type)
-        if self.librarr_url:
-            allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
-            validate_service_url(self.librarr_url, allowed)
+    def validate_values(
+        self,
+        *,
+        validate_embedding: bool = True,
+        validate_librarr: bool = True,
+        check_librarr_host: bool = True,
+    ):
+        if validate_embedding:
+            if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
+            parsed = urlparse(self.embedding_url) if self.embedding_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("embedding URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("embedding URL cannot contain credentials, query parameters, or fragments")
+            if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
+        if validate_librarr:
+            parsed = urlparse(self.librarr_url) if self.librarr_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("Librarr URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("Librarr URL cannot contain credentials, query parameters, or fragments")
+            normalize_media_type(self.librarr_media_type)
+            if check_librarr_host and self.librarr_url:
+                allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
+                validate_service_url(self.librarr_url, allowed)
 
 
 class NYTApiKeyIn(BaseModel):
@@ -1336,6 +1361,62 @@ class LLMRerankSettingsIn(BaseModel):
 def api_token_list():
     """Return token metadata without ever returning a token value."""
     return identity_store.list_profile_api_tokens(current_profile_id() or "legacy")
+
+
+def _parse_json_list(raw: Any) -> list[Any]:
+    if isinstance(raw, list):
+        return raw
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def _distinct_genres(items: list[dict[str, Any]]) -> list[str]:
+    seen: dict[str, str] = {}
+    for item in items:
+        for genre in _parse_json_list(item.get("genres")):
+            cleaned = str(genre).strip()
+            if cleaned:
+                seen.setdefault(cleaned.casefold(), cleaned)
+    return sorted(seen.values(), key=lambda value: (value.casefold(), value))
+
+
+def _matches_recommendation_filter(
+    item: dict[str, Any],
+    *,
+    search: str | None = None,
+    genre: str | None = None,
+) -> bool:
+    search_norm = (search or "").strip().casefold()
+    genre_norm = (genre or "").strip().casefold()
+    if not search_norm and not genre_norm:
+        return True
+    genres = [str(value).strip() for value in _parse_json_list(item.get("genres")) if str(value).strip()]
+    if genre_norm and not any(value.casefold() == genre_norm for value in genres):
+        return False
+    if search_norm:
+        haystack = (
+            f"{item.get('title', '')} {item.get('author', '')} "
+            f"{' '.join(genres)} {item.get('description', '')}"
+        ).casefold()
+        if search_norm not in haystack:
+            return False
+    return True
+
+
+def _format_recommendation_item(
+    item: dict[str, Any], *, format_urls: bool = True
+) -> dict[str, Any]:
+    formatted = dict(item)
+    formatted["genres"] = _parse_json_list(formatted.get("genres"))
+    formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    if format_urls:
+        _format_recommendation_urls([formatted])
+    return formatted
 
 
 def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]):
@@ -1401,13 +1482,17 @@ def _prepare_tracked_recommendations(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     connection=None,
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
     private: dict | None = None,
+    pool_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ranking_at = datetime.now(timezone.utc)
+    is_filtered = bool((search and search.strip()) or (genre and genre.strip()))
     base_pool = personalized_pool = None
     ranked = None
     recommendations = None
@@ -1445,7 +1530,8 @@ def _prepare_tracked_recommendations(
                 include_imported=include_imported,
                 format_urls=False,
             )
-            base_pool = [dict(item) for item in ranked]
+            if not is_filtered:
+                base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
             # The event primary key orders actions; cached vectors are keyed by
             # candidate id. Normalize only the cache inputs so learner event
@@ -1483,10 +1569,11 @@ def _prepare_tracked_recommendations(
                     max_penalty=settings.impression_fatigue_max_penalty,
                 )
                 diagnostics["impression_fatigue"] = fatigue_diagnostics
-            personalized_pool = [dict(item) for item in ranked]
+            if not is_filtered:
+                personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
-            if has_recommended:
+            if not is_filtered and has_recommended:
                 try:
                     llm_cfg = effective_llm_rerank_settings(connection, private)
                     llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
@@ -1507,11 +1594,22 @@ def _prepare_tracked_recommendations(
             fallback_triggered = True
             base_pool = personalized_pool = None
             ranked = None
+            if pool_summary is not None:
+                fallback_recommended = _recommendation_rows(
+                    connection,
+                    statuses=("recommended",),
+                    limit=None,
+                    identity_context=identity_context,
+                )
+                pool_summary["recommended_total"] = len(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
             recommendations = recommendation_list(
                 connection,
                 status=status,
                 limit=limit,
                 offset=offset,
+                search=search,
+                genre=genre,
                 recommended_limit=recommended_limit,
                 identity_context=identity_context,
                 include_imported=include_imported,
@@ -1536,6 +1634,8 @@ def _prepare_tracked_recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             recommended_limit=recommended_limit,
             identity_context=identity_context,
             include_imported=include_imported,
@@ -1545,6 +1645,10 @@ def _prepare_tracked_recommendations(
         "status": status,
         "limit": limit,
         "offset": offset,
+        "search": search,
+        "genre": genre,
+        "is_filtered": is_filtered,
+        "pool_summary": pool_summary,
         "recommended_limit": recommended_limit,
         "identity_context": identity_context,
         "include_imported": include_imported,
@@ -1575,6 +1679,10 @@ def _complete_tracked_recommendations(
     status = prepared["status"]
     limit = prepared["limit"]
     offset = prepared["offset"]
+    search = prepared["search"]
+    genre = prepared["genre"]
+    is_filtered = prepared["is_filtered"]
+    pool_summary = prepared["pool_summary"]
     recommended_limit = prepared["recommended_limit"]
     ranking_at = prepared["ranking_at"]
     can_personalize = prepared["can_personalize"]
@@ -1594,11 +1702,16 @@ def _complete_tracked_recommendations(
                 item for item in ranked if item.get("status") == "recommended"
             ]
             if recommended:
-                if prepared["llm_active"]:
+                if not is_filtered and prepared["llm_active"]:
                     llm_cfg = prepared["llm_cfg"]
                     unreranked_recommended = [dict(item) for item in recommended]
+                    rerank_fn = (
+                        rerank_with_llm_sync
+                        if rerank_with_llm_sync is not _default_rerank_with_llm_sync
+                        else llm_reranker.rerank_with_llm_sync
+                    )
                     try:
-                        recommended, llm_diag = rerank_with_llm_sync(
+                        recommended, llm_diag = rerank_fn(
                             prepared["read_rows"],
                             recommended,
                             interaction_events=prepared["llm_events"],
@@ -1626,7 +1739,20 @@ def _complete_tracked_recommendations(
                 discovery_metadata = empty_discovery_slate_diagnostics(
                     "no_recommended_candidates"
                 )
-            final_pool = [dict(item) for item in ranked]
+            if pool_summary is not None:
+                all_recommended = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                pool_summary["recommended_total"] = len(all_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(all_recommended)
+            if not is_filtered:
+                final_pool = [dict(item) for item in ranked]
+            else:
+                ranked = [
+                    item
+                    for item in ranked
+                    if _matches_recommendation_filter(item, search=search, genre=genre)
+                ]
             if recommended_limit is not None and status is None and offset == 0:
                 recommended_out = [
                     item for item in ranked if item.get("status") == "recommended"
@@ -1649,11 +1775,22 @@ def _complete_tracked_recommendations(
                 "Post-personalization slate assembly failed; serving base ranking"
             )
             base_pool = personalized_pool = final_pool = None
+            if pool_summary is not None:
+                fallback_recommended = _recommendation_rows(
+                    connection,
+                    statuses=("recommended",),
+                    limit=None,
+                    identity_context=prepared["identity_context"],
+                )
+                pool_summary["recommended_total"] = len(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
             recommendations = recommendation_list(
                 connection,
                 status=status,
                 limit=limit,
                 offset=offset,
+                search=search,
+                genre=genre,
                 recommended_limit=recommended_limit,
                 identity_context=prepared["identity_context"],
                 include_imported=prepared["include_imported"],
@@ -1682,7 +1819,14 @@ def _complete_tracked_recommendations(
             epsilon=settings.exploration_epsilon,
             stable_top_k=settings.exploration_stable_top_k,
         )
-    if base_pool is not None and personalized_pool is not None and final_pool is not None:
+    if is_filtered:
+        decision_evidence = {
+            "schema_version": 1,
+            "capture_status": "incomplete",
+            "reason": "filtered_query",
+            "captured_at": ranking_at.isoformat(),
+        }
+    elif base_pool is not None and personalized_pool is not None and final_pool is not None:
         decision_evidence = build_decision_evidence(
             connection,
             base_pool=base_pool,
@@ -1726,22 +1870,28 @@ def tracked_recommendations(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     connection=None,
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
     private: dict | None = None,
+    pool_summary: dict[str, Any] | None = None,
 ):
     if connection is not None:
         prepared = _prepare_tracked_recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             connection=connection,
             recommended_limit=recommended_limit,
             identity_context=identity_context,
             include_imported=include_imported,
             private=private,
+            pool_summary=pool_summary,
         )
         return _complete_tracked_recommendations(prepared, connection=connection)
 
@@ -1750,11 +1900,14 @@ def tracked_recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             connection=read_con,
             recommended_limit=recommended_limit,
             identity_context=identity_context,
             include_imported=include_imported,
             private=private,
+            pool_summary=pool_summary,
         )
         if not prepared["llm_active"]:
             return _complete_tracked_recommendations(prepared, connection=read_con)
@@ -1776,6 +1929,7 @@ def overview_payload(
     deferred_prepared = None
     recommendations = None
     run_id = None
+    pool_summary: dict[str, Any] = {}
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
@@ -1793,6 +1947,7 @@ def overview_payload(
                 identity_context=identity_context,
                 include_imported=True,
                 private=private,
+                pool_summary=pool_summary,
             )
         else:
             recommendations, run_id = tracked_recommendations(
@@ -1802,15 +1957,20 @@ def overview_payload(
                 identity_context=identity_context,
                 include_imported=True,
                 private=private,
+                pool_summary=pool_summary,
             )
-        decision_batch = recommendation_list(
+        all_decision_rows = _recommendation_rows(
             connection,
-            status="decisions",
-            limit=decision_limit + 1,
+            statuses=("rejected", "maybe_later"),
+            limit=None,
             identity_context=identity_context,
         )
-        decisions_has_more = len(decision_batch) > decision_limit
-        decisions = decision_batch[:decision_limit]
+        decision_genres = _distinct_genres(all_decision_rows)
+        decisions_has_more = len(all_decision_rows) > decision_limit
+        decisions = [
+            _format_recommendation_item(item)
+            for item in all_decision_rows[:decision_limit]
+        ]
         sources_list = [
             source_payload(item)
             for item in connection.execute(
@@ -1833,11 +1993,22 @@ def overview_payload(
         recommendations, run_id = _complete_tracked_recommendations(
             deferred_prepared, connection=None
         )
+    served_recommended = sum(
+        1 for item in recommendations if item.get("status") == "recommended"
+    )
+    recommendations_has_more = (
+        int(pool_summary.get("recommended_total", served_recommended))
+        > served_recommended
+    )
+    recommendation_genres = list(pool_summary.get("recommendation_genres") or [])
     return {
         "counts": counts,
         "recommendations": recommendations,
+        "recommendations_has_more": recommendations_has_more,
+        "recommendation_genres": recommendation_genres,
         "decisions": decisions,
         "decisions_has_more": decisions_has_more,
+        "decision_genres": decision_genres,
         "recommendation_run_id": run_id,
         "sources": sources_list,
         "history": history_list,
@@ -2028,6 +2199,8 @@ def _recommendation_rows(
     statuses: tuple[str, ...] | None = None,
     limit: int | None = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     identity_context=None,
     include_imported: bool = False,
 ):
@@ -2048,7 +2221,7 @@ def _recommendation_rows(
             if "rejected" in statuses:
                 archive_terms.append(
                     "(c.status='rejected' AND EXISTS(SELECT 1 FROM feedback f "
-                    "WHERE f.candidate_id=c.id AND f.action='reject'))"
+                    "WHERE f.candidate_id=c.id AND f.action='reject' AND f.undone_at IS NULL))"
                 )
             if "maybe_later" in statuses:
                 archive_terms.append("c.status='maybe_later'")
@@ -2057,17 +2230,35 @@ def _recommendation_rows(
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"c.status IN ({placeholders})")
             params.extend(statuses)
+    decision_select = (
+        ",COALESCE((SELECT f.created_at FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL "
+        "AND f.action=CASE c.status WHEN 'rejected' THEN 'reject' ELSE 'maybe_later' END "
+        "ORDER BY f.id DESC LIMIT 1),c.updated_at,c.created_at) active_decision_at"
+        ",COALESCE((SELECT f.id FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL "
+        "AND f.action=CASE c.status WHEN 'rejected' THEN 'reject' ELSE 'maybe_later' END "
+        "ORDER BY f.id DESC LIMIT 1),0) active_decision_id"
+        if is_decision_archive
+        else ""
+    )
+    order_clause = (
+        " ORDER BY COALESCE(unixepoch(active_decision_at,'subsec'),0) DESC,"
+        "active_decision_at DESC,active_decision_id DESC,c.score DESC,c.id DESC"
+        if is_decision_archive
+        else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC, c.id DESC"
+    )
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
-        "q.isbn10 quality_isbn10 "
+        f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+        + order_clause
     )
     result = (
         [dict(item) for item in connection.execute(query, params).fetchall()]
@@ -2077,9 +2268,12 @@ def _recommendation_rows(
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     read_identity_index, shortlisted_keys = identity_context
+    has_filters = bool((search and search.strip()) or (genre and genre.strip()))
     visible = []
     seen_recommendation_keys = set()
     for item in result:
+        item.pop("active_decision_at", None)
+        item.pop("active_decision_id", None)
         if item["status"] == "saved":
             visible.append(item)
             continue
@@ -2096,6 +2290,12 @@ def _recommendation_rows(
         if item["status"] == "recommended":
             seen_recommendation_keys.update(keys)
         visible.append(item)
+    if has_filters:
+        visible = [
+            item
+            for item in visible
+            if _matches_recommendation_filter(item, search=search, genre=genre)
+        ]
     end = None if limit is None else offset + limit
     return visible[offset:end]
 
@@ -2124,11 +2324,14 @@ def recommendation_list(
     status: str | None = None,
     limit: int | None = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
     format_urls: bool = True,
 ):
+    effective_include_imported = include_imported or status in {"saved", "imported", "all"}
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     if recommended_limit is not None and status is None and offset == 0:
@@ -2136,6 +2339,8 @@ def recommendation_list(
             connection,
             statuses=("recommended",),
             limit=recommended_limit,
+            search=search,
+            genre=genre,
             identity_context=identity_context,
         )
         result.extend(
@@ -2143,14 +2348,18 @@ def recommendation_list(
                 connection,
                 statuses=("saved", "imported", "new"),
                 limit=None,
+                search=search,
+                genre=genre,
                 identity_context=identity_context,
-                include_imported=include_imported,
+                include_imported=effective_include_imported,
             )
         )
     else:
         statuses = (
             ("rejected", "maybe_later")
             if status == "decisions"
+            else ("saved", "imported")
+            if status == "saved" and effective_include_imported
             else None if not status or status == "all" else (status,)
         )
         result = _recommendation_rows(
@@ -2158,12 +2367,14 @@ def recommendation_list(
             statuses=statuses,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             identity_context=identity_context,
-            include_imported=include_imported,
+            include_imported=effective_include_imported,
         )
     for item in result:
-        item["genres"] = json.loads(item["genres"] or "[]")
-        item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = _parse_json_list(item.get("genres"))
+        item["explanation"] = _parse_json_list(item.get("explanation"))
     if format_urls:
         _format_recommendation_urls(result)
     return result
@@ -2171,14 +2382,19 @@ def recommendation_list(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=100),
-    offset: int = Query(default=0, ge=0, le=1_000_000),
+    status: Annotated[Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    genre: Annotated[str | None, Query(max_length=100)] = None,
 ):
     values, run_id = tracked_recommendations(
         status=status,
         limit=limit,
         offset=offset,
+        search=search,
+        genre=genre,
+        include_imported=status in {"saved", "imported", "all"},
     )
     for item in values:
         item["recommendation_run_id"] = run_id
@@ -2314,76 +2530,89 @@ def feedback(candidate_id: int, payload: FeedbackIn):
         "id": candidate_id,
         "status": status,
     }
-    if payload.action in {"save", "reject", "maybe_later"}:
+    if (
+        payload.action in {"save", "reject", "maybe_later", "restore"}
+        and previous_status
+        and previous_status != "read"
+    ):
         result["decision_id"] = int(feedback_id)
     return result
+
+
+def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
+    decision = con.execute(
+        "SELECT id,action,previous_status,undone_at FROM feedback "
+        "WHERE id=? AND candidate_id=?",
+        (decision_id, candidate_id),
+    ).fetchone()
+    if (
+        not decision
+        or not decision["previous_status"]
+        or decision["previous_status"] == "read"
+    ):
+        raise HTTPException(404, "Undo is no longer available")
+    if decision["undone_at"]:
+        raise HTTPException(409, "This decision has already been undone")
+    if decision["action"] not in {"save", "reject", "maybe_later", "restore"}:
+        raise HTTPException(404, "Undo is no longer available")
+    latest = con.execute(
+        "SELECT id FROM feedback WHERE candidate_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (candidate_id,),
+    ).fetchone()
+    if not latest or int(latest["id"]) != decision_id:
+        raise HTTPException(409, "Only the latest decision can be undone")
+    current = con.execute(
+        "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+    ).fetchone()
+    if not current:
+        raise HTTPException(404, "Recommendation not found")
+    expected_status = {
+        "save": "saved",
+        "reject": "rejected",
+        "maybe_later": "maybe_later",
+        "restore": "recommended",
+    }[decision["action"]]
+    if current["status"] != expected_status:
+        raise HTTPException(409, "The recommendation changed after this decision")
+    previous_status = str(decision["previous_status"])
+    con.execute(
+        "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (previous_status, candidate_id),
+    )
+    con.execute(
+        "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
+        (decision_id,),
+    )
+    con.execute(
+        "DELETE FROM recommendation_outcomes WHERE event_id=("
+        "SELECT id FROM recommendation_events WHERE event_key=?)",
+        (f"feedback:{decision_id}",),
+    )
+    compensation = (
+        "librarr_import" if previous_status == "imported"
+        else "save" if previous_status == "saved"
+        else "reject" if previous_status == "rejected"
+        else "maybe_later" if previous_status == "maybe_later"
+        else "restore"
+    )
+    try:
+        record_event_in_connection(
+            con,
+            event_key=f"undo-feedback:{decision_id}",
+            candidate_id=candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": candidate_id, "status": previous_status}
 
 
 @app.post("/api/recommendations/{candidate_id}/undo")
 def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
     with transaction() as con:
-        decision = con.execute(
-            "SELECT id,action,previous_status,undone_at FROM feedback "
-            "WHERE id=? AND candidate_id=?",
-            (payload.decision_id, candidate_id),
-        ).fetchone()
-        if not decision or not decision["previous_status"]:
-            raise HTTPException(404, "Undo is no longer available")
-        if decision["undone_at"]:
-            raise HTTPException(409, "This decision has already been undone")
-        if decision["action"] not in {"save", "reject", "maybe_later"}:
-            raise HTTPException(404, "Undo is no longer available")
-        latest = con.execute(
-            "SELECT id FROM feedback WHERE candidate_id=? "
-            "ORDER BY id DESC LIMIT 1",
-            (candidate_id,),
-        ).fetchone()
-        if not latest or int(latest["id"]) != payload.decision_id:
-            raise HTTPException(409, "Only the latest decision can be undone")
-        current = con.execute(
-            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
-        ).fetchone()
-        if not current:
-            raise HTTPException(404, "Recommendation not found")
-        expected_status = {
-            "save": "saved",
-            "reject": "rejected",
-            "maybe_later": "maybe_later",
-            "restore": "recommended",
-        }[decision["action"]]
-        if current["status"] != expected_status:
-            raise HTTPException(409, "The recommendation changed after this decision")
-        previous_status = str(decision["previous_status"])
-        con.execute(
-            "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (previous_status, candidate_id),
-        )
-        con.execute(
-            "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
-            (payload.decision_id,),
-        )
-        con.execute(
-            "DELETE FROM recommendation_outcomes WHERE event_id=("
-            "SELECT id FROM recommendation_events WHERE event_key=?)",
-            (f"feedback:{payload.decision_id}",),
-        )
-        compensation = (
-            "save" if previous_status in {"saved", "imported"}
-            else "reject" if previous_status == "rejected"
-            else "maybe_later" if previous_status == "maybe_later"
-            else "restore"
-        )
-        try:
-            record_event_in_connection(
-                con,
-                event_key=f"undo-feedback:{payload.decision_id}",
-                candidate_id=candidate_id,
-                event_type=compensation,
-                source="ui_undo",
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    return {"id": candidate_id, "status": previous_status}
+        return _undo_feedback_in_connection(con, candidate_id, payload.decision_id)
 
 
 @app.post("/api/recommendations/{candidate_id}/read")
@@ -2434,17 +2663,23 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
 def bulk_feedback(payload: BulkFeedbackIn):
     status = {"save": "saved", "reject": "rejected", "restore": "recommended"}[payload.action]
     ids = list(dict.fromkeys(payload.ids))
+    decisions = []
     with transaction() as con:
         placeholders = ",".join("?" for _ in ids)
         found = {
-            int(item["id"])
-            for item in con.execute(f"SELECT id FROM candidates WHERE id IN ({placeholders})", ids).fetchall()
+            int(item["id"]): str(item["status"])
+            for item in con.execute(
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+            ).fetchall()
         }
-        for candidate_id in found:
+        for candidate_id in ids:
+            if candidate_id not in found:
+                continue
+            previous_status = found[candidate_id]
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
             feedback_id = con.execute(
-                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                (candidate_id, payload.action),
+                "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
+                (candidate_id, payload.action, previous_status),
             ).lastrowid
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
@@ -2461,7 +2696,29 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-    return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
+            if (
+                payload.action in {"save", "reject", "restore"}
+                and previous_status
+                and previous_status != "read"
+            ):
+                decisions.append({"id": candidate_id, "decision_id": int(feedback_id)})
+    return {
+        "updated": len(found),
+        "skipped": len(ids) - len(found),
+        "status": status,
+        "ids": sorted(found),
+        "decisions": decisions,
+    }
+
+
+@app.post("/api/recommendations/bulk-undo")
+def bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    items = list(dict.fromkeys((item.id, item.decision_id) for item in payload.decisions))
+    restored = []
+    with transaction() as con:
+        for candidate_id, decision_id in items:
+            restored.append(_undo_feedback_in_connection(con, candidate_id, decision_id))
+    return {"undone": len(restored), "items": restored}
 
 
 def telemetry_events(payload: TelemetryBatchIn):
@@ -2486,13 +2743,56 @@ def telemetry_events(payload: TelemetryBatchIn):
 def post_telemetry_events(payload: TelemetryBatchIn):
     return telemetry_events(payload)
 
+class LibrarrImportIn(BaseModel):
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+def _record_librarr_import_in_connection(con, candidate_id: int, *, run_id: str | None = None):
+    next_seq = int(
+        con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM recommendation_events").fetchone()[0]
+    )
+    return record_event_in_connection(
+        con,
+        event_key=f"librarr-import:{int(candidate_id)}:{next_seq:08d}",
+        candidate_id=int(candidate_id),
+        event_type="librarr_import",
+        run_id=run_id,
+        source="librarr",
+        label=1.0,
+        label_kind="librarr_import",
+        confidence=0.7,
+    )
+
+
 @app.post("/api/recommendations/{candidate_id}/import")
-async def import_librarr(candidate_id: int):
-    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
-    if not candidate: raise HTTPException(404, "Recommendation not found")
+async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    run_id = payload.run_id if payload else None
+    with connect() as con:
+        candidate_row = con.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "Recommendation not found")
+        candidate = dict(candidate_row)
+        try:
+            validate_candidate_run_id(con, candidate_id, run_id)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     key = hashlib.sha256(f"{candidate_id}:{candidate['normalized_key']}".encode()).hexdigest()
     existing = row("SELECT * FROM librarr_imports WHERE idempotency_key=? AND status='complete'", (key,))
-    if existing: return {"id":candidate_id,"status":"imported","remote_id":existing["remote_id"],"duplicate":True}
+    if existing:
+        if candidate["status"] not in {"saved", "imported", "read"}:
+            raise HTTPException(409, "Shortlist this book before importing it")
+        with transaction() as con:
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else str(candidate["status"])
+            if current_status != "read":
+                if current_status != "imported":
+                    con.execute(
+                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                        (candidate_id,),
+                    )
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": existing["remote_id"], "duplicate": True}
     if candidate["status"] != "saved": raise HTTPException(409, "Shortlist this book before importing it")
     config = private_settings()
     if not config.get("librarr_url") or not config.get("librarr_api_key"): raise HTTPException(409, "Connect Librarr first")
@@ -2510,10 +2810,16 @@ async def import_librarr(candidate_id: int):
             response.raise_for_status()
             try: data = response.json()
             except ValueError: data = {}
+        remote_id = str(data.get("id", "imported"))
         with transaction() as con:
-            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
-            con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
-        return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
+            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else "imported"
+            if current_status != "read":
+                con.execute("UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'", (candidate_id,))
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": remote_id}
     except (httpx.HTTPError, ValueError) as exc:
         message = safe_error_message(exc, limit=1000)
         with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(message,key))
@@ -2575,50 +2881,44 @@ class LibrarrDownloadIn(BaseModel):
     media_type: str = "audiobook"
     result: dict[str, Any]
     candidate_id: int | None = Field(default=None, gt=0)
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 @app.post("/api/librarr/download")
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
-        candidate = row("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)) if payload.candidate_id else None
-        if payload.candidate_id and not candidate:
-            raise HTTPException(404, "Recommendation not found")
+        with connect() as con:
+            candidate_row = (
+                con.execute("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)).fetchone()
+                if payload.candidate_id
+                else None
+            )
+            if payload.candidate_id and not candidate_row:
+                raise HTTPException(404, "Recommendation not found")
+            candidate = dict(candidate_row) if candidate_row else None
+            validate_candidate_run_id(con, int(candidate["id"]) if candidate else None, payload.run_id)
         encoded = json.dumps(payload.result, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{media}:{encoded}".encode()).hexdigest()
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         result = await librarr_download(config, payload.result, media, key)
         response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
         if candidate:
-            status = candidate["status"]
-            if status == "saved":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
+            with transaction() as con:
+                current = con.execute(
+                    "SELECT status FROM candidates WHERE id=?", (candidate["id"],)
+                ).fetchone()
+                status = str(current["status"]) if current else str(candidate["status"])
+                if status != "read":
+                    if status != "imported":
+                        con.execute(
+                            "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                            (candidate["id"],),
+                        )
+                    status = "imported"
+                    _record_librarr_import_in_connection(
+                        con, int(candidate["id"]), run_id=payload.run_id
                     )
-                status = "imported"
-            elif status != "imported":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
-                    )
-                    feedback_id = con.execute(
-                        "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                        (candidate["id"], "save"),
-                    ).lastrowid
-                    record_event_in_connection(
-                        con,
-                        event_key=f"feedback:{feedback_id}",
-                        candidate_id=int(candidate["id"]),
-                        event_type="save",
-                        source="librarr",
-                        label=1.0,
-                        label_kind="explicit_feedback",
-                        confidence=0.9,
-                    )
-                status = "saved"
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
     except ValueError as exc:
@@ -2626,16 +2926,29 @@ async def download_librarr(payload: LibrarrDownloadIn):
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
-@app.post("/api/import/goodreads/csv")
-async def goodreads_csv(file: UploadFile = File(...)):
+async def _import_csv_upload(file: UploadFile):
     content = bytearray()
     while chunk := await file.read(1024 * 1024):
         content.extend(chunk)
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
-    try: count = import_goodreads_csv(bytes(content))
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
+    try: result = import_csv(bytes(content))
+    except ValueError as exc: raise HTTPException(400, safe_error_message(exc))
     enqueue_job("read_work_identities", dedupe=True)
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+    return {
+        "imported": result["imported"],
+        "source": result["source"],
+        "job_id": enqueue_job("score", dedupe=True),
+    }
+
+
+@app.post("/api/import/csv")
+async def reading_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
+
+
+@app.post("/api/import/goodreads/csv")
+async def goodreads_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
 
 
 async def _sync_goodreads_rss(url: str):
@@ -2734,25 +3047,49 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
+def _toggle_source_row(con, source_id: int, source) -> bool:
+    became_enabled = not source["enabled"]
+    con.execute(
+        "UPDATE sources SET enabled=1-enabled, "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
+        "last_attempted_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_attempted_at END "
+        "WHERE id=?",
+        (source_id,),
+    )
+    if not became_enabled:
+        con.execute(
+            "UPDATE candidates SET status='new', score=0, explanation='[]', "
+            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE source_id=? AND status='recommended'",
+            (source_id,),
+        )
+    return became_enabled
+
+
+@app.put("/api/sources/default/toggle")
+def toggle_default_source():
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Default source not found.")
+        source_id = source["id"]
+        became_enabled = _toggle_source_row(con, source_id, source)
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if became_enabled and source["kind"] not in {"builtin", "association"}
+        else None
+    )
+    return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
+
+
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = not source["enabled"]
-        con.execute(
-            "UPDATE sources SET enabled=1-enabled, "
-            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
-            "WHERE id=?",
-            (source_id,),
-        )
-        if not became_enabled:
-            con.execute(
-                "UPDATE candidates SET status='new', score=0, explanation='[]', "
-                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE source_id=? AND status='recommended'",
-                (source_id,),
-            )
+        became_enabled = _toggle_source_row(con, source_id, source)
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}
@@ -2792,16 +3129,116 @@ def update_nyt_settings(payload: NYTApiKeyIn):
     return {"saved": True, "api_key_set": bool(api_key)}
 
 
+def _one_time_source_completed(source) -> bool:
+    return bool(
+        source["last_scanned_at"]
+        or (
+            source["last_attempted_at"]
+            and str(source["last_status"] or "") in {"empty:0", "filtered:0"}
+        )
+    )
+
+
+def _clear_google_books_metadata_lockouts(con) -> bool:
+    con.execute(
+        """UPDATE candidate_quality
+        SET metadata_checked_at=NULL,
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE metadata_checked_at IS NOT NULL
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    )
+    requeued = con.execute(
+        """UPDATE candidate_quality
+        SET quality_status='pending',
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE quality_status='quarantine'
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND (
+            flags_json LIKE '%catalog_provider_unavailable%'
+            OR flags_json LIKE '%catalog_provider_rate_limited%'
+          )
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    ).rowcount
+    con.execute(
+        """UPDATE read_metadata
+        SET metadata_checked_at=NULL
+        WHERE metadata_checked_at IS NOT NULL
+          AND (
+            description=''
+            OR cover_url='' OR cover_url LIKE '%/b/isbn/%'
+            OR cover_url LIKE 'https://placehold.co/%'
+            OR release_date=''
+            OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.last_attempt.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.last_attempt.fetch_trace')
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.fetch_trace')
+                ELSE '[]'
+              END
+            )
+            WHERE json_extract(value, '$.provider')='google_books'
+              AND (
+                json_extract(value, '$.status') IN (
+                  'credential_error',
+                  'rate_limited',
+                  'server_error',
+                  'request_error',
+                  'timeout',
+                  'provider_unavailable'
+                )
+                OR json_extract(value, '$.http_status') IN (400, 401, 403, 408, 429)
+                OR (
+                  json_type(value, '$.http_status')='integer'
+                  AND json_extract(value, '$.http_status')>=500
+                )
+              )
+          )"""
+    )
+    return bool(requeued)
+
+
+def _queue_google_books_metadata_recovery(*, requeued_quality: bool) -> dict[str, int | None]:
+    job_ids = {
+        "metadata": enqueue_job("metadata", dedupe=True),
+        "read_metadata": enqueue_job("read_metadata", dedupe=True),
+    }
+    if requeued_quality:
+        _enqueue_candidate_quality_followup()
+    return job_ids
+
+
 @app.put("/api/settings/google-books")
-def update_google_books_settings(payload: GoogleBooksKeyIn):
+async def update_google_books_settings(payload: GoogleBooksKeyIn):
     current = private_settings().get("association_google_books_api_key", "")
+    submitted_new_key = False
+    validation: dict[str, str] | None = None
     if payload.clear:
         api_key = ""
     elif payload.api_key is None or not payload.api_key.strip():
         api_key = current
     else:
         api_key = payload.api_key.strip()
+        submitted_new_key = True
+        try:
+            validation = await validate_google_books_api_key(api_key)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     stored = seal(api_key) if api_key else ""
+    requeued_quality = False
     with transaction() as con:
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1) "
@@ -2809,7 +3246,30 @@ def update_google_books_settings(payload: GoogleBooksKeyIn):
             "updated_at=CURRENT_TIMESTAMP",
             (stored,),
         )
-    return {"saved": True, "google_books_api_key_set": bool(api_key)}
+        if submitted_new_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    job_ids = (
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+        if submitted_new_key
+        else {}
+    )
+    return {
+        "saved": True,
+        "google_books_api_key_set": bool(api_key),
+        **({"job_ids": job_ids} if job_ids else {}),
+        **(
+            {
+                "validation_status": validation["status"],
+                **(
+                    {"validation_warning": validation["warning"]}
+                    if validation.get("warning")
+                    else {}
+                ),
+            }
+            if validation
+            else {}
+        ),
+    }
 
 
 @app.get("/api/settings/llm-rerank")
@@ -2940,43 +3400,79 @@ async def llm_models_catalog():
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
+    next_url: str | None = None
+    if payload.url is not None:
+        next_url = str(payload.url)
+        _reject_inline_nyt_key(next_url)
+        try:
+            validate_public_url(next_url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     updates = []
     values = []
-    if payload.filters is not None:
-        updates.append("filters=?")
-        values.append(json.dumps(payload.filters.model_dump()))
-    if payload.lifecycle is not None:
-        updates.append("lifecycle=?")
-        values.append(payload.lifecycle)
     with transaction() as con:
         source = con.execute(
-            "SELECT enabled,kind,lifecycle,filters FROM sources WHERE id=?",
+            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+            "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
-        if not source: raise HTTPException(404, "Source not found")
-        if payload.filters is not None and source["kind"] == "builtin":
-            raise HTTPException(400, "The built-in source cannot be filtered")
-        if payload.lifecycle is not None and source["kind"] in {"builtin", "association"}:
-            raise HTTPException(400, "This source lifecycle cannot be changed")
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if next_url is not None:
+            if source["is_default"] or source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source URL cannot be changed")
+            updates.append("url=?")
+            values.append(next_url)
+        if payload.filters is not None:
+            if source["kind"] == "builtin":
+                raise HTTPException(400, "The built-in source cannot be filtered")
+            updates.append("filters=?")
+            values.append(json.dumps(payload.filters.model_dump()))
+        if payload.lifecycle is not None:
+            if source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source lifecycle cannot be changed")
+            updates.append("lifecycle=?")
+            values.append(payload.lifecycle)
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        if effective_lifecycle == "one_time" and (
+            next_url is not None or payload.filters is not None
+        ):
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_attempted_at=NULL")
         if updates:
-            values.append(source_id)
-            con.execute(
-                f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
-            )
+            try:
+                con.execute(
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?",
+                    (*values, source_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "Source already exists") from exc
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
         else normalize_source_filters(source["filters"])
     )
+    should_queue = bool(
+        updates
+        and source["enabled"]
+        and source["kind"] not in {"builtin", "association"}
+        and not (
+            effective_lifecycle == "one_time"
+            and next_url is None
+            and payload.filters is None
+            and _one_time_source_completed(source)
+        )
+    )
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
-        if updates and source["enabled"] and source["kind"] != "association"
+        if should_queue
         else None
     )
     return {
         "id": source_id,
+        "url": next_url or source["url"],
         "filters": filters,
-        "lifecycle": payload.lifecycle or source["lifecycle"],
+        "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
 
@@ -2986,9 +3482,20 @@ def _save_digest_settings(updates: dict):
     existing = digest_config(current)
     merged = {**existing, **updates}
     try:
-        validate_digest_config(merged)
+        validate_digest_config(merged, previous=existing)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
+    next_app_url = str(merged["app_url"] or "").strip().rstrip("/")
+    prev_app_url = str(existing["app_url"] or "").strip().rstrip("/")
+    default_public_url = str(settings.public_url or "").strip().rstrip("/")
+    if "digest_app_url_custom" in current:
+        prev_custom = str(current["digest_app_url_custom"]) == "1"
+    else:
+        prev_custom = bool(prev_app_url and prev_app_url not in DEFAULT_DIGEST_APP_URLS)
+    if "app_url" in updates and next_app_url != prev_app_url:
+        app_url_custom = next_app_url != default_public_url
+    else:
+        app_url_custom = prev_custom
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -2998,7 +3505,8 @@ def _save_digest_settings(updates: dict):
         "digest_minimum_score": str(merged["minimum_score"]),
         "digest_maximum_books": str(merged["maximum_books"]),
         "digest_only_new": "1" if merged["only_new"] else "0",
-        "digest_app_url": merged["app_url"],
+        "digest_app_url": next_app_url,
+        "digest_app_url_custom": "1" if app_url_custom else "0",
         "digest_discord_webhook_url": merged["discord_webhook_url"],
         "digest_email_to": merged["email_to"],
         "digest_email_from": merged["email_from"],
@@ -3040,37 +3548,76 @@ def preview_digest():
 
 @app.get("/api/digest/review")
 def digest_review(period: str = Query(min_length=8, max_length=8)):
-    """Return the candidate IDs that were included in a digest period.
+    """Return the candidate IDs and unread book cards for a digest period.
 
     The public review link carries only an ISO week key. Candidate metadata
-    remains behind the normal overview/auth boundary; this endpoint exposes
-    only IDs so the web layer can render the same cards without copying book
+    remains behind the normal overview/auth boundary; this authenticated
+    endpoint hydrates unread period picks on the server without copying book
     data into a notification URL.
     """
 
     if len(period) != 8 or period[4] != "-" or period[5] != "W" or not period[0:4].isdigit() or not period[6:8].isdigit():
         raise HTTPException(400, "Invalid digest period")
     ids: list[int] = []
-    deliveries = rows(
-        "SELECT candidate_ids FROM notification_deliveries WHERE period_key=? ORDER BY created_at DESC",
-        (period,),
-    )
-    for delivery in deliveries:
-        try:
-            values = json.loads(delivery["candidate_ids"] or "[]")
-        except (TypeError, json.JSONDecodeError):
-            values = []
-        for value in values:
+    with connect() as connection:
+        deliveries = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT candidate_ids FROM notification_deliveries WHERE period_key=? ORDER BY created_at DESC",
+                (period,),
+            ).fetchall()
+        ]
+        for delivery in deliveries:
             try:
-                candidate_id = int(value)
-            except (TypeError, ValueError):
-                continue
-            if candidate_id not in ids:
-                ids.append(candidate_id)
-    # ``found`` lets the web app distinguish a valid digest with zero books
-    # from a stale link whose delivery history has been pruned or never
-    # existed. Stale links should return readers to the normal Discover feed.
-    return {"period": period, "ids": ids, "found": bool(deliveries)}
+                values = json.loads(delivery["candidate_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                values = []
+            for value in values:
+                try:
+                    candidate_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if candidate_id not in ids:
+                    ids.append(candidate_id)
+        if not deliveries:
+            # ``found`` lets the web app distinguish a valid digest with zero
+            # books from a stale link whose delivery history has been pruned or
+            # never existed.
+            return {"period": period, "ids": [], "found": False}
+        items: list[dict[str, Any]] = []
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            candidate_rows = {
+                int(item["id"]): dict(item)
+                for item in connection.execute(
+                    "SELECT c.*,s.name source_name,q.metadata_confidence,"
+                    "q.work_id quality_work_id,"
+                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.isbn10 quality_isbn10 "
+                    "FROM candidates c "
+                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                    f"WHERE c.id IN ({placeholders}) "
+                    "AND c.status='recommended' "
+                    "AND q.quality_status='accepted' "
+                    "AND COALESCE(s.enabled,1)=1",
+                    ids,
+                ).fetchall()
+            }
+            read_identity_index, shortlisted_keys = _recommendation_identity_context(
+                connection
+            )
+            seen_keys = set()
+            for candidate_id in ids:
+                candidate = candidate_rows.get(candidate_id)
+                if not candidate:
+                    continue
+                keys = book_row_identity_match_keys(candidate)
+                if read_identity_index.matches(candidate) or keys & shortlisted_keys or keys & seen_keys:
+                    continue
+                seen_keys.update(keys)
+                items.append(_format_recommendation_item(candidate))
+    return {"period": period, "ids": ids, "found": True, "items": items}
 
 
 @app.get("/api/digest/deliveries")
@@ -3140,8 +3687,12 @@ def association_settings():
 
 
 @app.put("/api/associations/settings")
-def update_association_settings(payload: AssociationSettingsIn):
+async def update_association_settings(payload: AssociationSettingsIn):
     current = private_settings()
+    submitted_new_google_key = bool(
+        payload.google_books_api_key is not None
+        and payload.google_books_api_key.strip()
+    )
     values = {
         "association_openlibrary_enabled": "1" if payload.openlibrary_enabled else "0",
         "association_openlibrary_contact": payload.openlibrary_contact.strip(),
@@ -3159,6 +3710,15 @@ def update_association_settings(payload: AssociationSettingsIn):
     }
     if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
         raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    google_validation: dict[str, str] | None = None
+    if submitted_new_google_key:
+        try:
+            google_validation = await validate_google_books_api_key(
+                values["association_google_books_api_key"]
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+    requeued_quality = False
     with transaction() as con:
         for key, value in values.items():
             secret = key.endswith("api_key")
@@ -3168,7 +3728,19 @@ def update_association_settings(payload: AssociationSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    return {"saved": True, "associations": safe_association_settings()}
+        if submitted_new_google_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    if submitted_new_google_key:
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+    return {
+        "saved": True,
+        "associations": safe_association_settings(),
+        **(
+            {"google_books_validation_warning": google_validation["warning"]}
+            if google_validation and google_validation.get("warning")
+            else {}
+        ),
+    }
 
 
 def _association_provider_name(value: str) -> str:
@@ -3373,24 +3945,51 @@ def revoke_api_token(token_id: int):
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
-    try: payload.validate_values()
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings()
-    current_values = {
-        "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
-        "embedding_model": current.get("embedding_model", settings.embedding_model),
-        "embedding_url": current.get("embedding_url", settings.embedding_url),
-        "embedding_api_key": current.get("embedding_api_key", settings.embedding_api_key),
-        "librarr_url": current.get("librarr_url", ""),
-        "librarr_api_key": current.get("librarr_api_key", ""),
-        "librarr_media_type": current.get("librarr_media_type", "audiobook"),
-    }
-    values = {**current_values, **payload.model_dump(exclude_unset=True)}
-    for key in ("embedding_api_key","librarr_api_key"):
-        if not values[key]: values[key] = current.get(key,"")
     embedding_fields = (
         "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"
     )
+    librarr_fields = (
+        "librarr_url", "librarr_api_key", "librarr_media_type"
+    )
+    updates = payload.model_dump(exclude_unset=True)
+    for key in ("embedding_api_key", "librarr_api_key"):
+        if key in updates:
+            updates[key] = updates[key].strip()
+
+    def _merge_settings(stored: dict) -> tuple[dict, dict]:
+        base = {
+            "embedding_backend": stored.get("embedding_backend", settings.embedding_backend),
+            "embedding_model": stored.get("embedding_model", settings.embedding_model),
+            "embedding_url": stored.get("embedding_url", settings.embedding_url),
+            "embedding_api_key": stored.get("embedding_api_key", settings.embedding_api_key),
+            "librarr_url": stored.get("librarr_url", ""),
+            "librarr_api_key": stored.get("librarr_api_key", ""),
+            "librarr_media_type": stored.get("librarr_media_type", "audiobook"),
+        }
+        merged = {**base, **updates}
+        for key in ("embedding_api_key", "librarr_api_key"):
+            if not merged[key]:
+                merged[key] = stored.get(key, "")
+        return base, merged
+
+    current = private_settings()
+    current_values, values = _merge_settings(current)
+    has_embedding_fields = any(key in payload.model_fields_set for key in embedding_fields)
+    has_librarr_fields = any(key in payload.model_fields_set for key in librarr_fields)
+    try:
+        EngineSettings(**values).validate_values(
+            validate_embedding=has_embedding_fields or not payload.model_fields_set,
+            validate_librarr=has_librarr_fields or not payload.model_fields_set,
+            check_librarr_host="librarr_url" in payload.model_fields_set,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc))
+    if (
+        "librarr_url" in payload.model_fields_set
+        and values["librarr_url"].strip()
+        and not values["librarr_api_key"].strip()
+    ):
+        raise HTTPException(400, "Enter a Librarr API key for the first connection.")
     embedding_changed = any(
         key in payload.model_fields_set and values[key] != current_values[key]
         for key in embedding_fields
@@ -3409,11 +4008,19 @@ async def update_settings(payload: EngineSettings):
                 400,
                 f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}",
             )
+        updates["embedding_model"] = test.model
         values["embedding_model"] = test.model
     else:
         health = {"ok": True, "checked": False, "model": values["embedding_model"]}
     with transaction() as con:
-        for key,value in values.items():
+        _, final_values = _merge_settings(private_settings(con))
+        if (
+            "librarr_url" in payload.model_fields_set
+            and final_values["librarr_url"].strip()
+            and not final_values["librarr_api_key"].strip()
+        ):
+            raise HTTPException(400, "Enter a Librarr API key for the first connection.")
+        for key, value in final_values.items():
             secret = key.endswith("api_key")
             stored = seal(value) if secret and value else value
             con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
@@ -3506,16 +4113,23 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=100),
-    offset: int = Query(default=0, ge=0, le=1_000_000),
+    status: Annotated[Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    genre: Annotated[str | None, Query(max_length=100)] = None,
 ):
-    return recommendations(response, status, limit, offset)
+    return recommendations(response, status, limit, offset, search=search, genre=genre)
 
 
 @api_v1.post("/recommendations/bulk-feedback")
 def api_bulk_feedback(payload: BulkFeedbackIn):
     return bulk_feedback(payload)
+
+
+@api_v1.post("/recommendations/bulk-undo")
+def api_bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    return bulk_undo_feedback(payload)
 
 
 @api_v1.post("/recommendations/{candidate_id}/feedback")
@@ -3534,8 +4148,8 @@ def api_telemetry_events(payload: TelemetryBatchIn):
 
 
 @api_v1.post("/recommendations/{candidate_id}/import")
-async def api_import_librarr(candidate_id: int):
-    return await import_librarr(candidate_id)
+async def api_import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    return await import_librarr(candidate_id, payload)
 
 
 @api_v1.get("/sources")
