@@ -11,12 +11,33 @@ describe('logout route', () => {
 
 	it('keeps the browser on the manual sign-in form when automatic OIDC is enabled', async () => {
 		engine.mockResolvedValue(undefined);
-		const cookies = { delete: vi.fn() };
+		const httpCookies = { delete: vi.fn() };
 
-		await expect(POST({ cookies } as never)).rejects.toMatchObject({
+		await expect(
+			POST({ cookies: httpCookies, url: new URL('http://127.0.0.1:3000/auth/logout') } as never)
+		).rejects.toMatchObject({
 			status: 303,
 			location: '/login?manual=1',
 		});
-		expect(cookies.delete).toHaveBeenCalledWith('bookward_session', { path: '/' });
+		expect(httpCookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/',
+		});
+
+		const httpsCookies = { delete: vi.fn() };
+		await expect(
+			POST({ cookies: httpsCookies, url: new URL('https://books.example.com/auth/logout') } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1',
+		});
+		expect(httpsCookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/',
+		});
 	});
 });

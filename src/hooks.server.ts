@@ -6,9 +6,12 @@ import {
 	engine,
 	isPayloadTooLarge
 } from '#lib/server/engine.js';
+import {
+	SESSION_COOKIE,
+	sessionCookieDeleteOptions,
+	sessionRefreshCookieOptions
+} from '#lib/server/cookies.js';
 import { requestFormData, withSessionToken } from '#lib/server/request-context.js';
-
-const SESSION_COOKIE = 'bookward_session';
 
 function jsonError(status: number, detail: string) {
 	return withSecurityHeaders(new Response(JSON.stringify({ detail, message: detail }), {
@@ -125,7 +128,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (path === '/login' && session) {
 		const user = await sessionUser(session);
 		if (user) throw redirect(303, '/');
-		event.cookies.delete(SESSION_COOKIE, { path: '/' });
+		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		return withSecurityHeaders(await resolve(event));
 	}
 
@@ -139,7 +142,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const user = await sessionUser(session);
 	if (!user) {
-		event.cookies.delete(SESSION_COOKIE, { path: '/' });
+		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		if (callback) return withSecurityHeaders(await resolve(event));
 		if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
 		throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
@@ -165,9 +168,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 	event.locals.user = user;
 	if (user.must_change_password && path !== '/account' && !path.startsWith('/auth/')) throw redirect(303, '/account?force_password_change=1');
-	event.cookies.set(SESSION_COOKIE, session, {
-		httpOnly: true, secure: event.url.protocol === 'https:', sameSite: 'lax', path: '/', maxAge: 24 * 60 * 60
-	});
+	event.cookies.set(SESSION_COOKIE, session, sessionRefreshCookieOptions(event.url));
 	const response = await withSessionToken(session, () => resolve(event));
 	response.headers.set('cache-control', 'private, no-store');
 	return withSecurityHeaders(response);
