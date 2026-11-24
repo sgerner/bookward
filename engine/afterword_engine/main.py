@@ -657,7 +657,15 @@ async def lifespan(app):
                 # A broken profile must not prevent the rest of the installation
                 # from serving. Its worker retries initialization with backoff.
                 LOGGER.exception("Could not initialize profile %s during startup", profile_id)
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
+    if not settings.enable_background_loops:
+        yield
+        return
+    stop = asyncio.Event()
+    worker = asyncio.create_task(worker_loop(handle_job, stop))
+    scheduler = asyncio.create_task(source_scheduler_loop(stop))
+    digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop))
+    goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop))
+    backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
@@ -670,8 +678,15 @@ async def lifespan(app):
                 enqueue_job("read_metadata", dedupe=True)
         except Exception:
             LOGGER.exception("Could not queue startup work for profile %s", profile_id)
-    yield
-    stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
+    try:
+        yield
+    finally:
+        stop.set()
+        await scheduler
+        await digest_scheduler
+        await goodreads_scheduler
+        await backup_scheduler
+        await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
@@ -1355,6 +1370,7 @@ def tracked_recommendations(
                 offset=0,
                 identity_context=identity_context,
                 include_imported=include_imported,
+                format_urls=False,
             )
             base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
@@ -1445,6 +1461,7 @@ def tracked_recommendations(
                 start = max(0, int(offset))
                 end = None if limit is None else start + max(0, int(limit))
                 recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
         except Exception:
             # Personalization must never take the recommendation service down.
             # On malformed legacy evidence, return the existing champion order.
@@ -1841,6 +1858,24 @@ def _recommendation_rows(
     return visible[offset:end]
 
 
+def _format_recommendation_urls(items):
+    for item in items:
+        source_url = item.get("source_url", "")
+        item["cover_url"] = fallback_cover_url(
+            item["title"],
+            item["author"],
+            item.get("cover_url", ""),
+            source_url,
+        )
+        item["source_url"] = canonical_book_source_url(
+            item["title"],
+            item["author"],
+            source_url,
+            item=item,
+        )
+    return items
+
+
 def recommendation_list(
     connection=None,
     *,
@@ -1850,6 +1885,7 @@ def recommendation_list(
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
+    format_urls: bool = True,
 ):
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
@@ -1884,20 +1920,10 @@ def recommendation_list(
             include_imported=include_imported,
         )
     for item in result:
-        item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
-        source_url = item.get("source_url", "")
-        parsed_source = urlparse(source_url)
-        if (
-            (parsed_source.hostname or "").casefold().rstrip(".")
-            in {"openlibrary.org", "www.openlibrary.org"}
-            and parsed_source.path.casefold().startswith("/people/")
-            and "/lists/" in parsed_source.path.casefold()
-        ):
-            work_url = book_openlibrary_work_id(item)
-            if work_url:
-                source_url = f"https://openlibrary.org{work_url}"
-        item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
-        item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = json.loads(item["genres"] or "[]")
+        item["explanation"] = json.loads(item["explanation"] or "[]")
+    if format_urls:
+        _format_recommendation_urls(result)
     return result
 
 @app.get("/api/recommendations")
