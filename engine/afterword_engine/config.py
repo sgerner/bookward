@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     source_max_bytes: int = 2_000_000
     source_max_items: int = 250
     source_sync_interval_hours: int = 24
+    enable_background_loops: bool = True
     # Contact address included in identified Open Library requests.  The
     # provider remains usable without one, but Open Library asks applications
     # making regular requests to identify themselves.
