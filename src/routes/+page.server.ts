@@ -397,16 +397,35 @@ export const actions: Actions = {
   },
   undoDecision: async ({ request }) => {
     const data = await request.formData();
-    const id = idSchema.safeParse(data.get("id"));
-    const decisionId = idSchema.safeParse(data.get("decision_id"));
-    if (!id.success || !decisionId.success)
+    const rawIds = data.getAll("id");
+    const rawDecisionIds = data.getAll("decision_id");
+    if (!rawIds.length || rawIds.length !== rawDecisionIds.length)
       return fail(400, { message: "This decision can no longer be undone." });
+    const seen = new Set<string>();
+    const decisions: Array<{ id: number; decision_id: number }> = [];
+    for (let index = 0; index < rawIds.length; index += 1) {
+      const id = idSchema.safeParse(rawIds[index]);
+      const decisionId = idSchema.safeParse(rawDecisionIds[index]);
+      if (!id.success || !decisionId.success)
+        return fail(400, { message: "This decision can no longer be undone." });
+      const key = `${id.data}:${decisionId.data}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      decisions.push({ id: id.data, decision_id: decisionId.data });
+    }
     try {
-      await engine(`/api/recommendations/${id.data}/undo`, {
+      if (decisions.length === 1) {
+        await engine(`/api/recommendations/${decisions[0].id}/undo`, {
+          method: "POST",
+          body: JSON.stringify({ decision_id: decisions[0].decision_id }),
+        });
+        return { message: "Decision undone." };
+      }
+      await engine("/api/recommendations/bulk-undo", {
         method: "POST",
-        body: JSON.stringify({ decision_id: decisionId.data }),
+        body: JSON.stringify({ decisions }),
       });
-      return { message: "Decision undone." };
+      return { message: "Decisions undone." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -975,7 +994,10 @@ export const actions: Actions = {
     const uniqueIds = [...new Set(ids)];
     if (!uniqueIds.length) return fail(400, { message: "Select at least one book first." });
     try {
-      const result = await engine<{ updated?: number }>(
+      const result = await engine<{
+        updated?: number;
+        decisions?: Array<{ id: number; decision_id: number }>;
+      }>(
         "/api/recommendations/bulk-feedback",
         {
           method: "POST",
@@ -986,7 +1008,24 @@ export const actions: Actions = {
           }),
         },
       );
-      return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
+      const count = result.updated ?? uniqueIds.length;
+      const undoDecisions = (result.decisions ?? []).filter(
+        (item) =>
+          idSchema.safeParse(item?.id).success &&
+          idSchema.safeParse(item?.decision_id).success,
+      );
+      return {
+        message: `${count} book${count === 1 ? "" : "s"} added to your shortlist.`,
+        ...(undoDecisions.length
+          ? {
+              undo_decisions: undoDecisions,
+              undo_label:
+                undoDecisions.length === 1
+                  ? "shortlisting this book"
+                  : `shortlisting ${undoDecisions.length} books`,
+            }
+          : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
