@@ -1352,6 +1352,16 @@ def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
         if failure_mode == "connect_error"
         else "rate_limited"
         if failure_mode == "http_429"
+        else "server_error"
+        if failure_mode == "http_503"
+        else "http_error"
+    )
+    # The audit path (quality.py) keeps the coarser ``http_error`` status for 5xx.
+    expected_audit_failure_status = (
+        "request_error"
+        if failure_mode == "connect_error"
+        else "rate_limited"
+        if failure_mode == "http_429"
         else "http_error"
     )
 
@@ -1412,7 +1422,7 @@ def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
     audit_traces = audit_result["metadata_provenance"]["fetch_trace"]
     assert [t["provider"] for t in audit_traces] == ["openlibrary", "google_books"]
     failed_audit_trace = next(t for t in audit_traces if t["provider"] == failing_provider)
-    assert failed_audit_trace["status"] == expected_failure_status
+    assert failed_audit_trace["status"] == expected_audit_failure_status
     if skipped_followup is not None:
         assert skipped_followup["quality_status"] == "accepted"
         assert skipped_followup["flags"] == []

@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -30,7 +30,7 @@ from .backups import (
     restore_backup,
 )
 from .embeddings import get_embedder
-from .covers import canonical_book_source_url, fallback_cover_url
+from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
 from .ingestion import (
     import_csv,
@@ -230,12 +230,13 @@ def source_sync_due_sources(now=None):
     )
     due = []
     for source in sources:
-        if not source["last_scanned_at"]:
+        attempt_at = source["last_attempted_at"] or source["last_scanned_at"]
+        if not attempt_at:
             due.append(source)
             continue
         try:
             last = datetime.fromisoformat(
-                str(source["last_scanned_at"]).replace(" ", "T").replace("Z", "+00:00")
+                str(attempt_at).replace(" ", "T").replace("Z", "+00:00")
             )
         except ValueError:
             due.append(source)
@@ -579,7 +580,7 @@ async def handle_job(kind: str):
             return {"skipped": "managed_by_association_provider", "source_id": source_id}
         if not source["enabled"]:
             return {"skipped": "disabled", "source_id": source_id}
-        if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
+        if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
@@ -587,9 +588,7 @@ async def handle_job(kind: str):
             message = safe_error_message(exc)
             with transaction() as con:
                 con.execute(
-                    "UPDATE sources SET last_status=?, "
-                    "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                    "WHERE id=?",
+                    "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                     (f"error:{message}", source_id),
                 )
             raise
@@ -613,7 +612,10 @@ async def handle_job(kind: str):
             sources = rows(
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
-                "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
+                "AND (lifecycle='permanent' OR ("
+                "lifecycle='one_time' AND last_scanned_at IS NULL "
+                "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
+                "))"
             )
         for source in sources:
             try:
@@ -622,9 +624,7 @@ async def handle_job(kind: str):
                 message = safe_error_message(exc)
                 with transaction() as con:
                     con.execute(
-                        "UPDATE sources SET last_status=?, "
-                        "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                        "WHERE id=?",
+                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                         (f"error:{message}", source["id"]),
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
@@ -1165,6 +1165,7 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
+    url: HttpUrl | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
 
@@ -1182,7 +1183,7 @@ class DigestSettingsIn(BaseModel):
     minimum_score: float = Field(default=80, ge=0, le=100)
     maximum_books: int = Field(default=5, ge=1, le=20)
     only_new: bool = True
-    app_url: str = "http://localhost:5173"
+    app_url: str | None = None
     # Optional secrets preserve the existing value when omitted and clear it
     # when explicitly sent as an empty string.
     discord_webhook_url: str | None = None
@@ -2773,7 +2774,8 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
     became_enabled = not source["enabled"]
     con.execute(
         "UPDATE sources SET enabled=1-enabled, "
-        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
+        "last_attempted_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_attempted_at END "
         "WHERE id=?",
         (source_id,),
     )
@@ -2850,16 +2852,116 @@ def update_nyt_settings(payload: NYTApiKeyIn):
     return {"saved": True, "api_key_set": bool(api_key)}
 
 
+def _one_time_source_completed(source) -> bool:
+    return bool(
+        source["last_scanned_at"]
+        or (
+            source["last_attempted_at"]
+            and str(source["last_status"] or "") in {"empty:0", "filtered:0"}
+        )
+    )
+
+
+def _clear_google_books_metadata_lockouts(con) -> bool:
+    con.execute(
+        """UPDATE candidate_quality
+        SET metadata_checked_at=NULL,
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE metadata_checked_at IS NOT NULL
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    )
+    requeued = con.execute(
+        """UPDATE candidate_quality
+        SET quality_status='pending',
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE quality_status='quarantine'
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND (
+            flags_json LIKE '%catalog_provider_unavailable%'
+            OR flags_json LIKE '%catalog_provider_rate_limited%'
+          )
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    ).rowcount
+    con.execute(
+        """UPDATE read_metadata
+        SET metadata_checked_at=NULL
+        WHERE metadata_checked_at IS NOT NULL
+          AND (
+            description=''
+            OR cover_url='' OR cover_url LIKE '%/b/isbn/%'
+            OR cover_url LIKE 'https://placehold.co/%'
+            OR release_date=''
+            OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.last_attempt.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.last_attempt.fetch_trace')
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.fetch_trace')
+                ELSE '[]'
+              END
+            )
+            WHERE json_extract(value, '$.provider')='google_books'
+              AND (
+                json_extract(value, '$.status') IN (
+                  'credential_error',
+                  'rate_limited',
+                  'server_error',
+                  'request_error',
+                  'timeout',
+                  'provider_unavailable'
+                )
+                OR json_extract(value, '$.http_status') IN (400, 401, 403, 408, 429)
+                OR (
+                  json_type(value, '$.http_status')='integer'
+                  AND json_extract(value, '$.http_status')>=500
+                )
+              )
+          )"""
+    )
+    return bool(requeued)
+
+
+def _queue_google_books_metadata_recovery(*, requeued_quality: bool) -> dict[str, int | None]:
+    job_ids = {
+        "metadata": enqueue_job("metadata", dedupe=True),
+        "read_metadata": enqueue_job("read_metadata", dedupe=True),
+    }
+    if requeued_quality:
+        _enqueue_candidate_quality_followup()
+    return job_ids
+
+
 @app.put("/api/settings/google-books")
-def update_google_books_settings(payload: GoogleBooksKeyIn):
+async def update_google_books_settings(payload: GoogleBooksKeyIn):
     current = private_settings().get("association_google_books_api_key", "")
+    submitted_new_key = False
+    validation: dict[str, str] | None = None
     if payload.clear:
         api_key = ""
     elif payload.api_key is None or not payload.api_key.strip():
         api_key = current
     else:
         api_key = payload.api_key.strip()
+        submitted_new_key = True
+        try:
+            validation = await validate_google_books_api_key(api_key)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     stored = seal(api_key) if api_key else ""
+    requeued_quality = False
     with transaction() as con:
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1) "
@@ -2867,7 +2969,30 @@ def update_google_books_settings(payload: GoogleBooksKeyIn):
             "updated_at=CURRENT_TIMESTAMP",
             (stored,),
         )
-    return {"saved": True, "google_books_api_key_set": bool(api_key)}
+        if submitted_new_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    job_ids = (
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+        if submitted_new_key
+        else {}
+    )
+    return {
+        "saved": True,
+        "google_books_api_key_set": bool(api_key),
+        **({"job_ids": job_ids} if job_ids else {}),
+        **(
+            {
+                "validation_status": validation["status"],
+                **(
+                    {"validation_warning": validation["warning"]}
+                    if validation.get("warning")
+                    else {}
+                ),
+            }
+            if validation
+            else {}
+        ),
+    }
 
 
 @app.get("/api/settings/llm-rerank")
@@ -2988,43 +3113,79 @@ async def llm_models_catalog():
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
+    next_url: str | None = None
+    if payload.url is not None:
+        next_url = str(payload.url)
+        _reject_inline_nyt_key(next_url)
+        try:
+            validate_public_url(next_url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     updates = []
     values = []
-    if payload.filters is not None:
-        updates.append("filters=?")
-        values.append(json.dumps(payload.filters.model_dump()))
-    if payload.lifecycle is not None:
-        updates.append("lifecycle=?")
-        values.append(payload.lifecycle)
     with transaction() as con:
         source = con.execute(
-            "SELECT enabled,kind,lifecycle,filters FROM sources WHERE id=?",
+            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+            "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
-        if not source: raise HTTPException(404, "Source not found")
-        if payload.filters is not None and source["kind"] == "builtin":
-            raise HTTPException(400, "The built-in source cannot be filtered")
-        if payload.lifecycle is not None and source["kind"] in {"builtin", "association"}:
-            raise HTTPException(400, "This source lifecycle cannot be changed")
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if next_url is not None:
+            if source["is_default"] or source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source URL cannot be changed")
+            updates.append("url=?")
+            values.append(next_url)
+        if payload.filters is not None:
+            if source["kind"] == "builtin":
+                raise HTTPException(400, "The built-in source cannot be filtered")
+            updates.append("filters=?")
+            values.append(json.dumps(payload.filters.model_dump()))
+        if payload.lifecycle is not None:
+            if source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source lifecycle cannot be changed")
+            updates.append("lifecycle=?")
+            values.append(payload.lifecycle)
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        if effective_lifecycle == "one_time" and (
+            next_url is not None or payload.filters is not None
+        ):
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_attempted_at=NULL")
         if updates:
-            values.append(source_id)
-            con.execute(
-                f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
-            )
+            try:
+                con.execute(
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?",
+                    (*values, source_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "Source already exists") from exc
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
         else normalize_source_filters(source["filters"])
     )
+    should_queue = bool(
+        updates
+        and source["enabled"]
+        and source["kind"] not in {"builtin", "association"}
+        and not (
+            effective_lifecycle == "one_time"
+            and next_url is None
+            and payload.filters is None
+            and _one_time_source_completed(source)
+        )
+    )
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
-        if updates and source["enabled"] and source["kind"] != "association"
+        if should_queue
         else None
     )
     return {
         "id": source_id,
+        "url": next_url or source["url"],
         "filters": filters,
-        "lifecycle": payload.lifecycle or source["lifecycle"],
+        "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
 
@@ -3034,9 +3195,20 @@ def _save_digest_settings(updates: dict):
     existing = digest_config(current)
     merged = {**existing, **updates}
     try:
-        validate_digest_config(merged)
+        validate_digest_config(merged, previous=existing)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
+    next_app_url = str(merged["app_url"] or "").strip().rstrip("/")
+    prev_app_url = str(existing["app_url"] or "").strip().rstrip("/")
+    default_public_url = str(settings.public_url or "").strip().rstrip("/")
+    if "digest_app_url_custom" in current:
+        prev_custom = str(current["digest_app_url_custom"]) == "1"
+    else:
+        prev_custom = bool(prev_app_url and prev_app_url not in DEFAULT_DIGEST_APP_URLS)
+    if "app_url" in updates and next_app_url != prev_app_url:
+        app_url_custom = next_app_url != default_public_url
+    else:
+        app_url_custom = prev_custom
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -3046,7 +3218,8 @@ def _save_digest_settings(updates: dict):
         "digest_minimum_score": str(merged["minimum_score"]),
         "digest_maximum_books": str(merged["maximum_books"]),
         "digest_only_new": "1" if merged["only_new"] else "0",
-        "digest_app_url": merged["app_url"],
+        "digest_app_url": next_app_url,
+        "digest_app_url_custom": "1" if app_url_custom else "0",
         "digest_discord_webhook_url": merged["discord_webhook_url"],
         "digest_email_to": merged["email_to"],
         "digest_email_from": merged["email_from"],
@@ -3227,8 +3400,12 @@ def association_settings():
 
 
 @app.put("/api/associations/settings")
-def update_association_settings(payload: AssociationSettingsIn):
+async def update_association_settings(payload: AssociationSettingsIn):
     current = private_settings()
+    submitted_new_google_key = bool(
+        payload.google_books_api_key is not None
+        and payload.google_books_api_key.strip()
+    )
     values = {
         "association_openlibrary_enabled": "1" if payload.openlibrary_enabled else "0",
         "association_openlibrary_contact": payload.openlibrary_contact.strip(),
@@ -3246,6 +3423,15 @@ def update_association_settings(payload: AssociationSettingsIn):
     }
     if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
         raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    google_validation: dict[str, str] | None = None
+    if submitted_new_google_key:
+        try:
+            google_validation = await validate_google_books_api_key(
+                values["association_google_books_api_key"]
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+    requeued_quality = False
     with transaction() as con:
         for key, value in values.items():
             secret = key.endswith("api_key")
@@ -3255,7 +3441,19 @@ def update_association_settings(payload: AssociationSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    return {"saved": True, "associations": safe_association_settings()}
+        if submitted_new_google_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    if submitted_new_google_key:
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+    return {
+        "saved": True,
+        "associations": safe_association_settings(),
+        **(
+            {"google_books_validation_warning": google_validation["warning"]}
+            if google_validation and google_validation.get("warning")
+            else {}
+        ),
+    }
 
 
 def _association_provider_name(value: str) -> str:
