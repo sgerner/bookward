@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "svelte/compiler";
+import { render } from "svelte/server";
+import ChipToggle from "./components/ChipToggle.svelte";
 
 type AstNode = {
   type?: string;
@@ -77,6 +79,7 @@ describe("mobile target sizes and modal bounds", () => {
     "../routes/account/+page.svelte",
     "../routes/admin/+page.svelte",
     "./components/ThemePicker.svelte",
+    "./components/ChipToggle.svelte",
   ];
 
   it("keeps buttons and links outside label elements for valid HTML5", () => {
@@ -122,15 +125,13 @@ describe("mobile target sizes and modal bounds", () => {
   it("enforces >=32px touch targets on genre chips, source links, source lifecycle actions, and filter summaries", () => {
     const { source, fragment } = readTemplate("../routes/+page.svelte");
 
-    const genreButtons = collectElements(fragment, "button").filter(({ element }) =>
-      getRawAttrSlice(source, element, "class").includes("badge"),
-    );
-    expect(genreButtons.length).toBeGreaterThan(0);
-    for (const { element } of genreButtons) {
-      const cls = getRawAttrSlice(source, element, "class");
-      expect(cls).toContain("min-h-8");
-      expect(cls).toContain("min-w-8");
-    }
+    expect(source).toContain("<ChipToggle");
+    const chipHtml = render(ChipToggle, {
+      props: { label: "Sci-Fi", ariaLabel: "Sci-Fi filter" },
+    }).body;
+    expect(chipHtml).toContain("min-h-8");
+    expect(chipHtml).toContain("min-w-8");
+    expect(chipHtml).toContain("px-2.5");
 
     const provenanceLinks = collectElements(fragment, "a").filter(({ element }) =>
       getRawAttrSlice(source, element, "aria-label").includes("Open source for"),
