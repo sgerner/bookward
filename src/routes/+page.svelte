@@ -38,12 +38,12 @@
     Upload,
     X,
   } from "@lucide/svelte";
+  import ChipToggle from "#lib/components/ChipToggle.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
-  import ChipToggle from "#lib/components/ChipToggle.svelte";
-  import RadioGroup from "#lib/components/RadioGroup.svelte";
-  import SwitchControl from "#lib/components/SwitchControl.svelte";
+  import StarRating from "#lib/components/StarRating.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
@@ -133,7 +133,6 @@
   let markReadDate = $state("");
   const todayIsoDate = new Date().toISOString().slice(0, 10);
   let readDateDrafts = $state<Record<number, string>>({});
-  let markReadRatingGroup = $state<{ focusFirst: () => void } | null>(null);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -3144,15 +3143,16 @@
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="id" value={item.id} />
                         {#each [1, 2, 3, 4, 5] as star (star)}
+                          {@const starActive = item.rating !== null && item.rating >= star}
                           <button
                             type="submit"
                             name="rating"
                             value={star}
-                            class={`grid size-8 place-items-center rounded-lg border text-sm transition ${item.rating !== null && item.rating >= star ? "border-amber-400/50 bg-amber-400/15 text-amber-500 dark:text-amber-300" : "border-surface-300-700/60 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/40 hover:text-amber-500"}`}
+                            class={`grid size-8 place-items-center rounded-lg border text-sm transition ${starActive ? "border-2 border-[var(--star-active-border)] bg-[var(--star-active-bg)] text-[var(--star-active-fg)]" : "border-[1.5px] border-[var(--star-idle-border)] bg-[var(--star-idle-bg)] text-[var(--star-idle-fg)] hover:border-[var(--star-active-border)] hover:text-[var(--star-active-fg)]"}`}
                             aria-label={`Rate ${item.title} ${star} ${star === 1 ? "star" : "stars"}`}
                             aria-pressed={item.rating === star}
                             disabled={isPending(`update-read-rating-${item.id}`)}
-                          ><span aria-hidden="true">★</span></button>
+                          ><span aria-hidden="true">{starActive ? "★" : "☆"}</span></button>
                         {/each}
                         {#if item.rating !== null && item.rating > 0}
                           <button
@@ -3396,18 +3396,14 @@
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
                       >
                         <ProfileField profileId={data.user?.profile_id} />
-                        <button
+                        <SwitchControl
                           type="submit"
-                          class={`relative h-7 w-12 rounded-full p-1 transition ${defaultSourceEnabled ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                          role="switch"
-                          aria-label="Toggle Bookward demo books"
-                          aria-checked={defaultSourceEnabled}
+                          tone="primary"
+                          checked={defaultSourceEnabled}
+                          ariaLabel="Toggle Bookward demo books"
                           disabled={isPending("toggle-default")}
-                          aria-busy={isPending("toggle-default")}
-                          ><span
-                            class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${defaultSourceEnabled ? "translate-x-5" : ""}`}
-                          ></span></button
-                        >
+                          busy={isPending("toggle-default")}
+                        />
                       </form>
                     </div>
                   {/if}
@@ -3637,18 +3633,14 @@
                               type="hidden"
                               name="id"
                               value={source.id}
-                            /><button
+                            /><SwitchControl
                               type="submit"
-                              class={`relative h-7 w-12 rounded-full p-1 transition ${sourceEnabled(source) ? "preset-filled-primary-500" : "preset-filled-surface-500"}`}
-                              role="switch"
-                              aria-label={`Toggle ${source.label}`}
-                              aria-checked={sourceEnabled(source)}
+                              tone="primary"
+                              checked={sourceEnabled(source)}
+                              ariaLabel={`Toggle ${source.label}`}
                               disabled={isPending(`toggle-source-${source.id}`)}
-                              aria-busy={isPending(`toggle-source-${source.id}`)}
-                              ><span
-                                class={`block size-5 rounded-full preset-filled-surface-50-950 shadow transition ${sourceEnabled(source) ? "translate-x-5" : ""}`}
-                              ></span></button
-                            >
+                              busy={isPending(`toggle-source-${source.id}`)}
+                            />
                           </form>
                         </div>{/each}
                     {:else}
@@ -4686,7 +4678,6 @@
                                 checked={digestEmail}
                                 ariaLabel="Send digest by email"
                                 activeClass="preset-filled-tertiary-500"
-                                focusClass="focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-tertiary-500"
                                 onToggle={(next) => (digestEmailOverride = next)}
                               />
                             </div>
@@ -4945,33 +4936,7 @@
                 <p id="mark-read-rating-label" class="text-sm font-semibold text-surface-950-50">How did it stay with you?</p>
                 <span class="text-xs text-surface-600-400">Optional</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-center gap-2">
-                <RadioGroup
-                  bind:this={markReadRatingGroup}
-                  items={[1, 2, 3, 4, 5]}
-                  value={markReadRating > 0 ? markReadRating : null}
-                  labelledBy="mark-read-rating-label"
-                  columns={1}
-                  selectOnMove
-                  clearable
-                  class="flex flex-wrap items-center gap-2"
-                  onSelect={(rating) => (markReadRating = rating)}
-                  onClear={() => (markReadRating = 0)}
-                >
-                  {#snippet item(rating, radio)}
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-label={`${rating} ${rating === 1 ? "star" : "stars"}`}
-                      aria-checked={radio.checked}
-                      tabindex={radio.tabIndex}
-                      class={`grid size-11 place-items-center rounded-xl border text-xl transition duration-200 hover:-translate-y-0.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${markReadRating >= rating ? "border-amber-400/50 bg-amber-400/15 text-amber-300 shadow-lg shadow-amber-950/20" : "border-surface-200-800/80 bg-surface-950/5 text-surface-600-400 hover:border-amber-400/30 hover:text-amber-300"}`}
-                      onclick={radio.select}
-                    ><span aria-hidden="true">★</span></button>
-                  {/snippet}
-                </RadioGroup>
-                {#if markReadRating > 0}<button type="button" class="btn btn-sm ml-1 min-h-10 preset-tonal-surface" onclick={() => { markReadRating = 0; markReadRatingGroup?.focusFirst(); }}>Clear rating</button>{/if}
-              </div>
+              <StarRating bind:value={markReadRating} labelledBy="mark-read-rating-label" />
             </div>
           </div>
 
@@ -5043,7 +5008,7 @@
             <label
               class="input flex min-h-12 min-w-0 flex-1 cursor-text items-center gap-2 py-0!"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch focus:outline-none focus:ring-0"
+                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"
