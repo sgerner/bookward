@@ -97,17 +97,17 @@ def free_port() -> int:
 
 
 def _launch_chromium(playwright):
-    launch_args = ["--no-sandbox"]
-    try:
-        return playwright.chromium.launch(headless=True, args=launch_args)
-    except PlaywrightError:
-        for candidate in ("google-chrome", "chromium", "chromium-browser"):
-            found = shutil.which(candidate)
-            if found:
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    for candidate in ("google-chrome", "chromium", "chromium-browser"):
+        found = shutil.which(candidate)
+        if found:
+            try:
                 return playwright.chromium.launch(
                     headless=True, executable_path=found, args=launch_args
                 )
-        raise
+            except PlaywrightError:
+                continue
+    return playwright.chromium.launch(headless=True, args=launch_args)
 
 
 AUDIT_JS = """
@@ -212,6 +212,7 @@ def main(argv: list[str] | None = None) -> None:
             AFTERWORD_BACKUP_DIR=f"{directory}/backups",
             AFTERWORD_BACKUP_INTERVAL_HOURS="24",
             AFTERWORD_AUTH_PASSWORD="",
+            AFTERWORD_ENABLE_BACKGROUND_LOOPS="false",
             AFTERWORD_SERVICE_SECRET="isolated-reflow-secret",
             AFTERWORD_SOURCE_SYNC_INTERVAL_HOURS="0",
             AFTERWORD_EMBEDDING_BACKEND="local",
