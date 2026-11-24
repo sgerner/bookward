@@ -13,9 +13,14 @@ import itertools
 import json
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 from scipy.stats import rankdata
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from evaluate_ranking import tail_metrics_at_k
 
 
 def sha(path):
@@ -44,16 +49,17 @@ def metrics(y, scores):
         raise ValueError("Metrics require a nonempty aligned finite score slice")
     high, low = y >= 4, y <= 2
     ha, la = auc(high, scores), auc(low, -scores)
-    k = min(20, len(y))
-    top = np.argsort(-scores, kind="stable")[:k]
-    bottom = np.argsort(scores, kind="stable")[:k]
+    top20_high_count, top20_high_precision = tail_metrics_at_k(scores, high, k=20, lowest=False)
+    bottom20_low_count, bottom20_low_precision = tail_metrics_at_k(scores, low, k=20, lowest=True)
     tails = high | low
     return {"n": len(y), "high_n": int(high.sum()), "low_n": int(low.sum()),
             "high_auc": ha, "low_auc": la,
             "balanced_auc": None if ha is None or la is None else (ha + la) / 2,
             "high_vs_low_auc": auc(high[tails], scores[tails]),
-            "top20_high_precision": float(high[top].mean()),
-            "bottom20_low_precision": float(low[bottom].mean())}
+            "high_rated_in_top_20": top20_high_count,
+            "low_rated_in_bottom_20": bottom20_low_count,
+            "top20_high_precision": top20_high_precision,
+            "bottom20_low_precision": bottom20_low_precision}
 
 
 def grouped_bootstrap(y, base, candidate, groups, repetitions=2000, seed=20261002):
@@ -252,16 +258,19 @@ def main():
     unseen = None
     if args.corpus:
         from evaluate_ranking import load_corpus, prepare
-        from afterword_engine.identity import book_identity
+        from afterword_engine.identity import book_author_identity_key
         corpus = load_corpus(args.corpus)
         records, _, _ = prepare(corpus, *manifest["backend_model"])
         first = {}
         earliest_by_id = {}
         for timestamp, item, _ in records:
-            key = book_identity("", item.get("author", ""))
+            key = book_author_identity_key(item.get("author", ""))
             day = timestamp.date().toordinal()
-            first.setdefault(key, day)
-            earliest_by_id[int(item["id"])] = first[key] >= day
+            if not key or key == "unknown author":
+                earliest_by_id[int(item["id"])] = True
+            else:
+                first.setdefault(key, day)
+                earliest_by_id[int(item["id"])] = first[key] >= day
         unseen = np.asarray([earliest_by_id[int(rid)] for rid in features["read_ids"]])
     final = report(features, scores, result["selected_arm"], unseen, args.repetitions)
     final["selection_sha256"] = sha(args.selection)
