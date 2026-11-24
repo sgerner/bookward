@@ -2,7 +2,9 @@ import asyncio
 import csv
 import hashlib
 import html
+import inspect
 import io
+import ipaddress
 import json
 import re
 import math
@@ -36,7 +38,13 @@ from .identity import (
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .read_dates import read_day
-from .security import redact_url, resolve_public_target, sanitize_pinned_error_message
+from .security import (
+    BLOCKED_HOSTS,
+    redact_url,
+    resolve_public_target,
+    sanitize_pinned_error_message,
+    validate_public_url,
+)
 from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
@@ -57,6 +65,18 @@ PENGUIN_RANDOM_HOUSE_HOSTS = frozenset(
     {"penguinrandomhouse.com", "www.penguinrandomhouse.com"}
 )
 SOURCE_MAX_REDIRECTS = 4
+SOURCE_MAX_DISCOVERED_FEEDS = 3
+SOURCE_MAX_DISCOVERED_CANDIDATES = 12
+FEED_AUTODISCOVERY_TYPES = frozenset(
+    {
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/rdf+xml",
+        "text/rss+xml",
+        "text/atom+xml",
+    }
+)
+COMMENT_FEED_RE = re.compile(r"(?:^|[\W_])comments?(?:$|[\W_\d])", re.I)
 SOURCE_FILTER_MAX_GENRES = 12
 SOURCE_FILTER_GENRE_MAX_LENGTH = 80
 READ_WORK_IDENTITY_BATCH_SIZE = 25
@@ -1904,7 +1924,9 @@ async def refresh_read_metadata(
         "remaining": read_metadata_refresh_remaining(),
     }
 
-async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False):
+async def _fetch_bytes_with_client(
+    client, url: str, allow_goodreads_http=False, *, return_url=False
+):
     current_url = str(url)
     for _ in range(SOURCE_MAX_REDIRECTS + 1):
         response = await _request_pinned(
@@ -1932,15 +1954,39 @@ async def _fetch_bytes_with_client(client, url: str, allow_goodreads_http=False)
             if size > settings.source_max_bytes:
                 raise ValueError("Source response is too large")
             chunks.append(chunk)
-        return b"".join(chunks), content_type
+        payload = b"".join(chunks)
+        if return_url:
+            return payload, content_type, current_url
+        return payload, content_type
     raise ValueError("Source returned too many redirects")
 
 
-async def fetch_bytes(url: str, allow_goodreads_http=False, client=None):
+async def fetch_bytes(url: str, allow_goodreads_http=False, client=None, *, return_url=False):
     if client is not None:
-        return await _fetch_bytes_with_client(client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            client, url, allow_goodreads_http, return_url=return_url
+        )
     async with _source_client() as owned_client:
-        return await _fetch_bytes_with_client(owned_client, url, allow_goodreads_http)
+        return await _fetch_bytes_with_client(
+            owned_client, url, allow_goodreads_http, return_url=return_url
+        )
+
+
+async def _call_fetch_bytes(url: str, *, client=None):
+    params = inspect.signature(fetch_bytes).parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    kwargs = {}
+    if client is not None and ("client" in params or accepts_kwargs):
+        kwargs["client"] = client
+    if "return_url" in params:
+        kwargs["return_url"] = True
+    result = await fetch_bytes(url, **kwargs)
+    if isinstance(result, tuple) and len(result) == 3:
+        return result
+    content, content_type = result
+    return content, content_type, str(url)
 
 
 def _goodreads_tooltip_params(resource_ids):
@@ -2058,23 +2104,57 @@ def _clean_parsed_subjects(items):
     ]
 
 
-async def _fetch_and_parse_source(url):
+async def _fetch_and_parse_source(url, *, include_resolved_url=False):
     request_url = _nyt_request_url(_apple_artwork_request_url(url))
     if _is_goodreads_blog_source(url):
         async with _source_client() as client:
-            content, content_type = await fetch_bytes(url, client=client)
+            content, content_type, _ = await _call_fetch_bytes(url, client=client)
             items = parse_book_items(content, content_type, url)
             items = await enrich_goodreads_blog_items(items, client)
-            return content_type, _clean_parsed_subjects(items)
+            cleaned = _clean_parsed_subjects(items)
+            return (content_type, cleaned, url) if include_resolved_url else (content_type, cleaned)
+    used_transformed_url = request_url != url
     try:
-        content, content_type = await fetch_bytes(request_url)
+        content, content_type, final_url = await _call_fetch_bytes(request_url)
     except (httpx.HTTPError, ValueError):
         if request_url == url:
             raise
-        content, content_type = await fetch_bytes(url)
-    return content_type, _clean_parsed_subjects(
-        parse_book_items(content, content_type, url)
-    )
+        used_transformed_url = False
+        content, content_type, final_url = await _call_fetch_bytes(url)
+    items = _clean_parsed_subjects(parse_book_items(content, content_type, url))
+    page_url = url if used_transformed_url else final_url
+    if not items and _should_discover_html_feeds(content, content_type, url):
+        candidates = discover_feed_urls(content, page_url, original_url=url)
+        if candidates:
+            fetched_feeds = 0
+            async with _source_client() as client:
+                for candidate_url in candidates[:SOURCE_MAX_DISCOVERED_CANDIDATES]:
+                    if fetched_feeds >= SOURCE_MAX_DISCOVERED_FEEDS:
+                        break
+                    try:
+                        validate_public_url(candidate_url)
+                    except ValueError:
+                        continue
+                    fetched_feeds += 1
+                    try:
+                        feed_content, feed_content_type, feed_final_url = await _call_fetch_bytes(
+                            candidate_url, client=client
+                        )
+                    except (httpx.HTTPError, ValueError):
+                        continue
+                    if not _is_feed_response(feed_content, feed_content_type):
+                        continue
+                    resolved_feed_url = _strip_url_fragment(feed_final_url) or candidate_url
+                    feed_items = _clean_parsed_subjects(
+                        parse_book_items(feed_content, feed_content_type, resolved_feed_url)
+                    )
+                    if feed_items:
+                        return (
+                            (feed_content_type, feed_items, resolved_feed_url)
+                            if include_resolved_url
+                            else (feed_content_type, feed_items)
+                        )
+    return (content_type, items, url) if include_resolved_url else (content_type, items)
 
 def validate_goodreads_rss_url(url: str) -> str:
     try:
@@ -2645,8 +2725,129 @@ def _parse_generic_html(soup, source_url):
             break
     return items[: settings.source_max_items]
 
+def _strip_url_fragment(url: str) -> str:
+    try:
+        return str(httpx.URL(str(url)).copy_with(fragment=None))
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+
+
+def _comparable_url_key(url: str) -> str:
+    try:
+        parsed = httpx.URL(str(url)).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    return str(parsed.copy_with(path=parsed.path or "/"))
+
+
+def _canonical_feed_candidate_url(raw_href: str, base_url: str) -> str:
+    href = str(raw_href or "").strip()
+    if not href:
+        return ""
+    try:
+        resolved = httpx.URL(str(base_url)).join(href).copy_with(fragment=None)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return ""
+    if resolved.scheme != "https" or not resolved.host or resolved.username or resolved.password:
+        return ""
+    # httpx reports the scheme default (443) as None; a page author must not be
+    # able to point discovery at an arbitrary port on a public host.
+    if resolved.port is not None:
+        return ""
+    host = resolved.host.lower().rstrip(".")
+    if host in BLOCKED_HOSTS or host.endswith(".local"):
+        return ""
+    if host == "api.nytimes.com" and any(
+        key.casefold() == "api-key" for key, _ in resolved.params.multi_items()
+    ):
+        return ""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        return ""
+    return str(resolved)
+
+
+def _is_feed_response(content: bytes, content_type: str) -> bool:
+    lowered_type = str(content_type or "").lower()
+    stripped = content.lstrip()
+    if stripped.startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:")):
+        return True
+    if "xhtml" in lowered_type:
+        return False
+    return any(kind in lowered_type for kind in ("xml", "rss", "atom"))
+
+
+def _should_discover_html_feeds(content: bytes, content_type: str, source_url: str) -> bool:
+    if (
+        _is_goodreads_blog_source(source_url)
+        or _source_matches(source_url, "goodreads.com", "/genres/")
+        or _source_matches(source_url, "www.goodreads.com", "/genres/")
+    ):
+        return False
+    lowered_type = str(content_type or "").lower()
+    if "html" not in lowered_type:
+        return False
+    return not _is_feed_response(content, content_type)
+
+
+def discover_feed_urls(content: bytes, page_url: str, original_url: str = "") -> list[str]:
+    """Extract alternate RSS and Atom feed URLs per the RSS Autodiscovery spec."""
+    soup = BeautifulSoup(content, "html.parser")
+    excluded = {
+        key
+        for key in (_comparable_url_key(page_url), _comparable_url_key(original_url))
+        if key
+    }
+    primary_feeds: list[str] = []
+    comment_feeds: list[str] = []
+    for link in soup.find_all("link", href=True):
+        raw_rel = link.get("rel")
+        rels = {
+            part.casefold()
+            for part in (
+                raw_rel if isinstance(raw_rel, (list, tuple)) else str(raw_rel or "").split()
+            )
+            if part
+        }
+        if "alternate" not in rels or "stylesheet" in rels:
+            continue
+        mime_type = str(link.get("type") or "").split(";", 1)[0].strip().casefold()
+        if mime_type not in FEED_AUTODISCOVERY_TYPES:
+            continue
+        candidate = _canonical_feed_candidate_url(link.get("href", ""), page_url)
+        if not candidate:
+            continue
+        if _comparable_url_key(candidate) in excluded:
+            continue
+        parsed = urlparse(candidate)
+        title = str(link.get("title") or "")
+        is_comment = bool(
+            COMMENT_FEED_RE.search(title)
+            or COMMENT_FEED_RE.search(f"{parsed.path}?{parsed.query}")
+        )
+        (comment_feeds if is_comment else primary_feeds).append(candidate)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in [*primary_feeds, *comment_feeds]:
+        key = _comparable_url_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return ordered
+
+
 def parse_book_items(content: bytes, content_type: str, source_url: str):
-    if "xml" in content_type or "rss" in content_type or content.lstrip().startswith(b"<?xml"):
+    lowered_type = str(content_type or "").lower()
+    if (
+        "xml" in lowered_type
+        or "rss" in lowered_type
+        or "atom" in lowered_type
+        or content.lstrip().startswith((b"<?xml", b"<rss", b"<feed", b"<rdf:"))
+    ):
         feed = feedparser.parse(content)
         if _is_apple_source(source_url):
             return _parse_apple_entries(feed.entries, source_url)
@@ -2656,7 +2857,10 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
                     "title": str(e.get("title", ""))[:500],
                     "author": str(e.get("author", "Unknown author"))[:300],
                     "description": BeautifulSoup(str(e.get("summary", "")), "html.parser").get_text(" ")[:4000],
-                    "source_url": metadata_url(e.get("link"), source_url),
+                    "source_url": metadata_url(
+                        urljoin(source_url, str(e.get("link"))) if e.get("link") else "",
+                        source_url,
+                    ),
                 },
                 [e.get(key) for key in ("isbn13", "isbn10", "isbn")],
             )
@@ -2665,7 +2869,7 @@ def parse_book_items(content: bytes, content_type: str, source_url: str):
         ]
     payloads = []
     soup = None
-    if "json" in content_type or "javascript" in content_type:
+    if "json" in lowered_type or "javascript" in lowered_type:
         try: payloads = [json.loads(content)]
         except (json.JSONDecodeError, UnicodeDecodeError): return []
         payload = payloads[0]
@@ -3501,10 +3705,17 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
 
 
 async def preview_source(url, filters=None):
-    content_type, items = await _fetch_and_parse_source(url)
+    params = inspect.signature(_fetch_and_parse_source).parameters
+    if "include_resolved_url" in params:
+        content_type, items, resolved_url = await _fetch_and_parse_source(
+            url, include_resolved_url=True
+        )
+    else:
+        content_type, items = await _fetch_and_parse_source(url)
+        resolved_url = url
     filtered = filter_source_items(items, filters)
     return {
-        "url": url,
+        "url": resolved_url,
         "content_type": content_type,
         "count": len(filtered),
         "raw_count": len(items),

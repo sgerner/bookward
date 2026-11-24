@@ -456,7 +456,10 @@ export const actions: Actions = {
     const data = await request.formData();
     const url = urlSchema.safeParse(data.get("url"));
     const label = z.preprocess(
-      (value) => typeof value === "string" && !value.trim() ? undefined : value,
+      (value) =>
+        value === null || (typeof value === "string" && !value.trim())
+          ? undefined
+          : value,
       z.string().trim().min(2).max(100).optional(),
     ).safeParse(data.get("label"));
     const lifecycle = z
@@ -468,7 +471,7 @@ export const actions: Actions = {
       return fail(400, { message: "Add a valid name and public URL." });
     const name = label.data ?? new URL(url.data).hostname.replace(/^www\./i, "");
     try {
-      const preview = await engine<{ count: number }>("/api/sources/preview", {
+      const preview = await engine<{ count: number; url?: string }>("/api/sources/preview", {
         method: "POST",
         body: JSON.stringify({ url: url.data, filters }),
       });
@@ -478,11 +481,15 @@ export const actions: Actions = {
             ? "No books matched these filters."
             : "No recognizable books were found at that URL.",
         });
+      const resolvedUrl =
+        typeof preview.url === "string" && preview.url.trim()
+          ? preview.url.trim()
+          : url.data;
       await engine("/api/sources", {
         method: "POST",
         body: JSON.stringify({
           name,
-          url: url.data,
+          url: resolvedUrl,
           lifecycle,
           filters,
         }),
@@ -532,8 +539,13 @@ export const actions: Actions = {
 
       let previewCount: number | null = null;
       let previewRawCount: number | null = null;
+      let resolvedTargetUrl = targetUrl;
       if (!skipLivePreview) {
-        const preview = await engine<{ count: number; raw_count?: number }>(
+        const preview = await engine<{
+          count: number;
+          raw_count?: number;
+          url?: string;
+        }>(
           "/api/sources/preview",
           {
             method: "POST",
@@ -543,6 +555,9 @@ export const actions: Actions = {
             }),
           },
         );
+        if (typeof preview.url === "string" && preview.url.trim()) {
+          resolvedTargetUrl = preview.url.trim();
+        }
         previewCount = preview.count;
         previewRawCount =
           typeof preview.raw_count === "number"
@@ -560,7 +575,7 @@ export const actions: Actions = {
             message: messageText,
             sourcePreview: {
               id: id.data,
-              url: targetUrl,
+              url: resolvedTargetUrl,
               count: previewCount,
               rawCount: previewRawCount,
               includeGenres: includeGenresRaw,
@@ -590,7 +605,7 @@ export const actions: Actions = {
             message: warningMessage,
             zeroMatchConfirm: {
               id: id.data,
-              url: submittedUrlRaw || targetUrl,
+              url: submittedUrlRaw || resolvedTargetUrl,
               rawCount: previewRawCount,
               includeGenres: includeGenresRaw,
               excludeGenres: excludeGenresRaw,
@@ -604,7 +619,7 @@ export const actions: Actions = {
         filters: SourceFilters;
       } = { filters };
       if (submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw)) {
-        updatePayload.url = targetUrl;
+        updatePayload.url = resolvedTargetUrl;
       }
       const updated = await engine<{ job_id?: string | number | null }>(
         `/api/sources/${id.data}`,
