@@ -1400,6 +1400,24 @@ def test_partial_settings_updates_preserve_sibling_fields_and_require_initial_li
     assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
 
 
+def test_settings_reject_private_librarr_host_even_with_a_key(database):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        rejected = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://10.0.0.1:5050",
+                "librarr_api_key": "librarr-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert rejected.status_code == 400
+    private = main_module.private_settings()
+    assert private.get("librarr_url", "") == ""
+    assert private.get("librarr_api_key", "") == ""
+
+
 def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
     default_source = row("SELECT id, enabled FROM sources WHERE is_default=1")
     assert default_source["enabled"] == 1
