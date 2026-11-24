@@ -114,7 +114,7 @@ describe('authentication boundary', () => {
 		mockSessionLookup('alice-profile');
 		const form = new URLSearchParams({ __profile_id: 'bob-profile', id: '15' });
 		const formMismatch = await handle({
-			event: eventFor(new Request('http://afterword.test/?/deleteRead', {
+			event: eventFor(new Request('http://afterword.test/?/updateRead', {
 				method: 'POST',
 				headers: {
 					origin: 'http://afterword.test',

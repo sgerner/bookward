@@ -353,6 +353,9 @@ def test_disabled_source_or_unaccepted_restore_returns_409_while_preserving_shor
     by_id = {item["id"]: item for item in maybe_later}
     assert by_id[disabled_cid]["source_enabled"] is False
     assert by_id[enabled_cid]["source_enabled"] is True
+    overview_by_id = {item["id"]: item for item in client.get("/api/overview").json()["decisions"]}
+    assert overview_by_id[disabled_cid]["source_enabled"] is False
+    assert overview_by_id[enabled_cid]["source_enabled"] is True
 
     blocked = client.post(
         f"/api/recommendations/{disabled_cid}/feedback",
@@ -453,7 +456,7 @@ def test_historical_undated_mark_read_skips_outcomes_and_sorts_below_dated_reads
     assert ranked_null["score"] == ranked_omitted["score"]
 
 
-def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and_dedupes_score_job(database):
+def test_put_reading_history_updates_and_clears_fields_reconciles_outcomes_and_validates_payload(database):
     headers = authenticated_headers()
     with transaction() as con:
         cid = _insert_accepted_candidate(con, title="Reconciled Book", author="Outcome Writer")
@@ -461,12 +464,44 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
 
     client = TestClient(app, headers=headers)
     token = client.post("/api/settings/api-tokens", json={"name": "History Test"}).json()["token"]
+    v1_headers = {"Authorization": f"Bearer {token}"}
+
+    root_endpoints = client.get("/api/v1", headers=v1_headers).json()["endpoints"]
+    assert root_endpoints["mark_read"] == "POST /api/v1/recommendations/{id}/read"
+    assert root_endpoints["reading_history_entry"] == "PUT /api/v1/reading-history/{id}"
+    assert "reading_history" not in root_endpoints
+
     marked = client.post(
-        f"/api/recommendations/{cid}/read",
-        json={"rating": 5, "read_at": "2025-05-12", "run_id": run_id},
+        f"/api/v1/recommendations/{cid}/read",
+        headers=v1_headers,
+        json={"rating": 5, "read_at": "2025-05-12"},
     )
     assert marked.status_code == 200
     read_id = marked.json()["read_id"]
+
+    # Repeat mark_read updates rating and reconciles without failing immutable event checks.
+    remarked = client.post(
+        f"/api/recommendations/{cid}/read",
+        json={"rating": 4},
+    )
+    assert remarked.status_code == 200
+    assert remarked.json()["already_present"] is True
+
+    # PATCH and DELETE are not exposed on reading-history entries.
+    assert client.patch(f"/api/reading-history/{read_id}", json={"rating": 3}).status_code == 405
+    assert client.delete(f"/api/reading-history/{read_id}").status_code == 405
+    assert client.delete(f"/api/v1/reading-history/{read_id}", headers=v1_headers).status_code == 405
+
+    # Payload and ID validation (including rejecting empty strings so "" never silently clears).
+    assert client.put(f"/api/reading-history/{read_id}", json={}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": ""}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"read_at": ""}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": True}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": 3.5}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": 0}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": 6}).status_code == 422
+    assert client.put("/api/reading-history/0", json={"rating": 4}).status_code == 404
+    assert client.put("/api/reading-history/-1", json={"rating": 4}).status_code == 404
 
     outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
     assert outcome["label"] == 1.0
@@ -475,16 +510,16 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
     with transaction() as con:
         con.execute("DELETE FROM jobs")
 
-    low = client.patch(f"/api/reading-history/{read_id}", json={"rating": 2})
+    low = client.put(f"/api/reading-history/{read_id}", json={"rating": 2})
     assert low.status_code == 200
     assert low.json()["rating"] == 2
     outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
     assert outcome["label"] == 0.0
     assert outcome["label_kind"] == "rating_negative"
 
-    cleared_rating = client.patch(
+    cleared_rating = client.put(
         f"/api/v1/reading-history/{read_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=v1_headers,
         json={"rating": None},
     )
     assert cleared_rating.status_code == 200
@@ -499,7 +534,7 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
     assert queued_score_jobs == 1
 
     # Moving read_at earlier than the impression removes causal outcome attribution.
-    pre_impression = client.patch(
+    pre_impression = client.put(
         f"/api/reading-history/{read_id}",
         json={"read_at": "2025-05-01"},
     )
@@ -510,7 +545,7 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
     )
 
     # Moving read_at after the impression restores causal outcome attribution.
-    post_impression = client.patch(
+    post_impression = client.put(
         f"/api/reading-history/{read_id}",
         json={"read_at": "2025-05-15", "rating": 4},
     )
@@ -522,8 +557,24 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
     assert restored_outcome["label"] == 1.0
     assert restored_outcome["label_kind"] == "rating_positive"
 
+    # If live recommendation_impressions are missing, a rating-only PUT preserves stored run_id.
+    with transaction() as con:
+        con.execute("DELETE FROM recommendation_outcomes WHERE read_id=?", (read_id,))
+        con.execute("DELETE FROM recommendation_impressions WHERE candidate_id=?", (cid,))
+    rerated_without_live_impression = client.put(
+        f"/api/reading-history/{read_id}",
+        json={"rating": 5},
+    )
+    assert rerated_without_live_impression.status_code == 200
+    stored_event = row(
+        "SELECT run_id,value FROM recommendation_events WHERE event_key=?",
+        (f"manual-read:{cid}:{read_id:08d}",),
+    )
+    assert stored_event["run_id"] == run_id
+    assert stored_event["value"] == 5.0
+
     # Clearing read_at removes causal attribution and transitions manual -> manual_history.
-    cleared_date = client.patch(
+    cleared_date = client.put(
         f"/api/reading-history/{read_id}",
         json={"read_at": None},
     )
@@ -536,150 +587,173 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
     )
 
 
-def test_delete_manual_read_purges_evidence_restores_candidates_guards_imports_and_isolates_profiles(database):
+def test_reconciling_read_in_multi_book_slate_preserves_other_slate_events_outcomes_and_append_only_evidence_and_isolates_profiles(database):
     headers = authenticated_headers()
+    cand_rows: list[dict] = []
+    cached_vecs: dict[int, list[float]] = {}
     with transaction() as con:
-        enabled_cid = _insert_accepted_candidate(con, title="Mistaken Tap Book", author="Tap Writer")
-        disabled_source_id = int(
-            con.execute(
-                "INSERT INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
-                ("Paused Feed", "https://93.184.216.34/paused2.xml", "rss", 0),
-            ).lastrowid
-        )
-        disabled_cid = _insert_accepted_candidate(
-            con,
-            title="Disabled Mistaken Read",
-            author="Paused Writer",
-            status="maybe_later",
-            source_id=disabled_source_id,
-        )
-        rss_read_id = int(
-            con.execute(
-                "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
-                ("Synced Shelf Book", "Goodreads Author", 5, "2025-08-01", "goodreads_rss"),
-            ).lastrowid
-        )
-        csv_read_id = int(
-            con.execute(
-                "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
-                ("Imported Shelf Book", "CSV Author", 4, "2025-07-01", "goodreads_csv"),
-            ).lastrowid
-        )
-        cand_row = dict(con.execute("SELECT * FROM candidates WHERE id=?", (enabled_cid,)).fetchone())
-        cand_row["genres"] = ["Literary fiction"]
-        cand_row["explanation"] = ["Initial match"]
-        cand_row["source_name"] = "Default"
-        cand_row["source_weight"] = 0.5
-        cand_row["quality_status"] = "accepted"
-        cand_row["quality_score"] = 0.88
-        cand_row["metadata_confidence"] = 0.8
-        vec = [1.0, 0.0, 0.0, 0.0]
         con.execute("UPDATE settings SET value='local' WHERE key='embedding_backend'")
         con.execute("UPDATE settings SET value='hashing-768' WHERE key='embedding_model'")
-        con.execute(
-            "INSERT OR REPLACE INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
-            "VALUES('candidate',?,'local','hashing-768',?,?,?)",
-            (enabled_cid, vector_blob(vec), len(vec), content_hash(document(cand_row))),
-        )
+        for idx, (title, author) in enumerate(
+            [
+                ("Target Slate Book", "Slate Writer A"),
+                ("Shortlisted Slate Book", "Slate Writer B"),
+                ("Sibling Read Slate Book", "Slate Writer C"),
+            ]
+        ):
+            cid = _insert_accepted_candidate(con, title=title, author=author, score=88.0 - idx * 2)
+            cand = dict(con.execute("SELECT * FROM candidates WHERE id=?", (cid,)).fetchone())
+            cand["genres"] = ["Literary fiction"]
+            cand["explanation"] = ["Initial match"]
+            cand["source_name"] = "Default"
+            cand["source_weight"] = 0.5
+            cand["quality_status"] = "accepted"
+            cand["quality_score"] = 0.88
+            cand["metadata_confidence"] = 0.8
+            vec = [1.0 if idx == 0 else 0.2, 1.0 if idx == 1 else 0.2, 1.0 if idx == 2 else 0.2, 0.0]
+            con.execute(
+                "INSERT OR REPLACE INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
+                "VALUES('candidate',?,'local','hashing-768',?,?,?)",
+                (cid, vector_blob(vec), len(vec), content_hash(document(cand))),
+            )
+            cand_rows.append(cand)
+            cached_vecs[cid] = vec
+
         evidence = build_decision_evidence(
             con,
-            base_pool=[cand_row],
-            personalized_pool=[cand_row],
-            final_pool=[cand_row],
+            base_pool=cand_rows,
+            personalized_pool=cand_rows,
+            final_pool=cand_rows,
             interaction_events=[],
-            cached_vectors={enabled_cid: vec},
+            cached_vectors=cached_vecs,
             ranking_metadata={"mode": "live"},
             discovery_slate_metadata={"applied": False},
             request_context={"status": "recommended", "limit": 24, "offset": 0},
         )
 
-    run_id = create_recommendation_run([cand_row], decision_evidence=evidence)
+    target_cid, shortlist_cid, sibling_read_cid = [int(item["id"]) for item in cand_rows]
+    shared_run_id = create_recommendation_run(cand_rows, decision_evidence=evidence)
     with transaction() as con:
         con.execute(
             "UPDATE recommendation_impressions SET presented_at='2025-06-01T10:00:00Z',"
             "visible_at='2025-06-01T10:00:00Z' WHERE run_id=?",
-            (run_id,),
+            (shared_run_id,),
         )
 
     client = TestClient(app, headers=headers)
-    token = client.post("/api/settings/api-tokens", json={"name": "Delete Token"}).json()["token"]
-    marked_enabled = client.post(
-        f"/api/recommendations/{enabled_cid}/read",
-        json={"rating": 5, "read_at": "2025-06-05", "run_id": run_id},
+    # Record explicit shortlist feedback and a separate read outcome in the same served run.
+    saved_resp = client.post(
+        f"/api/recommendations/{shortlist_cid}/feedback",
+        json={"action": "save", "run_id": shared_run_id},
     )
-    assert marked_enabled.status_code == 200
-    enabled_read_id = marked_enabled.json()["read_id"]
+    assert saved_resp.status_code == 200
+    sibling_marked = client.post(
+        f"/api/recommendations/{sibling_read_cid}/read",
+        json={"rating": 5, "read_at": "2025-06-04"},
+    )
+    assert sibling_marked.status_code == 200
+    sibling_read_id = sibling_marked.json()["read_id"]
 
-    with transaction() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO read_metadata(read_id,verified_work_id,identity_hash,description) VALUES(?,?,?,?)",
-            (enabled_read_id, "/works/OL999W", "hash-enabled", "Metadata description"),
+    target_marked = client.post(
+        f"/api/recommendations/{target_cid}/read",
+        json={"rating": 5, "read_at": "2025-06-05"},
+    )
+    assert target_marked.status_code == 200
+    target_read_id = target_marked.json()["read_id"]
+
+    evidence_runs_before = row(
+        "SELECT COUNT(*) count FROM recommendation_run_evidence WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+    evidence_exposures_before = row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+    evidence_events_before = row("SELECT COUNT(*) count FROM recommendation_evidence_events")["count"]
+    evidence_outcomes_before = row("SELECT COUNT(*) count FROM recommendation_evidence_outcomes")["count"]
+    assert evidence_runs_before == 1
+    assert evidence_exposures_before == 3
+
+    # Re-rate target read, clear its read_at (removing its live causal outcome), then restore read_at.
+    assert client.put(f"/api/reading-history/{target_read_id}", json={"rating": 2}).status_code == 200
+    assert client.put(f"/api/reading-history/{target_read_id}", json={"read_at": None}).status_code == 200
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (target_read_id,))["count"]
+        == 0
+    )
+    assert (
+        client.put(
+            f"/api/reading-history/{target_read_id}",
+            json={"read_at": "2025-06-06", "rating": 4},
+        ).status_code
+        == 200
+    )
+
+    # Sibling books in the shared run keep their live runs, impressions, events, and outcomes intact.
+    assert row("SELECT id FROM recommendation_runs WHERE id=?", (shared_run_id,)) is not None
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?", (shared_run_id,))["count"]
+        == 3
+    )
+    shortlist_event = row(
+        "SELECT id,run_id,event_type FROM recommendation_events WHERE candidate_id=? AND event_type='save'",
+        (shortlist_cid,),
+    )
+    assert shortlist_event is not None
+    assert shortlist_event["run_id"] == shared_run_id
+    shortlist_outcome = row(
+        "SELECT ro.label,ro.label_kind FROM recommendation_outcomes ro "
+        "JOIN recommendation_impressions ri ON ri.id=ro.impression_id "
+        "WHERE ri.run_id=? AND ri.candidate_id=?",
+        (shared_run_id, shortlist_cid),
+    )
+    assert shortlist_outcome is not None
+    assert shortlist_outcome["label"] == 1.0
+    assert shortlist_outcome["label_kind"] == "explicit_feedback"
+
+    sibling_event = row(
+        "SELECT id,run_id,value FROM recommendation_events WHERE event_key=?",
+        (f"manual-read:{sibling_read_cid}:{sibling_read_id:08d}",),
+    )
+    assert sibling_event is not None
+    assert sibling_event["run_id"] == shared_run_id
+    assert sibling_event["value"] == 5.0
+    sibling_outcome = row(
+        "SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?",
+        (sibling_read_id,),
+    )
+    assert sibling_outcome is not None
+    assert sibling_outcome["label"] == 1.0
+    assert sibling_outcome["label_kind"] == "rating_positive"
+
+    # Append-only evidence tables are never deleted; revisions only append.
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_run_evidence WHERE run_id=?", (shared_run_id,))["count"]
+        == evidence_runs_before
+    )
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?", (shared_run_id,))["count"]
+        == evidence_exposures_before
+    )
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_events")["count"] > evidence_events_before
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_outcomes")["count"] > evidence_outcomes_before
+    for cid_check in (shortlist_cid, sibling_read_cid, target_cid):
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE candidate_id=?",
+                (cid_check,),
+            )["count"]
+            >= 1
+        )
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE candidate_id=?",
+                (cid_check,),
+            )["count"]
+            >= 1
         )
 
-    assert (
-        row(
-            "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
-            (f"manual-read:*:{enabled_read_id:08d}",),
-        )["count"]
-        == 1
-    )
-    assert (
-        row(
-            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
-            (f"manual-read:*:{enabled_read_id:08d}",),
-        )["count"]
-        == 1
-    )
-    assert (
-        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
-        == 1
-    )
-
-    deleted = client.delete(f"/api/reading-history/{enabled_read_id}")
-    assert deleted.status_code == 200
-    assert row("SELECT id FROM reads WHERE id=?", (enabled_read_id,)) is None
-    assert row("SELECT read_id FROM read_metadata WHERE read_id=?", (enabled_read_id,)) is None
-    assert (
-        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
-        == 0
-    )
-    assert (
-        row(
-            "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
-            (f"manual-read:*:{enabled_read_id:08d}",),
-        )["count"]
-        == 0
-    )
-    assert (
-        row(
-            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
-            (f"manual-read:*:{enabled_read_id:08d}",),
-        )["count"]
-        == 0
-    )
-    assert row("SELECT status FROM candidates WHERE id=?", (enabled_cid,))["status"] == "recommended"
-
-    # Disabled-source candidate marked read and then deleted returns to maybe_later, not Discover.
-    marked_disabled = client.post(
-        f"/api/recommendations/{disabled_cid}/read",
-        json={"historical": True},
-    )
-    assert marked_disabled.status_code == 200
-    disabled_read_id = marked_disabled.json()["read_id"]
-    deleted_v1 = client.delete(
-        f"/api/v1/reading-history/{disabled_read_id}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert deleted_v1.status_code == 200
-    assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "maybe_later"
-
-    # Imported Goodreads rows cannot be deleted.
-    for imported_id in (rss_read_id, csv_read_id):
-        resp = client.delete(f"/api/reading-history/{imported_id}")
-        assert resp.status_code == 409
-        assert row("SELECT id FROM reads WHERE id=?", (imported_id,)) is not None
-
-    # Multi-profile isolation: Alice cannot mutate Owner's manual read.
+    # Multi-profile isolation: Alice cannot mutate Owner's read entry.
     with transaction() as con:
         owner_read_id = int(
             con.execute(
@@ -692,10 +766,9 @@ def test_delete_manual_read_purges_evidence_restores_candidates_guards_imports_a
         initialize(seed_demo=False)
     alice_session, _ = profiles.create_session(alice["id"])
     alice_client = TestClient(app, headers={"x-bookward-session": alice_session})
-    assert alice_client.patch(f"/api/reading-history/{owner_read_id}", json={"rating": 1}).status_code == 404
-    assert alice_client.delete(f"/api/reading-history/{owner_read_id}").status_code == 404
+    assert alice_client.put(f"/api/reading-history/{owner_read_id}", json={"rating": 1}).status_code == 404
 
     assert row("SELECT rating FROM reads WHERE id=?", (owner_read_id,))["rating"] == 5
     assert [item["version"] for item in rows("SELECT version FROM schema_migrations ORDER BY version")] == [
-        version for version, _ in MIGRATIONS
+        item[0] for item in MIGRATIONS
     ]

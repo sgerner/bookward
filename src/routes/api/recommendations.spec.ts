@@ -347,4 +347,55 @@ describe("recommendations endpoint", () => {
       }),
     ]);
   });
+
+  it("forwards trimmed search and genre filters across unread and decision statuses", async () => {
+    engineMock.mockResolvedValue([recommendation(35)]);
+
+    const discoverResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=0&search=%20quasar%20cipher%20&genre=%20Science%20Fiction%20",
+      ),
+    } as never);
+    expect(discoverResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=recommended&limit=9&offset=0&search=quasar+cipher&genre=Science+Fiction",
+    );
+
+    const deferredResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=maybe_later&limit=8&offset=8&search=solarpunk",
+      ),
+    } as never);
+    expect(deferredResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=maybe_later&limit=9&offset=8&search=solarpunk",
+    );
+
+    const passedResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=rejected&limit=8&offset=0&genre=Mystery&search=%20%20",
+      ),
+    } as never);
+    expect(passedResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=rejected&limit=9&offset=0&genre=Mystery",
+    );
+  });
+
+  it("rejects oversized search or genre filters before contacting the engine", async () => {
+    const longSearch = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&search=${"a".repeat(201)}`,
+      ),
+    } as never);
+    expect(longSearch.status).toBe(400);
+
+    const longGenre = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&genre=${"g".repeat(101)}`,
+      ),
+    } as never);
+    expect(longGenre.status).toBe(400);
+    expect(engineMock).not.toHaveBeenCalled();
+  });
 });

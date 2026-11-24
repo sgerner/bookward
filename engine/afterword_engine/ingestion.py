@@ -38,7 +38,13 @@ from .identity import (
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .read_dates import read_day
-from .security import BLOCKED_HOSTS, resolve_public_target, validate_public_url
+from .security import (
+    BLOCKED_HOSTS,
+    redact_url,
+    resolve_public_target,
+    sanitize_pinned_error_message,
+    validate_public_url,
+)
 from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
@@ -81,6 +87,7 @@ READ_METADATA_TRANSIENT_RETRY_HOURS = 24
 CANDIDATE_METADATA_BATCH_SIZE = 50
 CANDIDATE_METADATA_RETRY_DAYS = 30
 CANDIDATE_METADATA_COVER_RETRY_DAYS = 7
+CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS = 24
 SOURCE_METADATA_ENRICHMENT_BATCH_SIZE = 50
 READ_WORK_IDENTITY_MAX_REDIRECTS = 3
 
@@ -966,13 +973,29 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
     pinned = original.copy_with(host=address)
     default_port = 443 if original.scheme == "https" else 80
     host_header = hostname if original.port in (None, default_port) else f"{hostname}:{original.port}"
-    return await client.request(
-        method,
-        pinned,
-        params=params,
-        headers={"Host": host_header},
-        extensions={"sni_hostname": hostname},
-    )
+    unpinned_url = client.build_request(method, original, params=params).url
+    public_request = client.build_request(method, redact_url(unpinned_url))
+    try:
+        response = await client.request(
+            method,
+            pinned,
+            params=params,
+            headers={"Host": host_header},
+            extensions={"sni_hostname": hostname},
+        )
+    except httpx.RequestError as exc:
+        sanitized = sanitize_pinned_error_message(
+            exc,
+            address=address,
+            hostname=hostname,
+        )
+        try:
+            rewritten = type(exc)(sanitized, request=public_request)
+        except TypeError:
+            rewritten = httpx.RequestError(sanitized, request=public_request)
+        raise rewritten from None
+    response.request = public_request
+    return response
 
 
 async def _request_openlibrary_edition(client, isbn13: str):
@@ -1283,7 +1306,13 @@ def _read_metadata_attempt_is_due(read, retry_before):
         provenance = {}
     attempt = provenance.get("last_attempt", provenance) if isinstance(provenance, dict) else {}
     traces = attempt.get("fetch_trace", []) if isinstance(attempt, dict) else []
-    transient_statuses = {"request_error", "http_error", "rate_limited", "server_error", "timeout", "provider_unavailable"}
+    transient_statuses = {
+        "request_error",
+        "rate_limited",
+        "server_error",
+        "timeout",
+        "provider_unavailable",
+    }
     transient = bool(
         isinstance(attempt, dict)
         and (attempt.get("error_type") or attempt.get("attempt_status") in {"request_error", "provider_unavailable"})
@@ -1740,7 +1769,13 @@ async def refresh_read_metadata(
                     "provider_unavailable"
                     if any(
                         isinstance(trace, dict)
-                        and trace.get("status") in {"request_error", "http_error", "rate_limited", "server_error", "timeout"}
+                        and trace.get("status")
+                        in {
+                            "request_error",
+                            "rate_limited",
+                            "server_error",
+                            "timeout",
+                        }
                         for trace in attempt_provenance.get("fetch_trace", [])
                     )
                     else "no_verified_record"
@@ -3359,21 +3394,92 @@ def _persist_metadata_field_provenance(
     )
 
 
+_TRANSIENT_METADATA_TRACE_STATUSES = frozenset(
+    {
+        "rate_limited",
+        "server_error",
+        "request_error",
+        "timeout",
+        "provider_unavailable",
+    }
+)
+
+
+def _trace_failure_is_transient(trace: dict) -> bool:
+    status = trace.get("status")
+    if status in _TRANSIENT_METADATA_TRACE_STATUSES:
+        return True
+    if status in {"credential_error", "http_error"}:
+        return False
+    http_status = trace.get("http_status")
+    return isinstance(http_status, int) and (
+        http_status in {408, 429} or http_status >= 500
+    )
+
+
+def _candidate_metadata_retry_status(item: dict) -> str:
+    provenance = item.get("_metadata_provenance")
+    if not isinstance(provenance, dict):
+        return ""
+    traces = provenance.get("fetch_trace")
+    if not isinstance(traces, list):
+        return ""
+    has_transient = False
+    has_google_transient = False
+    has_google_credential_error = False
+    for trace in traces:
+        if not isinstance(trace, dict):
+            continue
+        is_google = trace.get("provider") == "google_books"
+        if _trace_failure_is_transient(trace):
+            has_transient = True
+            if is_google:
+                has_google_transient = True
+            continue
+        http_status = trace.get("http_status")
+        if is_google and (
+            trace.get("status") == "credential_error"
+            or (isinstance(http_status, int) and http_status in {400, 401, 403})
+        ):
+            has_google_credential_error = True
+    if has_google_transient:
+        return "google_books_transient"
+    if has_transient:
+        return "transient"
+    if has_google_credential_error:
+        return "google_books_error"
+    return ""
+
+
+def _candidate_metadata_failure_is_transient(item: dict) -> bool:
+    return _candidate_metadata_retry_status(item) in {
+        "transient",
+        "google_books_transient",
+    }
+
+
 def candidate_metadata_refresh_remaining(
     retry_days: int = CANDIDATE_METADATA_RETRY_DAYS,
+    *,
+    now: datetime | None = None,
 ) -> int:
     """Count accepted candidates due for a sparse-field or version refresh."""
 
-    now = datetime.now(timezone.utc)
-    retry_before = (now - timedelta(days=max(1, int(retry_days)))).isoformat(
-        timespec="seconds"
-    )
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    retry_before = (
+        reference_time - timedelta(days=max(1, int(retry_days)))
+    ).isoformat(timespec="seconds")
     cover_retry_days = min(
         max(1, int(retry_days)), CANDIDATE_METADATA_COVER_RETRY_DAYS
     )
-    cover_retry_before = (now - timedelta(days=cover_retry_days)).isoformat(
-        timespec="seconds"
-    )
+    cover_retry_before = (
+        reference_time - timedelta(days=cover_retry_days)
+    ).isoformat(timespec="seconds")
+    transient_retry_before = (
+        reference_time - timedelta(hours=CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS)
+    ).isoformat(timespec="seconds")
     result = row(
         """SELECT COUNT(*) AS count FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
@@ -3389,6 +3495,7 @@ def candidate_metadata_refresh_remaining(
             q.metadata_version!=?
             OR q.metadata_checked_at IS NULL
             OR q.metadata_checked_at<=CASE
+              WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ?
               WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%'
                 OR c.cover_url LIKE 'https://placehold.co/%'
               THEN ? ELSE ? END
@@ -3396,6 +3503,7 @@ def candidate_metadata_refresh_remaining(
         (
             METADATA_NORMALIZATION_VERSION,
             METADATA_NORMALIZATION_VERSION,
+            transient_retry_before,
             cover_retry_before,
             retry_before,
         ),
@@ -3403,11 +3511,14 @@ def candidate_metadata_refresh_remaining(
     return int(result["count"] if result else 0)
 
 
-async def refresh_missing_candidate_metadata():
+async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
     """Backfill sparse metadata for catalog-accepted candidates only."""
 
     normalize_stored_candidate_subjects()
     normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
@@ -3423,7 +3534,9 @@ async def refresh_missing_candidate_metadata():
         "OR cover_url LIKE 'https://placehold.co/%' OR description='' OR release_date IS NULL "
         "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
         "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR "
-        "q.metadata_checked_at<=CASE WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
+        "q.metadata_checked_at<=CASE "
+        "WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ? "
+        "WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
         "OR c.cover_url LIKE 'https://placehold.co/%' THEN ? ELSE ? END) "
         "ORDER BY CASE WHEN q.metadata_version!=? THEN 0 ELSE 1 END,"
         "q.metadata_checked_at ASC,c.score DESC,c.id LIMIT ?",
@@ -3431,11 +3544,15 @@ async def refresh_missing_candidate_metadata():
             METADATA_NORMALIZATION_VERSION,
             METADATA_NORMALIZATION_VERSION,
             (
-                datetime.now(timezone.utc)
+                reference_time
+                - timedelta(hours=CANDIDATE_METADATA_TRANSIENT_RETRY_HOURS)
+            ).isoformat(timespec="seconds"),
+            (
+                reference_time
                 - timedelta(days=CANDIDATE_METADATA_COVER_RETRY_DAYS)
             ).isoformat(timespec="seconds"),
             (
-                datetime.now(timezone.utc)
+                reference_time
                 - timedelta(days=CANDIDATE_METADATA_RETRY_DAYS)
             ).isoformat(timespec="seconds"),
             METADATA_NORMALIZATION_VERSION,
@@ -3544,15 +3661,37 @@ async def refresh_missing_candidate_metadata():
                         default_provider_id=metadata_provider_id,
                         default_confidence=1.0,
                     )
+            effective_description = (
+                description
+                if (not previous.get("description") and description) or description_upgrade
+                else (previous.get("description") or "")
+            )
+            effective_cover = (
+                cover_url if cover_changed else (previous.get("cover_url") or "")
+            )
+            effective_release_date = previous.get("release_date") or release_date
+            still_sparse = bool(
+                not effective_cover
+                or is_weak_cover_url(effective_cover)
+                or str(effective_cover).startswith("https://placehold.co/")
+                or not effective_description
+                or not effective_release_date
+                or not genres
+            )
+            metadata_retry_status = (
+                _candidate_metadata_retry_status(item) if still_sparse else ""
+            )
             con.execute(
                 """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,
+                    metadata_retry_status=?,
                     metadata_provider=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider END,
                     metadata_provider_id=CASE WHEN ?=1 AND ?!='' THEN ? ELSE metadata_provider_id END,
                     updated_at=CURRENT_TIMESTAMP
                     WHERE candidate_id=? AND quality_status='accepted'""",
                 (
-                    datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                    reference_time.isoformat(timespec="microseconds"),
                     METADATA_NORMALIZATION_VERSION,
+                    metadata_retry_status,
                     int(description_changed),
                     metadata_provider,
                     metadata_provider,
@@ -3560,7 +3699,7 @@ async def refresh_missing_candidate_metadata():
                     metadata_provider_id,
                     metadata_provider_id,
                     item["id"],
-                )
+                ),
             )
     return changed + normalized_catalog_dates
 
@@ -3827,15 +3966,21 @@ async def scan_source(source):
                 )
         if seen:
             placeholders = ",".join("?" for _ in seen)
-            con.execute(f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})", (source["id"], *seen))
-        elif raw_count:
             con.execute(
-                "DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended')",
-                (source["id"],),
+                f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})",
+                (source["id"], *seen),
             )
-        # An empty response can be a transient block page, parser mismatch,
-        # or upstream outage. It is not safe to interpret it as proof that a
-        # source no longer contains any books, so retain existing candidates.
-        status = f"ok:{len(items)}" if items else "empty:0"
-        con.execute("UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP WHERE id=?", (status, source["id"]))
+            con.execute(
+                "UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"ok:{len(items)}", source["id"]),
+            )
+        else:
+            # An empty upstream response or a zero-match filter run must not
+            # delete previously discovered candidates or overwrite the age of
+            # the last good scan.
+            status = "filtered:0" if raw_count else "empty:0"
+            con.execute(
+                "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, source["id"]),
+            )
     return len(items)
