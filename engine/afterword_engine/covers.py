@@ -321,13 +321,6 @@ def _google_cover_url(image_links: object) -> str:
     return ""
 
 
-async def _lookup_open_library(
-    title: str, author: str, client: httpx.AsyncClient | None = None
-) -> str:
-    record = await _lookup_open_library_record(title, author, client=client)
-    return str(record.get("cover_url", ""))
-
-
 def _normalized_title(value: object) -> str:
     return book_catalog_title_identity_key(value)
 
@@ -1305,51 +1298,6 @@ async def resolve_openlibrary_work_metadata(
         "source_payloads": source_payloads,
     }
     return result
-
-
-async def resolve_cover_url(
-    title: str,
-    author: str,
-    supplied: object = "",
-    source_url: str = "",
-    client: httpx.AsyncClient | None = None,
-    google_books_api_key: str = "",
-    isbn13: object = "",
-    isbn10: object = "",
-) -> str:
-    """Resolve a useful cover URL, always returning a non-empty value."""
-
-    if isbn_parts(isbn13, isbn10) != ("", ""):
-        metadata = await resolve_book_metadata(
-            title,
-            author,
-            supplied=supplied,
-            source_url=source_url,
-            client=client,
-            isbn13=isbn13,
-            isbn10=isbn10,
-            prefer_isbn_cover=True,
-            google_books_api_key=google_books_api_key,
-        )
-        if metadata.get("cover_url"):
-            return str(metadata["cover_url"])
-        # With an ISBN, do not replace a missing exact catalog match with a
-        # title-only result that could belong to another edition.
-        return placeholder_cover_url(title, author)
-
-    supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
-    if supplied_url:
-        # Source-provided artwork is preferred.  We still normalize it to HTTPS
-        # and never ask the engine to fetch it.
-        return supplied_url
-    cover = await _lookup_open_library(title, author, client=client)
-    if cover:
-        return cover
-    record = await _lookup_google_books_record(
-        title, author, client=client, google_books_api_key=google_books_api_key
-    )
-    cover = str(record.get("cover_url") or "")
-    return cover or placeholder_cover_url(title, author)
 
 
 def fallback_cover_url(title: str, author: str, supplied: object = "", source_url: str = "") -> str:
