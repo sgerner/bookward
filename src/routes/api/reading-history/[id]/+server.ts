@@ -1,5 +1,6 @@
 import type { RequestHandler } from "./$types";
 import {
+  RATING_VALIDATION_MESSAGE,
   parseReadingHistoryId,
   parseWholeStarRating,
 } from "#lib/reading-history-ratings.js";
@@ -19,7 +20,7 @@ type ReadingHistoryRatingResponse = {
 const updateErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Rating could not be saved.";
 
-const updateById: RequestHandler = async ({ params, request }) => {
+export const PUT: RequestHandler = async ({ params, request }) => {
   const parsedId = parseReadingHistoryId(params.id);
   if (!parsedId.ok) {
     return Response.json({ message: parsedId.message }, { status: 400 });
@@ -36,6 +37,9 @@ const updateById: RequestHandler = async ({ params, request }) => {
   }
 
   const record = body as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, "rating")) {
+    return Response.json({ message: RATING_VALIDATION_MESSAGE }, { status: 400 });
+  }
   const parsedRating = parseWholeStarRating(record.rating);
   if (!parsedRating.ok) {
     return Response.json({ message: parsedRating.message }, { status: 400 });
@@ -55,6 +59,3 @@ const updateById: RequestHandler = async ({ params, request }) => {
     return Response.json({ message: updateErrorMessage(error) }, { status: engineStatus(error) });
   }
 };
-
-export const PUT = updateById;
-export const PATCH = updateById;

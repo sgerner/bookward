@@ -40,14 +40,14 @@
   } from "@lucide/svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
+  import StarRating from "#lib/components/StarRating.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import {
     applyRatingOverrides,
-    effectiveBookRating,
+    createReadingHistoryRatingController,
     formatRatingConfirmation,
-    starButtonLabel,
   } from "#lib/reading-history-ratings.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -134,18 +134,15 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
-  let readingHistoryScoreGeneration = 0;
-  let readingHistoryScoreAbortController: AbortController | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
   let historyRatingOverrides = $state<Record<number, number | null>>({});
-  let committedHistoryRatings = $state<Record<number, number | null>>({});
   let pendingRatingIds = $state(new Set<number>());
   let discoverNeedsRefresh = $state(false);
-  let ratingRequestSeq = new Map<number, number>();
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
@@ -645,7 +642,7 @@
       }
       readingHistory = payload.items;
       readingHistoryState = "ready";
-      void loadReadingHistoryScores(payload.items.length, { restart: true });
+      void loadReadingHistoryScores(payload.items.length);
     } catch (error) {
       readingHistoryError = error instanceof Error
         ? error.message
@@ -653,35 +650,22 @@
       readingHistoryState = "error";
     }
   }
-  function loadReadingHistoryScores(total: number, options: { restart?: boolean } = {}) {
-    if (options.restart) {
-      readingHistoryScoreGeneration += 1;
-      readingHistoryScoreAbortController?.abort();
-      readingHistoryScoreAbortController = null;
-      readingHistoryScoreOffset = 0;
-      readingHistoryScoreTask = null;
-    } else if (readingHistoryScoreTask) {
-      return readingHistoryScoreTask;
-    }
+  function loadReadingHistoryScores(total: number) {
+    if (readingHistoryScoreTask) return readingHistoryScoreTask;
     const batchSize = 20;
     if (total === 0) {
       readingHistoryScoreState = "ready";
       return Promise.resolve();
     }
-    const generation = readingHistoryScoreGeneration;
-    const controller = new AbortController();
-    readingHistoryScoreAbortController = controller;
     readingHistoryScoreState = "loading";
     readingHistoryScoreError = "";
     const task = (async () => {
       try {
         for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
-          if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
           const response = await fetch(
             `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
-            { headers: profileHeaders, signal: controller.signal },
+            { headers: profileHeaders },
           );
-          if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
           const payload = (await response.json().catch(() => ({}))) as {
             scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
             message?: string;
@@ -696,88 +680,40 @@
           });
           readingHistoryScoreOffset = offset + batchSize;
         }
-        if (generation === readingHistoryScoreGeneration && !controller.signal.aborted) {
-          readingHistoryScoreState = "ready";
-        }
+        readingHistoryScoreState = "ready";
       } catch (error) {
-        if (generation !== readingHistoryScoreGeneration || controller.signal.aborted) return;
         readingHistoryScoreError = error instanceof Error
           ? error.message
           : "Reading history scores could not be loaded.";
         readingHistoryScoreState = "error";
       } finally {
-        if (generation === readingHistoryScoreGeneration) {
-          readingHistoryScoreTask = null;
-        }
-        if (readingHistoryScoreAbortController === controller) {
-          readingHistoryScoreAbortController = null;
-        }
+        readingHistoryScoreTask = null;
       }
     })();
     readingHistoryScoreTask = task;
     return task;
   }
-  function refreshReadingHistoryScores() {
-    if (readingHistoryState !== "ready") return Promise.resolve();
-    return loadReadingHistoryScores(readingHistory.length, { restart: true });
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
   }
-  async function updateReadingHistoryRating(
-    item: { id: number; title: string; rating: number | null },
-    nextRating: number | null,
-    surface: "history" | "recent",
-    triggerElement?: HTMLElement | null,
-  ) {
-    const currentRating = effectiveBookRating(item.id, item.rating, historyRatingOverrides);
-    if (currentRating === nextRating && !pendingRatingIds.has(item.id)) return;
-
-    const hadKeyboardFocus =
-      typeof document !== "undefined" &&
-      triggerElement != null &&
-      document.activeElement === triggerElement;
-    const clearingFocusedControl = hadKeyboardFocus && nextRating === null;
-
-    const baselineRating = Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)
-      ? committedHistoryRatings[item.id]
-      : currentRating;
-    if (!Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)) {
-      committedHistoryRatings = { ...committedHistoryRatings, [item.id]: baselineRating };
-    }
-
-    const seq = (ratingRequestSeq.get(item.id) ?? 0) + 1;
-    ratingRequestSeq.set(item.id, seq);
-    historyRatingOverrides = { ...historyRatingOverrides, [item.id]: nextRating };
-    readingHistory = readingHistory.map((entry) =>
-      entry.id === item.id ? { ...entry, rating: nextRating } : entry,
-    );
-    pendingRatingIds = new Set([...pendingRatingIds, item.id]);
-
-    if (hadKeyboardFocus && typeof document !== "undefined") {
-      void tick().then(() => {
-        if (clearingFocusedControl) {
-          const firstStar = document.querySelector<HTMLButtonElement>(
-            `[data-rating-star="${surface}-${item.id}-1"]`,
-          );
-          if (firstStar) {
-            firstStar.focus();
-            return;
-          }
-        }
-        if (document.activeElement === document.body) {
-          const fallback =
-            document.querySelector<HTMLButtonElement>(
-              `[data-rating-star^="${surface}-"][data-rating-star$="-1"]`,
-            ) ??
-            document.querySelector<HTMLElement>('[aria-label="Filter read books by rating"]');
-          fallback?.focus();
-        }
-      });
-    }
-
-    try {
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
       const response = await fetch("/api/reading-history", {
         method: "PUT",
         headers: { "content-type": "application/json", ...profileHeaders },
-        body: JSON.stringify({ id: item.id, rating: nextRating }),
+        body: JSON.stringify({ id, rating: nextRating }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         item?: { rating?: number | null };
@@ -786,41 +722,35 @@
       if (!response.ok) {
         throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
       }
-      const savedRating =
-        payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
-      committedHistoryRatings = { ...committedHistoryRatings, [item.id]: savedRating };
-      if (ratingRequestSeq.get(item.id) !== seq) return;
-      historyRatingOverrides = { ...historyRatingOverrides, [item.id]: savedRating };
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
       readingHistory = readingHistory.map((entry) =>
-        entry.id === item.id ? { ...entry, rating: savedRating } : entry,
+        entry.id === id ? { ...entry, rating } : entry,
       );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
       discoverNeedsRefresh = true;
-      announceActionSuccess(formatRatingConfirmation(item.title, savedRating));
-      if (readingHistoryState === "ready") {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        discoverNeedsRefresh = true;
         void refreshReadingHistoryScores();
       }
-    } catch (error) {
-      if (ratingRequestSeq.get(item.id) !== seq) return;
-      const reverted = Object.prototype.hasOwnProperty.call(committedHistoryRatings, item.id)
-        ? committedHistoryRatings[item.id]
-        : baselineRating;
-      historyRatingOverrides = { ...historyRatingOverrides, [item.id]: reverted };
-      readingHistory = readingHistory.map((entry) =>
-        entry.id === item.id ? { ...entry, rating: reverted } : entry,
-      );
       announceActionError(
         error instanceof Error
           ? error.message
           : "Rating could not be saved. Your change was reverted.",
       );
-    } finally {
-      if (ratingRequestSeq.get(item.id) === seq) {
-        const nextPending = new Set(pendingRatingIds);
-        nextPending.delete(item.id);
-        pendingRatingIds = nextPending;
-      }
-    }
-  }
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
     decisionFilter = filter;
     readingHistoryVisibleCount = 30;
@@ -1545,25 +1475,7 @@
     const nextHistory = data.history;
     if (previousDataHistory === nextHistory) return;
     previousDataHistory = nextHistory;
-    untrack(() => {
-      if (pendingRatingIds.size === 0) {
-        committedHistoryRatings = {};
-        historyRatingOverrides = {};
-        return;
-      }
-      const nextCommitted: Record<number, number | null> = {};
-      const nextOverrides: Record<number, number | null> = {};
-      for (const id of pendingRatingIds) {
-        if (Object.prototype.hasOwnProperty.call(committedHistoryRatings, id)) {
-          nextCommitted[id] = committedHistoryRatings[id];
-        }
-        if (Object.prototype.hasOwnProperty.call(historyRatingOverrides, id)) {
-          nextOverrides[id] = historyRatingOverrides[id];
-        }
-      }
-      committedHistoryRatings = nextCommitted;
-      historyRatingOverrides = nextOverrides;
-    });
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -2451,14 +2363,21 @@
                       <div class="flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
-                          <span class="badge preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
+                          <span class="badge preset-tonal-secondary"><span aria-hidden="true">{item.rating} ★</span><span class="sr-only">Your rating: {item.rating} {item.rating === 1 ? "star" : "stars"}</span></span>
                         {:else}
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
                     </div>
                     <div class="mt-3 border-t border-surface-300-700/40 pt-3">
-                      {@render inlineStarRating(item, "history")}
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
                     </div>
                     <div class="mt-3 border-t border-surface-300-700/40 pt-2">
                       <button
@@ -2518,36 +2437,6 @@
             {/if}
           </section>
         {/if}
-      {/snippet}
-
-      {#snippet inlineStarRating(item: { id: number; title: string; rating: number | null }, surface: "history" | "recent")}
-        {@const currentRating = item.rating}
-        {@const ratingPending = pendingRatingIds.has(item.id)}
-        <div
-          class="flex flex-wrap items-center gap-1.5"
-          role="group"
-          aria-label={`Rating for ${item.title}`}
-          aria-busy={ratingPending}
-          data-rating-group={`${surface}-${item.id}`}
-        >
-          {#each [1, 2, 3, 4, 5] as rating (rating)}
-            <button
-              type="button"
-              data-rating-star={`${surface}-${item.id}-${rating}`}
-              class={`grid size-9 place-items-center rounded-lg border text-base transition duration-150 motion-safe:hover:-translate-y-0.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 ${(currentRating ?? 0) >= rating ? "border-amber-500/60 bg-amber-500/15 text-amber-700 shadow-sm dark:border-amber-400/50 dark:bg-amber-400/15 dark:text-amber-300" : "border-surface-300-700/70 bg-surface-50-950/50 text-surface-600-400 hover:border-amber-500/50 hover:text-amber-600 dark:hover:border-amber-400/40 dark:hover:text-amber-300"}`}
-              aria-label={starButtonLabel(rating)}
-              aria-pressed={currentRating === rating}
-              onclick={(event) => void updateReadingHistoryRating(item, rating, surface, event.currentTarget)}
-            ><span aria-hidden="true">★</span></button>
-          {/each}
-          {#if currentRating !== null && currentRating > 0}
-            <button
-              type="button"
-              class="btn btn-sm ml-1 min-h-9 preset-tonal-surface text-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500"
-              onclick={(event) => void updateReadingHistoryRating(item, null, surface, event.currentTarget)}
-            >Clear rating</button>
-          {/if}
-        </div>
       {/snippet}
 
       <!-- Layer each view in the same grid cell so fade intros/outros overlap instead of leaving a blank frame. -->
@@ -3929,11 +3818,17 @@
                           {#if item.rating !== null && item.rating > 0}<span
                               in:scale={{ duration: motionDuration(150) }}
                               class="badge badge-sm shrink-0 preset-tonal-secondary"
-                              aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}
-                              >{item.rating} ★</span
+                              ><span aria-hidden="true">{item.rating} ★</span><span class="sr-only">Your rating: {item.rating} {item.rating === 1 ? "star" : "stars"}</span></span
                             >{:else}<span class="badge badge-sm shrink-0 preset-tonal-surface">Unrated</span>{/if}
                         </div>
-                        {@render inlineStarRating(item, "recent")}
+                        <StarRating
+                          value={item.rating}
+                          label={`Rating for ${item.title}`}
+                          busy={pendingRatingIds.has(item.id)}
+                          groupKey={`recent-${item.id}`}
+                          onchange={(nextRating, trigger, clearedViaButton) =>
+                            void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                        />
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}

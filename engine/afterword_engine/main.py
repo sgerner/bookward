@@ -697,7 +697,7 @@ app.add_middleware(
     # the engine port does not turn every legacy endpoint into a wildcard CORS
     # API.
     allow_origins=[settings.cors_origin],
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
@@ -1228,7 +1228,7 @@ class MarkReadIn(BaseModel):
 
 
 class ReadingHistoryRatingIn(BaseModel):
-    rating: int | None = None
+    rating: int | None
 
     @field_validator("rating", mode="before")
     @classmethod
@@ -1679,7 +1679,6 @@ def reading_history():
 
 
 @app.put("/api/reading-history/{read_id}")
-@app.patch("/api/reading-history/{read_id}")
 def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
     """Set, change, or clear a whole-star rating on an existing read entry."""
     if read_id <= 0:
@@ -3321,7 +3320,6 @@ def api_reading_history():
 
 
 @api_v1.put("/reading-history/{read_id}")
-@api_v1.patch("/reading-history/{read_id}")
 def api_update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
     return update_reading_history_rating(read_id, payload)
 

@@ -50,28 +50,37 @@ def test_inline_rating_set_change_clear_and_validation(database):
     assert body["read_at"] == "2026-08-14"
     assert body["job_id"]
 
-    # Change rating via PATCH from 5 -> 3 -> 1
-    patch_resp = client.patch(f"/api/reading-history/{read_id}", json={"rating": "3"})
-    assert patch_resp.status_code == 200
-    assert patch_resp.json()["rating"] == 3
+    # Change rating via PUT from 5 -> 3 -> 1
+    mid_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": "3"})
+    assert mid_resp.status_code == 200
+    assert mid_resp.json()["rating"] == 3
 
     low_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": 1})
     assert low_resp.status_code == 200
     assert low_resp.json()["rating"] == 1
+
+    # Missing rating key returns 422 instead of silently clearing the stored rating
+    missing_key = client.put(f"/api/reading-history/{read_id}", json={})
+    assert missing_key.status_code == 422
+    assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == 1
+
+    missing_key_extra = client.put(f"/api/reading-history/{read_id}", json={"unrelated": 5})
+    assert missing_key_extra.status_code == 422
+    assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == 1
 
     # Overview history reflects the updated rating
     overview = client.get("/api/overview").json()
     recent_match = next(item for item in overview["history"] if item["id"] == read_id)
     assert recent_match["rating"] == 1
 
-    # Clear rating back to Unrated (null and empty string)
+    # Clear rating back to Unrated (explicit null and empty string)
     clear_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": None})
     assert clear_resp.status_code == 200
     assert clear_resp.json()["rating"] is None
     assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] is None
 
     client.put(f"/api/reading-history/{read_id}", json={"rating": 4})
-    empty_clear = client.patch(f"/api/reading-history/{read_id}", json={"rating": ""})
+    empty_clear = client.put(f"/api/reading-history/{read_id}", json={"rating": ""})
     assert empty_clear.status_code == 200
     assert empty_clear.json()["rating"] is None
 
@@ -120,7 +129,10 @@ def test_public_v1_reading_history_rating_authentication_and_profile_isolation(d
     assert rated.status_code == 200
     assert rated.json()["rating"] == 4
 
-    cleared = v1_client.patch(f"/api/v1/reading-history/{read_id}", json={"rating": None})
+    assert v1_client.put(f"/api/v1/reading-history/{read_id}", json={}).status_code == 422
+    assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == 4
+
+    cleared = v1_client.put(f"/api/v1/reading-history/{read_id}", json={"rating": None})
     assert cleared.status_code == 200
     assert cleared.json()["rating"] is None
 
@@ -380,6 +392,58 @@ def test_rating_edits_synchronize_attributed_outcomes_telemetry_and_evidence(dat
     ]
 
 
+def test_rerating_succeeds_when_existing_read_event_has_run_id_without_live_impression(database):
+    headers = authenticated_headers()
+    recs, run_id = tracked_recommendations(limit=5)
+    assert recs and run_id
+    exposed_candidate = recs[0]
+    candidate_id = int(exposed_candidate["id"])
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE recommendation_impressions SET presented_at='2026-01-01T00:00:00+00:00' "
+            "WHERE candidate_id=?",
+            (candidate_id,),
+        )
+
+    client = TestClient(app, headers=headers)
+    mark_resp = client.post(f"/api/recommendations/{candidate_id}/read", json={"rating": 4})
+    assert mark_resp.status_code == 200
+    read_id = int(
+        row(
+            "SELECT id FROM reads WHERE title=? AND author=?",
+            (exposed_candidate["title"], exposed_candidate["author"]),
+        )["id"]
+    )
+
+    # Remove the impression row while recommendation_runs (and thus recommendation_events.run_id)
+    # remains populated, so _run_impression(con, run_id, candidate_id) returns None.
+    with transaction() as con:
+        con.execute(
+            "DELETE FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+            (run_id, candidate_id),
+        )
+    stored_event = row(
+        "SELECT id, run_id, value FROM recommendation_events WHERE event_key=?",
+        (f"manual-read:{candidate_id}:{read_id:08d}",),
+    )
+    assert stored_event["run_id"] == run_id
+    assert stored_event["value"] == pytest.approx(4.0)
+
+    # Re-rating and clearing must succeed (200) and update both reads.rating and recommendation_events.value
+    for expected in (5, 2, None, 3):
+        resp = client.put(f"/api/reading-history/{read_id}", json={"rating": expected})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["rating"] == expected
+        assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == expected
+        ev_after = row("SELECT run_id, value FROM recommendation_events WHERE id=?", (stored_event["id"],))
+        assert ev_after["run_id"] == run_id
+        if expected is None:
+            assert ev_after["value"] is None
+        else:
+            assert ev_after["value"] == pytest.approx(float(expected))
+
+
 def test_rapid_rating_edits_coalesce_and_running_score_queues_single_followup(database):
     headers = authenticated_headers()
     with transaction() as con:
@@ -395,7 +459,7 @@ def test_rapid_rating_edits_coalesce_and_running_score_queues_single_followup(da
     # Four rapid edits coalesce into one queued score job
     j1 = client.put(f"/api/reading-history/{read_a}", json={"rating": 5}).json()["job_id"]
     j2 = client.put(f"/api/reading-history/{read_b}", json={"rating": 2}).json()["job_id"]
-    j3 = client.patch(f"/api/reading-history/{read_a}", json={"rating": 4}).json()["job_id"]
+    j3 = client.put(f"/api/reading-history/{read_a}", json={"rating": 4}).json()["job_id"]
     j4 = client.put(f"/api/reading-history/{read_b}", json={"rating": None}).json()["job_id"]
 
     assert j1 == j2 == j3 == j4

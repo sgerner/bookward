@@ -72,38 +72,7 @@ describe("public API proxy", () => {
     expect(response.headers.get("access-control-allow-methods")).toContain(
       "GET",
     );
-    expect(response.headers.get("access-control-allow-methods")).toContain(
-      "PATCH",
-    );
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("forwards PATCH requests for reading-history rating edits", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ id: 9, rating: 5 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const request = new Request(
-      "http://bookward.test/api/v1/reading-history/9",
-      {
-        method: "PATCH",
-        headers: {
-          authorization: "Bearer bkw_test",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ rating: 5 }),
-      },
-    );
-
-    const response = await proxyApi(eventFor(request, "reading-history/9"));
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ id: 9, rating: 5 });
-    const [target, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(target).toBe("http://127.0.0.1:8000/api/v1/reading-history/9");
-    expect(init.method).toBe("PATCH");
   });
 
   it("does not advertise mutating methods on the read-only API root", async () => {
