@@ -2056,8 +2056,10 @@ def feedback(candidate_id: int, payload: FeedbackIn):
         "id": candidate_id,
         "status": status,
     }
-    if payload.action in {"save", "reject", "maybe_later"} or (
-        payload.action == "restore" and previous_status and previous_status != "read"
+    if (
+        payload.action in {"save", "reject", "maybe_later", "restore"}
+        and previous_status
+        and previous_status != "read"
     ):
         result["decision_id"] = int(feedback_id)
     return result
@@ -2219,8 +2221,10 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            if payload.action in {"save", "reject"} or (
-                payload.action == "restore" and previous_status and previous_status != "read"
+            if (
+                payload.action in {"save", "reject", "restore"}
+                and previous_status
+                and previous_status != "read"
             ):
                 decisions.append({"id": candidate_id, "decision_id": int(feedback_id)})
     return {

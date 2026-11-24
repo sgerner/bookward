@@ -712,6 +712,29 @@ def test_bulk_feedback_records_run_attribution_and_supports_v1_bulk_undo(databas
         )["event_type"] == "restore"
 
 
+def test_bulk_feedback_offers_no_undo_for_books_that_were_already_read(database):
+    recommendations, _run_id = tracked_recommendations()
+    read_id = recommendations[0]["id"]
+    other_id = recommendations[1]["id"]
+    single_read_id = recommendations[2]["id"]
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id IN (?,?)", (read_id, single_read_id)
+        )
+    with TestClient(app, headers=authenticated_headers()) as client:
+        bulk = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [read_id, other_id], "action": "save"},
+        )
+        single = client.post(
+            f"/api/recommendations/{single_read_id}/feedback", json={"action": "reject"}
+        )
+    assert bulk.status_code == 200
+    assert [item["id"] for item in bulk.json()["decisions"]] == [other_id]
+    assert single.status_code == 200
+    assert "decision_id" not in single.json()
+
+
 def test_bulk_undo_rolls_back_atomically_on_conflict(database):
     recommendations, run_id = tracked_recommendations()
     first_id, second_id, third_id, fourth_id = [item["id"] for item in recommendations[:4]]
