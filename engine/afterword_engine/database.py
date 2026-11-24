@@ -1169,10 +1169,9 @@ class _LockedConnection(sqlite3.Connection):
 def connect():
     db_path = profile_database_path()
     if not restore_fence_bypassed():
-        from .backups import _restore_journal_path
+        from .backups import has_restore_journal
 
-        journal = _restore_journal_path()
-        if journal.exists() or journal.is_symlink():
+        if has_restore_journal():
             raise sqlite3.OperationalError(
                 "Profile database is unavailable until interrupted restore recovery completes."
             )

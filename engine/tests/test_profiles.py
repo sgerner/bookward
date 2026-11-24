@@ -495,7 +495,6 @@ def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_resto
     profiles.initialize_auth()
     owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
     alice = profiles.create_account("alice", "alice-password-with-enough-length")
-    legacy_token = generate_api_token()
 
     with profile_scope("legacy"):
         initialize(seed_demo=False)
@@ -503,10 +502,6 @@ def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_resto
             con.execute(
                 "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
                 ("Legacy healthy read", "Owner", "test"),
-            )
-            con.execute(
-                "INSERT INTO api_tokens(id,name,token_prefix,token_hash) VALUES(1,?,?,?)",
-                ("Legacy token", legacy_token[:12], legacy_hash_api_token(legacy_token)),
             )
 
     with profile_scope(alice["profile_id"]):
@@ -558,6 +553,7 @@ def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_resto
             "/api/overview", headers={"x-bookward-session": fenced_session}
         )
         assert fenced_overview.status_code == 503
+        assert fenced_overview.json()["detail"] == backups.RESTORE_FENCE_DETAIL
 
         healthy_overview = client.get(
             "/api/overview", headers={"x-bookward-session": healthy_session}
@@ -569,11 +565,6 @@ def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_resto
         assert expected_title in {
             item["title"] for item in healthy_overview.json()["history"]
         }
-
-    if fenced_target == "legacy":
-        assert profiles.legacy_api_tokens_migrated() is False
-    else:
-        assert profiles.legacy_api_tokens_migrated() is True
 
     with profile_scope(fenced_profile_id):
         assert backups._restore_journal_path().is_file()
@@ -588,7 +579,7 @@ def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     profiles.initialize_auth()
     owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
-    legacy_token = generate_api_token()
+    api_token = profiles.create_profile_api_token("legacy", "Recovery check")["token"]
 
     with profile_scope("legacy"):
         initialize(seed_demo=False)
@@ -596,10 +587,6 @@ def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
             con.execute(
                 "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
                 ("Safety baseline read", "Owner", "test"),
-            )
-            con.execute(
-                "INSERT INTO api_tokens(id,name,token_prefix,token_hash) VALUES(1,?,?,?)",
-                ("Delayed migration token", legacy_token[:12], legacy_hash_api_token(legacy_token)),
             )
         safety = backups.create_backup()
         safety_path = tmp_path / "backups" / f"{safety['id']}.sqlite3"
@@ -619,28 +606,26 @@ def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
     )
     try:
         with TestClient(app) as client:
-            assert profiles.legacy_api_tokens_migrated() is False
             locked_resp = client.get(
                 "/api/overview", headers={"x-bookward-session": owner_session}
             )
             assert locked_resp.status_code == 503
-            assert "could not be safely closed" in locked_resp.json()["detail"]
+            assert locked_resp.json()["detail"] == backups.RESTORE_FENCE_DETAIL
 
             external_lock.rollback()
             external_lock.close()
             external_lock = None
 
             # Once the lock clears, an API token or session request completes
-            # rollback and deferred legacy API token migration before serving.
+            # rollback before serving.
             v1_resp = client.get(
                 "/api/v1/overview",
-                headers={"authorization": f"Bearer {legacy_token}"},
+                headers={"authorization": f"Bearer {api_token}"},
             )
             assert v1_resp.status_code == 200
             titles = {item["title"] for item in v1_resp.json()["history"]}
             assert "Safety baseline read" in titles
             assert "Unfinished restore state" not in titles
-            assert profiles.legacy_api_tokens_migrated() is True
 
             with profile_scope("legacy"):
                 assert not backups._restore_journal_path().exists()
