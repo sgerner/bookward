@@ -25,7 +25,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(ENGINE))
-from afterword_engine.identity import book_identity
+from afterword_engine.identity import book_author_identity_key, book_identity
 from afterword_engine.ranking import (
     _KERNEL_ESS_PRIOR,
     _KERNEL_FULL_HISTORY,
@@ -39,7 +39,7 @@ from afterword_engine.ranking import (
     _top_weighted,
     rank_candidates,
 )
-from evaluate_ranking import load_corpus, prepare
+from evaluate_ranking import load_corpus, prepare, tail_metrics_at_k
 from evaluate_historical_ratings import whole_day_cuts
 
 BASE_NAMES = (
@@ -374,21 +374,21 @@ def metric_set(y, scores, calibrated=None):
         return {'n': 0}
     high, low = y >= 4, y <= 2
     clear = high | low
-    # Match raw_ranking_metrics: ties share one descending stable order.
-    order = np.argsort(-scores, kind='stable')
-    top = order[:min(20, n)]
-    bottom = order[-min(20, n):]
+    top20_high_count, top20_high_rate = tail_metrics_at_k(scores, high, k=20, lowest=False)
+    bottom20_low_count, bottom20_low_rate = tail_metrics_at_k(scores, low, k=20, lowest=True)
+    _, top20_mean_rating = tail_metrics_at_k(scores, y, k=20, lowest=False)
+    _, bottom20_mean_rating = tail_metrics_at_k(scores, y, k=20, lowest=True)
     out = {
         'n': int(n), 'high_count': int(high.sum()), 'low_count': int(low.sum()),
         'auc_high_4plus': auc(high, scores),
         'auc_low_2or_less_reversed': auc(low, -scores),
         'auc_high_vs_low_excluding_neutral': auc(high[clear], scores[clear]),
-        'top20_high_count': int(high[top].sum()),
-        'top20_high_rate': float(high[top].mean()),
-        'bottom20_low_count': int(low[bottom].sum()),
-        'bottom20_low_rate': float(low[bottom].mean()),
-        'top20_mean_rating': float(y[top].mean()),
-        'bottom20_mean_rating': float(y[bottom].mean()),
+        'top20_high_count': top20_high_count,
+        'top20_high_rate': top20_high_rate,
+        'bottom20_low_count': bottom20_low_count,
+        'bottom20_low_rate': bottom20_low_rate,
+        'top20_mean_rating': top20_mean_rating,
+        'bottom20_mean_rating': bottom20_mean_rating,
     }
     if calibrated is not None:
         out['calibrated_star_mae'] = float(np.mean(np.abs(np.asarray(calibrated) - y)))
@@ -518,11 +518,11 @@ def temporal_halves(records, indexes, y, current_scores, candidate_scores):
 def author_slices(records, items, indexes, y, current_scores, candidate_scores):
     seen = []
     for index in indexes:
-        author = book_identity('', items[index].get('author', ''))
+        author = book_author_identity_key(items[index].get('author', ''))
         current_day = index
-        known = any(
+        known = bool(author and author != 'unknown author') and any(
             records[j][0].date() < records[current_day][0].date()
-            and book_identity('', items[j].get('author', '')) == author
+            and book_author_identity_key(items[j].get('author', '')) == author
             for j in range(index)
         )
         seen.append(known)
