@@ -665,7 +665,15 @@ async def lifespan(app):
                 # A broken profile must not prevent the rest of the installation
                 # from serving. Its worker retries initialization with backoff.
                 LOGGER.exception("Could not initialize profile %s during startup", profile_id)
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
+    if not settings.enable_background_loops:
+        yield
+        return
+    stop = asyncio.Event()
+    worker = asyncio.create_task(worker_loop(handle_job, stop))
+    scheduler = asyncio.create_task(source_scheduler_loop(stop))
+    digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop))
+    goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop))
+    backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
@@ -678,8 +686,15 @@ async def lifespan(app):
                 enqueue_job("read_metadata", dedupe=True)
         except Exception:
             LOGGER.exception("Could not queue startup work for profile %s", profile_id)
-    yield
-    stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
+    try:
+        yield
+    finally:
+        stop.set()
+        await scheduler
+        await digest_scheduler
+        await goodreads_scheduler
+        await backup_scheduler
+        await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
