@@ -1705,6 +1705,7 @@
 >
 
 <div
+  data-sticky-shell
   class="relative isolate min-h-screen overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
 >
   <header
@@ -2941,7 +2942,7 @@
                   duration: motionDuration(300),
                   delay: motionDelay(2),
                 }}
-                class="card scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
+                class="card scroll-mt-4 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
