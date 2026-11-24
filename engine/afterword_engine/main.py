@@ -107,6 +107,7 @@ from .llm_reranker import (
     clear_llm_rerank_cache,
     is_custom_llm_endpoint,
     rerank_with_llm_sync,
+    resolve_llm_rerank_credentials,
 )
 from .identity import (
     ReadIdentityIndex,
@@ -1323,18 +1324,11 @@ class LLMRerankSettingsIn(BaseModel):
         url = self.api_url.strip()
         if url:
             parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"}:
-                raise ValueError("LLM API URL must use HTTP or HTTPS")
+            if parsed.scheme != "https":
+                raise ValueError("LLM API URL must use HTTPS")
             if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
                 raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
-            normalized = _normalize_chat_url(url)
-            if parsed.scheme == "http":
-                try:
-                    validate_public_url(normalized, allow_http=True)
-                except TypeError:
-                    validate_public_url(normalized)
-                raise ValueError("LLM API URL must use HTTPS")
-            validate_public_url(normalized)
+            validate_public_url(_normalize_chat_url(url))
         if self.enabled and (not url or not self.model.strip()):
             raise ValueError("LLM reranking requires both an API URL and a model")
 
@@ -1493,12 +1487,19 @@ def _prepare_tracked_recommendations(
             learning_metadata.update(diagnostics)
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
             if has_recommended:
-                llm_cfg = effective_llm_rerank_settings(connection, private)
-                llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
-                if llm_active:
-                    read_rows, llm_events = _load_llm_rerank_inputs(
-                        connection, interaction_events
+                try:
+                    llm_cfg = effective_llm_rerank_settings(connection, private)
+                    llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
+                    if llm_active:
+                        read_rows, llm_events = _load_llm_rerank_inputs(
+                            connection, interaction_events
+                        )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Failed to load LLM rerank inputs; serving personalized base slate: %s",
+                        safe_error_message(exc),
                     )
+                    llm_active = False
         except Exception:
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
@@ -1545,6 +1546,7 @@ def _prepare_tracked_recommendations(
         "limit": limit,
         "offset": offset,
         "recommended_limit": recommended_limit,
+        "identity_context": identity_context,
         "include_imported": include_imported,
         "ranking_at": ranking_at,
         "can_personalize": can_personalize,
@@ -1594,15 +1596,24 @@ def _complete_tracked_recommendations(
             if recommended:
                 if prepared["llm_active"]:
                     llm_cfg = prepared["llm_cfg"]
-                    recommended, llm_diag = rerank_with_llm_sync(
-                        prepared["read_rows"],
-                        recommended,
-                        interaction_events=prepared["llm_events"],
-                        profile_id=prepared["profile_id"],
-                        api_url=llm_cfg["api_url"],
-                        api_key=llm_cfg["api_key"],
-                        model=llm_cfg["model"],
-                    )
+                    unreranked_recommended = [dict(item) for item in recommended]
+                    try:
+                        recommended, llm_diag = rerank_with_llm_sync(
+                            prepared["read_rows"],
+                            recommended,
+                            interaction_events=prepared["llm_events"],
+                            profile_id=prepared["profile_id"],
+                            api_url=llm_cfg["api_url"],
+                            api_key=llm_cfg["api_key"],
+                            model=llm_cfg["model"],
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "LLM reranker failed; preserving personalized slate: %s",
+                            safe_error_message(exc),
+                        )
+                        recommended = unreranked_recommended
+                        llm_diag = {"applied": False, "reason": "fallback"}
                     learning_metadata["llm_rerank"] = llm_diag
                 # Apply bounded anti-redundancy swaps after LLM score adjustments.
                 diversified, discovery_metadata = diversify_discovery_slate(
@@ -1644,6 +1655,7 @@ def _complete_tracked_recommendations(
                 limit=limit,
                 offset=offset,
                 recommended_limit=recommended_limit,
+                identity_context=prepared["identity_context"],
                 include_imported=prepared["include_imported"],
             )
             learning_metadata = {
@@ -2813,32 +2825,28 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
         raise HTTPException(400, safe_error_message(exc)) from exc
     current = private_settings()
     if payload.clear_api_key:
-        api_key = ""
+        profile_api_key = ""
     elif payload.api_key is None or not payload.api_key.strip():
-        api_key = (current.get("llm_rerank_api_key") or "").strip()
+        profile_api_key = (current.get("llm_rerank_api_key") or "").strip()
     else:
-        api_key = payload.api_key.strip()
+        profile_api_key = payload.api_key.strip()
 
     cleaned_url = payload.api_url.strip()
-    custom_url = is_custom_llm_endpoint(cleaned_url)
-    if custom_url and not api_key and (payload.enabled or not payload.clear_api_key):
-        raise HTTPException(
-            400, "A profile API key is required for custom LLM endpoint URLs"
-        )
-    active_profile = current_profile_id()
-    can_use_host_default_key = (
-        not custom_url
-        and active_profile in (None, "legacy")
-        and bool(settings.llm_rerank_api_key.strip())
+    effective_url, effective_key = resolve_llm_rerank_credentials(
+        cleaned_url, profile_api_key
     )
-    if payload.enabled and not (api_key or can_use_host_default_key):
+    if payload.enabled and not effective_key:
+        if is_custom_llm_endpoint(effective_url):
+            raise HTTPException(
+                400, "A profile API key is required for custom LLM endpoint URLs"
+            )
         raise HTTPException(400, "An API key is required when LLM reranking is enabled")
     values = {
         "llm_rerank_enabled": "1" if payload.enabled else "0",
         "llm_rerank_provider": payload.provider.strip(),
         "llm_rerank_api_url": cleaned_url,
         "llm_rerank_model": payload.model.strip(),
-        "llm_rerank_api_key": api_key,
+        "llm_rerank_api_key": profile_api_key,
     }
     with transaction() as con:
         for key, value in values.items():
@@ -2849,7 +2857,7 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    clear_llm_rerank_cache(active_profile or "legacy")
+    clear_llm_rerank_cache(current_profile_id() or "legacy")
     return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
 
 
@@ -3266,14 +3274,10 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
         if "llm_rerank_enabled" in private
         else bool(settings.llm_rerank_enabled)
     )
-    profile_url = (private.get("llm_rerank_api_url") or "").strip()
-    profile_key = (private.get("llm_rerank_api_key") or "").strip()
-    api_url = profile_url or settings.llm_rerank_api_url
-    if is_custom_llm_endpoint(profile_url):
-        # Custom profile URLs must never inherit default host credentials.
-        api_key = profile_key
-    else:
-        api_key = profile_key or settings.llm_rerank_api_key
+    api_url, api_key = resolve_llm_rerank_credentials(
+        private.get("llm_rerank_api_url"),
+        private.get("llm_rerank_api_key"),
+    )
     return {
         "enabled": enabled,
         "provider": private.get("llm_rerank_provider", ""),
@@ -3287,13 +3291,12 @@ def safe_llm_rerank_settings(connection=None, private=None) -> dict:
     if private is None:
         private = private_settings(connection)
     effective = effective_llm_rerank_settings(connection, private)
-    profile_key = (private.get("llm_rerank_api_key") or "").strip()
     return {
         "enabled": effective["enabled"],
         "provider": effective["provider"],
         "api_url": effective["api_url"],
         "model": effective["model"],
-        "api_key_set": bool(profile_key),
+        "api_key_set": bool(effective["api_key"]),
     }
 
 
