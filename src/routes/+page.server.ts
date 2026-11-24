@@ -247,6 +247,36 @@ const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
 };
+async function handleCsvImport(request: Request) {
+  let incoming: FormData;
+  try {
+    incoming = await request.formData();
+  } catch (error) {
+    if (isPayloadTooLarge(error)) {
+      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+    }
+    throw error;
+  }
+  const file = incoming.get("file");
+  if (!(file instanceof File) || file.size === 0)
+    return fail(400, { message: "Choose a Goodreads or StoryGraph CSV export." });
+  if (file.size > GOODREADS_CSV_MAX_BYTES)
+    return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
+  const body = new FormData();
+  body.set("file", file, file.name);
+  try {
+    const result = await engine<{ imported: number; source?: string }>(
+      "/api/import/csv",
+      { method: "POST", body },
+    );
+    const provider =
+      result.source === "storygraph_csv" ? "The StoryGraph" : "Goodreads";
+    const noun = result.imported === 1 ? "book" : "books";
+    return { message: `Imported ${result.imported} ${noun} from ${provider}.` };
+  } catch (error) {
+    return fail(engineStatus(error), { message: message(error) });
+  }
+}
 export const actions: Actions = {
   createBackup: async () => {
     try {
@@ -595,32 +625,11 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
+  importCsv: async ({ request }) => {
+    return handleCsvImport(request);
+  },
   importGoodreadsCsv: async ({ request }) => {
-    let incoming: FormData;
-    try {
-      incoming = await request.formData();
-    } catch (error) {
-      if (isPayloadTooLarge(error)) {
-        return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
-      }
-      throw error;
-    }
-    const file = incoming.get("file");
-    if (!(file instanceof File) || file.size === 0)
-      return fail(400, { message: "Choose a Goodreads CSV export." });
-    if (file.size > GOODREADS_CSV_MAX_BYTES)
-      return fail(413, { message: GOODREADS_CSV_LIMIT_MESSAGE });
-    const body = new FormData();
-    body.set("file", file, file.name);
-    try {
-      const result = await engine<{ imported: number }>(
-        "/api/import/goodreads/csv",
-        { method: "POST", body },
-      );
-      return { message: `Imported ${result.imported} Goodreads books.` };
-    } catch (error) {
-      return fail(engineStatus(error), { message: message(error) });
-    }
+    return handleCsvImport(request);
   },
   configureLibrar: async ({ request }) => {
     const data = await request.formData();
