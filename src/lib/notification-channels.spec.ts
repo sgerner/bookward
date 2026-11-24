@@ -98,4 +98,108 @@ describe('split notification channels', () => {
 
 		channels.destroy();
 	});
+
+	it('keeps hover and focus pause active when a new transient notice replaces an existing one', () => {
+		const channels = createNotificationChannels();
+
+		channels.announceSuccess('First notice.');
+		channels.setPointerInside(true);
+		vi.advanceTimersByTime(2000);
+
+		channels.announceError('Second notice while pointer is still inside.');
+		expect(channels.getState().transientNotice).toMatchObject({
+			message: 'Second notice while pointer is still inside.',
+			error: true
+		});
+
+		// Must remain visible indefinitely while pointer stays inside.
+		vi.advanceTimersByTime(TRANSIENT_ERROR_DISMISS_MS * 3);
+		expect(channels.getState().transientNotice?.message).toBe(
+			'Second notice while pointer is still inside.'
+		);
+
+		// Once pointer leaves, the full error dismiss window runs before auto-dismiss.
+		channels.setPointerInside(false);
+		vi.advanceTimersByTime(TRANSIENT_ERROR_DISMISS_MS - 1);
+		expect(channels.getState().transientNotice?.message).toBe(
+			'Second notice while pointer is still inside.'
+		);
+		vi.advanceTimersByTime(1);
+		expect(channels.getState().transientNotice).toBeNull();
+
+		channels.destroy();
+	});
+
+	it('routes error form payloads carrying undo_id or undo_decisions to transientNotice instead of undoBanner', () => {
+		const channels = createNotificationChannels();
+
+		channels.applyForm({
+			error: true,
+			message: 'Could not save decision.',
+			id: 19,
+			undo_id: 104,
+			undo_label: 'shortlisting this book'
+		});
+
+		expect(channels.getState().undoBanner).toBeNull();
+		expect(channels.getState().transientNotice).toMatchObject({
+			message: 'Could not save decision.',
+			error: true
+		});
+
+		channels.applyForm({
+			error: true,
+			message: 'Could not shortlist selected books.',
+			undo_decisions: [{ id: 7, decision_id: 21 }],
+			undo_label: 'shortlisting 1 book'
+		});
+
+		expect(channels.getState().undoBanner).toBeNull();
+		expect(channels.getState().transientNotice).toMatchObject({
+			message: 'Could not shortlist selected books.',
+			error: true
+		});
+
+		channels.destroy();
+	});
+
+	it('tracks batch undo_decisions from bulk shortlist, narrows when one book is marked read, and clears by key', () => {
+		const channels = createNotificationChannels();
+
+		channels.applyForm({
+			message: '2 books added to your shortlist.',
+			undo_decisions: [
+				{ id: 7, decision_id: 21 },
+				{ id: 8, decision_id: 22 }
+			],
+			undo_label: 'shortlisting 2 books'
+		});
+
+		expect(channels.getState().undoBanner).toEqual({
+			key: 'undo-21-22',
+			decisions: [
+				{ id: 7, decision_id: 21 },
+				{ id: 8, decision_id: 22 }
+			],
+			id: undefined,
+			undo_id: undefined,
+			message: '2 books added to your shortlist.',
+			undo_label: 'shortlisting 2 books'
+		});
+
+		channels.clearUndoForBook(7);
+		expect(channels.getState().undoBanner).toEqual({
+			key: 'undo-22',
+			decisions: [{ id: 8, decision_id: 22 }],
+			id: 8,
+			undo_id: 22,
+			message: '2 books added to your shortlist.',
+			undo_label: 'shortlisting 2 books'
+		});
+
+		channels.clearUndoKey('undo-22');
+		expect(channels.getState().undoBanner).toBeNull();
+
+		channels.destroy();
+	});
 });

@@ -104,7 +104,6 @@ export function createNotificationChannels(
 		const trimmed = message.trim();
 		if (!trimmed) return;
 		clearTimer();
-		resetPauseFlags();
 		const id = ++nextId;
 		transientNotice = { id, message: trimmed, error };
 		currentDelay = error ? errorDismissMs : dismissMs;
@@ -118,23 +117,25 @@ export function createNotificationChannels(
 			if (form === lastForm) return;
 			lastForm = form;
 			if (!form?.message || !form.message.trim()) return;
-			const decisions: UndoDecisionItem[] = form.undo_decisions?.length
-				? form.undo_decisions
-				: form.undo_id && form.id
-					? [{ id: form.id, decision_id: form.undo_id }]
-					: [];
-			if (decisions.length) {
-				const single = decisions.length === 1 ? decisions[0] : undefined;
-				undoBanner = {
-					key: `undo-${decisions.map((item) => item.decision_id).join('-')}`,
-					decisions,
-					id: single?.id ?? form.id,
-					undo_id: single?.decision_id ?? form.undo_id,
-					message: form.message.trim(),
-					undo_label: form.undo_label
-				};
-				emit();
-				return;
+			if (!form.error) {
+				const decisions: UndoDecisionItem[] = form.undo_decisions?.length
+					? form.undo_decisions
+					: form.undo_id && form.id
+						? [{ id: form.id, decision_id: form.undo_id }]
+						: [];
+				if (decisions.length) {
+					const single = decisions.length === 1 ? decisions[0] : undefined;
+					undoBanner = {
+						key: `undo-${decisions.map((item) => item.decision_id).join('-')}`,
+						decisions,
+						id: single?.id ?? form.id,
+						undo_id: single?.decision_id ?? form.undo_id,
+						message: form.message.trim(),
+						undo_label: form.undo_label
+					};
+					emit();
+					return;
+				}
 			}
 			showTransient(form.message, Boolean(form.error));
 		},

@@ -24,7 +24,6 @@
     KeyRound,
     Library,
     Link2,
-    LogOut,
     Mail,
     MessageCircle,
     RefreshCw,
@@ -39,6 +38,9 @@
     X,
   } from "@lucide/svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import DiscoverLoadMoreFooter from "#lib/components/DiscoverLoadMoreFooter.svelte";
+  import LogoutMenuForm from "#lib/components/LogoutMenuForm.svelte";
+  import MarkReadErrorAlert from "#lib/components/MarkReadErrorAlert.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
@@ -47,6 +49,10 @@
   import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
+  import {
+    createLogoutSubmit,
+    createMarkReadSubmit,
+  } from "#lib/reader-form-actions.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
@@ -149,7 +155,6 @@
   const DECISION_PAGE_SIZE = 24;
   const FILTER_DEBOUNCE_MS = 180;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
-  let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
   let unfilteredDiscoverOffset = $state(0);
   let unfilteredDiscoverHasMore = $state(false);
@@ -996,84 +1001,28 @@
   }
 
   function submitMarkRead(bookId: number): SubmitFunction {
-    const key = `shortlist-read-${bookId}`;
-    return ({ formData, submitter }) => {
-      markReadError = "";
-      withPending(key, true);
-      let change: OptimisticChange | void;
-      try {
-        change = optimisticShortlistRead(formData);
-      } catch {
-        change = undefined;
-      }
-      return async ({ update, result }) => {
-        const succeeded = result.type === "success" || result.type === "redirect";
-        let failed = !succeeded;
-        const rollback = () => {
-          try {
-            change?.rollback?.();
-          } catch {
-            // A rollback must never obscure the action result.
-          }
-        };
-        try {
-          if (!succeeded) {
-            rollback();
-            markReadError = actionResultMessage(result);
-            return;
-          }
-          await update({ reset: false });
-          readingHistory = [];
-          readingHistoryState = "idle";
-          notifications.clearUndoForBook(bookId);
-          change?.commit?.();
-        } catch (error) {
-          failed = true;
-          rollback();
-          markReadError =
-            error instanceof Error
-              ? error.message
-              : "The request could not be completed. Your change was reverted.";
-        } finally {
-          withPending(key, false);
-          if (failed && submitter instanceof HTMLElement) {
-            await tick();
-            const dialogNode = submitter.closest('[role="dialog"]');
-            if (
-              submitter.isConnected &&
-              dialogNode &&
-              !dialogNode.contains(document.activeElement)
-            ) {
-              submitter.focus({ preventScroll: true });
-            }
-          }
-        }
-      };
-    };
+    return createMarkReadSubmit({
+      bookId,
+      setError: (message) => {
+        markReadError = message;
+      },
+      setPending: withPending,
+      startOptimistic: optimisticShortlistRead,
+      onSuccess: () => {
+        readingHistory = [];
+        readingHistoryState = "idle";
+        notifications.clearUndoForBook(bookId);
+      },
+    });
   }
 
-  const submitLogout: SubmitFunction = () => {
-    withPending("logout", true);
-    return async ({ update, result }) => {
-      const succeeded = result.type === "success" || result.type === "redirect";
-      try {
-        profileMenuOpen = false;
-        if (!succeeded) {
-          announceActionError(actionResultMessage(result, "Sign-out could not be completed."));
-          return;
-        }
-        window.dispatchEvent(new CustomEvent("bookward:logout"));
-        await update();
-      } catch (error) {
-        profileMenuOpen = false;
-        announceActionError(
-          error instanceof Error ? error.message : "Sign-out could not be completed.",
-        );
-      } finally {
-        withPending("logout", false);
-      }
-    };
-  };
+  const submitLogout: SubmitFunction = createLogoutSubmit({
+    setPending: (pending) => withPending("logout", pending),
+    closeMenu: () => {
+      profileMenuOpen = false;
+    },
+    announceError: announceActionError,
+  });
 
   function setPending(
     key: string,
@@ -2111,39 +2060,6 @@
       digestMode = false;
     }
   });
-
-  $effect(() => {
-    const sentinel = loadMoreSentinel;
-    const canLoadMore = hasMoreDiscoverBooks;
-    const loading = discoverLoading;
-    const pending = filteredDiscoverPending;
-    const hasError = Boolean(discoverLoadError);
-    const visibleCount = discoverViewVisibleBooks.length;
-    const serverOffset = hasActiveDiscoverFilter
-      ? filteredDiscoverOffset
-      : unfilteredDiscoverOffset;
-    void visibleCount;
-    void serverOffset;
-    if (
-      !sentinel ||
-      !canLoadMore ||
-      loading ||
-      pending ||
-      hasError ||
-      typeof IntersectionObserver === "undefined"
-    )
-      return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting) && !discoverLoading && !discoverLoadError) {
-          void loadMoreDiscover();
-        }
-      },
-      { rootMargin: "240px 0px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  });
   function handleLibrarrMediaTypeChange(event: Event) {
     const nextMediaType: MediaType =
       (event.currentTarget as HTMLSelectElement).value === "ebook"
@@ -2530,10 +2446,11 @@
               {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
               <ThemePicker compact />
             </div>
-            <form method="POST" action="/auth/logout" use:enhance={submitLogout} class="border-t border-surface-300-700/40 pt-2">
-              <ProfileField profileId={data.user?.profile_id} />
-              <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit" disabled={isPending("logout")} aria-busy={isPending("logout")}>{#if isPending("logout")}<RefreshCw size={17} class="animate-spin" aria-hidden="true" />{:else}<LogOut size={17} aria-hidden="true" />{/if}Sign out</button>
-            </form>
+            <LogoutMenuForm
+              profileId={data.user?.profile_id}
+              pending={isPending("logout")}
+              onSubmit={submitLogout}
+            />
           {/snippet}
         </PopoverDialog>
       </div>
@@ -2626,50 +2543,54 @@
             {/key}
           {/if}
           {#if transientNotice}
-            {#key transientNotice.id}
-              <div
-                in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
-                out:fly={{ x: 16, duration: motionDuration(170) }}
-                class={`pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${transientIsError ? "border-error-500/25" : "border-success-500/25"}`}
-                role="group"
-                aria-label={transientIsError ? "Action error notification" : "Action success notification"}
-                onpointerenter={() => notifications.setPointerInside(true)}
-                onpointerleave={() => notifications.setPointerInside(false)}
-                onfocusin={() => notifications.setFocusInside(true)}
-                onfocusout={onNotificationFocusOut}
-              >
-                <span
-                  aria-hidden="true"
-                  class={`absolute inset-y-0 left-0 w-1 ${transientIsError ? "bg-error-500" : "bg-success-500"}`}
-                ></span>
-                <div class="flex items-start gap-3 pl-1">
+            <div
+              class="pointer-events-auto w-full max-w-md"
+              role="group"
+              aria-label={transientIsError ? "Action error notification" : "Action success notification"}
+              onpointerenter={() => notifications.setPointerInside(true)}
+              onpointerleave={() => notifications.setPointerInside(false)}
+              onfocusin={() => notifications.setFocusInside(true)}
+              onfocusout={onNotificationFocusOut}
+            >
+              {#key transientNotice.id}
+                <div
+                  in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+                  out:fly={{ x: 16, duration: motionDuration(170) }}
+                  class={`relative w-full overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${transientIsError ? "border-error-500/25" : "border-success-500/25"}`}
+                >
                   <span
-                    class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${transientIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
                     aria-hidden="true"
-                  >
-                    {#if transientIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
-                  </span>
-                  <div class="min-w-0 flex-1">
-                    <p
-                      class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${transientIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                    class={`absolute inset-y-0 left-0 w-1 ${transientIsError ? "bg-error-500" : "bg-success-500"}`}
+                  ></span>
+                  <div class="flex items-start gap-3 pl-1">
+                    <span
+                      class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${transientIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
+                      aria-hidden="true"
                     >
-                      {transientIsError ? "Action needs attention" : "All set"}
-                    </p>
-                    <p class="leading-relaxed text-surface-900-100">
-                      {transientNotice.message}
-                    </p>
+                      {#if transientIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
+                    </span>
+                    <div class="min-w-0 flex-1">
+                      <p
+                        class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${transientIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                      >
+                        {transientIsError ? "Action needs attention" : "All set"}
+                      </p>
+                      <p class="leading-relaxed text-surface-900-100">
+                        {transientNotice.message}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                      aria-label="Dismiss notification"
+                      onclick={() => notifications.dismissTransient()}
+                    >
+                      <X size={15} />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
-                    aria-label="Dismiss notification"
-                    onclick={() => notifications.dismissTransient()}
-                  >
-                    <X size={15} />
-                  </button>
                 </div>
-              </div>
-            {/key}
+              {/key}
+            </div>
           {/if}
         </div>
       {/if}
@@ -2960,10 +2881,15 @@
                   </button>
                 </form>{/if}
               </div>{/if}{/each}
-          {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if discoverLoadError}<p class="text-sm text-error-600-400" role="alert">{discoverLoadError}</p>{/if}
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
-            </div>{/if}
+          {#if viewHasMoreDiscoverBooks}
+            <DiscoverLoadMoreFooter
+              observeEnabled={hasMoreDiscoverBooks && !filteredDiscoverPending}
+              loading={discoverLoading}
+              error={discoverLoadError}
+              resetKey={`${discoverViewVisibleBooks.length}:${hasActiveDiscoverFilter ? filteredDiscoverOffset : unfilteredDiscoverOffset}`}
+              onLoadMore={loadMoreDiscover}
+            />
+          {/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
               {#if decisionsLoadError}<p class="text-sm text-error-600-400" role="alert">{decisionsLoadError}</p>{/if}
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
@@ -4721,16 +4647,10 @@
 
             <p id="mark-read-description" class="mt-5 max-w-md text-sm leading-6 text-surface-700-300">Add this book to your read history. You can leave a rating now, or keep the moment unrated.</p>
 
-            {#if markReadError}
-              <div
-                in:fly={{ y: -8, duration: motionDuration(180) }}
-                class="mt-5 flex items-start gap-2 rounded-xl border border-error-500/30 preset-tonal-error p-3 text-sm"
-                role="alert"
-              >
-                <TriangleAlert size={16} class="mt-0.5 shrink-0" />
-                <span>{markReadError}</span>
-              </div>
-            {/if}
+            <MarkReadErrorAlert
+              message={markReadError}
+              transitionDuration={motionDuration(180)}
+            />
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">
