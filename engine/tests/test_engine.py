@@ -34,6 +34,7 @@ from afterword_engine.ingestion import (
     enrich_goodreads_blog_items,
     fetch_bytes,
     filter_source_items,
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     normalize_source_filters,
@@ -3913,3 +3914,111 @@ def test_migration_27_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monke
     assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 4
     assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 1
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+
+
+def test_storygraph_csv_imports_completed_books_fractional_ratings_dates_and_isbns(database):
+    payload = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        '"This Is How You Lose the Time War","Amal El-Mohtar, Max Gladstone",,9781534431003,hardcover,read,2024/01/01,2024/01/18,2024/01/05-2024/01/18,4.75\n'
+        '"A Canticle for Leibowitz","Walter M. Miller, Jr.",,0553273817,paperback,read,2023/06/01,,2021/03/01-2021/03/10; 2023/06/02-2023/06/19,4.25\n'
+        '"Indie Digital Book",Solo Writer,,B08FHBV4ZX,digital,read,2024/02/01,,2024/02/10-,3.5\n'
+        '"UUID Edition",Another Writer,,a1b2c3d4-e5f6-4789-abcd-ef0123456789,audio,read,2024/03/01,2024-03-15,,\n'
+    ).encode("utf-8")
+
+    result = import_csv(payload)
+    assert result == {"imported": 4, "source": "storygraph_csv"}
+
+    imported_rows = rows(
+        "SELECT title, author, rating, read_at, isbn, source "
+        "FROM reads WHERE source='storygraph_csv' ORDER BY title"
+    )
+    assert imported_rows == [
+        {
+            "title": "A Canticle for Leibowitz",
+            "author": "Walter M. Miller, Jr.",
+            "rating": 4.25,
+            "read_at": "2023/06/19",
+            "isbn": "9780553273816",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "Indie Digital Book",
+            "author": "Solo Writer",
+            "rating": 3.5,
+            "read_at": None,
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar, Max Gladstone".split(",")[0],
+            "rating": 4.75,
+            "read_at": "2024/01/18",
+            "isbn": "9781534431003",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "UUID Edition",
+            "author": "Another Writer",
+            "rating": None,
+            "read_at": "2024-03-15",
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+    ]
+
+
+def test_invalid_storygraph_rating_rolls_back_all_rows(database):
+    payload = (
+        "Title,Authors,Read Status,Star Rating\n"
+        "First Book,Writer One,read,4.5\n"
+        "Out Of Range,Writer Two,read,5.25\n"
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="CSV row 3.*Out Of Range.*No books were imported"):
+        import_csv(payload)
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='storygraph_csv'")["count"] == 0
+
+
+def test_unsupported_csv_headers_name_supported_formats(database):
+    payload = b"Heading,Writer,Rating\nSome Book,Someone,4\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(payload)
+    calibre_like = b"Title,Authors,Publisher\nSome Book,Someone,Press\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(calibre_like)
+
+
+def test_csv_upload_routes_handle_storygraph_and_goodreads(database):
+    storygraph_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Piranesi,Susanna Clarke,9781635575637,read,2025/08/12,4.75\n"
+    ).encode("utf-8")
+    goodreads_csv_bytes = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Dune,Frank Herbert,5,2025/07/01,read\n"
+    ).encode("utf-8")
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        sg_res = client.post(
+            "/api/import/csv",
+            files={"file": ("storygraph.csv", storygraph_csv, "text/csv")},
+        )
+        assert sg_res.status_code == 200
+        assert sg_res.json()["imported"] == 1
+        assert sg_res.json()["source"] == "storygraph_csv"
+        assert sg_res.json()["job_id"]
+
+        gr_res = client.post(
+            "/api/import/goodreads/csv",
+            files={"file": ("goodreads.csv", goodreads_csv_bytes, "text/csv")},
+        )
+        assert gr_res.status_code == 200
+        assert gr_res.json()["imported"] == 1
+        assert gr_res.json()["source"] == "goodreads_csv"
+
+        bad_res = client.post(
+            "/api/import/csv",
+            files={"file": ("other.csv", b"Name,Price\nTea,5\n", "text/csv")},
+        )
+        assert bad_res.status_code == 400
+        assert "StoryGraph" in bad_res.json()["detail"]

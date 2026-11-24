@@ -33,6 +33,7 @@ from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from . import ingestion
 from .ingestion import (
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     validate_goodreads_rss_url,
@@ -2497,16 +2498,29 @@ async def download_librarr(payload: LibrarrDownloadIn):
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
-@app.post("/api/import/goodreads/csv")
-async def goodreads_csv(file: UploadFile = File(...)):
+async def _import_csv_upload(file: UploadFile):
     content = bytearray()
     while chunk := await file.read(1024 * 1024):
         content.extend(chunk)
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
-    try: count = import_goodreads_csv(bytes(content))
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
+    try: result = import_csv(bytes(content))
+    except ValueError as exc: raise HTTPException(400, safe_error_message(exc))
     enqueue_job("read_work_identities", dedupe=True)
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+    return {
+        "imported": result["imported"],
+        "source": result["source"],
+        "job_id": enqueue_job("score", dedupe=True),
+    }
+
+
+@app.post("/api/import/csv")
+async def reading_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
+
+
+@app.post("/api/import/goodreads/csv")
+async def goodreads_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
 
 
 async def _sync_goodreads_rss(url: str):
