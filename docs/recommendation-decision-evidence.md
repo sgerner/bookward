@@ -16,34 +16,35 @@ older telemetry rows.
 
 Each successful scoring job now writes an immutable batch containing the exact
 rated-read rows and vectors passed to the scorer, the full read identity
-projection used for exclusion, active `goodreads_shelf_items` rows (`to-read`
-and `currently-reading`), candidate scorer inputs and vectors, runtime source
-hashes/dependency versions across all twenty ranking and evidence modules, and
-both the pre-boost `base_score` and post-shelf `score` and explanations written
-by that job. A candidate row points to the batch that produced its current
-materialized score. Serving evidence checks that pointer against the stored
-score and book identity, and separately reports whether the candidate's
-serving-time embedding document still matches the original scorer input. A
-later description or genre edit can make inputs stale while the archived batch
-still reproduces the historical score. Archive loaders and replay helpers accept
-both legacy schema v1 and extended schema v2 snapshots. Scores without a valid
-complete batch link remain `unknown`, `incomplete`, or `partial`; a serving run
-is complete when its own online stages are replayable, regardless of older
+projection used for exclusion, candidate-scoped `to_read_candidate_ids` (recording
+only which scored candidates in that batch matched the Goodreads `to-read` shelf,
+without copying raw shelf titles, authors, or ISBNs), candidate scorer inputs and
+vectors, runtime source hashes/dependency versions across all twenty ranking and
+evidence modules, and both the pre-boost `base_score` and post-shelf `score` and
+explanations written by that job. A candidate row points to the batch that
+produced its current materialized score. Serving evidence checks that pointer
+against the stored score and book identity, and separately reports whether the
+candidate's serving-time embedding document still matches the original scorer
+input. A later description or genre edit can make inputs stale while the archived
+batch still reproduces the historical score. Archive loaders and replay helpers
+accept both legacy schema v1 and extended schema v2 snapshots. Scores without a
+valid complete batch link remain `unknown`, `incomplete`, or `partial`; a serving
+run is complete when its own online stages are replayable, regardless of older
 unlinked base scores. Runtime source hashes identify installed pipeline files
 when no deployment build ID is available; they are not a substitute for a build
 artifact.
 
 Evidence is local to the profile database and may contain book descriptions,
-interaction history, shelf items, and actual vector bytes. It does not copy
-session IDs, API keys, bearer tokens, raw endpoint userinfo/query credentials,
-or general settings. Capture is bounded to 5,000 rows in
+interaction history, and actual vector bytes. It does not copy unscored Goodreads
+shelf contents, session IDs, API keys, bearer tokens, URL paths/queries/fragments
+or userinfo on LLM endpoints (persisting only scheme/host/port origin), or
+general settings. Capture is bounded to 5,000 rows in
 each candidate pool, 5,000 interaction events, 6,000 vectors, 8,192 dimensions
 per vector, 32 MiB of vector bytes, and 8 MiB of serialized evidence per run.
 Served exposures, archived events, and outcomes have per-run caps of 5,000,
-2,000, and 2,000 rows. A scoring batch is capped at 10,000 history rows, 10,000
-shelf rows, 5,000 candidate inputs/outputs, 15,000 vectors, 8,192 dimensions per
-vector, 64 MiB of vector bytes, and 16 MiB of serialized evidence. Both serving
-and scoring
+2,000, and 2,000 rows. A scoring batch is capped at 10,000 history rows, 5,000
+candidate inputs/outputs, 15,000 vectors, 8,192 dimensions per vector, 64 MiB of
+vector bytes, and 16 MiB of serialized evidence. Both serving and scoring
 evidence share a profile-wide 512 MiB logical budget that includes payloads,
 deduplicated vector bytes, reference rows, exposure/event/outcome data, and
 scoring-batch read links. If a cap or budget is reached, scoring still writes
@@ -65,7 +66,12 @@ read-history rows, pass their IDs as `read_ids=[...]`; each scoring batch that
 copied any selected read is removed as a unit, including its candidate score
 links and read/candidate vectors. Passing `read_ids=[...]` also removes scoring
 batches indexed by those IDs, serving runs linked to those batches, and
-first-party read event/outcome copies keyed to the selected ID. This is a
+first-party read event/outcome copies keyed to the selected ID. When Goodreads
+shelf items are removed during shelf re-import or deleted/reset explicitly, pass
+`shelf_items=[...]` or `clear_goodreads_shelves=True` to
+`purge_recommendation_evidence` in the same transaction; this removes every
+scoring batch and serving run that recorded shelf-derived boosts or explanations
+for the removed shelf items while preserving user feedback rows. This is a
 targeted cleanup helper, not a complete library-history privacy reset: legacy
 or unlinked serving snapshots and materialized scores/explanations may still
 reflect that history. A library or profile history reset must

@@ -65,7 +65,8 @@ POOL_FIELDS = (
 )
 PROFILE_FIELDS = (
     "id", "candidate_id", "event_type", "value", "occurred_at", "title",
-    "author", "genres", "description", "release_date", "first_publication_year",
+    "author", "genres", "description", "release_date", "date_kind",
+    "first_publication_year", "publication_work_id",
 )
 REQUEST_FIELDS = (
     "status", "limit", "offset", "recommended_limit", "build_id",
@@ -186,7 +187,7 @@ def _safe_identifier(value: Any, *, fallback: str = "unknown") -> str:
 
 
 def _safe_endpoint_url(value: Any) -> str:
-    """Return a credential-free HTTP(S) endpoint URL without query or fragment."""
+    """Return a credential-free HTTP(S) endpoint origin without path, query, or fragment."""
 
     if not isinstance(value, str):
         return ""
@@ -205,8 +206,7 @@ def _safe_endpoint_url(value: Any) -> str:
     host = f"[{hostname}]" if ":" in hostname else hostname.lower()
     if port is not None:
         host = f"{host}:{port}"
-    path = parsed.path.rstrip("/")
-    sanitized = f"{scheme}://{host}{path}"
+    sanitized = f"{scheme}://{host}"
     return sanitized if len(sanitized) <= 256 else ""
 
 
@@ -1476,12 +1476,27 @@ def replay_decision_evidence(record_or_decision: Mapping[str, Any]) -> dict[str,
         if bool(fatigue_cfg.get("enabled", False)):
             raw_counts = fatigue_stage.get("visible_day_counts") or {}
             counts = {int(cid): int(days) for cid, days in raw_counts.items()}
+            grace_raw = fatigue_cfg.get("grace_days")
+            penalty_raw = fatigue_cfg.get("penalty_per_day")
+            max_penalty_raw = fatigue_cfg.get("max_penalty")
             replayed_personalized, fatigue_diag = apply_impression_fatigue(
                 replayed_personalized,
                 counts,
-                grace_days=int(fatigue_cfg.get("grace_days", 3)),
-                penalty_per_day=float(fatigue_cfg.get("penalty_per_day", 0.75)),
-                max_penalty=float(fatigue_cfg.get("max_penalty", 4.5)),
+                grace_days=(
+                    int(settings.impression_fatigue_grace_days)
+                    if grace_raw is None
+                    else int(grace_raw)
+                ),
+                penalty_per_day=(
+                    float(settings.impression_fatigue_penalty_per_day)
+                    if penalty_raw is None
+                    else float(penalty_raw)
+                ),
+                max_penalty=(
+                    float(settings.impression_fatigue_max_penalty)
+                    if max_penalty_raw is None
+                    else float(max_penalty_raw)
+                ),
             )
 
     policy = decision.get("policy") or {}
@@ -1759,12 +1774,50 @@ def archive_recommendation_outcome(
         return False
 
 
+def _batch_payload_has_any_shelf_evidence(payload: Mapping[str, Any]) -> set[int]:
+    """Return candidate IDs carrying Goodreads shelf state inside a batch payload."""
+
+    matched_ids: set[int] = set()
+    input_selection = payload.get("input_selection")
+    if isinstance(input_selection, Mapping):
+        for raw_cid in input_selection.get("to_read_candidate_ids") or ():
+            if not isinstance(raw_cid, bool):
+                try:
+                    matched_ids.add(int(raw_cid))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    for item in payload.get("candidate_outputs") or ():
+        if not isinstance(item, Mapping):
+            continue
+        has_boost = bool(item.get("on_goodreads_to_read"))
+        if not has_boost:
+            try:
+                has_boost = float(item.get("shelf_boost") or 0.0) > 0
+            except (TypeError, ValueError, OverflowError):
+                has_boost = False
+        if not has_boost:
+            explanation = item.get("explanation")
+            has_boost = (
+                isinstance(explanation, Sequence)
+                and not isinstance(explanation, (str, bytes))
+                and "On your Goodreads to-read shelf" in explanation
+            )
+        if has_boost and item.get("candidate_id") is not None and not isinstance(item.get("candidate_id"), bool):
+            try:
+                matched_ids.add(int(item["candidate_id"]))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return matched_ids
+
+
 def purge_recommendation_evidence(
     connection,
     *,
     candidate_ids: Iterable[int] = (),
     read_ids: Iterable[int] = (),
     run_ids: Iterable[str] = (),
+    shelf_items: Iterable[Mapping[str, Any]] = (),
+    clear_goodreads_shelves: bool = False,
     clear_scoring_batches: bool = False,
     clear_all_evidence: bool = False,
 ) -> dict[str, int]:
@@ -1775,18 +1828,32 @@ def purge_recommendation_evidence(
     artifacts. It also removes every scoring batch that scored that candidate.
     Read purge removes every scoring batch whose captured history included a
     read ID and every served run with an attributed outcome for that read.
-    `clear_scoring_batches=True` removes every scorer batch, including
-    one without candidate or read-reference rows. Whole-profile history reset
-    should use `clear_all_evidence=True` to also remove run snapshots and
-    ordinary interaction history. Callers delete live library/profile rows in
-    the same outer transaction.
+    `shelf_items` and `clear_goodreads_shelves=True` remove scoring batches and
+    serving runs that recorded Goodreads shelf boosts or shelf-derived
+    explanations without deleting user feedback rows. `clear_scoring_batches=True`
+    removes every scorer batch, including one without candidate or read-reference
+    rows. Whole-profile history reset should use `clear_all_evidence=True` to
+    also remove run snapshots and ordinary interaction history. Callers delete
+    live library/profile rows in the same outer transaction.
     """
 
     candidates = sorted({int(item) for item in candidate_ids if int(item) > 0})
     reads = sorted({int(item) for item in read_ids if int(item) > 0})
     selected_runs = {str(item) for item in run_ids if item}
-    if not candidates and not reads and not selected_runs and not clear_scoring_batches and not clear_all_evidence:
-        raise ValueError("Candidate IDs, read IDs, run IDs, or clear_scoring_batches are required")
+    shelf_rows = [dict(item) for item in shelf_items if isinstance(item, Mapping)]
+    if (
+        not candidates
+        and not reads
+        and not selected_runs
+        and not shelf_rows
+        and not clear_goodreads_shelves
+        and not clear_scoring_batches
+        and not clear_all_evidence
+    ):
+        raise ValueError(
+            "Candidate IDs, read IDs, run IDs, shelf items, clear_goodreads_shelves, "
+            "or clear_scoring_batches are required"
+        )
     if clear_all_evidence:
         selected_runs.update(
             str(row["id"])
@@ -1822,6 +1889,151 @@ def purge_recommendation_evidence(
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
 
     scoring_batch_ids: set[str] = set()
+    if (shelf_rows or clear_goodreads_shelves) and not clear_all_evidence:
+        from .identity import book_row_identity_match_keys
+
+        matched_shelf_candidate_ids: set[int] = set()
+        shelf_identity_hashes: set[str] = set()
+        if clear_goodreads_shelves:
+            shelf_rows.extend(
+                dict(row)
+                for row in connection.execute(
+                    "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                    "FROM goodreads_shelf_items"
+                ).fetchall()
+            )
+            for brow in connection.execute(
+                "SELECT id, payload_encoding, payload FROM scoring_batches "
+                "WHERE capture_status='complete'"
+            ).fetchall():
+                if brow["payload_encoding"] != "zlib-json" or not brow["payload"]:
+                    continue
+                try:
+                    bpayload = json.loads(zlib.decompress(bytes(brow["payload"])))
+                except Exception:
+                    continue
+                if not isinstance(bpayload, Mapping):
+                    continue
+                boosted_ids = _batch_payload_has_any_shelf_evidence(bpayload)
+                if boosted_ids or bpayload.get("goodreads_shelf_items"):
+                    scoring_batch_ids.add(str(brow["id"]))
+                    matched_shelf_candidate_ids.update(boosted_ids)
+            selected_runs.update(
+                str(row["run_id"])
+                for row in connection.execute(
+                    "SELECT DISTINCT run_id FROM recommendation_evidence_exposures "
+                    "WHERE candidate_snapshot_json LIKE '%On your Goodreads to-read shelf%'"
+                ).fetchall()
+                if row["run_id"]
+            )
+            for rrow in connection.execute(
+                "SELECT run_id, payload_encoding, payload FROM recommendation_run_evidence "
+                "WHERE capture_status='complete'"
+            ).fetchall():
+                rid = str(rrow["run_id"])
+                if rid in selected_runs or rrow["payload_encoding"] != "zlib-json" or not rrow["payload"]:
+                    continue
+                try:
+                    raw_run = zlib.decompress(bytes(rrow["payload"]))
+                except Exception:
+                    continue
+                if b"On your Goodreads to-read shelf" in raw_run:
+                    selected_runs.add(rid)
+
+        shelf_match_keys: set[tuple[str, ...]] = set()
+        for srow in shelf_rows:
+            shelf_match_keys.update(book_row_identity_match_keys(srow))
+            if srow.get("title") or srow.get("author"):
+                shelf_identity_hashes.add(
+                    _identity_hash(srow.get("title"), srow.get("author"))
+                )
+        if shelf_match_keys:
+            for crow in connection.execute(
+                "SELECT c.id, c.title, c.author, c.source_url, c.score_batch_id, "
+                "q.work_id AS quality_work_id, q.provider AS quality_provider, "
+                "q.isbn13 AS quality_isbn13, q.isbn10 AS quality_isbn10 "
+                "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
+            ).fetchall():
+                cdict = dict(crow)
+                if set(book_row_identity_match_keys(cdict)) & shelf_match_keys:
+                    matched_shelf_candidate_ids.add(int(cdict["id"]))
+                    if cdict.get("score_batch_id"):
+                        scoring_batch_ids.add(str(cdict["score_batch_id"]))
+            for brow in connection.execute(
+                "SELECT id, payload_encoding, payload FROM scoring_batches "
+                "WHERE capture_status='complete'"
+            ).fetchall():
+                bid = str(brow["id"])
+                if bid in scoring_batch_ids or brow["payload_encoding"] != "zlib-json" or not brow["payload"]:
+                    continue
+                try:
+                    bpayload = json.loads(zlib.decompress(bytes(brow["payload"])))
+                except Exception:
+                    continue
+                if not isinstance(bpayload, Mapping):
+                    continue
+                matched_in_batch = any(
+                    isinstance(legacy_srow, Mapping)
+                    and (set(book_row_identity_match_keys(legacy_srow)) & shelf_match_keys)
+                    for legacy_srow in (bpayload.get("goodreads_shelf_items") or ())
+                )
+                if not matched_in_batch:
+                    for cinput in bpayload.get("candidate_inputs") or ():
+                        if isinstance(cinput, Mapping) and (
+                            set(book_row_identity_match_keys(cinput)) & shelf_match_keys
+                        ):
+                            matched_in_batch = True
+                            if cinput.get("id") is not None and not isinstance(cinput.get("id"), bool):
+                                matched_shelf_candidate_ids.add(int(cinput["id"]))
+                if matched_in_batch:
+                    scoring_batch_ids.add(bid)
+        ordered_shelf_hashes = sorted(shelf_identity_hashes)
+        for start in range(0, len(ordered_shelf_hashes), 400):
+            hbatch = ordered_shelf_hashes[start : start + 400]
+            hmarks = ",".join("?" for _ in hbatch)
+            for sbc in connection.execute(
+                "SELECT batch_id, candidate_id FROM scoring_batch_candidates "
+                f"WHERE identity_hash IN ({hmarks})",
+                hbatch,
+            ).fetchall():
+                scoring_batch_ids.add(str(sbc["batch_id"]))
+                matched_shelf_candidate_ids.add(int(sbc["candidate_id"]))
+            selected_runs.update(
+                str(r["run_id"])
+                for r in connection.execute(
+                    "SELECT run_id FROM recommendation_run_evidence_candidates "
+                    f"WHERE identity_hash IN ({hmarks}) UNION "
+                    "SELECT run_id FROM recommendation_evidence_exposures "
+                    f"WHERE identity_hash IN ({hmarks})",
+                    (*hbatch, *hbatch),
+                ).fetchall()
+                if r["run_id"]
+            )
+        ordered_shelf_cids = sorted(matched_shelf_candidate_ids)
+        for start in range(0, len(ordered_shelf_cids), 400):
+            cbatch = ordered_shelf_cids[start : start + 400]
+            cmarks = ",".join("?" for _ in cbatch)
+            scoring_batch_ids.update(
+                str(r["batch_id"])
+                for r in connection.execute(
+                    "SELECT batch_id FROM scoring_batch_candidates "
+                    f"WHERE candidate_id IN ({cmarks})",
+                    cbatch,
+                ).fetchall()
+            )
+            selected_runs.update(
+                str(r["run_id"])
+                for r in connection.execute(
+                    "SELECT run_id FROM recommendation_run_evidence_candidates "
+                    f"WHERE candidate_id IN ({cmarks}) UNION "
+                    "SELECT run_id FROM recommendation_evidence_exposures "
+                    f"WHERE candidate_id IN ({cmarks}) UNION "
+                    "SELECT run_id FROM recommendation_impressions "
+                    f"WHERE candidate_id IN ({cmarks})",
+                    (*cbatch, *cbatch, *cbatch),
+                ).fetchall()
+                if r["run_id"]
+            )
     if candidates:
         scoring_batch_ids.update(
             str(row["batch_id"])

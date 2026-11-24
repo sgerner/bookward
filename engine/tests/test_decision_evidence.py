@@ -757,7 +757,7 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
                 ("llm_rerank_provider", "openai", 0),
                 (
                     "llm_rerank_api_url",
-                    "https://user-cred:super-secret-pass@api.example.com/v1/chat/completions?token=query-secret-999#frag",
+                    "https://user-cred:super-secret-pass@api.example.com:8443/v1/keys/path-key-token-444/chat/completions?token=query-secret-999#frag",
                     0,
                 ),
                 ("llm_rerank_api_key", seal("sk-live-super-secret-bearer-777"), 1),
@@ -847,6 +847,8 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
         assert "sk-live-super-secret-bearer-777" not in text_blob
         assert "super-secret-pass" not in text_blob
         assert "user-cred" not in text_blob
+        assert "path-key-token-444" not in text_blob
+        assert "/v1/" not in text_blob
         assert "query-secret-999" not in text_blob
         assert "frag" not in text_blob
         assert "bearer" not in text_blob.lower()
@@ -862,7 +864,7 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
     llm_stage = decision["stage_inputs"]["llm_rerank"]
     assert llm_stage["settings"]["enabled"] is True
     assert llm_stage["settings"]["configured"] is True
-    assert llm_stage["settings"]["endpoint_url"] == "https://api.example.com/v1/chat/completions"
+    assert llm_stage["settings"]["endpoint_url"] == "https://api.example.com:8443"
     assert llm_stage["settings"]["model"] == "gpt-4o-mini"
     assert llm_stage["mode"] == rerank_mode
     if rerank_mode == "adjustments":
@@ -1012,3 +1014,110 @@ def test_legacy_v1_decision_snapshot_loads_and_replays_and_rerank_cap_fails_open
     assert replayed["verification"]["matches_archived"] is True
     assert replayed["verification"]["max_score_drift"] == 0.0
 
+
+def test_replay_decision_evidence_falls_back_to_runtime_settings_for_missing_fatigue_knobs(
+    database, monkeypatch
+):
+    monkeypatch.setattr(settings, "impression_fatigue_enabled", True)
+    monkeypatch.setattr(settings, "impression_fatigue_grace_days", 2)
+    monkeypatch.setattr(settings, "impression_fatigue_penalty_per_day", 2.0)
+    monkeypatch.setattr(settings, "impression_fatigue_max_penalty", 6.0)
+
+    vector = np.asarray([0.6, 0.8, 0.0], dtype=np.float32)
+    with transaction() as con:
+        base_candidate = _candidate(con, "Custom Fatigue Book", "F. Author", score=80.0)
+        _set_embeddings(con, [base_candidate], {base_candidate["id"]: vector})
+        # With grace_days=2 and penalty_per_day=2.0, 4 visible days -> penalty 4.0 -> score 76.0
+        # (whereas hard-coded (3, 0.75, 4.5) would yield 79.25 and fail zero-drift replay).
+        penalized = {
+            **base_candidate,
+            "pre_fatigue_score": 80.0,
+            "fatigue_penalty": 4.0,
+            "fatigue_visible_days": 4,
+            "score": 76.0,
+        }
+        evidence = build_decision_evidence(
+            con,
+            base_pool=[base_candidate],
+            personalized_pool=[penalized],
+            final_pool=[penalized],
+            interaction_events=[],
+            cached_vectors={base_candidate["id"]: vector},
+            ranking_metadata={
+                "impression_fatigue": {
+                    "applied": True,
+                    "adjusted_candidates": 1,
+                    "max_penalty": 4.0,
+                }
+            },
+            discovery_slate_metadata={},
+            request_context={"ranking_at": "2026-10-02T19:37:00-07:00"},
+            impression_fatigue_settings={"enabled": True},
+            visible_day_counts={int(base_candidate["id"]): 4},
+        )
+        # Simulate a snapshot whose archived fatigue settings omitted numeric knobs.
+        evidence["stage_inputs"]["impression_fatigue"]["settings"] = {
+            "enabled": True,
+            "grace_days": None,
+            "penalty_per_day": None,
+            "max_penalty": None,
+        }
+        raw_payload = {k: v for k, v in evidence.items() if not k.startswith("_")}
+        evidence["_raw_json"] = decision_evidence_module._canonical_json(raw_payload)
+
+        run_id = "fatigue-settings-fallback-run"
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count) "
+            "VALUES(?,?,?,1)",
+            (run_id, "fixture", "v2"),
+        )
+        assert persist_run_evidence(con, run_id=run_id, evidence=evidence) == "complete"
+
+    with connect() as con:
+        loaded = load_decision_evidence(con, run_id)
+    replayed = replay_decision_evidence(loaded)
+    assert replayed["verification"]["matches_archived"] is True
+    assert replayed["verification"]["max_score_drift"] == 0.0
+    assert replayed["pools"]["personalized"][0]["score"] == 76.0
+
+
+def test_tracked_recommendations_skips_llm_settings_lookup_when_recommended_empty(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    def _forbidden_llm_settings(*args, **kwargs):
+        raise AssertionError(
+            "effective_llm_rerank_settings must not run when recommended is empty"
+        )
+
+    monkeypatch.setattr(
+        main_module, "effective_llm_rerank_settings", _forbidden_llm_settings
+    )
+
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+        saved = _candidate(con, "Saved Shelf Book", "S. Reader", score=81.0)
+        con.execute("UPDATE candidates SET status='saved' WHERE id=?", (saved["id"],))
+        saved["status"] = "saved"
+        vector = np.asarray([0.5, 0.5, 0.0], dtype=np.float32)
+        _set_embeddings(con, [saved], {saved["id"]: vector})
+
+    with connect() as con:
+        empty_recommended, empty_run = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        saved_items, saved_run = tracked_recommendations(
+            status="saved", limit=10, offset=0, connection=con
+        )
+        empty_evidence = load_decision_evidence(con, empty_run)
+
+    assert empty_recommended == []
+    assert empty_run is not None
+    assert empty_evidence["capture_status"] == "complete"
+    assert (
+        empty_evidence["decision"]["stage_inputs"]["llm_rerank"]["settings"]["enabled"]
+        is False
+    )
+    assert [item["id"] for item in saved_items] == [saved["id"]]
+    assert saved_run is not None

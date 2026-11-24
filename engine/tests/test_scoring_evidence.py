@@ -1,5 +1,6 @@
 import asyncio
 import json
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -654,6 +655,14 @@ def test_scoring_batch_archives_goodreads_shelves_and_replays_zero_drift(databas
             "INSERT INTO goodreads_shelf_items(shelf,title,author,added_at) "
             "VALUES('currently-reading','Currently Reading Hidden','C. Reader','2026-09-02')"
         )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
+            "VALUES('to-read','Never Scored Secret Title','Private Author','9780000000099','2026-09-03')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,added_at) "
+            "VALUES('currently-reading','Private Nightstand Book','Unscored Writer','2026-09-04')"
+        )
 
     assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 3
 
@@ -680,11 +689,23 @@ def test_scoring_batch_archives_goodreads_shelves_and_replays_zero_drift(databas
         assert archived["schema_version"] == SCORING_BATCH_SCHEMA_VERSION == 2
         assert archived["capture_status"] == "complete"
         decision = archived["decision"]
-        assert decision["input_selection"]["goodreads_shelf_count"] == 2
-        assert [item["shelf"] for item in decision["goodreads_shelf_items"]] == [
-            "to-read",
-            "currently-reading",
-        ]
+        assert "goodreads_shelf_items" not in decision
+        assert "goodreads_shelf_count" not in decision["input_selection"]
+        assert decision["input_selection"]["to_read_candidate_ids"] == [boosted_id]
+        raw_batch_blob = con.execute(
+            "SELECT payload FROM scoring_batches WHERE id=?", (batch_id,)
+        ).fetchone()["payload"]
+        raw_batch_json = zlib.decompress(raw_batch_blob).decode("utf-8")
+        for forbidden_shelf_text in (
+            "Never Scored Secret Title",
+            "Private Author",
+            "9780000000099",
+            "Private Nightstand Book",
+            "Unscored Writer",
+            "Currently Reading Hidden",
+            "Different Edition Title",
+        ):
+            assert forbidden_shelf_text not in raw_batch_json
         assert {
             "impression_fatigue.py",
             "llm_reranker.py",
@@ -698,6 +719,8 @@ def test_scoring_batch_archives_goodreads_shelves_and_replays_zero_drift(databas
         assert reading_id not in outputs_by_id
         boosted_out = outputs_by_id[boosted_id]
         ordinary_out = outputs_by_id[eligible_id]
+        assert boosted_out["on_goodreads_to_read"] is True
+        assert ordinary_out["on_goodreads_to_read"] is False
         assert boosted_out["score"] == boosted_row["score"]
         assert boosted_out["score"] == round(min(100.0, boosted_out["base_score"] + 10.0), 1)
         assert boosted_out["shelf_boost"] == round(
@@ -749,8 +772,8 @@ def test_scoring_batch_archives_goodreads_shelves_and_replays_zero_drift(databas
         )
 
 
-def test_legacy_v1_scoring_batch_loads_and_replays_and_shelf_cap_fails_open(
-    database, monkeypatch
+def test_legacy_v1_scoring_batch_loads_and_replays_and_rejects_raw_shelf_payloads(
+    database,
 ):
     from afterword_engine import scoring_evidence as scoring_evidence_module
 
@@ -779,31 +802,81 @@ def test_legacy_v1_scoring_batch_loads_and_replays_and_shelf_cap_fails_open(
     # Strip v2 fields to construct an authentic schema_version=1 batch payload.
     v1_ev = dict(v2_ev)
     v1_ev["schema_version"] = 1
-    v1_ev.pop("goodreads_shelf_items", None)
     v1_ev["input_selection"] = {
         k: v
         for k, v in v2_ev["input_selection"].items()
-        if k != "goodreads_shelf_count"
+        if k != "to_read_candidate_ids"
     }
     v1_ev["candidate_outputs"] = [
         {
             k: v
             for k, v in item.items()
-            if k not in {"base_score", "shelf_boost"}
+            if k not in {"base_score", "shelf_boost", "on_goodreads_to_read"}
         }
         for item in v2_ev["candidate_outputs"]
     ]
     v1_raw_payload = {k: v for k, v in v1_ev.items() if not k.startswith("_")}
     v1_ev["_raw_json"] = scoring_evidence_module._canonical_json(v1_raw_payload)
 
+    raw_shelf_ev = dict(v2_ev)
+    raw_shelf_ev["goodreads_shelf_items"] = [
+        {"shelf": "to-read", "title": "Leaked Shelf Title", "author": "Author"}
+    ]
+    raw_shelf_payload = {k: v for k, v in raw_shelf_ev.items() if not k.startswith("_")}
+    raw_shelf_ev["_raw_json"] = scoring_evidence_module._canonical_json(raw_shelf_payload)
+
+    bad_manifest_ev = dict(v2_ev)
+    bad_manifest_ev["input_selection"] = {
+        **v2_ev["input_selection"],
+        "to_read_candidate_ids": ["not-an-int"],
+    }
+    bad_manifest_payload = {
+        k: v for k, v in bad_manifest_ev.items() if not k.startswith("_")
+    }
+    bad_manifest_ev["_raw_json"] = scoring_evidence_module._canonical_json(
+        bad_manifest_payload
+    )
+
     with transaction() as con:
-        status = scoring_evidence_module.persist_scoring_batch(
-            con, batch_id="legacy-v1-batch", evidence=v1_ev
+        assert (
+            scoring_evidence_module.persist_scoring_batch(
+                con, batch_id="legacy-v1-batch", evidence=v1_ev
+            )
+            == "complete"
         )
-        assert status == "complete"
+        assert (
+            scoring_evidence_module.persist_scoring_batch(
+                con, batch_id="raw-shelf-batch", evidence=raw_shelf_ev
+            )
+            == "complete"
+        )
+        assert (
+            scoring_evidence_module.persist_scoring_batch(
+                con, batch_id="bad-manifest-batch", evidence=bad_manifest_ev
+            )
+            == "complete"
+        )
 
     with connect() as con:
         loaded_v1 = load_scoring_batch(con, "legacy-v1-batch")
+        with pytest.raises(ValueError, match="must not persist raw Goodreads shelf items"):
+            load_scoring_batch(con, "raw-shelf-batch")
+        with pytest.raises(ValueError, match="shelf match manifest is invalid"):
+            load_scoring_batch(con, "bad-manifest-batch")
+        invalid_build = build_scoring_batch_evidence(
+            con,
+            captured_at="2026-10-02T00:00:00+00:00",
+            read_history=all_reads,
+            rated_reads=rated_reads,
+            candidates=[candidate],
+            ranked=ranked,
+            read_vectors=[read_vec],
+            candidate_vectors={eligible_id: cand_vec},
+            backend="local",
+            model="test-model",
+            scoring_batch_size=SCORING_BATCH_SIZE,
+            to_read_candidate_ids=["not-an-int"],
+        )
     assert loaded_v1["schema_version"] == 1
     assert loaded_v1["capture_status"] == "complete"
     assert "goodreads_shelf_items" not in loaded_v1["decision"]
@@ -811,26 +884,305 @@ def test_legacy_v1_scoring_batch_loads_and_replays_and_shelf_cap_fails_open(
     assert replayed_v1["schema_version"] == 1
     assert replayed_v1["verification"]["matches_archived"] is True
     assert replayed_v1["verification"]["max_score_drift"] == 0.0
+    assert invalid_build["capture_status"] == "incomplete"
+    assert invalid_build["reason"] == "invalid_shelf_match_manifest"
 
-    # Shelf cap fail-open: live score + boost still succeed while batch records `shelf_limit_exceeded`.
-    with transaction() as con:
-        con.execute(
-            "INSERT INTO goodreads_shelf_items(shelf,title,author) "
-            "VALUES('to-read','A New Book','N. Writer')"
-        )
-        con.execute(
-            "INSERT INTO goodreads_shelf_items(shelf,title,author) "
-            "VALUES('to-read','Another Shelf Book','O. Writer')"
-        )
-    monkeypatch.setattr(scoring_evidence_module, "MAX_SCORING_SHELF_ITEMS", 1)
+
+def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedback_and_promoted_reads(
+    database, monkeypatch
+):
+    from afterword_engine import ingestion
+    from afterword_engine.ingestion import import_goodreads_rss, import_goodreads_shelves
+    from afterword_engine.main import tracked_recommendations
+
+    _rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+
+    # First score `eligible_id` before any Goodreads shelves exist so we have a clean non-shelf batch & run.
     assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
     with connect() as con:
-        row = con.execute(
-            "SELECT score,explanation,score_batch_id FROM candidates WHERE id=?",
-            (eligible_id,),
-        ).fetchone()
-        assert "On your Goodreads to-read shelf" in json.loads(row["explanation"])
-        batch_record = load_scoring_batch(con, row["score_batch_id"])
-        assert batch_record["capture_status"] == "incomplete"
-        assert batch_record["reason"] == "shelf_limit_exceeded"
+        clean_served, clean_run_id = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        clean_batch_id = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (eligible_id,)
+        ).fetchone()[0]
+    assert [item["id"] for item in clean_served] == [eligible_id]
+    assert clean_run_id is not None
+    assert clean_batch_id is not None
 
+    # Next add two Goodreads to-read shelf items: one matched via ISBN ("Different Edition Title")
+    # and one that will be promoted to `reads` ("Promoted Soon"), plus an unscored shelf item.
+    with transaction() as con:
+        boosted_id = _candidate(con, "Shelf Boosted Target", "S. Shelf")
+        promoted_id = _candidate(con, "Promoted Soon", "P. Writer")
+        con.execute(
+            "UPDATE candidate_quality SET isbn13='9780593135204' WHERE candidate_id=?",
+            (boosted_id,),
+        )
+        _store_vector(
+            con,
+            "candidate",
+            boosted_id,
+            _served_candidate(con, boosted_id),
+            [0.75, 0.35, 0.15],
+        )
+        _store_vector(
+            con,
+            "candidate",
+            promoted_id,
+            _served_candidate(con, promoted_id),
+            [0.72, 0.32, 0.18],
+        )
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
+            "VALUES(?,?,?,?,?)",
+            [
+                (
+                    "to-read",
+                    "Different Edition Title",
+                    "S. Shelf",
+                    "9780593135204",
+                    "2026-09-01",
+                ),
+                ("to-read", "Promoted Soon", "P. Writer", None, "2026-09-02"),
+                (
+                    "to-read",
+                    "Unscored Shelf Entry",
+                    "U. Author",
+                    "9780000000111",
+                    "2026-09-03",
+                ),
+            ],
+        )
+
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 3
+    with connect() as con:
+        shelf_served, shelf_run_id = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        shelf_batch_id = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (boosted_id,)
+        ).fetchone()[0]
+    with transaction() as con:
+        # Record a visible impression on `promoted_id` and a user `save` feedback row on `boosted_id`.
+        con.execute(
+            "UPDATE recommendation_impressions SET visible_at=presented_at "
+            "WHERE run_id=? AND candidate_id=?",
+            (shelf_run_id, promoted_id),
+        )
+        con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            (boosted_id, "save"),
+        )
+    assert shelf_batch_id != clean_batch_id
+    assert {item["id"] for item in shelf_served} >= {boosted_id, promoted_id}
+
+    # Promoting `Promoted Soon` onto `reads` removes it from `goodreads_shelf_items`
+    # while keeping its attributed `shelf_run_id` intact.
+    promoted_rss = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Promoted Soon</title>
+        <author_name>P. Writer</author_name>
+        <user_rating>5</user_rating>
+        <user_read_at>2026/12/01</user_read_at>
+      </item>
+    </channel></rss>"""
+
+    async def fake_read_rss(url: str, **kwargs):
+        return promoted_rss, "application/rss+xml"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_read_rss)
+    assert (
+        asyncio.run(
+            import_goodreads_rss(
+                "https://www.goodreads.com/review/list_rss/12345?key=test&shelf=read"
+            )
+        )
+        == 1
+    )
+    with connect() as con:
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (shelf_run_id,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT run_id FROM recommendation_evidence_outcomes WHERE candidate_id=?",
+                (promoted_id,),
+            ).fetchone()["run_id"]
+            == shelf_run_id
+        )
+
+    # Now reset both Goodreads shelves to empty feeds (user deleted their shelf items).
+    empty_rss = b"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel></channel></rss>"""
+
+    async def fake_empty_shelves(url: str, **kwargs):
+        return empty_rss, "application/xml"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_empty_shelves)
+    counts = asyncio.run(
+        import_goodreads_shelves(
+            "https://www.goodreads.com/review/list_rss/12345?key=test&shelf=read"
+        )
+    )
+    assert counts == {"to-read": 0, "currently-reading": 0}
+
+    with connect() as con:
+        assert (
+            con.execute("SELECT COUNT(*) FROM goodreads_shelf_items").fetchone()[0] == 0
+        )
+        # Shelf-derived scoring batch & run were purged on shelf reset.
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (shelf_batch_id,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (shelf_run_id,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT score_batch_id FROM candidates WHERE id=?", (boosted_id,)
+            ).fetchone()[0]
+            is None
+        )
+        # Unrelated non-shelf batch & run remain intact, and user `save` feedback is preserved.
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (clean_batch_id,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (clean_run_id,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM feedback WHERE candidate_id=? AND action='save'",
+                (boosted_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        clean_only_budget = con.execute(
+            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+        ).fetchone()[0]
+        assert clean_only_budget > 0
+
+    # Verify `clear_goodreads_shelves=True` also purges shelf-boosted evidence even after
+    # `goodreads_shelf_items` and the candidate row itself have already been deleted.
+    with transaction() as con:
+        promoted_read = con.execute(
+            "SELECT * FROM reads WHERE title='Promoted Soon'"
+        ).fetchone()
+        _store_vector(con, "read", promoted_read["id"], dict(promoted_read), [0.72, 0.32, 0.18])
+        con.execute("UPDATE candidates SET status='new', score=0.0 WHERE id=?", (boosted_id,))
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn) "
+            "VALUES('to-read','Different Edition Title','S. Shelf','9780593135204')"
+        )
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 2
+    with connect() as con:
+        _, second_shelf_run = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+    assert second_shelf_run is not None
+
+    with transaction() as con:
+        con.execute("DELETE FROM goodreads_shelf_items")
+        con.execute("DELETE FROM feedback WHERE candidate_id=?", (boosted_id,))
+        con.execute("DELETE FROM candidates WHERE id=?", (boosted_id,))
+        purged = purge_recommendation_evidence(con, clear_goodreads_shelves=True)
+        assert purged["scoring_batches_removed"] == 1
+        assert purged["runs_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+            ).fetchone()[0]
+            == clean_only_budget
+        )
+
+
+def test_scoring_batch_payload_and_budget_have_zero_growth_with_large_goodreads_shelf(
+    database,
+):
+    _rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
+    with connect() as con:
+        baseline_batch = con.execute(
+            "SELECT id, payload_bytes, length(payload) AS compressed_bytes "
+            "FROM scoring_batches"
+        ).fetchone()
+        baseline_budget = con.execute(
+            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+        ).fetchone()[0]
+
+    with transaction() as con:
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,openlibrary_work_id,added_at) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                (
+                    "to-read" if idx % 3 else "currently-reading",
+                    f"Unscored Shelf Volume {idx:04d}: Extended Edition Subtitle",
+                    f"Shelf Author {idx:04d}",
+                    f"979123456{idx:04d}",
+                    f"OL{100000 + idx}W",
+                    "2026-09-15",
+                )
+                for idx in range(2_500)
+            ],
+        )
+
+    batch_metrics: list[tuple[int, int]] = []
+    for idx in range(3):
+        with transaction() as con:
+            # Re-score the exact same `eligible_id` candidate against the 2,500-item shelf
+            # so payload sizes are directly comparable byte-for-byte.
+            con.execute(
+                "UPDATE candidates SET status='new', score=0.0, score_batch_id=NULL WHERE id=?",
+                (eligible_id,),
+            )
+            if idx == 2:
+                cand_row = con.execute(
+                    "SELECT title, author FROM candidates WHERE id=?", (eligible_id,)
+                ).fetchone()
+                con.execute(
+                    "INSERT INTO goodreads_shelf_items(shelf,title,author) VALUES('to-read',?,?)",
+                    (cand_row["title"], cand_row["author"]),
+                )
+        assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
+        with connect() as con:
+            batch_id = con.execute(
+                "SELECT score_batch_id FROM candidates WHERE id=?", (eligible_id,)
+            ).fetchone()[0]
+            row = con.execute(
+                "SELECT payload_bytes, length(payload) AS compressed_bytes "
+                "FROM scoring_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            batch_metrics.append((int(row["payload_bytes"]), int(row["compressed_bytes"])))
+
+    # Unmatched batches with 2,500 shelf items have literally zero shelf-induced payload growth
+    # (only timestamps differ, which are fixed-width ISO strings), and a matched batch adds
+    # only the integer candidate ID + boost explanation (~40 bytes uncompressed).
+    assert batch_metrics[0][0] == int(baseline_batch["payload_bytes"])
+    assert batch_metrics[1][0] == int(baseline_batch["payload_bytes"])
+    assert abs(batch_metrics[2][0] - int(baseline_batch["payload_bytes"])) <= 64
+    with connect() as con:
+        final_budget = con.execute(
+            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+        ).fetchone()[0]
+    # Total budget across all 4 batches stays under a few KiB rather than ~4x 2,500 shelf dumps.
+    assert final_budget < baseline_budget * 5
+    assert final_budget < 20_000

@@ -33,7 +33,6 @@ SCORING_BATCH_SCHEMA_VERSION = 2
 SUPPORTED_SCORING_BATCH_SCHEMA_VERSIONS = frozenset({1, 2})
 MAX_SCORING_READS = 10_000
 MAX_SCORING_CANDIDATES = 5_000
-MAX_SCORING_SHELF_ITEMS = 10_000
 MAX_SCORING_VECTORS = 15_000
 MAX_SCORING_VECTOR_DIMENSIONS = 8_192
 MAX_SCORING_VECTOR_BYTES = 64 * 1024 * 1024
@@ -56,9 +55,6 @@ CANDIDATE_FIELDS = (
     "quality_status", "quality_score", "catalog_confidence", "quality_work_id",
     "quality_provider", "quality_isbn13", "quality_isbn10", "score_batch_id",
     "first_publication_year", "publication_work_id",
-)
-SHELF_ITEM_FIELDS = (
-    "id", "shelf", "title", "author", "isbn", "openlibrary_work_id", "added_at",
 )
 
 
@@ -162,14 +158,16 @@ def build_scoring_batch_evidence(
     backend: str,
     model: str,
     scoring_batch_size: int,
-    goodreads_shelf_items: Iterable[Mapping[str, Any]] = (),
+    to_read_candidate_ids: Iterable[int] | None = None,
+    goodreads_shelf_items: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build replay inputs for the exact inputs and outputs written by a scorer job.
 
     The active scorer's result is a materialized score. This artifact stores
     both the complete read identity projection used for eligibility and the
     rated reads, candidate inputs, exact vectors, and outputs passed/written
-    by that particular invocation.
+    by that particular invocation, plus candidate-scoped `to_read_candidate_ids`
+    without copying raw Goodreads shelf contents.
     """
 
     read_count = len(read_history) if hasattr(read_history, "__len__") else 0
@@ -180,9 +178,6 @@ def build_scoring_batch_evidence(
         reads = _bounded_list(rated_reads, MAX_SCORING_READS, "read_limit_exceeded")
         candidate_items = _bounded_list(candidates, MAX_SCORING_CANDIDATES, "candidate_limit_exceeded")
         ranked_items = _bounded_list(ranked, MAX_SCORING_CANDIDATES, "candidate_limit_exceeded")
-        shelf_items = _bounded_list(
-            goodreads_shelf_items, MAX_SCORING_SHELF_ITEMS, "shelf_limit_exceeded"
-        )
         if len(all_reads) > MAX_SCORING_READS:
             raise _LimitError("read_limit_exceeded")
         if len(candidate_items) > MAX_SCORING_CANDIDATES or len(ranked_items) > MAX_SCORING_CANDIDATES:
@@ -207,12 +202,53 @@ def build_scoring_batch_evidence(
         rated_read_ids = [int(item["id"]) for item in reads]
         rated_read_snapshots = [_snapshot(item, READ_FIELDS) for item in reads]
         candidate_snapshots = [_snapshot(item, CANDIDATE_FIELDS) for item in candidate_items]
-        shelf_snapshots = []
-        for srow in shelf_items:
-            snap = _snapshot(srow, SHELF_ITEM_FIELDS)
-            if snap.get("shelf") not in {"to-read", "currently-reading"}:
-                raise _LimitError("invalid_shelf_item")
-            shelf_snapshots.append(snap)
+
+        if to_read_candidate_ids is not None:
+            raw_matched = _bounded_list(
+                to_read_candidate_ids, MAX_SCORING_CANDIDATES, "candidate_limit_exceeded"
+            )
+            matched_to_read_set: set[int] = set()
+            for raw_cid in raw_matched:
+                if isinstance(raw_cid, bool):
+                    raise _LimitError("invalid_shelf_match_manifest")
+                try:
+                    cid = int(raw_cid)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise _LimitError("invalid_shelf_match_manifest") from exc
+                if cid not in candidate_vector_ids:
+                    raise _LimitError("invalid_shelf_match_manifest")
+                matched_to_read_set.add(cid)
+        elif goodreads_shelf_items is not None:
+            from .identity import book_row_identity_match_keys
+
+            to_read_keys: set[tuple[str, ...]] = set()
+            for srow in goodreads_shelf_items:
+                if not isinstance(srow, Mapping) or srow.get("shelf") not in {
+                    "to-read",
+                    "currently-reading",
+                }:
+                    raise _LimitError("invalid_shelf_item")
+                if srow.get("shelf") == "to-read":
+                    to_read_keys.update(book_row_identity_match_keys(srow))
+            matched_to_read_set = {
+                cid
+                for cid in candidate_ids
+                if set(book_row_identity_match_keys(by_candidate[cid])) & to_read_keys
+            }
+        else:
+            matched_to_read_set = set()
+            for cid in candidate_ids:
+                out = output_by_id[cid]
+                if bool(out.get("on_goodreads_to_read")):
+                    matched_to_read_set.add(cid)
+                    continue
+                try:
+                    if float(out.get("shelf_boost") or 0.0) > 0:
+                        matched_to_read_set.add(cid)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        matched_to_read_ids = sorted(matched_to_read_set)
+
         outputs = []
         candidate_descriptors = {}
         for candidate_id in candidate_ids:
@@ -245,6 +281,7 @@ def build_scoring_batch_evidence(
                     "base_score": base_score,
                     "score": score,
                     "shelf_boost": shelf_boost,
+                    "on_goodreads_to_read": candidate_id in matched_to_read_set,
                     "metadata_confidence": metadata_confidence,
                     "explanation": _json_value(output.get("explanation") or []),
                     **({"publication_era": _json_value(output["publication_era"])}
@@ -364,11 +401,10 @@ def build_scoring_batch_evidence(
                     "current_verified_openlibrary_read_work_id"
                 ),
                 "candidate_count": len(candidate_items),
-                "goodreads_shelf_count": len(shelf_snapshots),
+                "to_read_candidate_ids": matched_to_read_ids,
             },
             "read_history": read_snapshots,
             "read_identity_projection": read_identity,
-            "goodreads_shelf_items": shelf_snapshots,
             # Preserve the exact records passed to rank_candidates separately
             # from the full-history identity exclusion projection.
             "rated_read_inputs": rated_read_snapshots,
@@ -653,17 +689,21 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
     ):
         raise ValueError("Unsupported scoring batch schema")
     if schema_version >= 2:
-        shelf_items = payload.get("goodreads_shelf_items")
+        if "goodreads_shelf_items" in payload:
+            raise ValueError("Scoring batch must not persist raw Goodreads shelf items")
+        input_selection = payload.get("input_selection")
+        to_read_ids = (
+            input_selection.get("to_read_candidate_ids")
+            if isinstance(input_selection, dict)
+            else None
+        )
         if (
-            not isinstance(shelf_items, list)
-            or len(shelf_items) > MAX_SCORING_SHELF_ITEMS
-            or any(
-                not isinstance(item, dict)
-                or item.get("shelf") not in {"to-read", "currently-reading"}
-                for item in shelf_items
-            )
+            not isinstance(to_read_ids, list)
+            or len(to_read_ids) > MAX_SCORING_CANDIDATES
+            or any(isinstance(cid, bool) or not isinstance(cid, int) for cid in to_read_ids)
+            or len(set(to_read_ids)) != len(to_read_ids)
         ):
-            raise ValueError("Scoring batch Goodreads shelf manifest is invalid")
+            raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
     vectors = []
     for descriptor in payload.get("vectors", []):
         if not isinstance(descriptor, dict):
@@ -727,6 +767,9 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
     if len(expected) != len(outputs) or expected != actual:
         raise ValueError("Scoring batch candidate outputs do not match immutable links")
     if schema_version >= 2:
+        to_read_id_set = set(payload["input_selection"]["to_read_candidate_ids"])
+        if not to_read_id_set.issubset(expected):
+            raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
         for item in outputs:
             try:
                 base_score = float(item["base_score"])
@@ -735,6 +778,11 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
                 raise ValueError("Scoring batch base-score manifest is invalid") from exc
             if not math.isfinite(base_score) or not math.isfinite(shelf_boost):
                 raise ValueError("Scoring batch base-score manifest is invalid")
+            if "on_goodreads_to_read" in item and (
+                not isinstance(item["on_goodreads_to_read"], bool)
+                or item["on_goodreads_to_read"] != (int(item["candidate_id"]) in to_read_id_set)
+            ):
+                raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
     input_by_id = {
         int(item["id"]): item
         for item in payload.get("candidate_inputs", [])
@@ -782,9 +830,8 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
 
 
 def replay_scoring_batch(record_or_decision: Mapping[str, Any]) -> dict[str, Any]:
-    """Deterministically replay a scoring batch archive including Goodreads shelf boosts."""
+    """Deterministically replay a scoring batch archive including candidate-scoped shelf boosts."""
 
-    from .identity import book_row_identity_match_keys
     from .ranking import rank_candidates
 
     if not isinstance(record_or_decision, Mapping):
@@ -817,40 +864,38 @@ def replay_scoring_batch(record_or_decision: Mapping[str, Any]) -> dict[str, Any
         vector_map[("candidate", int(item["id"]))] for item in candidate_inputs
     ]
 
-    shelf_items = decision.get("goodreads_shelf_items") if schema_version >= 2 else ()
-    to_read_keys: set[tuple[str, ...]] = set()
-    currently_reading_keys: set[tuple[str, ...]] = set()
-    for srow in shelf_items or ():
-        if not isinstance(srow, Mapping):
-            continue
-        target = (
-            currently_reading_keys
-            if srow.get("shelf") == "currently-reading"
-            else to_read_keys
-        )
-        target.update(book_row_identity_match_keys(srow))
+    input_selection = decision.get("input_selection")
+    input_selection = input_selection if isinstance(input_selection, Mapping) else {}
+    raw_to_read_ids = (
+        input_selection.get("to_read_candidate_ids") if schema_version >= 2 else ()
+    )
+    to_read_ids = {
+        int(cid)
+        for cid in (raw_to_read_ids or ())
+        if not isinstance(cid, bool)
+    }
 
     ranked = rank_candidates(
         rated_reads, read_vectors, candidate_inputs, candidate_vectors
     )
     replayed_outputs: list[dict[str, Any]] = []
     for candidate in ranked:
-        cand_keys = set(book_row_identity_match_keys(candidate))
-        if cand_keys & currently_reading_keys:
-            continue
+        cid = int(candidate["id"])
         base_score = float(candidate["score"])
         score = base_score
         explanation = list(candidate.get("explanation") or [])
-        if cand_keys & to_read_keys:
+        on_to_read = cid in to_read_ids
+        if on_to_read:
             score = round(min(100.0, base_score + 10.0), 1)
             if "On your Goodreads to-read shelf" not in explanation:
                 explanation.insert(0, "On your Goodreads to-read shelf")
         replayed_outputs.append(
             {
-                "candidate_id": int(candidate["id"]),
+                "candidate_id": cid,
                 "base_score": base_score,
                 "score": score,
                 "shelf_boost": round(score - base_score, 1),
+                "on_goodreads_to_read": on_to_read,
                 "metadata_confidence": float(candidate["metadata_confidence"]),
                 "explanation": explanation,
                 **(
