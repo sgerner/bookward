@@ -442,7 +442,7 @@ async def _open_library_match(
             "opening_sentence": opening_sentence,
             "genres": genres,
             "identifiers": projected_identifiers,
-            "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+            "publication_date": _clean_metadata_text(doc.get(release_date_source_field), 40) if release_date else "",
             "publication_date_source_field": release_date_source_field if release_date else "",
             "cover_id": str(doc.get("cover_i") or "")[:40],
         }
@@ -887,6 +887,15 @@ async def resolve_catalog_match(
                     "normalization_version": METADATA_NORMALIZATION_VERSION,
                 })
         cover_record = next((record for record in metadata_records if record.get("cover_url")), None)
+        # Intentional precedence reversal over pure precision ranking: bounded
+        # Open Library work dates (first_publish_date / first_publish_year,
+        # storing year-only dates as YYYY-01-01 with date_kind="year") rank
+        # ahead of day-precision edition dates (Google publishedDate, Apple
+        # releaseDate), with day > month > year tie-breaking within each tier.
+        # On undated candidates, this populates original work provenance for
+        # attach_publication_years -> ranking.py era fitting and feeds original
+        # era keys via release_date in interaction_personalization._book_features,
+        # while _store_result leaves existing source dates untouched.
         date_rank = {"day": 3, "month": 2, "year": 1}
         date_record = max(
             (record for record in metadata_records if record.get("release_date")),
@@ -1210,33 +1219,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     )
     release_date = _text(result.get("release_date"), 32)
     existing_release_date = _text(candidate.get("release_date"), 32)
-    existing_date_kind = str(candidate.get("date_kind") or "").strip().lower()
-    has_verified_work_date = bool(
-        release_date
-        and str(result.get("release_date_provider") or "") == "openlibrary"
-        and str(result.get("release_date_source_field") or "") in {"first_publish_date", "first_publish_year"}
-    )
-    release_provenance_providers = {
-        str(prov_row["provider"] or "").strip().lower()
-        for prov_row in con.execute(
-            "SELECT provider FROM metadata_field_provenance "
-            "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
-            (candidate_id,),
-        ).fetchall()
-    } if existing_release_date and has_verified_work_date else set()
-    replacing_source_release_date = bool(
-        existing_release_date
-        and has_verified_work_date
-        and existing_date_kind not in {"manual", "demo", "catalog"}
-        and not (release_provenance_providers - {"source"})
-        and (
-            existing_date_kind == "source"
-            or release_provenance_providers == {"source"}
-        )
-    )
-    store_release_date = bool(
-        release_date and (not existing_release_date or replacing_source_release_date)
-    )
+    store_release_date = bool(release_date and not existing_release_date)
     release_date_kind = str(result.get("release_date_kind") or "catalog") if store_release_date else ""
     existing_genres = candidate.get("genres", "[]")
     if isinstance(existing_genres, str):
@@ -1341,12 +1324,6 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             "cover_url": ("cover_provider", "cover_provider_id"),
             "release_date": ("release_date_provider", "release_date_provider_id"),
         }
-        if replacing_source_release_date:
-            con.execute(
-                "DELETE FROM metadata_field_provenance "
-                "WHERE entity_type='candidate' AND entity_id=? AND field='release_date' AND provider='source'",
-                (candidate_id,),
-            )
         for field, provider, provider_id in selected_fields:
             provider_key, provider_id_key = field_provider_keys[field]
             persist_metadata_field_provenance(

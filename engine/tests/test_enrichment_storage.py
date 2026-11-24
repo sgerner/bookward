@@ -948,25 +948,52 @@ def test_genre_filter_enriches_untagged_items_and_never_replaces_real_cover(data
     assert candidate["cover_url"] == "https://images.example.com/real.jpg"
 
 
-def test_scan_source_preserves_verified_release_date_and_provenance_hash_on_rescan(database, monkeypatch):
+def test_scan_source_preserves_verified_release_date_and_applies_feed_corrections(database, monkeypatch):
     import hashlib
     from afterword_engine.database import connect, persist_metadata_field_provenance
     from afterword_engine.publication_year_metadata import attach_publication_years
 
-    title = "Murder on the Orient Express"
-    author = "Agatha Christie"
+    classic_title = "Murder on the Orient Express"
+    classic_author = "Agatha Christie"
     work_id = "/works/OL471579W"
     verified_date = "1934-01-01"
     expected_sha = hashlib.sha256(verified_date.encode("utf-8")).hexdigest()
 
+    mixed_title = "Death on the Nile"
+    mixed_work_id = "/works/OL471580W"
+    mixed_date = "1937-01-01"
+    mixed_sha = hashlib.sha256(mixed_date.encode("utf-8")).hexdigest()
+
+    feed_title = "Forthcoming Mystery"
+    feed_author = "Modern Crime Writer"
+    feed_date_state = ["2026-11-01", "day"]
+
     async def fake_fetch(_url):
-        return "application/json", [{
-            "title": title,
-            "author": author,
-            "release_date": "2023-12-25",
-            "date_kind": "day",
+        feed_item = {
+            "title": feed_title,
+            "author": feed_author,
             "genres": ["Mystery"],
-        }]
+        }
+        if feed_date_state[0] is not None:
+            feed_item["release_date"] = feed_date_state[0]
+            feed_item["date_kind"] = feed_date_state[1]
+        return "application/json", [
+            {
+                "title": classic_title,
+                "author": classic_author,
+                "release_date": "2023-12-25",
+                "date_kind": "day",
+                "genres": ["Mystery"],
+            },
+            {
+                "title": mixed_title,
+                "author": classic_author,
+                "release_date": "2024-06-01",
+                "date_kind": "day",
+                "genres": ["Mystery"],
+            },
+            feed_item,
+        ]
 
     async def passthrough(items):
         return items
@@ -975,81 +1002,145 @@ def test_scan_source_preserves_verified_release_date_and_provenance_hash_on_resc
     monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough)
     monkeypatch.setattr(ingestion, "enrich_book_metadata", passthrough)
 
-    normalized_key = ingestion.normalize_key(title, author)
+    classic_key = ingestion.normalize_key(classic_title, classic_author)
+    mixed_key = ingestion.normalize_key(mixed_title, classic_author)
+    feed_key = ingestion.normalize_key(feed_title, feed_author)
     with transaction() as con:
         source_id = con.execute(
             "INSERT INTO sources(name,url,filters) VALUES(?,?,?)",
             ("Mystery feed", "https://example.com/mystery", "{}"),
         ).lastrowid
-        candidate_id = con.execute(
+        classic_id = con.execute(
             "INSERT INTO candidates(title,author,release_date,date_kind,genres,source_id,status,normalized_key) "
             "VALUES(?,?,?,?,?,?,?,?)",
-            (title, author, verified_date, "year", json.dumps(["Mystery"]), source_id, "recommended", normalized_key),
+            (classic_title, classic_author, verified_date, "year", json.dumps(["Mystery"]), source_id, "recommended", classic_key),
         ).lastrowid
-        con.execute(
-            "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
-            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
-            "quality_status=excluded.quality_status,provider=excluded.provider,provider_id=excluded.provider_id,work_id=excluded.work_id",
-            (candidate_id, "accepted", 0.96, "openlibrary", work_id, work_id, "test"),
-        )
+        mixed_id = con.execute(
+            "INSERT INTO candidates(title,author,release_date,date_kind,genres,source_id,status,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (mixed_title, classic_author, mixed_date, "year", json.dumps(["Mystery"]), source_id, "recommended", mixed_key),
+        ).lastrowid
+        for cid, wid, yr, sha in (
+            (classic_id, work_id, "1934", expected_sha),
+            (mixed_id, mixed_work_id, "1937", mixed_sha),
+        ):
+            con.execute(
+                "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,provider,provider_id,work_id,audit_version) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+                "quality_status=excluded.quality_status,provider=excluded.provider,provider_id=excluded.provider_id,work_id=excluded.work_id",
+                (cid, "accepted", 0.96, "openlibrary", wid, wid, "test"),
+            )
+            persist_metadata_field_provenance(
+                con,
+                "candidate",
+                cid,
+                "release_date",
+                {
+                    "metadata_provenance": {
+                        "fields": {
+                            "release_date": {
+                                "provider": "openlibrary",
+                                "provider_id": wid,
+                                "kind": "year",
+                                "source_field": "first_publish_year",
+                                "value_sha256": sha,
+                            }
+                        },
+                        "fetch_trace": [],
+                        "source_payloads": [{
+                            "provider": "openlibrary",
+                            "provider_id": wid,
+                            "payload": {
+                                "key": wid,
+                                "title": classic_title if cid == classic_id else mixed_title,
+                                "authors": [classic_author],
+                                "publication_date": yr,
+                                "publication_date_source_field": "first_publish_year",
+                            },
+                        }],
+                    }
+                },
+                default_provider="openlibrary",
+                default_provider_id=wid,
+                default_confidence=0.96,
+            )
+        # Mixed provenance set on mixed_id: source + openlibrary.
         persist_metadata_field_provenance(
             con,
             "candidate",
-            candidate_id,
+            mixed_id,
             "release_date",
             {
                 "metadata_provenance": {
                     "fields": {
                         "release_date": {
-                            "provider": "openlibrary",
-                            "provider_id": work_id,
-                            "kind": "year",
-                            "source_field": "first_publish_year",
-                            "value_sha256": expected_sha,
+                            "provider": "source",
+                            "provider_id": str(source_id),
+                            "kind": "source_item",
                         }
                     },
                     "fetch_trace": [],
-                    "source_payloads": [{
-                        "provider": "openlibrary",
-                        "provider_id": work_id,
-                        "payload": {
-                            "key": work_id,
-                            "title": title,
-                            "authors": [author],
-                            "publication_date": "1934",
-                            "publication_date_source_field": "first_publish_year",
-                        },
-                    }],
+                    "source_payloads": [],
                 }
             },
-            default_provider="openlibrary",
-            default_provider_id=work_id,
-            default_confidence=0.96,
+            default_provider="source",
+            default_provider_id=str(source_id),
         )
 
-    assert asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source_id,)))) == 1
+    source_row = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    assert asyncio.run(ingestion.scan_source(source_row)) == 3
 
-    stored = row(
-        "SELECT id,release_date,date_kind FROM candidates WHERE id=?",
-        (candidate_id,),
+    # Initial ingest sets source-owned release_date on feed_title while keeping
+    # catalog-verified and mixed-provenance work dates intact.
+    assert row("SELECT release_date,date_kind FROM candidates WHERE normalized_key=?", (feed_key,)) == {
+        "release_date": "2026-11-01",
+        "date_kind": "day",
+    }
+
+    # Feed correction updates source-owned release_date and date_kind on rescan.
+    feed_date_state[:] = ["2027-02-01", "month"]
+    assert asyncio.run(ingestion.scan_source(source_row)) == 3
+    assert row("SELECT release_date,date_kind FROM candidates WHERE normalized_key=?", (feed_key,)) == {
+        "release_date": "2027-02-01",
+        "date_kind": "month",
+    }
+    feed_prov = rows(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=(SELECT id FROM candidates WHERE normalized_key=?) "
+        "AND field='release_date'",
+        (feed_key,),
     )
-    assert stored["release_date"] == "1934-01-01"
-    assert stored["date_kind"] == "year"
+    assert [item["provider"] for item in feed_prov] == ["source"]
 
-    prov_rows = rows(
-        "SELECT provider,provider_id,source_payload FROM metadata_field_provenance "
-        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
-        (candidate_id,),
+    # Feed rescan omitting release_date preserves the corrected source date.
+    feed_date_state[:] = [None, ""]
+    assert asyncio.run(ingestion.scan_source(source_row)) == 3
+    assert row("SELECT release_date,date_kind FROM candidates WHERE normalized_key=?", (feed_key,)) == {
+        "release_date": "2027-02-01",
+        "date_kind": "month",
+    }
+
+    stored_classic = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (classic_id,))
+    stored_mixed = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (mixed_id,))
+    assert stored_classic["release_date"] == "1934-01-01"
+    assert stored_classic["date_kind"] == "year"
+    assert stored_mixed["release_date"] == "1937-01-01"
+    assert stored_mixed["date_kind"] == "year"
+
+    mixed_prov = rows(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date' ORDER BY provider",
+        (mixed_id,),
     )
-    assert len(prov_rows) == 1
-    assert prov_rows[0]["provider"] == "openlibrary"
-    assert json.loads(prov_rows[0]["source_payload"])["field_provenance"]["value_sha256"] == expected_sha
+    assert [item["provider"] for item in mixed_prov] == ["openlibrary", "source"]
 
-    mutable = [dict(stored)]
+    mutable = [dict(stored_classic), dict(stored_mixed)]
     with connect() as con:
         attach_publication_years(con, [], mutable)
     assert mutable[0]["first_publication_year"] == 1934
     assert mutable[0]["publication_work_id"] == work_id
+    assert mutable[1]["first_publication_year"] == 1937
+    assert mutable[1]["publication_work_id"] == mixed_work_id
 
 
 def test_migration_adds_enrichment_storage_without_changing_existing_user_data(tmp_path):

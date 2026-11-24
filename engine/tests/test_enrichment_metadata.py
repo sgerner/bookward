@@ -755,14 +755,88 @@ def test_openlibrary_release_date_provenance_tracks_actual_source_field(
         assert payload["publication_date_source_field"] == source_field
 
 
+def test_quality_release_date_ranking_preserves_openlibrary_year_precision():
+    requested_isbn = "9780307474278"
+    seen_queries: list[tuple[str, dict[str, list[str]]]] = []
+
+    def handler(request):
+        seen_queries.append((request.url.host, parse_qs(request.url.query.decode())))
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": "/works/OLYEARPRECISION",
+                    "title": "Precision Book",
+                    "author_name": ["A Writer"],
+                    "isbn": [requested_isbn],
+                    # Polluted future work year (< 2100) must be rejected rather
+                    # than outranking Google's verified day-precision date; omit
+                    # cover_i too so existing_fields_complete=True proves title
+                    # fallback is suppressed.
+                    "first_publish_year": 2099,
+                    "description": "Open Library synopsis.",
+                    "subject": ["Fiction"],
+                }]},
+            )
+        if request.url.host == "www.googleapis.com":
+            return httpx.Response(
+                200,
+                json={"items": [{
+                    "id": "google-day-precision",
+                    "volumeInfo": {
+                        "title": "Precision Book",
+                        "authors": ["A Writer"],
+                        "industryIdentifiers": [{"type": "ISBN_13", "identifier": requested_isbn}],
+                        "publishedDate": "2005-06-07",
+                        "description": "Google Books synopsis.",
+                        "categories": ["Fiction"],
+                    },
+                }]},
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    async def run():
+        async with _provider_client(handler) as client:
+            return await resolve_catalog_match(
+                "Precision Book",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+                existing_fields_complete=True,
+            )
+
+    match = asyncio.run(run())
+
+    assert match is not None
+    assert len(seen_queries) == 2
+    assert match["release_date"] == "2005-06-07"
+    assert match["release_date_kind"] == "day"
+    assert match["release_date_provider"] == "google_books"
+    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == "publishedDate"
+    ol_payload = next(
+        entry["payload"]
+        for entry in match["metadata_provenance"]["source_payloads"]
+        if entry["provider"] == "openlibrary"
+    )
+    assert ol_payload["publication_date"] == ""
+    assert ol_payload["publication_date_source_field"] == ""
+
+
 @pytest.mark.parametrize(
     ("ol_doc_fields", "expected_date", "expected_kind", "expected_source_field"),
     [
         ({"first_publish_year": 2010}, "2010-01-01", "year", "first_publish_year"),
         ({"first_publish_date": "1934-05"}, "1934-05-01", "month", "first_publish_date"),
+        (
+            {"first_publish_date": "2099-01-01", "first_publish_year": 1984},
+            "1984-01-01",
+            "year",
+            "first_publish_year",
+        ),
     ],
 )
-def test_quality_release_date_ranking_preserves_openlibrary_year_precision(
+def test_openlibrary_work_dates_outrank_storefront_edition_dates(
     ol_doc_fields, expected_date, expected_kind, expected_source_field
 ):
     requested_isbn = "9780307474278"
@@ -815,7 +889,15 @@ def test_quality_release_date_ranking_preserves_openlibrary_year_precision(
 
     async def run():
         async with _provider_client(handler) as client:
-            quality_match = await resolve_catalog_match(
+            complete_match = await resolve_catalog_match(
+                "Precision Book",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+                existing_fields_complete=True,
+            )
+            incomplete_match = await resolve_catalog_match(
                 "Precision Book",
                 "A Writer",
                 client=client,
@@ -829,17 +911,18 @@ def test_quality_release_date_ranking_preserves_openlibrary_year_precision(
                 isbn13=requested_isbn,
                 client=client,
             )
-            return quality_match, cover_match
+            return complete_match, incomplete_match, cover_match
 
-    match, cover_match = asyncio.run(run())
+    complete_match, match, cover_match = asyncio.run(run())
 
-    assert match is not None
-    assert match["release_date"] == expected_date
-    assert match["release_date_kind"] == expected_kind
-    assert match["release_date_provider"] == "openlibrary"
-    assert match["release_date_source_field"] == expected_source_field
-    assert match["metadata_provenance"]["fields"]["release_date"]["provider"] == "openlibrary"
-    assert match["metadata_provenance"]["fields"]["release_date"]["source_field"] == expected_source_field
+    for quality_result in (complete_match, match):
+        assert quality_result is not None
+        assert quality_result["release_date"] == expected_date
+        assert quality_result["release_date_kind"] == expected_kind
+        assert quality_result["release_date_provider"] == "openlibrary"
+        assert quality_result["release_date_source_field"] == expected_source_field
+        assert quality_result["metadata_provenance"]["fields"]["release_date"]["provider"] == "openlibrary"
+        assert quality_result["metadata_provenance"]["fields"]["release_date"]["source_field"] == expected_source_field
 
     assert cover_match["release_date"] == expected_date
     assert cover_match["date_kind"] == expected_kind

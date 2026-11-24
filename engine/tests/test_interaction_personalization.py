@@ -301,53 +301,69 @@ def test_mature_semantic_pooling_uses_asymmetric_positive_floor():
     assert diagnostics["semantic_evidence_books"] == 20
 
 
-def test_1934_work_with_2023_reissue_date_gets_pre_1950_era_and_contemporary_keeps_release_fallback():
+def test_catalog_work_date_precedence_drives_intended_era_personalization_via_release_date():
+    """Catalog resolution storing OL work dates (YYYY-01-01) feeds era keys via release_date."""
     from afterword_engine.interaction_personalization import _book_features
 
-    reissue_1934 = {
+    # Undated classic reissue after catalog resolution selects Open Library's
+    # 1934 work date ("1934-01-01", date_kind="year") over a 2023 edition date,
+    # with no serving-time first_publication_year attachment needed.
+    catalog_work_dated_reissue = {
         **candidate(401, "Mystery", 50),
-        "first_publication_year": 1934,
-        "publication_work_id": "/works/OL471579W",
+        "release_date": "1934-01-01",
+        "date_kind": "year",
+        "genres": [],
+    }
+    # Had the 2023 storefront edition date won, the same book would have been
+    # misclassified as era:2020_plus and received a positive boost instead.
+    edition_dated_counterfactual = {
+        **candidate(401, "Mystery", 50),
         "release_date": "2023-12-25",
+        "date_kind": "day",
         "genres": [],
     }
     contemporary_no_ol = {
         **candidate(402, "Mystery", 50),
-        "first_publication_year": None,
-        "publication_work_id": None,
         "release_date": "2025-05-01",
+        "date_kind": "day",
         "genres": [],
     }
 
-    assert "era:pre_1950" in _book_features(reissue_1934)
-    assert "era:2020_plus" not in _book_features(reissue_1934)
+    assert "era:pre_1950" in _book_features(catalog_work_dated_reissue)
+    assert "era:2020_plus" not in _book_features(catalog_work_dated_reissue)
+    assert "era:2020_plus" in _book_features(edition_dated_counterfactual)
     assert "era:2020_plus" in _book_features(contemporary_no_ol)
 
     events = []
     for index in range(10):
         events.append({
             **interaction(index + 1, "save", f"Unique contemporary {index}"),
-            "first_publication_year": None,
             "release_date": "2025-05-01",
         })
     for index in range(10):
         events.append({
             **interaction(index + 11, "reject", f"Unique classic {index}"),
-            "first_publication_year": 1934,
-            "release_date": "2023-12-25",
+            "release_date": "1934-01-01",
         })
 
     ranked, diagnostics = personalize_recommendations(
-        [reissue_1934, contemporary_no_ol],
+        [catalog_work_dated_reissue, contemporary_no_ol],
+        events,
+        now=NOW,
+    )
+    counterfactual_ranked, _ = personalize_recommendations(
+        [edition_dated_counterfactual, contemporary_no_ol],
         events,
         now=NOW,
     )
 
     assert diagnostics["applied"] is True
     by_id = {item["id"]: item for item in ranked}
+    counterfactual_by_id = {item["id"]: item for item in counterfactual_ranked}
     assert [item["id"] for item in ranked] == [402, 401]
     assert by_id[402]["score"] > 50
     assert by_id[401]["score"] < 50
+    assert counterfactual_by_id[401]["score"] > 50
     assert any("publication era" in text for text in by_id[401]["explanation"])
     assert any("publication era" in text for text in by_id[402]["explanation"])
 

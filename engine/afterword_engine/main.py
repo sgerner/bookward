@@ -1372,28 +1372,15 @@ def tracked_recommendations(
                 include_imported=include_imported,
                 format_urls=False,
             )
+            base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
-            # The event primary key orders actions; cached vectors and candidate
-            # provenance lookups are keyed by candidate id. Normalize only the
-            # lookup inputs so learner event ordering and latest-event semantics
-            # keep their original ids.
+            # The event primary key orders actions; cached vectors are keyed by
+            # candidate id. Normalize only the cache inputs so learner event
+            # ordering and latest-event semantics keep their original ids.
             cache_events = [
                 {**event, "id": event["candidate_id"]}
                 for event in interaction_events
             ]
-            publication_targets = [*ranked, *cache_events]
-            if publication_targets:
-                from .publication_year_metadata import attach_publication_years
-
-                if connection is not None:
-                    attach_publication_years(connection, [], publication_targets)
-                else:
-                    with connect() as publication_con:
-                        attach_publication_years(publication_con, [], publication_targets)
-            for event, cache_event in zip(interaction_events, cache_events):
-                event["first_publication_year"] = cache_event.get("first_publication_year")
-                event["publication_work_id"] = cache_event.get("publication_work_id")
-            base_pool = [dict(item) for item in ranked]
             cached_vectors = load_cached_candidate_vectors(
                 [*ranked, *cache_events], connection
             )

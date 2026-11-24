@@ -62,8 +62,7 @@ POOL_FIELDS = (
 )
 PROFILE_FIELDS = (
     "id", "candidate_id", "event_type", "value", "occurred_at", "title",
-    "author", "genres", "description", "first_publication_year",
-    "publication_work_id", "release_date", "date_kind",
+    "author", "genres", "description",
 )
 REQUEST_FIELDS = (
     "status", "limit", "offset", "recommended_limit", "build_id",

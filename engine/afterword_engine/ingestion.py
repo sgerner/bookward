@@ -3410,7 +3410,7 @@ async def scan_source(source):
                 item.get("source_url", source["url"]),
             )
             existing = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+                "SELECT id,isbn13,isbn10,description,cover_url,release_date,date_kind,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
             genres = normalize_subjects(
@@ -3419,19 +3419,43 @@ async def scan_source(source):
                 limit=METADATA_GENRE_LIMIT,
             )
             genres_json = json.dumps(genres, ensure_ascii=False, separators=(",", ":"))
+            source_fields = set(item.get("_source_provided_fields", []))
+            existing_release_date = str(existing["release_date"] or "").strip() if existing else ""
+            existing_date_kind = str(existing["date_kind"] or "").strip().lower() if existing else ""
+            incoming_release_date = str(item.get("release_date") or "").strip() or None
+            incoming_date_kind = str(item.get("date_kind") or "source").strip() or "source"
+            existing_release_providers = {
+                str(prov["provider"] or "").strip().lower()
+                for prov in con.execute(
+                    "SELECT provider FROM metadata_field_provenance "
+                    "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+                    (existing["id"],),
+                ).fetchall()
+            } if existing and existing_release_date else set()
+            allow_release_update = bool(
+                incoming_release_date
+                and (
+                    not existing_release_date
+                    or (
+                        "release_date" in source_fields
+                        and existing_date_kind not in {"manual", "demo", "catalog"}
+                        and not (existing_release_providers - {"source"})
+                    )
+                )
+            )
             con.execute("""INSERT INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,isbn13,isbn10,normalized_key)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(normalized_key) DO UPDATE SET
             description=CASE WHEN description='' AND excluded.description!='' THEN excluded.description ELSE description END,
             cover_url=CASE WHEN length(excluded.cover_url)>0 AND excluded.cover_url NOT LIKE 'https://placehold.co/%' AND excluded.cover_url NOT LIKE '%/b/isbn/%' THEN excluded.cover_url ELSE cover_url END,
             source_url=CASE WHEN length(excluded.source_url)>0 THEN excluded.source_url ELSE source_url END,
-            release_date=COALESCE(NULLIF(release_date, ''), excluded.release_date),
-            date_kind=CASE WHEN (release_date IS NULL OR release_date='') AND excluded.release_date IS NOT NULL AND excluded.release_date!='' THEN excluded.date_kind ELSE date_kind END,
+            release_date=CASE WHEN ?=1 THEN excluded.release_date ELSE release_date END,
+            date_kind=CASE WHEN ?=1 THEN excluded.date_kind ELSE date_kind END,
             genres=CASE WHEN excluded.genres!='[]' THEN excluded.genres ELSE genres END,
             isbn13=CASE WHEN isbn13='' AND excluded.isbn13!='' THEN excluded.isbn13 ELSE isbn13 END,
             isbn10=CASE WHEN isbn10='' AND excluded.isbn10!='' THEN excluded.isbn10 ELSE isbn10 END,
-            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], item.get("release_date"), item.get("date_kind", "source"), genres_json, isbn13, isbn10, key))
+            updated_at=CURRENT_TIMESTAMP""", (item["title"], item.get("author", "Unknown author"), item.get("description", ""), item.get("cover_url", ""), item.get("source_url", source["url"]), source["id"], incoming_release_date, incoming_date_kind, genres_json, isbn13, isbn10, key, int(allow_release_update), int(allow_release_update)))
             candidate = con.execute(
-                "SELECT id,isbn13,isbn10,description,cover_url,release_date,genres FROM candidates WHERE normalized_key=?",
+                "SELECT id,isbn13,isbn10,description,cover_url,release_date,date_kind,genres FROM candidates WHERE normalized_key=?",
                 (key,),
             ).fetchone()
             if candidate:
@@ -3446,14 +3470,14 @@ async def scan_source(source):
                     and candidate["cover_url"] == item.get("cover_url")
                     and (not existing or existing["cover_url"] != candidate["cover_url"])
                 )
+                stored_release_date = str(candidate["release_date"] or "").strip()
                 release_added = bool(
-                    item.get("release_date")
-                    and not (existing["release_date"] if existing else "")
-                    and candidate["release_date"] == item.get("release_date")
+                    incoming_release_date
+                    and stored_release_date == incoming_release_date
+                    and (not existing_release_date or existing_release_date != stored_release_date)
                 )
                 previous_genres = _stored_genre_values(existing["genres"] if existing else [])
                 genres_added = len(_stored_genre_values(candidate["genres"])) > len(previous_genres)
-                source_fields = set(item.get("_source_provided_fields", []))
                 source_provenance = {
                     "metadata_provenance": {
                         "fields": {
