@@ -34,6 +34,7 @@ from afterword_engine.ingestion import (
     enrich_goodreads_blog_items,
     fetch_bytes,
     filter_source_items,
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     normalize_source_filters,
@@ -1513,6 +1514,132 @@ def test_settings_encrypt_and_preserve_api_keys(database):
     stored = row("SELECT value,secret FROM settings WHERE key='librarr_api_key'")
     assert stored["secret"] == 1 and stored["value"].startswith("fernet:") and "librarr-secret" not in stored["value"]
     assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
+
+
+def test_partial_settings_updates_preserve_sibling_fields_and_require_initial_librarr_key(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        missing_key = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert missing_key.status_code == 400
+        assert missing_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        omitted_key = client.put(
+            "/api/settings",
+            json={"librarr_url": "http://librarr:5050"},
+        )
+        assert omitted_key.status_code == 400
+        assert omitted_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        saved_librarr = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "librarr-initial-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert saved_librarr.status_code == 200
+
+        saved_embeddings = client.put(
+            "/api/settings",
+            json={
+                "embedding_backend": "local",
+                "embedding_model": "hashing-768",
+                "embedding_url": "",
+                "embedding_api_key": "embedding-initial-secret",
+            },
+        )
+        assert saved_embeddings.status_code == 200
+
+        def reject_embedding_check(*_args, **_kwargs):
+            raise AssertionError("unchanged embedding settings should not be checked")
+
+        monkeypatch.setattr(main_module, "get_embedder", reject_embedding_check)
+        updated_format = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "audiobook",
+            },
+        )
+        assert updated_format.status_code == 200
+        assert updated_format.json()["embedding"]["checked"] is False
+
+    private = main_module.private_settings()
+    assert private["librarr_url"] == "http://librarr:5050"
+    assert private["librarr_api_key"] == "librarr-initial-secret"
+    assert private["librarr_media_type"] == "audiobook"
+    assert private["embedding_api_key"] == "embedding-initial-secret"
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+
+
+def test_settings_reject_private_librarr_host_even_with_a_key(database):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        rejected = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://10.0.0.1:5050",
+                "librarr_api_key": "librarr-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert rejected.status_code == 400
+    private = main_module.private_settings()
+    assert private.get("librarr_url", "") == ""
+    assert private.get("librarr_api_key", "") == ""
+
+
+def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
+    default_source = row("SELECT id, enabled FROM sources WHERE is_default=1")
+    assert default_source["enabled"] == 1
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        disabled = client.put("/api/sources/default/toggle")
+        assert disabled.status_code == 200
+        assert disabled.json() == {
+            "id": default_source["id"],
+            "enabled": 0,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 0
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM candidates WHERE source_id=? AND status='recommended'",
+                (default_source["id"],),
+            )["count"]
+            == 0
+        )
+
+        reenabled = client.put("/api/sources/default/toggle")
+        assert reenabled.status_code == 200
+        assert reenabled.json() == {
+            "id": default_source["id"],
+            "enabled": 1,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 1
+
+        with transaction() as con:
+            con.execute("UPDATE sources SET is_default=0 WHERE is_default=1")
+
+        missing = client.put("/api/sources/default/toggle")
+        assert missing.status_code == 404
+        assert missing.json()["detail"] == "Default source not found."
+
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
 
 
 def test_nyt_books_key_is_encrypted_and_only_added_to_outgoing_requests(database):
@@ -3348,3 +3475,112 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def test_storygraph_csv_imports_completed_books_fractional_ratings_dates_and_isbns(database):
+    payload = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        '"This Is How You Lose the Time War","Amal El-Mohtar, Max Gladstone",,9781534431003,hardcover,read,2024/01/01,2024/01/18,2024/01/05-2024/01/18,4.75\n'
+        '"A Canticle for Leibowitz","Walter M. Miller, Jr.",,0553273817,paperback,read,2023/06/01,,2021/03/01-2021/03/10; 2023/06/02-2023/06/19,4.25\n'
+        '"Indie Digital Book",Solo Writer,,B08FHBV4ZX,digital,read,2024/02/01,,2024/02/10-,3.5\n'
+        '"UUID Edition",Another Writer,,a1b2c3d4-e5f6-4789-abcd-ef0123456789,audio,read,2024/03/01,2024-03-15,,\n'
+    ).encode("utf-8")
+
+    result = import_csv(payload)
+    assert result == {"imported": 4, "source": "storygraph_csv"}
+
+    imported_rows = rows(
+        "SELECT title, author, rating, read_at, isbn, source "
+        "FROM reads WHERE source='storygraph_csv' ORDER BY title"
+    )
+    assert imported_rows == [
+        {
+            "title": "A Canticle for Leibowitz",
+            "author": "Walter M. Miller, Jr.",
+            "rating": 4.25,
+            "read_at": "2023/06/19",
+            "isbn": "9780553273816",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "Indie Digital Book",
+            "author": "Solo Writer",
+            "rating": 3.5,
+            "read_at": None,
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar, Max Gladstone".split(",")[0],
+            "rating": 4.75,
+            "read_at": "2024/01/18",
+            "isbn": "9781534431003",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "UUID Edition",
+            "author": "Another Writer",
+            "rating": None,
+            "read_at": "2024-03-15",
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+    ]
+
+
+def test_invalid_storygraph_rating_rolls_back_all_rows(database):
+    payload = (
+        "Title,Authors,Read Status,Star Rating\n"
+        "First Book,Writer One,read,4.5\n"
+        "Out Of Range,Writer Two,read,5.25\n"
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="CSV row 3.*Out Of Range.*No books were imported"):
+        import_csv(payload)
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='storygraph_csv'")["count"] == 0
+
+
+def test_unsupported_csv_headers_name_supported_formats(database):
+    payload = b"Heading,Writer,Rating\nSome Book,Someone,4\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(payload)
+    calibre_like = b"Title,Authors,Publisher\nSome Book,Someone,Press\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(calibre_like)
+
+
+def test_csv_upload_routes_handle_storygraph_and_goodreads(database):
+    storygraph_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Piranesi,Susanna Clarke,9781635575637,read,2025/08/12,4.75\n"
+    ).encode("utf-8")
+    goodreads_csv_bytes = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Dune,Frank Herbert,5,2025/07/01,read\n"
+    ).encode("utf-8")
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        sg_res = client.post(
+            "/api/import/csv",
+            files={"file": ("storygraph.csv", storygraph_csv, "text/csv")},
+        )
+        assert sg_res.status_code == 200
+        assert sg_res.json()["imported"] == 1
+        assert sg_res.json()["source"] == "storygraph_csv"
+        assert sg_res.json()["job_id"]
+
+        gr_res = client.post(
+            "/api/import/goodreads/csv",
+            files={"file": ("goodreads.csv", goodreads_csv_bytes, "text/csv")},
+        )
+        assert gr_res.status_code == 200
+        assert gr_res.json()["imported"] == 1
+        assert gr_res.json()["source"] == "goodreads_csv"
+
+        bad_res = client.post(
+            "/api/import/csv",
+            files={"file": ("other.csv", b"Name,Price\nTea,5\n", "text/csv")},
+        )
+        assert bad_res.status_code == 400
+        assert "StoryGraph" in bad_res.json()["detail"]
+
