@@ -127,10 +127,10 @@ class SmokeHandler(BaseHTTPRequestHandler):
         raw = raw_bytes.decode("utf-8")
         data = parse_qs(raw)
         origin_header = self.headers.get("Origin", "")
-        if origin_header not in {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}:
+        if origin_header != f"http://127.0.0.1:{PORT}":
             self._send(
                 403,
-                '{"message":"Cross-site POST form submissions are forbidden"}',
+                '{"detail":"Request origin could not be verified","message":"Request origin could not be verified"}',
                 {"Content-Type": "application/json"},
             )
             return

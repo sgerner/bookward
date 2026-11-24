@@ -8,6 +8,16 @@ export function isSecureCookieUrl(url: Pick<URL, 'protocol'> | undefined): boole
 	return url?.protocol === 'https:';
 }
 
+export function hasExplicitHttpOrigin(env: NodeJS.ProcessEnv = process.env): boolean {
+	const raw = env.ORIGIN?.trim();
+	if (!raw) return false;
+	try {
+		return new URL(raw).protocol === 'http:';
+	} catch {
+		return false;
+	}
+}
+
 export function cookieDeleteOptions(
 	url: Pick<URL, 'protocol'> | undefined,
 	path: string = SESSION_COOKIE_PATH
@@ -26,6 +36,20 @@ export function sessionCookieOptions(
 ) {
 	return {
 		...cookieDeleteOptions(url, SESSION_COOKIE_PATH),
+		maxAge
+	};
+}
+
+export function sessionRefreshCookieOptions(
+	url: Pick<URL, 'protocol'> | undefined,
+	maxAge: number = DEFAULT_SESSION_MAX_AGE,
+	env: NodeJS.ProcessEnv = process.env
+) {
+	return {
+		httpOnly: true,
+		secure: isSecureCookieUrl(url) || !hasExplicitHttpOrigin(env),
+		sameSite: 'lax' as const,
+		path: SESSION_COOKIE_PATH,
 		maxAge
 	};
 }

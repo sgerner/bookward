@@ -243,7 +243,7 @@ Docker is the easiest way to run Bookward as a small self-hosted service.
 cp .env.example .env
 ~~~
 
-For local or private-network HTTP runs, leave `ORIGIN` blank and Bookward will resolve the origin from the connection and `Host` header automatically. For a public domain, set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open; behind a trusted reverse proxy that overwrites forwarded headers, you can also set `PROTOCOL_HEADER=x-forwarded-proto` and `HOST_HEADER=x-forwarded-host`. `ORIGIN`, `PROTOCOL_HEADER`, and `HOST_HEADER` are runtime settings on the web container, so restart with `docker compose up -d` after changing them (no image rebuild needed). Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
+Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open (`.env.example` defaults both to `http://127.0.0.1:3000` for local HTTP runs). When both `ORIGIN` and `PROTOCOL_HEADER` are blank or unset, Bookward defaults to `https` with the request `Host` header for TLS-terminating reverse proxies; behind a trusted reverse proxy that forwards scheme and host headers, you can also leave `ORIGIN` blank and set `PROTOCOL_HEADER=x-forwarded-proto` and `HOST_HEADER=x-forwarded-host`. `ORIGIN`, `PROTOCOL_HEADER`, and `HOST_HEADER` are runtime settings on the web container, so restart with `docker compose up -d` after changing them (no image rebuild needed). Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
 
 ~~~
 docker compose up --build -d
@@ -293,8 +293,8 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 
 | Variable | Purpose |
 | --- | --- |
-| `ORIGIN` | Optional canonical browser origin checked at runtime for mutations and `Secure` cookies; derived from the connection or trusted proxy headers when blank. |
-| `PROTOCOL_HEADER` / `HOST_HEADER` | Optional trusted reverse-proxy header names (such as `x-forwarded-proto` and `x-forwarded-host`) read at runtime when `ORIGIN` is blank. |
+| `ORIGIN` | Canonical browser origin checked at runtime for mutations and `Secure` cookies. Set an explicit `http://...` URL for local or LAN plain-HTTP runs; when both `ORIGIN` and `PROTOCOL_HEADER` are blank, Bookward defaults to `https` with the request `Host` header. |
+| `PROTOCOL_HEADER` / `HOST_HEADER` | Optional trusted reverse-proxy header names (such as `x-forwarded-proto` and `x-forwarded-host`) read at runtime when `ORIGIN` is blank; untrusted `X-Forwarded-*` headers are ignored unless configured here. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
 | `BODY_SIZE_LIMIT` | Maximum HTTP request body accepted by the Node web server; defaults to `12M` so Goodreads CSV exports up to 10 MB (20,000 books) can upload. |
