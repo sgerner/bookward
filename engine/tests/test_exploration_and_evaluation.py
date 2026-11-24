@@ -14,6 +14,7 @@ from afterword_engine.evaluation import (
     build_report,
     cluster_bootstrap,
     ips_auc,
+    ips_grade_concordance,
     ips_ndcg_at_k,
     ips_precision_at_k,
     load_rows,
@@ -54,35 +55,22 @@ def _pairwise_ips_auc_reference(
     *,
     score_key: str = "score",
     positive_threshold: float = 0.5,
-    min_propensity: float = evaluation.DEFAULT_MIN_PROPENSITY,
 ) -> float | None:
-    del positive_threshold
-    usable = [
-        (score, label, weight)
-        for _, score, label, weight in evaluation._weighted_rows(
-            rows,
-            score_key=score_key,
-            min_propensity=min_propensity,
-        )
-        if weight > 0
-    ]
+    usable = evaluation._weighted_rows(rows, score_key=score_key)
+    positives = [(score, weight) for _, score, label, weight in usable if label > positive_threshold]
+    negatives = [(score, weight) for _, score, label, weight in usable if label < positive_threshold]
+    denominator = sum(left_weight * right_weight for _, left_weight in positives for _, right_weight in negatives)
+    if not positives or not negatives or denominator <= 0:
+        return None
     numerator = 0.0
-    denominator = 0.0
-    for index, (left_score, left_label, left_weight) in enumerate(usable):
-        for right_score, right_label, right_weight in usable[index + 1:]:
-            if left_label == right_label:
-                continue
-            pair_weight = left_weight * right_weight
-            denominator += pair_weight
-            if left_label > right_label:
-                high_score, low_score = left_score, right_score
-            else:
-                high_score, low_score = right_score, left_score
-            if high_score > low_score:
+    for positive, positive_weight in positives:
+        for negative, negative_weight in negatives:
+            pair_weight = positive_weight * negative_weight
+            if positive > negative:
                 numerator += pair_weight
-            elif high_score == low_score:
+            elif positive == negative:
                 numerator += pair_weight * 0.5
-    return numerator / denominator if denominator > 0 else None
+    return numerator / denominator
 
 
 def test_ips_metrics_weight_propensity_and_ignore_censored_rows():
@@ -419,39 +407,87 @@ def test_build_report_retains_shortlisted_neutral_reads_in_enjoyment_at_full_wei
     assert enjoyment["positive_impressions"] == 1
     assert enjoyment["neutral_impressions"] == 1
     assert enjoyment["negative_impressions"] == 0
-    assert enjoyment["auc"] == pytest.approx(1.0)
-    # Full certainty (1.0) on rating_neutral means 1 positive + 1 neutral => precision 0.5, not 1 / 1.25 = 0.8.
+    # Binary AUC excludes neutral 0.5 ties, so with no < 0.5 negatives it is None;
+    # multi-grade concordance reports 5★ > 3★ under its separate key.
+    assert enjoyment["auc"] is None
+    assert enjoyment["grade_concordance"] == pytest.approx(1.0)
+    # Full certainty (1.0) on rating_neutral in enjoyment means 1 positive + 1 neutral => precision 0.5, not 1 / 1.25 = 0.8.
     assert enjoyment["precision_at_20"] == pytest.approx(0.5)
 
 
-def test_ips_auc_evaluates_concordance_across_all_distinct_grades():
+def test_ips_auc_honors_positive_threshold_and_raw_confidence_against_hand_computed_values():
+    # Independent hand-computed fixture (does not call _weighted_rows):
+    # row A: score=10, label=1.0,  conf=1.0,  prop=0.5  -> weight = 1.0 / 0.5  = 2.0
+    # row B: score=30, label=0.75, conf=0.5,  prop=1.0  -> weight = 0.5 / 1.0  = 0.5
+    # row C: score=20, label=0.5,  conf=0.25, prop=0.5  -> weight = 0.25 / 0.5 = 0.5 (label_kind=None: NOT overridden to 1.0!)
+    # row D: score=15, label=0.2,  conf=0.4,  prop=0.05 -> weight = 0.4 / 0.2  = 2.0 (propensity clipped to 0.2)
+    rows = [
+        {"score": 10.0, "label": 1.0, "confidence": 1.0, "propensity": 0.5},
+        {"score": 30.0, "label": 0.75, "confidence": 0.5, "propensity": 1.0},
+        {"score": 20.0, "label": 0.5, "confidence": 0.25, "propensity": 0.5},
+        {"score": 15.0, "label": 0.2, "confidence": 0.4, "propensity": 0.05},
+    ]
+
+    # At positive_threshold=0.5:
+    # - row C (label == 0.5) is excluded as a threshold tie.
+    # - positives: A (score=10, w=2.0), B (score=30, w=0.5); total_pos = 2.5
+    # - negatives: D (score=15, w=2.0); total_neg = 2.0; denominator = 5.0
+    # - pairs: (A vs D: 10 < 15 -> 0) + (B vs D: 30 > 15 -> 0.5 * 2.0 = 1.0) => AUC = 1.0 / 5.0 = 0.20
+    assert ips_auc(rows, positive_threshold=0.5) == pytest.approx(0.20, abs=1e-12)
+
+    # At positive_threshold=0.75:
+    # - row B (label == 0.75) is excluded as a threshold tie.
+    # - positives: A (score=10, w=2.0); total_pos = 2.0
+    # - negatives: C (score=20, w=0.5), D (score=15, w=2.0); total_neg = 2.5; denominator = 5.0
+    #   (if C's confidence had been forced to 1.0, C's weight would be 2.0 and denominator would be 8.0)
+    # - both negatives outscore A (20 > 10, 15 > 10) => AUC = 0.0
+    assert ips_auc(rows, positive_threshold=0.75) == pytest.approx(0.0, abs=1e-12)
+
+    # Raising A's score to 18.0 at positive_threshold=0.75:
+    # - A beats D (18 > 15 -> 2.0 * 2.0 = 4.0) and loses to C (18 < 20 -> 0)
+    # - Hand-computed AUC = 4.0 / (2.0 * (0.5 + 2.0)) = 4.0 / 5.0 = 0.80
+    #   (would be 4.0 / (2.0 * (2.0 + 2.0)) = 0.50 if label=0.5 forced confidence=1.0)
+    raised = [{**rows[0], "score": 18.0}, *rows[1:]]
+    assert ips_auc(raised, positive_threshold=0.75) == pytest.approx(0.80, abs=1e-12)
+
+
+def test_ips_grade_concordance_evaluates_distinct_grades_without_changing_binary_auc():
     five_over_three = [
         {"run_id": "r1", "rank": 1, "score": 95.0, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive"},
         {"run_id": "r1", "rank": 2, "score": 80.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
     ]
-    assert ips_auc(five_over_three) == pytest.approx(1.0)
+    assert ips_auc(five_over_three) is None
+    assert ips_grade_concordance(five_over_three) == pytest.approx(1.0)
 
     three_over_one = [
         {"run_id": "r1", "rank": 1, "score": 80.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
         {"run_id": "r1", "rank": 2, "score": 60.0, "label": 0.0, "confidence": 1.0, "label_kind": "rating_negative"},
     ]
-    assert ips_auc(three_over_one) == pytest.approx(1.0)
+    assert ips_auc(three_over_one) is None
+    assert ips_grade_concordance(three_over_one) == pytest.approx(1.0)
 
     three_grades_partial_inversion = [
         {"run_id": "r1", "rank": 1, "score": 80.0, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive"},
         {"run_id": "r1", "rank": 2, "score": 90.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
         {"run_id": "r1", "rank": 3, "score": 60.0, "label": 0.0, "confidence": 1.0, "label_kind": "rating_negative"},
     ]
-    assert ips_auc(three_grades_partial_inversion) == pytest.approx(2 / 3)
+    # Binary AUC compares only 1.0 (score 80) vs 0.0 (score 60) => 1.0.
+    assert ips_auc(three_grades_partial_inversion) == pytest.approx(1.0)
+    # Raw weights: w(1.0)=1.0, w(0.5)=0.25, w(0.0)=1.0.
+    # Pairs: (1.0 vs 0.5: 80 < 90, w=0.25 -> 0), (1.0 vs 0.0: 80 > 60, w=1.0 -> 1.0), (0.5 vs 0.0: 90 > 60, w=0.25 -> 0.25)
+    # Concordance = (1.0 + 0.25) / (0.25 + 1.0 + 0.25) = 1.25 / 1.50 = 5 / 6.
+    assert ips_grade_concordance(three_grades_partial_inversion) == pytest.approx(5 / 6)
+    # With full_rating_certainty=True (all ratings weight 1.0): 2 / 3.
+    assert ips_grade_concordance(three_grades_partial_inversion, full_rating_certainty=True) == pytest.approx(2 / 3)
 
     single_grade_only = [
         {"run_id": "r1", "rank": 1, "score": 90.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
         {"run_id": "r1", "rank": 2, "score": 70.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
     ]
-    assert ips_auc(single_grade_only) is None
+    assert ips_grade_concordance(single_grade_only) is None
 
 
-def test_neutral_reads_have_full_precision_weight_and_zero_ndcg_gain():
+def test_scoped_full_rating_certainty_and_zero_neutral_ndcg_gain():
     one_five_above_four_threes = [
         {"run_id": "r1", "rank": 1, "score": 99.0, "propensity": 1.0, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive"},
         *[
@@ -467,7 +503,16 @@ def test_neutral_reads_have_full_precision_weight_and_zero_ndcg_gain():
             for rank in range(2, 6)
         ],
     ]
-    assert ips_precision_at_k(one_five_above_four_threes, 5) == pytest.approx(0.20)
+    # Default (full_rating_certainty=False) preserves raw confidence=0.25: 1.0 / (1.0 + 4 * 0.25) = 0.50.
+    assert ips_precision_at_k(one_five_above_four_threes, 5) == pytest.approx(0.50)
+    # Scoped enjoyment certainty (full_rating_certainty=True) weights all explicit ratings at 1.0: 1.0 / 5.0 = 0.20.
+    assert ips_precision_at_k(one_five_above_four_threes, 5, full_rating_certainty=True) == pytest.approx(0.20)
+    # Neutral rows without a rating label_kind never have confidence overridden even when full_rating_certainty=True.
+    untyped_neutrals = [
+        {k: v for k, v in item.items() if k != "label_kind"}
+        for item in one_five_above_four_threes
+    ]
+    assert ips_precision_at_k(untyped_neutrals, 5, full_rating_certainty=True) == pytest.approx(0.50)
     assert ips_ndcg_at_k(one_five_above_four_threes, 5) == pytest.approx(1.0)
 
     neutral_above_five = [
@@ -481,6 +526,38 @@ def test_neutral_reads_have_full_precision_weight_and_zero_ndcg_gain():
         {"run_id": "r3", "rank": 2, "score": 85.0, "propensity": 1.0, "label": 0.0, "confidence": 1.0, "label_kind": "rating_negative"},
     ]
     assert ips_ndcg_at_k(no_positive_outcomes, 5) is None
+
+
+def test_ips_ndcg_at_k_matches_hand_computed_gain_only_ideal_without_clamping():
+    # Two relevant items at ranks 2 and 3 (rank 1 censored) with skewed propensities:
+    # DCG  = 1.0 / log2(3) + 1.0 / log2(4)
+    # IDCG = 1.0 / log2(2) + 1.0 / log2(3)  (from gains alone, independent of propensities)
+    two_relevant_ranks_2_and_3 = [
+        {"run_id": "r1", "rank": 1, "score": 99.0, "propensity": 1.0, "confidence": 1.0, "label": None},
+        {"run_id": "r1", "rank": 2, "score": 95.0, "propensity": 0.2, "confidence": 0.9, "label": 1.0},
+        {"run_id": "r1", "rank": 3, "score": 90.0, "propensity": 1.0, "confidence": 0.5, "label": 1.0},
+    ]
+    expected_ranks_2_3 = (1.0 / math.log2(3) + 1.0 / math.log2(4)) / (1.0 / math.log2(2) + 1.0 / math.log2(3))
+    assert ips_ndcg_at_k(two_relevant_ranks_2_and_3, 5) == pytest.approx(expected_ranks_2_3, abs=1e-12)
+
+    # Swapping propensities leaves NDCG unchanged because IDCG and DCG depend symmetrically on gains alone.
+    swapped_propensity = [
+        two_relevant_ranks_2_and_3[0],
+        {**two_relevant_ranks_2_and_3[1], "propensity": 1.0, "confidence": 0.5},
+        {**two_relevant_ranks_2_and_3[2], "propensity": 0.2, "confidence": 0.9},
+    ]
+    assert ips_ndcg_at_k(swapped_propensity, 5) == pytest.approx(expected_ranks_2_3, abs=1e-12)
+
+    # Suboptimal order where rank 1 has lower gain (0.75) and much larger IPS weight than rank 2 (gain 1.0):
+    # Previously, attaching item weights to sorted gains made dcg > idcg (~1.40) and relied on clamping to 1.0.
+    # Hand-computed: DCG = 0.75 / log2(2) + 1.0 / log2(3); IDCG = 1.0 / log2(2) + 0.75 / log2(3) => ~0.937369 < 1.0.
+    suboptimal_weighted = [
+        {"run_id": "r2", "rank": 1, "score": 95.0, "propensity": 0.2, "confidence": 1.0, "label": 0.75},
+        {"run_id": "r2", "rank": 2, "score": 90.0, "propensity": 1.0, "confidence": 0.2, "label": 1.0},
+    ]
+    expected_suboptimal = (0.75 / math.log2(2) + 1.0 / math.log2(3)) / (1.0 / math.log2(2) + 0.75 / math.log2(3))
+    assert expected_suboptimal < 1.0
+    assert ips_ndcg_at_k(suboptimal_weighted, 5) == pytest.approx(expected_suboptimal, abs=1e-12)
 
 
 def test_signal_diagnostics_reports_multiclass_facets_and_per_kind_counts():
@@ -602,9 +679,10 @@ def test_clipped_snips_bounds_explored_slates_and_excludes_out_of_window_idcg():
     precision = ips_precision_at_k(eight_top_vs_one_tail, 20)
     ndcg = ips_ndcg_at_k(eight_top_vs_one_tail, 20)
     auc = ips_auc(eight_top_vs_one_tail)
-    assert precision is not None and 0.5 < precision <= 1.0
-    assert ndcg is not None and 0.0 <= ndcg <= 1.0
-    assert auc == pytest.approx(1.0)
+    # Clipped weight on tail slot is 1 / 0.2 = 5.0 vs eight 1.0 top slots => 8 / (8 + 5) = 8 / 13.
+    assert precision == pytest.approx(8 / 13, abs=1e-12)
+    assert ndcg == pytest.approx(1.0, abs=1e-12)
+    assert auc == pytest.approx(1.0, abs=1e-12)
 
 
 def test_temporal_split_censors_post_cutoff_outcomes_without_mutating_inputs():
@@ -668,6 +746,70 @@ def test_temporal_split_censors_post_cutoff_outcomes_without_mutating_inputs():
     report_neg = build_report(rows_negative, bootstrap_iterations=5, bootstrap_seed=11)
     assert report_pos["splits"]["train"] == report_neg["splits"]["train"]
     assert report_pos["splits"]["validation"] == report_neg["splits"]["validation"]
+
+
+def test_temporal_split_fails_closed_on_missing_or_unparseable_attributed_at():
+    rows = load_rows({
+        "recommendation_runs": [
+            {"id": "run-1", "created_at": "2026-01-01T00:00:00Z"},
+            {"id": "run-2", "created_at": "2026-01-02T00:00:00Z"},
+            {"id": "run-3", "created_at": "2026-01-03T00:00:00Z"},
+            {"id": "run-4", "created_at": "2026-01-04T00:00:00Z"},
+            {"id": "run-5", "created_at": "2026-01-05T00:00:00Z"},
+        ],
+        "recommendation_impressions": [
+            {"id": 1, "run_id": "run-1", "candidate_id": 11, "rank": 1, "score": 95.0, "propensity": 1.0},
+            {"id": 2, "run_id": "run-1", "candidate_id": 12, "rank": 2, "score": 85.0, "propensity": 1.0},
+            {"id": 3, "run_id": "run-2", "candidate_id": 21, "rank": 1, "score": 90.0, "propensity": 1.0},
+            {"id": 4, "run_id": "run-4", "candidate_id": 41, "rank": 1, "score": 92.0, "propensity": 1.0},
+            {"id": 5, "run_id": "run-5", "candidate_id": 51, "rank": 1, "score": 96.0, "propensity": 1.0},
+        ],
+        "recommendation_outcomes": [
+            # Impression 1: unparseable timestamp on rating_positive, valid pre-cutoff timestamp on explicit_feedback -> falls back to explicit_feedback.
+            {"impression_id": 1, "label": 1.0, "confidence": 0.8, "label_kind": "explicit_feedback", "attributed_at": "2026-01-01T12:00:00Z"},
+            {"impression_id": 1, "label": 0.0, "confidence": 1.0, "label_kind": "rating_negative", "attributed_at": "not-a-timestamp"},
+            # Impression 2: only an unparseable attributed_at -> must be censored to None in train.
+            {"impression_id": 2, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive", "attributed_at": "2026-13-99"},
+            # Impression 3: missing attributed_at (None) -> must be censored to None in train.
+            {"impression_id": 3, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive", "attributed_at": None},
+            # Impression 4 (validation, cutoff=run-5 start): whitespace attributed_at -> must be censored to None in validation.
+            {"impression_id": 4, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive", "attributed_at": "   "},
+            # Impression 5 (test, cutoff=None): unparseable attributed_at in final test split has no future cutoff and stays observed.
+            {"impression_id": 5, "label": 1.0, "confidence": 1.0, "label_kind": "rating_positive", "attributed_at": "unknown-date"},
+        ],
+    })
+    # Also include a flat synthetic train row with an unparseable top-level attributed_at.
+    flat_unparseable = {
+        "run_id": "run-3",
+        "run_created_at": "2026-01-03T00:00:00Z",
+        "impression_id": 99,
+        "candidate_id": 31,
+        "rank": 1,
+        "score": 88.0,
+        "propensity": 1.0,
+        "label": 1.0,
+        "confidence": 1.0,
+        "label_kind": "rating_positive",
+        "attributed_at": "corrupt-timestamp",
+    }
+    splits = temporal_split([*rows, flat_unparseable])
+    by_train = {row["impression_id"]: row for row in splits["train"]}
+    assert by_train[1]["label_kind"] == "explicit_feedback"
+    assert by_train[1]["label"] == 1.0
+    assert len(by_train[1]["observed_outcomes"]) == 1
+    assert by_train[2]["label"] is None
+    assert by_train[2]["observed_outcomes"] == []
+    assert by_train[3]["label"] is None
+    assert by_train[3]["observed_outcomes"] == []
+    assert by_train[99]["label"] is None
+    assert by_train[99]["attributed_at"] is None
+
+    by_val = {row["impression_id"]: row for row in splits["validation"]}
+    assert by_val[4]["label"] is None
+    assert by_val[4]["observed_outcomes"] == []
+
+    by_test = {row["impression_id"]: row for row in splits["test"]}
+    assert by_test[5]["label"] == 1.0
 
 
 def test_sqlite_cli_preserves_report_contract_with_shortlisted_neutral_reads(tmp_path: Path):
@@ -750,6 +892,8 @@ def test_sqlite_cli_preserves_report_contract_with_shortlisted_neutral_reads(tmp
     }
     assert report["enjoyment"]["labeled_impressions"] == 10
     assert report["enjoyment"]["neutral_impressions"] == 5
-    assert report["enjoyment"]["auc"] == pytest.approx(1.0)
+    assert report["enjoyment"]["auc"] is None
+    assert report["enjoyment"]["grade_concordance"] == pytest.approx(1.0)
     assert report["enjoyment"]["precision_at_20"] == pytest.approx(0.5)
-    assert report["signal_diagnostics"]["explicit_ratings"]["auc"] == pytest.approx(1.0)
+    assert report["signal_diagnostics"]["explicit_ratings"]["auc"] is None
+    assert report["signal_diagnostics"]["explicit_ratings"]["grade_concordance"] == pytest.approx(1.0)

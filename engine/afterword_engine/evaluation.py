@@ -18,6 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from operator import itemgetter
 from pathlib import Path
 from typing import Any
 
@@ -91,10 +92,12 @@ def _time_sort_key(value: Any) -> tuple[datetime, str]:
 
 
 def _is_at_or_after(value: Any, cutoff: datetime | None) -> bool:
+    """Return True when ``cutoff`` is set and ``value`` is missing, unparseable, or ``>= cutoff``."""
+
     if cutoff is None:
         return False
     parsed = _time(value)
-    return parsed is not None and parsed >= cutoff
+    return parsed is None or parsed >= cutoff
 
 
 def _row_label(row: Mapping[str, Any]) -> float | None:
@@ -105,19 +108,12 @@ def _row_label(row: Mapping[str, Any]) -> float | None:
 def _effective_confidence(
     row: Mapping[str, Any],
     *,
-    label: float | None = None,
     full_rating_certainty: bool = False,
 ) -> float | None:
     confidence = _as_float(row.get("confidence"), default=1.0)
     if confidence is None or confidence < 0:
         return None
-    resolved_label = _row_label(row) if label is None else label
-    kind = row.get("label_kind")
-    if confidence > 0 and (
-        kind == "rating_neutral"
-        or (kind is None and resolved_label == 0.5)
-        or (full_rating_certainty and kind in RATING_KINDS)
-    ):
+    if full_rating_certainty and confidence > 0 and row.get("label_kind") in RATING_KINDS:
         return 1.0
     return confidence
 
@@ -277,11 +273,12 @@ def _weighted_item(
     *,
     score_key: str,
     min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
 ) -> tuple[float, float, float] | None:
     label = _row_label(row)
     score = _as_float(row.get(score_key))
     propensity = _as_float(row.get("propensity"), default=1.0)
-    confidence = _effective_confidence(row, label=label)
+    confidence = _effective_confidence(row, full_rating_certainty=full_rating_certainty)
     if (
         label is None
         or score is None
@@ -302,12 +299,18 @@ def _weighted_rows(
     *,
     score_key: str = "score",
     min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
 ) -> list[tuple[Mapping[str, Any], float, float, float]]:
     """Return ``(row, score, label, weight)`` for usable labeled rows."""
 
     result = []
     for row in rows:
-        item = _weighted_item(row, score_key=score_key, min_propensity=min_propensity)
+        item = _weighted_item(
+            row,
+            score_key=score_key,
+            min_propensity=min_propensity,
+            full_rating_certainty=full_rating_certainty,
+        )
         if item is not None:
             score, label, weight = item
             result.append((row, score, label, weight))
@@ -320,11 +323,80 @@ def ips_auc(
     score_key: str = "score",
     positive_threshold: float = 0.5,
     min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
 ) -> float | None:
-    """Compute weighted pairwise concordance AUC across all distinct grades."""
+    """Compute pairwise binary IPS AUC with confidence-adjusted propensity weights.
 
-    del positive_threshold
-    usable = _weighted_rows(rows, score_key=score_key, min_propensity=min_propensity)
+    Labels strictly above ``positive_threshold`` are positives, labels strictly
+    below ``positive_threshold`` are negatives, and labels equal to
+    ``positive_threshold`` are excluded.
+    """
+
+    usable = _weighted_rows(
+        rows,
+        score_key=score_key,
+        min_propensity=min_propensity,
+        full_rating_certainty=full_rating_certainty,
+    )
+    scored: list[tuple[float, bool, float]] = []
+    total_pos_weight = 0.0
+    total_neg_weight = 0.0
+    has_positive = False
+    has_negative = False
+    for _, score, label, weight in usable:
+        if label > positive_threshold:
+            has_positive = True
+            total_pos_weight += weight
+            scored.append((0.0 if score == 0.0 else score, True, weight))
+        elif label < positive_threshold:
+            has_negative = True
+            total_neg_weight += weight
+            scored.append((0.0 if score == 0.0 else score, False, weight))
+    denominator = total_pos_weight * total_neg_weight
+    if not has_positive or not has_negative or denominator <= 0:
+        return None
+    scored.sort(key=itemgetter(0))
+    numerator = 0.0
+    cumulative_lower_neg_weight = 0.0
+    current_score = scored[0][0]
+    pos_group_weight = 0.0
+    neg_group_weight = 0.0
+    for score, is_positive, weight in scored:
+        if score != current_score:
+            numerator += (
+                pos_group_weight * cumulative_lower_neg_weight
+                + 0.5 * pos_group_weight * neg_group_weight
+            )
+            cumulative_lower_neg_weight += neg_group_weight
+            current_score = score
+            pos_group_weight = 0.0
+            neg_group_weight = 0.0
+        if is_positive:
+            pos_group_weight += weight
+        else:
+            neg_group_weight += weight
+    numerator += (
+        pos_group_weight * cumulative_lower_neg_weight
+        + 0.5 * pos_group_weight * neg_group_weight
+    )
+    return numerator / denominator
+
+
+def ips_grade_concordance(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    score_key: str = "score",
+    min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
+) -> float | None:
+    """Compute weighted pairwise concordance across all distinct outcome grades."""
+
+    usable = _weighted_rows(
+        rows,
+        score_key=score_key,
+        min_propensity=min_propensity,
+        full_rating_certainty=full_rating_certainty,
+    )
     if len(usable) < 2:
         return None
     by_score: dict[float, dict[float, float]] = defaultdict(lambda: defaultdict(float))
@@ -366,13 +438,16 @@ def ips_precision_at_k(
     score_key: str = "score",
     positive_threshold: float = 0.5,
     min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
 ) -> float | None:
     """Estimate logged top-k precision as a clipped SNIPS macro-average over runs.
 
     The logged rank is used for the slate position.  Top-k selection happens
     before censoring unlabeled rows, and only runs with an observed label in
-    their top-k contribute to the descriptive average.  Neutral reads (`0.5`)
-    count as full-weight non-positive observations.
+    their top-k contribute to the descriptive average.  Neutral reads (``0.5``)
+    are non-positive; pass ``full_rating_certainty=True`` (used by the
+    ``enjoyment`` projection) to treat all explicit star ratings as certainty
+    ``1.0``.
     """
 
     if k <= 0:
@@ -382,7 +457,12 @@ def ips_precision_at_k(
         topk = [(row, rank) for row, rank in values if rank <= k]
         usable = []
         for row, _rank in topk:
-            item = _weighted_item(row, score_key=score_key, min_propensity=min_propensity)
+            item = _weighted_item(
+                row,
+                score_key=score_key,
+                min_propensity=min_propensity,
+                full_rating_certainty=full_rating_certainty,
+            )
             if item is not None:
                 usable.append(item)
         total_weight = sum(weight for _, _, weight in usable)
@@ -400,13 +480,21 @@ def ips_ndcg_at_k(
     score_key: str = "score",
     positive_threshold: float = 0.5,
     min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
 ) -> float | None:
-    """Estimate logged NDCG@k as a clipped SNIPS macro-average over runs.
+    """Estimate logged NDCG@k as a macro-average over runs.
 
-    Logged integer ranks determine both the cutoff and the discount.  Missing
-    outcomes leave their slots in place instead of moving a later observed
-    label upward, neutral/negative outcomes (`<= 0.5`) receive zero gain, and
-    ideal gain is ranked by intrinsic relevance within top-k (`rank <= k`).
+    Logged integer ranks determine both the cutoff (``rank <= k``) and the
+    logarithmic discount ``1 / log2(rank + 1)``.  Missing outcomes leave their
+    slots in place instead of moving a later observed label upward, and
+    neutral/negative outcomes (``<= positive_threshold``) receive zero gain.
+
+    Weighting rule: ``_weighted_item`` filters usable positive-weight
+    observations (valid label, finite score, ``0 < propensity <= 1``, and
+    ``confidence > 0``), and both ``DCG@k`` and ``IDCG@k`` apply unweighted
+    intrinsic relevance gains symmetrically so ``IDCG@k`` is computed from the
+    observed top-k gains alone and each run's ``DCG@k / IDCG@k`` is guaranteed
+    within ``[0, 1]`` without clamping.
     """
 
     if k <= 0:
@@ -414,41 +502,71 @@ def ips_ndcg_at_k(
     per_run: list[float] = []
     for values in _ranked_runs(rows).values():
         topk = [(row, rank) for row, rank in values if rank <= k]
-        observed_topk: list[tuple[int, float, float]] = []
+        observed_topk: list[tuple[int, float]] = []
         for row, rank in topk:
-            item = _weighted_item(row, score_key=score_key, min_propensity=min_propensity)
+            item = _weighted_item(
+                row,
+                score_key=score_key,
+                min_propensity=min_propensity,
+                full_rating_certainty=full_rating_certainty,
+            )
             if item is not None:
                 _score, label, weight = item
-                gain = label if label > positive_threshold else 0.0
-                observed_topk.append((rank, gain, weight))
-        total_weight = sum(weight for _rank, _gain, weight in observed_topk)
-        if total_weight <= 0:
+                if weight > 0:
+                    gain = label if label > positive_threshold else 0.0
+                    observed_topk.append((rank, gain))
+        if not observed_topk:
             continue
-        normalized = [
-            (rank, gain, weight / total_weight)
-            for rank, gain, weight in observed_topk
-        ]
-        dcg = sum(
-            gain * norm_weight / math.log2(rank + 1)
-            for rank, gain, norm_weight in normalized
-        )
-        ideal = sorted(normalized, key=lambda item: item[1], reverse=True)
+        dcg = sum(gain / math.log2(rank + 1) for rank, gain in observed_topk)
+        ideal_gains = sorted((gain for _rank, gain in observed_topk), reverse=True)
         idcg = sum(
-            gain * norm_weight / math.log2(position + 2)
-            for position, (_rank, gain, norm_weight) in enumerate(ideal)
+            gain / math.log2(position + 2)
+            for position, gain in enumerate(ideal_gains)
         )
         if idcg > 0:
-            per_run.append(min(1.0, max(0.0, dcg / idcg)))
+            ratio = dcg / idcg
+            if not 0.0 <= ratio <= 1.0:
+                raise AssertionError(f"NDCG@k out of [0, 1] bounds: {ratio}")
+            per_run.append(ratio)
     return sum(per_run) / len(per_run) if per_run else None
 
 
-def _metric_bundle(rows: Sequence[Mapping[str, Any]], *, score_key: str, k: int) -> dict[str, Any]:
-    usable = _weighted_rows(rows, score_key=score_key)
+def _metric_bundle(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    score_key: str,
+    k: int,
+    full_rating_certainty: bool = False,
+) -> dict[str, Any]:
+    usable = _weighted_rows(
+        rows,
+        score_key=score_key,
+        full_rating_certainty=full_rating_certainty,
+    )
     labels = [label for _, _, label, _ in usable]
     return {
-        "auc": ips_auc(rows, score_key=score_key),
-        "precision_at_20": ips_precision_at_k(rows, k, score_key=score_key),
-        "ndcg_at_20": ips_ndcg_at_k(rows, k, score_key=score_key),
+        "auc": ips_auc(
+            rows,
+            score_key=score_key,
+            full_rating_certainty=full_rating_certainty,
+        ),
+        "grade_concordance": ips_grade_concordance(
+            rows,
+            score_key=score_key,
+            full_rating_certainty=full_rating_certainty,
+        ),
+        "precision_at_20": ips_precision_at_k(
+            rows,
+            k,
+            score_key=score_key,
+            full_rating_certainty=full_rating_certainty,
+        ),
+        "ndcg_at_20": ips_ndcg_at_k(
+            rows,
+            k,
+            score_key=score_key,
+            full_rating_certainty=full_rating_certainty,
+        ),
         "impressions": len(rows),
         "labeled_impressions": len(usable),
         "positive_impressions": sum(label > 0.5 for label in labels),
@@ -463,11 +581,17 @@ def evaluate_metrics(
     *,
     score_key: str = "score",
     k: int = DEFAULT_K,
+    full_rating_certainty: bool = False,
 ) -> dict[str, Any]:
     """Return IPS metrics and usable sample counts for one score column."""
 
     values = list(rows)
-    return _metric_bundle(values, score_key=score_key, k=k)
+    return _metric_bundle(
+        values,
+        score_key=score_key,
+        k=k,
+        full_rating_certainty=full_rating_certainty,
+    )
 
 
 def cluster_bootstrap(
@@ -478,6 +602,7 @@ def cluster_bootstrap(
     k: int = DEFAULT_K,
     iterations: int = DEFAULT_BOOTSTRAP_ITERATIONS,
     seed: int = 20260920,
+    full_rating_certainty: bool = False,
 ) -> dict[str, Any]:
     """Bootstrap a metric by resampling complete recommendation runs."""
 
@@ -485,10 +610,12 @@ def cluster_bootstrap(
     clusters: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in values:
         clusters[_run_key(row)].append(row)
+    extra = {"full_rating_certainty": True} if full_rating_certainty else {}
     metric_fn = {
-        "auc": lambda sample: ips_auc(sample, score_key=score_key),
-        "precision_at_20": lambda sample: ips_precision_at_k(sample, k, score_key=score_key),
-        "ndcg_at_20": lambda sample: ips_ndcg_at_k(sample, k, score_key=score_key),
+        "auc": lambda sample: ips_auc(sample, score_key=score_key, **extra),
+        "grade_concordance": lambda sample: ips_grade_concordance(sample, score_key=score_key, **extra),
+        "precision_at_20": lambda sample: ips_precision_at_k(sample, k, score_key=score_key, **extra),
+        "ndcg_at_20": lambda sample: ips_ndcg_at_k(sample, k, score_key=score_key, **extra),
     }.get(metric)
     if metric_fn is None:
         raise ValueError(f"Unsupported bootstrap metric: {metric}")
@@ -608,8 +735,9 @@ def signal_diagnostics(
     *,
     score_key: str = "score",
     k: int = DEFAULT_K,
+    full_rating_certainty: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Report multi-class behavioral facets alongside per-signal sample and SNIPS metrics."""
+    """Report multi-class behavioral facets alongside per-signal sample and IPS metrics."""
 
     values = list(rows)
     groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
@@ -618,7 +746,7 @@ def signal_diagnostics(
         if not observed:
             signal = str(row.get("label_kind") or row.get("signal_type") or "unknown")
             groups[signal].append(
-                _project_outcome_row(row, row, full_rating_certainty=signal in RATING_KINDS)
+                _project_outcome_row(row, row, full_rating_certainty=full_rating_certainty)
                 if row.get("label_kind")
                 else dict(row)
             )
@@ -629,21 +757,32 @@ def signal_diagnostics(
         for outcome in observed:
             by_signal[str(outcome.get("label_kind") or "unknown")].append(outcome)
         for signal, outcomes in by_signal.items():
-            full_certainty = signal in RATING_KINDS
-            selected = _select_primary_outcome(outcomes, full_rating_certainty=full_certainty)
+            selected = _select_primary_outcome(outcomes, full_rating_certainty=full_rating_certainty)
             if selected is not None:
-                groups[signal].append(_project_outcome_row(row, selected, full_rating_certainty=full_certainty))
+                groups[signal].append(
+                    _project_outcome_row(row, selected, full_rating_certainty=full_rating_certainty)
+                )
     diagnostics: dict[str, dict[str, Any]] = {
-        signal: _metric_bundle(signal_rows, score_key=score_key, k=k)
+        signal: _metric_bundle(
+            signal_rows,
+            score_key=score_key,
+            k=k,
+            full_rating_certainty=full_rating_certainty,
+        )
         for signal, signal_rows in sorted(groups.items())
     }
     for facet_name, allowed_kinds in FACET_SIGNAL_KINDS.items():
         facet_rows = _facet_rows(
             values,
             allowed_kinds,
-            full_rating_certainty=(facet_name == "explicit_ratings"),
+            full_rating_certainty=full_rating_certainty,
         )
-        diagnostics[facet_name] = _metric_bundle(facet_rows, score_key=score_key, k=k)
+        diagnostics[facet_name] = _metric_bundle(
+            facet_rows,
+            score_key=score_key,
+            k=k,
+            full_rating_certainty=full_rating_certainty,
+        )
     return dict(sorted(diagnostics.items()))
 
 
@@ -737,13 +876,15 @@ def build_report(
     values = list(rows)
     splits = temporal_split(values)
     report: dict[str, Any] = {
-        "protocol": "temporal run split 60/20/20 with cutoff outcome censoring; clipped self-normalized propensity weighting; run-macro top-k metrics; cluster bootstrap by run",
+        "protocol": "temporal run split 60/20/20 with fail-closed cutoff outcome censoring; clipped propensity weighting for AUC and precision@k; unweighted gain-only NDCG@k; run-macro top-k metrics; cluster bootstrap by run",
         "sample": _metric_bundle(values, score_key="score", k=k),
         "splits": {},
         "signal_diagnostics": signal_diagnostics(values, score_key="score", k=k),
         "enjoyment": _metric_bundle(
             _enjoyment_rows(values),
-            score_key="score", k=k,
+            score_key="score",
+            k=k,
+            full_rating_certainty=True,
         ),
         "metric_scope": "Logged-policy metrics mix observed intent and outcomes; enjoyment uses explicit ratings only. Neither authorizes serving promotion.",
         "minimums": {**DEFAULT_MINIMUMS, **(minimums or {})},
