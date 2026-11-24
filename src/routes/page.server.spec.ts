@@ -1375,7 +1375,7 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
 
-    expect(result).toEqual({ message: "Digest delivery retry queued." });
+    expect(result).toEqual({ message: "Digest delivery sent." });
     expect(fetchMock).toHaveBeenCalledWith(
       `http://127.0.0.1:8000/api/digest/deliveries/${deliveryId}/retry`,
       expect.objectContaining({
@@ -1684,6 +1684,97 @@ describe("page actions", () => {
       action: "save",
       run_id: "run-digest-1",
     });
+  });
+
+  it("surfaces skipped reasons and delivered book counts from manual digest runs", async () => {
+    vi.useFakeTimers();
+    try {
+      const outcomes = [
+        {
+          payload: { status: "skipped", reason: "no_new_recommendations", items: 0 },
+          expected: "Digest skipped: no new recommendations matched your minimum score.",
+        },
+        {
+          payload: { status: "skipped", reason: "already_delivered", period: "2026-W47", items: 4 },
+          expected: "Digest skipped: 2026-W47 was already delivered.",
+        },
+        {
+          payload: { status: "skipped", reason: "no_channels", items: 4 },
+          expected: "Digest skipped: enable and save at least one delivery channel first.",
+        },
+        {
+          payload: { status: "sent", period: "2026-W47", items: 3 },
+          expected: "Digest sent with 3 books.",
+        },
+      ];
+
+      for (const { payload, expected } of outcomes) {
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(
+            new Response(JSON.stringify({ job_id: "job-digest-1" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          )
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify({
+                status: "complete",
+                error: null,
+                result: JSON.stringify(payload),
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        vi.stubGlobal("fetch", fetchMock);
+        const promise = actions.runDigest!({} as never);
+        await vi.advanceTimersByTimeAsync(500);
+        await expect(promise).resolves.toEqual({ message: expected });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces top-level retry_delivery error strings on failed digest retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ job_id: "job-retry-1" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              status: "complete",
+              error: null,
+              result: JSON.stringify({
+                id: "550e8400-e29b-41d4-a716-446655440000",
+                status: "failed",
+                error: "Discord webhook returned HTTP 404",
+              }),
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+      const body = new FormData();
+      body.set("id", "550e8400-e29b-41d4-a716-446655440000");
+      const promise = actions.retryDigest!({
+        request: new Request("http://afterword.test", { method: "POST", body }),
+      } as never);
+      await vi.advanceTimersByTimeAsync(500);
+      const result = (await promise) as { status: number; data: { message: string; error: boolean } };
+      expect(result.status).toBe(502);
+      expect(result.data.message).toBe("Discord webhook returned HTTP 404");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("imports a StoryGraph CSV export through the unified CSV action and names The StoryGraph", async () => {

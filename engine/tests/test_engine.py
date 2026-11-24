@@ -3648,24 +3648,29 @@ def test_discord_webhook_cannot_be_redirected_to_an_arbitrary_host():
 def test_digest_can_be_disabled_with_stale_provider_settings():
     from afterword_engine.digest import validate_digest_config
 
-    validate_digest_config(
-        {
-            "enabled": False,
-            "channels": ["discord", "email"],
-            "day": 1,
-            "time": "09:00",
-            "timezone": "UTC",
-            "minimum_score": 80,
-            "maximum_books": 5,
-            "only_new": True,
-            "app_url": "https://afterword.example",
-            "discord_webhook_url": "https://not-discord.example/webhook",
-            "email_to": "not-an-email",
-            "email_from": "",
-            "smtp_host": "",
-            "smtp_security": "starttls",
-        }
-    )
+    base = {
+        "enabled": False,
+        "channels": ["discord", "email"],
+        "day": 1,
+        "time": "09:00",
+        "timezone": "UTC",
+        "minimum_score": 80,
+        "maximum_books": 5,
+        "only_new": True,
+        "app_url": "https://afterword.example",
+        "discord_webhook_url": "",
+        "email_to": "",
+        "email_from": "",
+        "smtp_host": "",
+        "smtp_security": "starttls",
+    }
+    validate_digest_config(base)
+
+    with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+        validate_digest_config({**base, "discord_webhook_url": "https://not-discord.example/webhook"})
+
+    with pytest.raises(ValueError, match="Valid email to is required"):
+        validate_digest_config({**base, "email_to": "not-an-email"})
 
 
 def test_digest_rejects_unknown_channels():
