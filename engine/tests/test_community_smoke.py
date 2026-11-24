@@ -55,7 +55,9 @@ class SmokeHandler(BaseHTTPRequestHandler):
     def _send(self, status, body="", headers=None, content_type="text/html; charset=utf-8"):
         payload = body.encode("utf-8")
         extra_headers = dict(headers or {})
-        content_type = extra_headers.pop("Content-Type", content_type)
+        for key in list(extra_headers):
+            if key.lower() == "content-type":
+                content_type = extra_headers.pop(key)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -132,6 +134,14 @@ class SmokeHandler(BaseHTTPRequestHandler):
             return
         raw = raw_bytes.decode("utf-8")
         data = parse_qs(raw)
+        origin_header = self.headers.get("Origin", "")
+        if origin_header != f"http://127.0.0.1:{PORT}":
+            self._send(
+                403,
+                '{"detail":"Request origin could not be verified","message":"Request origin could not be verified"}',
+                {"Content-Type": "application/json"},
+            )
+            return
         if self.path in {"/login?/setup", "/login?/login"}:
             self._send(
                 303,
