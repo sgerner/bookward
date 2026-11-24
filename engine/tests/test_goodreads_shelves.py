@@ -1176,3 +1176,64 @@ def test_import_goodreads_shelves_preserves_existing_rows_on_http_404(
         ("to-read", "Kept To Read", "Author One"),
     ]
 
+def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine.ingestion import import_csv
+
+    db_path = tmp_path / "storygraph_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    csv_data = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        'Project Hail Mary,Andy Weir,,9780593135204,hardcover,to-read,2026/01/10,,,\n'
+        'Piranesi,"Susanna Clarke, Coauthor",,b4f901a2-7c4d-4f1b-9a2e-1234567890ab,digital,currently-reading,2026/02/01,,,\n'
+        'Abandoned Tome,Some Writer,,9780306406157,paperback,did-not-finish,2026/02/10,2026/02/15,2026/02/10-2026/02/15,1.5\n'
+        'The Martian,Andy Weir,,0553418025,paperback,read,2025/04/01,2025/05/01,2025/04/20-2025/05/01,4.75\n'
+    ).encode("utf-8")
+
+    result = import_csv(csv_data)
+    assert result == {"imported": 1, "source": "storygraph_csv"}
+
+    con = sqlite3.connect(db_path)
+    try:
+        reads_rows = con.execute(
+            "SELECT title, author, rating, read_at, isbn, source FROM reads"
+        ).fetchall()
+        shelves = con.execute(
+            "SELECT shelf, title, author, isbn FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+        shortlist_count = con.execute(
+            "SELECT COUNT(*) FROM candidates WHERE status='saved'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+    assert reads_rows == [
+        ("The Martian", "Andy Weir", 4.75, "2025/05/01", "9780553418026", "storygraph_csv")
+    ]
+    assert shelves == [
+        ("currently-reading", "Piranesi", "Susanna Clarke", None),
+        ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+    ]
+    assert shortlist_count == 0
+
+    followup_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Project Hail Mary,Andy Weir,9780593135204,read,2026/03/01,5.0\n"
+    ).encode("utf-8")
+    assert import_csv(followup_csv) == {"imported": 1, "source": "storygraph_csv"}
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining_shelves = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert remaining_shelves == [
+        ("currently-reading", "Piranesi", "Susanna Clarke"),
+    ]
+

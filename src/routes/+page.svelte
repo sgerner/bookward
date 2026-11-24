@@ -48,6 +48,7 @@
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
     buildLibrarrDownloadPayload,
@@ -721,12 +722,7 @@
     expandedRecommendationDetails = next;
   }
   function readingSourceLabel(source: string) {
-    return ({
-      goodreads_csv: "Goodreads CSV export",
-      goodreads_rss: "Goodreads read shelf RSS",
-      manual: "Added in Bookward",
-      demo: "Demo data",
-    } as Record<string, string>)[source] ?? (source || "Unknown source");
+    return formatReadingSourceLabel(source);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -833,6 +829,7 @@
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
+              key === "csv-import" ||
               key === "goodreads-csv")
           ) {
             readingHistory = [];
@@ -2352,7 +2349,7 @@
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
                   <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -2946,9 +2943,9 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
-                action="?/importGoodreadsCsv"
+                action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("goodreads-csv")}
+                use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex items-center justify-between gap-4">
@@ -2960,7 +2957,7 @@
                     <h2
                       class="truncate text-lg font-semibold text-surface-950-50"
                     >
-                      Goodreads export
+                      CSV library export
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
@@ -2968,11 +2965,11 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import the books on your Goodreads read shelf, with their ratings and read dates.
+                  Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
-                  >Goodreads CSV<input
+                  >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
                     type="file"
@@ -2982,9 +2979,9 @@
                 ><button
                   class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
-                  disabled={isPending("goodreads-csv")}
-                  aria-busy={isPending("goodreads-csv")}
-                  >{#if isPending("goodreads-csv")}<RefreshCw
+                  disabled={isPending("csv-import")}
+                  aria-busy={isPending("csv-import")}
+                  >{#if isPending("csv-import")}<RefreshCw
                       size={16}
                       class="animate-spin"
                     />{:else}<Upload size={16} />{/if} Import CSV</button

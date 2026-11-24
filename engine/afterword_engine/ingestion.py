@@ -37,6 +37,7 @@ from .identity import (
     read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
+from .read_dates import read_day
 from .security import resolve_public_target
 from .subjects import normalize_subjects
 
@@ -747,16 +748,99 @@ def metadata_url(value, fallback=""):
             return str(parsed)
     return ""
 
-def import_goodreads_csv(content: bytes):
+STORYGRAPH_IDENTIFYING_HEADERS = frozenset(
+    {"Read Status", "ISBN/UID", "Star Rating", "Last Date Read", "Dates Read"}
+)
+_STORYGRAPH_AUTHOR_SUFFIXES = frozenset(
+    {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
+)
+_STORYGRAPH_ISBN_CANDIDATE_RE = re.compile(r"^[0-9\s-]+[0-9Xx]?$")
+
+
+def _detect_csv_source(fieldnames) -> str:
+    headers = {str(name).strip() for name in (fieldnames or ()) if name is not None}
+    if {"Title", "Author"}.issubset(headers):
+        return "goodreads_csv"
+    if {"Title", "Authors"}.issubset(headers) and (headers & STORYGRAPH_IDENTIFYING_HEADERS):
+        return "storygraph_csv"
+    raise ValueError("CSV must match Goodreads or The StoryGraph export format")
+
+
+def _storygraph_primary_author(value) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    if not parts:
+        return ""
+    primary = parts[0]
+    if len(parts) > 1 and parts[1].casefold() in _STORYGRAPH_AUTHOR_SUFFIXES:
+        primary = f"{primary}, {parts[1]}"
+    return primary[:300]
+
+
+def _storygraph_isbn(value) -> str | None:
+    cleaned = str(value or "").strip().strip('="').strip()
+    if not cleaned or not _STORYGRAPH_ISBN_CANDIDATE_RE.fullmatch(cleaned):
+        return None
+    return canonical_isbn(cleaned) or None
+
+
+def _storygraph_completion_date_from_entry(entry: str) -> str | None:
+    direct = _read_date_value(entry)
+    if direct is not None:
+        return direct
+    explicit_range = re.fullmatch(
+        r"(.+?)\s*(?:\.\.|[–—]|\bto\b)\s*(.*)", entry, flags=re.IGNORECASE
+    )
+    if explicit_range:
+        return _read_date_value(explicit_range.group(2))
+    iso_range = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}\s*-\s*(.*)", entry)
+    if iso_range:
+        return _read_date_value(iso_range.group(1))
+    if "-" in entry:
+        return _read_date_value(entry.rsplit("-", 1)[1])
+    return None
+
+
+def _storygraph_read_date(last_date_read, dates_read) -> str | None:
+    direct = _read_date_value(last_date_read)
+    if direct is not None:
+        return direct
+    raw_ranges = str(dates_read or "").strip()
+    if not raw_ranges:
+        return None
+    whole = _read_date_value(raw_ranges)
+    if whole is not None:
+        return whole
+    best_date = None
+    best_day = None
+    for part in re.split(r"[,;]", raw_ranges):
+        entry = part.strip()
+        if not entry:
+            continue
+        candidate = _storygraph_completion_date_from_entry(entry)
+        if candidate is None:
+            continue
+        day = read_day(candidate)
+        if best_date is None or (day is not None and (best_day is None or day >= best_day)):
+            best_date = candidate
+            best_day = day
+    return best_date
+
+
+def import_csv(content: bytes) -> dict[str, int | str]:
     if len(content) > 10_000_000: raise ValueError("CSV is larger than 10 MB")
     try:
         text = content.decode("utf-8-sig", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError("CSV must be UTF-8 encoded") from exc
     reader = csv.DictReader(io.StringIO(text))
-    required = {"Title", "Author"}
-    if not reader.fieldnames or not required.issubset(reader.fieldnames): raise ValueError("This does not look like a Goodreads export")
-    has_shelf_column = "Exclusive Shelf" in (reader.fieldnames or [])
+    if reader.fieldnames:
+        reader.fieldnames = [
+            name.strip() if isinstance(name, str) else name
+            for name in reader.fieldnames
+        ]
+    source = _detect_csv_source(reader.fieldnames)
+    shelf_header = "Read Status" if source == "storygraph_csv" else "Exclusive Shelf"
+    has_shelf_column = shelf_header in (reader.fieldnames or [])
     count = 0
     shelf_rows: list[tuple] = []
     read_rows: list[tuple] = []
@@ -765,10 +849,22 @@ def import_goodreads_csv(content: bytes):
             if row_number > 20_001: raise ValueError("CSV exceeds the 20,000-book limit")
             # DictReader uses None for fields omitted from a truncated row.
             title = str(source_row.get("Title") or "").strip()[:500]
-            author = str(source_row.get("Author") or "").strip()[:300]
+            if source == "storygraph_csv":
+                author = _storygraph_primary_author(source_row.get("Authors"))
+                shelf = str(source_row.get("Read Status") or "").strip().lower()
+                isbn = _storygraph_isbn(source_row.get("ISBN/UID"))
+                rating_raw = str(source_row.get("Star Rating") or "").strip()
+                read_at = _storygraph_read_date(
+                    source_row.get("Last Date Read"),
+                    source_row.get("Dates Read"),
+                )
+            else:
+                author = str(source_row.get("Author") or "").strip()[:300]
+                shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
+                isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
+                rating_raw = str(source_row.get("My Rating") or "").strip()
+                read_at = _read_date_value(source_row.get("Date Read"))
             if not title or not author: continue
-            shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
-            isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
             if shelf in {"to-read", "currently-reading"}:
                 shelf_rows.append(
                     (
@@ -782,7 +878,7 @@ def import_goodreads_csv(content: bytes):
             else:
                 if shelf and shelf != "read": continue
                 try:
-                    rating = float(source_row.get("My Rating") or 0) or None
+                    rating = float(rating_raw or 0) or None
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"CSV row {row_number} ({title!r}): rating must be numeric and between 0 and 5. No books were imported.") from exc
                 if rating is not None and (not math.isfinite(rating) or not 0 <= rating <= 5):
@@ -792,8 +888,9 @@ def import_goodreads_csv(content: bytes):
                         title,
                         author,
                         rating,
-                        _read_date_value(source_row.get("Date Read")),
+                        read_at,
                         isbn,
+                        source,
                     )
                 )
                 count += 1
@@ -820,7 +917,7 @@ def import_goodreads_csv(content: bytes):
             )
             con.executemany(
                 "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,'goodreads_csv') "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(title,author) DO UPDATE SET "
                 "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
                 "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
@@ -838,7 +935,11 @@ def import_goodreads_csv(content: bytes):
     # during application startup.
     from .learning import attribute_read_outcomes
     attribute_read_outcomes()
-    return count
+    return {"imported": count, "source": source}
+
+
+def import_goodreads_csv(content: bytes):
+    return int(import_csv(content)["imported"])
 
 def _source_client():
     return httpx.AsyncClient(
