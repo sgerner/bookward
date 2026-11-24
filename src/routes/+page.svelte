@@ -2866,20 +2866,41 @@
                       ></div>
                     </div>
                     <p class="mt-1 text-xs leading-5 text-surface-600-400">
-                      Auto-rotates oldest unreferenced snapshots above 80% down to 65%.
+                      {#if data.backupStatus.retention_enabled === false}
+                        Automatic rotation is paused; new captures degrade cleanly at 100%.
+                      {:else}
+                        Auto-rotates oldest unattributed snapshots above 80% down to 65%.
+                      {/if}
                     </p>
                   </div>
 
                   <div class="flex flex-col justify-between gap-3">
-                    <p class="text-xs leading-5 text-surface-700-300">
-                      Prune stale telemetry, orphaned embeddings, and expired logs, then reclaim free SQLite pages online.
-                    </p>
-                    <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
-                      <ProfileField profileId={data.user?.profile_id} />
-                      <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
-                        <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
-                      </button>
-                    </form>
+                    <div>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Storage hygiene</span>
+                        <span class={`badge text-xs ${data.backupStatus.retention_enabled === false ? "preset-tonal-warning" : "preset-tonal-success"}`}>
+                          {data.backupStatus.retention_enabled === false ? "Retention paused" : "Retention active"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-xs leading-5 text-surface-700-300">
+                        Compact storage reclaims unused SQLite pages and truncates the write-ahead log without deleting stored history.{#if data.backupStatus.auto_vacuum_mode && data.backupStatus.auto_vacuum_mode !== "incremental"} Compacting once upgrades this database to incremental vacuum.{/if}
+                      </p>
+                    </div>
+                    <div class="grid gap-2">
+                      <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                          <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
+                        </button>
+                      </form>
+                      <form method="POST" action="?/setStorageRetention" use:enhance={setPending("toggle-retention")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <input type="hidden" name="enabled" value={data.backupStatus.retention_enabled === false ? "1" : "0"} />
+                        <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
+                          {data.backupStatus.retention_enabled === false ? "Resume automatic retention" : "Pause automatic retention"}
+                        </button>
+                      </form>
+                    </div>
                   </div>
                 </div>
 

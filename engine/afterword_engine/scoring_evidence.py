@@ -16,7 +16,6 @@ from typing import Any
 
 import numpy as np
 
-from . import decision_evidence as _decision_evidence
 from .decision_evidence import (
     MAX_STORED_EVIDENCE_BYTES,
     _canonical_json,
@@ -521,11 +520,6 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
             or len(packed) > MAX_SCORING_JSON_BYTES
         ):
             raise _LimitError("storage_quota_exceeded")
-        quota_limit = (
-            MAX_SCORING_QUOTA
-            if (MAX_SCORING_QUOTA := MAX_STORED_EVIDENCE_BYTES) != 512 * 1024 * 1024
-            else _decision_evidence.MAX_STORED_EVIDENCE_BYTES
-        )
         unique_vector_bytes: dict[str, int] = {}
         for _etype, _eid, _backend, _model, _dims, raw, artifact_hash in vector_records:
             unique_vector_bytes.setdefault(artifact_hash, len(raw))
@@ -538,7 +532,7 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
                 + reference_bytes
                 + read_reference_bytes
             ),
-            max_bytes=quota_limit,
+            max_bytes=MAX_STORED_EVIDENCE_BYTES,
         )
         new_vector_bytes = 0
         for artifact_hash, byte_len in unique_vector_bytes.items():
@@ -559,7 +553,7 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
             + new_vector_bytes
             + reference_bytes
             + read_reference_bytes
-            > quota_limit
+            > MAX_STORED_EVIDENCE_BYTES
         ):
             raise _LimitError("storage_quota_exceeded")
     except _LimitError as exc:

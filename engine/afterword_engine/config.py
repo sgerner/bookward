@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     backup_dir: str = ""
     backup_interval_hours: int = 24
     backup_retention_count: int = 7
+    retention_enabled: bool = True
     embedding_backend: str = "local"
     embedding_model: str = "hashing-768"
     embedding_url: str = "http://ollama:11434"

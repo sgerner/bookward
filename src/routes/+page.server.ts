@@ -23,6 +23,7 @@ type BackupStatus = {
   last_error: string | null;
   next_backup_at: string | null;
   backups: Array<{ id: string; created_at: string; size_bytes: number }>;
+  retention_enabled?: boolean;
   database_size_bytes?: number;
   wal_size_bytes?: number;
   live_size_bytes?: number;
@@ -154,6 +155,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     last_error: null,
     next_backup_at: null,
     backups: [],
+    retention_enabled: true,
     database_size_bytes: 0,
     wal_size_bytes: 0,
     live_size_bytes: 0,
@@ -293,6 +295,7 @@ export const actions: Actions = {
       const result = await engine<{
         reclaimed_bytes?: number;
         after_bytes?: number;
+        migrated_auto_vacuum?: boolean;
       }>("/api/backups/compact", { method: "POST", body: "{}" }, 10 * 60_000);
       const reclaimed = Math.max(0, Number(result.reclaimed_bytes ?? 0));
       const afterBytes = Math.max(0, Number(result.after_bytes ?? 0));
@@ -307,7 +310,29 @@ export const actions: Actions = {
         message:
           reclaimed > 0
             ? `Storage compacted; reclaimed ${formatSize(reclaimed)}.${liveSummary}`
-            : `Storage maintenance completed.${liveSummary}`,
+            : result.migrated_auto_vacuum
+              ? `Incremental vacuum enabled.${liveSummary}`
+              : `Database already compact.${liveSummary}`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setStorageRetention: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid storage retention setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/retention", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Automatic storage retention enabled."
+          : "Automatic storage retention paused.",
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });

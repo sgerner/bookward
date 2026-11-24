@@ -49,6 +49,7 @@ MAX_EVIDENCE_JSON_BYTES = 8 * 1024 * 1024
 MAX_STORED_EVIDENCE_BYTES = 512 * 1024 * 1024
 EVIDENCE_HIGH_WATERMARK_RATIO = 0.80
 EVIDENCE_LOW_WATERMARK_RATIO = 0.65
+STORAGE_RETENTION_ENABLED_KEY = "storage_retention_enabled"
 MAX_EXPOSURES_PER_RUN = 5_000
 MAX_ARCHIVED_EVENTS_PER_RUN = 2_000
 MAX_ARCHIVED_OUTCOMES_PER_RUN = 2_000
@@ -277,6 +278,30 @@ def evidence_low_watermark_bytes(max_bytes: int | None = None) -> int:
     return int(quota * EVIDENCE_LOW_WATERMARK_RATIO)
 
 
+def is_storage_retention_enabled(connection=None) -> bool:
+    """Return whether automatic retention and watermark eviction are enabled."""
+
+    if not settings.retention_enabled:
+        return False
+
+    def _read(con) -> bool:
+        row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (STORAGE_RETENTION_ENABLED_KEY,),
+        ).fetchone()
+        if not row or row["value"] is None or str(row["value"]).strip() == "":
+            return True
+        return str(row["value"]).strip().lower() in {"1", "true", "yes", "on"}
+
+    if connection is not None:
+        return _read(connection)
+    try:
+        with connect() as con:
+            return _read(con)
+    except Exception:
+        return True
+
+
 def _prune_unreferenced_evidence_vectors(connection) -> int:
     cursor = connection.execute(
         "DELETE FROM recommendation_evidence_vectors WHERE NOT EXISTS ("
@@ -318,18 +343,28 @@ def rotate_recommendation_evidence_if_needed(
     max_bytes: int | None = None,
     exclude_run_ids: Iterable[str] = (),
 ) -> dict[str, int]:
-    """Rotate aged replay artifacts from 80% high watermark down to 65% of quota.
+    """Rotate aged unattributed replay artifacts from 80% high watermark down to 65% of quota.
 
     Never deletes `recommendation_events`, `feedback`, `recommendation_outcomes`,
+    `recommendation_evidence_outcomes`, outcome- or action-attributed runs,
     `recommendation_runs`, `recommendation_impressions`, or `scoring_batches`
     linked by active `candidates.score_batch_id` or retained runs.
     """
+
+    used_before = _evidence_used_bytes(connection)
+    if not is_storage_retention_enabled(connection):
+        return {
+            "rotated_runs": 0,
+            "rotated_scoring_batches": 0,
+            "removed_vectors": 0,
+            "used_bytes_before": used_before,
+            "used_bytes_after": used_before,
+        }
 
     quota = MAX_STORED_EVIDENCE_BYTES if max_bytes is None else max(0, int(max_bytes))
     additional = max(0, int(incoming_bytes))
     high_watermark = evidence_high_watermark_bytes(quota)
     low_watermark = evidence_low_watermark_bytes(quota)
-    used_before = _evidence_used_bytes(connection)
     if used_before <= high_watermark and used_before + additional <= high_watermark:
         return {
             "rotated_runs": 0,
@@ -371,25 +406,36 @@ def rotate_recommendation_evidence_if_needed(
                 rotated_batches += max(0, int(deleted))
                 removed_vectors += _prune_unreferenced_evidence_vectors(connection)
 
-    exclude_clause = ""
+    where_clauses = [
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_impressions i
+            JOIN recommendation_outcomes o ON o.impression_id = i.id
+            WHERE i.run_id = e.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_outcomes eo
+            WHERE eo.run_id = e.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_events ee
+            WHERE ee.run_id = e.run_id
+              AND ee.event_type != 'visible'
+        )""",
+    ]
     exclude_params: tuple[Any, ...] = ()
     if excluded:
         marks = ",".join("?" for _ in excluded)
-        exclude_clause = f"WHERE e.run_id NOT IN ({marks})"
+        where_clauses.append(f"e.run_id NOT IN ({marks})")
         exclude_params = tuple(excluded)
+    where_sql = "WHERE " + " AND ".join(where_clauses)
 
     while _evidence_used_bytes(connection) > target_bytes:
         candidates_to_evict = connection.execute(
             f"""
             SELECT e.run_id
             FROM recommendation_run_evidence e
-            {exclude_clause}
+            {where_sql}
             ORDER BY
-                EXISTS (
-                    SELECT 1 FROM recommendation_impressions i
-                    JOIN recommendation_outcomes o ON o.impression_id = i.id
-                    WHERE i.run_id = e.run_id
-                ) ASC,
                 CASE WHEN e.capture_status = 'incomplete' THEN 0 ELSE 1 END ASC,
                 datetime(e.captured_at) ASC,
                 e.captured_at ASC,
@@ -414,11 +460,7 @@ def rotate_recommendation_evidence_if_needed(
                 (evict_run_id,),
             )
             connection.execute(
-                "DELETE FROM recommendation_evidence_events WHERE run_id=?",
-                (evict_run_id,),
-            )
-            connection.execute(
-                "DELETE FROM recommendation_evidence_outcomes WHERE run_id=?",
+                "DELETE FROM recommendation_evidence_events WHERE run_id=? AND event_type='visible'",
                 (evict_run_id,),
             )
             deleted_run = connection.execute(

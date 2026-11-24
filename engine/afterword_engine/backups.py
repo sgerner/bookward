@@ -14,12 +14,20 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
-from .database import MIGRATIONS, _restrict_database_files, connect, database_lock, transaction
+from .database import (
+    MIGRATIONS,
+    _LockedConnection,
+    _restrict_database_files,
+    connect,
+    database_lock,
+    transaction,
+)
 from .decision_evidence import (
     EVIDENCE_HIGH_WATERMARK_RATIO,
     EVIDENCE_LOW_WATERMARK_RATIO,
     MAX_STORED_EVIDENCE_BYTES,
     evidence_budget_summary,
+    is_storage_retention_enabled,
 )
 from .maintenance import (
     MAINTENANCE_INTERVAL_HOURS,
@@ -41,7 +49,7 @@ AUTH_BACKUP_ERROR_KEY = "auth_backup_last_error"
 AUTH_BACKUP_ATTEMPT_KEY = "auth_backup_last_attempt_at"
 AUTH_BACKUP_SUCCESS_KEY = "auth_backup_last_success_at"
 AUTH_BACKUP_RESTORE_KEY = "auth_backup_last_restore_at"
-PRE_BACKUP_INCREMENTAL_VACUUM_PAGES = 16_384
+INCREMENTAL_VACUUM_STEP_PAGES = 4_096
 MIN_VACUUM_FREE_SPACE_BYTES = 16 * 1024 * 1024
 
 
@@ -226,6 +234,7 @@ def database_storage_metrics(backups: list[dict] | None = None) -> dict:
     backup_total_bytes = sum(int(item.get("size_bytes") or 0) for item in items)
     quota_bytes = int(MAX_STORED_EVIDENCE_BYTES)
     default_metrics = {
+        "retention_enabled": bool(settings.retention_enabled),
         "database_size_bytes": database_bytes,
         "wal_size_bytes": wal_bytes,
         "live_size_bytes": live_bytes,
@@ -255,6 +264,7 @@ def database_storage_metrics(backups: list[dict] | None = None) -> dict:
             }.get(auto_vacuum_raw, "none")
             evidence = evidence_budget_summary(con)
             return {
+                "retention_enabled": is_storage_retention_enabled(con),
                 "database_size_bytes": database_bytes,
                 "wal_size_bytes": wal_bytes,
                 "live_size_bytes": live_bytes,
@@ -313,6 +323,8 @@ def maintenance_is_due(now: datetime | None = None) -> bool:
         current = current.replace(tzinfo=timezone.utc)
     try:
         with connect() as con:
+            if not is_storage_retention_enabled(con):
+                return False
             row = con.execute(
                 "SELECT value FROM settings WHERE key=?",
                 (MAINTENANCE_LAST_RUN_KEY,),
@@ -323,7 +335,7 @@ def maintenance_is_due(now: datetime | None = None) -> bool:
             if last_run.tzinfo is None:
                 last_run = last_run.replace(tzinfo=timezone.utc)
     except (sqlite3.Error, ValueError):
-        return True
+        return bool(settings.retention_enabled)
     return current.astimezone(timezone.utc) - last_run.astimezone(timezone.utc) >= timedelta(
         hours=MAINTENANCE_INTERVAL_HOURS
     )
@@ -743,34 +755,56 @@ def _prune_backups() -> None:
                 LOGGER.warning("Could not remove an orphaned Bookward key recovery file")
 
 
-def _reclaim_pages_unlocked(
+def _reclaim_incremental_pages_step(
     live_path: Path,
     *,
-    max_pages: int | None = PRE_BACKUP_INCREMENTAL_VACUUM_PAGES,
-) -> None:
-    if not live_path.is_file():
+    max_pages: int = INCREMENTAL_VACUUM_STEP_PAGES,
+) -> int:
+    """Reclaim up to `max_pages` free pages online without exclusive `database_lock`."""
+
+    if not live_path.is_file() or live_path.is_symlink():
+        return 0
+    con = None
+    try:
+        con = sqlite3.connect(
+            live_path,
+            timeout=10,
+            isolation_level=None,
+            factory=_LockedConnection,
+        )
+        con.execute("PRAGMA busy_timeout=5000")
+        auto_vacuum = int(con.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+        if auto_vacuum != 2:
+            return 0
+        before_free = int(con.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        if before_free <= 0:
+            return 0
+        con.execute(f"PRAGMA incremental_vacuum({max(1, int(max_pages))})").fetchall()
+        after_free = int(con.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        return max(0, before_free - after_free)
+    finally:
+        if con is not None:
+            con.close()
+        _restrict_database_files()
+
+
+def _checkpoint_wal_unlocked(live_path: Path, *, mode: str = "PASSIVE") -> None:
+    if not live_path.is_file() or live_path.is_symlink():
         return
+    checkpoint_mode = mode if mode in {"PASSIVE", "TRUNCATE"} else "PASSIVE"
     raw = None
     try:
         raw = sqlite3.connect(live_path, timeout=30, isolation_level=None)
-        auto_vacuum = int(raw.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
-        if auto_vacuum == 2:
-            if max_pages is None:
-                raw.execute("PRAGMA incremental_vacuum").fetchall()
-            else:
-                raw.execute(
-                    f"PRAGMA incremental_vacuum({max(1, int(max_pages))})"
-                ).fetchall()
-        raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        raw.execute(f"PRAGMA wal_checkpoint({checkpoint_mode})").fetchone()
     finally:
         if raw is not None:
             raw.close()
         _restrict_database_files()
 
 
-def _run_maintenance_if_initialized() -> dict | None:
+def _run_maintenance_if_initialized(*, now: datetime | None = None) -> dict | None:
     live_path = profile_database_path()
-    if not live_path.is_file():
+    if not live_path.is_file() or live_path.is_symlink():
         return None
     with connect() as con:
         has_table = con.execute(
@@ -778,56 +812,93 @@ def _run_maintenance_if_initialized() -> dict | None:
         ).fetchone()
     if not has_table:
         return None
-    return run_storage_maintenance()
+    return run_storage_maintenance(now=now)
 
 
-def run_scheduled_maintenance() -> dict:
+def run_scheduled_maintenance(*, now: datetime | None = None) -> dict:
+    """Run batched retention outside `database_lock` and reclaim bounded free pages."""
+
     live_path = profile_database_path()
-    with database_lock(live_path):
-        maintenance = _run_maintenance_if_initialized() or {}
-        _reclaim_pages_unlocked(
-            live_path, max_pages=PRE_BACKUP_INCREMENTAL_VACUUM_PAGES
+    maintenance = _run_maintenance_if_initialized(now=now) or {}
+    if maintenance and not maintenance.get("skipped") and not maintenance.get("truncated"):
+        reclaimed_pages = _reclaim_incremental_pages_step(
+            live_path, max_pages=INCREMENTAL_VACUUM_STEP_PAGES
         )
+        if reclaimed_pages > 0:
+            _checkpoint_wal_unlocked(live_path, mode="PASSIVE")
     return maintenance
 
 
 def compact_database() -> dict:
+    """Compact unused SQLite pages and truncate the WAL without deleting rows."""
+
     live_path = profile_database_path()
     try:
-        with database_lock(live_path):
-            if not live_path.is_file() or live_path.is_symlink():
-                raise BackupError("The Bookward database is not available for compaction.")
-            before_bytes = _file_size(live_path) + _file_size(Path(f"{live_path}-wal"))
-            maintenance = _run_maintenance_if_initialized() or {}
-            raw = None
-            migrated_auto_vacuum = False
-            try:
-                raw = sqlite3.connect(live_path, timeout=30, isolation_level=None)
-                auto_vacuum = int(raw.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
-                if auto_vacuum != 2:
-                    current_bytes = _file_size(live_path) + _file_size(
-                        Path(f"{live_path}-wal")
+        if not live_path.is_file() or live_path.is_symlink():
+            raise BackupError("The Bookward database is not available for compaction.")
+        before_bytes = _file_size(live_path) + _file_size(Path(f"{live_path}-wal"))
+        with connect() as con:
+            auto_vacuum = int(con.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+
+        migrated_auto_vacuum = False
+        if auto_vacuum == 2:
+            # Drain free pages in bounded steps outside `database_lock` so
+            # concurrent read/write requests can interleave freely.
+            while (
+                _reclaim_incremental_pages_step(
+                    live_path, max_pages=INCREMENTAL_VACUUM_STEP_PAGES
+                )
+                >= INCREMENTAL_VACUUM_STEP_PAGES
+            ):
+                pass
+            with database_lock(live_path):
+                raw = None
+                try:
+                    raw = sqlite3.connect(live_path, timeout=30, isolation_level=None)
+                    raw.execute(
+                        f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_STEP_PAGES})"
+                    ).fetchall()
+                    raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                finally:
+                    if raw is not None:
+                        raw.close()
+                    _restrict_database_files()
+        else:
+            with database_lock(live_path):
+                if not live_path.is_file() or live_path.is_symlink():
+                    raise BackupError(
+                        "The Bookward database is not available for compaction."
                     )
-                    required_free = max(
-                        MIN_VACUUM_FREE_SPACE_BYTES, current_bytes * 2
+                raw = None
+                try:
+                    raw = sqlite3.connect(live_path, timeout=30, isolation_level=None)
+                    current_auto_vacuum = int(
+                        raw.execute("PRAGMA auto_vacuum").fetchone()[0] or 0
                     )
-                    available_free = shutil.disk_usage(live_path.parent).free
-                    if available_free < required_free:
-                        raise BackupError(
-                            "Not enough free disk space to migrate this database to incremental compaction."
+                    if current_auto_vacuum != 2:
+                        current_bytes = _file_size(live_path) + _file_size(
+                            Path(f"{live_path}-wal")
                         )
-                    raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                    raw.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                    raw.execute("VACUUM")
-                    raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                    migrated_auto_vacuum = True
-                else:
-                    raw.execute("PRAGMA incremental_vacuum").fetchall()
-                    raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            finally:
-                if raw is not None:
-                    raw.close()
-                _restrict_database_files()
+                        required_free = max(
+                            MIN_VACUUM_FREE_SPACE_BYTES, current_bytes * 2
+                        )
+                        available_free = shutil.disk_usage(live_path.parent).free
+                        if available_free < required_free:
+                            raise BackupError(
+                                "Not enough free disk space to migrate this database to incremental compaction."
+                            )
+                        raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                        raw.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                        raw.execute("VACUUM")
+                        raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                        migrated_auto_vacuum = True
+                    else:
+                        raw.execute("PRAGMA incremental_vacuum").fetchall()
+                        raw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                finally:
+                    if raw is not None:
+                        raw.close()
+                    _restrict_database_files()
         status = backup_status()
         after_bytes = int(status.get("live_size_bytes", 0))
         return {
@@ -836,7 +907,6 @@ def compact_database() -> dict:
             "reclaimed_bytes": max(0, before_bytes - after_bytes),
             "migrated_auto_vacuum": migrated_auto_vacuum,
             "auto_vacuum_mode": status.get("auto_vacuum_mode", "incremental"),
-            "maintenance": maintenance,
             "status": status,
         }
     except BackupError:
@@ -849,13 +919,7 @@ def compact_database() -> dict:
 
 def create_backup() -> dict:
     try:
-        live_path = profile_database_path()
-        with database_lock(live_path):
-            if live_path.is_file() and not live_path.is_symlink():
-                _run_maintenance_if_initialized()
-                _reclaim_pages_unlocked(
-                    live_path, max_pages=PRE_BACKUP_INCREMENTAL_VACUUM_PAGES
-                )
+        with database_lock(profile_database_path()):
             path = _create_snapshot_unlocked()
             _set_last_error("")
             _prune_backups()
@@ -1187,10 +1251,16 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         for profile_id in profile_ids():
             try:
                 with profile_scope(profile_id):
+                    try:
+                        if maintenance_is_due():
+                            await asyncio.to_thread(run_scheduled_maintenance)
+                    except Exception:
+                        LOGGER.exception(
+                            "Scheduled Bookward storage maintenance failed for profile %s",
+                            profile_id,
+                        )
                     if backup_is_due():
                         await asyncio.to_thread(create_backup)
-                    elif maintenance_is_due():
-                        await asyncio.to_thread(run_scheduled_maintenance)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:

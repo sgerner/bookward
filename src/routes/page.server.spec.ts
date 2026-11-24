@@ -1031,6 +1031,7 @@ describe("page actions", () => {
     };
     const backupStatus = {
       enabled: true,
+      retention_enabled: true,
       interval_hours: 24,
       retention_count: 7,
       last_success_at: "2026-11-21T00:00:00+00:00",
@@ -1044,14 +1045,31 @@ describe("page actions", () => {
       evidence_quota_bytes: 512 * 1024 * 1024,
       evidence_status: "healthy",
     };
+    let compactCalls = 0;
     const fetchMock = vi.fn().mockImplementation((input: string) => {
       if (String(input).includes("/api/backups/compact")) {
+        compactCalls += 1;
         return Promise.resolve(
           new Response(
-            JSON.stringify({
-              reclaimed_bytes: 2 * 1024 * 1024,
-              after_bytes: 10 * 1024 * 1024,
-            }),
+            JSON.stringify(
+              compactCalls === 1
+                ? {
+                    reclaimed_bytes: 2 * 1024 * 1024,
+                    after_bytes: 10 * 1024 * 1024,
+                  }
+                : {
+                    reclaimed_bytes: 0,
+                    after_bytes: 10 * 1024 * 1024,
+                  },
+            ),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups/retention")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ retention_enabled: false, status: backupStatus }),
             { status: 200, headers: { "content-type": "application/json" } },
           ),
         );
@@ -1077,6 +1095,7 @@ describe("page actions", () => {
       url: new URL("http://afterword.test/?view=settings"),
       locals: { user: null },
     } as never)) as { backupStatus: typeof backupStatus };
+    expect(loaded.backupStatus.retention_enabled).toBe(true);
     expect(loaded.backupStatus.live_size_bytes).toBe(12 * 1024 * 1024);
     expect(loaded.backupStatus.evidence_used_bytes).toBe(64 * 1024 * 1024);
     expect(loaded.backupStatus.evidence_status).toBe("healthy");
@@ -1089,6 +1108,32 @@ describe("page actions", () => {
       "http://127.0.0.1:8000/api/backups/compact",
       expect.objectContaining({ method: "POST" }),
     );
+
+    const alreadyCompact = await actions.compactStorage!({} as never);
+    expect(alreadyCompact).toEqual({
+      message: "Database already compact. Live database: 10.0 MB.",
+    });
+
+    const pauseForm = new FormData();
+    pauseForm.set("enabled", "0");
+    const paused = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: pauseForm }),
+    } as never);
+    expect(paused).toEqual({ message: "Automatic storage retention paused." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/retention",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: false }),
+      }),
+    );
+
+    const resumeForm = new FormData();
+    resumeForm.set("enabled", "1");
+    const resumed = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: resumeForm }),
+    } as never);
+    expect(resumed).toEqual({ message: "Automatic storage retention enabled." });
   });
 
   it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {

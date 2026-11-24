@@ -30,6 +30,7 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
+from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from . import ingestion
@@ -1137,12 +1138,31 @@ def make_backup():
     return {"backup": created, "status": backup_status()}
 
 
+class StorageRetentionIn(BaseModel):
+    enabled: bool
+
+
 @app.post("/api/backups/compact")
 def compact_database_storage():
     try:
         return compact_database()
     except BackupError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/backups/retention")
+def update_storage_retention(payload: StorageRetentionIn):
+    if payload.enabled and not settings.retention_enabled:
+        raise HTTPException(
+            409,
+            "Storage retention is disabled by AFTERWORD_RETENTION_ENABLED.",
+        )
+    set_storage_retention_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "retention_enabled": bool(status.get("retention_enabled", payload.enabled)),
+        "status": status,
+    }
 
 
 @app.post("/api/backups/{backup_id}/restore")
