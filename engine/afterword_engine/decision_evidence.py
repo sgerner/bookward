@@ -56,8 +56,8 @@ MAX_JSON_DEPTH = 8
 POOL_FIELDS = (
     "id", "title", "author", "description", "genres", "score", "explanation",
     "status", "source_id", "source_name", "source_weight", "catalog_confidence",
-    "quality_score", "quality_status", "quality_openlibrary_work_id", "quality_work_id", "quality_provider",
-    "quality_isbn13", "quality_isbn10", "quality_isbn_verified", "score_batch_id", "metadata_confidence", "release_date",
+    "quality_score", "quality_status", "quality_work_id", "quality_provider",
+    "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
     "date_kind", "propensity", "first_publication_year", "publication_work_id", "publication_era",
 )
 PROFILE_FIELDS = (

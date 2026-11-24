@@ -220,6 +220,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         "q.work_id quality_work_id,q.provider quality_provider,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
         "COALESCE(q.isbn_verified,0) quality_isbn_verified,"
+        "q.quality_status quality_status,q.audit_version quality_audit_version,"
         "CASE WHEN q.quality_score>0 THEN q.quality_score "
         "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
         "FROM candidates c JOIN sources s ON s.id=c.source_id "

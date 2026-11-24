@@ -15,6 +15,7 @@ JOB_HEARTBEAT_SECONDS = 30
 JOB_REAPER_SECONDS = 30
 JOB_MAX_ATTEMPTS = 3
 PROFILE_RETRY_SECONDS = 60
+QUALITY_RECOVERY_COOLDOWN_SECONDS = 60
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -91,6 +92,7 @@ async def worker_loop(handler, stop):
     last_reaped_at: dict[str, float] = {}
     ready_profiles: set[str] = set()
     profile_retry_after: dict[str, float] = {}
+    last_quality_recovery_at: float | None = None
     while not stop.is_set():
         worked = False
         for profile_id in profile_ids():
@@ -110,7 +112,35 @@ async def worker_loop(handler, stop):
                     ):
                         _reap_abandoned_jobs()
                         last_reaped_at[profile_id] = current
-                    job = row("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
+                    cooldown = max(0.0, float(QUALITY_RECOVERY_COOLDOWN_SECONDS))
+                    recovery_throttled = bool(
+                        cooldown > 0
+                        and last_quality_recovery_at is not None
+                        and current - last_quality_recovery_at < cooldown
+                    )
+                    if not recovery_throttled and cooldown > 0:
+                        cutoff = (
+                            datetime.now(timezone.utc) - timedelta(seconds=cooldown)
+                        ).isoformat()
+                        recovery_throttled = bool(
+                            row(
+                                "SELECT 1 FROM jobs WHERE kind='candidate_quality_recovery' "
+                                "AND status='complete' AND finished_at IS NOT NULL "
+                                "AND julianday(finished_at) > julianday(?) LIMIT 1",
+                                (cutoff,),
+                            )
+                        )
+                    if recovery_throttled:
+                        job = row(
+                            "SELECT * FROM jobs WHERE status='queued' "
+                            "AND kind!='candidate_quality_recovery' ORDER BY created_at LIMIT 1"
+                        )
+                    else:
+                        job = row(
+                            "SELECT * FROM jobs WHERE status='queued' "
+                            "ORDER BY CASE WHEN kind='candidate_quality_recovery' THEN 1 ELSE 0 END, "
+                            "created_at LIMIT 1"
+                        )
                     if not job:
                         continue
                     lease_token = uuid.uuid4().hex
@@ -149,6 +179,8 @@ async def worker_loop(handler, stop):
                                 (safe_error_message(exc, limit=2000), now(), job["id"], lease_token),
                             )
                     finally:
+                        if job["kind"] == "candidate_quality_recovery":
+                            last_quality_recovery_at = time.monotonic()
                         heartbeat_stop.set()
                         await asyncio.to_thread(heartbeat.join)
             except Exception:

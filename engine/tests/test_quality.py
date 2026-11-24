@@ -216,7 +216,7 @@ def test_provider_unavailable_quarantine_retries_after_backoff(database):
 
 
 def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
-    assert QUALITY_VERSION == "candidate-quality-v5"
+    assert QUALITY_VERSION == "candidate-quality-v6"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
@@ -554,9 +554,8 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
 
 
 @respx.mock
-def test_google_books_override_preserves_openlibrary_work_id_and_year_provenance(database):
-    from afterword_engine.database import connect
-    from afterword_engine.publication_year_metadata import attach_publication_years
+def test_google_books_override_preserves_openlibrary_work_id_for_read_overlap_dedupe(database):
+    from afterword_engine.quality import _dedupe_and_hide
 
     candidate_id = add_candidate("The Dispossessed", "Ursula K. Le Guin")
     with transaction() as con:
@@ -620,18 +619,17 @@ def test_google_books_override_preserves_openlibrary_work_id_and_year_provenance
     candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
     assert candidate["release_date"] == "2014-10-14"
 
-    projected = [
-        {
-            **candidate,
-            "quality_openlibrary_work_id": quality["openlibrary_work_id"],
-            "quality_work_id": quality["work_id"],
-            "quality_provider": quality["provider"],
-        }
-    ]
-    with connect() as con:
-        attach_publication_years(con, [], projected)
-    assert projected[0]["first_publication_year"] == 1974
-    assert projected[0]["publication_work_id"] == "/works/OL59863W"
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source,openlibrary_work_id) "
+            "VALUES('Les Dépossédés','U. Le Guin',5,'goodreads_csv','/works/OL59863W')"
+        )
+        deduped = _dedupe_and_hide(con)
+    assert deduped == 1
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,))["status"] == "rejected"
+    assert "read_overlap" in json.loads(
+        row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (candidate_id,))["flags_json"]
+    )
 
 
 @respx.mock
@@ -729,65 +727,108 @@ def test_unverified_title_search_box_set_isbn_keeps_unread_sequels_eligible(data
 
 
 @respx.mock
-def test_isbn_parts_and_audit_reject_cross_edition_isbn_pairing(database):
-    from afterword_engine.isbn import isbn_parts
-
-    assert isbn_parts(["9780143127550", "0307474275"]) == ("9780143127550", "")
-    assert isbn_parts(["9780143127550", "0143127551"]) == ("9780143127550", "0143127551")
-
-    candidate_id = add_candidate("Station Eleven", "Emily St. John Mandel", isbn13="9780804172448")
+def test_audit_rejects_non_equivalent_catalog_isbn10_pairing_for_source_isbn13(database):
+    mismatched_id = add_candidate("Station Eleven", "Emily St. John Mandel", isbn13="9780804172448")
+    equivalent_id = add_candidate("Sea of Tranquility", "Emily St. John Mandel", isbn13="9780143127550")
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
         con.execute(
-            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
-            (QUALITY_VERSION, candidate_id),
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, mismatched_id, equivalent_id),
         )
 
-    respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "docs": [
-                    {
-                        "key": "/works/OL17078986W",
-                        "title": "Station Eleven",
-                        "author_name": ["Emily St. John Mandel"],
-                        "isbn": ["9780804172448", "0307474275"],
-                    }
-                ]
-            },
-        )
-    )
+    def ol_handler(request):
+        isbn = request.url.params.get("isbn", "")
+        if isbn == "9780804172448":
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL17078986W",
+                            "title": "Station Eleven",
+                            "author_name": ["Emily St. John Mandel"],
+                            "isbn": ["9780804172448", "0307474275"],
+                        }
+                    ]
+                },
+            )
+        if isbn == "9780143127550":
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL24636892W",
+                            "title": "Sea of Tranquility",
+                            "author_name": ["Emily St. John Mandel"],
+                            "isbn": ["9780143127550", "0143127551"],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"docs": []})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
     respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
 
     asyncio.run(audit_candidates(only_pending=True))
-    quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
-    assert quality["isbn13"] == "9780804172448"
-    assert quality["isbn10"] == ""
-    assert quality["isbn_verified"] == 1
+    mismatched_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (mismatched_id,))
+    assert mismatched_q["isbn13"] == "9780804172448"
+    assert mismatched_q["isbn10"] == ""
+    assert mismatched_q["isbn_verified"] == 1
+
+    equivalent_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (equivalent_id,))
+    assert equivalent_q["isbn13"] == "9780143127550"
+    assert equivalent_q["isbn10"] == "0143127551"
+    assert equivalent_q["isbn_verified"] == 1
 
 
-def test_bounded_v5_recovery_selects_legacy_google_books_without_openlibrary_work_id(database):
+def test_bounded_v6_recovery_skips_already_verified_v4_v5_rows_with_work_id(database):
     legacy_google = add_candidate("Legacy Google Match", "A Writer")
-    legacy_ol_complete = add_candidate("Legacy OpenLibrary Match", "A Writer")
+    legacy_ol_verified_v4 = add_candidate("Legacy OL Verified v4", "A Writer", isbn13="9780307474278")
+    legacy_ol_verified_v5 = add_candidate("Legacy OL Verified v5", "A Writer", isbn13="9780307474278")
+    legacy_ol_no_isbn = add_candidate("Legacy OL Without ISBN", "A Writer")
+    legacy_ol_unverified_isbn = add_candidate("Legacy OL Unverified Catalog ISBN", "A Writer")
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
-            "provider='google_books',provider_id='gb-legacy',work_id='',openlibrary_work_id='' "
+            "provider='google_books',provider_id='gb-legacy',work_id='gb-legacy',openlibrary_work_id='' "
             "WHERE candidate_id=?",
             (legacy_google,),
         )
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
             "provider='openlibrary',provider_id='/works/OL999W',work_id='/works/OL999W',"
-            "openlibrary_work_id='/works/OL999W' WHERE candidate_id=?",
-            (legacy_ol_complete,),
+            "openlibrary_work_id='/works/OL999W',isbn13='9780307474278',isbn_verified=1 WHERE candidate_id=?",
+            (legacy_ol_verified_v4,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v5',"
+            "provider='openlibrary',provider_id='/works/OL998W',work_id='/works/OL998W',"
+            "openlibrary_work_id='/works/OL998W',isbn13='9780307474278',isbn_verified=1 WHERE candidate_id=?",
+            (legacy_ol_verified_v5,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OL997W',work_id='/works/OL997W',"
+            "openlibrary_work_id='/works/OL997W',isbn13='',isbn10='',isbn_verified=0 WHERE candidate_id=?",
+            (legacy_ol_no_isbn,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OL996W',work_id='/works/OL996W',"
+            "openlibrary_work_id='/works/OL996W',isbn13='9780345538376',isbn_verified=0 WHERE candidate_id=?",
+            (legacy_ol_unverified_isbn,),
         )
 
     selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
     assert legacy_google in selected_ids
-    assert legacy_ol_complete not in selected_ids
+    assert legacy_ol_unverified_isbn in selected_ids
+    assert legacy_ol_verified_v4 not in selected_ids
+    assert legacy_ol_verified_v5 not in selected_ids
+    assert legacy_ol_no_isbn not in selected_ids
 
 
 def test_fetch_catalog_json_registers_trace_before_await_and_handles_json_edges():

@@ -188,27 +188,11 @@ def evaluate_organic_reads(db_path: Path, *, since: str = DEFAULT_SINCE) -> dict
             filtered_reads, read_metadata_rows
         )
 
-        quality_columns = {
-            str(item["name"])
-            for item in con.execute("PRAGMA table_info(candidate_quality)").fetchall()
-        }
-        openlibrary_work_expr = (
-            "q.openlibrary_work_id AS quality_openlibrary_work_id"
-            if "openlibrary_work_id" in quality_columns
-            else "'' AS quality_openlibrary_work_id"
-        )
-        isbn_verified_expr = (
-            "COALESCE(q.isbn_verified, 0) AS quality_isbn_verified"
-            if "isbn_verified" in quality_columns
-            else "1 AS quality_isbn_verified"
-        )
         candidates = con.execute(
             "SELECT c.id, c.title, c.author, c.source_id, c.source_url, c.created_at, "
             "c.isbn13, c.isbn10, "
-            f"{openlibrary_work_expr}, "
             "q.work_id AS quality_work_id, q.provider AS quality_provider, "
-            "q.isbn13 AS quality_isbn13, q.isbn10 AS quality_isbn10, "
-            f"{isbn_verified_expr} "
+            "q.isbn13 AS quality_isbn13, q.isbn10 AS quality_isbn10 "
             "FROM candidates c "
             "JOIN sources s ON s.id = c.source_id "
             "JOIN candidate_quality q ON q.candidate_id = c.id "

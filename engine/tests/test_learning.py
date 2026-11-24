@@ -808,7 +808,7 @@ def test_unrated_manual_read_keeps_verified_isbn_for_aliases_imports_and_rescori
             ("Hospitality: A New Approach", "Catalog Variant", source_id, "hospitality alias"),
         ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,isbn_verified=1,"
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,"
             "provider='openlibrary',work_id='/works/OL123456W' "
             "WHERE candidate_id IN (?,?)",
             (isbn13, marked_id, alias_id),
@@ -872,7 +872,7 @@ def test_manual_read_keeps_existing_isbn_rating_and_read_source(database):
             ("Existing Work", "A Reader", source_id, "existing work marker"),
         ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,isbn_verified=1 "
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=? "
             "WHERE candidate_id=?",
             ("9780593418574", candidate_id),
         )
@@ -916,7 +916,7 @@ def test_manual_read_canonicalizes_valid_isbn10_and_ignores_invalid_isbn(
             ("Identifier Check", "A Reader", source_id, "identifier check"),
         ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,isbn10=?,isbn_verified=1 "
+            "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,isbn10=? "
             "WHERE candidate_id=?",
             (quality_isbn13, quality_isbn10, candidate_id),
         )
@@ -941,7 +941,7 @@ def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
             ("Finished Work", "A Reader", source_id, "finished work marker"),
         ).lastrowid
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn10=?,isbn_verified=1 "
+            "UPDATE candidate_quality SET quality_status='accepted',isbn10=? "
             "WHERE candidate_id=?",
             ("0593418573", candidate_id),
         )

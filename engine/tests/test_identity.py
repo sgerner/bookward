@@ -589,25 +589,93 @@ def test_work_match_keys_collect_across_fields_and_reject_openlibrary_editions()
     assert edition_work_keys == set()
 
 
-def test_isbn_match_keys_ignore_unverified_quality_isbns():
+def test_isbn_match_keys_gate_v6_unverified_quality_isbns_and_keep_pre_v6_legacy_dedupe(database):
     read_keys = book_identity_match_index(
         [{"title": "Read Book", "author": "Read Author", "isbn": "9780345538376"}]
     )
 
-    unverified_candidate = {
+    v6_unverified = {
         "title": "Unread Sequel",
         "author": "Read Author",
+        "quality_status": "accepted",
+        "quality_audit_version": "candidate-quality-v6",
         "quality_isbn13": "9780345538376",
         "quality_isbn10": "0345538374",
         "quality_isbn_verified": 0,
     }
-    assert not (book_row_identity_match_keys(unverified_candidate) & read_keys)
+    assert not (book_row_identity_match_keys(v6_unverified) & read_keys)
 
-    verified_candidate = {
-        **unverified_candidate,
+    pending_requeued = {
+        **v6_unverified,
+        "quality_status": "pending",
+        "quality_audit_version": "candidate-quality-v4",
+    }
+    assert not (book_row_identity_match_keys(pending_requeued) & read_keys)
+
+    pre_v6_legacy = {
+        **v6_unverified,
+        "quality_status": "accepted",
+        "quality_audit_version": "candidate-quality-v4",
+    }
+    assert book_row_identity_match_keys(pre_v6_legacy) & read_keys
+
+    v6_verified = {
+        **v6_unverified,
         "quality_isbn_verified": 1,
     }
-    assert book_row_identity_match_keys(verified_candidate) & read_keys
+    assert book_row_identity_match_keys(v6_verified) & read_keys
+
+    # 978 cross-format, 979 direct vs non-equivalent ISBN-10, and lowercase-x ISBN-10
+    isbn_979_keys = book_identity_match_index(
+        [{"title": "French Edition", "author": "Author", "isbn": "9791032305690"}]
+    )
+    assert book_row_identity_match_keys(
+        {"title": "Alt Title", "author": "Alt Author", "isbn13": "9791032305690"}
+    ) & isbn_979_keys
+    # 979 ISBN-13 sharing digits 4..12 with a 978/ISBN-10 stem must never collide
+    isbn_10_keys = book_identity_match_index(
+        [{"title": "978 Book", "author": "Author", "isbn": "0307474275"}]
+    )
+    assert not (
+        book_row_identity_match_keys(
+            {"title": "979 Book", "author": "Other", "isbn13": "9790307474277"}
+        )
+        & isbn_10_keys
+    )
+    # Lowercase-x ISBN-10 matches uppercase-X ISBN-10 and equivalent 978 ISBN-13
+    lowercase_x_keys = book_identity_match_index(
+        [{"title": "X Checksum Book", "author": "Author", "isbn": "043942089x"}]
+    )
+    assert book_row_identity_match_keys(
+        {"title": "Upper X", "author": "Other", "isbn10": "043942089X"}
+    ) & lowercase_x_keys
+    assert book_row_identity_match_keys(
+        {"title": "978 Equivalent", "author": "Other", "isbn13": "9780439420891"}
+    ) & lowercase_x_keys
+
+    # End-to-end DB check: pre-v6 accepted row with catalog-only ISBN stays hidden until v6 re-audit
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,5,?,'goodreads_csv')",
+            ("Translated Read Title", "Translated Author", "9780307474278"),
+        )
+    legacy_cid = add_candidate("Original Edition Title", "Original Author", score=95)
+    v6_unverified_cid = add_candidate("Unread Companion Volume", "Original Author", score=94)
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "isbn13='9780307474278',isbn_verified=0 WHERE candidate_id=?",
+            (legacy_cid,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v6',"
+            "isbn13='9780307474278',isbn_verified=0 WHERE candidate_id=?",
+            (v6_unverified_cid,),
+        )
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert legacy_cid not in visible_ids
+    assert v6_unverified_cid in visible_ids
 
 
 def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():

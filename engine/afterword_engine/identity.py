@@ -25,6 +25,8 @@ _OPEN_LIBRARY_BARE_WORK = re.compile(r"^(OL\d+W)$", re.IGNORECASE)
 _OPEN_LIBRARY_EDITION = re.compile(
     r"(?:^|/)books/[^/?#]+(?:\.json)?(?:[/?#]|$)|^OL\d+M$", re.IGNORECASE
 )
+_QUALITY_VERSION_NUMBER = re.compile(r"^candidate-quality-v(\d+)$", re.IGNORECASE)
+_ISBN_VERIFIED_MIN_QUALITY_VERSION = 6
 _ARTICLE_LED_SUBTITLE = re.compile(r"^(?:a|an|the)\b", re.IGNORECASE)
 _NUMBERED_SERIES_SUBTITLE = re.compile(
     r"^(?:a|an|the)\s+(?:one|two|three|four|five|first|second|third|fourth|fifth)\b",
@@ -148,6 +150,39 @@ def _title_match_keys(value: object) -> set[str]:
     return keys
 
 
+def _quality_isbn_usable(item) -> bool:
+    """Whether ``quality_isbn13`` / ``quality_isbn10`` may participate in dedupe.
+
+    Rows audited under ``candidate-quality-v6`` or later explicitly record
+    ``isbn_verified = 1`` for source/ISBN-query matches and ``0`` for
+    unverified title-search work bags. Pre-v6 non-pending rows keep their
+    catalog ISBN keys until background re-audit stamps them at v6+ so
+    read-overlap detection never regresses immediately after migration.
+    """
+
+    verified_flag = _row_value(item, "quality_isbn_verified", None)
+    if verified_flag is None:
+        verified_flag = _row_value(item, "isbn_verified", None)
+    if verified_flag is None:
+        return True
+    if bool(verified_flag):
+        return True
+    quality_status = str(_row_value(item, "quality_status") or "").strip().lower()
+    if quality_status == "pending":
+        return False
+    audit_version = str(
+        _row_value(item, "quality_audit_version")
+        or _row_value(item, "audit_version")
+        or ""
+    ).strip()
+    if not audit_version:
+        return False
+    version_match = _QUALITY_VERSION_NUMBER.fullmatch(audit_version)
+    if version_match and int(version_match.group(1)) >= _ISBN_VERIFIED_MIN_QUALITY_VERSION:
+        return False
+    return True
+
+
 def _isbn_match_keys(item) -> set[tuple[str, str]]:
     """Return validated, edition-level identifiers for a catalog row."""
 
@@ -165,10 +200,7 @@ def _isbn_match_keys(item) -> set[tuple[str, str]]:
             # isbn_parts maps a valid ISBN-10 to its ISBN-13 equivalent, so
             # both representations share one key without relying on titles.
             keys.add(("isbn", isbn13))
-    verified_flag = _row_value(item, "quality_isbn_verified", None)
-    if verified_flag is None:
-        verified_flag = _row_value(item, "isbn_verified", False)
-    if bool(verified_flag):
+    if _quality_isbn_usable(item):
         for field in ("quality_isbn10", "quality_isbn13"):
             value = _row_value(item, field)
             if not value:

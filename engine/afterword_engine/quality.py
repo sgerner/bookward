@@ -57,7 +57,7 @@ from .identity import (
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
-QUALITY_VERSION = "candidate-quality-v5"
+QUALITY_VERSION = "candidate-quality-v6"
 APPLE_BOOKS_SEARCH = "https://itunes.apple.com/search"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
@@ -1078,40 +1078,6 @@ async def resolve_catalog_match(
                 for source in record.get("metadata_provenance", {}).get("source_payloads", [])
             ],
         }
-        if (
-            best_openlibrary_record is not None
-            and openlibrary_work_id
-            and best_openlibrary_record.get("release_date")
-            and best_openlibrary_record.get("release_date_source_field")
-            in {"first_publish_year", "first_publish_date"}
-        ):
-            ol_provenance = best_openlibrary_record.get("metadata_provenance") or {}
-            ol_release_field = dict((ol_provenance.get("fields") or {}).get("release_date") or {})
-            if ol_release_field:
-                ol_release_field["provider"] = "openlibrary"
-                ol_release_field["provider_id"] = openlibrary_work_id
-                result["openlibrary_work_provenance"] = {
-                    "quality_score": best_openlibrary_record.get("quality_score", 0.0),
-                    "metadata_provenance": {
-                        "fetched_at": ol_provenance.get("fetched_at") or _utc_now(),
-                        "normalization_version": METADATA_NORMALIZATION_VERSION,
-                        "fields": {"release_date": ol_release_field},
-                        "fetch_trace": fetch_trace,
-                        "source_payloads": [
-                            {
-                                **source,
-                                "provider": "openlibrary",
-                                "provider_id": openlibrary_work_id,
-                                "payload": {
-                                    **(source.get("payload") if isinstance(source.get("payload"), dict) else {}),
-                                    "key": openlibrary_work_id,
-                                },
-                            }
-                            for source in ol_provenance.get("source_payloads", [])
-                            if isinstance(source, dict)
-                        ],
-                    },
-                }
         return result
 
     task = asyncio.create_task(lookup())
@@ -1180,11 +1146,12 @@ async def _audit_one(
             **source_identifiers,
         }
     accepted = match["quality_score"] >= 0.82 and match["title_match"] >= 0.82 and match["author_match"] >= 0.65
-    final_isbn13, final_isbn10 = isbn_parts(
-        source_isbn13,
-        source_isbn10,
-        match.get("isbn13", ""),
-        match.get("isbn10", ""),
+    match_isbn10 = str(match.get("isbn10") or "")
+    final_isbn13 = source_isbn13 or str(match.get("isbn13") or "")
+    final_isbn10 = source_isbn10 or (
+        match_isbn10
+        if match_isbn10 and (not final_isbn13 or canonical_isbn(match_isbn10) == final_isbn13)
+        else ""
     )
     isbn_verified = int(
         bool(source_isbn13 or source_isbn10 or (accepted and match.get("isbn_verified")))
@@ -1241,8 +1208,14 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "OR q.audit_version='legacy-pending-audit-v1' "
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND COALESCE(q.audit_version,'')!=? "
-        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='' "
-        "OR (q.quality_status='accepted' AND COALESCE(q.provider,'')!='' AND COALESCE(q.openlibrary_work_id,'')=''))) "
+        "AND ("
+        "(COALESCE(q.audit_version,'') NOT IN ('candidate-quality-v4','candidate-quality-v5') "
+        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
+        "OR (COALESCE(q.audit_version,'') IN ('candidate-quality-v4','candidate-quality-v5') "
+        "AND COALESCE(q.isbn_verified,0)=0 "
+        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
+        "OR (q.quality_status='accepted' AND COALESCE(q.provider,'')!='' AND COALESCE(q.openlibrary_work_id,'')='')"
+        ")) "
         "OR (q.quality_status='quarantine' AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
         "AND datetime(q.audited_at)<=datetime(?)))"
@@ -1493,23 +1466,6 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 default_provider_id=str(provider_id or result.get(provider_id_key) or ""),
                 default_confidence=float(result.get("quality_score", 0) or 0),
             )
-    openlibrary_work_provenance = result.get("openlibrary_work_provenance")
-    openlibrary_work_id = str(result.get("openlibrary_work_id") or "")
-    if isinstance(openlibrary_work_provenance, dict) and openlibrary_work_id:
-        persist_metadata_field_provenance(
-            con,
-            "candidate",
-            candidate_id,
-            "release_date",
-            openlibrary_work_provenance,
-            default_provider="openlibrary",
-            default_provider_id=openlibrary_work_id,
-            default_confidence=float(
-                openlibrary_work_provenance.get("quality_score")
-                or result.get("quality_score", 0)
-                or 0
-            ),
-        )
     return bool(selected_fields)
 
 
@@ -1540,7 +1496,9 @@ def _dedupe_and_hide(con) -> int:
         q.openlibrary_work_id AS quality_openlibrary_work_id,
         q.work_id AS quality_work_id,q.provider AS quality_provider,
         q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10,
-        COALESCE(q.isbn_verified,0) AS quality_isbn_verified
+        COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+        q.quality_status AS quality_status,
+        q.audit_version AS quality_audit_version
         FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended')"""
@@ -1562,7 +1520,9 @@ def _dedupe_and_hide(con) -> int:
             q.openlibrary_work_id AS quality_openlibrary_work_id,
             q.work_id AS quality_work_id,q.provider AS quality_provider,
             q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10,
-            COALESCE(q.isbn_verified,0) AS quality_isbn_verified
+            COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+            q.quality_status AS quality_status,
+            q.audit_version AS quality_audit_version
             FROM candidates c
             LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE c.status IN ('saved','imported')"""
@@ -1582,7 +1542,9 @@ def _dedupe_and_hide(con) -> int:
         q.work_id AS quality_work_id,
         q.provider AS quality_provider,q.isbn13 AS quality_isbn13,
         q.isbn10 AS quality_isbn10,
-        COALESCE(q.isbn_verified,0) AS quality_isbn_verified
+        COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+        q.quality_status AS quality_status,
+        q.audit_version AS quality_audit_version
         FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'"""
     ).fetchall()

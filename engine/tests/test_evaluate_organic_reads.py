@@ -23,18 +23,14 @@ def _accept_candidate(
     *,
     provider: str = "openlibrary",
     work_id: str = "",
-    openlibrary_work_id: str = "",
     isbn13: str = "",
     isbn10: str = "",
-    isbn_verified: int | None = None,
 ) -> None:
-    verified = int(bool(isbn13 or isbn10)) if isbn_verified is None else int(bool(isbn_verified))
     con.execute(
         "UPDATE candidate_quality "
-        "SET quality_status = 'accepted', provider = ?, work_id = ?, "
-        "openlibrary_work_id = ?, isbn13 = ?, isbn10 = ?, isbn_verified = ? "
+        "SET quality_status = 'accepted', provider = ?, work_id = ?, isbn13 = ?, isbn10 = ? "
         "WHERE candidate_id = ?",
-        (provider, work_id, openlibrary_work_id, isbn13, isbn10, verified, candidate_id),
+        (provider, work_id, isbn13, isbn10, candidate_id),
     )
 
 
@@ -483,61 +479,4 @@ def test_separates_completion_and_rating_enjoyment_cohorts(
         "hit_at_8": 1,
         "hit_at_24": 2,
         "mrr": round((1.0 / 20.0 + 1.0 / 4.0) / 2.0, 4),
-    }
-
-
-def test_pool_matches_decoupled_openlibrary_work_id_and_ignores_unverified_quality_isbn(
-    tmp_path: Path, monkeypatch
-) -> None:
-    db_path = _init_db(tmp_path, monkeypatch, "decoupled_pool.db")
-
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute(
-            "INSERT INTO sources(id, name, url, kind, enabled) "
-            "VALUES(999, 'Enabled Feed', 'https://example.com/enabled', 'rss', 1)"
-        )
-        con.execute(
-            "INSERT INTO candidates(id, source_id, title, author, normalized_key, created_at) "
-            "VALUES(30, 999, 'Google Winner Variant', 'A. Author', 'googlewinner|aauthor', '2026-09-22 00:00:00')"
-        )
-        _accept_candidate(
-            con,
-            30,
-            provider="google_books",
-            work_id="",
-            openlibrary_work_id="/works/OL888888W",
-        )
-        con.execute(
-            "INSERT INTO candidates(id, source_id, title, author, normalized_key, created_at) "
-            "VALUES(31, 999, 'Box Set Sequel', 'Series Author', 'boxsetsequel|seriesauthor', '2026-09-22 00:00:00')"
-        )
-        _accept_candidate(
-            con,
-            31,
-            provider="openlibrary",
-            work_id="/works/OL111112W",
-            openlibrary_work_id="/works/OL111112W",
-            isbn13="9780143127741",
-            isbn_verified=0,
-        )
-
-        con.execute(
-            "INSERT INTO reads(id, title, author, rating, read_at, source, openlibrary_work_id) "
-            "VALUES(1, 'Original Open Library Work', 'Actual Author', 5, '2026-10-05', 'goodreads_rss', '/works/OL888888W')"
-        )
-        con.execute(
-            "INSERT INTO reads(id, title, author, rating, read_at, isbn, source) "
-            "VALUES(2, 'Box Set Book One', 'Series Author', 4, '2026-10-05', '9780143127741', 'goodreads_rss')"
-        )
-        con.commit()
-    finally:
-        con.close()
-
-    report = evaluate_organic_reads(db_path, since="2026-09-21")
-    by_title = {item["title"]: item["in_pool"] for item in report["reads"]}
-    assert by_title == {
-        "Original Open Library Work": True,
-        "Box Set Book One": False,
     }

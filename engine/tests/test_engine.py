@@ -448,7 +448,6 @@ def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pair
             "release_date": None,
             "date_kind": "",
             "genres": [],
-            "isbn13": "9781966503149",
         }
     ]
 

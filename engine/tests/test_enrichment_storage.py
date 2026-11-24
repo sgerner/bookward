@@ -985,6 +985,9 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
 
 
 def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+    from afterword_engine.identity import ReadIdentityIndex
+    from afterword_engine.main import recommendation_list
+
     settings.db = str(tmp_path / "legacy-v26.db")
     con = sqlite3.connect(settings.db)
     con.execute(
@@ -1000,11 +1003,35 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         "INSERT INTO sources(name,url) VALUES('Test Feed','https://example.com/feed')"
     ).lastrowid
 
-    def insert_legacy(title, *, status="new", source_url="", c_isbn13="", q_status="accepted", provider="openlibrary", work_id="", q_isbn13="", q_isbn10="", flags="[]"):
+    def insert_legacy(
+        title,
+        *,
+        status="new",
+        source_url="",
+        c_isbn13="",
+        c_isbn10="",
+        q_status="accepted",
+        provider="openlibrary",
+        work_id="",
+        q_isbn13="",
+        q_isbn10="",
+        flags="[]",
+        score=85.0,
+    ):
         cid = con.execute(
-            "INSERT INTO candidates(title,author,source_url,source_id,status,isbn13,normalized_key) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (title, "Writer", source_url, source_id, status, c_isbn13, title.lower().replace(" ", "-")),
+            "INSERT INTO candidates(title,author,source_url,source_id,status,isbn13,isbn10,score,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                title,
+                "Writer",
+                source_url,
+                source_id,
+                status,
+                c_isbn13,
+                c_isbn10,
+                score,
+                title.lower().replace(" ", "-"),
+            ),
         ).lastrowid
         con.execute(
             "UPDATE candidate_quality SET quality_status=?,provider=?,work_id=?,isbn13=?,isbn10=?,flags_json=?,audit_version='candidate-quality-v4' "
@@ -1019,9 +1046,42 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         work_id="/works/OL100W",
         q_isbn13="9780307474278",
     )
+    cross_978_c10_q13 = insert_legacy(
+        "Cross 978 C10 To Q13",
+        c_isbn10="0307474275",
+        q_isbn13="9780307474278",
+    )
+    cross_978_c13_q10 = insert_legacy(
+        "Cross 978 C13 To Q10",
+        c_isbn13="9780307474278",
+        q_isbn10="0307474275",
+    )
+    direct_979 = insert_legacy(
+        "Direct 979 Match",
+        c_isbn13="9791032305690",
+        q_isbn13="9791032305690",
+    )
+    non_equiv_979 = insert_legacy(
+        "979 Non Equivalent Stem",
+        c_isbn10="0307474275",
+        q_isbn13="9790307474277",
+    )
+    lowercase_x_direct = insert_legacy(
+        "Lowercase x ISBN10 Direct",
+        c_isbn10="043942089x",
+        q_isbn10="043942089X",
+    )
+    lowercase_x_cross = insert_legacy(
+        "Lowercase x ISBN10 Cross 978",
+        c_isbn10="043942089x",
+        q_isbn13="9780439420891",
+    )
     gb_with_source_work = insert_legacy(
         "Google With Source Work",
-        source_url="https://openlibrary.org/works/OL200W/Book_Title",
+        status="recommended",
+        source_url="https://openlibrary.org/works/OL200W/Book_Title?edition=key%3A/books/OL1M#details",
+        c_isbn13="9780804172448",
+        c_isbn10="043942089X",
         provider="google_books",
         work_id="gb-volume-42",
         q_isbn13="9780143127550",
@@ -1037,7 +1097,8 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         status="rejected",
         q_status="rejected",
         q_isbn13="9780345538376",
-        flags='["read_overlap"]',
+        q_isbn10="0345538374",
+        flags='["catalog_match_ambiguous","read_overlap","short_description"]',
     )
     requeued_dup = insert_legacy(
         "False Duplicate Identity",
@@ -1045,6 +1106,27 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         q_status="rejected",
         q_isbn13="9780345538376",
         flags='["duplicate_identity"]',
+    )
+    hard_flag_overlap = insert_legacy(
+        "Hard Flag Plus Overlap",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["unknown_author","read_overlap"]',
+    )
+    no_quality_isbn_overlap = insert_legacy(
+        "Title Author Read Overlap Without Quality ISBN",
+        status="rejected",
+        q_status="rejected",
+        flags='["read_overlap"]',
+    )
+    url_query_work_requeued = insert_legacy(
+        "Source URL Work With Query And Unverified ISBN Overlap",
+        status="rejected",
+        source_url="https://openlibrary.org/works/OL777W?edition=1",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
     )
     source_isbn_overlap = insert_legacy(
         "True Source ISBN Overlap",
@@ -1065,9 +1147,38 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         "INSERT INTO feedback(candidate_id,action) VALUES(?,'reject')",
         (user_rejected,),
     )
+    reject_then_restored = insert_legacy(
+        "User Rejected Then Restored",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    con.execute(
+        "INSERT INTO feedback(candidate_id,action) VALUES(?,'reject')",
+        (reject_then_restored,),
+    )
+    con.execute(
+        "INSERT INTO feedback(candidate_id,action) VALUES(?,'restore')",
+        (reject_then_restored,),
+    )
+    undone_reject = insert_legacy(
+        "User Undid Reject",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["duplicate_identity"]',
+    )
+    con.execute(
+        "INSERT INTO feedback(candidate_id,action,undone_at) VALUES(?,'reject','2026-02-01T00:00:00+00:00')",
+        (undone_reject,),
+    )
     saved_row = insert_legacy("Saved Shortlist Book", status="saved", q_isbn13="9780345538376")
     imported_row = insert_legacy("Imported Book", status="imported", q_isbn13="9780345538376")
     read_row = insert_legacy("Completed Read Book", status="read", q_isbn13="9780345538376")
+    con.execute(
+        "INSERT INTO reads(title,author,rating,isbn,source) VALUES('Different Read Title','Different Author',5,'9780143127550','goodreads_csv')"
+    )
     con.commit()
     con.close()
 
@@ -1082,83 +1193,146 @@ def test_migration_27_decouples_work_ids_verifies_source_isbns_and_requeues_only
         "work_id": "/works/OL100W",
         "isbn_verified": 1,
     }
+    for verified_cid in (
+        cross_978_c10_q13,
+        cross_978_c13_q10,
+        direct_979,
+        lowercase_x_direct,
+        lowercase_x_cross,
+    ):
+        assert row(
+            "SELECT isbn_verified FROM candidate_quality WHERE candidate_id=?",
+            (verified_cid,),
+        ) == {"isbn_verified": 1}
+    assert row(
+        "SELECT isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (non_equiv_979,),
+    ) == {"isbn_verified": 0}
+
+    # Non-destructive preservation of candidates.isbn10, candidate_quality.isbn10, and work_id
+    assert row("SELECT isbn13,isbn10 FROM candidates WHERE id=?", (gb_with_source_work,)) == {
+        "isbn13": "9780804172448",
+        "isbn10": "043942089X",
+    }
     assert row(
         "SELECT openlibrary_work_id,work_id,isbn13,isbn10,isbn_verified FROM candidate_quality WHERE candidate_id=?",
         (gb_with_source_work,),
     ) == {
         "openlibrary_work_id": "/works/OL200W",
-        "work_id": "",
+        "work_id": "gb-volume-42",
         "isbn13": "9780143127550",
-        "isbn10": "",
+        "isbn10": "0307474275",
         "isbn_verified": 0,
     }
     assert row(
         "SELECT openlibrary_work_id,work_id FROM candidate_quality WHERE candidate_id=?",
         (ol_edition,),
-    ) == {"openlibrary_work_id": "", "work_id": ""}
+    ) == {"openlibrary_work_id": "", "work_id": "/books/OL300M"}
 
-    for cid in (requeued_overlap, requeued_dup):
+    # Requeued rows keep quality ISBNs (with isbn_verified=0) and retain non-overlap flags
+    assert row("SELECT status FROM candidates WHERE id=?", (requeued_overlap,)) == {"status": "new"}
+    requeued_overlap_q = row(
+        "SELECT quality_status,isbn13,isbn10,isbn_verified,flags_json FROM candidate_quality WHERE candidate_id=?",
+        (requeued_overlap,),
+    )
+    assert requeued_overlap_q["quality_status"] == "pending"
+    assert requeued_overlap_q["isbn13"] == "9780345538376"
+    assert requeued_overlap_q["isbn10"] == "0345538374"
+    assert requeued_overlap_q["isbn_verified"] == 0
+    assert json.loads(requeued_overlap_q["flags_json"]) == [
+        "catalog_match_ambiguous",
+        "short_description",
+    ]
+
+    for cid in (requeued_dup, reject_then_restored, undone_reject):
         assert row("SELECT status FROM candidates WHERE id=?", (cid,)) == {"status": "new"}
         assert row(
-            "SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?",
+            "SELECT quality_status,isbn13,isbn_verified,flags_json FROM candidate_quality WHERE candidate_id=?",
             (cid,),
-        ) == {"quality_status": "pending", "flags_json": "[]"}
+        ) == {
+            "quality_status": "pending",
+            "isbn13": "9780345538376",
+            "isbn_verified": 0,
+            "flags_json": "[]",
+        }
 
-    assert row("SELECT status FROM candidates WHERE id=?", (source_isbn_overlap,)) == {"status": "rejected"}
-    assert row("SELECT status FROM candidates WHERE id=?", (user_rejected,)) == {"status": "rejected"}
+    assert row("SELECT status FROM candidates WHERE id=?", (url_query_work_requeued,)) == {
+        "status": "new"
+    }
+    assert row(
+        "SELECT openlibrary_work_id,quality_status,isbn13,isbn_verified,flags_json FROM candidate_quality WHERE candidate_id=?",
+        (url_query_work_requeued,),
+    ) == {
+        "openlibrary_work_id": "/works/OL777W",
+        "quality_status": "pending",
+        "isbn13": "9780345538376",
+        "isbn_verified": 0,
+        "flags_json": "[]",
+    }
+
+    for still_rejected_cid in (
+        hard_flag_overlap,
+        no_quality_isbn_overlap,
+        source_isbn_overlap,
+        user_rejected,
+    ):
+        assert row("SELECT status FROM candidates WHERE id=?", (still_rejected_cid,)) == {
+            "status": "rejected"
+        }
+        assert row(
+            "SELECT quality_status FROM candidate_quality WHERE candidate_id=?",
+            (still_rejected_cid,),
+        ) == {"quality_status": "rejected"}
+
     assert row("SELECT status FROM candidates WHERE id=?", (saved_row,)) == {"status": "saved"}
     assert row("SELECT status FROM candidates WHERE id=?", (imported_row,)) == {"status": "imported"}
     assert row("SELECT status FROM candidates WHERE id=?", (read_row,)) == {"status": "read"}
 
-
-def test_publishers_weekly_heading_isbn_and_rescan_ignore_unverified_quality_isbn(database, monkeypatch):
-    pw_html = (
-        b"<article>"
-        b"<h3><a href='/9780143127550'>Station Eleven</a></h3>"
-        b"<h4>By Emily Mandel. Knopf, $26.95 (336p) ISBN 978-0-14-312755-0</h4>"
-        b"<p>A traveling symphony crosses a post-pandemic landscape.</p>"
-        b"</article>"
+    # Pre-v6 accepted row keeps catalog-ISBN dedupe active until v6 re-audit, while pending requeued row does not
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert gb_with_source_work not in visible_ids
+    box_set_index = ReadIdentityIndex.from_reads(
+        [{"title": "Box Set Read", "author": "Other", "isbn": "9780345538376"}]
     )
-    parsed = ingestion.parse_book_items(pw_html, "text/html", "https://www.publishersweekly.com/pw/reviews")
-    assert len(parsed) == 1
-    assert parsed[0]["title"] == "Station Eleven"
-    assert parsed[0]["author"] == "Emily Mandel"
-    assert parsed[0]["isbn13"] == "9780143127550"
+    assert not box_set_index.matches(
+        {
+            "title": "False Box Set Read Overlap",
+            "author": "Writer",
+            "quality_status": "pending",
+            "quality_audit_version": "candidate-quality-v4",
+            "quality_isbn13": "9780345538376",
+            "quality_isbn10": "0345538374",
+            "quality_isbn_verified": 0,
+        }
+    )
 
+    # Idempotency check on second initialize(): post-migration rejections and rows are untouched
     with transaction() as con:
-        source_id = con.execute(
-            "INSERT INTO sources(name,url) VALUES('PW Feed','https://www.publishersweekly.com/pw/reviews')"
-        ).lastrowid
-        key = ingestion.normalize_key("Station Eleven", "Emily Mandel")
-        cid = con.execute(
-            "INSERT INTO candidates(title,author,source_id,status,normalized_key) VALUES(?,?,?,?,?)",
-            ("Station Eleven", "Emily Mandel", source_id, "new", key),
-        ).lastrowid
+        con.execute("UPDATE candidates SET status='rejected' WHERE id=?", (requeued_dup,))
         con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13='9780345538376',isbn_verified=0 "
+            "UPDATE candidate_quality SET quality_status='rejected',audit_version=?,flags_json='[\"duplicate_identity\"]' "
             "WHERE candidate_id=?",
-            (cid,),
+            (QUALITY_VERSION, requeued_dup),
         )
+    snapshot_candidates = rows("SELECT id,status,isbn13,isbn10 FROM candidates ORDER BY id")
+    snapshot_quality = rows(
+        "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version "
+        "FROM candidate_quality ORDER BY candidate_id"
+    )
 
-    async def fake_fetch(_url):
-        return "text/html", parsed
+    initialize(seed_demo=False)
 
-    async def passthrough(items):
-        return items
-
-    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
-    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough)
-    monkeypatch.setattr(ingestion, "enrich_book_metadata", passthrough)
-
-    assert asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source_id,)))) == 1
-    assert row("SELECT isbn13 FROM candidates WHERE id=?", (cid,)) == {"isbn13": "9780143127550"}
-    assert row(
-        "SELECT isbn13,isbn_verified FROM candidate_quality WHERE candidate_id=?",
-        (cid,),
-    ) == {"isbn13": "9780143127550", "isbn_verified": 1}
+    assert rows("SELECT id,status,isbn13,isbn10 FROM candidates ORDER BY id") == snapshot_candidates
+    assert (
+        rows(
+            "SELECT candidate_id,quality_status,provider,work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,flags_json,audit_version "
+            "FROM candidate_quality ORDER BY candidate_id"
+        )
+        == snapshot_quality
+    )
 
 
-def test_mark_recommendation_read_prefers_candidate_isbn_and_ignores_unverified_quality_isbn(database):
+def test_mark_recommendation_read_carries_decoupled_openlibrary_work_id(database):
     from fastapi.testclient import TestClient
     from auth_helpers import authenticated_headers
 
@@ -1167,38 +1341,159 @@ def test_mark_recommendation_read_prefers_candidate_isbn_and_ignores_unverified_
         source_id = con.execute(
             "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
         ).fetchone()[0]
-        unverified_cid = con.execute(
+        gb_cid = con.execute(
             "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
-            "VALUES('Unverified Catalog ISBN Book','Author One',90,'recommended',?,'unverified-cat-isbn')",
+            "VALUES('Google Books Audited Recommendation','Author One',90,'recommended',?,'gb-audited-rec')",
             (source_id,),
         ).lastrowid
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',"
-            "work_id='',openlibrary_work_id='/works/OL555W',isbn13='9780345538376',isbn_verified=0 "
+            "work_id='gb-vol-1',openlibrary_work_id='/works/OL555W',isbn13='9780345538376',isbn_verified=0 "
             "WHERE candidate_id=?",
-            (unverified_cid,),
-        )
-        preferred_cid = con.execute(
-            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
-            "VALUES('Source ISBN Wins Book','Author Two',88,'recommended',?,'9780143127550','source-isbn-wins')",
-            (source_id,),
-        ).lastrowid
-        con.execute(
-            "UPDATE candidate_quality SET quality_status='accepted',isbn13='9780307474278',isbn_verified=1 "
-            "WHERE candidate_id=?",
-            (preferred_cid,),
+            (gb_cid,),
         )
 
     with TestClient(engine_main.app, headers=headers) as client:
-        r1 = client.post(f"/api/recommendations/{unverified_cid}/read", json={"rating": 4})
-        r2 = client.post(f"/api/recommendations/{preferred_cid}/read", json={"rating": 5})
-    assert r1.status_code == 200
-    assert r2.status_code == 200
+        resp = client.post(f"/api/recommendations/{gb_cid}/read", json={"rating": 4})
+    assert resp.status_code == 200
+    assert row(
+        "SELECT isbn,openlibrary_work_id FROM reads WHERE title='Google Books Audited Recommendation'"
+    ) == {"isbn": "9780345538376", "openlibrary_work_id": "/works/OL555W"}
 
-    assert row(
-        "SELECT isbn,openlibrary_work_id FROM reads WHERE title='Unverified Catalog ISBN Book'"
-    ) == {"isbn": None, "openlibrary_work_id": "/works/OL555W"}
-    assert row(
-        "SELECT isbn FROM reads WHERE title='Source ISBN Wins Book'"
-    ) == {"isbn": "9780143127550"}
+
+def test_boot_worker_throttles_quality_recovery_across_multiple_profiles(tmp_path, monkeypatch):
+    import time
+    from fastapi.testclient import TestClient
+    from afterword_engine import jobs as jobs_module
+    from afterword_engine import profiles
+    from afterword_engine.database import connect
+    from afterword_engine.tenancy import current_profile_id, profile_scope
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "multi-profile-boot.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "enable_background_loops", True)
+    monkeypatch.setattr(jobs_module, "QUALITY_RECOVERY_COOLDOWN_SECONDS", 60)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    alice = profiles.create_account("alice", "alice-password-with-enough-length")
+    profile_list = ("legacy", alice["profile_id"])
+
+    for pid in profile_list:
+        with profile_scope(pid):
+            initialize(seed_demo=False)
+            with transaction() as con:
+                source_id = con.execute(
+                    "SELECT id FROM sources WHERE url='builtin://upcoming'"
+                ).fetchone()[0]
+                for idx in range(QUALITY_AUDIT_BATCH_SIZE + 15):
+                    cid = con.execute(
+                        "INSERT INTO candidates(title,author,isbn13,source_url,source_id,status,normalized_key) "
+                        "VALUES(?,?,?,?,?,'new',?)",
+                        (
+                            f"{pid} Legacy {idx}",
+                            "A Writer",
+                            "9780307474278",
+                            "https://example.com/book",
+                            source_id,
+                            f"{pid}-legacy-{idx}",
+                        ),
+                    ).lastrowid
+                    con.execute(
+                        "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v3',"
+                        "openlibrary_work_id='',isbn13='9780307474278',isbn_verified=1 "
+                        "WHERE candidate_id=?",
+                        (cid,),
+                    )
+
+    audited_batches: list[tuple[str, int]] = []
+    score_calls: list[str] = []
+
+    async def fake_audit(*, only_pending=False, limit=None):
+        assert only_pending is True
+        batch = candidate_quality_audit_candidates(limit=limit)
+        with transaction() as con:
+            for item in batch:
+                con.execute(
+                    "UPDATE candidate_quality SET audit_version=?,openlibrary_work_id='/works/OL1W',audited_at=CURRENT_TIMESTAMP "
+                    "WHERE candidate_id=?",
+                    (QUALITY_VERSION, item["id"]),
+                )
+        audited_batches.append((current_profile_id(), len(batch)))
+        return {
+            "audited": len(batch),
+            "accepted": len(batch),
+            "quarantine": 0,
+            "rejected": 0,
+            "deduped": 0,
+            "enriched": 0,
+        }
+
+    async def fake_score_all(*_args, **_kwargs):
+        score_calls.append(current_profile_id())
+        return 0
+
+    async def noop_async(*_args, **_kwargs):
+        return 0
+
+    async def noop_read_work_identities(*_args, **_kwargs):
+        return {"matched": 0, "remaining": 0}
+
+    async def noop_read_metadata(*_args, **_kwargs):
+        return {"refreshed": 0, "remaining": 0}
+
+    def idle_scheduler(stop):
+        async def _loop():
+            await stop.wait()
+
+        return _loop()
+
+    monkeypatch.setattr(engine_main, "audit_candidates", fake_audit)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+    monkeypatch.setattr(engine_main, "refresh_missing_candidate_metadata", noop_async)
+    monkeypatch.setattr(engine_main, "candidate_metadata_refresh_remaining", lambda: 0)
+    monkeypatch.setattr(engine_main, "refresh_read_work_identities", noop_read_work_identities)
+    monkeypatch.setattr(engine_main, "refresh_read_metadata", noop_read_metadata)
+    for scheduler_name in (
+        "source_scheduler_loop",
+        "digest_scheduler_loop",
+        "goodreads_rss_scheduler_loop",
+        "backup_scheduler_loop",
+    ):
+        monkeypatch.setattr(engine_main, scheduler_name, idle_scheduler)
+
+    with TestClient(engine_main.app) as client:
+        assert client.get("/api/health").status_code == 200
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            non_recovery_remaining = 0
+            completed_recovery = 0
+            for pid in profile_list:
+                with profile_scope(pid), connect() as con:
+                    non_recovery_remaining += con.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE kind!='candidate_quality_recovery' AND status IN ('queued','running')"
+                    ).fetchone()[0]
+                    completed_recovery += con.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE kind='candidate_quality_recovery' AND status='complete'"
+                    ).fetchone()[0]
+            if non_recovery_remaining == 0 and completed_recovery >= 1:
+                # Give worker_loop one extra beat to ensure it does not claim any more throttled recovery batches
+                time.sleep(0.15)
+                break
+            time.sleep(0.05)
+
+        assert non_recovery_remaining == 0
+        assert len(audited_batches) == 1
+        assert sum(count for _, count in audited_batches) == QUALITY_AUDIT_BATCH_SIZE
+        # Intermediate recovery pass defers score_all when nothing was rejected/deduped/enriched
+        assert score_calls == []
+        # Both profiles still have queued recovery continuations waiting for the cooldown window
+        queued_continuations = 0
+        for pid in profile_list:
+            with profile_scope(pid), connect() as con:
+                queued_continuations += con.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'"
+                ).fetchone()[0]
+        assert queued_continuations == 2
 

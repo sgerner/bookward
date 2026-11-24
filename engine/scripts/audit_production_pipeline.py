@@ -93,10 +93,8 @@ def _fixture_connection(snapshot: Mapping[str, Any]) -> sqlite3.Connection:
         CREATE TABLE candidate_quality (
             candidate_id INTEGER PRIMARY KEY, quality_status TEXT NOT NULL DEFAULT 'pending',
             quality_score REAL NOT NULL DEFAULT 0, metadata_confidence REAL NOT NULL DEFAULT 0.5,
-            openlibrary_work_id TEXT NOT NULL DEFAULT '',
             work_id TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
             isbn13 TEXT NOT NULL DEFAULT '', isbn10 TEXT NOT NULL DEFAULT '',
-            isbn_verified INTEGER NOT NULL DEFAULT 0,
             title_match REAL NOT NULL DEFAULT 0, author_match REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE reads (
@@ -156,20 +154,16 @@ def _fixture_connection(snapshot: Mapping[str, Any]) -> sqlite3.Connection:
     )
     con.executemany(
         """INSERT INTO candidate_quality(
-            candidate_id,quality_status,quality_score,metadata_confidence,
-            openlibrary_work_id,work_id,provider,isbn13,isbn10,isbn_verified,
-            title_match,author_match
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            candidate_id,quality_status,quality_score,metadata_confidence,work_id,
+            provider,isbn13,isbn10,title_match,author_match
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         [
             (
                 int(item["candidate_id"]), str(item.get("quality_status") or "pending"),
                 float(item.get("quality_score") or 0),
-                float(item.get("metadata_confidence") or 0),
-                str(item.get("openlibrary_work_id") or ""),
-                str(item.get("work_id") or ""),
+                float(item.get("metadata_confidence") or 0), str(item.get("work_id") or ""),
                 str(item.get("provider") or ""), str(item.get("isbn13") or ""),
-                str(item.get("isbn10") or ""), int(bool(item.get("isbn_verified"))),
-                float(item.get("title_match") or 0),
+                str(item.get("isbn10") or ""), float(item.get("title_match") or 0),
                 float(item.get("author_match") or 0),
             )
             for item in snapshot.get("candidate_quality", [])
@@ -376,10 +370,8 @@ def _compare_reference(generated: Mapping[str, Any], reference: Mapping[str, Any
 def _score_eligible_candidates(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     query = """
         SELECT c.*, s.name source_name, s.weight source_weight,
-               q.openlibrary_work_id quality_openlibrary_work_id,
                q.work_id quality_work_id, q.provider quality_provider,
                q.isbn13 quality_isbn13, q.isbn10 quality_isbn10,
-               COALESCE(q.isbn_verified, 0) quality_isbn_verified,
                CASE WHEN q.quality_score>0 THEN q.quality_score
                     WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END
                     AS catalog_confidence
