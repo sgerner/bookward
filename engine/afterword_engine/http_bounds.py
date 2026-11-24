@@ -24,6 +24,7 @@ JSON_CONTENT_TYPES: tuple[str, ...] = (
 )
 
 _OMIT = object()
+ERROR_BODY_MAX_BYTES = 65_536
 
 
 class ResponseBoundsError(ValueError):
@@ -241,6 +242,7 @@ async def stream_bytes_async(
     content_type_error: str = "Response returned an unsupported content type",
     size_error: str = "Response is too large",
     raise_for_status: bool = True,
+    public_request: httpx.Request | None = None,
     auth: Any = _OMIT,
     follow_redirects: Any = _OMIT,
     **request_kwargs: Any,
@@ -255,10 +257,24 @@ async def stream_bytes_async(
         send_kwargs["follow_redirects"] = follow_redirects
     response = await client.send(request, **send_kwargs)
     try:
+        if public_request is not None:
+            response.request = public_request
         if raise_for_status:
             response.raise_for_status()
         elif getattr(response, "is_error", False):
-            return response, b""
+            error_cap = min(max_bytes, ERROR_BODY_MAX_BYTES)
+            if error_cap <= 0:
+                return response, b""
+            try:
+                error_body = await read_bounded_bytes_async(
+                    response,
+                    max_bytes=error_cap,
+                    allowed_content_types=allowed_content_types,
+                    allow_missing_content_type=allow_missing_content_type,
+                )
+            except ResponseBoundsError:
+                return response, b""
+            return response, error_body
         body = await read_bounded_bytes_async(
             response,
             max_bytes=max_bytes,
@@ -283,6 +299,7 @@ def stream_bytes_sync(
     content_type_error: str = "Response returned an unsupported content type",
     size_error: str = "Response is too large",
     raise_for_status: bool = True,
+    public_request: httpx.Request | None = None,
     auth: Any = _OMIT,
     follow_redirects: Any = _OMIT,
     **request_kwargs: Any,
@@ -297,10 +314,24 @@ def stream_bytes_sync(
         send_kwargs["follow_redirects"] = follow_redirects
     response = client.send(request, **send_kwargs)
     try:
+        if public_request is not None:
+            response.request = public_request
         if raise_for_status:
             response.raise_for_status()
         elif getattr(response, "is_error", False):
-            return response, b""
+            error_cap = min(max_bytes, ERROR_BODY_MAX_BYTES)
+            if error_cap <= 0:
+                return response, b""
+            try:
+                error_body = read_bounded_bytes_sync(
+                    response,
+                    max_bytes=error_cap,
+                    allowed_content_types=allowed_content_types,
+                    allow_missing_content_type=allow_missing_content_type,
+                )
+            except ResponseBoundsError:
+                return response, b""
+            return response, error_body
         body = read_bounded_bytes_sync(
             response,
             max_bytes=max_bytes,
@@ -324,6 +355,7 @@ async def stream_json_async(
     allow_missing_content_type: bool = True,
     content_type_error: str = "Response returned an unsupported content type",
     size_error: str = "Response is too large",
+    public_request: httpx.Request | None = None,
     auth: Any = _OMIT,
     follow_redirects: Any = _OMIT,
     **request_kwargs: Any,
@@ -340,6 +372,7 @@ async def stream_json_async(
         content_type_error=content_type_error,
         size_error=size_error,
         raise_for_status=True,
+        public_request=public_request,
         auth=auth,
         follow_redirects=follow_redirects,
         **request_kwargs,

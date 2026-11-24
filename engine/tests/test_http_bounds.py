@@ -885,3 +885,54 @@ def test_models_dev_single_flight_and_60_second_failure_cooldown(monkeypatch) ->
     assert stale_first == {"providers": recovered["providers"], "cached": True, "stale": True}
     assert stale_second == {"providers": recovered["providers"], "cached": True, "stale": True}
 
+
+def test_google_books_key_validation_and_error_streams_enforce_byte_caps(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "source_max_bytes", 150_000)
+    oversized_probe = CountingAsyncStream(b"g" * 50_000, 10)  # 500 KB > 150 KB
+    html_error_stream = CountingAsyncStream(b"<html>502 Bad Gateway</html>", 5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        target = (request.url.host, request.url.path)
+        if target == ("www.googleapis.com", "/books/v1/volumes"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=oversized_probe,
+                request=request,
+            )
+        if target == ("example.test", "/html-502"):
+            return httpx.Response(
+                502,
+                headers={"content-type": "text/html"},
+                stream=html_error_stream,
+                request=request,
+            )
+        raise AssertionError(f"Unexpected URL: {request.url}")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            validation = await covers.validate_google_books_api_key("probe-secret-key", client=client)
+            err_resp = await stream_response_async(
+                client,
+                "GET",
+                "https://example.test/html-502",
+                max_bytes=150_000,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                raise_for_status=False,
+            )
+            return validation, err_resp
+
+    validation, err_resp = asyncio.run(run())
+    assert validation == {
+        "status": "deferred",
+        "warning": "Google Books returned an unexpected verification response; key saved.",
+    }
+    assert oversized_probe.chunks_yielded == 4
+    assert oversized_probe.closed is True
+    assert err_resp.status_code == 502
+    assert err_resp.content == b""
+    assert html_error_stream.chunks_yielded == 0
+    assert html_error_stream.closed is True
+
+
