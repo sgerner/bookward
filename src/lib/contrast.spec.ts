@@ -1,7 +1,13 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { THEMES, type SkeletonThemeName } from './theme';
+import {
+	DEFAULT_THEME,
+	THEME_LOADERS,
+	THEMES,
+	loadThemeCss,
+	type SkeletonThemeName,
+} from './theme';
 
 type Oklab = { L: number; a: number; b: number };
 type Mode = 'light' | 'dark';
@@ -155,7 +161,54 @@ function parseCssVars(css: string): Record<string, string> {
 	return vars;
 }
 
-function parseScopedLayoutVars(css: string, theme: SkeletonThemeName): Record<string, string> {
+function expandLocalImports(filePath: string, seen = new Set<string>()): string {
+	const resolvedPath = resolve(filePath);
+	if (seen.has(resolvedPath) || !existsSync(resolvedPath)) return '';
+	seen.add(resolvedPath);
+	const raw = readFileSync(resolvedPath, 'utf8');
+	return raw.replace(/@import\s+['"](\.[^'"]+)['"]\s*;/g, (_match, relPath: string) => {
+		const importedPath = resolve(dirname(resolvedPath), relPath);
+		return expandLocalImports(importedPath, seen);
+	});
+}
+
+function classifySelector(
+	sel: string,
+	theme: SkeletonThemeName,
+): { scope: 'global' | 'theme'; mode: Mode | 'both' } | null {
+	const normalized = sel.replace(/\s+/g, '');
+	const themeAttrs = [`[data-theme='${theme}']`, `[data-theme="${theme}"]`];
+
+	if (normalized === ':root' || normalized === '[data-theme]') {
+		return { scope: 'global', mode: 'both' };
+	}
+	if (normalized === ':root.dark' || normalized === '.dark' || normalized === '[data-theme].dark') {
+		return { scope: 'global', mode: 'dark' };
+	}
+	if (normalized === ':root:not(.dark)' || normalized === '[data-theme]:not(.dark)') {
+		return { scope: 'global', mode: 'light' };
+	}
+
+	for (const attr of themeAttrs) {
+		if (normalized === attr || normalized === `:root${attr}`) {
+			return { scope: 'theme', mode: 'both' };
+		}
+		if (normalized === `${attr}.dark` || normalized === `:root${attr}.dark`) {
+			return { scope: 'theme', mode: 'dark' };
+		}
+		if (normalized === `${attr}:not(.dark)` || normalized === `:root${attr}:not(.dark)`) {
+			return { scope: 'theme', mode: 'light' };
+		}
+	}
+	return null;
+}
+
+export function parseScopedCssVars(
+	css: string,
+	theme: SkeletonThemeName,
+	mode: Mode,
+	scopeFilter: 'all' | 'global' | 'theme' = 'all',
+): Record<string, string> {
 	const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
 	const vars: Record<string, string> = {};
 	for (const block of stripped.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
@@ -163,26 +216,45 @@ function parseScopedLayoutVars(css: string, theme: SkeletonThemeName): Record<st
 			.split(',')
 			.map((part) => part.trim())
 			.filter(Boolean);
-		const matchesGlobal = selectors.some((sel) => sel === ':root' || sel === '[data-theme]');
-		const matchesTheme = selectors.some(
-			(sel) => sel === `[data-theme='${theme}']` || sel === `[data-theme="${theme}"]`,
-		);
-		if (matchesGlobal || matchesTheme) {
+		const matches = selectors.some((sel) => {
+			const match = classifySelector(sel, theme);
+			if (!match) return false;
+			if (scopeFilter !== 'all' && match.scope !== scopeFilter) return false;
+			return match.mode === 'both' || match.mode === mode;
+		});
+		if (matches) {
 			Object.assign(vars, parseCssVars(block[2]));
 		}
 	}
 	return vars;
 }
 
-const layoutCss = readFileSync(join(process.cwd(), 'src/routes/layout.css'), 'utf8');
-const semanticVars = parseScopedLayoutVars(layoutCss, 'cerberus');
+const layoutCssPath = join(process.cwd(), 'src/routes/layout.css');
+const layoutCss = readFileSync(layoutCssPath, 'utf8');
+const expandedLayoutCss = expandLocalImports(layoutCssPath);
+const semanticVars = parseScopedCssVars(expandedLayoutCss, DEFAULT_THEME, 'light');
 
-function loadThemeVars(theme: SkeletonThemeName): Record<string, string> {
-	const themeCss = readFileSync(
+async function loadThemeVars(theme: SkeletonThemeName, mode: Mode): Promise<Record<string, string>> {
+	const rawThemeCss = readFileSync(
 		join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme}.css`),
 		'utf8',
 	);
-	return { ...parseCssVars(themeCss), ...parseScopedLayoutVars(layoutCss, theme) };
+	let resolvedThemeCss: string | null = null;
+	if (theme !== DEFAULT_THEME) {
+		const originalLoader = THEME_LOADERS[theme];
+		THEME_LOADERS[theme] = () => Promise.resolve({ default: rawThemeCss });
+		try {
+			resolvedThemeCss = await loadThemeCss(theme);
+		} finally {
+			THEME_LOADERS[theme] = originalLoader;
+		}
+	}
+	return {
+		...parseScopedCssVars(rawThemeCss, theme, mode),
+		...parseScopedCssVars(expandedLayoutCss, theme, mode, 'global'),
+		...(resolvedThemeCss ? parseScopedCssVars(resolvedThemeCss, theme, mode) : {}),
+		...parseScopedCssVars(expandedLayoutCss, theme, mode, 'theme'),
+	};
 }
 
 const themeModePairs = THEMES.flatMap((theme) => [
@@ -218,10 +290,28 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 		expect(layoutCss).not.toContain('button:not(.input-ghost)');
 	});
 
+	it('resolves mode-scoped :root[data-theme] and .dark calibrated overrides in cascade order', async () => {
+		const sampleCalibration = `
+			:root { --color-surface-50: #f0f0f0; }
+			:root.dark { --color-surface-950: #101010; }
+			:root[data-theme="sahara"] { --color-surface-50: #faecee; }
+			:root[data-theme="sahara"].dark { --color-surface-950: #260b0f; }
+		`;
+		const lightVars = parseScopedCssVars(sampleCalibration, 'sahara', 'light');
+		const darkVars = parseScopedCssVars(sampleCalibration, 'sahara', 'dark');
+		expect(lightVars['--color-surface-50']).toBe('#faecee');
+		expect(lightVars['--color-surface-950']).toBeUndefined();
+		expect(darkVars['--color-surface-950']).toBe('#260b0f');
+
+		const saharaVars = await loadThemeVars('sahara', 'dark');
+		expect(saharaVars['--control-border']).toBeTruthy();
+		expect(saharaVars['--color-primary-500']).toBeTruthy();
+	});
+
 	it.each(themeModePairs)(
 		'achieves >= 3:1 resting control borders across surfaces in $theme ($mode)',
-		({ theme, mode }) => {
-			const vars = loadThemeVars(theme);
+		async ({ theme, mode }) => {
+			const vars = await loadThemeVars(theme, mode);
 			const border = resolveColorExpr('var(--control-border)', vars, mode);
 			const surfaces =
 				mode === 'light'
@@ -237,8 +327,8 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 
 	it.each(themeModePairs)(
 		'achieves >= 3:1 switch track boundaries, active/inactive states, and thumb contrast in $theme ($mode)',
-		({ theme, mode }) => {
-			const vars = loadThemeVars(theme);
+		async ({ theme, mode }) => {
+			const vars = await loadThemeVars(theme, mode);
 			const border = resolveColorExpr('var(--control-border)', vars, mode);
 			const trackOff = resolveColorExpr('var(--switch-track-off)', vars, mode);
 			const thumbOff = resolveColorExpr('var(--switch-thumb-off)', vars, mode);
@@ -266,8 +356,8 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 
 	it.each(themeModePairs)(
 		'achieves >= 3:1 active and idle star glyphs and borders in $theme ($mode)',
-		({ theme, mode }) => {
-			const vars = loadThemeVars(theme);
+		async ({ theme, mode }) => {
+			const vars = await loadThemeVars(theme, mode);
 			const dialogSurface = resolveColorExpr('var(--color-surface-50-950)', vars, mode);
 			const idleFg = resolveColorExpr('var(--star-idle-fg)', vars, mode);
 			const idleBorder = resolveColorExpr('var(--star-idle-border)', vars, mode);
@@ -285,8 +375,8 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 
 	it.each(themeModePairs)(
 		'achieves >= 3:1 two-color focus contrast against surfaces and ThemePicker active swatches in $theme ($mode)',
-		({ theme, mode }) => {
-			const vars = loadThemeVars(theme);
+		async ({ theme, mode }) => {
+			const vars = await loadThemeVars(theme, mode);
 			const focusInner = resolveColorExpr('var(--focus-ring-inner)', vars, mode);
 			const swatchFocusInner = resolveColorExpr('var(--focus-ring-swatch-inner)', vars, mode);
 			const focusOuter = resolveColorExpr('var(--focus-ring-outer)', vars, mode);

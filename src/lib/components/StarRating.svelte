@@ -104,7 +104,8 @@
 		color: var(--star-active-fg);
 	}
 
-	.star-rating-btn:focus-visible {
+	.star-rating-btn:focus-visible,
+	.star-rating-clear:focus-visible {
 		outline: 2px solid var(--focus-ring-outer);
 		outline-offset: 2px;
 		box-shadow:
@@ -139,7 +140,8 @@
 			color: HighlightText;
 		}
 
-		.star-rating-btn:focus-visible {
+		.star-rating-btn:focus-visible,
+		.star-rating-clear:focus-visible {
 			outline: 2px solid Highlight;
 			outline-offset: 2px;
 		}
