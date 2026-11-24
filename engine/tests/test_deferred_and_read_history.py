@@ -126,52 +126,52 @@ def test_deferred_archive_orders_most_recent_decision_first_with_bounded_paging(
             score=21.5,
         )
 
-    with TestClient(app, headers=headers) as client:
-        for cid in rejected_ids:
-            resp = client.post(f"/api/recommendations/{cid}/feedback", json={"action": "reject"})
-            assert resp.status_code == 200
-        # Undo and re-defer one book to ensure undone pass rows do not leak into status=rejected.
-        flipped_id = rejected_ids[0]
-        decision_row = row(
-            "SELECT id FROM feedback WHERE candidate_id=? AND undone_at IS NULL ORDER BY id DESC LIMIT 1",
-            (flipped_id,),
-        )
-        assert client.post(
-            f"/api/recommendations/{flipped_id}/undo",
-            json={"decision_id": decision_row["id"]},
-        ).status_code == 200
-        assert client.post(
-            f"/api/recommendations/{flipped_id}/feedback",
-            json={"action": "maybe_later"},
-        ).status_code == 200
+    client = TestClient(app, headers=headers)
+    for cid in rejected_ids:
+        resp = client.post(f"/api/recommendations/{cid}/feedback", json={"action": "reject"})
+        assert resp.status_code == 200
+    # Undo and re-defer one book to ensure undone pass rows do not leak into status=rejected.
+    flipped_id = rejected_ids[0]
+    decision_row = row(
+        "SELECT id FROM feedback WHERE candidate_id=? AND undone_at IS NULL ORDER BY id DESC LIMIT 1",
+        (flipped_id,),
+    )
+    assert client.post(
+        f"/api/recommendations/{flipped_id}/undo",
+        json={"decision_id": decision_row["id"]},
+    ).status_code == 200
+    assert client.post(
+        f"/api/recommendations/{flipped_id}/feedback",
+        json={"action": "maybe_later"},
+    ).status_code == 200
 
-        defer_resp = client.post(
-            f"/api/recommendations/{deferred_id}/feedback",
-            json={"action": "maybe_later"},
-        )
-        assert defer_resp.status_code == 200
+    defer_resp = client.post(
+        f"/api/recommendations/{deferred_id}/feedback",
+        json={"action": "maybe_later"},
+    )
+    assert defer_resp.status_code == 200
 
-        overview = client.get("/api/overview").json()
-        assert overview["decisions_has_more"] is True
-        assert len(overview["decisions"]) == 24
-        assert overview["decisions"][0]["id"] == deferred_id
-        assert overview["decisions"][0]["status"] == "maybe_later"
-        assert overview["decisions"][1]["id"] == flipped_id
-        assert overview["decisions"][1]["status"] == "maybe_later"
+    overview = client.get("/api/overview").json()
+    assert overview["decisions_has_more"] is True
+    assert len(overview["decisions"]) == 24
+    assert overview["decisions"][0]["id"] == deferred_id
+    assert overview["decisions"][0]["status"] == "maybe_later"
+    assert overview["decisions"][1]["id"] == flipped_id
+    assert overview["decisions"][1]["status"] == "maybe_later"
 
-        decisions_page_1 = client.get("/api/recommendations?status=decisions&limit=24&offset=0").json()
-        decisions_page_2 = client.get("/api/recommendations?status=decisions&limit=24&offset=24").json()
-        assert [item["id"] for item in decisions_page_1[:2]] == [deferred_id, flipped_id]
-        assert len(decisions_page_1) == 24
-        assert len(decisions_page_2) == 2
+    decisions_page_1 = client.get("/api/recommendations?status=decisions&limit=24&offset=0").json()
+    decisions_page_2 = client.get("/api/recommendations?status=decisions&limit=24&offset=24").json()
+    assert [item["id"] for item in decisions_page_1[:2]] == [deferred_id, flipped_id]
+    assert len(decisions_page_1) == 24
+    assert len(decisions_page_2) == 2
 
-        maybe_later = client.get("/api/recommendations?status=maybe_later&limit=24&offset=0").json()
-        assert [item["id"] for item in maybe_later] == [deferred_id, flipped_id]
+    maybe_later = client.get("/api/recommendations?status=maybe_later&limit=24&offset=0").json()
+    assert [item["id"] for item in maybe_later] == [deferred_id, flipped_id]
 
-        rejected = client.get("/api/recommendations?status=rejected&limit=25&offset=0").json()
-        assert len(rejected) == 24
-        assert flipped_id not in {item["id"] for item in rejected}
-        assert deferred_id not in {item["id"] for item in rejected}
+    rejected = client.get("/api/recommendations?status=rejected&limit=25&offset=0").json()
+    assert len(rejected) == 24
+    assert flipped_id not in {item["id"] for item in rejected}
+    assert deferred_id not in {item["id"] for item in rejected}
 
 
 def test_score_all_refreshes_maybe_later_without_promoting_to_discover_or_digest(database):
@@ -233,9 +233,9 @@ def test_score_all_refreshes_maybe_later_without_promoting_to_discover_or_digest
     assert disabled_deferred["status"] == "maybe_later"
     assert live_row["status"] == "recommended"
 
-    with TestClient(app, headers=headers) as client:
-        discover = client.get("/api/recommendations").json()
-        assert {item["id"] for item in discover} == {live_id}
+    client = TestClient(app, headers=headers)
+    discover = client.get("/api/recommendations").json()
+    assert {item["id"] for item in discover} == {live_id}
 
     preview = digest_preview()
     digest_ids = {item["id"] for item in preview.get("books", [])}
@@ -264,7 +264,7 @@ def test_restoring_candidate_resets_prior_impression_fatigue_until_post_restore_
     with transaction() as con:
         cid = _insert_accepted_candidate(con, title="Nine Day Veteran", score=84.0)
         for day_offset in range(10, 1, -1):
-            visible_ts = (base_now - timedelta(days=day_offset)).strftime("%Y-%m-%dT12:00:00Z")
+            visible_ts = (base_now - timedelta(days=day_offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
             _insert_run_and_impression(con, cid, visible_at=visible_ts)
         prior_counts = load_unacted_visible_impression_counts(con, now=base_now)
         assert prior_counts[cid] == 9
@@ -273,13 +273,13 @@ def test_restoring_candidate_resets_prior_impression_fatigue_until_post_restore_
         )
         assert adjusted_prior[0]["fatigue_penalty"] == 4.5
 
-    with TestClient(app, headers=headers) as client:
-        assert client.post(
-            f"/api/recommendations/{cid}/feedback", json={"action": "maybe_later"}
-        ).status_code == 200
-        assert client.post(
-            f"/api/recommendations/{cid}/feedback", json={"action": "restore"}
-        ).status_code == 200
+    client = TestClient(app, headers=headers)
+    assert client.post(
+        f"/api/recommendations/{cid}/feedback", json={"action": "maybe_later"}
+    ).status_code == 200
+    assert client.post(
+        f"/api/recommendations/{cid}/feedback", json={"action": "restore"}
+    ).status_code == 200
 
     with transaction() as con:
         after_restore_now = datetime.now(timezone.utc) + timedelta(minutes=1)
@@ -292,7 +292,7 @@ def test_restoring_candidate_resets_prior_impression_fatigue_until_post_restore_
         assert adjusted_reset[0].get("fatigue_penalty", 0.0) == 0.0
 
         for day in range(1, 4):
-            visible_ts = (after_restore_now + timedelta(days=day)).strftime("%Y-%m-%dT12:00:00Z")
+            visible_ts = (after_restore_now + timedelta(days=day)).strftime("%Y-%m-%dT%H:%M:%SZ")
             _insert_run_and_impression(con, cid, visible_at=visible_ts)
         grace_now = after_restore_now + timedelta(days=3, hours=1)
         grace_counts = load_unacted_visible_impression_counts(con, now=grace_now)
@@ -303,7 +303,7 @@ def test_restoring_candidate_resets_prior_impression_fatigue_until_post_restore_
         assert meta_grace["max_penalty"] == 0.0
         assert adjusted_grace[0].get("fatigue_penalty", 0.0) == 0.0
 
-        fourth_ts = (after_restore_now + timedelta(days=4)).strftime("%Y-%m-%dT12:00:00Z")
+        fourth_ts = (after_restore_now + timedelta(days=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
         _insert_run_and_impression(con, cid, visible_at=fourth_ts)
         decayed_now = after_restore_now + timedelta(days=4, hours=1)
         decayed_counts = load_unacted_visible_impression_counts(con, now=decayed_now)
@@ -348,48 +348,48 @@ def test_disabled_source_or_unaccepted_restore_returns_409_while_preserving_shor
             status="maybe_later",
         )
 
-    with TestClient(app, headers=headers) as client:
-        maybe_later = client.get("/api/recommendations?status=maybe_later&limit=24&offset=0").json()
-        by_id = {item["id"]: item for item in maybe_later}
-        assert by_id[disabled_cid]["source_enabled"] is False
-        assert by_id[enabled_cid]["source_enabled"] is True
+    client = TestClient(app, headers=headers)
+    maybe_later = client.get("/api/recommendations?status=maybe_later&limit=24&offset=0").json()
+    by_id = {item["id"]: item for item in maybe_later}
+    assert by_id[disabled_cid]["source_enabled"] is False
+    assert by_id[enabled_cid]["source_enabled"] is True
 
-        blocked = client.post(
-            f"/api/recommendations/{disabled_cid}/feedback",
-            json={"action": "restore"},
-        )
-        assert blocked.status_code == 409
-        detail = blocked.json()["detail"].lower()
-        assert "is disabled" in detail
-        assert "re-enable the source" in detail
-        assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "maybe_later"
+    blocked = client.post(
+        f"/api/recommendations/{disabled_cid}/feedback",
+        json={"action": "restore"},
+    )
+    assert blocked.status_code == 409
+    detail = blocked.json()["detail"].lower()
+    assert "is disabled" in detail
+    assert "re-enable the source" in detail
+    assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "maybe_later"
 
-        bulk_blocked = client.post(
-            "/api/recommendations/bulk-feedback",
-            json={"ids": [disabled_cid], "action": "restore"},
-        )
-        assert bulk_blocked.status_code == 409
+    bulk_blocked = client.post(
+        "/api/recommendations/bulk-feedback",
+        json={"ids": [disabled_cid], "action": "restore"},
+    )
+    assert bulk_blocked.status_code == 409
 
-        quarantine_blocked = client.post(
-            f"/api/recommendations/{quarantined_cid}/feedback",
-            json={"action": "restore"},
-        )
-        assert quarantine_blocked.status_code == 409
-        assert "catalog quality checks" in quarantine_blocked.json()["detail"].lower()
+    quarantine_blocked = client.post(
+        f"/api/recommendations/{quarantined_cid}/feedback",
+        json={"action": "restore"},
+    )
+    assert quarantine_blocked.status_code == 409
+    assert "catalog quality checks" in quarantine_blocked.json()["detail"].lower()
 
-        saved = client.post(
-            f"/api/recommendations/{disabled_cid}/feedback",
-            json={"action": "save"},
-        )
-        assert saved.status_code == 200
-        assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "saved"
+    saved = client.post(
+        f"/api/recommendations/{disabled_cid}/feedback",
+        json={"action": "save"},
+    )
+    assert saved.status_code == 200
+    assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "saved"
 
-        marked_read = client.post(
-            f"/api/recommendations/{second_disabled_cid}/read",
-            json={"rating": 4, "historical": True},
-        )
-        assert marked_read.status_code == 200
-        assert row("SELECT status FROM candidates WHERE id=?", (second_disabled_cid,))["status"] == "read"
+    marked_read = client.post(
+        f"/api/recommendations/{second_disabled_cid}/read",
+        json={"rating": 4, "historical": True},
+    )
+    assert marked_read.status_code == 200
+    assert row("SELECT status FROM candidates WHERE id=?", (second_disabled_cid,))["status"] == "read"
 
 
 def test_historical_undated_mark_read_skips_outcomes_and_sorts_below_dated_reads(database):
@@ -399,50 +399,50 @@ def test_historical_undated_mark_read_skips_outcomes_and_sorts_below_dated_reads
         dated_cid = _insert_accepted_candidate(con, title="Finished Yesterday", author="Recent Writer")
         _insert_run_and_impression(con, historical_cid, visible_at="2026-03-01T10:00:00Z")
 
-    with TestClient(app, headers=headers) as client:
-        bad_date = client.post(
-            f"/api/recommendations/{historical_cid}/read",
-            json={"read_at": "not-a-date"},
-        )
-        assert bad_date.status_code == 400
+    client = TestClient(app, headers=headers)
+    bad_date = client.post(
+        f"/api/recommendations/{historical_cid}/read",
+        json={"read_at": "not-a-date"},
+    )
+    assert bad_date.status_code == 400
 
-        future_date = client.post(
-            f"/api/recommendations/{historical_cid}/read",
-            json={"read_at": "2099-12-31"},
-        )
-        assert future_date.status_code == 400
+    future_date = client.post(
+        f"/api/recommendations/{historical_cid}/read",
+        json={"read_at": "2099-12-31"},
+    )
+    assert future_date.status_code == 400
 
-        dated_resp = client.post(
-            f"/api/recommendations/{dated_cid}/read",
-            json={"rating": 5, "read_at": "2024-02-15"},
-        )
-        assert dated_resp.status_code == 200
-        dated_read_id = dated_resp.json()["read_id"]
+    dated_resp = client.post(
+        f"/api/recommendations/{dated_cid}/read",
+        json={"rating": 5, "read_at": "2024-02-15"},
+    )
+    assert dated_resp.status_code == 200
+    dated_read_id = dated_resp.json()["read_id"]
 
-        hist_resp = client.post(
-            f"/api/recommendations/{historical_cid}/read",
-            json={"rating": 4, "historical": True},
-        )
-        assert hist_resp.status_code == 200
-        hist_read_id = hist_resp.json()["read_id"]
+    hist_resp = client.post(
+        f"/api/recommendations/{historical_cid}/read",
+        json={"rating": 4, "historical": True},
+    )
+    assert hist_resp.status_code == 200
+    hist_read_id = hist_resp.json()["read_id"]
 
-        hist_read = row("SELECT * FROM reads WHERE id=?", (hist_read_id,))
-        assert hist_read["source"] == "manual_history"
-        assert hist_read["read_at"] is None
-        assert hist_read["rating"] == 4
+    hist_read = row("SELECT * FROM reads WHERE id=?", (hist_read_id,))
+    assert hist_read["source"] == "manual_history"
+    assert hist_read["read_at"] is None
+    assert hist_read["rating"] == 4
 
-        attribute_read_outcomes()
-        assert (
-            row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (hist_read_id,))["count"]
-            == 0
-        )
+    attribute_read_outcomes()
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (hist_read_id,))["count"]
+        == 0
+    )
 
-        overview_titles = [item["title"] for item in client.get("/api/overview").json()["history"]]
-        history_titles = [item["title"] for item in client.get("/api/reading-history").json()]
-        scored_ids = [item["id"] for item in client.get("/api/reading-history/scores").json()]
-        assert overview_titles == ["Finished Yesterday", "Read Years Ago"]
-        assert history_titles == ["Finished Yesterday", "Read Years Ago"]
-        assert scored_ids == [dated_read_id, hist_read_id]
+    overview_titles = [item["title"] for item in client.get("/api/overview").json()["history"]]
+    history_titles = [item["title"] for item in client.get("/api/reading-history").json()]
+    scored_ids = [item["id"] for item in client.get("/api/reading-history/scores").json()]
+    assert overview_titles == ["Finished Yesterday", "Read Years Ago"]
+    assert history_titles == ["Finished Yesterday", "Read Years Ago"]
+    assert scored_ids == [dated_read_id, hist_read_id]
 
     # Verify rank_candidates leaves read_at=None neutral on median neighbor age.
     undated_read = {"id": 1, "title": "Read Years Ago", "author": "Past Writer", "rating": 5, "read_at": None}
@@ -459,81 +459,81 @@ def test_patch_reading_history_updates_and_clears_fields_reconciles_outcomes_and
         cid = _insert_accepted_candidate(con, title="Reconciled Book", author="Outcome Writer")
         run_id = _insert_run_and_impression(con, cid, visible_at="2025-05-10T12:00:00Z", score=82.0)
 
-    with TestClient(app, headers=headers) as client:
-        token = client.post("/api/settings/api-tokens", json={"name": "History Test"}).json()["token"]
-        marked = client.post(
-            f"/api/recommendations/{cid}/read",
-            json={"rating": 5, "read_at": "2025-05-12", "run_id": run_id},
-        )
-        assert marked.status_code == 200
-        read_id = marked.json()["read_id"]
+    client = TestClient(app, headers=headers)
+    token = client.post("/api/settings/api-tokens", json={"name": "History Test"}).json()["token"]
+    marked = client.post(
+        f"/api/recommendations/{cid}/read",
+        json={"rating": 5, "read_at": "2025-05-12", "run_id": run_id},
+    )
+    assert marked.status_code == 200
+    read_id = marked.json()["read_id"]
 
-        outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
-        assert outcome["label"] == 1.0
-        assert outcome["label_kind"] == "rating_positive"
+    outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
+    assert outcome["label"] == 1.0
+    assert outcome["label_kind"] == "rating_positive"
 
-        with transaction() as con:
-            con.execute("DELETE FROM jobs")
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
 
-        low = client.patch(f"/api/reading-history/{read_id}", json={"rating": 2})
-        assert low.status_code == 200
-        assert low.json()["rating"] == 2
-        outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
-        assert outcome["label"] == 0.0
-        assert outcome["label_kind"] == "rating_negative"
+    low = client.patch(f"/api/reading-history/{read_id}", json={"rating": 2})
+    assert low.status_code == 200
+    assert low.json()["rating"] == 2
+    outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
+    assert outcome["label"] == 0.0
+    assert outcome["label_kind"] == "rating_negative"
 
-        cleared_rating = client.patch(
-            f"/api/v1/reading-history/{read_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"rating": None},
-        )
-        assert cleared_rating.status_code == 200
-        assert cleared_rating.json()["rating"] is None
-        outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
-        assert outcome["label"] == 0.75
-        assert outcome["label_kind"] == "completed_unrated"
+    cleared_rating = client.patch(
+        f"/api/v1/reading-history/{read_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"rating": None},
+    )
+    assert cleared_rating.status_code == 200
+    assert cleared_rating.json()["rating"] is None
+    outcome = row("SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?", (read_id,))
+    assert outcome["label"] == 0.75
+    assert outcome["label_kind"] == "completed_unrated"
 
-        queued_score_jobs = row(
-            "SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'"
-        )["count"]
-        assert queued_score_jobs == 1
+    queued_score_jobs = row(
+        "SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'"
+    )["count"]
+    assert queued_score_jobs == 1
 
-        # Moving read_at earlier than the impression removes causal outcome attribution.
-        pre_impression = client.patch(
-            f"/api/reading-history/{read_id}",
-            json={"read_at": "2025-05-01"},
-        )
-        assert pre_impression.status_code == 200
-        assert (
-            row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
-            == 0
-        )
+    # Moving read_at earlier than the impression removes causal outcome attribution.
+    pre_impression = client.patch(
+        f"/api/reading-history/{read_id}",
+        json={"read_at": "2025-05-01"},
+    )
+    assert pre_impression.status_code == 200
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
+        == 0
+    )
 
-        # Moving read_at after the impression restores causal outcome attribution.
-        post_impression = client.patch(
-            f"/api/reading-history/{read_id}",
-            json={"read_at": "2025-05-15", "rating": 4},
-        )
-        assert post_impression.status_code == 200
-        restored_outcome = row(
-            "SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?",
-            (read_id,),
-        )
-        assert restored_outcome["label"] == 1.0
-        assert restored_outcome["label_kind"] == "rating_positive"
+    # Moving read_at after the impression restores causal outcome attribution.
+    post_impression = client.patch(
+        f"/api/reading-history/{read_id}",
+        json={"read_at": "2025-05-15", "rating": 4},
+    )
+    assert post_impression.status_code == 200
+    restored_outcome = row(
+        "SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?",
+        (read_id,),
+    )
+    assert restored_outcome["label"] == 1.0
+    assert restored_outcome["label_kind"] == "rating_positive"
 
-        # Clearing read_at removes causal attribution and transitions manual -> manual_history.
-        cleared_date = client.patch(
-            f"/api/reading-history/{read_id}",
-            json={"read_at": None},
-        )
-        assert cleared_date.status_code == 200
-        assert cleared_date.json()["read_at"] is None
-        assert cleared_date.json()["source"] == "manual_history"
-        assert (
-            row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
-            == 0
-        )
+    # Clearing read_at removes causal attribution and transitions manual -> manual_history.
+    cleared_date = client.patch(
+        f"/api/reading-history/{read_id}",
+        json={"read_at": None},
+    )
+    assert cleared_date.status_code == 200
+    assert cleared_date.json()["read_at"] is None
+    assert cleared_date.json()["source"] == "manual_history"
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
+        == 0
+    )
 
 
 def test_delete_manual_read_purges_evidence_restores_candidates_guards_imports_and_isolates_profiles(database):
@@ -601,83 +601,83 @@ def test_delete_manual_read_purges_evidence_restores_candidates_guards_imports_a
             (run_id,),
         )
 
-    with TestClient(app, headers=headers) as client:
-        token = client.post("/api/settings/api-tokens", json={"name": "Delete Token"}).json()["token"]
-        marked_enabled = client.post(
-            f"/api/recommendations/{enabled_cid}/read",
-            json={"rating": 5, "read_at": "2025-06-05", "run_id": run_id},
-        )
-        assert marked_enabled.status_code == 200
-        enabled_read_id = marked_enabled.json()["read_id"]
+    client = TestClient(app, headers=headers)
+    token = client.post("/api/settings/api-tokens", json={"name": "Delete Token"}).json()["token"]
+    marked_enabled = client.post(
+        f"/api/recommendations/{enabled_cid}/read",
+        json={"rating": 5, "read_at": "2025-06-05", "run_id": run_id},
+    )
+    assert marked_enabled.status_code == 200
+    enabled_read_id = marked_enabled.json()["read_id"]
 
-        with transaction() as con:
-            con.execute(
-                "INSERT OR REPLACE INTO read_metadata(read_id,verified_work_id,identity_hash,description) VALUES(?,?,?,?)",
-                (enabled_read_id, "/works/OL999W", "hash-enabled", "Metadata description"),
-            )
-
-        assert (
-            row(
-                "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
-                (f"manual-read:*:{enabled_read_id:08d}",),
-            )["count"]
-            == 1
-        )
-        assert (
-            row(
-                "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
-                (f"manual-read:*:{enabled_read_id:08d}",),
-            )["count"]
-            == 1
-        )
-        assert (
-            row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
-            == 1
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO read_metadata(read_id,verified_work_id,identity_hash,description) VALUES(?,?,?,?)",
+            (enabled_read_id, "/works/OL999W", "hash-enabled", "Metadata description"),
         )
 
-        deleted = client.delete(f"/api/reading-history/{enabled_read_id}")
-        assert deleted.status_code == 200
-        assert row("SELECT id FROM reads WHERE id=?", (enabled_read_id,)) is None
-        assert row("SELECT read_id FROM read_metadata WHERE read_id=?", (enabled_read_id,)) is None
-        assert (
-            row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
-            == 0
-        )
-        assert (
-            row(
-                "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
-                (f"manual-read:*:{enabled_read_id:08d}",),
-            )["count"]
-            == 0
-        )
-        assert (
-            row(
-                "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
-                (f"manual-read:*:{enabled_read_id:08d}",),
-            )["count"]
-            == 0
-        )
-        assert row("SELECT status FROM candidates WHERE id=?", (enabled_cid,))["status"] == "recommended"
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
+            (f"manual-read:*:{enabled_read_id:08d}",),
+        )["count"]
+        == 1
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
+            (f"manual-read:*:{enabled_read_id:08d}",),
+        )["count"]
+        == 1
+    )
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
+        == 1
+    )
 
-        # Disabled-source candidate marked read and then deleted returns to maybe_later, not Discover.
-        marked_disabled = client.post(
-            f"/api/recommendations/{disabled_cid}/read",
-            json={"historical": True},
-        )
-        assert marked_disabled.status_code == 200
-        disabled_read_id = marked_disabled.json()["read_id"]
-        deleted_v1 = client.delete(
-            f"/api/v1/reading-history/{disabled_read_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert deleted_v1.status_code == 200
-        assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "maybe_later"
+    deleted = client.delete(f"/api/reading-history/{enabled_read_id}")
+    assert deleted.status_code == 200
+    assert row("SELECT id FROM reads WHERE id=?", (enabled_read_id,)) is None
+    assert row("SELECT read_id FROM read_metadata WHERE read_id=?", (enabled_read_id,)) is None
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (enabled_read_id,))["count"]
+        == 0
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_events WHERE event_key GLOB ?",
+            (f"manual-read:*:{enabled_read_id:08d}",),
+        )["count"]
+        == 0
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key GLOB ?",
+            (f"manual-read:*:{enabled_read_id:08d}",),
+        )["count"]
+        == 0
+    )
+    assert row("SELECT status FROM candidates WHERE id=?", (enabled_cid,))["status"] == "recommended"
 
-        # Imported Goodreads rows cannot be deleted.
-        for imported_id in (rss_read_id, csv_read_id):
-            resp = client.delete(f"/api/reading-history/{imported_id}")
-            assert resp.status_code == 409
-            assert row("SELECT id FROM reads WHERE id=?", (imported_id,)) is not None
+    # Disabled-source candidate marked read and then deleted returns to maybe_later, not Discover.
+    marked_disabled = client.post(
+        f"/api/recommendations/{disabled_cid}/read",
+        json={"historical": True},
+    )
+    assert marked_disabled.status_code == 200
+    disabled_read_id = marked_disabled.json()["read_id"]
+    deleted_v1 = client.delete(
+        f"/api/v1/reading-history/{disabled_read_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert deleted_v1.status_code == 200
+    assert row("SELECT status FROM candidates WHERE id=?", (disabled_cid,))["status"] == "maybe_later"
+
+    # Imported Goodreads rows cannot be deleted.
+    for imported_id in (rss_read_id, csv_read_id):
+        resp = client.delete(f"/api/reading-history/{imported_id}")
+        assert resp.status_code == 409
+        assert row("SELECT id FROM reads WHERE id=?", (imported_id,)) is not None
 
     # Multi-profile isolation: Alice cannot mutate Owner's manual read.
     with transaction() as con:
@@ -691,9 +691,9 @@ def test_delete_manual_read_purges_evidence_restores_candidates_guards_imports_a
     with profile_scope(alice["profile_id"]):
         initialize(seed_demo=False)
     alice_session, _ = profiles.create_session(alice["id"])
-    with TestClient(app, headers={"x-bookward-session": alice_session}) as alice_client:
-        assert alice_client.patch(f"/api/reading-history/{owner_read_id}", json={"rating": 1}).status_code == 404
-        assert alice_client.delete(f"/api/reading-history/{owner_read_id}").status_code == 404
+    alice_client = TestClient(app, headers={"x-bookward-session": alice_session})
+    assert alice_client.patch(f"/api/reading-history/{owner_read_id}", json={"rating": 1}).status_code == 404
+    assert alice_client.delete(f"/api/reading-history/{owner_read_id}").status_code == 404
 
     assert row("SELECT rating FROM reads WHERE id=?", (owner_read_id,))["rating"] == 5
     assert [item["version"] for item in rows("SELECT version FROM schema_migrations ORDER BY version")] == [
