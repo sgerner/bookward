@@ -1434,6 +1434,7 @@ def _prepare_tracked_recommendations(
                 offset=0,
                 identity_context=identity_context,
                 include_imported=include_imported,
+                format_urls=False,
             )
             base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
@@ -1616,6 +1617,7 @@ def _complete_tracked_recommendations(
                 start = max(0, int(offset))
                 end = None if limit is None else start + max(0, int(limit))
                 recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
         except Exception:
             LOGGER.exception(
                 "Post-personalization slate assembly failed; serving base ranking"
@@ -2071,6 +2073,24 @@ def _recommendation_rows(
     return visible[offset:end]
 
 
+def _format_recommendation_urls(items):
+    for item in items:
+        source_url = item.get("source_url", "")
+        item["cover_url"] = fallback_cover_url(
+            item["title"],
+            item["author"],
+            item.get("cover_url", ""),
+            source_url,
+        )
+        item["source_url"] = canonical_book_source_url(
+            item["title"],
+            item["author"],
+            source_url,
+            item=item,
+        )
+    return items
+
+
 def recommendation_list(
     connection=None,
     *,
@@ -2080,6 +2100,7 @@ def recommendation_list(
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
+    format_urls: bool = True,
 ):
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
@@ -2114,20 +2135,10 @@ def recommendation_list(
             include_imported=include_imported,
         )
     for item in result:
-        item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
-        source_url = item.get("source_url", "")
-        parsed_source = urlparse(source_url)
-        if (
-            (parsed_source.hostname or "").casefold().rstrip(".")
-            in {"openlibrary.org", "www.openlibrary.org"}
-            and parsed_source.path.casefold().startswith("/people/")
-            and "/lists/" in parsed_source.path.casefold()
-        ):
-            work_url = book_openlibrary_work_id(item)
-            if work_url:
-                source_url = f"https://openlibrary.org{work_url}"
-        item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
-        item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = json.loads(item["genres"] or "[]")
+        item["explanation"] = json.loads(item["explanation"] or "[]")
+    if format_urls:
+        _format_recommendation_urls(result)
     return result
 
 @app.get("/api/recommendations")
