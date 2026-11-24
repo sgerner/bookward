@@ -485,6 +485,217 @@ def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
     assert job["status"] == "complete"
 
 
+@pytest.mark.parametrize("fenced_target", ["legacy", "secondary"])
+def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_restore_journal(
+    tmp_path: Path, monkeypatch, fenced_target
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "lifespan-fence.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    alice = profiles.create_account("alice", "alice-password-with-enough-length")
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Legacy healthy read", "Owner", "test"),
+            )
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Alice healthy read", "Alice", "test"),
+            )
+
+    fenced_profile_id = "legacy" if fenced_target == "legacy" else alice["profile_id"]
+    healthy_profile_id = alice["profile_id"] if fenced_target == "legacy" else "legacy"
+    fenced_account = owner if fenced_target == "legacy" else alice
+    healthy_account = alice if fenced_target == "legacy" else owner
+
+    with profile_scope(fenced_profile_id):
+        journal = backups._restore_journal_path()
+        journal.write_text(
+            '{"safety_backup": "bookward-20260101T000000Z-deadbeef", "selected_backup": "bookward-20260101T000000Z-deadbeef"}',
+            encoding="utf-8",
+        )
+        journal.chmod(0o600)
+        db_file = profile_database_path()
+        db_file.write_bytes(b"corrupt-unrecovered-bytes")
+
+    owner_session, _ = profiles.create_session(owner["id"])
+    fenced_session, _ = profiles.create_session(fenced_account["id"])
+    healthy_session, _ = profiles.create_session(healthy_account["id"])
+
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        assert (
+            client.get("/auth/me", headers={"x-bookward-session": fenced_session}).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/admin/auth-backups", headers={"x-bookward-session": owner_session}
+            ).status_code
+            == 200
+        )
+        fenced_backups = client.get(
+            "/api/backups", headers={"x-bookward-session": fenced_session}
+        )
+        assert fenced_backups.status_code == 200
+        assert fenced_backups.json()["last_error"] == "That backup is no longer available."
+
+        fenced_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": fenced_session}
+        )
+        assert fenced_overview.status_code == 503
+        assert fenced_overview.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+
+        healthy_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": healthy_session}
+        )
+        assert healthy_overview.status_code == 200
+        expected_title = (
+            "Alice healthy read" if healthy_profile_id != "legacy" else "Legacy healthy read"
+        )
+        assert expected_title in {
+            item["title"] for item in healthy_overview.json()["history"]
+        }
+
+    with profile_scope(fenced_profile_id):
+        assert backups._restore_journal_path().is_file()
+        assert profile_database_path().read_bytes() == b"corrupt-unrecovered-bytes"
+
+
+def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "transient-lock.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    api_token = profiles.create_profile_api_token("legacy", "Recovery check")["token"]
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Safety baseline read", "Owner", "test"),
+            )
+        safety = backups.create_backup()
+        safety_path = tmp_path / "backups" / f"{safety['id']}.sqlite3"
+        with transaction() as con:
+            con.execute("DELETE FROM reads WHERE title='Safety baseline read'")
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Unfinished restore state", "Owner", "test"),
+            )
+        backups._write_restore_journal(safety_path, safety_path)
+
+    owner_session, _ = profiles.create_session(owner["id"])
+    external_lock = sqlite3.connect(settings.db)
+    external_lock.execute("BEGIN IMMEDIATE")
+    external_lock.execute(
+        "INSERT INTO reads(title,author,source) VALUES('External lock row','Ext','test')"
+    )
+    try:
+        with TestClient(app) as client:
+            locked_resp = client.get(
+                "/api/overview", headers={"x-bookward-session": owner_session}
+            )
+            assert locked_resp.status_code == 503
+            assert locked_resp.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+
+            external_lock.rollback()
+            external_lock.close()
+            external_lock = None
+
+            # Once the lock clears, an API token or session request completes
+            # rollback before serving.
+            v1_resp = client.get(
+                "/api/v1/overview",
+                headers={"authorization": f"Bearer {api_token}"},
+            )
+            assert v1_resp.status_code == 200
+            titles = {item["title"] for item in v1_resp.json()["history"]}
+            assert "Safety baseline read" in titles
+            assert "Unfinished restore state" not in titles
+
+            with profile_scope("legacy"):
+                assert not backups._restore_journal_path().exists()
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                        ("Write after recovery", "Owner", "test"),
+                    )
+    finally:
+        if external_lock is not None:
+            external_lock.close()
+
+    # Restarting the engine must preserve post-recovery writes.
+    with TestClient(app) as client:
+        restarted = client.get(
+            "/api/overview", headers={"x-bookward-session": owner_session}
+        )
+        assert restarted.status_code == 200
+        restarted_titles = {item["title"] for item in restarted.json()["history"]}
+        assert "Safety baseline read" in restarted_titles
+        assert "Write after recovery" in restarted_titles
+
+
+def test_worker_loop_completes_interrupted_restore_once_transient_lock_clears(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "PROFILE_RETRY_SECONDS", 0.05)
+    alice = profiles.create_account("worker-recover", "worker-recover-password-long")
+    profile_id = alice["profile_id"]
+    with profile_scope(profile_id):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("post_recovery_job")
+        safety = backups.create_backup()
+        safety_path = backups.backup_directory() / f"{safety['id']}.sqlite3"
+        profile_database_path().write_bytes(b"corrupt-partial-restore")
+        backups._write_restore_journal(safety_path, safety_path)
+
+    original_recover = backups.recover_interrupted_restore
+    attempts = 0
+
+    def transient_lock_then_recover():
+        nonlocal attempts
+        if current_profile_id() == profile_id:
+            attempts += 1
+            if attempts == 1:
+                raise backups.BackupError(
+                    "The active database could not be safely closed for restore."
+                )
+        return original_recover()
+
+    monkeypatch.setattr(backups, "recover_interrupted_restore", transient_lock_then_recover)
+    stop = asyncio.Event()
+    handled = []
+
+    async def handler(kind):
+        handled.append((current_profile_id(), kind))
+        stop.set()
+        return {"recovered_by": "worker"}
+
+    asyncio.run(worker_loop(handler, stop))
+
+    assert attempts >= 2
+    assert handled == [(profile_id, "post_recovery_job")]
+    with profile_scope(profile_id):
+        assert not backups._restore_journal_path().exists()
+        with connect() as con:
+            job = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        assert job["status"] == "complete"
+
+
 def test_lease_reaper_preserves_a_lease_renewed_after_its_read(identity_store, monkeypatch):
     with profile_scope("legacy"):
         initialize(seed_demo=False)
@@ -887,11 +1098,15 @@ def test_worker_heartbeat_logs_deferred_lease_renewal_when_profile_locked(
         initialize(seed_demo=False)
         job_id = enqueue_job("read_metadata")
 
-    state, _, _, claimed = jobs._poll_and_claim_job(
-        alice["profile_id"], need_init=False, need_reap=False
+    status, claimed_job, lease_token = jobs._claim_profile_job(
+        alice["profile_id"],
+        time.monotonic(),
+        {alice["profile_id"]},
+        set(),
+        {alice["profile_id"]: time.monotonic()},
+        {},
     )
-    assert state == "claimed" and claimed is not None
-    claimed_job, lease_token = claimed
+    assert status == "claimed" and claimed_job is not None and lease_token is not None
     assert claimed_job["id"] == job_id
 
     alice_path = profile_database_path(alice["profile_id"])
@@ -932,6 +1147,162 @@ def test_worker_heartbeat_logs_deferred_lease_renewal_when_profile_locked(
         f"Deferred lease renewal for job {job_id} while profile database lock is held"
         in caplog.text
     )
+
+
+def test_deferred_heartbeat_cancels_live_job_at_lease_expiry_before_duplicate_reap(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_LEASE_SECONDS", 0.12)
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_REAPER_SECONDS", 0.02)
+
+    alice = profiles.create_account("hb-bound-alice", "hb-bound-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("lease_bound_check")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    first_started = Event()
+    first_cancelled = Event()
+    lock_held = Event()
+    release_lock = Event()
+    stop = asyncio.Event()
+    active_count = 0
+    max_concurrent = 0
+    attempts_seen = 0
+
+    def hold_long_exclusive_lock():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    async def handler(kind: str):
+        nonlocal active_count, max_concurrent, attempts_seen
+        assert kind == "lease_bound_check"
+        attempts_seen += 1
+        active_count += 1
+        max_concurrent = max(max_concurrent, active_count)
+        try:
+            if attempts_seen == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            stop.set()
+            return {"attempt": attempts_seen}
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        finally:
+            active_count -= 1
+
+    async def run_scenario():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        holder = Thread(target=hold_long_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(first_started.wait, 2)
+            holder.start()
+            assert await asyncio.to_thread(lock_held.wait, 2)
+            # Hold the lock past JOB_LEASE_SECONDS (0.12s); _heartbeat must
+            # cancel the live handler before releasing the lock so the reaper
+            # can never start a second copy concurrently.
+            assert await asyncio.to_thread(first_cancelled.wait, 2)
+            with profile_scope(alice["profile_id"]):
+                assert database_lock(alice_path).is_locked()
+            release_lock.set()
+            await asyncio.to_thread(holder.join, 2)
+            await asyncio.wait_for(worker, timeout=3)
+        finally:
+            release_lock.set()
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            if holder.is_alive():
+                await asyncio.to_thread(holder.join, 2)
+
+    with caplog.at_level(logging.WARNING, logger="afterword_engine.jobs"):
+        asyncio.run(run_scenario())
+
+    assert (
+        f"Lease expired for job {job_id} while profile database lock was held; cancelling active handler"
+        in caplog.text
+    )
+    assert max_concurrent == 1
+    assert attempts_seen == 2
+    with profile_scope(alice["profile_id"]), connect() as con:
+        final_job = con.execute(
+            "SELECT status,attempts,result FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert final_job["status"] == "complete"
+    assert final_job["attempts"] == 2
+    assert final_job["result"] == '{"attempt": 2}'
+
+
+def test_quiesce_requeues_active_worker_job_and_times_out_on_stuck_connection(
+    identity_store,
+):
+    alice = profiles.create_account("quiesce-alice", "quiesce-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("quiesce_job")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+    job_started = Event()
+    job_cancelled = Event()
+    quiesced_and_locked = Event()
+    stop = asyncio.Event()
+
+    async def blocking_async_handler(kind: str):
+        assert kind == "quiesce_job"
+        job_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            job_cancelled.set()
+            raise
+
+    def run_quiesce_and_exclusive():
+        with lock.quiesce(timeout=2.0) as deadline, lock.exclusive(deadline):
+            quiesced_and_locked.set()
+
+    async def run_quiesce_scenario():
+        worker = asyncio.create_task(worker_loop(blocking_async_handler, stop))
+        try:
+            assert await asyncio.to_thread(job_started.wait, 2)
+            # Pause worker from re-claiming once restore finishes so we can inspect the row.
+            stop.set()
+            await asyncio.to_thread(run_quiesce_and_exclusive)
+            assert job_cancelled.is_set()
+            assert quiesced_and_locked.is_set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run_quiesce_scenario())
+    with profile_scope(alice["profile_id"]), connect() as con:
+        requeued = con.execute(
+            "SELECT status,attempts,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert requeued["status"] == "queued"
+    assert requeued["attempts"] == 0
+    assert requeued["lease_token"] is None
+
+    # A stuck open connection must cause lock.exclusive(deadline) to fail with BackupError
+    # after the quiescence timeout and leave the profile lock cleanly released.
+    with profile_scope(alice["profile_id"]):
+        stuck = connect()
+        try:
+            with pytest.raises(
+                backups.BackupError, match="could not be safely closed for restore"
+            ):
+                with lock.quiesce(timeout=0.05) as deadline, lock.exclusive(deadline):
+                    pass
+            assert not lock.is_locked()
+            assert not lock.is_restoring()
+        finally:
+            stuck.close()
 
 
 def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
@@ -1047,7 +1418,8 @@ def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
             assert bob_state == "complete"
 
             # Verify cancelling an in-flight worker task cancels handle_job cleanly
-            # without marking the interrupted job as failed.
+            # and immediately returns the interrupted job to queued without waiting
+            # for the 300s lease reaper.
             pause_cancel_lookup = True
             with profile_scope(bob["profile_id"]):
                 with transaction() as con:
@@ -1067,12 +1439,14 @@ def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
             worker.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await worker
-            assert (
-                await asyncio.to_thread(
-                    job_status, bob["profile_id"], cancelled_job_id
-                )
-                == "running"
-            )
+            with profile_scope(bob["profile_id"]), connect() as con:
+                cancelled_row = con.execute(
+                    "SELECT status,attempts,lease_token FROM jobs WHERE id=?",
+                    (cancelled_job_id,),
+                ).fetchone()
+            assert cancelled_row["status"] == "queued"
+            assert cancelled_row["attempts"] == 0
+            assert cancelled_row["lease_token"] is None
         finally:
             release_lock.set()
             release_alice_lookup.set()

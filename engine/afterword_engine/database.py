@@ -1,8 +1,10 @@
 import json
 import sqlite3
 import threading
+import time
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from .config import settings
@@ -15,9 +17,11 @@ from .covers import (
 from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path
+from .tenancy import profile_database_path, restore_fence_bypassed
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
+RESTORE_QUIESCENCE_TIMEOUT_SECONDS = 5.0
+SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -992,12 +996,28 @@ MIGRATIONS = [
             ON goodreads_shelf_items(title, author);
         """,
     ),
+    (
+        27,
+        """
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_APP_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1007,7 +1027,7 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_minimum_score": "80",
     "digest_maximum_books": "5",
     "digest_only_new": "1",
-    "digest_app_url": settings.public_url,
+    "digest_app_url": "http://localhost:5173",
     "digest_discord_webhook_url": "",
     "digest_email_to": "",
     "digest_email_from": "",
@@ -1037,6 +1057,13 @@ DEFAULT_SOURCES = (
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
 )
 
+@dataclass(eq=False)
+class _ActiveWorkerJob:
+    cancel: object
+    loop_thread_id: int
+    done: threading.Event
+
+
 class _ProfileDatabaseLock:
     """Allow concurrent connections and let backup/restore take an exclusive lock."""
 
@@ -1047,16 +1074,120 @@ class _ProfileDatabaseLock:
         self._waiting_writers = 0
         self._connections = 0
         self._connections_by_thread: dict[int, int] = {}
+        self._restoring_count = 0
+        self._quiesce_deadlines: dict[int, list[float]] = {}
+        self._active_jobs: set[_ActiveWorkerJob] = set()
+        self._active_schedulers: set[tuple[object, int]] = set()
+
+    def is_restoring(self) -> bool:
+        with self._condition:
+            return self._restoring_count > 0
 
     def is_locked(self) -> bool:
         owner = threading.get_ident()
         with self._condition:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
-            return self._writer not in (None, owner) or (
-                bool(self._waiting_writers)
-                and self._writer != owner
-                and not owns_connection
+            return (
+                (self._restoring_count > 0 and self._writer != owner)
+                or self._writer not in (None, owner)
+                or (
+                    bool(self._waiting_writers)
+                    and self._writer != owner
+                    and not owns_connection
+                )
             )
+
+    @contextmanager
+    def scheduler_guard(self):
+        owner = threading.get_ident()
+        entry = (object(), owner)
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if (
+                self._restoring_count > 0
+                or self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
+                allowed = False
+            else:
+                allowed = True
+                self._active_schedulers.add(entry)
+        try:
+            yield allowed
+        finally:
+            if allowed:
+                with self._condition:
+                    self._active_schedulers.discard(entry)
+                    self._condition.notify_all()
+
+    @contextmanager
+    def track_worker_job(self, cancel_callback, loop_thread_id: int):
+        done = threading.Event()
+        handle = _ActiveWorkerJob(
+            cancel=cancel_callback,
+            loop_thread_id=loop_thread_id,
+            done=done,
+        )
+        with self._condition:
+            if self._restoring_count > 0:
+                cancel_immediately = True
+            else:
+                cancel_immediately = False
+                self._active_jobs.add(handle)
+        if cancel_immediately:
+            cancel_callback()
+            done.set()
+            yield handle
+            return
+        try:
+            yield handle
+        finally:
+            with self._condition:
+                self._active_jobs.discard(handle)
+                self._condition.notify_all()
+            done.set()
+
+    @contextmanager
+    def quiesce(self, timeout: float | None = None):
+        if timeout is None:
+            timeout = RESTORE_QUIESCENCE_TIMEOUT_SECONDS
+        current_thread = threading.get_ident()
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            self._restoring_count += 1
+            self._quiesce_deadlines.setdefault(current_thread, []).append(deadline)
+            jobs_to_cancel = list(self._active_jobs)
+        try:
+            for job_handle in jobs_to_cancel:
+                job_handle.cancel()
+            for job_handle in jobs_to_cancel:
+                if job_handle.loop_thread_id == current_thread:
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                job_handle.done.wait(timeout=remaining)
+            with self._condition:
+                while any(
+                    thread_id != current_thread
+                    for _, thread_id in self._active_schedulers
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(timeout=remaining)
+            yield deadline
+        finally:
+            with self._condition:
+                stack = self._quiesce_deadlines.get(current_thread)
+                if stack:
+                    stack.pop()
+                    if not stack:
+                        del self._quiesce_deadlines[current_thread]
+                self._restoring_count -= 1
+                self._condition.notify_all()
 
     def acquire_connection(self) -> int:
         owner = threading.get_ident()
@@ -1098,45 +1229,76 @@ class _ProfileDatabaseLock:
             self.release_connection(owner)
 
     @contextmanager
-    def try_shared(self):
+    def try_shared(self, *, allow_during_quiesce: bool = False):
         owner = threading.get_ident()
         with self._condition:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
-            acquired = not (
-                self._writer not in (None, owner)
+            restoring_blocked = (
+                self._restoring_count > 0
+                and self._writer != owner
+                and not allow_during_quiesce
+            )
+            if (
+                restoring_blocked
+                or self._writer not in (None, owner)
                 or (
                     self._waiting_writers
                     and self._writer != owner
                     and not owns_connection
                 )
-            )
-            if acquired:
+            ):
+                acquired = False
+            else:
+                acquired = True
                 self._connections += 1
                 self._connections_by_thread[owner] = (
                     self._connections_by_thread.get(owner, 0) + 1
                 )
-        if not acquired:
-            yield False
-            return
         try:
-            yield True
+            yield acquired
         finally:
-            self.release_connection(owner)
+            if acquired:
+                self.release_connection(owner)
 
-    def acquire(self) -> None:
+    def acquire(self, deadline: float | None = None) -> None:
         owner = threading.get_ident()
         with self._condition:
             if self._writer == owner:
                 self._write_depth += 1
                 return
+            effective_deadline = deadline
+            if effective_deadline is None:
+                stack = self._quiesce_deadlines.get(owner)
+                if stack:
+                    effective_deadline = stack[-1]
             self._waiting_writers += 1
             try:
                 while self._writer is not None or self._connections:
-                    self._condition.wait()
+                    if effective_deadline is not None:
+                        remaining = effective_deadline - time.monotonic()
+                        if remaining <= 0:
+                            from .backups import BackupError
+
+                            raise BackupError(
+                                "The active database could not be safely closed for restore."
+                            )
+                        self._condition.wait(timeout=remaining)
+                    else:
+                        self._condition.wait()
                 self._writer = owner
                 self._write_depth = 1
             finally:
                 self._waiting_writers -= 1
+                if self._writer != owner:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def exclusive(self, deadline: float | None = None):
+        self.acquire(deadline)
+        try:
+            yield self
+        finally:
+            self.release()
 
     def release(self) -> None:
         owner = threading.get_ident()
@@ -1212,6 +1374,13 @@ class _LockedConnection(sqlite3.Connection):
 
 def connect():
     db_path = profile_database_path()
+    if not restore_fence_bypassed():
+        from .backups import has_restore_journal
+
+        if has_restore_journal():
+            raise sqlite3.OperationalError(
+                "Profile database is unavailable until interrupted restore recovery completes."
+            )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if db_path.parent.name == "profiles":
         try:
@@ -1424,10 +1593,18 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        existing_digest_app_url_row = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url'"
+        ).fetchone()
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (
+                (settings.public_url or default_value).rstrip("/")
+                if key == "digest_app_url"
+                else default_value
+            )
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1440,13 +1617,41 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
+        # Seed digest_app_url_custom for existing rows that predate the flag so
+        # an operator-configured URL (including custom loopback ports such as
+        # http://localhost:3000) is preserved across restarts.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        custom_flag = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+        ).fetchone()
+        if custom_flag is None:
+            if existing_digest_app_url_row is None:
+                custom_value = "0"
+            else:
+                existing_app_url = (
+                    str(existing_digest_app_url_row[0] or "").strip().rstrip("/")
+                )
+                custom_value = (
+                    "1"
+                    if existing_app_url and existing_app_url not in DEFAULT_DIGEST_APP_URLS
+                    else "0"
+                )
             con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
+                "INSERT INTO settings(key,value,secret) VALUES('digest_app_url_custom',?,0)",
+                (custom_value,),
+            )
+        else:
+            custom_value = str(custom_flag[0] or "0")
+        # Upgrade an untouched loopback default (http://localhost:5173 or
+        # Docker's http://127.0.0.1:3000) when the deployment advertises a
+        # different public origin, without overwriting a custom URL.
+        if configured_public_url and custom_value != "1":
+            placeholders = ",".join("?" for _ in DEFAULT_DIGEST_APP_URLS)
+            con.execute(
+                f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                f"AND RTRIM(value,'/')!=?",
+                (configured_public_url, *DEFAULT_DIGEST_APP_URLS, configured_public_url),
             )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
@@ -1454,10 +1659,41 @@ def initialize(*, seed_demo: bool = True):
             ("Bookward demo upcoming books",),
         )
         builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        # Track default URLs once seeded so a user's custom source that shares
+        # a default source's display name never blocks seeding that default URL,
+        # while editing an already-seeded starter URL will not re-insert the
+        # original URL on subsequent startups.
+        seeded_row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SEEDED_DEFAULT_SOURCES_KEY,),
+        ).fetchone()
+        try:
+            parsed_seeded = json.loads(seeded_row["value"]) if seeded_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_seeded = []
+        seeded_urls = {
+            str(item)
+            for item in (parsed_seeded if isinstance(parsed_seeded, list) else [])
+            if item
+        }
+        seeded_changed = False
         for name, url, enabled in DEFAULT_SOURCES:
+            if url in seeded_urls:
+                continue
             con.execute(
                 "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
                 (name, url, "web", enabled),
+            )
+            seeded_urls.add(url)
+            seeded_changed = True
+        if seeded_changed:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (
+                    SEEDED_DEFAULT_SOURCES_KEY,
+                    json.dumps(sorted(seeded_urls), separators=(",", ":")),
+                ),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []
