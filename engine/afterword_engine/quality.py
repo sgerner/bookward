@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
@@ -60,7 +61,7 @@ from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
 LOGGER = logging.getLogger(__name__)
-QUALITY_VERSION = "candidate-quality-v5"
+QUALITY_VERSION = "candidate-quality-v6"
 _NON_CATALOG_PROVIDERS = frozenset({"source", "penguinrandomhouse"})
 _POLLUTION_FLAGS = frozenset(
     {
@@ -73,10 +74,26 @@ APPLE_BOOKS_SEARCH = "https://itunes.apple.com/search"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 CATALOG_PROVIDER_RETRY_HOURS = 24
+CATALOG_QUARANTINE_RETRY_DAYS = 14
 QUALITY_AUDIT_BATCH_SIZE = 50
 QUALITY_AUDIT_SUBBATCH_SIZE = 10
 QUALITY_AUDIT_TIME_BUDGET_SECONDS = 30.0
 _audit_monotonic = time.monotonic
+_AUDIT_TIMESTAMP_LOCK = threading.Lock()
+_LAST_AUDIT_TIMESTAMP_US = 0
+
+
+def _utc_audit_timestamp() -> str:
+    """Return a strictly increasing naive UTC timestamp with >=1ms step for SQLite julianday()."""
+
+    global _LAST_AUDIT_TIMESTAMP_US
+    epoch_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+    with _AUDIT_TIMESTAMP_LOCK:
+        if epoch_us < _LAST_AUDIT_TIMESTAMP_US + 1_000:
+            epoch_us = _LAST_AUDIT_TIMESTAMP_US + 1_000
+        _LAST_AUDIT_TIMESTAMP_US = epoch_us
+    resolved = datetime.fromtimestamp(epoch_us / 1_000_000, tz=timezone.utc).replace(tzinfo=None)
+    return resolved.isoformat(sep=" ", timespec="microseconds")
 
 _TRAILING_PAREN = re.compile(r"\s*\([^()]{2,80}\)\s*$")
 _AUTHOR_SPLIT = re.compile(r"\s*(?:,|;|&|\band\b)\s*", re.IGNORECASE)
@@ -126,212 +143,58 @@ _DERIVATIVE_CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
-_FOREIGN_TITLE_LANGUAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "es",
-        re.compile(
-            r"\b(?:spanish\s+(?:edition|language|version)|edici[oó]n\s+en\s+espa[nñ]ol|"
-            r"versi[oó]n\s+en\s+espa[nñ]ol|en\s+espa[nñ]ol|in\s+spanish)\b"
-            r"|[\(\[\-–—:]\s*(?:spanish|espa[nñ]ol)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "fr",
-        re.compile(
-            r"\b(?:french\s+(?:edition|language|version)|[eé]dition\s+fran[cç]aise|"
-            r"version\s+fran[cç]aise|en\s+fran[cç]ais|in\s+french)\b"
-            r"|[\(\[\-–—:]\s*(?:french|fran[cç]ais)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "de",
-        re.compile(
-            r"\b(?:german\s+(?:edition|language|version)|deutsche\s+ausgabe|"
-            r"auf\s+deutsch|in\s+german)\b"
-            r"|[\(\[\-–—:]\s*(?:german|deutsch)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "it",
-        re.compile(
-            r"\b(?:italian\s+(?:edition|language|version)|edizione\s+italiana|in\s+italian)\b"
-            r"|[\(\[\-–—:]\s*(?:italian|italiano)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "pt",
-        re.compile(
-            r"\b(?:portuguese\s+(?:edition|language|version)|edi[cç][aã]o\s+em\s+portugu[eê]s|"
-            r"in\s+portuguese)\b"
-            r"|[\(\[\-–—:]\s*(?:portuguese|portugu[eê]s)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "ru",
-        re.compile(
-            r"\b(?:russian\s+(?:edition|language|version)|in\s+russian)\b"
-            r"|[\(\[\-–—:]\s*russian\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "ja",
-        re.compile(
-            r"\b(?:japanese\s+(?:edition|language|version)|in\s+japanese)\b"
-            r"|[\(\[\-–—:]\s*japanese\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "zh",
-        re.compile(
-            r"\b(?:chinese\s+(?:edition|language|version)|in\s+chinese)\b"
-            r"|[\(\[\-–—:]\s*chinese\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "ko",
-        re.compile(
-            r"\b(?:korean\s+(?:edition|language|version)|in\s+korean)\b"
-            r"|[\(\[\-–—:]\s*korean\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "nl",
-        re.compile(
-            r"\b(?:dutch\s+(?:edition|language|version)|nederlandse\s+editie|in\s+dutch)\b"
-            r"|[\(\[\-–—:]\s*(?:dutch|nederlands)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "pl",
-        re.compile(
-            r"\b(?:polish\s+(?:edition|language|version)|wydanie\s+polskie|in\s+polish)\b"
-            r"|[\(\[\-–—:]\s*(?:polish|polski)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "sv",
-        re.compile(
-            r"\b(?:swedish\s+(?:edition|language|version)|svensk\s+utg[aå]va|in\s+swedish)\b"
-            r"|[\(\[\-–—:]\s*(?:swedish|svenska)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "tr",
-        re.compile(
-            r"\b(?:turkish\s+(?:edition|language|version)|t[uü]rk[cç]e\s+bask[iı]|in\s+turkish)\b"
-            r"|[\(\[\-–—:]\s*(?:turkish|t[uü]rk[cç]e)\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "ar",
-        re.compile(
-            r"\b(?:arabic\s+(?:edition|language|version)|in\s+arabic)\b"
-            r"|[\(\[\-–—:]\s*arabic\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "he",
-        re.compile(
-            r"\b(?:hebrew\s+(?:edition|language|version)|in\s+hebrew)\b"
-            r"|[\(\[\-–—:]\s*hebrew\s*[\)\]]?\s*$",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "foreign",
-        re.compile(r"\b(?:foreign|translated)\s+(?:language\s+)?edition\b", re.IGNORECASE),
-    ),
+_FOREIGN_TITLE_LANGUAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (lang, re.compile(pattern, re.IGNORECASE))
+    for lang, pattern in (
+        ("es", r"\b(?:spanish\s+(?:edition|language|version)|edici[oó]n\s+en\s+espa[nñ]ol|versi[oó]n\s+en\s+espa[nñ]ol|en\s+espa[nñ]ol|in\s+spanish)\b|[\(\[\-–—:]\s*(?:spanish|espa[nñ]ol)\s*[\)\]]?\s*$"),
+        ("fr", r"\b(?:french\s+(?:edition|language|version)|[eé]dition\s+fran[cç]aise|version\s+fran[cç]aise|en\s+fran[cç]ais|in\s+french)\b|[\(\[\-–—:]\s*(?:french|fran[cç]ais)\s*[\)\]]?\s*$"),
+        ("de", r"\b(?:german\s+(?:edition|language|version)|deutsche\s+ausgabe|auf\s+deutsch|in\s+german)\b|[\(\[\-–—:]\s*(?:german|deutsch)\s*[\)\]]?\s*$"),
+        ("it", r"\b(?:italian\s+(?:edition|language|version)|edizione\s+italiana|in\s+italian)\b|[\(\[\-–—:]\s*(?:italian|italiano)\s*[\)\]]?\s*$"),
+        ("pt", r"\b(?:portuguese\s+(?:edition|language|version)|edi[cç][aã]o\s+em\s+portugu[eê]s|in\s+portuguese)\b|[\(\[\-–—:]\s*(?:portuguese|portugu[eê]s)\s*[\)\]]?\s*$"),
+        ("ru", r"\b(?:russian\s+(?:edition|language|version)|in\s+russian)\b|[\(\[\-–—:]\s*russian\s*[\)\]]?\s*$"),
+        ("ja", r"\b(?:japanese\s+(?:edition|language|version)|in\s+japanese)\b|[\(\[\-–—:]\s*japanese\s*[\)\]]?\s*$"),
+        ("zh", r"\b(?:chinese\s+(?:edition|language|version)|in\s+chinese)\b|[\(\[\-–—:]\s*chinese\s*[\)\]]?\s*$"),
+        ("ko", r"\b(?:korean\s+(?:edition|language|version)|in\s+korean)\b|[\(\[\-–—:]\s*korean\s*[\)\]]?\s*$"),
+        ("nl", r"\b(?:dutch\s+(?:edition|language|version)|nederlandse\s+editie|in\s+dutch)\b|[\(\[\-–—:]\s*(?:dutch|nederlands)\s*[\)\]]?\s*$"),
+        ("pl", r"\b(?:polish\s+(?:edition|language|version)|wydanie\s+polskie|in\s+polish)\b|[\(\[\-–—:]\s*(?:polish|polski)\s*[\)\]]?\s*$"),
+        ("sv", r"\b(?:swedish\s+(?:edition|language|version)|svensk\s+utg[aå]va|in\s+swedish)\b|[\(\[\-–—:]\s*(?:swedish|svenska)\s*[\)\]]?\s*$"),
+        ("tr", r"\b(?:turkish\s+(?:edition|language|version)|t[uü]rk[cç]e\s+bask[iı]|in\s+turkish)\b|[\(\[\-–—:]\s*(?:turkish|t[uü]rk[cç]e)\s*[\)\]]?\s*$"),
+        ("ar", r"\b(?:arabic\s+(?:edition|language|version)|in\s+arabic)\b|[\(\[\-–—:]\s*arabic\s*[\)\]]?\s*$"),
+        ("he", r"\b(?:hebrew\s+(?:edition|language|version)|in\s+hebrew)\b|[\(\[\-–—:]\s*hebrew\s*[\)\]]?\s*$"),
+        ("foreign", r"\b(?:foreign|translated)\s+(?:language\s+)?edition\b"),
+    )
 )
 _LANGUAGE_CODE_ALIASES: dict[str, str] = {
-    "en": "en",
-    "eng": "en",
-    "english": "en",
-    "es": "es",
-    "spa": "es",
-    "spanish": "es",
-    "fr": "fr",
-    "fre": "fr",
-    "fra": "fr",
-    "french": "fr",
-    "de": "de",
-    "ger": "de",
-    "deu": "de",
-    "german": "de",
-    "it": "it",
-    "ita": "it",
-    "italian": "it",
-    "pt": "pt",
-    "por": "pt",
-    "portuguese": "pt",
-    "ru": "ru",
-    "rus": "ru",
-    "russian": "ru",
-    "ja": "ja",
-    "jpn": "ja",
-    "japanese": "ja",
-    "zh": "zh",
-    "chi": "zh",
-    "zho": "zh",
-    "chinese": "zh",
-    "ko": "ko",
-    "kor": "ko",
-    "korean": "ko",
-    "nl": "nl",
-    "dut": "nl",
-    "nld": "nl",
-    "dutch": "nl",
-    "pl": "pl",
-    "pol": "pl",
-    "polish": "pl",
-    "sv": "sv",
-    "swe": "sv",
-    "swedish": "sv",
-    "tr": "tr",
-    "tur": "tr",
-    "turkish": "tr",
-    "ar": "ar",
-    "ara": "ar",
-    "arabic": "ar",
-    "he": "he",
-    "heb": "he",
-    "hebrew": "he",
-    "cs": "cs",
-    "cze": "cs",
-    "ces": "cs",
-    "el": "el",
-    "gre": "el",
-    "ell": "el",
-    "hu": "hu",
-    "hun": "hu",
-    "ro": "ro",
-    "rum": "ro",
-    "ron": "ro",
-    "uk": "uk",
-    "ukr": "uk",
-    "ca": "ca",
-    "cat": "ca",
-    "id": "id",
-    "ind": "id",
-    "vi": "vi",
-    "vie": "vi",
-    "th": "th",
-    "tha": "th",
-    "hi": "hi",
-    "hin": "hi",
+    alias: canonical
+    for canonical, aliases in (
+        ("en", ("en", "eng", "english")),
+        ("es", ("es", "spa", "spanish")),
+        ("fr", ("fr", "fre", "fra", "french")),
+        ("de", ("de", "ger", "deu", "german")),
+        ("it", ("it", "ita", "italian")),
+        ("pt", ("pt", "por", "portuguese")),
+        ("ru", ("ru", "rus", "russian")),
+        ("ja", ("ja", "jpn", "japanese")),
+        ("zh", ("zh", "chi", "zho", "chinese")),
+        ("ko", ("ko", "kor", "korean")),
+        ("nl", ("nl", "dut", "nld", "dutch")),
+        ("pl", ("pl", "pol", "polish")),
+        ("sv", ("sv", "swe", "swedish")),
+        ("tr", ("tr", "tur", "turkish")),
+        ("ar", ("ar", "ara", "arabic")),
+        ("he", ("he", "heb", "hebrew")),
+        ("cs", ("cs", "cze", "ces")),
+        ("el", ("el", "gre", "ell")),
+        ("hu", ("hu", "hun")),
+        ("ro", ("ro", "rum", "ron")),
+        ("uk", ("uk", "ukr")),
+        ("ca", ("ca", "cat")),
+        ("id", ("id", "ind")),
+        ("vi", ("vi", "vie")),
+        ("th", ("th", "tha")),
+        ("hi", ("hi", "hin")),
+    )
+    for alias in aliases
 }
 _IGNORED_LANGUAGE_CODES = {"", "und", "mul", "zxx", "mis", "unknown", "none", "null"}
 _DERIVATIVE_SUBJECT_PATTERN = re.compile(
@@ -1926,15 +1789,26 @@ def _attach_catalog_provenance_flags(candidates: list[dict[str, Any]]) -> list[d
     return candidates
 
 
-def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[str, tuple[str, ...]]:
+def candidate_quality_audit_eligibility(
+    now: datetime | None = None,
+    *,
+    include_quarantined: bool = False,
+    quarantine_before: str | None = None,
+) -> tuple[str, tuple[str, ...]]:
     """Return the shared SQL predicate and parameters for a due bounded audit."""
 
     reference_time = now or datetime.now(timezone.utc)
     if reference_time.tzinfo is None:
         reference_time = reference_time.replace(tzinfo=timezone.utc)
-    retry_before = (
+    outage_retry_before = (
         reference_time - timedelta(hours=CATALOG_PROVIDER_RETRY_HOURS)
     ).isoformat(timespec="seconds")
+    if include_quarantined:
+        quarantine_cutoff = quarantine_before or reference_time.isoformat(timespec="microseconds")
+    else:
+        quarantine_cutoff = (
+            reference_time - timedelta(days=CATALOG_QUARANTINE_RETRY_DAYS)
+        ).isoformat(timespec="seconds")
     predicate = (
         "COALESCE(q.audit_version,'')!='builtin-curated-v1' AND ("
         "COALESCE(q.quality_status,'pending')='pending' "
@@ -1949,14 +1823,20 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "OR EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
         "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
         "AND mfp.provider NOT IN ('source','penguinrandomhouse')))))) "
-        "OR (q.quality_status IN ('accepted','quarantine') AND q.audit_version=? "
+        "OR (q.quality_status IN ('accepted','quarantine') "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
-        "AND datetime(q.audited_at)<=datetime(?)))"
+        "AND julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?)) "
+        "OR (q.quality_status='quarantine' "
+        "AND julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?)))"
     )
-    return predicate, (QUALITY_VERSION, QUALITY_VERSION, retry_before)
+    return predicate, (QUALITY_VERSION, outage_retry_before, quarantine_cutoff)
 
 
-def _due_audit_reason(candidate: Mapping[str, Any]) -> str | None:
+def _due_audit_reason(
+    candidate: Mapping[str, Any],
+    *,
+    include_quarantined: bool = False,
+) -> str | None:
     audit_version = str(candidate.get("audit_version") or "")
     if audit_version == "builtin-curated-v1":
         return None
@@ -1969,29 +1849,30 @@ def _due_audit_reason(candidate: Mapping[str, Any]) -> str | None:
         flags = json.loads(candidate.get("flags_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         flags = []
-    if (
-        status in {"accepted", "quarantine"}
-        and audit_version == QUALITY_VERSION
-        and isinstance(flags, list)
-        and "catalog_provider_unavailable" in flags
-    ):
-        return "outage_retry"
-    if status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION:
-        c_isbn13 = str(candidate.get("c_isbn13") or "").strip()
-        c_isbn10 = str(candidate.get("c_isbn10") or "").strip()
-        q_isbn13 = str(candidate.get("q_isbn13") or "").strip()
-        q_isbn10 = str(candidate.get("q_isbn10") or "").strip()
-        eligibility_isbn13 = c_isbn13 or q_isbn13
-        eligibility_isbn10 = c_isbn10 or q_isbn10
-        valid_isbn = any(
-            isbn_parts_from_source(
-                [eligibility_isbn13, eligibility_isbn10],
-                str(candidate.get("source_url") or ""),
-            )
+    has_outage_flag = isinstance(flags, list) and "catalog_provider_unavailable" in flags
+    c_isbn13 = str(candidate.get("c_isbn13") or "").strip()
+    c_isbn10 = str(candidate.get("c_isbn10") or "").strip()
+    q_isbn13 = str(candidate.get("q_isbn13") or "").strip()
+    q_isbn10 = str(candidate.get("q_isbn10") or "").strip()
+    has_raw_isbn = bool(c_isbn13 or c_isbn10 or q_isbn13 or q_isbn10)
+    valid_isbn = any(
+        isbn_parts_from_source(
+            [c_isbn13 or q_isbn13, c_isbn10 or q_isbn10],
+            str(candidate.get("source_url") or ""),
         )
+    )
+    corrupt_isbn_only = has_raw_isbn and not valid_isbn
+    outage_due = bool(candidate.get("outage_due"))
+    quarantine_due = bool(candidate.get("quarantine_due"))
+
+    if status in {"accepted", "quarantine"} and audit_version == QUALITY_VERSION and has_outage_flag:
+        if outage_due or (status == "quarantine" and include_quarantined and quarantine_due):
+            return "outage_retry"
+        return None
+    if status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION:
         if valid_isbn:
             return "prior_version_isbn"
-        if c_isbn13 or c_isbn10 or q_isbn13 or q_isbn10:
+        if corrupt_isbn_only:
             return None
         has_catalog_attribution = bool(
             str(candidate.get("q_provider") or "").strip()
@@ -2000,6 +1881,16 @@ def _due_audit_reason(candidate: Mapping[str, Any]) -> str | None:
         )
         if status == "accepted" and has_catalog_attribution:
             return "prior_version_catalog"
+        if status == "quarantine" and has_outage_flag and outage_due:
+            return "outage_retry"
+        if status == "quarantine" and quarantine_due:
+            return "quarantine_retry"
+        return None
+    if status == "quarantine" and audit_version == QUALITY_VERSION:
+        if corrupt_isbn_only:
+            return None
+        if quarantine_due:
+            return "quarantine_retry"
     return None
 
 
@@ -2008,51 +1899,85 @@ def _due_candidate_quality_page_rows(
     params: tuple[str, ...],
     *,
     page_size: int,
-    offset: int,
+    last_id: int,
+    audited_before: str | None = None,
 ) -> list[dict[str, Any]]:
+    _, outage_retry_before, quarantine_cutoff = params
+    extra_where = ""
+    extra_params: tuple[str, ...] = ()
+    if audited_before:
+        extra_where = "AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?)) "
+        extra_params = (audited_before,)
     return rows(
         "SELECT c.id,c.isbn13 AS c_isbn13,c.isbn10 AS c_isbn10,c.source_url,"
         "q.quality_status,q.audit_version,q.flags_json,"
         "q.isbn13 AS q_isbn13,q.isbn10 AS q_isbn10,"
         "q.provider AS q_provider,q.metadata_provider AS q_metadata_provider,"
+        "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS outage_due,"
+        "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS quarantine_due,"
         "EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
         "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
         "AND mfp.provider NOT IN ('source','penguinrandomhouse')) AS has_catalog_provenance "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "LEFT JOIN sources s ON s.id=c.source_id "
-        f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
-        "ORDER BY c.id LIMIT ? OFFSET ?",
-        (*params, page_size, offset),
+        f"WHERE c.id>? AND c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND ({predicate}) {extra_where}"
+        "ORDER BY c.id LIMIT ?",
+        (outage_retry_before, quarantine_cutoff, last_id, *params, *extra_params, page_size),
     )
 
 
-def _due_candidate_quality_breakdown(*, now: datetime | None = None) -> tuple[int, dict[str, int]]:
-    predicate, params = candidate_quality_audit_eligibility(now)
+def _due_candidate_quality_breakdown(
+    *,
+    now: datetime | None = None,
+    include_quarantined: bool = False,
+    quarantine_before: str | None = None,
+    audited_before: str | None = None,
+) -> tuple[int, dict[str, int]]:
+    predicate, params = candidate_quality_audit_eligibility(
+        now,
+        include_quarantined=include_quarantined,
+        quarantine_before=quarantine_before,
+    )
     page_size = 250
-    offset = 0
+    last_id = 0
     total = 0
     breakdown: dict[str, int] = {}
     while True:
         page = _due_candidate_quality_page_rows(
-            predicate, params, page_size=page_size, offset=offset
+            predicate,
+            params,
+            page_size=page_size,
+            last_id=last_id,
+            audited_before=audited_before,
         )
         if not page:
             break
         for candidate in page:
-            reason = _due_audit_reason(candidate)
+            reason = _due_audit_reason(candidate, include_quarantined=include_quarantined)
             if reason:
                 total += 1
                 breakdown[reason] = breakdown.get(reason, 0) + 1
-        offset += len(page)
+        last_id = int(page[-1]["id"])
         if len(page) < page_size:
             break
     return total, breakdown
 
 
-def count_candidate_quality_audit_candidates(*, now: datetime | None = None) -> int:
+def count_candidate_quality_audit_candidates(
+    *,
+    now: datetime | None = None,
+    include_quarantined: bool = False,
+    quarantine_before: str | None = None,
+    audited_before: str | None = None,
+) -> int:
     """Return the exact number of candidates currently due for quality recovery."""
 
-    total, _ = _due_candidate_quality_breakdown(now=now)
+    total, _ = _due_candidate_quality_breakdown(
+        now=now,
+        include_quarantined=include_quarantined,
+        quarantine_before=quarantine_before,
+        audited_before=audited_before,
+    )
     return total
 
 
@@ -2060,26 +1985,37 @@ def candidate_quality_audit_candidates(
     limit: int = QUALITY_AUDIT_BATCH_SIZE,
     *,
     now: datetime | None = None,
+    include_quarantined: bool = False,
+    quarantine_before: str | None = None,
+    audited_before: str | None = None,
 ) -> list[dict[str, Any]]:
     """Select a bounded batch due for quality audit."""
 
     batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
-    predicate, params = candidate_quality_audit_eligibility(now)
+    predicate, params = candidate_quality_audit_eligibility(
+        now,
+        include_quarantined=include_quarantined,
+        quarantine_before=quarantine_before,
+    )
     page_size = max(100, batch_limit * 4)
     selected_ids: list[int] = []
-    offset = 0
+    last_id = 0
     while len(selected_ids) < batch_limit:
         page = _due_candidate_quality_page_rows(
-            predicate, params, page_size=page_size, offset=offset
+            predicate,
+            params,
+            page_size=page_size,
+            last_id=last_id,
+            audited_before=audited_before,
         )
         if not page:
             break
         for candidate in page:
-            if _due_audit_reason(candidate):
+            if _due_audit_reason(candidate, include_quarantined=include_quarantined):
                 selected_ids.append(int(candidate["id"]))
             if len(selected_ids) >= batch_limit:
                 break
-        offset += len(page)
+        last_id = int(page[-1]["id"])
         if len(page) < page_size:
             break
     if not selected_ids:
@@ -2099,10 +2035,24 @@ def candidate_quality_audit_candidates(
     return _attach_catalog_provenance_flags(selected)
 
 
-def has_candidate_quality_audit_candidates(*, now: datetime | None = None) -> bool:
+def has_candidate_quality_audit_candidates(
+    *,
+    now: datetime | None = None,
+    include_quarantined: bool = False,
+    quarantine_before: str | None = None,
+    audited_before: str | None = None,
+) -> bool:
     """Return whether any candidate is due for a bounded quality audit."""
 
-    return bool(candidate_quality_audit_candidates(limit=1, now=now))
+    return bool(
+        candidate_quality_audit_candidates(
+            limit=1,
+            now=now,
+            include_quarantined=include_quarantined,
+            quarantine_before=quarantine_before,
+            audited_before=audited_before,
+        )
+    )
 
 
 def _provenance_payload_genres(raw_payload: object) -> list[str]:
@@ -2296,7 +2246,10 @@ def _plan_store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -
         and existing_provider_id == str(description_candidate.get("provider_id") or "")
         and description
     )
-    if is_catalog_description:
+    if transient_outage and existing_description:
+        store_description = False
+        next_description = existing_description
+    elif is_catalog_description:
         if description:
             store_description = description != existing_description or can_upgrade_opening_sentence
             next_description = description
@@ -2311,7 +2264,10 @@ def _plan_store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -
         next_description = description if store_description else existing_description
 
     cover_url = str(result.get("cover_url") or "")
-    if is_catalog_cover:
+    if transient_outage and is_catalog_cover and existing_cover:
+        store_cover = False
+        next_cover = existing_cover
+    elif is_catalog_cover:
         if cover_url:
             store_cover = cover_url != existing_cover
             next_cover = cover_url
@@ -2337,7 +2293,7 @@ def _plan_store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -
     next_release_date_kind = existing_date_kind
     store_release_date = False
     if is_catalog_date:
-        if release_date:
+        if release_date and not (transient_outage and existing_release_date):
             candidate_date_kind = str(result.get("release_date_kind") or "catalog")
             if release_date != existing_release_date or candidate_date_kind != existing_date_kind:
                 store_release_date = True
@@ -2453,6 +2409,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     candidate_id = int(candidate["id"])
     plan = _plan_store_result(con, candidate, result)
     flags = plan["flags"]
+    audited_at = _utc_audit_timestamp()
 
     if plan["branch"] == "preserve_accepted_outage":
         con.execute(
@@ -2461,7 +2418,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 isbn13=CASE WHEN isbn13!='' THEN isbn13 ELSE ? END,
                 isbn10=CASE WHEN isbn10!='' THEN isbn10 ELSE ? END,
                 audit_version=?,
-                audited_at=CURRENT_TIMESTAMP,
+                audited_at=?,
                 updated_at=CURRENT_TIMESTAMP
             WHERE candidate_id=?""",
             (
@@ -2469,6 +2426,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 str(result.get("isbn13", "")),
                 str(result.get("isbn10", "")),
                 QUALITY_VERSION,
+                audited_at,
                 candidate_id,
             ),
         )
@@ -2486,7 +2444,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
                 work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
                 metadata_provider_id,metadata_retry_status,audited_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
             ON CONFLICT(candidate_id) DO UPDATE SET
                 quality_status=excluded.quality_status,
                 quality_score=excluded.quality_score,
@@ -2520,6 +2478,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 plan["next_metadata_provider"],
                 plan["next_metadata_provider_id"],
                 quarantine_retry_status,
+                audited_at,
             ),
         )
         if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
@@ -2596,7 +2555,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     if store_description:
         metadata_provider = str(result.get("description_provider") or "") if next_description else ""
         metadata_provider_id = str(result.get("description_provider_id") or "") if next_description else ""
-    elif is_catalog_description and description:
+    elif is_catalog_description and description and not plan["transient_outage"]:
         metadata_provider = str(result.get("description_provider") or existing_provider)
         metadata_provider_id = str(result.get("description_provider_id") or existing_provider_id)
     else:
@@ -2608,7 +2567,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
             work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
             metadata_provider_id,metadata_retry_status,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -2642,6 +2601,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             metadata_provider,
             metadata_provider_id,
             "",
+            audited_at,
         ),
     )
 
@@ -2820,13 +2780,20 @@ async def audit_candidates(
     limit: int | None = None,
     dry_run: bool = False,
     count_only: bool = False,
+    retry_quarantined: bool = False,
+    quarantine_before: str | None = None,
+    audited_before: str | None = None,
     max_duration_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Audit and enrich candidates, returning a deterministic quality report."""
 
     if count_only:
-        due_total, breakdown = _due_candidate_quality_breakdown()
+        due_total, breakdown = _due_candidate_quality_breakdown(
+            include_quarantined=retry_quarantined,
+            quarantine_before=quarantine_before,
+            audited_before=audited_before,
+        )
         if only_pending:
             effective_limit = (
                 max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
@@ -2834,20 +2801,16 @@ async def audit_candidates(
                 else QUALITY_AUDIT_BATCH_SIZE
             )
             selected_count = min(due_total, effective_limit)
-            remaining_count = max(0, due_total - selected_count)
         else:
-            total_active = int(
-                rows("SELECT COUNT(*) AS count FROM candidates WHERE status!='rejected'")[0]["count"]
-                or 0
-            )
             selected_count = (
-                min(total_active, max(1, int(limit))) if limit is not None else total_active
+                min(due_total, max(1, int(limit))) if limit is not None else due_total
             )
-            remaining_count = max(0, total_active - selected_count)
+        remaining_count = max(0, due_total - selected_count)
         return {
             "count_only": True,
             "dry_run": True,
             "only_pending": only_pending,
+            "retry_quarantined": retry_quarantined,
             "due": due_total,
             "selected": selected_count,
             "remaining": remaining_count,
@@ -2861,9 +2824,12 @@ async def audit_candidates(
             "quality_version": QUALITY_VERSION,
         }
 
-    if only_pending:
+    if only_pending or retry_quarantined:
         candidates = candidate_quality_audit_candidates(
-            limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE
+            limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE,
+            include_quarantined=retry_quarantined,
+            quarantine_before=quarantine_before,
+            audited_before=audited_before,
         )
     else:
         query = (
@@ -2874,13 +2840,17 @@ async def audit_candidates(
             "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
             "LEFT JOIN sources s ON s.id=c.source_id "
             "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status!='rejected' ORDER BY c.id"
+            "WHERE c.status!='rejected'"
         )
-        params: tuple[object, ...] = ()
+        params: list[object] = []
+        if audited_before:
+            query += " AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+            params.append(audited_before)
+        query += " ORDER BY c.id"
         if limit is not None:
             query += " LIMIT ?"
-            params = (max(1, int(limit)),)
-        candidates = _attach_catalog_provenance_flags(rows(query, params))
+            params.append(max(1, int(limit)))
+        candidates = _attach_catalog_provenance_flags(rows(query, tuple(params)))
 
     if not candidates:
         if dry_run:
@@ -2917,7 +2887,7 @@ async def audit_candidates(
     effective_max_duration: float | None
     if max_duration_seconds is not None:
         effective_max_duration = max(0.0, float(max_duration_seconds))
-    elif only_pending:
+    elif only_pending or retry_quarantined:
         effective_max_duration = QUALITY_AUDIT_TIME_BUDGET_SECONDS
     else:
         effective_max_duration = None
@@ -3003,7 +2973,15 @@ async def audit_candidates(
 
     elapsed = round(max(0.0, _audit_monotonic() - started_at), 3)
     if dry_run:
-        due_total = count_candidate_quality_audit_candidates() if only_pending else total_selected
+        due_total = (
+            count_candidate_quality_audit_candidates(
+                include_quarantined=retry_quarantined,
+                quarantine_before=quarantine_before,
+                audited_before=audited_before,
+            )
+            if (only_pending or retry_quarantined)
+            else total_selected
+        )
         return {
             "dry_run": True,
             "audited": audited_count,
@@ -3020,7 +2998,15 @@ async def audit_candidates(
 
     with transaction() as con:
         deduped = _dedupe_and_hide(con)
-    remaining = count_candidate_quality_audit_candidates() if only_pending else 0
+    remaining = (
+        count_candidate_quality_audit_candidates(
+            include_quarantined=retry_quarantined,
+            quarantine_before=quarantine_before,
+            audited_before=audited_before,
+        )
+        if (only_pending or retry_quarantined)
+        else 0
+    )
     return {
         "audited": audited_count,
         **counts,
@@ -3058,5 +3044,6 @@ def quality_summary() -> dict[str, Any]:
         "flags": dict(sorted(flag_counts.items(), key=lambda item: (-item[1], item[0]))),
         "due": due_total,
         "due_breakdown": due_breakdown,
+        "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
         "version": QUALITY_VERSION,
     }

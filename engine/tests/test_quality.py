@@ -13,6 +13,7 @@ from afterword_engine.database import initialize, row, rows, transaction
 from afterword_engine.isbn import normalize_isbn_identifier
 from afterword_engine.quality import (
     APPLE_BOOKS_SEARCH,
+    CATALOG_QUARANTINE_RETRY_DAYS,
     QUALITY_VERSION,
     _apple_books_match,
     _author_similarity,
@@ -218,14 +219,18 @@ def test_provider_unavailable_quarantine_retries_after_backoff(database):
 
 
 def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
-    assert QUALITY_VERSION == "candidate-quality-v5"
+    assert QUALITY_VERSION == "candidate-quality-v6"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
     quality_isbn_quarantine = add_candidate("Old Quarantine Quality ISBN", "A Writer")
+    v5_catalog_accepted = add_candidate("V5 Catalog Accepted Without ISBN", "A Writer")
     v4_no_isbn_catalog_accepted = add_candidate("V4 Catalog Accepted Without ISBN", "A Writer")
     v4_no_isbn_unattributed = add_candidate("V4 Unattributed Accepted Without ISBN", "A Writer")
     v4_no_isbn_quarantine = add_candidate("V4 Quarantine Without ISBN", "A Writer")
+    expired_v4_no_isbn_quarantine = add_candidate("Expired V4 Quarantine Without ISBN", "A Writer")
+    expired_current_quarantine = add_candidate("Expired Current Quarantine", "A Writer")
+    fresh_current_quarantine = add_candidate("Fresh Current Quarantine", "A Writer")
     invalid_isbn = add_candidate("Invalid ISBN", "A Writer", isbn13="9780307474279")
     current_accepted = add_candidate("Current Accepted Without ISBN", "A Writer")
     curated = add_candidate("Curated Seed", "A Writer", isbn13="9780307474278")
@@ -243,9 +248,13 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
             (old_quarantine, "quarantine", "candidate-quality-v2"),
             (quality_isbn_accepted, "accepted", "candidate-quality-v3"),
             (quality_isbn_quarantine, "quarantine", "candidate-quality-v2"),
+            (v5_catalog_accepted, "accepted", "candidate-quality-v5"),
             (v4_no_isbn_catalog_accepted, "accepted", "candidate-quality-v4"),
             (v4_no_isbn_unattributed, "accepted", "candidate-quality-v4"),
             (v4_no_isbn_quarantine, "quarantine", "candidate-quality-v4"),
+            (expired_v4_no_isbn_quarantine, "quarantine", "candidate-quality-v4"),
+            (expired_current_quarantine, "quarantine", QUALITY_VERSION),
+            (fresh_current_quarantine, "quarantine", QUALITY_VERSION),
             (invalid_isbn, "accepted", "candidate-quality-v3"),
             (current_accepted, "accepted", QUALITY_VERSION),
             (curated, "accepted", "builtin-curated-v1"),
@@ -260,10 +269,24 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
                 "UPDATE candidate_quality SET quality_status=?,audit_version=? WHERE candidate_id=?",
                 (status, version, candidate_id),
             )
-        con.execute(
-            "UPDATE candidate_quality SET provider='openlibrary',provider_id='/works/OLV4W' WHERE candidate_id=?",
-            (v4_no_isbn_catalog_accepted,),
-        )
+        for cat_cid, work_id in (
+            (v5_catalog_accepted, "/works/OLV5W"),
+            (v4_no_isbn_catalog_accepted, "/works/OLV4W"),
+        ):
+            con.execute(
+                "UPDATE candidate_quality SET provider='openlibrary',provider_id=? WHERE candidate_id=?",
+                (work_id, cat_cid),
+            )
+        for fresh_quar_cid in (v4_no_isbn_quarantine, fresh_current_quarantine):
+            con.execute(
+                "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+                ('["catalog_unmatched"]', "2026-09-25 12:00:00", fresh_quar_cid),
+            )
+        for expired_quar_cid in (expired_v4_no_isbn_quarantine, expired_current_quarantine):
+            con.execute(
+                "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+                ('["catalog_unmatched"]', "2026-09-10 12:00:00", expired_quar_cid),
+            )
         for outage_cid in (expired_outage, expired_accepted_outage):
             con.execute(
                 "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
@@ -307,7 +330,10 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         old_quarantine,
         quality_isbn_accepted,
         quality_isbn_quarantine,
+        v5_catalog_accepted,
         v4_no_isbn_catalog_accepted,
+        expired_v4_no_isbn_quarantine,
+        expired_current_quarantine,
         expired_outage,
         expired_accepted_outage,
         pending,
@@ -319,10 +345,21 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
     assert invalid_isbn not in selected_ids
     assert v4_no_isbn_unattributed not in selected_ids
     assert v4_no_isbn_quarantine not in selected_ids
+    assert fresh_current_quarantine not in selected_ids
     assert current_accepted not in selected_ids
     assert curated not in selected_ids
     assert fresh_outage not in selected_ids
     assert fresh_accepted_outage not in selected_ids
+
+    manual_retry_ids = {
+        int(item["id"])
+        for item in candidate_quality_audit_candidates(
+            limit=50, now=reference_time, include_quarantined=True
+        )
+    }
+    assert {v4_no_isbn_quarantine, fresh_current_quarantine} <= manual_retry_ids
+    assert curated not in manual_retry_ids
+    assert invalid_isbn not in manual_retry_ids
     assert len(candidate_quality_audit_candidates(limit=500, now=reference_time)) == 50
     assert has_candidate_quality_audit_candidates(now=reference_time)
 
@@ -1642,6 +1679,8 @@ def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, m
         isbn_to_idx[isbn] = idx
         cid = add_candidate(f"Timed Book {idx}", "A Writer", isbn13=isbn)
         cids.append(cid)
+    already_current_cid = add_candidate("Already Current Accepted", "A Writer")
+    curated_cid = add_candidate("Curated Accepted", "A Writer")
     with transaction() as con:
         for idx, cid in enumerate(cids):
             con.execute(
@@ -1649,8 +1688,17 @@ def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, m
                 "provider='openlibrary',provider_id=?,work_id=? WHERE candidate_id=?",
                 (f"/works/OLOLD{idx}W", f"OLOLD{idx}W", cid),
             )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,"
+            "provider='openlibrary',provider_id='/works/OLCURW',work_id='OLCURW' WHERE candidate_id=?",
+            (QUALITY_VERSION, already_current_cid),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='builtin-curated-v1' WHERE candidate_id=?",
+            (curated_cid,),
+        )
 
-    # 1. count_only makes zero HTTP requests and mutates nothing.
+    # 1. count_only makes zero HTTP requests, mutates nothing, and reports due rows even when only_pending=False.
     def ol_handler(request: httpx.Request) -> httpx.Response:
         isbn = request.url.params.get("isbn", "")
         idx = isbn_to_idx.get(isbn, 0)
@@ -1682,9 +1730,20 @@ def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, m
     assert count_report["breakdown"] == {"prior_version_isbn": 15}
     assert len(ol_route.calls) == 0
 
+    full_count_report = asyncio.run(
+        engine_main.candidate_audit(payload=None, dry_run=False, count_only=True, only_pending=False)
+    )
+    assert full_count_report["count_only"] is True
+    assert full_count_report["only_pending"] is False
+    assert full_count_report["due"] == 15
+    assert full_count_report["selected"] == 15
+    assert full_count_report["remaining"] == 0
+    assert len(ol_route.calls) == 0
+
     summary = engine_main.candidate_quality()
     assert summary["due"] == 15
     assert summary["due_breakdown"] == {"prior_version_isbn": 15}
+    assert summary["quarantine_retry_days"] == CATALOG_QUARANTINE_RETRY_DAYS
 
     # 2. dry_run previews enrichments without mutating SQLite rows.
     dry_report = asyncio.run(
@@ -1731,8 +1790,14 @@ def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, m
 
     # 4. Continuous recovery chain defers immediate followup once chain budget is exhausted.
     chain_clock = [500.0]
-    monkeypatch.setattr(engine_main, "_recovery_monotonic", lambda: chain_clock[0])
-    engine_main._recovery_chain_started_at.clear()
+    monkeypatch.setattr(engine_main, "_recovery_clock", lambda: chain_clock[0])
+    engine_main._set_quality_recovery_settings(
+        **{
+            engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+            engine_main.QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+            engine_main.QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+        }
+    )
 
     async def fast_score(*_args, **_kwargs):
         return 0
@@ -1751,8 +1816,324 @@ def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, m
     assert recovery_outcome["followup_deferred"] is True
     assert row("SELECT COUNT(*) AS count FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'")["count"] == 0
 
-    # Periodic scheduler later starts a fresh bounded recovery window.
+    # While still inside the cooldown window, the periodic scheduler will not immediately re-queue.
     monkeypatch.setattr(engine_main, "candidate_metadata_refresh_remaining", lambda: 0)
     monkeypatch.setattr(engine_main, "read_metadata_refresh_remaining", lambda: 0)
+    assert "candidate_quality_recovery" not in engine_main._queue_due_enrichment_retries()
+
+    # Once the cooldown window elapses, the periodic scheduler starts a fresh bounded recovery window.
+    chain_clock[0] += engine_main.ENRICHMENT_RETRY_POLL_SECONDS + 1.0
     requeued = engine_main._queue_due_enrichment_retries()
     assert "candidate_quality_recovery" in requeued
+
+
+@respx.mock
+def test_partial_outage_non_empty_surviving_description_preserves_existing_description(database):
+    existing_cid = add_candidate("Home", "Marilynne Robinson", isbn13="9780312428549")
+    empty_cid = add_candidate("Lila", "Marilynne Robinson", isbn13="9780374187613")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='rejected' WHERE id NOT IN (?,?)",
+            (existing_cid, empty_cid),
+        )
+        con.execute(
+            "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind='published',genres=? WHERE id=?",
+            (
+                "Rich existing Open Library synopsis that must survive partial outage.",
+                "https://covers.openlibrary.org/b/id/901-L.jpg",
+                "2008-09-02",
+                '["Literary fiction"]',
+                existing_cid,
+            ),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLHOME1W',work_id='/works/OLHOME1W',"
+            "metadata_provider='openlibrary',metadata_provider_id='/works/OLHOME1W' WHERE candidate_id=?",
+            (existing_cid,),
+        )
+        for field in ("description", "cover_url", "release_date", "genres"):
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,?, 'openlibrary','/works/OLHOME1W',0.95,'{}')",
+                (existing_cid, field),
+            )
+
+    def gb_handler(request: httpx.Request) -> httpx.Response:
+        query = request.url.params.get("q", "")
+        if "9780312428549" in query or "Home" in query:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "GBHOME1",
+                            "volumeInfo": {
+                                "title": "Home",
+                                "authors": ["Marilynne Robinson"],
+                                "description": "Short surviving Google blurb during partial outage.",
+                                "publishedDate": "2009",
+                                "language": "en",
+                                "industryIdentifiers": [{"type": "ISBN_13", "identifier": "9780312428549"}],
+                                "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=GBHOME1&img=1"},
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "GBLILA1",
+                        "volumeInfo": {
+                            "title": "Lila",
+                            "authors": ["Marilynne Robinson"],
+                            "description": "Surviving Google blurb fills an empty candidate.",
+                            "publishedDate": "2014-10-07",
+                            "language": "en",
+                            "industryIdentifiers": [{"type": "ISBN_13", "identifier": "9780374187613"}],
+                        },
+                    }
+                ]
+            },
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(503, json={"error": "down"}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(side_effect=gb_handler)
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    report = asyncio.run(audit_candidates(only_pending=True))
+    assert report["accepted"] == 2
+
+    preserved_cand = row("SELECT * FROM candidates WHERE id=?", (existing_cid,))
+    preserved_qual = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (existing_cid,))
+    assert preserved_qual["quality_status"] == "accepted"
+    assert preserved_qual["audit_version"] == QUALITY_VERSION
+    assert "catalog_provider_unavailable" in json.loads(preserved_qual["flags_json"])
+    assert preserved_cand["description"] == "Rich existing Open Library synopsis that must survive partial outage."
+    assert preserved_cand["cover_url"] == "https://covers.openlibrary.org/b/id/901-L.jpg"
+    assert preserved_cand["release_date"] == "2008-09-02"
+    assert preserved_qual["metadata_provider"] == "openlibrary"
+    desc_prov = row(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (existing_cid,),
+    )
+    assert desc_prov["provider"] == "openlibrary"
+    assert desc_prov["provider_id"] == "/works/OLHOME1W"
+
+    filled_cand = row("SELECT description FROM candidates WHERE id=?", (empty_cid,))
+    assert filled_cand["description"] == "Surviving Google blurb fills an empty candidate."
+
+    # Once the 24h outage backoff expires and Open Library recovers, canonical metadata reconciles cleanly.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (existing_cid,),
+        )
+    ol_route.mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLHOME1W",
+                        "title": "Home",
+                        "author_name": ["Marilynne Robinson"],
+                        "isbn": ["9780312428549"],
+                        "description": "Updated canonical Open Library synopsis after recovery when both providers are healthy.",
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+    )
+    recovered = asyncio.run(audit_candidates(only_pending=True))
+    assert recovered["accepted"] >= 1
+    reconciled_cand = row("SELECT description FROM candidates WHERE id=?", (existing_cid,))
+    reconciled_qual = row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (existing_cid,))
+    assert "catalog_provider_unavailable" not in json.loads(reconciled_qual["flags_json"])
+    assert (
+        reconciled_cand["description"]
+        == "Updated canonical Open Library synopsis after recovery when both providers are healthy."
+    )
+
+
+@respx.mock
+def test_quarantined_false_negative_recovers_after_cooldown_or_manual_retry(database, monkeypatch):
+    from afterword_engine import main as engine_main
+
+    v6_quarantined = add_candidate("Unindexed Forthcoming Novel", "Marilynne Robinson")
+    v4_no_isbn_quarantined = add_candidate("Misflagged Prior Novel", "Marilynne Robinson")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='rejected' WHERE id NOT IN (?,?)",
+            (v6_quarantined, v4_no_isbn_quarantined),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='quarantine',audit_version=?,"
+            "flags_json=?,audited_at='2026-10-01 12:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, '["catalog_unmatched"]', v6_quarantined),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='quarantine',audit_version='candidate-quality-v4',"
+            "flags_json=?,audited_at='2026-10-01 12:00:00' WHERE candidate_id=?",
+            ('["catalog_homonym_author"]', v4_no_isbn_quarantined),
+        )
+
+    # Not selected within the 14-day quarantine cooldown window.
+    early_ids = {
+        int(item["id"])
+        for item in candidate_quality_audit_candidates(
+            now=datetime(2026, 10, 8, tzinfo=timezone.utc)
+        )
+    }
+    assert v6_quarantined not in early_ids
+    assert v4_no_isbn_quarantined not in early_ids
+
+    # Automatically selected once CATALOG_QUARANTINE_RETRY_DAYS (14d) has elapsed.
+    due_after_cooldown_ids = {
+        int(item["id"])
+        for item in candidate_quality_audit_candidates(
+            now=datetime(2026, 10, 16, tzinfo=timezone.utc)
+        )
+    }
+    assert {v6_quarantined, v4_no_isbn_quarantined} <= due_after_cooldown_ids
+
+    async def fast_score(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(engine_main, "score_all", fast_score)
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    # Manual retry=True re-audits quarantined rows immediately without looping infinitely if still unmatched.
+    queued = asyncio.run(engine_main.candidate_audit(payload=None, retry=True))
+    assert queued["retry_quarantined"] is True
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='running' WHERE id=?", (queued["job_id"],))
+    outcome_still_missing = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='complete' WHERE id=?", (queued["job_id"],))
+    assert outcome_still_missing["audited"] == 2
+    assert outcome_still_missing["quarantine"] == 2
+    assert row(
+        "SELECT COUNT(*) AS count FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'"
+    )["count"] == 0
+
+    # Once catalog records appear, manual retry promotes both false negatives to accepted.
+    def ol_found(request: httpx.Request) -> httpx.Response:
+        title = request.url.params.get("title", "")
+        if "Unindexed Forthcoming Novel" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLFORTH1W",
+                            "title": "Unindexed Forthcoming Novel",
+                            "author_name": ["Marilynne Robinson"],
+                            "description": "Newly indexed work.",
+                            "language": ["eng"],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLPRIOR1W",
+                        "title": "Misflagged Prior Novel",
+                        "author_name": ["Marilynne Robinson"],
+                        "description": "Recovered false-negative work.",
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+
+    ol_route.mock(side_effect=ol_found)
+    asyncio.run(engine_main.candidate_audit(payload=None, retry=True))
+    outcome_recovered = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))
+    assert outcome_recovered["accepted"] == 2
+    for cid in (v6_quarantined, v4_no_isbn_quarantined):
+        assert row("SELECT quality_status FROM candidate_quality WHERE candidate_id=?", (cid,))["quality_status"] == "accepted"
+
+
+def test_recovery_chain_budget_persists_across_simulated_restarts(database, monkeypatch):
+    from afterword_engine import main as engine_main
+    from afterword_engine.database import private_setting
+
+    cid = add_candidate("Persistent Budget Book", "A Writer", isbn13="9780307474278")
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected' WHERE id!=?", (cid,))
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLPERSIST1W' WHERE candidate_id=?",
+            (cid,),
+        )
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality_recovery'")
+
+    clock = [1000.0]
+    monkeypatch.setattr(engine_main, "_recovery_clock", lambda: clock[0])
+    monkeypatch.setattr(engine_main, "candidate_metadata_refresh_remaining", lambda: 0)
+    monkeypatch.setattr(engine_main, "read_metadata_refresh_remaining", lambda: 0)
+    engine_main._set_quality_recovery_settings(
+        **{
+            engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+            engine_main.QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+            engine_main.QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+        }
+    )
+
+    async def fast_score(*_args, **_kwargs):
+        return 0
+
+    step_durations = [70.0, 65.0]
+
+    async def fake_step_audit(*, only_pending=False, limit=None):
+        assert only_pending is True
+        clock[0] += step_durations.pop(0)
+        return {"audited": 1, "accepted": 0, "quarantine": 0, "rejected": 0, "enriched": 0}
+
+    monkeypatch.setattr(engine_main, "score_all", fast_score)
+    monkeypatch.setattr(engine_main, "audit_candidates", fake_step_audit)
+
+    # Batch 1 consumes 70s (< 120s budget): follow-up is queued and started_at is persisted in SQLite.
+    batch1 = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))
+    assert batch1["followup_deferred"] is False
+    assert private_setting(engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY) == "1000.000000"
+    assert row(
+        "SELECT COUNT(*) AS count FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'"
+    )["count"] == 1
+
+    # Simulate a process restart 5s later: queued job cleared and startup recovery check runs.
+    clock[0] = 1075.0
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality_recovery'")
+    startup_queued = engine_main._queue_due_enrichment_retries()
+    assert "candidate_quality_recovery" in startup_queued
+    # The unfinished chain's start timestamp survives across the restart!
+    assert private_setting(engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY) == "1000.000000"
+
+    # Batch 2 consumes 65s (1140 - 1000 = 140s >= 120s continuous budget across the restart): deferred!
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality_recovery'")
+    batch2 = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))
+    assert batch2["followup_deferred"] is True
+    assert private_setting(engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY) == ""
+    deferred_until = float(private_setting(engine_main.QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY))
+    assert deferred_until == pytest.approx(1140.0 + engine_main.ENRICHMENT_RETRY_POLL_SECONDS)
+
+    # Another restart during the cooldown window still honors deferred_until from SQLite.
+    clock[0] = 1200.0
+    assert "candidate_quality_recovery" not in engine_main._queue_due_enrichment_retries()
+
+    # After the cooldown window elapses, recovery resumes cleanly.
+    clock[0] = deferred_until + 1.0
+    assert "candidate_quality_recovery" in engine_main._queue_due_enrichment_retries()

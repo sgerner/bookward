@@ -20,7 +20,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
+from .database import (
+    DEFAULT_DIGEST_APP_URLS,
+    connect,
+    initialize,
+    normalize_key,
+    private_setting,
+    row,
+    rows,
+    transaction,
+)
 from .backups import (
     BackupError,
     RESTORE_FENCE_DETAIL,
@@ -103,7 +112,9 @@ from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
+    CATALOG_QUARANTINE_RETRY_DAYS,
     QUALITY_AUDIT_BATCH_SIZE,
+    _utc_audit_timestamp,
     audit_candidates,
     has_candidate_quality_audit_candidates,
     quality_summary,
@@ -128,10 +139,12 @@ SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 ENRICHMENT_RETRY_POLL_SECONDS = 300
 QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS = 120.0
+QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY = "candidate_quality_recovery_chain_started_at"
+QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY = "candidate_quality_recovery_deferred_until"
+QUALITY_RETRY_QUARANTINED_BEFORE_KEY = "candidate_quality_retry_quarantined_before"
 GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
-_recovery_monotonic = time.monotonic
-_recovery_chain_started_at: dict[str, float] = {}
+_recovery_clock = time.time
 
 
 class LocalLoginIn(BaseModel):
@@ -291,8 +304,48 @@ def enqueue_followup_job(kind: str):
         return job_id
 
 
+def _get_quality_recovery_setting_float(key: str) -> float | None:
+    raw = private_setting(key, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _set_quality_recovery_settings(**values: str) -> None:
+    if not values:
+        return
+    with transaction() as con:
+        for key, value in values.items():
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+
+
+def _is_quality_recovery_deferred(now: float | None = None) -> bool:
+    deferred_until = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY)
+    if deferred_until is None:
+        return False
+    current = _recovery_clock() if now is None else now
+    return current < deferred_until and (deferred_until - current) <= (ENRICHMENT_RETRY_POLL_SECONDS * 2)
+
+
+def _has_due_quality_recovery() -> bool:
+    retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+    if retry_cutoff:
+        return has_candidate_quality_audit_candidates(
+            include_quarantined=True,
+            quarantine_before=retry_cutoff,
+        )
+    return has_candidate_quality_audit_candidates()
+
+
 def _enqueue_candidate_quality_followup():
-    if has_candidate_quality_audit_candidates():
+    if _has_due_quality_recovery():
         return enqueue_followup_job("candidate_quality_recovery")
     return None
 
@@ -301,8 +354,19 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
-        _recovery_chain_started_at.pop(current_profile_id(), None)
+    now_ts = _recovery_clock()
+    if (
+        not active_job("candidate_quality_recovery")
+        and not _is_quality_recovery_deferred(now_ts)
+        and _has_due_quality_recovery()
+    ):
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        updates: dict[str, str] = {QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: ""}
+        if started is not None and (
+            started > now_ts or (now_ts - started) >= QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS
+        ):
+            updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**updates)
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -568,14 +632,39 @@ async def handle_job(kind: str):
         return {**quality, "scored": scored}
     if kind == "candidate_quality_recovery":
         profile_key = current_profile_id()
-        started = _recovery_chain_started_at.setdefault(profile_key, _recovery_monotonic())
-        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        now_ts = _recovery_clock()
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        max_chain_age = QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
+        if started is None or started > now_ts or (now_ts - started) > max_chain_age:
+            started = now_ts
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                }
+            )
+        retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+        if retry_cutoff:
+            quality = await audit_candidates(
+                only_pending=True,
+                limit=QUALITY_AUDIT_BATCH_SIZE,
+                retry_quarantined=True,
+                quarantine_before=retry_cutoff,
+            )
+        else:
+            quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        after_ts = _recovery_clock()
         followup_deferred = False
-        if has_candidate_quality_audit_candidates():
-            if (_recovery_monotonic() - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+        if _has_due_quality_recovery():
+            if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
                 _enqueue_candidate_quality_followup()
             else:
-                _recovery_chain_started_at.pop(profile_key, None)
+                _set_quality_recovery_settings(
+                    **{
+                        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                        QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
+                    }
+                )
                 followup_deferred = True
                 LOGGER.info(
                     "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
@@ -583,7 +672,13 @@ async def handle_job(kind: str):
                     QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
                 )
         else:
-            _recovery_chain_started_at.pop(profile_key, None)
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                    QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+                }
+            )
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
@@ -704,7 +799,7 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if has_candidate_quality_audit_candidates():
+                if not _is_quality_recovery_deferred() and _has_due_quality_recovery():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -3464,21 +3559,30 @@ class CandidateAuditIn(BaseModel):
     dry_run: bool = False
     count_only: bool = False
     only_pending: bool = True
+    retry: bool = False
+    retry_quarantined: bool = False
     limit: int | None = Field(default=None, ge=1, le=500)
 
 
 @app.post("/api/candidates/audit")
 async def candidate_audit(
-    payload: CandidateAuditIn | None = Body(default=None),
-    dry_run: bool = Query(default=False),
-    count_only: bool = Query(default=False),
-    only_pending: bool | None = Query(default=None),
-    limit: int | None = Query(default=None, ge=1, le=500),
+    payload: Annotated[CandidateAuditIn | None, Body()] = None,
+    dry_run: Annotated[bool, Query()] = False,
+    count_only: Annotated[bool, Query()] = False,
+    only_pending: Annotated[bool | None, Query()] = None,
+    retry: Annotated[bool, Query()] = False,
+    retry_quarantined: Annotated[bool, Query()] = False,
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
 ):
-    """Queue a catalog audit, or preview scope via count_only/dry_run."""
+    """Queue a catalog audit, retry quarantined rows, or preview scope via count_only/dry_run."""
 
     effective_dry_run = bool(dry_run or (payload and payload.dry_run))
     effective_count_only = bool(count_only or (payload and payload.count_only))
+    effective_retry = bool(
+        retry
+        or retry_quarantined
+        or (payload and (payload.retry or payload.retry_quarantined))
+    )
     if effective_dry_run or effective_count_only:
         effective_only_pending = (
             only_pending
@@ -3493,7 +3597,21 @@ async def candidate_audit(
             limit=effective_limit,
             dry_run=effective_dry_run,
             count_only=effective_count_only,
+            retry_quarantined=effective_retry,
         )
+    if effective_retry:
+        cutoff = _utc_audit_timestamp()
+        _set_quality_recovery_settings(
+            **{
+                QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+            }
+        )
+        return {
+            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "retry_quarantined": True,
+            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
+        }
     return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
 
 @app.get("/api/candidates/quality")
