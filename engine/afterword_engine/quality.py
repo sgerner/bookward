@@ -1120,7 +1120,7 @@ def candidate_quality_audit_candidates(
             "q.quality_status,q.audit_version,q.flags_json "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "LEFT JOIN sources s ON s.id=c.source_id "
-            f"WHERE c.status!='rejected' AND ((s.enabled=1 AND s.kind!='association') OR c.status IN ('saved','imported')) AND {predicate} "
+            f"WHERE c.status!='rejected' AND (s.enabled=1 OR c.status IN ('saved','imported')) AND {predicate} "
             "ORDER BY c.id LIMIT ? OFFSET ?",
             (*params, page_size, offset),
         )
@@ -1386,7 +1386,7 @@ def _dedupe_and_hide(con) -> int:
     accepted = con.execute(
         """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
         c.isbn13,c.isbn10,
-        CASE WHEN s.enabled=1 AND s.kind!='association' THEN 1 ELSE 0 END AS source_enabled,
+        CASE WHEN s.enabled=1 THEN 1 ELSE 0 END AS source_enabled,
         q.quality_score,q.work_id AS quality_work_id,
         q.provider AS quality_provider,q.isbn13 AS quality_isbn13,
         q.isbn10 AS quality_isbn10

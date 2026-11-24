@@ -16,8 +16,10 @@ from afterword_engine.associations import Association, persist_associations
 from afterword_engine.config import settings
 from afterword_engine.database import (
     MIGRATIONS,
+    demote_orphaned_recommended_candidates,
     initialize,
     normalize_key,
+    recompute_candidate_sources,
     row,
     rows,
     transaction,
@@ -467,8 +469,18 @@ def test_scan_source_and_associations_promote_highest_weight_enabled_non_associa
     monkeypatch.setattr("afterword_engine.ingestion.enrich_book_metadata", no_enrichment)
 
     # Scanning a disabled source records membership and beats association among disabled sources,
-    # while still keeping candidate non-active until an enabled feed scans it.
+    # while an explicitly enabled association source beats a disabled feed.
     assert asyncio.run(scan_source(row("SELECT * FROM sources WHERE id=?", (disabled_feed_id,)))) == 1
+    assert row("SELECT source_id FROM candidates WHERE id=?", (candidate["id"],))["source_id"] == disabled_feed_id
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE id=?", (assoc_source["id"],))
+    assert row("SELECT source_id FROM candidates WHERE id=?", (candidate["id"],))["source_id"] == assoc_source["id"]
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=0 WHERE id=?", (assoc_source["id"],))
+        with pytest.raises(ValueError, match="Specify candidate_ids or source_id"):
+            recompute_candidate_sources(con)
+        with pytest.raises(ValueError, match="Specify candidate_ids or source_id"):
+            demote_orphaned_recommended_candidates(con)
     assert row("SELECT source_id FROM candidates WHERE id=?", (candidate["id"],))["source_id"] == disabled_feed_id
 
     # Scanning an enabled feed promotes candidates.source_id to the enabled feed.

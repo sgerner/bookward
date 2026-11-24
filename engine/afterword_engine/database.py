@@ -1044,7 +1044,7 @@ MIGRATIONS = [
                         ROW_NUMBER() OVER (
                             PARTITION BY cs.candidate_id
                             ORDER BY
-                                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.enabled DESC,
                                 CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
                                 s.weight DESC,
                                 s.id ASC
@@ -1120,7 +1120,7 @@ MIGRATIONS = [
                             ROW_NUMBER() OVER (
                                 PARTITION BY cs.candidate_id
                                 ORDER BY
-                                    CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                    s.enabled DESC,
                                     CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
                                     s.weight DESC,
                                     s.id ASC
@@ -1154,7 +1154,7 @@ MIGRATIONS = [
                         ROW_NUMBER() OVER (
                             PARTITION BY cs.candidate_id
                             ORDER BY
-                                CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.enabled DESC,
                                 CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
                                 s.weight DESC,
                                 s.id ASC
@@ -1637,7 +1637,7 @@ def initialize(*, seed_demo: bool = True):
 
 
 _CANDIDATE_SOURCE_PRIORITY_ORDER = """
-    CASE WHEN s.enabled = 1 AND s.kind != 'association' THEN 1 ELSE 0 END DESC,
+    s.enabled DESC,
     CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
     s.weight DESC,
     s.id ASC
@@ -1731,37 +1731,7 @@ def recompute_candidate_sources(
                 (sid, sid),
             ).rowcount,
         )
-    return max(
-        0,
-        con.execute(
-            f"""WITH best AS (
-                SELECT candidate_id, source_id
-                FROM (
-                    SELECT
-                        cs.candidate_id,
-                        cs.source_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY cs.candidate_id
-                            ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
-                        ) AS rn
-                    FROM candidate_sources cs
-                    JOIN sources s ON s.id = cs.source_id
-                )
-                WHERE rn = 1
-            ),
-            resolved AS (
-                SELECT c.id AS candidate_id, best.source_id AS next_source_id
-                FROM candidates c
-                LEFT JOIN best ON best.candidate_id = c.id
-                WHERE c.source_id IS NOT best.source_id
-            )
-            UPDATE candidates
-            SET source_id = resolved.next_source_id,
-                updated_at = CURRENT_TIMESTAMP
-            FROM resolved
-            WHERE candidates.id = resolved.candidate_id"""
-        ).rowcount,
-    )
+    raise ValueError("Specify candidate_ids or source_id")
 
 
 def upsert_candidate_source(
@@ -1801,12 +1771,12 @@ def demote_orphaned_recommended_candidates(
     *,
     source_id: int | None = None,
 ) -> int:
-    """Reset recommended rows that lack any remaining enabled non-association owner."""
+    """Reset recommended rows that lack any remaining enabled owner."""
 
     no_enabled_owner = (
         "NOT EXISTS ("
         "SELECT 1 FROM sources s "
-        "WHERE s.id = candidates.source_id AND s.enabled = 1 AND s.kind != 'association'"
+        "WHERE s.id = candidates.source_id AND s.enabled = 1"
         ")"
     )
     if candidate_ids is not None:
@@ -1836,14 +1806,7 @@ def demote_orphaned_recommended_candidates(
                 (int(source_id), int(source_id)),
             ).rowcount,
         )
-    return max(
-        0,
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            f"WHERE status='recommended' AND {no_enabled_owner}"
-        ).rowcount,
-    )
+    raise ValueError("Specify candidate_ids or source_id")
 
 
 def rows(query: str, params=()):

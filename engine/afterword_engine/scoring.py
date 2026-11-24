@@ -223,7 +223,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
-        "AND s.enabled=1 AND s.kind!='association'"
+        "AND s.enabled=1"
     )
     candidates = [
         item for item in candidates
@@ -237,8 +237,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
                 SELECT c.id FROM candidates c
                 LEFT JOIN sources s ON s.id=c.source_id
                 LEFT JOIN candidate_quality q ON q.candidate_id=c.id
-                WHERE COALESCE(s.enabled, 0)=0 OR s.kind='association'
-                   OR COALESCE(q.quality_status, 'pending')!='accepted'
+                WHERE COALESCE(s.enabled, 0)=0 OR COALESCE(q.quality_status, 'pending')!='accepted'
             )"""
         )
     if not candidates: return 0

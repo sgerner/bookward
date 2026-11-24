@@ -1941,7 +1941,7 @@ def _recommendation_rows(
         clauses = [
             "c.status NOT IN ('rejected','maybe_later')",
             "(c.status IN ('saved','imported') OR q.quality_status='accepted')",
-            "(c.status IN ('saved','imported') OR (s.enabled=1 AND s.kind!='association'))",
+            "(c.status IN ('saved','imported') OR s.enabled=1)",
         ]
     params: list[object] = []
     if statuses:
@@ -3145,8 +3145,7 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND s.enabled=1 "
-                    "AND s.kind!='association'",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }

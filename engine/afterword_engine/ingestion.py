@@ -1070,7 +1070,7 @@ async def refresh_read_work_identities(
         "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
         "JOIN sources s ON s.id=c.source_id "
         "WHERE c.status IN ('new','recommended') "
-        "AND q.quality_status='accepted' AND s.enabled=1 AND s.kind!='association'"
+        "AND q.quality_status='accepted' AND s.enabled=1"
     )
 
     candidates_by_author: dict[str, list[tuple[dict, set]]] = {}
