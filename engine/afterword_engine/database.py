@@ -24,9 +24,11 @@ from .tenancy import (
     profile_database_path,
     restore_epoch_latch_scope,
     restore_epoch_scope,
+    restore_fence_bypassed,
 )
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
+SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 RESTORE_EPOCH_KEY = "restore_epoch"
 RESTORE_QUIESCENCE_TIMEOUT_SECONDS = 5.0
 
@@ -1007,12 +1009,28 @@ MIGRATIONS = [
             ON goodreads_shelf_items(title, author);
         """,
     ),
+    (
+        27,
+        """
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_APP_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1022,7 +1040,7 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_minimum_score": "80",
     "digest_maximum_books": "5",
     "digest_only_new": "1",
-    "digest_app_url": settings.public_url,
+    "digest_app_url": "http://localhost:5173",
     "digest_discord_webhook_url": "",
     "digest_email_to": "",
     "digest_email_from": "",
@@ -1388,6 +1406,13 @@ class _LockedConnection(sqlite3.Connection):
 
 def connect():
     db_path = profile_database_path()
+    if not restore_fence_bypassed():
+        from .backups import has_restore_journal
+
+        if has_restore_journal():
+            raise sqlite3.OperationalError(
+                "Profile database is unavailable until interrupted restore recovery completes."
+            )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if db_path.parent.name == "profiles":
         try:
@@ -1702,10 +1727,18 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        existing_digest_app_url_row = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url'"
+        ).fetchone()
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (
+                (settings.public_url or default_value).rstrip("/")
+                if key == "digest_app_url"
+                else default_value
+            )
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1718,13 +1751,41 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
+        # Seed digest_app_url_custom for existing rows that predate the flag so
+        # an operator-configured URL (including custom loopback ports such as
+        # http://localhost:3000) is preserved across restarts.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        custom_flag = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+        ).fetchone()
+        if custom_flag is None:
+            if existing_digest_app_url_row is None:
+                custom_value = "0"
+            else:
+                existing_app_url = (
+                    str(existing_digest_app_url_row[0] or "").strip().rstrip("/")
+                )
+                custom_value = (
+                    "1"
+                    if existing_app_url and existing_app_url not in DEFAULT_DIGEST_APP_URLS
+                    else "0"
+                )
             con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
+                "INSERT INTO settings(key,value,secret) VALUES('digest_app_url_custom',?,0)",
+                (custom_value,),
+            )
+        else:
+            custom_value = str(custom_flag[0] or "0")
+        # Upgrade an untouched loopback default (http://localhost:5173 or
+        # Docker's http://127.0.0.1:3000) when the deployment advertises a
+        # different public origin, without overwriting a custom URL.
+        if configured_public_url and custom_value != "1":
+            placeholders = ",".join("?" for _ in DEFAULT_DIGEST_APP_URLS)
+            con.execute(
+                f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                f"AND RTRIM(value,'/')!=?",
+                (configured_public_url, *DEFAULT_DIGEST_APP_URLS, configured_public_url),
             )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
@@ -1732,10 +1793,41 @@ def initialize(*, seed_demo: bool = True):
             ("Bookward demo upcoming books",),
         )
         builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        # Track default URLs once seeded so a user's custom source that shares
+        # a default source's display name never blocks seeding that default URL,
+        # while editing an already-seeded starter URL will not re-insert the
+        # original URL on subsequent startups.
+        seeded_row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SEEDED_DEFAULT_SOURCES_KEY,),
+        ).fetchone()
+        try:
+            parsed_seeded = json.loads(seeded_row["value"]) if seeded_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_seeded = []
+        seeded_urls = {
+            str(item)
+            for item in (parsed_seeded if isinstance(parsed_seeded, list) else [])
+            if item
+        }
+        seeded_changed = False
         for name, url, enabled in DEFAULT_SOURCES:
+            if url in seeded_urls:
+                continue
             con.execute(
                 "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
                 (name, url, "web", enabled),
+            )
+            seeded_urls.add(url)
+            seeded_changed = True
+        if seeded_changed:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (
+                    SEEDED_DEFAULT_SOURCES_KEY,
+                    json.dumps(sorted(seeded_urls), separators=(",", ":")),
+                ),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []

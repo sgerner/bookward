@@ -99,12 +99,26 @@ def _claim_profile_job(
     seen_restore_generations: dict[str, int],
     last_reaped_at: dict[str, float],
     profile_retry_after: dict[str, float],
+    fenced_profiles: set[str],
 ):
+    from .backups import has_restore_journal, recover_interrupted_restore
     from .database import initialize, row
     from .tenancy import profile_scope
 
     with profile_scope(profile_id):
         lock = database_lock()
+        if lock.is_locked():
+            return ("busy", None, None, None)
+        recovered = False
+        if has_restore_journal():
+            recovered = recover_interrupted_restore()
+            if recovered:
+                fenced_profiles.discard(profile_id)
+                ready_profiles.discard(profile_id)
+                ready_profile_epochs.pop(profile_id, None)
+                last_reaped_at.pop(profile_id, None)
+        else:
+            fenced_profiles.discard(profile_id)
         with lock.try_shared() as acquired:
             if not acquired:
                 return ("busy", None, None, None)
@@ -117,7 +131,11 @@ def _claim_profile_job(
                 profile_retry_after.pop(profile_id, None)
             if current < profile_retry_after.get(profile_id, 0):
                 return ("backoff", None, None, None)
-            epoch = current_restore_epoch() if profile_id in ready_profiles else None
+            epoch = (
+                current_restore_epoch()
+                if (not recovered and profile_id in ready_profiles)
+                else None
+            )
             if (
                 profile_id in ready_profiles
                 and ready_profile_epochs.get(profile_id) != epoch
@@ -125,7 +143,7 @@ def _claim_profile_job(
                 ready_profiles.discard(profile_id)
                 ready_profile_epochs.pop(profile_id, None)
                 last_reaped_at.pop(profile_id, None)
-            if profile_id not in ready_profiles:
+            if recovered or profile_id not in ready_profiles:
                 initialize(seed_demo=False)
                 epoch = current_restore_epoch()
                 ready_profiles.add(profile_id)
@@ -201,6 +219,7 @@ def _requeue_aborted_job(
 
 
 async def worker_loop(handler, stop):
+    from .backups import has_restore_journal
     from .profiles import profile_ids
     from .tenancy import profile_scope
 
@@ -211,6 +230,7 @@ async def worker_loop(handler, stop):
     ready_profile_epochs: dict[str, int] = {}
     seen_restore_generations: dict[str, int] = {}
     profile_retry_after: dict[str, float] = {}
+    fenced_profiles: set[str] = set()
 
     def reset_profile_ready(profile_id: str) -> None:
         ready_profiles.discard(profile_id)
@@ -233,8 +253,13 @@ async def worker_loop(handler, stop):
                         seen_restore_generations[profile_id] = generation
                         reset_profile_ready(profile_id)
                         profile_retry_after.pop(profile_id, None)
+                        fenced_profiles.discard(profile_id)
                     if current < profile_retry_after.get(profile_id, 0):
-                        continue
+                        if profile_id in fenced_profiles and not has_restore_journal(profile_id):
+                            profile_retry_after.pop(profile_id, None)
+                            fenced_profiles.discard(profile_id)
+                        else:
+                            continue
                 status, job, lease_token, epoch = await asyncio.to_thread(
                     _claim_profile_job,
                     profile_id,
@@ -244,6 +269,7 @@ async def worker_loop(handler, stop):
                     seen_restore_generations,
                     last_reaped_at,
                     profile_retry_after,
+                    fenced_profiles,
                 )
                 if status != "claimed":
                     continue
@@ -337,6 +363,8 @@ async def worker_loop(handler, stop):
                 reset_profile_ready(profile_id)
             except Exception:
                 reset_profile_ready(profile_id)
+                if has_restore_journal(profile_id):
+                    fenced_profiles.add(profile_id)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
                 LOGGER.exception("Worker skipped unavailable profile %s", profile_id)
         if not worked:

@@ -21,6 +21,7 @@ _database_override: ContextVar[Path | None] = ContextVar("bookward_database_over
 _restore_epoch_fence: ContextVar[_RestoreEpochBinding | None] = ContextVar(
     "bookward_restore_epoch_fence", default=None
 )
+_restore_fence_bypass: ContextVar[bool] = ContextVar("bookward_restore_fence_bypass", default=False)
 _PROFILE_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -112,3 +113,16 @@ def unbind_restore_epoch():
         yield
     finally:
         _restore_epoch_fence.reset(token)
+
+
+def restore_fence_bypassed() -> bool:
+    return _database_override.get() is not None or _restore_fence_bypass.get()
+
+
+@contextmanager
+def allow_restore_database_access():
+    token = _restore_fence_bypass.set(True)
+    try:
+        yield
+    finally:
+        _restore_fence_bypass.reset(token)
