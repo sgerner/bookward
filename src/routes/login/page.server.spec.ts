@@ -11,7 +11,7 @@ vi.mock('#lib/server/engine.js', () => ({
 	engine,
 }));
 
-import { load } from './+page.server';
+import { actions, load } from './+page.server';
 
 const oidcConfig = { setup_required: false, local_login_enabled: true, oidc_enabled: true };
 
@@ -57,5 +57,52 @@ describe('login page loader', () => {
 
 		await expect(load({ url: new URL('https://bookward.test/login?next=%2F%2Fevil.example') } as never))
 			.rejects.toMatchObject({ status: 303, location: '/auth/oidc/start?intent=login&next=%2F' });
+	});
+
+	it('omits Secure on HTTP setup and login session cookies and sets Secure on HTTPS', async () => {
+		engine.mockResolvedValue({ session_token: 'admin-session', max_age: 86400 });
+		const httpCookies = { set: vi.fn() };
+		const body = new URLSearchParams({ username: 'admin', password: 'Strong-setup-password-1' });
+
+		await expect(
+			actions.setup({
+				request: new Request('http://127.0.0.1:3000/login?/setup', {
+					method: 'POST',
+					headers: { 'content-type': 'application/x-www-form-urlencoded' },
+					body
+				}),
+				cookies: httpCookies,
+				url: new URL('http://127.0.0.1:3000/login')
+			} as never)
+		).rejects.toMatchObject({ status: 303, location: '/' });
+
+		expect(httpCookies.set).toHaveBeenCalledWith('bookward_session', 'admin-session', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/',
+			maxAge: 86400
+		});
+
+		const httpsCookies = { set: vi.fn() };
+		await expect(
+			actions.login({
+				request: new Request('https://books.example.com/login?/login', {
+					method: 'POST',
+					headers: { 'content-type': 'application/x-www-form-urlencoded' },
+					body
+				}),
+				cookies: httpsCookies,
+				url: new URL('https://books.example.com/login')
+			} as never)
+		).rejects.toMatchObject({ status: 303, location: '/' });
+
+		expect(httpsCookies.set).toHaveBeenCalledWith('bookward_session', 'admin-session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/',
+			maxAge: 86400
+		});
 	});
 });

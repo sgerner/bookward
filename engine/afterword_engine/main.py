@@ -4,6 +4,7 @@ import asyncio
 import logging
 import base64
 import hmac
+import re
 import secrets
 import sqlite3
 import time
@@ -31,9 +32,12 @@ from .database import (
 )
 from .backups import (
     BackupError,
+    RESTORE_FENCE_DETAIL,
     backup_scheduler_loop,
     backup_status,
+    clear_interrupted_restore_journal,
     create_backup,
+    has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
@@ -163,6 +167,7 @@ class AccountPasswordIn(BaseModel):
 
 def _ensure_profile_database(profile_id: str):
     with profile_scope(profile_id):
+        recover_interrupted_restore()
         initialize(seed_demo=profile_id == "legacy")
 
 
@@ -754,17 +759,21 @@ async def handle_job(kind: str):
 @asynccontextmanager
 async def lifespan(app):
     identity_store.initialize_auth()
-    with profile_scope("legacy"):
-        recover_interrupted_restore()
-        initialize()
-        legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
-    identity_store.migrate_legacy_api_tokens(legacy_tokens)
+    ready_profiles: set[str] = set()
+    try:
+        with profile_scope("legacy"):
+            recover_interrupted_restore()
+            initialize()
+            legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
+        identity_store.migrate_legacy_api_tokens(legacy_tokens)
+        ready_profiles.add("legacy")
+    except Exception:
+        LOGGER.exception("Could not initialize profile legacy during startup")
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
-                with profile_scope(profile_id):
-                    recover_interrupted_restore()
                 _ensure_profile_database(profile_id)
+                ready_profiles.add(profile_id)
             except Exception:
                 # A broken profile must not prevent the rest of the installation
                 # from serving. Its worker retries initialization with backoff.
@@ -781,6 +790,8 @@ async def lifespan(app):
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
+        if profile_id not in ready_profiles:
+            continue
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
@@ -812,6 +823,16 @@ app.add_middleware(
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
+
+
+_RESTORE_ROUTE_RE = re.compile(r"^/api/backups/[^/]+/restore$")
+
+
+def _recover_profile_for_request(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        recovered = recover_interrupted_restore()
+    if recovered:
+        _ensure_profile_database(profile_id)
 
 
 @app.middleware("http")
@@ -865,6 +886,18 @@ async def authenticate_engine_request(request: Request, call_next):
             )
         request.state.api_token = token
         request.state.account = {"profile_id": token["profile_id"], "role": "user", "id": "api-token"}
+        if has_restore_journal(token["profile_id"]):
+            try:
+                await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+            except Exception:
+                LOGGER.exception(
+                    "Authenticated profile is unavailable during API request recovery"
+                )
+                return JSONResponse(
+                    {"detail": RESTORE_FENCE_DETAIL},
+                    status_code=503,
+                    headers={"cache-control": "private, no-store"},
+                )
         with profile_scope(token["profile_id"]):
             response = await call_next(request)
         _mark_private_no_store(response)
@@ -884,6 +917,28 @@ async def authenticate_engine_request(request: Request, call_next):
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
+    is_restore_route = (
+        request.method == "POST" and _RESTORE_ROUTE_RE.fullmatch(path) is not None
+    )
+    if (
+        not path.startswith("/auth/")
+        and not path.startswith("/admin/")
+        and not is_restore_route
+        and has_restore_journal(account["profile_id"])
+    ):
+        try:
+            await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except Exception:
+            if not (request.method == "GET" and path == "/api/backups"):
+                LOGGER.exception(
+                    "Profile %s is unavailable during request recovery",
+                    account["profile_id"],
+                )
+                return JSONResponse(
+                    {"detail": RESTORE_FENCE_DETAIL},
+                    status_code=503,
+                    headers={"cache-control": "private, no-store"},
+                )
     with profile_scope(account["profile_id"]):
         response = await call_next(request)
     _mark_private_no_store(response)
@@ -1031,6 +1086,19 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"updated": True, "account_id": account_id, "status": status}
+
+
+@app.delete("/admin/profiles/{profile_id}/restore-journal")
+def admin_delete_restore_journal(profile_id: str, request: Request):
+    _require_admin(request)
+    if (
+        profile_id != "legacy"
+        and profile_id not in identity_store.profile_ids(active_only=False)
+    ):
+        raise HTTPException(404, "Profile not found")
+    with profile_scope(profile_id):
+        cleared = clear_interrupted_restore_journal()
+    return {"cleared": cleared, "profile_id": profile_id}
 
 
 def _valid_oidc_url(value: str, *, allow_local_http: bool = False) -> bool:
