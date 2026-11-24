@@ -394,6 +394,10 @@ Goodreads CSV and manual historical imports contribute time-based read outcomes 
 
 The URL must be reachable from the engine process, not just from your browser. Use `http://librarr:5050` between containers and `http://127.0.0.1:5050` when both services run on the host.
 
+### The models.dev selector fails behind an outbound proxy
+
+The optional `models.dev` catalog picker in **Settings** (`GET /api/llm/models`) fetches `https://models.dev/api.json` directly with `trust_env=False` and `follow_redirects=False`, matching Bookward's public source and catalog clients so ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `SSL_CERT_*` environment variables are ignored. In deployments that can reach the public internet only through an outbound HTTP proxy, loading the `models.dev` catalog returns `502`; enter the LLM reranker API URL and model ID directly in **Settings** instead.
+
 ## Automation and releases
 
 Every push to `main` and every pull request runs frontend checks, engine tests, Python compilation, CodeQL analysis, dependency review, and both Docker builds with npm install scripts blocked via `.npmrc` and `--ignore-scripts`. Dependabot checks npm, Python, Docker, Docker Compose, and GitHub Actions dependencies weekly, and `npm test` fails if unreviewed Linux install scripts enter `package-lock.json`.

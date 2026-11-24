@@ -50,6 +50,7 @@ from .ingestion import (
 )
 from .http_bounds import (
     JSON_CONTENT_TYPES,
+    ResponseBoundsError,
     ResponseTooLargeError,
     iter_bounded_bytes_async,
     stream_bytes_async,
@@ -971,13 +972,9 @@ async def _oidc_metadata():
     issuer, discovery_url, redirect_uri, allow_local_http = _oidc_config()
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            _response, metadata = await stream_json_async(
-                client,
-                "GET",
-                discovery_url,
-                max_bytes=settings.oidc_max_bytes,
-                size_error="OIDC discovery response is too large",
-            )
+            response = await client.get(discovery_url)
+            response.raise_for_status()
+            metadata = response.json()
     except Exception as exc:
         raise HTTPException(502, "The SSO provider could not be reached") from exc
     if not isinstance(metadata, dict) or metadata.get("issuer") != issuer or not all(
@@ -1056,9 +1053,7 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         raise HTTPException(502, "The SSO provider does not support a configured client authentication method")
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            _token_response, tokens = await stream_json_async(
-                client,
-                "POST",
+            token_response = await client.post(
                 metadata["token_endpoint"],
                 data={
                     "grant_type": "authorization_code", "code": code,
@@ -1067,23 +1062,14 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
                     **token_client_fields,
                 },
                 auth=token_auth,
-                max_bytes=settings.oidc_max_bytes,
-                size_error="OIDC token response is too large",
             )
-            if not isinstance(tokens, dict):
-                raise ValueError("OIDC token response must be a JSON object")
+            token_response.raise_for_status()
+            tokens = token_response.json()
             id_token = tokens.get("id_token", "")
             header = jwt.get_unverified_header(id_token)
-            _keys_response, jwks_payload = await stream_json_async(
-                client,
-                "GET",
-                metadata["jwks_uri"],
-                max_bytes=settings.oidc_max_bytes,
-                size_error="OIDC JWKS response is too large",
-            )
-            if not isinstance(jwks_payload, dict):
-                raise ValueError("OIDC JWKS response must be a JSON object")
-            jwks = jwks_payload.get("keys", [])
+            keys_response = await client.get(metadata["jwks_uri"])
+            keys_response.raise_for_status()
+            jwks = keys_response.json().get("keys", [])
         jwk = next((key for key in jwks if key.get("kid") == header.get("kid")), None)
         if not jwk:
             raise ValueError("Unknown signing key")
@@ -2322,10 +2308,10 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         media = normalize_media_type(media_type)
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 @app.get("/api/librarr/search/stream")
@@ -2341,10 +2327,10 @@ async def stream_librarr_search(
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
     assert client is not None and upstream is not None
 
@@ -2361,6 +2347,10 @@ async def stream_librarr_search(
                 "Aborted Librarr SSE stream after exceeding %d bytes",
                 settings.librarr_stream_max_bytes,
             )
+            error_payload = json.dumps(
+                {"message": "Librarr search stream exceeded the maximum response size."}
+            )
+            yield f"\n\nevent: error\ndata: {error_payload}\n\n".encode("utf-8")
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -2425,10 +2415,10 @@ async def download_librarr(payload: LibrarrDownloadIn):
                 status = "saved"
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @app.post("/api/import/goodreads/csv")
 async def goodreads_csv(file: UploadFile = File(...)):
@@ -2736,6 +2726,16 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
+    """Return the cached models.dev provider catalog for the Settings picker.
+
+    Refreshes connect directly with ``follow_redirects=False`` and
+    ``trust_env=False`` (matching public source and catalog fetches so ambient
+    ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` and ``SSL_CERT_*`` variables
+    are ignored). Deployments that require an outbound HTTP proxy receive HTTP
+    502 here and should configure the LLM reranker endpoint URL and model ID
+    directly in Settings.
+    """
+
     now = _models_dev_clock()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):

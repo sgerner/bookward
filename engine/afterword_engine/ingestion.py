@@ -38,6 +38,7 @@ from .identity import (
 from .http_bounds import (
     JSON_CONTENT_TYPES,
     SOURCE_CONTENT_TYPES,
+    materialize_response,
     read_bounded_bytes_async,
     read_bounded_json_async,
     validate_response_headers,
@@ -891,10 +892,9 @@ async def _request_openlibrary_edition(client, isbn13: str):
             location = response.headers.get("location", "").strip()
             if not response.is_redirect or not location:
                 if response.status_code == 404:
-                    response._content = b""
-                    return response
+                    return materialize_response(response, b"")
                 response.raise_for_status()
-                response._content = await read_bounded_bytes_async(
+                body = await read_bounded_bytes_async(
                     response,
                     max_bytes=settings.source_max_bytes,
                     allowed_content_types=JSON_CONTENT_TYPES,
@@ -902,7 +902,7 @@ async def _request_openlibrary_edition(client, isbn13: str):
                     content_type_error="Open Library returned an unsupported content type",
                     size_error="Open Library response is too large",
                 )
-                return response
+                return materialize_response(response, body)
 
         target = urljoin(url, location)
         parsed = urlparse(target)

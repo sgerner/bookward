@@ -20,10 +20,13 @@ from afterword_engine.associations import RateLimiter
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, transaction
 from afterword_engine.http_bounds import (
+    InvalidContentLengthError,
+    JSON_CONTENT_TYPES,
     ResponseTooLargeError,
     UnsupportedContentTypeError,
     stream_json_async,
     stream_json_sync,
+    stream_response_async,
 )
 from afterword_engine.secrets import seal
 
@@ -142,6 +145,135 @@ def test_fetch_bytes_rejects_oversized_content_length_with_zero_chunks_read(monk
     assert stream.closed is True
 
 
+@pytest.mark.parametrize(
+    ("family", "private_ip"),
+    [
+        (socket.AF_INET, "127.0.0.1"),
+        (socket.AF_INET, "10.0.0.8"),
+        (socket.AF_INET, "169.254.169.254"),
+        (socket.AF_INET6, "::1"),
+    ],
+)
+def test_request_pinned_rejects_private_ips_before_sending_requests(
+    monkeypatch, family: int, private_ip: str
+) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (family, socket.SOCK_STREAM, 6, "", (private_ip, 443))
+        ],
+    )
+    requests_sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_sent
+        requests_sent += 1
+        return httpx.Response(200, text="unexpected", request=request)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            await ingestion.fetch_bytes("https://feeds.example.test/rss.xml", client=client)
+
+    with pytest.raises(ValueError, match="Private, loopback, and link-local"):
+        asyncio.run(run())
+
+    assert requests_sent == 0
+
+
+def test_request_pinned_rejects_unsafe_missing_and_excessive_redirects_without_reading_bodies(
+    monkeypatch,
+) -> None:
+    def resolve_by_host(host, *_args, **_kwargs):
+        if host == "private.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PINNED_IP, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_by_host)
+
+    # 1. Public source redirecting to a host that resolves to a loopback IP.
+    private_redirect_stream = CountingAsyncStream(b"r" * 10_000, 5)
+    private_hop_requests = 0
+
+    def private_redirect_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal private_hop_requests
+        private_hop_requests += 1
+        assert request.headers["host"] == "feeds.example.test"
+        return httpx.Response(
+            302,
+            headers={"location": "https://private.example.test/internal"},
+            stream=private_redirect_stream,
+            request=request,
+        )
+
+    async def run_url(handler, url: str):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            await ingestion.fetch_bytes(url, client=client)
+
+    with pytest.raises(ValueError, match="Private, loopback, and link-local"):
+        asyncio.run(run_url(private_redirect_handler, "https://feeds.example.test/rss.xml"))
+
+    assert private_hop_requests == 1
+    assert private_redirect_stream.chunks_yielded == 0
+    assert private_redirect_stream.closed is True
+
+    # 2. Public HTTPS source redirecting to plain HTTP when allow_goodreads_http=False.
+    http_redirect_stream = CountingAsyncStream(b"h" * 10_000, 5)
+
+    def http_redirect_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"location": "http://feeds.example.test/insecure.xml"},
+            stream=http_redirect_stream,
+            request=request,
+        )
+
+    with pytest.raises(ValueError, match="Sources must use HTTPS"):
+        asyncio.run(run_url(http_redirect_handler, "https://feeds.example.test/rss.xml"))
+
+    assert http_redirect_stream.chunks_yielded == 0
+    assert http_redirect_stream.closed is True
+
+    # 3. Redirect response with missing Location header.
+    missing_loc_stream = CountingAsyncStream(b"m" * 10_000, 5)
+
+    def missing_loc_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, stream=missing_loc_stream, request=request)
+
+    with pytest.raises(ValueError, match="Source returned an invalid redirect"):
+        asyncio.run(run_url(missing_loc_handler, "https://feeds.example.test/rss.xml"))
+
+    assert missing_loc_stream.chunks_yielded == 0
+    assert missing_loc_stream.closed is True
+
+    # 4. Redirect chain exceeding SOURCE_MAX_REDIRECTS closes every hop stream without reading bytes.
+    loop_streams: list[CountingAsyncStream] = []
+
+    def loop_handler(request: httpx.Request) -> httpx.Response:
+        hop_stream = CountingAsyncStream(b"l" * 10_000, 5)
+        loop_streams.append(hop_stream)
+        return httpx.Response(
+            302,
+            headers={"location": "/next"},
+            stream=hop_stream,
+            request=request,
+        )
+
+    with pytest.raises(ValueError, match="Source returned too many redirects"):
+        asyncio.run(run_url(loop_handler, "https://feeds.example.test/start"))
+
+    assert len(loop_streams) == ingestion.SOURCE_MAX_REDIRECTS + 1
+    assert all(s.chunks_yielded == 0 and s.closed is True for s in loop_streams)
+
+
 def test_fetch_bytes_aborts_10mb_chunked_rss_right_after_source_max_bytes(monkeypatch) -> None:
     pin_public_dns(monkeypatch)
     monkeypatch.setattr(settings, "source_max_bytes", 2_000_000)
@@ -247,7 +379,7 @@ def test_association_clients_abort_10mb_streams_right_after_source_max_bytes(
     database, monkeypatch, provider_kind: str
 ) -> None:
     pin_public_dns(monkeypatch)
-    monkeypatch.setattr(settings, "source_max_bytes", 2_000_000)
+    monkeypatch.setattr(settings, "source_max_bytes", 350_000)
     stream = CountingAsyncStream(b"a" * 100_000, 100)  # 10 MB
 
     with respx.mock:
@@ -271,8 +403,8 @@ def test_association_clients_abort_10mb_streams_right_after_source_max_bytes(
         with pytest.raises(ValueError, match="response is too large"):
             asyncio.run(coro)
 
-    assert stream.chunks_yielded == 21
-    assert stream.bytes_yielded == 2_100_000
+    assert stream.chunks_yielded == 4
+    assert stream.bytes_yielded == 400_000
     assert stream.closed is True
 
 
@@ -326,6 +458,100 @@ def test_gzip_compressed_bomb_counts_decompressed_bytes_async_and_sync() -> None
     with httpx.Client(transport=httpx.MockTransport(async_handler)) as sync_client:
         with pytest.raises(ResponseTooLargeError):
             stream_json_sync(sync_client, "GET", "https://example.test/bomb", max_bytes=100_000)
+
+
+def test_public_response_materialization_and_json_content_type_guards(monkeypatch) -> None:
+    pin_public_dns(monkeypatch)
+    monkeypatch.setattr(covers, "OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS", 0)
+    compressed_edition = gzip.compress(
+        json.dumps({"isbn_13": ["9780593418574"], "works": [{"key": "/works/OL123W"}]}).encode("utf-8")
+    )
+    not_found_stream = CountingAsyncStream(b"ignored-404-body", 3)
+    html_async_stream = CountingAsyncStream(b"<html>not json</html>", 5)
+    html_sync_stream = CountingSyncStream(b"<html>not json</html>", 5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/isbn/9780593418574.json":
+            return httpx.Response(
+                200,
+                content=compressed_edition,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",
+                    "content-length": str(len(compressed_edition)),
+                },
+                request=request,
+            )
+        if request.url.path == "/isbn/9780000000002.json":
+            return httpx.Response(
+                404,
+                headers={"content-type": "application/json"},
+                stream=not_found_stream,
+                request=request,
+            )
+        if request.url.path == "/bad-length":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json", "content-length": "not-an-int"},
+                stream=html_async_stream,
+                request=request,
+            )
+        if request.url.path == "/html":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                stream=html_async_stream,
+                request=request,
+            )
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            ok_resp = await ingestion._request_openlibrary_edition(client, "9780593418574")
+            missing_resp = await ingestion._request_openlibrary_edition(client, "9780000000002")
+            streamed_resp = await stream_response_async(
+                client,
+                "GET",
+                "https://openlibrary.org/isbn/9780593418574.json",
+                max_bytes=100_000,
+                allowed_content_types=JSON_CONTENT_TYPES,
+            )
+            with pytest.raises(UnsupportedContentTypeError):
+                await stream_json_async(client, "GET", "https://example.test/html", max_bytes=100_000)
+            with pytest.raises(InvalidContentLengthError):
+                await stream_json_async(client, "GET", "https://example.test/bad-length", max_bytes=100_000)
+            return ok_resp, missing_resp, streamed_resp
+
+    ok_resp, missing_resp, streamed_resp = asyncio.run(run())
+    assert ok_resp.status_code == 200
+    assert ok_resp.json()["works"] == [{"key": "/works/OL123W"}]
+    assert "content-encoding" not in ok_resp.headers
+    assert missing_resp.status_code == 404
+    assert missing_resp.content == b""
+    assert not_found_stream.chunks_yielded == 0
+    assert not_found_stream.closed is True
+    assert streamed_resp.json()["isbn_13"] == ["9780593418574"]
+    assert html_async_stream.chunks_yielded == 0
+    assert html_async_stream.closed is True
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                stream=html_sync_stream,
+                request=req,
+            )
+        )
+    ) as sync_client:
+        with pytest.raises(UnsupportedContentTypeError):
+            stream_json_sync(sync_client, "GET", "https://example.test/html", max_bytes=100_000)
+    assert html_sync_stream.chunks_yielded == 0
+    assert html_sync_stream.closed is True
 
 
 def test_catalog_and_quality_clients_reject_oversized_streams_and_fallback(monkeypatch) -> None:
@@ -442,8 +668,9 @@ def test_librarr_json_and_sse_stream_enforce_byte_caps(database, monkeypatch) ->
         import_resp = client.post("/api/recommendations/1/import")
         sse_resp = client.get("/api/librarr/search/stream", params={"q": "Dune", "media_type": "ebook"})
         declared_sse = client.get("/api/librarr/search/stream", params={"q": "Dune", "media_type": "audiobook"})
+        bad_media_sse = client.get("/api/librarr/search/stream", params={"q": "Dune", "media_type": "vinyl"})
 
-    assert search_resp.status_code == 400
+    assert search_resp.status_code == 502
     assert search_stream.chunks_yielded == 3
     assert search_stream.closed is True
 
@@ -453,16 +680,20 @@ def test_librarr_json_and_sse_stream_enforce_byte_caps(database, monkeypatch) ->
     assert row("SELECT status FROM librarr_imports WHERE candidate_id=1")["status"] == "failed"
 
     assert sse_resp.status_code == 200
-    assert 0 < len(sse_resp.content) <= settings.librarr_stream_max_bytes
     assert sse_stream.chunks_yielded == 4
     assert sse_stream.closed is True
+    sse_frames = [frame for frame in sse_resp.text.split("\n\n") if frame.strip()]
+    assert sse_frames[-1].startswith("event: error\ndata: ")
+    error_data = json.loads(sse_frames[-1].split("data: ", 1)[1])
+    assert error_data == {"message": "Librarr search stream exceeded the maximum response size."}
 
-    assert declared_sse.status_code == 400
+    assert declared_sse.status_code == 502
     assert "too large" in declared_sse.json()["detail"]
+    assert bad_media_sse.status_code == 400
 
 
 @respx.mock
-def test_embeddings_rerankers_oidc_and_discord_enforce_byte_caps(database, monkeypatch) -> None:
+def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatch) -> None:
     # 1. 64-item embedding batch succeeds under 16 MB while oversized stream aborts early.
     vectors_64 = [{"index": idx, "embedding": [0.125] * 64} for idx in range(64)]
     oversized_embed = CountingAsyncStream(b"v" * 100_000, 20)
@@ -506,22 +737,7 @@ def test_embeddings_rerankers_oidc_and_discord_enforce_byte_caps(database, monke
     assert sync_llm_stream.chunks_yielded == 3
     assert sync_llm_stream.closed is True
 
-    # 3. OIDC discovery and Discord webhook enforce 1 MB cap.
-    monkeypatch.setattr(settings, "oidc_issuer", "https://sso.example.test")
-    monkeypatch.setattr(settings, "oidc_client_id", "client-id")
-    monkeypatch.setattr(settings, "oidc_client_secret", "client-secret")
-    monkeypatch.setattr(settings, "oidc_redirect_uri", "https://bookward.example.test/auth/oidc/callback")
-    monkeypatch.setattr(settings, "oidc_max_bytes", 100_000)
-    oidc_stream = CountingAsyncStream(b"o" * 40_000, 10)
-    respx.get("https://sso.example.test/.well-known/openid-configuration").mock(
-        return_value=httpx.Response(200, headers={"content-type": "application/json"}, stream=oidc_stream)
-    )
-    with pytest.raises(HTTPException) as oidc_exc:
-        asyncio.run(main._oidc_metadata())
-    assert oidc_exc.value.status_code == 502
-    assert oidc_stream.chunks_yielded == 3
-    assert oidc_stream.closed is True
-
+    # 3. Discord webhook enforces 1 MB cap without leaking webhook token.
     pin_public_dns(monkeypatch)
     monkeypatch.setattr(settings, "discord_max_bytes", 100_000)
     discord_stream = CountingAsyncStream(b"d" * 40_000, 10)

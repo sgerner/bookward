@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 import json
 from typing import Any
 
@@ -26,12 +26,20 @@ JSON_CONTENT_TYPES: tuple[str, ...] = (
 _OMIT = object()
 
 
-class ResponseTooLargeError(ValueError):
+class ResponseBoundsError(ValueError):
+    """Base error raised when an upstream response violates header or byte bounds."""
+
+
+class ResponseTooLargeError(ResponseBoundsError):
     """Raised when response headers or decompressed stream bytes exceed max_bytes."""
 
 
-class UnsupportedContentTypeError(ValueError):
+class UnsupportedContentTypeError(ResponseBoundsError):
     """Raised when a response content-type header is outside allowed_content_types."""
+
+
+class InvalidContentLengthError(ResponseBoundsError):
+    """Raised when a response sends a negative or malformed Content-Length header."""
 
 
 def _declared_content_lengths(headers: Any) -> list[str]:
@@ -78,9 +86,9 @@ def validate_response_headers(
             try:
                 declared = int(token)
             except ValueError as exc:
-                raise ValueError("Invalid Content-Length header") from exc
+                raise InvalidContentLengthError("Invalid Content-Length header") from exc
             if declared < 0:
-                raise ValueError("Invalid Content-Length header")
+                raise InvalidContentLengthError("Invalid Content-Length header")
             if declared > max_bytes:
                 raise ResponseTooLargeError(size_error)
 
@@ -372,6 +380,51 @@ def stream_json_sync(
     return response, json.loads(body)
 
 
+_DECODED_BODY_STRIP_HEADERS = frozenset(
+    {"content-encoding", "transfer-encoding", "content-length"}
+)
+
+
+def materialize_response(response: Any, body: bytes) -> httpx.Response:
+    """Build a closed, decoded httpx.Response using only public httpx APIs.
+
+    ``aiter_bytes()`` and ``iter_bytes()`` already decode transport compression,
+    so ``Content-Encoding``, ``Transfer-Encoding``, and wire ``Content-Length``
+    headers are omitted before passing ``content=body`` to ``httpx.Response`` to
+    prevent double-decompression while avoiding private ``response._content``
+    writes.
+    """
+
+    raw_headers = getattr(response, "headers", None)
+    if isinstance(raw_headers, httpx.Headers):
+        header_items = raw_headers.multi_items()
+    elif isinstance(raw_headers, Mapping):
+        header_items = list(raw_headers.items())
+    else:
+        header_items = []
+    filtered_headers = httpx.Headers(
+        [
+            (key, value)
+            for key, value in header_items
+            if key.lower() not in _DECODED_BODY_STRIP_HEADERS
+        ]
+    )
+    kwargs: dict[str, Any] = {
+        "headers": filtered_headers,
+        "content": body,
+    }
+    extensions = getattr(response, "extensions", None)
+    if isinstance(extensions, Mapping):
+        kwargs["extensions"] = dict(extensions)
+    try:
+        request = response.request
+    except RuntimeError:
+        request = None
+    if isinstance(request, httpx.Request):
+        kwargs["request"] = request
+    return httpx.Response(int(response.status_code), **kwargs)
+
+
 async def stream_response_async(
     client: httpx.AsyncClient,
     method: str,
@@ -387,7 +440,7 @@ async def stream_response_async(
     follow_redirects: Any = _OMIT,
     **request_kwargs: Any,
 ) -> httpx.Response:
-    """Stream a bounded response, attach its materialized bytes, and close it."""
+    """Stream a bounded response, close the wire stream, and return a decoded httpx.Response."""
 
     response, body = await stream_bytes_async(
         client,
@@ -403,5 +456,4 @@ async def stream_response_async(
         follow_redirects=follow_redirects,
         **request_kwargs,
     )
-    response._content = body
-    return response
+    return materialize_response(response, body)
