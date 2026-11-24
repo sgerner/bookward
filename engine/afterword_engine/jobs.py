@@ -139,6 +139,7 @@ def enqueue_job(kind: str, dedupe: bool = False):
         return job_id
 
 async def worker_loop(handler, stop):
+    from .backups import has_restore_journal, recover_interrupted_restore
     from .database import row
     from .database import initialize
     from .profiles import profile_ids
@@ -146,6 +147,7 @@ async def worker_loop(handler, stop):
     last_reaped_at: dict[str, float] = {}
     ready_profiles: set[str] = set()
     profile_retry_after: dict[str, float] = {}
+    fenced_profiles: set[str] = set()
     while not stop.is_set():
         worked = False
         for profile_id in profile_ids():
@@ -153,10 +155,23 @@ async def worker_loop(handler, stop):
                 break
             current = time.monotonic()
             if current < profile_retry_after.get(profile_id, 0):
-                continue
+                if profile_id in fenced_profiles:
+                    if not has_restore_journal(profile_id):
+                        profile_retry_after.pop(profile_id, None)
+                        fenced_profiles.discard(profile_id)
+                    else:
+                        continue
+                else:
+                    continue
             try:
                 with profile_scope(profile_id):
-                    if profile_id not in ready_profiles:
+                    recovered = (
+                        recover_interrupted_restore()
+                        if has_restore_journal()
+                        else False
+                    )
+                    fenced_profiles.discard(profile_id)
+                    if recovered or profile_id not in ready_profiles:
                         initialize(seed_demo=False)
                         ready_profiles.add(profile_id)
                     if (
@@ -210,6 +225,8 @@ async def worker_loop(handler, stop):
                         await asyncio.to_thread(heartbeat.join)
             except Exception:
                 ready_profiles.discard(profile_id)
+                if has_restore_journal(profile_id):
+                    fenced_profiles.add(profile_id)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
                 LOGGER.exception("Worker skipped unavailable profile %s", profile_id)
         if not worked:

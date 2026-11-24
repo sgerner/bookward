@@ -677,6 +677,217 @@ def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
     assert job["status"] == "complete"
 
 
+@pytest.mark.parametrize("fenced_target", ["legacy", "secondary"])
+def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_restore_journal(
+    tmp_path: Path, monkeypatch, fenced_target
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "lifespan-fence.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    alice = profiles.create_account("alice", "alice-password-with-enough-length")
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Legacy healthy read", "Owner", "test"),
+            )
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Alice healthy read", "Alice", "test"),
+            )
+
+    fenced_profile_id = "legacy" if fenced_target == "legacy" else alice["profile_id"]
+    healthy_profile_id = alice["profile_id"] if fenced_target == "legacy" else "legacy"
+    fenced_account = owner if fenced_target == "legacy" else alice
+    healthy_account = alice if fenced_target == "legacy" else owner
+
+    with profile_scope(fenced_profile_id):
+        journal = backups._restore_journal_path()
+        journal.write_text(
+            '{"safety_backup": "bookward-20260101T000000Z-deadbeef", "selected_backup": "bookward-20260101T000000Z-deadbeef"}',
+            encoding="utf-8",
+        )
+        journal.chmod(0o600)
+        db_file = profile_database_path()
+        db_file.write_bytes(b"corrupt-unrecovered-bytes")
+
+    owner_session, _ = profiles.create_session(owner["id"])
+    fenced_session, _ = profiles.create_session(fenced_account["id"])
+    healthy_session, _ = profiles.create_session(healthy_account["id"])
+
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        assert (
+            client.get("/auth/me", headers={"x-bookward-session": fenced_session}).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/admin/auth-backups", headers={"x-bookward-session": owner_session}
+            ).status_code
+            == 200
+        )
+        fenced_backups = client.get(
+            "/api/backups", headers={"x-bookward-session": fenced_session}
+        )
+        assert fenced_backups.status_code == 200
+        assert fenced_backups.json()["last_error"] == "That backup is no longer available."
+
+        fenced_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": fenced_session}
+        )
+        assert fenced_overview.status_code == 503
+        assert fenced_overview.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+
+        healthy_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": healthy_session}
+        )
+        assert healthy_overview.status_code == 200
+        expected_title = (
+            "Alice healthy read" if healthy_profile_id != "legacy" else "Legacy healthy read"
+        )
+        assert expected_title in {
+            item["title"] for item in healthy_overview.json()["history"]
+        }
+
+    with profile_scope(fenced_profile_id):
+        assert backups._restore_journal_path().is_file()
+        assert profile_database_path().read_bytes() == b"corrupt-unrecovered-bytes"
+
+
+def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "transient-lock.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    profiles.initialize_auth()
+    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    api_token = profiles.create_profile_api_token("legacy", "Recovery check")["token"]
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Safety baseline read", "Owner", "test"),
+            )
+        safety = backups.create_backup()
+        safety_path = tmp_path / "backups" / f"{safety['id']}.sqlite3"
+        with transaction() as con:
+            con.execute("DELETE FROM reads WHERE title='Safety baseline read'")
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                ("Unfinished restore state", "Owner", "test"),
+            )
+        backups._write_restore_journal(safety_path, safety_path)
+
+    owner_session, _ = profiles.create_session(owner["id"])
+    external_lock = sqlite3.connect(settings.db)
+    external_lock.execute("BEGIN IMMEDIATE")
+    external_lock.execute(
+        "INSERT INTO reads(title,author,source) VALUES('External lock row','Ext','test')"
+    )
+    try:
+        with TestClient(app) as client:
+            locked_resp = client.get(
+                "/api/overview", headers={"x-bookward-session": owner_session}
+            )
+            assert locked_resp.status_code == 503
+            assert locked_resp.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+
+            external_lock.rollback()
+            external_lock.close()
+            external_lock = None
+
+            # Once the lock clears, an API token or session request completes
+            # rollback before serving.
+            v1_resp = client.get(
+                "/api/v1/overview",
+                headers={"authorization": f"Bearer {api_token}"},
+            )
+            assert v1_resp.status_code == 200
+            titles = {item["title"] for item in v1_resp.json()["history"]}
+            assert "Safety baseline read" in titles
+            assert "Unfinished restore state" not in titles
+
+            with profile_scope("legacy"):
+                assert not backups._restore_journal_path().exists()
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+                        ("Write after recovery", "Owner", "test"),
+                    )
+    finally:
+        if external_lock is not None:
+            external_lock.close()
+
+    # Restarting the engine must preserve post-recovery writes.
+    with TestClient(app) as client:
+        restarted = client.get(
+            "/api/overview", headers={"x-bookward-session": owner_session}
+        )
+        assert restarted.status_code == 200
+        restarted_titles = {item["title"] for item in restarted.json()["history"]}
+        assert "Safety baseline read" in restarted_titles
+        assert "Write after recovery" in restarted_titles
+
+
+def test_worker_loop_completes_interrupted_restore_once_transient_lock_clears(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "PROFILE_RETRY_SECONDS", 0.05)
+    alice = profiles.create_account("worker-recover", "worker-recover-password-long")
+    profile_id = alice["profile_id"]
+    with profile_scope(profile_id):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("post_recovery_job")
+        safety = backups.create_backup()
+        safety_path = backups.backup_directory() / f"{safety['id']}.sqlite3"
+        profile_database_path().write_bytes(b"corrupt-partial-restore")
+        backups._write_restore_journal(safety_path, safety_path)
+
+    original_recover = backups.recover_interrupted_restore
+    attempts = 0
+
+    def transient_lock_then_recover():
+        nonlocal attempts
+        if current_profile_id() == profile_id:
+            attempts += 1
+            if attempts == 1:
+                raise backups.BackupError(
+                    "The active database could not be safely closed for restore."
+                )
+        return original_recover()
+
+    monkeypatch.setattr(backups, "recover_interrupted_restore", transient_lock_then_recover)
+    stop = asyncio.Event()
+    handled = []
+
+    async def handler(kind):
+        handled.append((current_profile_id(), kind))
+        stop.set()
+        return {"recovered_by": "worker"}
+
+    asyncio.run(worker_loop(handler, stop))
+
+    assert attempts >= 2
+    assert handled == [(profile_id, "post_recovery_job")]
+    with profile_scope(profile_id):
+        assert not backups._restore_journal_path().exists()
+        with connect() as con:
+            job = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        assert job["status"] == "complete"
+
+
 def test_lease_reaper_preserves_a_lease_renewed_after_its_read(identity_store, monkeypatch):
     with profile_scope("legacy"):
         initialize(seed_demo=False)
