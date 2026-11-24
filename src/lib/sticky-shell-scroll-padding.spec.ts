@@ -118,7 +118,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     }
   });
 
-  it("defines scoped root scroll-padding and sr-only switch scroll-margin-block rules in layout.css", () => {
+  it("defines scoped root scroll-padding and switch scroll-margin-block rules in layout.css", () => {
     const css = readRelative("../routes/layout.css");
 
     expect(css).toMatch(
@@ -128,7 +128,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
       /@media\s*\(min-width:\s*48rem\)\s*\{\s*html:has\(\[data-sticky-shell\]\)\s*\{\s*scroll-padding-bottom:\s*0;\s*\}\s*\}/s,
     );
     expect(css).toMatch(
-      /\[data-sticky-shell\]\s+input\.sr-only\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
+      /\[data-sticky-shell\]\s+\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
     );
     expect(css).not.toMatch(/(?:^|\n)\s*html\s*\{[^}]*scroll-padding/s);
   });
