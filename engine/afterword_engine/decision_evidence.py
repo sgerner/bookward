@@ -1053,9 +1053,15 @@ def load_decision_evidence(connection, run_id: str) -> dict[str, Any] | None:
     result["outcomes"] = [
         dict(item)
         for item in connection.execute(
-            "SELECT event_key,event_revision,candidate_id,rank,score,propensity," 
-            "presented_at,visible_at,label,label_kind,confidence,attributed_at "
-            "FROM recommendation_evidence_outcomes WHERE run_id=? ORDER BY id",
+            "SELECT o.event_key,o.event_revision,o.candidate_id,o.rank,o.score,o.propensity,"
+            "o.presented_at,o.visible_at,o.label,o.label_kind,o.confidence,o.attributed_at "
+            "FROM recommendation_evidence_outcomes o "
+            "WHERE o.run_id=? AND o.event_revision=MAX("
+            "COALESCE((SELECT MAX(o2.event_revision) FROM recommendation_evidence_outcomes o2 "
+            "WHERE o2.event_key=o.event_key),0),"
+            "COALESCE((SELECT MAX(e.revision) FROM recommendation_evidence_events e "
+            "WHERE e.event_key=o.event_key),0)"
+            ") ORDER BY o.id",
             (run_id,),
         ).fetchall()
     ]
@@ -1076,14 +1082,28 @@ def archive_recommendation_event(
     """Append a run-linked event revision without mutable-catalog references."""
 
     if not run_id:
-        return None
-    count = connection.execute(
-        "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE run_id=?",
-        (run_id,),
-    ).fetchone()["count"]
-    if int(count) >= MAX_ARCHIVED_EVENTS_PER_RUN:
-        LOGGER.warning("Recommendation evidence event cap exceeded")
-        return None
+        has_prior_evidence = (
+            connection.execute(
+                "SELECT 1 FROM recommendation_evidence_events WHERE event_key=? LIMIT 1",
+                (event_key,),
+            ).fetchone()
+            is not None
+            or connection.execute(
+                "SELECT 1 FROM recommendation_evidence_outcomes WHERE event_key=? LIMIT 1",
+                (event_key,),
+            ).fetchone()
+            is not None
+        )
+        if not has_prior_evidence:
+            return None
+    else:
+        count = connection.execute(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE run_id=?",
+            (run_id,),
+        ).fetchone()["count"]
+        if int(count) >= MAX_ARCHIVED_EVENTS_PER_RUN:
+            LOGGER.warning("Recommendation evidence event cap exceeded")
+            return None
     estimated_bytes = (
         128
         + len(event_key.encode("utf-8"))
@@ -1096,14 +1116,16 @@ def archive_recommendation_event(
         return None
     revision = int(
         connection.execute(
-            "SELECT COALESCE(MAX(revision),0)+1 revision "
-            "FROM recommendation_evidence_events WHERE event_key=?",
-            (event_key,),
+            "SELECT MAX("
+            "COALESCE((SELECT MAX(revision) FROM recommendation_evidence_events WHERE event_key=?),0),"
+            "COALESCE((SELECT MAX(event_revision) FROM recommendation_evidence_outcomes WHERE event_key=?),0)"
+            ")+1 AS revision",
+            (event_key, event_key),
         ).fetchone()["revision"]
     )
     try:
-        cursor = connection.execute(
-            "INSERT INTO recommendation_evidence_events(" 
+        connection.execute(
+            "INSERT INTO recommendation_evidence_events("
             "event_key,revision,run_id,candidate_id,event_type,value,source,occurred_at) "
             "VALUES(?,?,?,?,?,?,?,?)",
             (
@@ -1117,10 +1139,60 @@ def archive_recommendation_event(
                 occurred_at,
             ),
         )
-        return int(cursor.lastrowid)
+        return revision
     except Exception:
         LOGGER.warning("Could not archive a recommendation event")
         return None
+
+
+def retract_recommendation_outcome_evidence(
+    connection,
+    *,
+    candidate_id: int,
+    event_type: str,
+    source: str,
+    occurred_at: str,
+    event_key: str | None = None,
+) -> int:
+    """Append retraction revisions so replay hides retracted explicit feedback without deleting rows."""
+
+    params: tuple[Any, ...]
+    if event_key is not None:
+        where_clause = "o.event_key=? AND o.label_kind='explicit_feedback'"
+        params = (event_key,)
+    else:
+        where_clause = "o.candidate_id=? AND o.label_kind='explicit_feedback'"
+        params = (int(candidate_id),)
+    active_keys = [
+        str(item["event_key"])
+        for item in connection.execute(
+            "SELECT DISTINCT o.event_key FROM recommendation_evidence_outcomes o "
+            f"WHERE {where_clause} AND o.event_revision=MAX("
+            "COALESCE((SELECT MAX(o2.event_revision) FROM recommendation_evidence_outcomes o2 "
+            "WHERE o2.event_key=o.event_key),0),"
+            "COALESCE((SELECT MAX(e.revision) FROM recommendation_evidence_events e "
+            "WHERE e.event_key=o.event_key),0)"
+            ") ORDER BY o.id",
+            params,
+        ).fetchall()
+    ]
+    retracted = 0
+    for key in active_keys:
+        if (
+            archive_recommendation_event(
+                connection,
+                event_key=key,
+                run_id=None,
+                candidate_id=int(candidate_id),
+                event_type=event_type,
+                value=None,
+                source=source,
+                occurred_at=occurred_at,
+            )
+            is not None
+        ):
+            retracted += 1
+    return retracted
 
 
 def archive_recommendation_outcome(
@@ -1238,7 +1310,25 @@ def purge_recommendation_evidence(
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
     if reads:
         read_marks = ",".join("?" for _ in reads)
-        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
+        read_event_keys = sorted(
+            {f"read:{read_id:08d}" for read_id in reads}
+            | {
+                str(row["event_key"])
+                for read_id in reads
+                for row in connection.execute(
+                    "SELECT event_key FROM recommendation_events "
+                    "WHERE event_key LIKE ? OR event_key LIKE ? UNION "
+                    "SELECT event_key FROM recommendation_evidence_events "
+                    "WHERE event_key LIKE ? OR event_key LIKE ?",
+                    (
+                        f"read:{read_id:08d}:%",
+                        f"manual-read:%:{read_id:08d}",
+                        f"read:{read_id:08d}:%",
+                        f"manual-read:%:{read_id:08d}",
+                    ),
+                ).fetchall()
+            }
+        )
         event_marks = ",".join("?" for _ in read_event_keys)
         rows = connection.execute(
             "SELECT i.run_id FROM recommendation_outcomes o "
@@ -1338,6 +1428,13 @@ def purge_recommendation_evidence(
             f"DELETE FROM recommendation_runs WHERE id IN ({run_marks})",
             run_list,
         )
+        connection.execute(
+            "DELETE FROM recommendation_evidence_events "
+            "WHERE run_id IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM recommendation_evidence_events e2 "
+            "WHERE e2.event_key=recommendation_evidence_events.event_key "
+            "AND e2.run_id IS NOT NULL)"
+        )
     if candidates:
         connection.execute(
             f"DELETE FROM recommendation_events WHERE candidate_id IN ({marks})",
@@ -1360,7 +1457,6 @@ def purge_recommendation_evidence(
         )
     if reads:
         read_marks = ",".join("?" for _ in reads)
-        read_event_keys = [f"read:{read_id:08d}" for read_id in reads]
         event_marks = ",".join("?" for _ in read_event_keys)
         connection.execute(
             f"DELETE FROM recommendation_outcomes WHERE read_id IN ({read_marks})",

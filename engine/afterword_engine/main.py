@@ -73,6 +73,7 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
@@ -2016,14 +2017,23 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "time_precision": "day" if day_precision else "timestamp",
     }
     read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
     existing_read_event = con.execute(
-        "SELECT candidate_id FROM recommendation_events WHERE event_key=?",
-        (read_event_key,),
-    ).fetchone()
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?) ORDER BY id",
+        (read_event_key, candidate_read_event_key),
+    ).fetchall()
+    matched_existing_key = next(
+        (
+            str(item["event_key"])
+            for item in existing_read_event
+            if int(item["candidate_id"]) == int(candidate["id"])
+        ),
+        None,
+    )
     event_key = (
-        read_event_key
-        if existing_read_event is not None
-        and int(existing_read_event["candidate_id"]) == int(candidate["id"])
+        matched_existing_key
+        if matched_existing_key is not None
         else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
     )
     try:
@@ -2051,8 +2061,11 @@ def _clear_explicit_feedback_outcomes(
     con,
     candidate_id: int,
     *,
+    event_type: str,
+    source: str = "ui",
     event_key: str | None = None,
 ) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     if event_key is not None:
         con.execute(
             "DELETE FROM recommendation_outcomes "
@@ -2060,10 +2073,13 @@ def _clear_explicit_feedback_outcomes(
             "SELECT id FROM recommendation_events WHERE event_key=?)",
             (event_key,),
         )
-        con.execute(
-            "DELETE FROM recommendation_evidence_outcomes "
-            "WHERE event_key=? AND label_kind='explicit_feedback'",
-            (event_key,),
+        retract_recommendation_outcome_evidence(
+            con,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            source=source,
+            occurred_at=now,
+            event_key=event_key,
         )
         return
     con.execute(
@@ -2073,10 +2089,12 @@ def _clear_explicit_feedback_outcomes(
         "OR impression_id IN (SELECT id FROM recommendation_impressions WHERE candidate_id=?))",
         (candidate_id, candidate_id),
     )
-    con.execute(
-        "DELETE FROM recommendation_evidence_outcomes "
-        "WHERE candidate_id=? AND label_kind='explicit_feedback'",
-        (candidate_id,),
+    retract_recommendation_outcome_evidence(
+        con,
+        candidate_id=candidate_id,
+        event_type=event_type,
+        source=source,
+        occurred_at=now,
     )
 
 
@@ -2101,7 +2119,12 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             (candidate_id, payload.action, previous_status),
         ).lastrowid
         if payload.action in {"restore", "maybe_later"}:
-            _clear_explicit_feedback_outcomes(con, candidate_id)
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=payload.action,
+                source="ui",
+            )
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
             record_event_in_connection(
@@ -2169,19 +2192,26 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
             "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
             (payload.decision_id,),
         )
-        _clear_explicit_feedback_outcomes(
-            con,
-            candidate_id,
-            event_key=f"feedback:{payload.decision_id}",
-        )
         compensation = (
             "save" if previous_status in {"saved", "imported"}
             else "reject" if previous_status == "rejected"
             else "maybe_later" if previous_status == "maybe_later"
             else "restore"
         )
+        _clear_explicit_feedback_outcomes(
+            con,
+            candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+            event_key=f"feedback:{payload.decision_id}",
+        )
         if compensation in {"restore", "maybe_later"}:
-            _clear_explicit_feedback_outcomes(con, candidate_id)
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=compensation,
+                source="ui_undo",
+            )
         try:
             record_event_in_connection(
                 con,
@@ -2280,7 +2310,12 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 (candidate_id, payload.action, previous_status),
             ).lastrowid
             if payload.action == "restore":
-                _clear_explicit_feedback_outcomes(con, candidate_id)
+                _clear_explicit_feedback_outcomes(
+                    con,
+                    candidate_id,
+                    event_type="restore",
+                    source="ui",
+                )
             candidate_run_id = (
                 payload.run_id if candidate_id in run_candidate_ids else None
             )

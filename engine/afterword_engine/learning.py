@@ -30,7 +30,7 @@ from .decision_evidence import (
     purge_recommendation_evidence,
     build_decision_evidence,
 )
-from .identity import book_identity, book_row_identity_match_keys
+from .identity import _isbn_match_keys, book_identity, book_row_identity_match_keys
 
 
 LOGGER = logging.getLogger(__name__)
@@ -48,6 +48,12 @@ EVENT_TYPES = {
 }
 HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv"})
 INACTIVE_CANDIDATE_STATUSES = frozenset({"rejected", "maybe_later", "hidden"})
+READ_OUTCOME_LABEL_KINDS = (
+    "completed_unrated",
+    "rating_positive",
+    "rating_negative",
+    "rating_neutral",
+)
 EVENT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 MAX_METADATA_BYTES = 4096
@@ -300,6 +306,7 @@ def record_event_in_connection(
     label_kind: str | None = None,
     confidence: float | None = None,
     read_id: int | None = None,
+    clear_read_outcome: bool = False,
 ):
     """Insert one validated event inside a caller-owned transaction."""
 
@@ -323,6 +330,7 @@ def record_event_in_connection(
         (event_key,),
     ).fetchone()
     read_changed = False
+    effective_run_id = run_id
     if existing:
         if not _existing_event_matches(
             existing,
@@ -335,15 +343,22 @@ def record_event_in_connection(
             raise ValueError("Event key was already used for a different event")
         event_id = int(existing["id"])
         duplicate = True
+        if (
+            event_type == "read"
+            and run_id is None
+            and label is None
+            and not clear_read_outcome
+        ):
+            effective_run_id = existing["run_id"]
         if event_type == "read" and (
-            existing["run_id"] != run_id
+            existing["run_id"] != effective_run_id
             or not _values_equal(existing["value"], value)
             or existing["metadata"] != encoded_metadata
             or (occurred_at is not None and existing["occurred_at"] != timestamp)
         ):
             con.execute(
                 "UPDATE recommendation_events SET run_id=?,value=?,occurred_at=?,metadata=? WHERE id=?",
-                (run_id, value, timestamp, encoded_metadata, event_id),
+                (effective_run_id, value, timestamp, encoded_metadata, event_id),
             )
             read_changed = True
     else:
@@ -371,27 +386,26 @@ def record_event_in_connection(
         )
     impression = None
     outcome_at = None
+    read_kind_marks = ",".join("?" for _ in READ_OUTCOME_LABEL_KINDS)
+    deleted_superseded = 0
     if label is not None:
         label = _validate_value(label)
         confidence = 0.5 if confidence is None else float(confidence)
         if not 0 <= confidence <= 1:
             raise ValueError("Outcome confidence must be between 0 and 1")
-        impression = _find_latest_impression(con, candidate_id, run_id)
-        deleted_superseded = 0
+        impression = _find_latest_impression(con, candidate_id, effective_run_id)
         if event_type == "read":
             if impression is None:
                 deleted_superseded = con.execute(
-                    "DELETE FROM recommendation_outcomes WHERE event_id=?",
-                    (event_id,),
+                    f"DELETE FROM recommendation_outcomes "
+                    f"WHERE event_id=? AND label_kind IN ({read_kind_marks})",
+                    (event_id, *READ_OUTCOME_LABEL_KINDS),
                 ).rowcount
-                con.execute(
-                    "DELETE FROM recommendation_evidence_outcomes WHERE event_key=?",
-                    (event_key,),
-                )
             else:
                 deleted_superseded = con.execute(
-                    "DELETE FROM recommendation_outcomes WHERE event_id=? AND impression_id!=?",
-                    (event_id, int(impression["id"])),
+                    f"DELETE FROM recommendation_outcomes "
+                    f"WHERE event_id=? AND impression_id!=? AND label_kind IN ({read_kind_marks})",
+                    (event_id, int(impression["id"]), *READ_OUTCOME_LABEL_KINDS),
                 ).rowcount
         outcome_at = utc_now()
         outcome_status = _record_outcome(
@@ -407,26 +421,22 @@ def record_event_in_connection(
         if outcome_status == "created" and deleted_superseded > 0:
             outcome_status = "updated"
     else:
-        if event_type == "read" and duplicate:
-            con.execute(
-                "DELETE FROM recommendation_outcomes WHERE event_id=?",
-                (event_id,),
-            )
-            con.execute(
-                "DELETE FROM recommendation_evidence_outcomes WHERE event_key=?",
-                (event_key,),
-            )
+        if event_type == "read" and duplicate and clear_read_outcome:
+            deleted_superseded = con.execute(
+                f"DELETE FROM recommendation_outcomes "
+                f"WHERE event_id=? AND label_kind IN ({read_kind_marks})",
+                (event_id, *READ_OUTCOME_LABEL_KINDS),
+            ).rowcount
         outcome_status = "none"
-    if not duplicate or read_changed or (event_type == "read" and outcome_status == "updated"):
-        if event_type == "read" and duplicate:
-            con.execute(
-                "DELETE FROM recommendation_evidence_outcomes WHERE event_key=?",
-                (event_key,),
-            )
+    if (
+        not duplicate
+        or read_changed
+        or (event_type == "read" and (outcome_status == "updated" or deleted_superseded > 0))
+    ):
         archived_revision = archive_recommendation_event(
             con,
             event_key=event_key,
-            run_id=run_id,
+            run_id=effective_run_id,
             candidate_id=candidate_id,
             event_type=event_type,
             value=value,
@@ -578,6 +588,8 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         parts = key.split(":")
         if len(parts) == 2 and parts[0] == "read" and parts[1].isdigit():
             existing_read_events_by_read_id[int(parts[1])].append(event_dict)
+        elif len(parts) == 3 and parts[0] == "read" and parts[1].isdigit():
+            existing_read_events_by_read_id[int(parts[1])].append(event_dict)
         elif len(parts) == 3 and parts[0] == "manual-read" and parts[2].isdigit():
             existing_read_events_by_read_id[int(parts[2])].append(event_dict)
 
@@ -594,6 +606,12 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         if read_time is None and source not in HISTORICAL_READ_SOURCES:
             read_time, day_precision = _read_time(read.get("created_at"))
 
+        # Preserve earlier attributed labels when a later import omits dates or
+        # the current catalog has no matching row; only an explicit read_time
+        # that precedes exposures is evidence against attribution.
+        if not matched_by_id or read_time is None:
+            continue
+
         existing_events = existing_read_events_by_read_id.get(read_id, [])
         metadata = {
             "read_source": str(read.get("source") or "unknown")[:32],
@@ -602,22 +620,8 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         read_value = float(read["rating"]) if read.get("rating") is not None else None
         occurred_at = read.get("read_at") or read.get("created_at") or utc_now()
 
-        if not matched_by_id or read_time is None:
-            for existing_event in existing_events:
-                record_event_in_connection(
-                    con,
-                    event_key=str(existing_event["event_key"]),
-                    candidate_id=int(existing_event["candidate_id"]),
-                    event_type="read",
-                    run_id=None,
-                    value=read_value,
-                    source="read_import",
-                    metadata=metadata,
-                    occurred_at=read.get("read_at") or existing_event["occurred_at"] or occurred_at,
-                )
-            continue
-
         exact_identity = book_identity(read["title"], read["author"])
+        read_isbn_keys = _isbn_match_keys(read)
         impressions_by_candidate: dict[int, Any] = {
             cand_id: _latest_preceding_impression(con, cand_id, read_time, day_precision)
             for cand_id in matched_by_id
@@ -629,8 +633,9 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
             imp_time = str(imp["visible_at"] or imp["presented_at"] or "") if imp is not None else ""
             imp_id = int(imp["id"]) if imp is not None else 0
             return (
-                1 if imp is not None else 0,
                 1 if book_identity(item["title"], item["author"]) == exact_identity else 0,
+                1 if bool(read_isbn_keys and (_isbn_match_keys(item) & read_isbn_keys)) else 0,
+                1 if imp is not None else 0,
                 1 if str(item.get("status") or "") not in INACTIVE_CANDIDATE_STATUSES else 0,
                 float(item.get("score") or 0.0),
                 imp_time,
@@ -653,6 +658,7 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
                     source="read_import",
                     metadata=metadata,
                     occurred_at=occurred_at,
+                    clear_read_outcome=True,
                 )
             continue
 
@@ -682,6 +688,7 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
                     source="read_import",
                     metadata=metadata,
                     occurred_at=occurred_at,
+                    clear_read_outcome=True,
                 )
 
         result = record_event_in_connection(
@@ -719,7 +726,9 @@ def attribute_read_outcomes(connection=None) -> dict[str, int]:
     No exposure means no outcome. This function is safe to call repeatedly;
     event and outcome keys are stable across Goodreads re-imports. Historical
     imports need an explicit completion date; their creation time is import
-    time, not evidence of when the book was read.
+    time, not evidence of when the book was read. If a later import omits a
+    completion date or does not match a current catalog row, previously
+    attributed outcomes are preserved rather than wiped.
     """
 
     if connection is not None:
