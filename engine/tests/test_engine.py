@@ -448,6 +448,7 @@ def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pair
             "description": "A collection of fantastic stories.",
             "cover_url": "",
             "source_url": "https://publisher.example/books/call-and-response",
+            "isbn13": "9781966503149",
             "release_date": None,
             "date_kind": "",
             "genres": [],
@@ -1181,11 +1182,13 @@ def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monke
 
 
 def test_failed_permanent_source_retries_after_error_retry_floor(database, monkeypatch):
+    good_scan_at = "2026-04-10T12:00:00+00:00"
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=0")
         cursor = con.execute(
-            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
-            ("Retry permanent", "https://example.com/retry-permanent"),
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_scanned_at,last_attempted_at) "
+            "VALUES(?,?,1,'permanent',?,?)",
+            ("Retry permanent", "https://example.com/retry-permanent", good_scan_at, good_scan_at),
         )
 
     async def fail(_source):
@@ -1196,6 +1199,8 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:")
+    assert source["last_scanned_at"] == good_scan_at
+    assert source["last_attempted_at"] != good_scan_at
     assert source_sync_is_due() is False
 
     retry_at = datetime.now(timezone.utc) - timedelta(
@@ -1203,7 +1208,7 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     )
     with transaction() as con:
         con.execute(
-            "UPDATE sources SET last_scanned_at=? WHERE id=?",
+            "UPDATE sources SET last_attempted_at=? WHERE id=?",
             (retry_at.isoformat(), cursor.lastrowid),
         )
     assert source_sync_is_due() is True
