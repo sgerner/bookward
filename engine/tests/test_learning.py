@@ -1774,7 +1774,9 @@ def test_three_part_read_event_key_cleans_up_on_rematch_and_pre_exposure_date(da
 def test_undated_reads_and_unlabelled_duplicate_reads_preserve_outcomes_while_unmatched_reads_clean_up(database):
     recommendations, run_id = tracked_recommendations()
     candidate = recommendations[0]
+    second_candidate = recommendations[1]
     _set_candidate_exposure_time(candidate["id"], run_id, "2025-05-01T10:00:00+00:00")
+    _set_candidate_exposure_time(second_candidate["id"], run_id, "2025-05-01T10:00:00+00:00")
 
     with transaction() as con:
         read_id = int(
@@ -1802,7 +1804,7 @@ def test_undated_reads_and_unlabelled_duplicate_reads_preserve_outcomes_while_un
         other_imp_id = int(
             con.execute(
                 "SELECT id FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
-                (run_id, recommendations[1]["id"]),
+                (run_id, second_candidate["id"]),
             ).fetchone()["id"]
         )
         con.execute(
@@ -1844,12 +1846,73 @@ def test_undated_reads_and_unlabelled_duplicate_reads_preserve_outcomes_while_un
         )
     ]
     assert remaining == [{"label_kind": "explicit_feedback"}]
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (event_key,),
+    )["count"] == 1
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+    # Re-matching to a second candidate mints a 3-part read:NNN:CAND key; dropping read_at preserves it,
+    # and becoming unmatched cleans up the 3-part key while preserving non-read label_kinds and evidence history.
+    three_part_key = f"read:{read_id:08d}:{second_candidate['id']}"
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title=?,author=?,read_at='2025-05-07' WHERE id=?",
+            (second_candidate["title"], second_candidate["author"], read_id),
+        )
+    assert attribute_read_outcomes()["outcomes_created"] == 1
+    three_part_event = row(
+        "SELECT id,run_id FROM recommendation_events WHERE event_key=?",
+        (three_part_key,),
+    )
+    assert three_part_event["run_id"] == run_id
+
+    with transaction() as con:
+        con.execute("UPDATE reads SET read_at=NULL WHERE id=?", (read_id,))
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] == run_id
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?",
+        (three_part_event["id"],),
+    )["count"] == 1
+
+    with transaction() as con:
+        first_imp_id = int(
+            con.execute(
+                "SELECT id FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+                (run_id, candidate["id"]),
+            ).fetchone()["id"]
+        )
+        con.execute(
+            "INSERT INTO recommendation_outcomes(impression_id,event_id,label,label_kind,confidence,attributed_at) "
+            "VALUES(?,?,1.0,'explicit_feedback',0.8,'2025-05-08T00:00:00+00:00')",
+            (first_imp_id, three_part_event["id"]),
+        )
+        con.execute(
+            "UPDATE reads SET title='Unmatched Three-Part Export Title',author='Nobody',read_at='2025-05-07' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    remaining_three_part = [
+        dict(r)
+        for r in __import__("afterword_engine.database", fromlist=["rows"]).rows(
+            "SELECT label_kind FROM recommendation_outcomes WHERE event_id=?",
+            (three_part_event["id"],),
+        )
+    ]
+    assert remaining_three_part == [{"label_kind": "explicit_feedback"}]
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (three_part_key,),
+    )["count"] == 1
     with connect() as con:
         assert load_decision_evidence(con, run_id)["outcomes"] == []
 
 
 def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_outcomes(database):
-    from afterword_engine.evaluation import load_rows
+    from afterword_engine.evaluation import load_rows, signal_diagnostics
 
     recommendations, run_id = tracked_recommendations()
     first_cand = recommendations[0]
@@ -1870,18 +1933,36 @@ def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_
             json={"action": "reject", "run_id": run_id},
         )
         assert rejected.status_code == 200
-        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
-        assert by_cand[first_cand["id"]]["label_kind"] == "explicit_feedback"
-        assert by_cand[first_cand["id"]]["label"] == 0.0
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
+        assert by_cand[first_cand["id"]]["label_kind"] == "completed_unrated"
+        assert by_cand[first_cand["id"]]["label"] == 0.75
+        assert {
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        } == {"completed_unrated", "explicit_feedback"}
+        assert signal_diagnostics(run_rows)["shortlist_intent"]["negative_impressions"] == 1
+        with connect() as con:
+            assert [
+                item["label_kind"]
+                for item in load_decision_evidence(con, run_id)["outcomes"]
+                if item["candidate_id"] == first_cand["id"]
+            ] == ["completed_unrated", "explicit_feedback"]
 
         deferred = client.post(
             f"/api/recommendations/{first_cand['id']}/feedback",
             json={"action": "maybe_later", "run_id": run_id},
         )
         assert deferred.status_code == 200
-        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
         assert by_cand[first_cand["id"]]["label_kind"] == "completed_unrated"
         assert by_cand[first_cand["id"]]["label"] == 0.75
+        assert [
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        ] == ["completed_unrated"]
+        assert signal_diagnostics(run_rows)["shortlist_intent"]["labeled_impressions"] == 0
         # Evidence outcomes stay append-only; replay hides retracted explicit feedback.
         assert row(
             "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
@@ -1909,6 +1990,12 @@ def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_
             json={"decision_id": saved["decision_id"]},
         )
         assert undone.status_code == 200
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
+        assert [
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        ] == ["completed_unrated"]
         assert row(
             "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
             "WHERE candidate_id=? AND label_kind='explicit_feedback'",
@@ -1921,15 +2008,23 @@ def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_
                 if item["candidate_id"] == first_cand["id"]
             ] == ["completed_unrated"]
 
-        client.post(
+        saved_second = client.post(
             f"/api/recommendations/{second_cand['id']}/feedback",
             json={"action": "save", "run_id": run_id},
         )
+        assert saved_second.status_code == 200
+        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
+        assert by_cand[second_cand["id"]]["label_kind"] == "explicit_feedback"
+        assert by_cand[second_cand["id"]]["label"] == 1.0
+
         restored = client.post(
             f"/api/recommendations/{second_cand['id']}/feedback",
             json={"action": "restore", "run_id": run_id},
         )
         assert restored.status_code == 200
+        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
+        assert by_cand[second_cand["id"]]["label_kind"] is None
+        assert by_cand[second_cand["id"]]["observed_outcomes"] == []
         assert row(
             "SELECT COUNT(*) count FROM recommendation_outcomes "
             "WHERE label_kind='explicit_feedback' AND event_id IN "
