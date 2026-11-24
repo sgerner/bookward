@@ -29,10 +29,11 @@ from .decision_evidence import (
     purge_recommendation_evidence,
     build_decision_evidence,
 )
-from .identity import book_row_identity_match_keys
+from .identity import book_row_exact_and_prefix_match_keys
 
 
 LOGGER = logging.getLogger(__name__)
+IMPRESSION_QUERY_CHUNK_SIZE = 500
 EVENT_TYPES = {
     "visible",
     "detail_open",
@@ -257,18 +258,7 @@ def _record_outcome(
         and existing["label_kind"] == label_kind
         and float(existing["confidence"]) == float(confidence)
     ):
-        con.execute(
-            "DELETE FROM recommendation_outcomes WHERE event_id=? AND impression_id!=?",
-            (event_id, impression_id),
-        )
         return "unchanged"
-    superseded = (
-        con.execute(
-            "DELETE FROM recommendation_outcomes WHERE event_id=? AND impression_id!=?",
-            (event_id, impression_id),
-        ).rowcount
-        > 0
-    )
     con.execute(
         "INSERT INTO recommendation_outcomes(impression_id,event_id,read_id,label,label_kind,confidence,attributed_at) "
         "VALUES(?,?,?,?,?,?,?) ON CONFLICT(impression_id,event_id) DO UPDATE SET "
@@ -284,7 +274,7 @@ def _record_outcome(
             attributed_at or utc_now(),
         ),
     )
-    return "updated" if (existing or superseded) else "created"
+    return "updated" if existing else "created"
 
 
 def record_event_in_connection(
@@ -326,12 +316,7 @@ def record_event_in_connection(
     ).fetchone()
     read_value_changed = False
     if existing:
-        is_reattributed_read_import = (
-            source == "read_import"
-            and event_type == "read"
-            and existing["event_type"] == "read"
-        )
-        if not is_reattributed_read_import and not _existing_event_matches(
+        if not _existing_event_matches(
             existing,
             run_id=run_id,
             candidate_id=candidate_id,
@@ -342,15 +327,10 @@ def record_event_in_connection(
             raise ValueError("Event key was already used for a different event")
         event_id = int(existing["id"])
         duplicate = True
-        if event_type == "read" and (
-            existing["value"] != value
-            or existing["run_id"] != run_id
-            or int(existing["candidate_id"]) != int(candidate_id)
-            or existing["metadata"] != encoded_metadata
-        ):
+        if event_type == "read" and existing["value"] != value:
             con.execute(
-                "UPDATE recommendation_events SET run_id=?,candidate_id=?,value=?,occurred_at=?,metadata=? WHERE id=?",
-                (run_id, candidate_id, value, timestamp, encoded_metadata, event_id),
+                "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
+                (value, timestamp, event_id),
             )
             read_value_changed = True
     else:
@@ -538,15 +518,27 @@ def attribute_read_outcomes() -> dict[str, int]:
                 "ORDER BY c.id"
             ).fetchall()
         ]
-        by_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        by_any_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        by_exact_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = {}
         for item in candidates:
-            for key in book_row_identity_match_keys(item):
-                by_match_key.setdefault(key, []).append(item)
+            cand_exact, cand_prefix = book_row_exact_and_prefix_match_keys(item)
+            for key in cand_exact:
+                by_exact_match_key.setdefault(key, []).append(item)
+                by_any_match_key.setdefault(key, []).append(item)
+            for key in cand_prefix:
+                by_any_match_key.setdefault(key, []).append(item)
+
+        eligible_reads: list[tuple[dict[str, Any], datetime, bool, dict[int, dict[str, Any]]]] = []
+        needed_candidate_ids: set[int] = set()
         for read in reads:
             scanned += 1
+            read_exact, read_prefix = book_row_exact_and_prefix_match_keys(read)
             matched_candidates: dict[int, dict[str, Any]] = {}
-            for key in book_row_identity_match_keys(read):
-                for item in by_match_key.get(key, ()):
+            for key in read_exact:
+                for item in by_any_match_key.get(key, ()):
+                    matched_candidates[int(item["id"])] = item
+            for key in read_prefix:
+                for item in by_exact_match_key.get(key, ()):
                     matched_candidates[int(item["id"])] = item
             if not matched_candidates:
                 continue
@@ -556,16 +548,28 @@ def attribute_read_outcomes() -> dict[str, int]:
                 read_time, day_precision = _read_time(read.get("created_at"))
             if read_time is None:
                 continue
+            eligible_reads.append((read, read_time, day_precision, matched_candidates))
+            needed_candidate_ids.update(matched_candidates)
+
+        impressions_by_candidate: dict[int, list[sqlite3.Row]] = {}
+        sorted_candidate_ids = sorted(needed_candidate_ids)
+        for start in range(0, len(sorted_candidate_ids), IMPRESSION_QUERY_CHUNK_SIZE):
+            chunk = sorted_candidate_ids[start : start + IMPRESSION_QUERY_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            for item in con.execute(
+                "SELECT id,run_id,candidate_id,rank,score,propensity,presented_at,visible_at "
+                f"FROM recommendation_impressions WHERE candidate_id IN ({placeholders}) "
+                "ORDER BY candidate_id, COALESCE(visible_at,presented_at) DESC, id DESC",
+                chunk,
+            ).fetchall():
+                impressions_by_candidate.setdefault(int(item["candidate_id"]), []).append(item)
+
+        for read, read_time, day_precision, matched_candidates in eligible_reads:
             selected_candidate = None
             impression = None
             best_sort_key: tuple[datetime, int] | None = None
             for candidate in matched_candidates.values():
-                impression_rows = con.execute(
-                    "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-                    "FROM recommendation_impressions WHERE candidate_id=? "
-                    "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-                    (candidate["id"],),
-                ).fetchall()
+                impression_rows = impressions_by_candidate.get(int(candidate["id"]), ())
                 candidate_impression = next(
                     (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
                     None,

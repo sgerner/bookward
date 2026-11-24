@@ -386,6 +386,8 @@ The default local embedder is intentionally small and predictable. FastEmbed, Ol
 
 Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
 
+Goodreads CSV imports also store `Additional Authors` on completed reads and `to-read` / `currently-reading` shelf items for co-author matching. Upgrading an existing database adds empty `additional_authors` columns without a backfill, so previously imported reads and shelves match no secondary co-authors until you re-import your Goodreads CSV export (Goodreads RSS feeds only include the primary author). Because `candidates` has no `additional_authors` column, structured co-author matching is read/shelf-side only: a read with `additional_authors` hides a candidate credited to that co-author, whereas a single-author read only matches a co-authored candidate when both contributors appear in `candidates.author` or the records share a valid ISBN or verified work ID.
+
 Goodreads CSV and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
 
 ### Librarr works in Docker but not locally (or vice versa)

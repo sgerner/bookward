@@ -775,3 +775,115 @@ def test_serving_scoring_quality_and_digest_exclude_coauthor_subtitle_and_series
         word_series_cid: "rejected",
         sequel_cid: "recommended",
     }
+
+
+def test_coauthor_matching_is_asymmetric_without_candidate_additional_authors():
+    # Read has structured additional_authors -> matches secondary-author candidate.
+    read_with_coauthor = ReadIdentityIndex.from_reads([
+        {
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "additional_authors": "Brian Herbert",
+        }
+    ])
+    assert read_with_coauthor.matches({"title": "Dune", "author": "Brian Herbert"})
+
+    # Candidates have no additional_authors column: a single-author read by the
+    # secondary contributor does NOT match a primary-only candidate unless both
+    # contributors appear in candidates.author or they share an ISBN/work ID.
+    reverse_read = ReadIdentityIndex.from_reads([
+        {"title": "Dune", "author": "Brian Herbert", "additional_authors": ""}
+    ])
+    assert not reverse_read.matches({"title": "Dune", "author": "Frank Herbert"})
+    assert reverse_read.matches({"title": "Dune", "author": "Frank Herbert & Brian Herbert"})
+
+    # The 4-argument book_identity_matches fallback compares primary author strings only.
+    assert book_identity_matches("Dune", "Frank Herbert & Brian Herbert", "Dune", "Brian Herbert")
+    assert not book_identity_matches("Dune", "Frank Herbert", "Dune", "Brian Herbert")
+
+
+def test_article_led_subtitle_sequels_do_not_match_each_other(database):
+    from afterword_engine.quality import _dedupe_and_hide
+
+    gunslinger_read = {"title": "The Dark Tower: The Gunslinger", "author": "Stephen King"}
+    dark_tower_index = ReadIdentityIndex.from_reads([gunslinger_read])
+    assert not dark_tower_index.matches(
+        {"title": "The Dark Tower: The Drawing of the Three", "author": "Stephen King"}
+    )
+    assert not dark_tower_index.matches(
+        {"title": "The Dark Tower: The Waste Lands", "author": "Stephen King"}
+    )
+    assert not book_identity_matches(
+        "The Dark Tower: The Gunslinger",
+        "Stephen King",
+        "The Dark Tower: The Drawing of the Three",
+        "Stephen King",
+    )
+    assert not book_identity_matches(
+        "The Lord of the Rings: The Fellowship of the Ring",
+        "J. R. R. Tolkien",
+        "The Lord of the Rings: The Return of the King",
+        "J. R. R. Tolkien",
+    )
+    # Same book with format/edition suffixes and bare omitted-subtitle pairs still match.
+    assert dark_tower_index.matches(
+        {"title": "The Dark Tower: The Gunslinger (Unabridged)", "author": "Stephen King"}
+    )
+    assert dark_tower_index.matches(
+        {"title": "The Dark Tower: The Gunslinger: Deluxe Edition", "author": "Stephen King"}
+    )
+    assert dark_tower_index.matches({"title": "The Dark Tower", "author": "Stephen King"})
+    bare_index = ReadIdentityIndex.from_reads([
+        {"title": "The Dark Tower", "author": "Stephen King"}
+    ])
+    assert bare_index.matches(gunslinger_read)
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("The Dark Tower: The Gunslinger", "Stephen King"),
+        )
+
+    gunslinger_cid = add_candidate("The Dark Tower: The Gunslinger (Unabridged)", "Stephen King", score=96)
+    drawing_cid = add_candidate("The Dark Tower: The Drawing of the Three", "Stephen King", score=95)
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            [(gunslinger_cid,), (drawing_cid,)],
+        )
+
+    assert {item["id"] for item in recommendation_list(status="recommended", limit=None)} == {drawing_cid}
+    assert {
+        item["id"]
+        for item in _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    } == {drawing_cid}
+
+    class FakeEmbedder:
+        name, model = "test", "article-subtitle-sequels"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+    assert asyncio.run(score_all(embedder=embedder)) == 1
+    assert any("The Drawing of the Three" in text for text in embedder.texts)
+    assert not any("The Gunslinger (Unabridged)" in text for text in embedder.texts)
+
+    with transaction() as con:
+        _dedupe_and_hide(con)
+        statuses = dict(
+            con.execute(
+                "SELECT id,status FROM candidates WHERE id IN (?,?)",
+                (gunslinger_cid, drawing_cid),
+            ).fetchall()
+        )
+    assert statuses == {
+        gunslinger_cid: "rejected",
+        drawing_cid: "recommended",
+    }

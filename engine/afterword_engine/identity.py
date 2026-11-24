@@ -280,7 +280,15 @@ def book_author_identity_keys(*values: object) -> set[str]:
 
 
 def book_row_author_identity_keys(item) -> set[str]:
-    """Return normalized contributor keys for a read, shelf, or candidate row."""
+    """Return normalized contributor keys for a read, shelf, or candidate row.
+
+    ``reads`` and ``goodreads_shelf_items`` store a separate
+    ``additional_authors`` column populated by Goodreads CSV imports (with no
+    historical backfill prior to CSV re-import), whereas ``candidates`` only
+    stores ``author``. Secondary-author matching via ``additional_authors`` is
+    therefore asymmetric unless co-authors also appear inline in
+    ``candidates.author`` or the rows match by ISBN or verified work ID.
+    """
 
     return book_author_identity_keys(
         _row_value(item, "author"),
@@ -304,22 +312,33 @@ def _is_explicit_genre_or_edition_subtitle(subtitle: str) -> bool:
     return bool(_EXPLICIT_GENRE_SUBTITLE.match(sub))
 
 
-def _title_match_keys(value: object) -> set[str]:
-    """Return the full title and a safe subtitle-free comparison key.
+def _expand_title_aliases(keys: set[str]) -> set[str]:
+    expanded = set(keys)
+    for key in list(keys):
+        expanded.update(_TITLE_ALIASES.get(key, ()))
+        words = key.split()
+        if len(words) >= 4 and words[0] in {"a", "an", "the"}:
+            expanded.add(" ".join(words[1:]))
+    return expanded
 
-    Catalogs frequently disagree about whether a subtitle is included. The
-    prefix is accepted for subtitle-shaped, article-led extensions when the
-    base has at least three words, or two words with one unusually distinctive
-    long word, and for explicit genre or edition subtitles on shorter titles.
-    Number-led series titles such as ``The Lord of the Rings: The Two Towers``
-    are kept distinct, as are short series titles such as ``Dune`` and ``Dune:
-    Messiah``.
+
+def _split_title_match_keys(value: object) -> tuple[set[str], set[str]]:
+    """Return ``(exact_keys, prefix_keys)`` for a book title.
+
+    ``exact_keys`` cover the full title after format/series normalization plus
+    explicit genre or edition subtitle variants (e.g. ``Piranesi: A Novel``,
+    ``Dune: Deluxe Edition``). ``prefix_keys`` hold heuristic article-led
+    omitted-subtitle prefixes on longer or distinctive titles so a bare title
+    matches its subtitled edition without allowing two distinct subtitle
+    sequels (e.g. ``The Dark Tower: The Gunslinger`` and ``The Dark Tower: The
+    Drawing of the Three``) to match each other via a shared prefix.
     """
 
     title = _title_without_format_suffix(value)
     if not title:
-        return set()
-    keys: set[str] = set()
+        return set(), set()
+    exact_raw: set[str] = set()
+    prefix_raw: set[str] = set()
     variants = [title]
 
     current = title
@@ -343,11 +362,16 @@ def _title_match_keys(value: object) -> set[str]:
     for variant in variants:
         normalized = canonical_part(variant)
         if normalized:
-            keys.add(normalized)
+            exact_raw.add(normalized)
         parts = _TITLE_SEPARATOR.split(variant, maxsplit=1)
         if len(parts) == 2:
             prefix = canonical_part(_title_without_format_suffix(parts[0]))
             subtitle = parts[1].strip()
+            if not prefix:
+                continue
+            if _is_explicit_genre_or_edition_subtitle(subtitle):
+                exact_raw.add(prefix)
+                continue
             words = prefix.split()
             distinctive_two_word_title = (
                 len(words) == 2 and any(len(word) >= 9 for word in words)
@@ -356,18 +380,28 @@ def _title_match_keys(value: object) -> set[str]:
                 bool(_ARTICLE_LED_SUBTITLE.match(subtitle))
                 and not bool(_NUMBERED_SERIES_SUBTITLE.match(subtitle))
             )
-            if prefix and (
-                (subtitle_shaped and (len(words) >= 3 or distinctive_two_word_title))
-                or _is_explicit_genre_or_edition_subtitle(subtitle)
-            ):
-                keys.add(prefix)
+            if subtitle_shaped and (len(words) >= 3 or distinctive_two_word_title):
+                prefix_raw.add(prefix)
 
-    for key in list(keys):
-        keys.update(_TITLE_ALIASES.get(key, ()))
-        words = key.split()
-        if len(words) >= 4 and words[0] in {"a", "an", "the"}:
-            keys.add(" ".join(words[1:]))
-    return keys
+    exact_keys = _expand_title_aliases(exact_raw)
+    prefix_keys = _expand_title_aliases(prefix_raw) - exact_keys
+    return exact_keys, prefix_keys
+
+
+def _title_match_keys(value: object) -> set[str]:
+    """Return the full title and a safe subtitle-free comparison key.
+
+    Catalogs frequently disagree about whether a subtitle is included. The
+    prefix is accepted for subtitle-shaped, article-led extensions when the
+    base has at least three words, or two words with one unusually distinctive
+    long word, and for explicit genre or edition subtitles on shorter titles.
+    Number-led series titles such as ``The Lord of the Rings: The Two Towers``
+    are kept distinct, as are short series titles such as ``Dune`` and ``Dune:
+    Messiah``.
+    """
+
+    exact_keys, prefix_keys = _split_title_match_keys(value)
+    return exact_keys | prefix_keys
 
 
 def _isbn_match_keys(item) -> set[tuple[str, str]]:
@@ -432,19 +466,59 @@ def _work_match_keys(item) -> set[tuple[str, str, str]]:
     return {("work", provider, identifier)}
 
 
+def _author_title_keys_for_row(
+    title_keys: set[str],
+    author: object,
+    additional_authors: object = "",
+) -> set[tuple[str, str]]:
+    if not title_keys:
+        return set()
+    author_keys = book_author_identity_keys(author, additional_authors)
+    if author_keys:
+        return {
+            (author_key, title_key)
+            for author_key in author_keys
+            for title_key in title_keys
+        }
+    raw_primary = canonical_part(author)
+    raw_secondary = canonical_part(additional_authors)
+    if raw_primary in {"", "unknown author"} and not raw_secondary:
+        return {(raw_primary, title_key) for title_key in title_keys}
+    return set()
+
+
+def book_row_exact_and_prefix_match_keys(
+    item,
+) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    """Return ``(exact_keys, prefix_keys)`` for a read, shelf, or candidate row.
+
+    ``exact_keys`` include exact/genre-edition title variants, validated ISBNs,
+    and provider-scoped work IDs. ``prefix_keys`` hold heuristic omitted-subtitle
+    prefixes so bare titles match subtitled editions without matching two
+    distinct subtitle sequels against each other.
+    """
+
+    title = _row_value(item, "title")
+    author = _row_value(item, "author")
+    additional_authors = _row_value(item, "additional_authors")
+    exact_titles, prefix_titles = _split_title_match_keys(title)
+    exact_keys: set[tuple[str, ...]] = set(
+        _author_title_keys_for_row(exact_titles, author, additional_authors)
+    )
+    exact_keys.update(_isbn_match_keys(item))
+    exact_keys.update(_work_match_keys(item))
+    prefix_keys: set[tuple[str, ...]] = (
+        set(_author_title_keys_for_row(prefix_titles, author, additional_authors))
+        - exact_keys
+    )
+    return exact_keys, prefix_keys
+
+
 def book_row_identity_match_keys(item) -> set[tuple[str, ...]]:
     """Return title and stable catalog keys for a read or candidate row."""
 
-    keys: set[tuple[str, ...]] = set(
-        book_identity_match_keys(
-            _row_value(item, "title"),
-            _row_value(item, "author"),
-            _row_value(item, "additional_authors"),
-        )
-    )
-    keys.update(_isbn_match_keys(item))
-    keys.update(_work_match_keys(item))
-    return keys
+    exact_keys, prefix_keys = book_row_exact_and_prefix_match_keys(item)
+    return exact_keys | prefix_keys
 
 
 def book_openlibrary_work_id(item) -> str:
@@ -488,21 +562,11 @@ def book_identity_match_keys(
 ) -> set[tuple[str, str]]:
     """Return indexed keys used by the conservative same-work matcher."""
 
-    title_keys = _title_match_keys(title)
-    if not title_keys:
-        return set()
-    author_keys = book_author_identity_keys(author, additional_authors)
-    if author_keys:
-        return {
-            (author_key, title_key)
-            for author_key in author_keys
-            for title_key in title_keys
-        }
-    raw_primary = canonical_part(author)
-    raw_secondary = canonical_part(additional_authors)
-    if raw_primary in {"", "unknown author"} and not raw_secondary:
-        return {(raw_primary, title_key) for title_key in title_keys}
-    return set()
+    return _author_title_keys_for_row(
+        _title_match_keys(title),
+        author,
+        additional_authors,
+    )
 
 
 def book_identity_match_index(items) -> set[tuple[str, ...]]:
@@ -519,7 +583,11 @@ class ReadIdentityIndex:
     """Indexed read identities for filtering provider-discovered candidates.
 
     Known authors use the same title/author aliases, provider-scoped work IDs,
-    and validated ISBN keys as serving eligibility. A title-only fallback is
+    and validated ISBN keys as serving eligibility. Because ``reads`` stores a
+    Goodreads CSV ``additional_authors`` column while ``candidates`` stores only
+    ``author``, secondary-author matching via ``additional_authors`` is
+    read-side asymmetric unless co-authors also appear in ``candidates.author``
+    or the rows share an ISBN or verified work ID. A title-only fallback is
     retained when either side has no author or the exact ``Unknown author``
     placeholder, where the available history or provider identity cannot
     support a safer comparison.
@@ -528,38 +596,61 @@ class ReadIdentityIndex:
     match_keys: frozenset[tuple[str, ...]]
     title_keys: frozenset[str]
     unknown_author_title_keys: frozenset[str]
+    exact_match_keys: frozenset[tuple[str, ...]] = frozenset()
+    exact_title_keys: frozenset[str] = frozenset()
+    unknown_author_exact_title_keys: frozenset[str] = frozenset()
 
     @classmethod
     def from_reads(cls, reads) -> "ReadIdentityIndex":
         rows = list(reads)
+        all_match_keys: set[tuple[str, ...]] = set()
+        exact_match_keys: set[tuple[str, ...]] = set()
+        all_title_keys: set[str] = set()
+        exact_title_keys: set[str] = set()
+        unknown_all_titles: set[str] = set()
+        unknown_exact_titles: set[str] = set()
+        for read in rows:
+            read_exact, read_prefix = book_row_exact_and_prefix_match_keys(read)
+            exact_match_keys.update(read_exact)
+            all_match_keys.update(read_exact)
+            all_match_keys.update(read_prefix)
+            exact_titles, prefix_titles = _split_title_match_keys(
+                _row_value(read, "title")
+            )
+            exact_title_keys.update(exact_titles)
+            all_title_keys.update(exact_titles)
+            all_title_keys.update(prefix_titles)
+            if _is_unknown_author_row(read):
+                unknown_exact_titles.update(exact_titles)
+                unknown_all_titles.update(exact_titles)
+                unknown_all_titles.update(prefix_titles)
         return cls(
-            match_keys=frozenset(book_identity_match_index(rows)),
-            title_keys=frozenset(
-                key
-                for read in rows
-                for key in _title_match_keys(_row_value(read, "title"))
-            ),
-            unknown_author_title_keys=frozenset(
-                key
-                for read in rows
-                if _is_unknown_author_row(read)
-                for key in _title_match_keys(_row_value(read, "title"))
-            ),
+            match_keys=frozenset(all_match_keys),
+            title_keys=frozenset(all_title_keys),
+            unknown_author_title_keys=frozenset(unknown_all_titles),
+            exact_match_keys=frozenset(exact_match_keys),
+            exact_title_keys=frozenset(exact_title_keys),
+            unknown_author_exact_title_keys=frozenset(unknown_exact_titles),
         )
 
     def matches(self, candidate) -> bool:
         """Return whether a provider result identifies a known read."""
 
-        if book_row_identity_match_keys(candidate) & self.match_keys:
+        cand_exact, cand_prefix = book_row_exact_and_prefix_match_keys(candidate)
+        if (cand_exact & self.match_keys) or (cand_prefix & self.exact_match_keys):
             return True
+        cand_exact_titles, cand_prefix_titles = _split_title_match_keys(
+            _row_value(candidate, "title")
+        )
         if _is_unknown_author_row(candidate):
             return bool(
-                _title_match_keys(_row_value(candidate, "title")) & self.title_keys
+                (cand_exact_titles & self.title_keys)
+                or (cand_prefix_titles & self.exact_title_keys)
             )
         if book_row_author_identity_keys(candidate):
             return bool(
-                _title_match_keys(_row_value(candidate, "title"))
-                & self.unknown_author_title_keys
+                (cand_exact_titles & self.unknown_author_title_keys)
+                or (cand_prefix_titles & self.unknown_author_exact_title_keys)
             )
         return False
 
@@ -580,8 +671,10 @@ def book_identity_matches(
 
     Exact identities remain the primary path. The fallback handles the
     common Goodreads/catalog variants that otherwise leak read books back into
-    discovery: generational author suffixes, shared contributors, and an
-    omitted subtitle.
+    discovery: generational author suffixes, inline shared contributors, and an
+    omitted subtitle. Because this 4-argument helper is also registered as a
+    SQLite scalar function, it compares only the passed ``author`` strings and
+    does not inspect ``reads.additional_authors``.
     """
 
     if book_identity(left_title, left_author) == book_identity(right_title, right_author):
@@ -590,6 +683,10 @@ def book_identity_matches(
     right_authors = book_author_identity_keys(right_author)
     if not left_authors or not right_authors or not (left_authors & right_authors):
         return False
-    left_titles = _title_match_keys(left_title)
-    right_titles = _title_match_keys(right_title)
-    return bool(left_titles & right_titles)
+    left_exact, left_prefix = _split_title_match_keys(left_title)
+    right_exact, right_prefix = _split_title_match_keys(right_title)
+    return bool(
+        (left_exact & right_exact)
+        or (left_exact & right_prefix)
+        or (left_prefix & right_exact)
+    )

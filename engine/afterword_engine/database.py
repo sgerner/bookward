@@ -992,6 +992,10 @@ MIGRATIONS = [
             ON goodreads_shelf_items(title, author);
         """,
     ),
+    # Migration 27 adds structured secondary contributor storage for Goodreads
+    # CSV imports without a historical backfill: existing reads and shelf rows
+    # default to '' and match no secondary co-authors until the user re-imports
+    # their Goodreads CSV export.
     (
         27,
         """

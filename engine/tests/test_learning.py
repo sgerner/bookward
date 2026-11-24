@@ -1064,12 +1064,18 @@ def test_read_attribution_matches_subtitles_coauthors_isbns_and_verified_work_id
     assert attributed_cids == {cand_subtitle, cand_coauthor, cand_isbn, cand_work}
 
 
-def test_read_attribution_preserves_exposed_dune_with_duplicate_and_credits_latest_exposure(database):
+def test_read_attribution_preserves_exposed_dune_with_duplicate_and_credits_latest_exposure(
+    database, monkeypatch
+):
+    from contextlib import contextmanager
+    import afterword_engine.learning as learning_mod
+
     with transaction() as con:
         source_id = con.execute(
             "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
         ).fetchone()[0]
         con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
         exposed_dune = con.execute(
             "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
             "VALUES('Dune','Frank Herbert',95,'recommended',?,'dune-primary')",
@@ -1090,6 +1096,11 @@ def test_read_attribution_preserves_exposed_dune_with_duplicate_and_credits_late
             "VALUES('Dune (Dune Chronicles, Book One)','Frank Herbert',91,'recommended',?,'dune-post')",
             (source_id,),
         ).lastrowid
+        drawing_sequel = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('The Dark Tower: The Drawing of the Three','Stephen King',90,'recommended',?,'dark-tower-2')",
+            (source_id,),
+        ).lastrowid
         con.execute(
             "UPDATE candidate_quality SET quality_status='rejected' WHERE candidate_id=?",
             (rejected_audio,),
@@ -1097,38 +1108,89 @@ def test_read_attribution_preserves_exposed_dune_with_duplicate_and_credits_late
 
     early_run = create_recommendation_run([{"id": exposed_dune, "score": 95}])
     _set_candidate_exposure_time(exposed_dune, early_run, "2026-02-01T10:00:00+00:00")
-
-    with transaction() as con:
-        read_id = con.execute(
-            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
-            ("Dune", "Frank Herbert", 5, "2026-02-10", "goodreads_csv"),
-        ).lastrowid
-
-    # Even with a later-inserted rejected 'Dune (Unabridged)' row, exposed 'Dune' gets attributed.
-    first = attribute_read_outcomes()
-    assert first["outcomes_created"] == 1
-    event = row(
-        "SELECT id,run_id,candidate_id FROM recommendation_events WHERE event_key=?",
-        (f"read:{read_id:08d}",),
-    )
-    assert (event["run_id"], event["candidate_id"]) == (early_run, exposed_dune)
-
-    # Now add a later prior exposure on another edition and a post-read exposure.
     later_prior_run = create_recommendation_run([{"id": deluxe_dune, "score": 92}])
     _set_candidate_exposure_time(deluxe_dune, later_prior_run, "2026-02-05T10:00:00+00:00")
     after_read_run = create_recommendation_run([{"id": post_read_dune, "score": 91}])
     _set_candidate_exposure_time(post_read_dune, after_read_run, "2026-02-15T10:00:00+00:00")
+    sequel_run = create_recommendation_run([{"id": drawing_sequel, "score": 90}])
+    _set_candidate_exposure_time(drawing_sequel, sequel_run, "2026-02-03T10:00:00+00:00")
+
+    with transaction() as con:
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Dune", "Frank Herbert", None, "2026-02-10", "goodreads_csv"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("The Dark Tower: The Gunslinger", "Stephen King", 5, "2026-02-10", "goodreads_csv"),
+        )
+
+    sql_statements: list[str] = []
+    real_transaction = learning_mod.transaction
+
+    @contextmanager
+    def traced_transaction():
+        with real_transaction() as con:
+            con.set_trace_callback(sql_statements.append)
+            try:
+                yield con
+            finally:
+                con.set_trace_callback(None)
+
+    monkeypatch.setattr(learning_mod, "transaction", traced_transaction)
+
+    # Even with an unexposed rejected 'Dune (Unabridged)' duplicate and 4 matched
+    # Dune candidates, impressions are fetched in a single batched query, the
+    # latest prior exposure ('Dune: Deluxe Edition') is credited, and 'The Dark
+    # Tower: The Gunslinger' does not falsely attribute to 'The Drawing of the Three'.
+    first = attribute_read_outcomes()
+    assert first["outcomes_created"] == 1
+    assert first["reads_attributed"] == 1
+    batch_impression_queries = [
+        stmt
+        for stmt in sql_statements
+        if "FROM recommendation_impressions WHERE candidate_id IN" in stmt
+    ]
+    per_candidate_queries = [
+        stmt
+        for stmt in sql_statements
+        if "FROM recommendation_impressions WHERE candidate_id=?" in stmt
+    ]
+    assert len(batch_impression_queries) == 1
+    assert per_candidate_queries == []
+
+    event = row(
+        "SELECT id,run_id,candidate_id,value FROM recommendation_events WHERE event_key=?",
+        (f"read:{read_id:08d}",),
+    )
+    assert (event["run_id"], event["candidate_id"], event["value"]) == (
+        later_prior_run,
+        deluxe_dune,
+        None,
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_events WHERE candidate_id=?",
+            (drawing_sequel,),
+        )["count"]
+        == 0
+    )
+
+    # Updating the read's rating updates the existing event/outcome in place without deleting rows.
+    with real_transaction() as con:
+        con.execute("UPDATE reads SET rating=5 WHERE id=?", (read_id,))
 
     second = attribute_read_outcomes()
     assert second["outcomes_updated"] == 1
     updated_event = row(
-        "SELECT id,run_id,candidate_id FROM recommendation_events WHERE event_key=?",
+        "SELECT id,run_id,candidate_id,value FROM recommendation_events WHERE event_key=?",
         (f"read:{read_id:08d}",),
     )
-    assert (updated_event["run_id"], updated_event["candidate_id"]) == (
-        later_prior_run,
-        deluxe_dune,
-    )
+    assert (
+        updated_event["run_id"],
+        updated_event["candidate_id"],
+        updated_event["value"],
+    ) == (later_prior_run, deluxe_dune, 5.0)
     outcomes = rows(
         "SELECT impression_id,read_id,label_kind FROM recommendation_outcomes WHERE event_id=?",
         (updated_event["id"],),

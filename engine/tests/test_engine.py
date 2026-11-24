@@ -2908,6 +2908,117 @@ def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(
     assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
 
 
+def test_initialize_upgrades_v26_database_to_add_additional_authors(tmp_path):
+    from afterword_engine.identity import ReadIdentityIndex, read_metadata_identity_hash
+
+    settings.db = str(tmp_path / "v26.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.row_factory = sqlite3.Row
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version > 26:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 27))
+        assert "additional_authors" not in {
+            item["name"] for item in con.execute("PRAGMA table_info(reads)")
+        }
+        assert "additional_authors" not in {
+            item["name"] for item in con.execute("PRAGMA table_info(goodreads_shelf_items)")
+        }
+        read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source,openlibrary_work_id) "
+            "VALUES(?,?,?,?,?,?,?) RETURNING id",
+            ("Good Omens", "Neil Gaiman", 4.0, "2025-05-01", "9780060853983", "goodreads_csv", "/works/OL262458W"),
+        ).fetchone()[0]
+        pre_read = dict(con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone())
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+            "identity_provider_id,identity_hash,description) VALUES(?,?,?,?,?,?)",
+            (
+                read_id,
+                "/works/OL262458W",
+                "openlibrary",
+                "/works/OL262458W",
+                read_metadata_identity_hash(pre_read),
+                "Existing cached read metadata.",
+            ),
+        )
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) VALUES(?,?,?,?,?)",
+            [
+                ("to-read", "This Is How You Lose the Time War", "Amal El-Mohtar", "9781534431003", "2026-01-10"),
+                ("currently-reading", "The Talisman", "Stephen King", "9781982115524", "2026-02-01"),
+            ],
+        )
+
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+    assert row("SELECT 1 FROM schema_migrations WHERE version=27") is not None
+
+    for table_name in ("reads", "goodreads_shelf_items"):
+        col_info = {item["name"]: item for item in rows(f"PRAGMA table_info({table_name})")}
+        assert "additional_authors" in col_info
+        assert col_info["additional_authors"]["notnull"] == 1
+        assert col_info["additional_authors"]["dflt_value"] == "''"
+
+    upgraded_read = row("SELECT * FROM reads WHERE id=?", (read_id,))
+    assert upgraded_read["title"] == "Good Omens"
+    assert upgraded_read["author"] == "Neil Gaiman"
+    assert upgraded_read["additional_authors"] == ""
+    assert upgraded_read["openlibrary_work_id"] == "/works/OL262458W"
+    assert row("SELECT description FROM read_metadata WHERE read_id=?", (read_id,)) == {
+        "description": "Existing cached read metadata."
+    }
+    assert rows(
+        "SELECT shelf,title,author,additional_authors FROM goodreads_shelf_items ORDER BY shelf"
+    ) == [
+        {
+            "shelf": "currently-reading",
+            "title": "The Talisman",
+            "author": "Stephen King",
+            "additional_authors": "",
+        },
+        {
+            "shelf": "to-read",
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar",
+            "additional_authors": "",
+        },
+    ]
+
+    # Without a CSV re-import there is no backfill, so title/author matching
+    # does not yet match secondary-author-only candidates.
+    pre_reimport_index = ReadIdentityIndex.from_reads([
+        {"title": upgraded_read["title"], "author": upgraded_read["author"], "additional_authors": upgraded_read["additional_authors"]}
+    ])
+    assert not pre_reimport_index.matches({"title": "Good Omens", "author": "Terry Pratchett"})
+
+    reimported = import_goodreads_csv(
+        b"Title,Author,Additional Authors,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        b"Good Omens,Neil Gaiman,Terry Pratchett,5,2025/05/01,2025/04/01,read,=\"9780060853983\"\n"
+    )
+    assert reimported == 1
+    post_reimport_read = row("SELECT * FROM reads WHERE id=?", (read_id,))
+    assert post_reimport_read["additional_authors"] == "Terry Pratchett"
+    assert row("SELECT description FROM read_metadata WHERE read_id=?", (read_id,)) == {
+        "description": "Existing cached read metadata."
+    }
+    post_reimport_index = ReadIdentityIndex.from_reads([
+        {
+            "title": post_reimport_read["title"],
+            "author": post_reimport_read["author"],
+            "additional_authors": post_reimport_read["additional_authors"],
+        }
+    ])
+    assert post_reimport_index.matches({"title": "Good Omens", "author": "Terry Pratchett"})
+
+
 def test_initialize_removes_retired_llm_data_from_v11_database(tmp_path):
     settings.db = str(tmp_path / "retired-model.db")
     import sqlite3
