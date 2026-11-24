@@ -10,9 +10,10 @@ instead of relying on the API's debugging-only title field.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
@@ -21,22 +22,24 @@ from ..associations import (
     Association,
     AssociationCache,
     RateLimiter,
-    record_association_request,
     select_seed_reads,
 )
 from ..database import rows
 from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import normalize_isbn_identifier
-from ..security import resolve_public_target
 from .openlibrary import OpenLibraryClient
-from .common import clean as _clean
+from .common import (
+    DEFAULT_USER_AGENT,
+    clean as _clean,
+    fetch_pinned_association_json,
+)
 
 
 LIBRARYTHING_PROVIDER = "librarything_multirecommendations"
 LIBRARYTHING_BASE = "https://www.librarything.com"
 LIBRARYTHING_PATH = "/api/multirecommendations.php"
 LIBRARYTHING_MAX_DAILY_REQUESTS = 25
-LIBRARYTHING_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
+LIBRARYTHING_USER_AGENT = DEFAULT_USER_AGENT
 _LIBRARYTHING_RATE_LIMITER = RateLimiter(1.0)
 
 
@@ -125,35 +128,17 @@ class LibraryThingClient:
         if librarything_requests_today() >= self.daily_limit:
             raise RuntimeError("LibraryThing daily request limit reached")
         await self.rate_limiter.wait()
-        request_url = f"{LIBRARYTHING_BASE}{LIBRARYTHING_PATH}"
-        original = httpx.URL(request_url)
-        _, address, hostname = resolve_public_target(str(original))
-        pinned = original.copy_with(host=address)
-        host_header = hostname if original.port in (None, 443) else f"{hostname}:{original.port}"
-        try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_seconds,
-                follow_redirects=False,
-                trust_env=False,
-                headers={"User-Agent": LIBRARYTHING_USER_AGENT},
-            ) as client:
-                response = await client.request(
-                    "GET",
-                    pinned,
-                    params={**query, "apiKey": self.api_key},
-                    headers={"Host": host_header},
-                    extensions={"sni_hostname": hostname},
-                )
-                response.raise_for_status()
-                if len(response.content) > 2_000_000:
-                    raise ValueError("LibraryThing response is too large")
-                payload = response.json()
-                if not isinstance(payload, Mapping):
-                    raise ValueError("LibraryThing response must be an object")
-        except Exception:
-            record_association_request(LIBRARYTHING_PROVIDER, cache_key, "error")
-            raise
-        record_association_request(LIBRARYTHING_PROVIDER, cache_key, "ok")
+        payload, _ = await fetch_pinned_association_json(
+            f"{LIBRARYTHING_BASE}{LIBRARYTHING_PATH}",
+            provider=LIBRARYTHING_PROVIDER,
+            request_key=cache_key,
+            source_label="LibraryThing",
+            params={**query, "apiKey": self.api_key},
+            timeout_seconds=self.timeout_seconds,
+            max_bytes=2_000_000,
+            user_agent=LIBRARYTHING_USER_AGENT,
+            require_mapping=True,
+        )
         normalized_payload = dict(payload)
         self.cache.put(
             LIBRARYTHING_PROVIDER,
