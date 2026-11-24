@@ -18,6 +18,7 @@ from .secrets import unseal
 from .tenancy import has_database_path_override, profile_database_path
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
+SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -992,6 +993,17 @@ MIGRATIONS = [
             ON goodreads_shelf_items(title, author);
         """,
     ),
+    (
+        27,
+        """
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1454,10 +1466,41 @@ def initialize(*, seed_demo: bool = True):
             ("Bookward demo upcoming books",),
         )
         builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        # Track default URLs once seeded so a user's custom source that shares
+        # a default source's display name never blocks seeding that default URL,
+        # while editing an already-seeded starter URL will not re-insert the
+        # original URL on subsequent startups.
+        seeded_row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SEEDED_DEFAULT_SOURCES_KEY,),
+        ).fetchone()
+        try:
+            parsed_seeded = json.loads(seeded_row["value"]) if seeded_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_seeded = []
+        seeded_urls = {
+            str(item)
+            for item in (parsed_seeded if isinstance(parsed_seeded, list) else [])
+            if item
+        }
+        seeded_changed = False
         for name, url, enabled in DEFAULT_SOURCES:
+            if url in seeded_urls:
+                continue
             con.execute(
                 "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
                 (name, url, "web", enabled),
+            )
+            seeded_urls.add(url)
+            seeded_changed = True
+        if seeded_changed:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (
+                    SEEDED_DEFAULT_SOURCES_KEY,
+                    json.dumps(sorted(seeded_urls), separators=(",", ":")),
+                ),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []
