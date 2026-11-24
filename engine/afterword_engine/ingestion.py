@@ -32,6 +32,7 @@ from .identity import (
     book_identity_match_keys,
     book_openlibrary_work_id,
     book_row_identity_match_keys,
+    read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .read_dates import read_day
@@ -1147,22 +1148,6 @@ async def refresh_read_work_identities(
     }
 
 
-def _read_metadata_identity_hash(read):
-    """Fingerprint the read's bibliographic identity and verified work key."""
-
-    isbn13, isbn10 = isbn_parts(read.get("isbn"))
-    identity = {
-        "title": normalize_key(read.get("title", ""), ""),
-        "author": normalize_key("", read.get("author", "")),
-        "source_isbn": re.sub(r"[^0-9xX]", "", str(read.get("isbn") or "")).upper(),
-        "isbn13": isbn13,
-        "isbn10": isbn10,
-        "openlibrary_work_id": book_openlibrary_work_id(read),
-    }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def read_identity_rows_with_current_verified_work_ids(reads, metadata_rows):
     """Project fresh, provider-consistent verified work IDs onto read rows.
 
@@ -1191,7 +1176,7 @@ def read_identity_rows_with_current_verified_work_ids(reads, metadata_rows):
             projected.append(item)
             continue
 
-        if str(metadata.get("identity_hash") or "") != _read_metadata_identity_hash(item):
+        if str(metadata.get("identity_hash") or "") != read_metadata_identity_hash(item):
             projected.append(item)
             continue
         if str(metadata.get("identity_provider") or "").strip().casefold() != "openlibrary":
@@ -1265,7 +1250,7 @@ def _read_metadata_attempt_is_due(read, retry_before):
         {"openlibrary_work_id": read.get("cached_work_id") or ""}
     )
     if (
-        str(read.get("cached_identity_hash") or "") != _read_metadata_identity_hash(read)
+        str(read.get("cached_identity_hash") or "") != read_metadata_identity_hash(read)
         or (current_work_id and cached_work_id and cached_work_id != current_work_id)
     ):
         return True
@@ -1731,7 +1716,7 @@ async def refresh_read_metadata(
                 )
                 metadata, identity_evidence, verified_work_id = {}, {}, ""
 
-            identity_hash = _read_metadata_identity_hash(read)
+            identity_hash = read_metadata_identity_hash(read)
             identity_provider = str(identity_evidence.get("provider") or "")
             identity_provider_id = str(identity_evidence.get("provider_id") or "")
             if identity_evidence or attempt_error_type:
@@ -1759,7 +1744,7 @@ async def refresh_read_metadata(
 
             with transaction() as con:
                 current = con.execute("SELECT * FROM reads WHERE id=?", (read["id"],)).fetchone()
-                if current is None or _read_metadata_identity_hash(dict(current)) != identity_hash:
+                if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
                     # A title, author, or ISBN edit landed while fetching.
                     continue
                 if book_openlibrary_work_id(dict(current)) != work_id:
@@ -2092,39 +2077,76 @@ def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
     return str(parsed.copy_set_param("shelf", shelf))
 
 
-async def import_goodreads_shelves(
+DEFAULT_GOODREADS_SHELVES: tuple[str, ...] = ("to-read", "currently-reading")
+GoodreadsShelfRow = tuple[str, str, str, str | None, str | None]
+
+
+def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShelfRow]:
+    feed = feedparser.parse(content)
+    entries = list(feed.entries[:500])
+    shelf_rows: list[GoodreadsShelfRow] = []
+    for entry in entries:
+        title = str(entry.get("title", "")).strip()[:500]
+        author = str(
+            entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
+        ).strip()[:300]
+        if not title:
+            continue
+        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+        shelf_rows.append(
+            (
+                shelf,
+                title,
+                author,
+                isbn,
+                _read_date_value(entry.get("user_date_added")),
+            )
+        )
+    return shelf_rows
+
+
+async def _fetch_goodreads_shelf(
     read_rss_url: str,
-    shelves: tuple[str, ...] = ("to-read", "currently-reading"),
+    shelf: str,
+    client: httpx.AsyncClient,
+) -> list[GoodreadsShelfRow] | None:
+    try:
+        shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
+        content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True, client=client)
+    except Exception:
+        return None
+    return _parse_goodreads_shelf_rows(shelf, content)
+
+
+async def _fetch_goodreads_shelves(
+    read_rss_url: str,
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, list[GoodreadsShelfRow] | None]:
+    if not shelves:
+        return {}
+    if client is None:
+        async with _source_client() as owned_client:
+            fetched = await asyncio.gather(
+                *(_fetch_goodreads_shelf(read_rss_url, shelf, owned_client) for shelf in shelves)
+            )
+    else:
+        fetched = await asyncio.gather(
+            *(_fetch_goodreads_shelf(read_rss_url, shelf, client) for shelf in shelves)
+        )
+    return dict(zip(shelves, fetched))
+
+
+def _apply_goodreads_shelves(
+    fetched_shelves: dict[str, list[GoodreadsShelfRow] | None],
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
-    """Import Goodreads non-read shelves separately from completed ``reads``."""
     imported: dict[str, int] = {}
     for shelf in shelves:
-        try:
-            shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
-            content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True)
-        except Exception:
+        shelf_rows = fetched_shelves.get(shelf)
+        if shelf_rows is None:
             imported[shelf] = 0
             continue
-        feed = feedparser.parse(content)
-        entries = list(feed.entries[:500])
-        shelf_rows = []
-        for entry in entries:
-            title = str(entry.get("title", "")).strip()[:500]
-            author = str(
-                entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
-            ).strip()[:300]
-            if not title:
-                continue
-            isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
-            shelf_rows.append(
-                (
-                    shelf,
-                    title,
-                    author,
-                    isbn,
-                    _read_date_value(entry.get("user_date_added")),
-                )
-            )
         with transaction() as con:
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
             con.executemany(
@@ -2140,9 +2162,23 @@ async def import_goodreads_shelves(
     return imported
 
 
-async def import_goodreads_rss(url: str):
+async def import_goodreads_shelves(
+    read_rss_url: str,
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, int]:
+    """Import Goodreads non-read shelves separately from completed ``reads``."""
+    fetched_shelves = await _fetch_goodreads_shelves(
+        read_rss_url,
+        shelves=shelves,
+        client=client,
+    )
+    return _apply_goodreads_shelves(fetched_shelves, shelves=shelves)
+
+
+async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None):
     url = validate_goodreads_rss_url(url)
-    content, _ = await fetch_bytes(url, allow_goodreads_http=True)
+    content, _ = await fetch_bytes(url, allow_goodreads_http=True, client=client)
     feed = feedparser.parse(content)
     count = 0
     read_rows = []

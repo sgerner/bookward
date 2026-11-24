@@ -1,11 +1,14 @@
 import asyncio
 from pathlib import Path
+import socket
 import sqlite3
 import sys
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from afterword_engine import ingestion
 from afterword_engine.config import settings
 from afterword_engine.database import initialize
 from afterword_engine.ingestion import goodreads_shelf_rss_url, import_goodreads_shelves, validate_goodreads_rss_url
@@ -263,6 +266,154 @@ def test_goodreads_imports_delete_matching_items_from_both_shelves_using_title_a
         ("to-read", "project hail mary", "Andy Weir"),
     ]
 
+
+def test_import_goodreads_shelves_shares_client_fetches_concurrently_and_writes_in_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "concurrent_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Project Hail Mary</title>
+        <author_name>Andy Weir</author_name>
+      </item>
+    </channel></rss>"""
+    reading_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Piranesi</title>
+        <author_name>Susanna Clarke</author_name>
+      </item>
+    </channel></rss>"""
+
+    created_clients: list[httpx.AsyncClient] = []
+    seen_clients: list[httpx.AsyncClient | None] = []
+    in_flight = 0
+    max_in_flight = 0
+    original_source_client = ingestion._source_client
+
+    def tracking_source_client() -> httpx.AsyncClient:
+        client = original_source_client()
+        created_clients.append(client)
+        return client
+
+    async def fake_fetch_bytes(url: str, allow_goodreads_http: bool = False, client=None):
+        nonlocal in_flight, max_in_flight
+        seen_clients.append(client)
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            if "shelf=to-read" in url:
+                # Finish after currently-reading so rowid order verifies deterministic SQLite writes.
+                await asyncio.sleep(0.06)
+                return to_read_xml, "application/xml"
+            if "shelf=currently-reading" in url:
+                await asyncio.sleep(0.02)
+                return reading_xml, "application/xml"
+            raise AssertionError(f"Unexpected url: {url}")
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(ingestion, "_source_client", tracking_source_client)
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+
+    counts = asyncio.run(
+        import_goodreads_shelves("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+    assert counts == {"to-read": 1, "currently-reading": 1}
+    assert len(created_clients) == 1
+    assert seen_clients == [created_clients[0], created_clients[0]]
+    assert max_in_flight == 2
+
+    con = sqlite3.connect(db_path)
+    try:
+        ordered_shelves = [
+            shelf
+            for (shelf,) in con.execute(
+                "SELECT shelf FROM goodreads_shelf_items ORDER BY id ASC"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+    assert ordered_shelves == ["to-read", "currently-reading"]
+
+
+def test_import_goodreads_shelves_preserves_existing_rows_on_http_404(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "private_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Kept To Read', 'Author One')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Old Reading', 'Author Two')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    reading_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>New Reading</title>
+        <author_name>Author Three</author_name>
+      </item>
+    </channel></rss>"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        shelf = request.url.params.get("shelf")
+        if shelf == "to-read":
+            return httpx.Response(404, content=b"Not Found", headers={"content-type": "text/plain"})
+        if shelf == "currently-reading":
+            return httpx.Response(200, content=reading_xml, headers={"content-type": "application/rss+xml"})
+        raise AssertionError(f"Unexpected shelf: {shelf}")
+
+    monkeypatch.setattr(
+        ingestion,
+        "_source_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+
+    counts = asyncio.run(
+        import_goodreads_shelves("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+    assert counts == {"to-read": 0, "currently-reading": 1}
+
+    con = sqlite3.connect(db_path)
+    try:
+        shelf_rows = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert shelf_rows == [
+        ("currently-reading", "New Reading", "Author Three"),
+        ("to-read", "Kept To Read", "Author One"),
+    ]
 
 def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_reads(
     tmp_path: Path, monkeypatch
