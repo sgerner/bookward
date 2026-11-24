@@ -15,7 +15,6 @@ import hashlib
 import json
 import re
 import weakref
-from collections import OrderedDict
 from datetime import date, datetime, timezone
 from urllib.parse import urlencode, urlparse
 
@@ -111,92 +110,6 @@ async def _openlibrary_request(
 
     await wait_for_openlibrary_request_slot()
     return await client.get(url, **kwargs)
-
-
-class CatalogCircuitBreaker(set):
-    """Batch rate-limit tracker that probes Google Books with one initial request."""
-
-    def __init__(self, *args) -> None:
-        super().__init__(*args)
-        self._probe_locks: dict[str, asyncio.Lock] = {}
-        self._probed_providers: set[str] = set()
-
-    def _lock_for(self, provider: str) -> asyncio.Lock:
-        lock = self._probe_locks.get(provider)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._probe_locks[provider] = lock
-        return lock
-
-
-_PLAIN_SET_PROBE_STATES = weakref.WeakKeyDictionary()
-
-
-def _skipped_rate_limited_trace(provider: str, query_kind: str) -> dict[str, object]:
-    return {
-        "provider": provider,
-        "fetched_at": _utc_now(),
-        "query_kind": query_kind,
-        "status": "rate_limited",
-        "http_status": 429,
-        "skipped": True,
-    }
-
-
-async def _run_with_provider_circuit_breaker(
-    rate_limited_providers: set[str] | None,
-    provider: str,
-    *,
-    probe_first: bool,
-    call_fn,
-    is_rate_limited_fn,
-    on_skip_fn,
-):
-    if rate_limited_providers is None:
-        return await call_fn()
-    if provider in rate_limited_providers:
-        return on_skip_fn()
-    if probe_first:
-        if isinstance(rate_limited_providers, CatalogCircuitBreaker):
-            lock = rate_limited_providers._lock_for(provider)
-            probed = rate_limited_providers._probed_providers
-        else:
-            loop = asyncio.get_running_loop()
-            loop_states = _PLAIN_SET_PROBE_STATES.get(loop)
-            if loop_states is None:
-                loop_states = OrderedDict()
-                _PLAIN_SET_PROBE_STATES[loop] = loop_states
-            set_id = id(rate_limited_providers)
-            entry = loop_states.get(set_id)
-            if entry is None:
-                entry = (rate_limited_providers, {}, set())
-                loop_states[set_id] = entry
-                while len(loop_states) > 64:
-                    loop_states.popitem(last=False)
-            else:
-                loop_states.move_to_end(set_id)
-            _, locks, probed = entry
-            lock = locks.get(provider)
-            if lock is None:
-                lock = asyncio.Lock()
-                locks[provider] = lock
-        if provider not in probed:
-            async with lock:
-                if provider in rate_limited_providers:
-                    return on_skip_fn()
-                if provider not in probed:
-                    result = await call_fn()
-                    if is_rate_limited_fn(result):
-                        rate_limited_providers.add(provider)
-                    else:
-                        probed.add(provider)
-                    return result
-        if provider in rate_limited_providers:
-            return on_skip_fn()
-    result = await call_fn()
-    if is_rate_limited_fn(result):
-        rate_limited_providers.add(provider)
-    return result
 
 
 def _bounded_source_payload(value: object) -> dict[str, object]:
@@ -911,7 +824,6 @@ async def resolve_book_metadata(
     prefer_catalog_synopsis: bool = False,
     google_books_api_key: str = "",
     prefer_isbn_cover: bool = False,
-    rate_limited_providers: set[str] | None = None,
 ) -> dict[str, object]:
     """Resolve summary, publication date, and cover from public book catalogs.
 
@@ -965,38 +877,16 @@ async def resolve_book_metadata(
         or (prefer_isbn_cover and has_source_isbn)
     ) and title and author:
         async def _lookup_provider_with_fallback(lookup):
-            provider_name = (
-                "openlibrary" if lookup is _lookup_open_library_record else "google_books"
-            )
             provider_traces: list[dict[str, object]] = []
 
-            async def _invoke_lookup(query_isbn: str) -> dict[str, object]:
-                query_kind = "isbn" if query_isbn else "title_author"
+            async def cached_lookup(query_isbn: str) -> dict[str, object]:
                 kwargs = (
                     {"google_books_api_key": google_books_api_key}
                     if lookup is _lookup_google_books_record
                     else {}
                 )
-                return await _run_with_provider_circuit_breaker(
-                    rate_limited_providers,
-                    provider_name,
-                    probe_first=provider_name == "google_books",
-                    call_fn=lambda: lookup(
-                        title, author, client=client, isbn=query_isbn, **kwargs
-                    ),
-                    is_rate_limited_fn=lambda record: (
-                        isinstance(record, dict)
-                        and isinstance(record.get("_fetch_trace"), dict)
-                        and record["_fetch_trace"].get("status") == "rate_limited"
-                    ),
-                    on_skip_fn=lambda: {
-                        "_fetch_trace": _skipped_rate_limited_trace(provider_name, query_kind)
-                    },
-                )
-
-            async def cached_lookup(query_isbn: str) -> dict[str, object]:
                 if lookup_cache is None:
-                    return await _invoke_lookup(query_isbn)
+                    return await lookup(title, author, client=client, isbn=query_isbn, **kwargs)
                 cache_key = (
                     lookup.__name__,
                     _normalized_title(title),
@@ -1006,7 +896,9 @@ async def resolve_book_metadata(
                 )
                 task = lookup_cache.get(cache_key)
                 if task is None:
-                    task = asyncio.create_task(_invoke_lookup(query_isbn))
+                    task = asyncio.create_task(
+                        lookup(title, author, client=client, isbn=query_isbn, **kwargs)
+                    )
                     lookup_cache[cache_key] = task
                 return await task
 

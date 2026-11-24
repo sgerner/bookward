@@ -1179,35 +1179,42 @@ def test_provisional_isbn_skips_quality_fallback_and_runs_metadata_fallbacks_con
 
 
 @pytest.mark.parametrize("resolver_kind", ["quality", "covers"])
-def test_twelve_book_eight_worker_benchmark_parallelizes_google_books(monkeypatch, resolver_kind):
-    import time
-
-    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", asyncio.sleep)
-
+def test_concurrent_workers_space_openlibrary_starts_with_fake_clock_without_blocking_google(
+    monkeypatch, resolver_kind
+):
+    clock = [10.0]
+    ol_starts: list[float] = []
+    gb_starts: list[float] = []
     ol_inflight = 0
     ol_peak = 0
     gb_inflight = 0
     gb_peak = 0
-    worker_gb_waits: list[float] = []
-    worker_enter_times: dict[int, float] = {}
+
+    monkeypatch.setattr(covers, "_openlibrary_rate_clock", lambda loop: clock[0])
+
+    async def advance_clock(delay: float) -> None:
+        await asyncio.sleep(0)
+        clock[0] += delay
+
+    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_clock)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal ol_inflight, ol_peak, gb_inflight, gb_peak
         if request.url.host == "openlibrary.org":
+            ol_starts.append(clock[0])
             ol_inflight += 1
             ol_peak = max(ol_peak, ol_inflight)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0)
             ol_inflight -= 1
             return httpx.Response(200, json={"docs": []})
         if request.url.host == "www.googleapis.com":
+            gb_starts.append(clock[0])
             q = request.url.params.get("q", "")
             isbn = q.split("isbn:")[1] if q.startswith("isbn:") else _isbn13_with_prefix(99)
             idx = int(isbn[3:12]) if q.startswith("isbn:") else int(q.split("Book ")[1].split(" ")[0])
-            if idx in worker_enter_times:
-                worker_gb_waits.append(time.perf_counter() - worker_enter_times.pop(idx))
             gb_inflight += 1
             gb_peak = max(gb_peak, gb_inflight)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0)
             gb_inflight -= 1
             return httpx.Response(
                 200,
@@ -1233,11 +1240,11 @@ def test_twelve_book_eight_worker_benchmark_parallelizes_google_books(monkeypatc
     async def run():
         semaphore = asyncio.Semaphore(8)
         cache = {}
-        breaker = covers.CatalogCircuitBreaker()
+        # Include 12 distinct books plus a duplicate of Book 1 to verify single-flight cache sharing.
+        book_indices = [*range(1, 13), 1]
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             async def worker(idx: int):
                 async with semaphore:
-                    worker_enter_times[idx] = time.perf_counter()
                     if resolver_kind == "quality":
                         return await resolve_catalog_match(
                             f"Book {idx}",
@@ -1245,22 +1252,181 @@ def test_twelve_book_eight_worker_benchmark_parallelizes_google_books(monkeypatc
                             client=client,
                             cache=cache,
                             isbn13=_isbn13_with_prefix(idx),
-                            rate_limited_providers=breaker,
                         )
                     return await resolve_book_metadata(
                         f"Book {idx}",
                         "Bench Author",
                         client=client,
                         lookup_cache=cache,
-                        rate_limited_providers=breaker,
                     )
 
-            return await asyncio.gather(*(worker(index) for index in range(1, 13)))
+            return await asyncio.gather(*(worker(index) for index in book_indices))
 
     results = asyncio.run(run())
-    assert len(results) == 12
+    assert len(results) == 13
+    assert results[0] == results[-1]
     assert ol_peak == 1
     assert gb_peak == 8
-    assert len(worker_gb_waits) == 12
-    assert max(worker_gb_waits[:8]) < 0.25
+    assert len(ol_starts) == 12
+    assert len(gb_starts) == 12
+    assert gb_starts[:8] == [10.0] * 8
+    assert all(
+        later - earlier >= covers.OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS
+        for earlier, later in zip(ol_starts, ol_starts[1:])
+    )
+    assert ol_starts == [10.0 + offset for offset in range(12)]
 
+
+@pytest.mark.parametrize(
+    ("failing_provider", "failure_mode"),
+    [
+        ("openlibrary", "http_503"),
+        ("openlibrary", "connect_error"),
+        ("google_books", "http_503"),
+        ("google_books", "connect_error"),
+        ("google_books", "http_429"),
+    ],
+)
+def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
+    monkeypatch, failing_provider, failure_mode
+):
+    requested_isbn = "9780307474278"
+    call_order: list[str] = []
+    ol_gate: list[asyncio.Event] = []
+
+    async def gated_openlibrary_slot():
+        await asyncio.wait_for(ol_gate[0].wait(), timeout=2.0)
+
+    monkeypatch.setattr(covers, "wait_for_openlibrary_request_slot", gated_openlibrary_slot)
+
+    def fail_response(request: httpx.Request) -> httpx.Response:
+        if failure_mode == "connect_error":
+            raise httpx.ConnectError("simulated provider network failure", request=request)
+        if failure_mode == "http_429":
+            return httpx.Response(429, json={"error": {"message": "quota exceeded"}})
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "openlibrary.org":
+            call_order.append("openlibrary")
+            if failing_provider == "openlibrary":
+                return fail_response(request)
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [{
+                        "key": "/works/OLSURVIVEW",
+                        "title": "Resilient Book",
+                        "author_name": ["Steady Author"],
+                        "isbn": [requested_isbn],
+                        "description": "Verified Open Library synopsis when Google fails.",
+                        "subject": ["Literary fiction"],
+                        "first_publish_year": 2022,
+                        "cover_i": 54321,
+                    }],
+                },
+            )
+        if request.url.host == "www.googleapis.com":
+            call_order.append("google_books")
+            ol_gate[0].set()
+            if failing_provider == "google_books":
+                return fail_response(request)
+            return httpx.Response(
+                200,
+                json={
+                    "items": [{
+                        "id": "gb-survive-1",
+                        "volumeInfo": {
+                            "title": "Resilient Book",
+                            "authors": ["Steady Author"],
+                            "description": "Verified Google Books synopsis when Open Library fails.",
+                            "categories": ["Literary fiction"],
+                            "publishedDate": "2022-09-10",
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": requested_isbn}
+                            ],
+                            "imageLinks": {
+                                "thumbnail": "https://books.google.com/books/content?id=gb-survive-1"
+                            },
+                        },
+                    }],
+                },
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    expected_survivor = "google_books" if failing_provider == "openlibrary" else "openlibrary"
+    expected_failure_status = (
+        "request_error"
+        if failure_mode == "connect_error"
+        else "rate_limited"
+        if failure_mode == "http_429"
+        else "http_error"
+    )
+
+    async def run_covers():
+        ol_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        async with _provider_client(handler) as client:
+            return await resolve_book_metadata(
+                "Resilient Book",
+                "Steady Author",
+                isbn13=requested_isbn,
+                client=client,
+            )
+
+    metadata = asyncio.run(run_covers())
+    assert call_order == ["google_books", "openlibrary"]
+    assert metadata["provider"] == expected_survivor
+    assert metadata["description"].startswith(
+        "Verified Google Books synopsis"
+        if expected_survivor == "google_books"
+        else "Verified Open Library synopsis"
+    )
+    assert metadata["genres"] == ["Literary fiction"]
+    assert metadata["cover_url"] != ""
+    assert metadata["release_date"].startswith("2022-")
+    cover_traces = metadata["metadata_provenance"]["fetch_trace"]
+    assert [t["provider"] for t in cover_traces] == ["openlibrary", "google_books"]
+    failed_cover_trace = next(t for t in cover_traces if t["provider"] == failing_provider)
+    assert failed_cover_trace["status"] == expected_failure_status
+
+    async def run_audit():
+        ol_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        rate_limited: set[str] = set()
+        async with _provider_client(handler) as client:
+            first = await _audit_one(
+                {"id": 101, "title": "Resilient Book", "author": "Steady Author", "isbn13": requested_isbn},
+                client,
+                {},
+                rate_limited_providers=rate_limited,
+            )
+            second = None
+            if failure_mode == "http_429":
+                ol_gate[:] = [asyncio.Event()]
+                ol_gate[0].set()
+                second = await _audit_one(
+                    {"id": 102, "title": "Resilient Book", "author": "Steady Author", "isbn13": requested_isbn},
+                    client,
+                    {},
+                    rate_limited_providers=rate_limited,
+                )
+            return first, second
+
+    audit_result, skipped_followup = asyncio.run(run_audit())
+    assert audit_result["quality_status"] == "accepted"
+    assert audit_result["provider"] == expected_survivor
+    assert audit_result["flags"] == []
+    audit_traces = audit_result["metadata_provenance"]["fetch_trace"]
+    assert [t["provider"] for t in audit_traces] == ["openlibrary", "google_books"]
+    failed_audit_trace = next(t for t in audit_traces if t["provider"] == failing_provider)
+    assert failed_audit_trace["status"] == expected_failure_status
+    if skipped_followup is not None:
+        assert skipped_followup["quality_status"] == "accepted"
+        assert skipped_followup["flags"] == []
+        skipped_gb_trace = next(
+            t for t in skipped_followup["metadata_provenance"]["fetch_trace"]
+            if t["provider"] == "google_books"
+        )
+        assert skipped_gb_trace["skipped"] is True
+        assert skipped_gb_trace["status"] == "rate_limited"
