@@ -8,6 +8,7 @@ records, and never exposes provider credentials to the web application.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 import smtplib
@@ -22,13 +23,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .config import settings
 from .database import row, rows, transaction
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
 from .ingestion import read_identity_rows_with_current_verified_work_ids
-from .security import safe_error_message, validate_public_url
+from .security import BLOCKED_HOSTS, safe_error_message, validate_public_url
 
 
 CHANNELS = {"discord", "email"}
+DISCORD_WEBHOOK_HOSTS = frozenset(
+    {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
+)
 SMTP_SECURITY = {"none", "starttls", "ssl"}
 MAX_DELIVERY_ATTEMPTS = 3
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -102,7 +107,9 @@ def digest_config(values: dict | None = None) -> dict:
         "minimum_score": _float(values.get("digest_minimum_score"), 80, 0, 100),
         "maximum_books": _int(values.get("digest_maximum_books"), 5, 1, 20),
         "only_new": _bool(values.get("digest_only_new"), True),
-        "app_url": str(values.get("digest_app_url") or "http://localhost:5173").rstrip("/"),
+        "app_url": str(
+            values.get("digest_app_url") or settings.public_url or "http://localhost:5173"
+        ).rstrip("/"),
         "discord_webhook_url": str(values.get("digest_discord_webhook_url") or ""),
         "email_to": str(values.get("digest_email_to") or ""),
         "email_from": str(values.get("digest_email_from") or ""),
@@ -115,7 +122,7 @@ def digest_config(values: dict | None = None) -> dict:
     }
 
 
-def validate_digest_config(config: dict) -> None:
+def validate_digest_config(config: dict, *, previous: dict | None = None) -> None:
     """Validate user-provided settings before they are persisted."""
 
     try:
@@ -133,10 +140,20 @@ def validate_digest_config(config: dict) -> None:
     if any(channel not in CHANNELS for channel in normalized_channel_values):
         raise ValueError("Unsupported digest channel")
     channels = parse_channels(normalized_channel_values)
-    # Turning the digest off is a kill switch. Do not make an operator repair
-    # a stale webhook or SMTP credential before they can stop delivery. The
-    # full provider validation runs again when the digest is enabled.
+    # Turning an active schedule off is a one-step kill switch: do not make an
+    # operator repair a stale webhook or SMTP credential before stopping
+    # automatic delivery. When saving channels directly (even while scheduling
+    # stays off), validate every active channel.
     enabled = _bool(config.get("enabled"), True)
+    if previous is None:
+        channels_to_validate = set(channels) if enabled else set()
+    else:
+        prev_enabled = _bool(previous.get("enabled"), False)
+        prev_channels = set(parse_channels(previous.get("channels")))
+        if prev_enabled and not enabled:
+            channels_to_validate = set(channels) - prev_channels
+        else:
+            channels_to_validate = set(channels)
     app_url = str(config.get("app_url") or "")
     parsed_app = urlparse(app_url)
     if (
@@ -149,31 +166,103 @@ def validate_digest_config(config: dict) -> None:
         or any(c in app_url for c in "\r\n")
     ):
         raise ValueError("Digest app URL must use HTTP or HTTPS")
-    webhook = str(config.get("discord_webhook_url") or "")
-    if enabled and "discord" in channels:
-        if not webhook:
-            raise ValueError("Discord webhook URL is required when Discord is enabled")
-        if not webhook.startswith("https://"):
-            raise ValueError("Discord webhook URL must use HTTPS")
-        hostname = (urlparse(webhook).hostname or "").lower().rstrip(".")
-        if hostname not in {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}:
-            raise ValueError("Discord webhook URL must point to Discord")
-        # Validate the address at write time and again immediately before the
-        # request to reduce SSRF risk if DNS changes after configuration.
-        validate_public_url(webhook)
+    webhook = str(config.get("discord_webhook_url") or "").strip()
+    if "discord" in channels_to_validate and not webhook:
+        raise ValueError("Discord webhook URL is required when Discord is enabled")
+    if webhook:
+        # Validate any non-empty webhook regardless of enabled or previous state
+        # so manual test/run actions cannot reach an unverified host.
+        validate_discord_webhook_url(webhook)
     if config.get("smtp_security") not in SMTP_SECURITY:
         raise ValueError("SMTP security must be none, starttls, or ssl")
-    if enabled and "email" in channels:
-        for label in ("email_to", "email_from"):
-            if not _valid_email(config.get(label, "")):
-                raise ValueError(f"Valid {label.replace('_', ' ')} is required when email is enabled")
-        if not str(config.get("smtp_host") or "").strip():
-            raise ValueError("SMTP host is required when email is enabled")
+    for label in ("email_to", "email_from"):
+        raw_email = str(config.get(label) or "").strip()
+        if raw_email and not _valid_email(raw_email):
+            raise ValueError(f"Valid {label.replace('_', ' ')} is required when email is enabled")
+        if "email" in channels_to_validate and not raw_email:
+            raise ValueError(f"Valid {label.replace('_', ' ')} is required when email is enabled")
+    raw_smtp_host = str(config.get("smtp_host") or "").strip()
+    if raw_smtp_host:
+        validate_smtp_host(raw_smtp_host)
+    elif "email" in channels_to_validate:
+        raise ValueError("SMTP host is required when email is enabled")
+
+
+def validate_discord_webhook_url(webhook: str) -> str:
+    url = str(webhook or "").strip()
+    if not url:
+        raise ValueError("Discord webhook URL is required when Discord is enabled")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not url.startswith("https://"):
+        raise ValueError("Discord webhook URL must use HTTPS")
+    if parsed.username or parsed.password or parsed.fragment or any(c in url for c in "\r\n"):
+        raise ValueError("Discord webhook URL is invalid")
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname not in DISCORD_WEBHOOK_HOSTS:
+        raise ValueError("Discord webhook URL must point to Discord")
+    validate_public_url(url)
+    return url
+
+
+def _allowed_smtp_hosts() -> set[str]:
+    return {
+        item.strip().lower().rstrip(".").strip("[]")
+        for item in str(settings.smtp_allowed_hosts or "").split(",")
+        if item.strip()
+    }
+
+
+def validate_smtp_host(host: str, allowed_hosts: set[str] | None = None) -> str:
+    cleaned = str(host or "").strip()
+    if not cleaned:
+        raise ValueError("SMTP host is required when email is enabled")
+    if "://" in cleaned or any(c.isspace() or ord(c) < 32 or c in "/\\@?#" for c in cleaned):
+        raise ValueError("SMTP host must be a hostname or IP address")
+    candidate = (
+        cleaned[1:-1]
+        if cleaned.startswith("[") and cleaned.endswith("]")
+        else cleaned
+    )
+    if not candidate:
+        raise ValueError("SMTP host must be a hostname or IP address")
+    normalized = candidate.lower().rstrip(".")
+    allowed = (
+        _allowed_smtp_hosts()
+        if allowed_hosts is None
+        else {
+            item.strip().lower().rstrip(".").strip("[]")
+            for item in allowed_hosts
+            if item.strip()
+        }
+    )
+    if normalized in allowed:
+        return cleaned
+    if (
+        normalized in BLOCKED_HOSTS
+        or normalized.endswith(".localhost")
+        or normalized.endswith(".local")
+    ):
+        raise ValueError("SMTP host cannot target loopback, private, or local addresses")
+    ip_candidate = candidate.partition("%")[0] if "%" in candidate else candidate
+    try:
+        ip = ipaddress.ip_address(ip_candidate)
+    except ValueError:
+        if ":" in candidate:
+            raise ValueError("SMTP host must not include a port") from None
+        return cleaned
+    effective_ip = ip.ipv4_mapped if getattr(ip, "ipv4_mapped", None) is not None else ip
+    if not effective_ip.is_global:
+        raise ValueError("SMTP host cannot target loopback, private, or local addresses")
+    return cleaned
 
 
 def _valid_email(value: str) -> bool:
-    name, address = parseaddr(str(value or ""))
-    return bool(address and "@" in address and not any(c in address for c in "\r\n"))
+    raw = str(value or "")
+    if any(c in raw for c in "\r\n"):
+        return False
+    _name, address = parseaddr(raw)
+    local, sep, domain = address.partition("@")
+    return bool(sep and local and domain and not any(c.isspace() for c in address))
 
 
 def period_key(at: datetime | None = None, timezone_name: str = "UTC") -> str:
@@ -343,11 +432,11 @@ def _discord_payload(items: list[dict], config: dict, key: str, test=False) -> d
 
 
 async def _send_discord(config: dict, payload: dict) -> str:
-    validate_public_url(config["discord_webhook_url"])
+    webhook_url = validate_discord_webhook_url(config.get("discord_webhook_url", ""))
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             # Enforce this at delivery too, including retries of old payloads.
-            response = await client.post(config["discord_webhook_url"], json={
+            response = await client.post(webhook_url, json={
                 **payload, "allowed_mentions": {"parse": []},
             })
             response.raise_for_status()
@@ -359,7 +448,9 @@ async def _send_discord(config: dict, payload: dict) -> str:
 
 
 def _smtp_send(config: dict, subject: str, body: str) -> str:
-    host = config["smtp_host"].strip()
+    host = validate_smtp_host(config.get("smtp_host", ""))
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     security_mode = config["smtp_security"]
     context = ssl.create_default_context()
     if security_mode == "ssl":
