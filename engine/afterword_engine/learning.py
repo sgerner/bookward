@@ -121,11 +121,7 @@ def create_recommendation_run(
 
     if session_id:
         _validate_identifier(session_id, "session identifier")
-    items = [
-        item
-        for item in recommendations
-        if str(item.get("status") or "").strip().casefold() != "hidden"
-    ]
+    items = list(recommendations)
     run_id = str(uuid.uuid4())
     metadata = {"status": status or "all"}
     if limit is not None:

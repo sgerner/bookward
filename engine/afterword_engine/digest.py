@@ -26,10 +26,7 @@ import httpx
 from .config import settings
 from .database import row, rows, transaction
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
-from .ingestion import (
-    enrich_shelf_rows_with_work_ids,
-    read_identity_rows_with_current_verified_work_ids,
-)
+from .ingestion import read_identity_rows_with_current_verified_work_ids
 from .security import BLOCKED_HOSTS, safe_error_message, validate_public_url
 
 
@@ -357,10 +354,9 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
         if "no such table: read_metadata" not in str(exc).casefold():
             raise
         read_metadata = []
-    verified_reads = read_identity_rows_with_current_verified_work_ids(
-        read_rows, read_metadata
+    read_index = ReadIdentityIndex.from_reads(
+        read_identity_rows_with_current_verified_work_ids(read_rows, read_metadata)
     )
-    read_index = ReadIdentityIndex.from_reads(verified_reads)
     shortlist_index = ReadIdentityIndex.from_reads(
         rows(
             "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
@@ -369,28 +365,11 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
             "WHERE c.status IN ('saved','imported')"
         )
     )
-    try:
-        shelf_rows = rows(
-            "SELECT id,shelf,source,title,author,isbn,openlibrary_work_id "
-            "FROM goodreads_shelf_items"
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table: goodreads_shelf_items" not in str(exc).casefold():
-            raise
-        shelf_rows = []
-    shelf_index = ReadIdentityIndex.from_reads(
-        enrich_shelf_rows_with_work_ids(rows, shelf_rows, read_rows=verified_reads)
-    )
     selected = []
     seen_keys = set()
     for item in result:
         keys = book_row_identity_match_keys(item)
-        if (
-            read_index.matches(item)
-            or shortlist_index.matches(item)
-            or shelf_index.matches(item)
-            or keys & seen_keys
-        ):
+        if read_index.matches(item) or shortlist_index.matches(item) or keys & seen_keys:
             continue
         selected.append(item)
         seen_keys.update(keys)

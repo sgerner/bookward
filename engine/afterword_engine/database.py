@@ -1009,6 +1009,7 @@ MIGRATIONS = [
         28,
         """
         -- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD
+        DROP TABLE IF EXISTS goodreads_shelf_items_v2;
         CREATE TABLE goodreads_shelf_items_v2 (
             id INTEGER PRIMARY KEY,
             shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
@@ -1047,6 +1048,7 @@ MIGRATIONS = [
             added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
             updated_at=excluded.updated_at;
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf;
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
         DROP TABLE goodreads_shelf_items;
         ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items;
@@ -1499,6 +1501,7 @@ def _rebuild_goodreads_shelf_items_migration(con: sqlite3.Connection) -> None:
     extra_ddl_clause = (
         ",\n            " + ",\n            ".join(extra_ddls) if extra_ddls else ""
     )
+    con.execute("DROP TABLE IF EXISTS goodreads_shelf_items_v2")
     con.execute(
         f"""
         CREATE TABLE goodreads_shelf_items_v2 (

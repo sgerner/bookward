@@ -276,6 +276,17 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         for item, vector in zip(candidate_items, all_candidate_vectors)
     }
     candidate_vectors = [vectors_by_id[int(item["id"])] for item in candidates]
+    from .identity import book_row_identity_match_keys
+    with connect() as con:
+        shelf_rows = con.execute(
+            "SELECT shelf, title, author, isbn, openlibrary_work_id FROM goodreads_shelf_items"
+        ).fetchall()
+    to_read_keys: set[str] = set()
+    currently_reading_keys: set[str] = set()
+    for srow in shelf_rows:
+        target = currently_reading_keys if srow["shelf"] == "currently-reading" else to_read_keys
+        target.update(book_row_identity_match_keys(dict(srow)))
+
     ranked = rank_candidates(reads, read_vectors, candidates, candidate_vectors)
     candidate_inputs_by_id = {int(item["id"]): item for item in candidates}
     batch_id = uuid.uuid4().hex
@@ -283,6 +294,20 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     with transaction() as con:
         written = []
         for candidate in ranked:
+            cand_keys = set(book_row_identity_match_keys(candidate))
+            if cand_keys & currently_reading_keys:
+                con.execute(
+                    "UPDATE candidates SET status='hidden', score=0, explanation='[]', score_batch_id=NULL, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('new', 'recommended')",
+                    (candidate["id"],),
+                )
+                continue
+            if cand_keys & to_read_keys:
+                candidate["score"] = round(min(100.0, float(candidate["score"]) + 10.0), 1)
+                explanation = list(candidate.get("explanation") or [])
+                if "On your Goodreads to-read shelf" not in explanation:
+                    explanation.insert(0, "On your Goodreads to-read shelf")
+                candidate["explanation"] = explanation
             cursor = con.execute(
                 "UPDATE candidates SET score=?, explanation=?, score_batch_id=NULL, "
                 "status=CASE WHEN status='new' THEN 'recommended' ELSE status END, "
