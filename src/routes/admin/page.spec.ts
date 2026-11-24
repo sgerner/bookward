@@ -61,9 +61,13 @@ describe('admin page SSR', () => {
 			}
 		});
 
-		expect(body).toContain('SSO-only · user · active');
+		expect(body).toContain(
+			'SSO-only <span aria-hidden="true">·</span> user <span aria-hidden="true">·</span> active'
+		);
 		expect(body).not.toContain('oidc:deadbeefcafebabe1234567890');
-		expect(body).toContain('oidc:legacy-reader · user · active');
+		expect(body).toContain(
+			'oidc:legacy-reader <span aria-hidden="true">·</span> user <span aria-hidden="true">·</span> active'
+		);
 		expect(body).toContain('aria-label="Reset password for Alice Local"');
 		expect(body).toContain('aria-label="Reset password for Legacy OIDC Name"');
 		expect(body).toContain('aria-label="Reset password unavailable for Casey SSO"');

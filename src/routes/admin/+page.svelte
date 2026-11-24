@@ -38,7 +38,7 @@
 			{@const headingLabel = account.display_name || loginLabel}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
-					<div><h3 class="font-semibold">{headingLabel}</h3><p class="text-sm text-surface-700-300" aria-label={`${loginLabel}, ${account.role}, ${account.status}`}>{loginLabel} · {account.role} · {account.status}</p></div>
+					<div><h3 class="font-semibold">{headingLabel}</h3><p class="text-sm text-surface-700-300">{loginLabel} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}</p></div>
 					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
 						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${headingLabel}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
 				</div>
@@ -80,7 +80,7 @@
 			{/if}
 			{#if backup.last_error}
 				<p class="mt-3 p-3 preset-tonal-error" role="alert">
-					{#if backup.last_attempt_at}<time datetime={backup.last_attempt_at}>{backupTime.format(new Date(backup.last_attempt_at))} UTC</time> · {/if}
+					{#if backup.last_attempt_at}<time datetime={backup.last_attempt_at}>{backupTime.format(new Date(backup.last_attempt_at))} UTC</time> <span aria-hidden="true">·</span> {/if}
 					{backup.last_error}
 				</p>
 			{/if}
