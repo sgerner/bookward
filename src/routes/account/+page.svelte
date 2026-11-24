@@ -9,7 +9,7 @@
 
 <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
 <main id="main-content" tabindex="-1" class="mx-auto max-w-3xl px-4 py-10 sm:px-6">
-	<a href="/" class="text-primary-600-400">← Bookward</a>
+	<a href="/" class="inline-flex min-h-11 items-center text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Account</h1>
 	<p class="mt-2 text-surface-700-300">Signed in as <strong>{data.user.display_name || data.user.username}</strong>. Your recommendations and reading lists are private to this profile.</p>
 	{#if data.forcePasswordChange}<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">Set a personal password before continuing. Your administrator supplied a temporary password for this first sign-in.</p>{/if}
@@ -31,7 +31,7 @@
 			<ProfileField profileId={data.user?.profile_id} />
 			{#if data.methods.password_enabled}<label class="grid gap-2 text-sm font-medium">Current password<input class="input" type="password" name="current_password" autocomplete="current-password" required /></label>{/if}
 			<label class="grid gap-2 text-sm font-medium">New password<input class="input" type="password" name="new_password" autocomplete="new-password" minlength="12" required /></label>
-			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
+			<button class="btn btn-reflow preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
 		</form>
 	</section>
 	<section class="mt-6 rounded-2xl border border-surface-300-700 p-6">
@@ -48,7 +48,7 @@
 								<ProfileField profileId={data.user?.profile_id} />
 								<input type="hidden" name="id" value={identity.id} />
 								<p class="text-xs text-surface-700-300">You will need another sign-in method to access this profile.</p>
-								<button class="btn btn-sm preset-filled-error-500" type="submit" aria-label={`Confirm disconnect: ${identity.email || identity.issuer}`}>Confirm disconnect</button>
+								<button class="btn btn-sm btn-reflow preset-filled-error-500" type="submit" aria-label={`Confirm disconnect: ${identity.email || identity.issuer}`}>Confirm disconnect</button>
 							</form>
 						</details>
 					</div>
@@ -56,9 +56,9 @@
 			</div>
 		{/if}
 		{#if data.oidcEnabled}
-			<a class="btn preset-tonal-primary mt-5" href="/auth/oidc/start?intent=link&amp;profile_id={encodeURIComponent(data.user.profile_id)}">Link SSO identity</a>
+			<a class="btn btn-reflow preset-tonal-primary mt-5" href="/auth/oidc/start?intent=link&amp;profile_id={encodeURIComponent(data.user.profile_id)}">Link SSO identity</a>
 			<p class="mt-2 text-xs text-surface-700-300">Linking requires a sign-in within the last 10 minutes. Sign out and back in if asked to confirm.</p>
 		{/if}
 	</section>
-	{#if data.user.role === 'admin'}<a class="btn preset-tonal-surface mt-6" href="/admin">Manage accounts</a>{/if}
+	{#if data.user.role === 'admin'}<a class="btn btn-reflow preset-tonal-surface mt-6" href="/admin">Manage accounts</a>{/if}
 </main>

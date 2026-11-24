@@ -9,7 +9,7 @@ import httpx
 
 from ..associations import record_association_request
 from ..identity import book_identity
-from ..security import resolve_public_target
+from ..security import redact_url, resolve_public_target, sanitize_pinned_error_message
 
 
 DEFAULT_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
@@ -53,13 +53,28 @@ async def fetch_pinned_association_json(
             trust_env=False,
             headers={"User-Agent": user_agent},
         ) as client:
-            response = await client.request(
-                "GET",
-                pinned,
-                params=params,
-                headers={"Host": host_header},
-                extensions={"sni_hostname": hostname},
-            )
+            unpinned_url = client.build_request("GET", original, params=params).url
+            public_request = client.build_request("GET", redact_url(unpinned_url))
+            try:
+                response = await client.request(
+                    "GET",
+                    pinned,
+                    params=params,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": hostname},
+                )
+            except httpx.RequestError as exc:
+                sanitized = sanitize_pinned_error_message(
+                    exc,
+                    address=address,
+                    hostname=hostname,
+                )
+                try:
+                    rewritten = type(exc)(sanitized, request=public_request)
+                except TypeError:
+                    rewritten = httpx.RequestError(sanitized, request=public_request)
+                raise rewritten from None
+            response.request = public_request
             response.raise_for_status()
             if len(response.content) > max_bytes:
                 raise ValueError(f"{source_label} response is too large")

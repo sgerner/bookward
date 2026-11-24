@@ -68,11 +68,8 @@
 
 		const syncBounds = () => {
 			const headerRect = siteHeaderEl.getBoundingClientRect();
-			const topOffset = Math.max(80, Math.ceil(headerRect.height + 12));
-			const availableHeight = Math.max(
-				160,
-				Math.floor(window.innerHeight - Math.max(0, headerRect.top) - topOffset - 16),
-			);
+			const topOffset = Math.max(80, Math.ceil(Math.max(0, headerRect.bottom) + 12));
+			const availableHeight = Math.max(160, Math.floor(window.innerHeight - topOffset - 16));
 			panelEl.style.top = `${topOffset}px`;
 			panelEl.style.maxHeight = `min(42rem, ${availableHeight}px)`;
 		};
@@ -112,7 +109,7 @@
 
 <PopoverDialog
 	bind:open={appearanceOpen}
-	triggerClass={compact ? 'btn min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
+	triggerClass={compact ? 'btn btn-reflow min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3 text-left' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
 	triggerLabel="Choose appearance"
 	triggerTitle="Choose appearance"
 	dialogLabelledby={headingId}
@@ -128,7 +125,7 @@
 				<h2 id={headingId} class="text-lg font-semibold">Appearance</h2>
 				<p class="text-reflow mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
 			</div>
-			<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
+			<button type="button" class="btn-icon btn-icon-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
 		</div>
 
 		<div class="modal-scroll-body space-y-4 p-4 pt-3 sm:p-5 sm:pt-4">
@@ -140,7 +137,7 @@
 					getValue={(entry) => entry.id}
 					labelledBy="appearance-color-mode-legend"
 					columns={3}
-					class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,5.5em),1fr))] gap-1 rounded-container preset-tonal-surface p-1"
+					class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,5.5em),1fr))] gap-1.5 rounded-container border border-[var(--control-border)] preset-tonal-surface p-1.5"
 					onSelect={(entry) => chooseMode(entry.id)}
 				>
 					{#snippet item(entry, radio)}
@@ -149,7 +146,8 @@
 							role="radio"
 							aria-checked={radio.checked}
 							tabindex={radio.tabIndex}
-							class={`btn min-h-11 flex-col gap-1 px-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
+							data-active={radio.checked ? 'true' : 'false'}
+							class={`theme-picker-option btn btn-reflow min-h-11 flex-col gap-1 px-2 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
 							title={entry.description}
 							onclick={radio.select}
 						>
@@ -171,7 +169,7 @@
 					getValue={(entry) => entry.id}
 					labelledBy="appearance-theme-legend"
 					columns={2}
-					class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,10em),1fr))] gap-2"
+					class="-mx-1.5 grid grid-cols-[repeat(auto-fit,minmax(min(100%,10em),1fr))] gap-2 p-1.5"
 					onSelect={(entry) => void chooseTheme(entry.id)}
 				>
 					{#snippet item(entry, radio)}
@@ -180,11 +178,12 @@
 							role="radio"
 							aria-checked={radio.checked}
 							tabindex={radio.tabIndex}
-							class={`flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
+							data-active={radio.checked ? 'true' : 'false'}
+							class={`theme-picker-option flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
 							aria-label={`Use ${entry.label} theme`}
 							onclick={radio.select}
 						>
-							<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-surface-300-700" aria-hidden="true">
+							<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-[var(--control-border)]" aria-hidden="true">
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].primary}`}></span>
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].secondary}`}></span>
 								<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].tertiary}`}></span>
@@ -198,3 +197,40 @@
 		</div>
 	{/snippet}
 </PopoverDialog>
+
+<style>
+	.theme-picker-option {
+		border: 1px solid var(--control-border);
+	}
+
+	.theme-picker-option[data-active='true'] {
+		border-color: var(--control-border-strong);
+	}
+
+	.theme-picker-option:focus-visible {
+		position: relative;
+		z-index: 1;
+		outline: 2px solid var(--focus-ring-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-ring-inner),
+			0 0 0 4px var(--focus-ring-outer);
+	}
+
+	.theme-picker-option[data-active='true']:focus-visible {
+		box-shadow:
+			0 0 0 2px var(--focus-ring-swatch-inner),
+			0 0 0 4px var(--focus-ring-outer);
+	}
+
+	@media (forced-colors: active) {
+		.theme-picker-option[data-active='true'] {
+			border: 2px solid Highlight;
+		}
+
+		.theme-picker-option:focus-visible {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+		}
+	}
+</style>

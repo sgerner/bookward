@@ -14,7 +14,7 @@
 
 <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
 <main id="main-content" tabindex="-1" class="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-	<a href="/" class="text-primary-600-400">← Bookward</a>
+	<a href="/" class="inline-flex min-h-11 items-center text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Manage accounts</h1>
 	<p class="mt-2 text-surface-700-300">Each account opens one private profile. Existing data stays with the original administrator profile.</p>
 	{#if form?.message && form.error}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>{:else if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
@@ -27,7 +27,7 @@
 			<label class="grid gap-2 text-sm font-medium">Display name<input class="input" name="display_name" maxlength="160" /></label>
 			<label class="grid gap-2 text-sm font-medium">Temporary password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" /></label>
 			<label class="grid gap-2 text-sm font-medium">Role<select class="select" name="role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
-			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Create profile</button>
+			<button class="btn btn-reflow preset-filled-primary-500 justify-self-start" type="submit">Create profile</button>
 		</form>
 	</section>
 	<section class="mt-8 grid gap-4">
@@ -43,7 +43,7 @@
 					<ProfileField profileId={data.user?.profile_id} />
 					<input type="hidden" name="account_id" value={account.id} />
 					<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">Set password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" aria-label={`Set password for ${account.display_name || account.username}`} /></label>
-					<button class="btn btn-sm preset-tonal-surface" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
+					<button class="btn btn-sm btn-reflow preset-tonal-surface" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
 				</form>{/if}
 			</article>
 		{/each}

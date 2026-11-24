@@ -44,8 +44,11 @@ type Overview = {
     status: string;
     source_name: string | null;
   }>;
+  recommendations_has_more?: boolean;
+  recommendation_genres?: string[];
   decisions?: Overview["recommendations"];
   decisions_has_more?: boolean;
+  decision_genres?: string[];
   history: Array<{
     id: number;
     title: string;
@@ -64,6 +67,7 @@ type Overview = {
     filters: SourceFilters;
     last_status: string | null;
     last_scanned_at: string | null;
+    last_attempted_at?: string | null;
   }>;
   settings: {
     embedding_backend: string;
@@ -131,6 +135,19 @@ type DigestSettings = {
   } | null;
 };
 
+const distinctGenres = (items: Array<{ genres: string[] }>) => {
+  const seen = new Map<string, string>();
+  for (const item of items) {
+    for (const raw of item.genres ?? []) {
+      const cleaned = String(raw ?? "").trim();
+      if (cleaned && !seen.has(cleaned.toLowerCase())) {
+        seen.set(cleaned.toLowerCase(), cleaned);
+      }
+    }
+  }
+  return [...seen.values()].sort((left, right) => left.localeCompare(right));
+};
+
 export const load: PageServerLoad = async ({ url, locals }) => {
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
@@ -147,6 +164,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
     () => fallbackBackupStatus,
   );
+  let digestPeriod = url.searchParams.get("digest_period");
+  const digestReviewRequest = digestPeriod
+    ? engine<{
+        ids?: unknown[];
+        items?: Overview["recommendations"];
+        found?: boolean;
+      }>(`/api/digest/review?period=${encodeURIComponent(digestPeriod)}`).catch(
+        () => null,
+      )
+    : Promise.resolve(null);
   let overview: Overview;
   try {
     overview = await overviewRequest;
@@ -158,41 +185,63 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
-  let digestPeriod = url.searchParams.get("digest_period");
+  const runId = overview.recommendation_run_id ?? "";
+  const books = overview.recommendations.map((book) =>
+    toPageBook({
+      ...book,
+      recommendation_run_id: runId,
+    }),
+  );
+  const overviewBooksById = new Map(books.map((book) => [book.id, book]));
+  const decisions = (overview.decisions ?? []).map((book) =>
+    toPageBook({ ...book, recommendation_run_id: "" }),
+  );
   let digestReviewIds: number[] = [];
+  let digestReviewBooks: typeof books = [];
   if (digestPeriod) {
-    try {
-      const review = await engine<{ ids?: unknown[]; found?: boolean }>(
-        `/api/digest/review?period=${encodeURIComponent(digestPeriod)}`,
-      );
+    const review = await digestReviewRequest;
+    if (review) {
       digestReviewIds = Array.isArray(review.ids)
         ? review.ids.filter((value): value is number => Number.isInteger(value))
         : [];
       if (review.found === false) {
         digestPeriod = null;
+        digestReviewIds = [];
+      } else if (Array.isArray(review.items)) {
+        digestReviewBooks = review.items.map((item) => {
+          const existing = overviewBooksById.get(item.id);
+          return existing ?? toPageBook({ ...item, recommendation_run_id: "" });
+        });
+      } else {
+        digestReviewBooks = digestReviewIds
+          .map((id) => overviewBooksById.get(id))
+          .filter((item): item is (typeof books)[number] => Boolean(item && item.status === "recommended"));
       }
-    } catch {
-      // A stale digest link should still open the normal Discover view.
-      digestReviewIds = [];
     }
   }
+  const recommendationGenres = Array.isArray(overview.recommendation_genres)
+    ? distinctGenres([{ genres: overview.recommendation_genres }])
+    : distinctGenres(books.filter((book) => book.status === "recommended"));
+  const decisionGenres = Array.isArray(overview.decision_genres)
+    ? distinctGenres([{ genres: overview.decision_genres }])
+    : distinctGenres(decisions);
   return {
     user: locals.user,
-    recommendation_run_id: overview.recommendation_run_id ?? "",
-    books: overview.recommendations.map((book) =>
-      toPageBook({
-        ...book,
-        recommendation_run_id: overview.recommendation_run_id ?? "",
-      }),
-    ),
-    decisions: (overview.decisions ?? []).map((book) =>
-      toPageBook({ ...book, recommendation_run_id: "" }),
-    ),
+    recommendation_run_id: runId,
+    books,
+    recommendations_has_more: overview.recommendations_has_more === true,
+    recommendation_genres: recommendationGenres,
+    decisions,
     decisions_has_more: overview.decisions_has_more === true,
+    decision_genres: decisionGenres,
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
-    digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
+    digestReview: {
+      requested: Boolean(digestPeriod),
+      ids: digestReviewIds,
+      books: digestReviewBooks,
+    },
     sources: overview.sources
       .filter((source) => !source.is_default)
       .map((source) => ({ ...source, label: source.name })),
@@ -219,7 +268,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 
 const idSchema = z.coerce.number().int().positive();
 const urlSchema = z.url();
-const fail = (statusCode: number, data: { message: string }) =>
+const fail = <T extends { message: string }>(statusCode: number, data: T) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
   error instanceof Error
@@ -505,12 +554,151 @@ export const actions: Actions = {
     const id = idSchema.safeParse(data.get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
     const filters = sourceFiltersFromForm(data);
+    const includeGenresRaw = formText(data, "includeGenres");
+    const excludeGenresRaw = formText(data, "excludeGenres");
+    const submittedUrlRaw = formText(data, "url");
+    const currentUrlRaw = formText(data, "currentUrl");
+    const intent = formText(data, "intent") || "save";
+    const confirmZeroMatch = formText(data, "confirmZeroMatch") === "1";
+
+    let targetUrl = "";
+    let skipLivePreview = false;
+    if (submittedUrlRaw) {
+      const parsedUrl = urlSchema.safeParse(submittedUrlRaw);
+      if (!parsedUrl.success) {
+        return fail(400, { message: "Enter a valid source URL." });
+      }
+      targetUrl = parsedUrl.data;
+    }
+
     try {
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify({ filters }),
-      });
-      return { message: "Source filters updated; a fresh scan is queued." };
+      if (!targetUrl) {
+        const overview = await engine<Overview>(
+          "/api/overview?recommendation_limit=1&decision_limit=1",
+        );
+        const existing = overview.sources.find((item) => item.id === id.data);
+        if (!existing) return fail(404, { message: "Source not found." });
+        if (existing.kind === "association" || existing.kind === "builtin") {
+          skipLivePreview = true;
+        } else {
+          targetUrl = existing.url;
+        }
+      }
+
+      let previewCount: number | null = null;
+      let previewRawCount: number | null = null;
+      let resolvedTargetUrl = targetUrl;
+      if (!skipLivePreview) {
+        const preview = await engine<{
+          count: number;
+          raw_count?: number;
+          url?: string;
+        }>(
+          "/api/sources/preview",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              url: targetUrl,
+              filters,
+            }),
+          },
+        );
+        if (typeof preview.url === "string" && preview.url.trim()) {
+          resolvedTargetUrl = preview.url.trim();
+        }
+        previewCount = preview.count;
+        previewRawCount =
+          typeof preview.raw_count === "number"
+            ? preview.raw_count
+            : preview.count;
+
+        if (intent === "preview") {
+          const messageText =
+            previewCount === 0
+              ? previewRawCount > 0
+                ? `Preview found ${previewRawCount} book${previewRawCount === 1 ? "" : "s"}, but 0 matched these filters.`
+                : "Preview found 0 recognizable books at that URL."
+              : `Preview matched ${previewCount} of ${previewRawCount} book${previewRawCount === 1 ? "" : "s"}.`;
+          return {
+            message: messageText,
+            sourcePreview: {
+              id: id.data,
+              url: resolvedTargetUrl,
+              count: previewCount,
+              rawCount: previewRawCount,
+              includeGenres: includeGenresRaw,
+              excludeGenres: excludeGenresRaw,
+            },
+          };
+        }
+
+        const urlChanged = Boolean(
+          submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw),
+        );
+        if (previewRawCount === 0 && urlChanged) {
+          return fail(400, {
+            message: "No recognizable books were found at that URL.",
+          });
+        }
+
+        if (previewCount === 0 && !confirmZeroMatch) {
+          const hasFilters = Boolean(
+            filters.include_genres.length || filters.exclude_genres.length,
+          );
+          const warningMessage =
+            previewRawCount > 0 && hasFilters
+              ? `0 of ${previewRawCount} book${previewRawCount === 1 ? "" : "s"} in this feed matched these filters. Confirm to save anyway (existing candidates will be kept).`
+              : "No books matched this source configuration. Confirm to save anyway (existing candidates will be kept).";
+          return fail(400, {
+            message: warningMessage,
+            zeroMatchConfirm: {
+              id: id.data,
+              url: submittedUrlRaw || resolvedTargetUrl,
+              rawCount: previewRawCount,
+              includeGenres: includeGenresRaw,
+              excludeGenres: excludeGenresRaw,
+            },
+          });
+        }
+      }
+
+      const updatePayload: {
+        url?: string;
+        filters: SourceFilters;
+      } = { filters };
+      if (submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw)) {
+        updatePayload.url = resolvedTargetUrl;
+      }
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify(updatePayload),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
+      if (updatePayload.url) {
+        return {
+          message:
+            previewCount === null
+              ? `Source URL and filters updated${scanSuffix}`
+              : `Source updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
+        };
+      }
+      if (previewCount === 0) {
+        return {
+          message: `Zero-match source filters confirmed and saved${scanSuffix}`,
+        };
+      }
+      return {
+        message:
+          previewCount === null
+            ? `Source filters updated${scanSuffix}`
+            : `Source filters updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -524,6 +712,26 @@ export const actions: Actions = {
         body: JSON.stringify({ lifecycle: "one_time" }),
       });
       return { message: "Source changed to a one-time import." };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  switchSourceToPermanent: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    try {
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ lifecycle: "permanent" }),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
+      return { message: `Source changed to a permanent feed${scanSuffix}` };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -719,17 +927,37 @@ export const actions: Actions = {
     const apiKey = String(data.get("apiKey") || "").trim();
     const clear = data.get("clear") === "on";
     try {
-      await engine("/api/settings/google-books", {
+      const result = await engine<{
+        saved: boolean;
+        google_books_api_key_set: boolean;
+        job_ids?: Record<string, string | number | null>;
+        validation_status?: "verified" | "deferred";
+        validation_warning?: string;
+      }>("/api/settings/google-books", {
         method: "PUT",
         body: JSON.stringify({
           api_key: apiKey || null,
           clear,
         }),
       });
+      if (!clear && !apiKey && !result.google_books_api_key_set) {
+        return fail(400, { message: "Enter a Google Books API key." });
+      }
+      if (clear) {
+        return { message: "Google Books API key cleared." };
+      }
+      if (!apiKey) {
+        return { message: "Existing Google Books API key kept." };
+      }
+      if (result.validation_status === "deferred") {
+        return {
+          message: result.validation_warning
+            ? `${result.validation_warning} Metadata refresh queued.`
+            : "Google Books API key saved (live verification deferred); metadata refresh queued.",
+        };
+      }
       return {
-        message: clear
-          ? "Google Books API key cleared."
-          : "Google Books API key saved.",
+        message: "Google Books API key verified and saved; metadata refresh queued.",
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
@@ -940,7 +1168,7 @@ export const actions: Actions = {
         return fail(502, { message: job.error || "Digest could not be delivered." });
       const deliveryError = digestJobFailure(job.result);
       if (deliveryError) return fail(502, { message: deliveryError });
-      return { message: "Digest run queued; configured channels will receive it shortly." };
+      return { message: digestRunMessage(job.result, queued.job_id, job.status) };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -960,7 +1188,9 @@ export const actions: Actions = {
       if (deliveryError) return fail(502, { message: deliveryError });
       if (job.status !== "complete")
         return { message: `Digest retry is still running (${queued.job_id.slice(0, 8)}).` };
-      return { message: "Digest delivery retry queued." };
+      const parsed = parseDigestJobResult(job.result);
+      if (parsed?.duplicate) return { message: "Digest delivery was already sent." };
+      return { message: "Digest delivery sent." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -1033,19 +1263,67 @@ async function waitForJob(jobId: string, maxAttempts = 30) {
   return { status: "queued", error: null, result: null };
 }
 
-function digestJobFailure(result: string | null) {
+type DigestJobResult = {
+  status?: string;
+  reason?: string;
+  period?: string;
+  items?: number;
+  duplicate?: boolean;
+  error?: string;
+  deliveries?: Array<{ status?: string; error?: string }>;
+};
+
+function parseDigestJobResult(result: string | null): DigestJobResult | null {
   if (!result) return null;
   try {
-    const parsed = JSON.parse(result) as {
-      status?: string;
-      deliveries?: Array<{ status?: string; error?: string }>;
-    };
-    if (parsed.status !== "failed") return null;
-    return (
-      parsed.deliveries?.find((delivery) => delivery.status === "failed")?.error ||
-      "The digest channel could not deliver the message."
-    );
+    const parsed = JSON.parse(result);
+    return parsed && typeof parsed === "object" ? (parsed as DigestJobResult) : null;
   } catch {
     return null;
   }
+}
+
+function digestRunMessage(result: string | null, jobId: string, jobStatus: string) {
+  if (jobStatus !== "complete") {
+    return `Digest is still running (${jobId.slice(0, 8)}).`;
+  }
+  const parsed = parseDigestJobResult(result);
+  if (parsed?.status === "skipped") {
+    if (parsed.reason === "no_new_recommendations") {
+      return "Digest skipped: no new recommendations matched your minimum score.";
+    }
+    if (parsed.reason === "already_delivered") {
+      return parsed.period
+        ? `Digest skipped: ${parsed.period} was already delivered.`
+        : "Digest skipped: this week's digest was already delivered.";
+    }
+    if (parsed.reason === "no_channels") {
+      return "Digest skipped: enable and save at least one delivery channel first.";
+    }
+    return "Digest skipped.";
+  }
+  if (parsed?.status === "sent") {
+    const count = typeof parsed.items === "number" ? parsed.items : 0;
+    return `Digest sent with ${count} book${count === 1 ? "" : "s"}.`;
+  }
+  return "Digest run completed.";
+}
+
+function digestJobFailure(result: string | null) {
+  const parsed = parseDigestJobResult(result);
+  if (!parsed || parsed.status !== "failed") return null;
+  if (typeof parsed.error === "string" && parsed.error.trim()) {
+    return parsed.error.trim();
+  }
+  const deliveryError = parsed.deliveries?.find(
+    (delivery) =>
+      delivery.status === "failed" &&
+      typeof delivery.error === "string" &&
+      delivery.error.trim(),
+  )?.error;
+  if (deliveryError) return deliveryError.trim();
+  if (parsed.reason === "retry_limit_reached") {
+    return "Digest delivery reached the automatic retry limit.";
+  }
+  return "The digest channel could not deliver the message.";
 }
