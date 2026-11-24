@@ -21,18 +21,20 @@ from ..associations import (
     AssociationCache,
     OPEN_LIBRARY_LISTS_PROVIDER,
     RateLimiter,
-    record_association_request,
 )
 from ..config import settings
-from ..http_bounds import stream_json_async
 from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import isbn_parts, normalize_isbn_identifier
-from ..security import resolve_public_target
-from .common import clean as _clean, title_key as _title_key
+from .common import (
+    DEFAULT_USER_AGENT,
+    clean as _clean,
+    fetch_pinned_association_json,
+    title_key as _title_key,
+)
 
 
 OPEN_LIBRARY_BASE = "https://openlibrary.org"
-OPEN_LIBRARY_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
+OPEN_LIBRARY_USER_AGENT = DEFAULT_USER_AGENT
 _OPEN_LIBRARY_BOOK_KEY = re.compile(r"^/(works|books)/(OL\d+[WM])/?$", re.IGNORECASE)
 
 
@@ -190,35 +192,22 @@ class OpenLibraryClient:
         if cached is not None:
             return cached
         await self.rate_limiter.wait()
-        original = httpx.URL(OPEN_LIBRARY_BASE).join(path)
-        _, address, hostname = resolve_public_target(str(original))
-        pinned = original.copy_with(host=address)
-        host_header = hostname if original.port in (None, 443) else f"{hostname}:{original.port}"
-        headers = {"User-Agent": OPEN_LIBRARY_USER_AGENT}
-        if self.contact:
-            headers["User-Agent"] += f"; contact={self.contact}"
-        try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_seconds,
-                follow_redirects=False,
-                trust_env=False,
-                headers=headers,
-            ) as client:
-                _response, payload = await stream_json_async(
-                    client,
-                    "GET",
-                    pinned,
-                    params=params,
-                    headers={"Host": host_header},
-                    extensions={"sni_hostname": hostname},
-                    max_bytes=settings.source_max_bytes,
-                    content_type_error="Open Library returned an unsupported content type",
-                    size_error="Open Library response is too large",
-                )
-        except Exception:
-            record_association_request(OPEN_LIBRARY_LISTS_PROVIDER, cache_key, "error")
-            raise
-        record_association_request(OPEN_LIBRARY_LISTS_PROVIDER, cache_key, "ok")
+        user_agent = (
+            f"{OPEN_LIBRARY_USER_AGENT}; contact={self.contact}"
+            if self.contact
+            else OPEN_LIBRARY_USER_AGENT
+        )
+        payload, _ = await fetch_pinned_association_json(
+            httpx.URL(OPEN_LIBRARY_BASE).join(path),
+            provider=OPEN_LIBRARY_LISTS_PROVIDER,
+            request_key=cache_key,
+            source_label="Open Library",
+            params=params,
+            timeout_seconds=self.timeout_seconds,
+            max_bytes=settings.source_max_bytes,
+            user_agent=user_agent,
+            require_mapping=False,
+        )
         self.cache.put(
             OPEN_LIBRARY_LISTS_PROVIDER,
             cache_key,
