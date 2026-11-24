@@ -1,11 +1,14 @@
 import asyncio
 from pathlib import Path
+import socket
 import sqlite3
 import sys
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from afterword_engine import ingestion
 from afterword_engine.config import settings
 from afterword_engine.database import initialize
 from afterword_engine.ingestion import goodreads_shelf_rss_url, import_goodreads_shelves, validate_goodreads_rss_url
@@ -168,3 +171,308 @@ def test_import_goodreads_csv_populates_and_clears_shelf_items(tmp_path: Path, m
         ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
         ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
     ]
+
+
+def test_goodreads_imports_delete_matching_items_from_both_shelves_using_title_author_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine import ingestion
+    from afterword_engine.ingestion import import_goodreads_csv, import_goodreads_rss
+
+    db_path = tmp_path / "shelf_delete_index.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    con = sqlite3.connect(db_path)
+    try:
+        plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("Project Hail Mary", "Andy Weir"),
+            ).fetchall()
+        ]
+        shelf_plan_details = [
+            row[3]
+            for row in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+                ("to-read",),
+            ).fetchall()
+        ]
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn) VALUES(?, ?, ?, ?)",
+            [
+                ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("currently-reading", "Project Hail Mary", "Andy Weir", "9780593135204"),
+                ("to-read", "project hail mary", "Andy Weir", None),
+                ("to-read", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("currently-reading", "Piranesi", "Susanna Clarke", "9781635575637"),
+                ("to-read", "Dune", "Frank Herbert", "9780441172719"),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author" in detail
+        for detail in plan_details
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf" in detail
+        for detail in shelf_plan_details
+    )
+
+    csv_promotion = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Project Hail Mary,Andy Weir,5,2026/03/10,2026/01/10,read,=\"9780593135204\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_promotion) == 1
+
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Piranesi</title>
+        <author_name>Susanna Clarke</author_name>
+        <user_rating>5</user_rating>
+        <user_read_at>2026/03/15</user_read_at>
+        <isbn13>9781635575637</isbn13>
+      </item>
+    </channel></rss>"""
+
+    async def fake_fetch_bytes(url: str, **kwargs):
+        return rss_xml, "application/rss+xml"
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+    assert (
+        asyncio.run(
+            import_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+        )
+        == 1
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY title, shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    # Exact BINARY collation preserves differently cased non-matching shelf rows
+    # while deleting both to-read and currently-reading rows for promoted books.
+    assert remaining == [
+        ("to-read", "Dune", "Frank Herbert"),
+        ("to-read", "project hail mary", "Andy Weir"),
+    ]
+
+
+def test_import_goodreads_shelves_shares_client_fetches_concurrently_and_writes_in_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "concurrent_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Project Hail Mary</title>
+        <author_name>Andy Weir</author_name>
+      </item>
+    </channel></rss>"""
+    reading_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Piranesi</title>
+        <author_name>Susanna Clarke</author_name>
+      </item>
+    </channel></rss>"""
+
+    created_clients: list[httpx.AsyncClient] = []
+    seen_clients: list[httpx.AsyncClient | None] = []
+    in_flight = 0
+    max_in_flight = 0
+    original_source_client = ingestion._source_client
+
+    def tracking_source_client() -> httpx.AsyncClient:
+        client = original_source_client()
+        created_clients.append(client)
+        return client
+
+    async def fake_fetch_bytes(url: str, allow_goodreads_http: bool = False, client=None):
+        nonlocal in_flight, max_in_flight
+        seen_clients.append(client)
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            if "shelf=to-read" in url:
+                # Finish after currently-reading so rowid order verifies deterministic SQLite writes.
+                await asyncio.sleep(0.06)
+                return to_read_xml, "application/xml"
+            if "shelf=currently-reading" in url:
+                await asyncio.sleep(0.02)
+                return reading_xml, "application/xml"
+            raise AssertionError(f"Unexpected url: {url}")
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(ingestion, "_source_client", tracking_source_client)
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+
+    counts = asyncio.run(
+        import_goodreads_shelves("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+    assert counts == {"to-read": 1, "currently-reading": 1}
+    assert len(created_clients) == 1
+    assert seen_clients == [created_clients[0], created_clients[0]]
+    assert max_in_flight == 2
+
+    con = sqlite3.connect(db_path)
+    try:
+        ordered_shelves = [
+            shelf
+            for (shelf,) in con.execute(
+                "SELECT shelf FROM goodreads_shelf_items ORDER BY id ASC"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+    assert ordered_shelves == ["to-read", "currently-reading"]
+
+
+def test_import_goodreads_shelves_preserves_existing_rows_on_http_404(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "private_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Kept To Read', 'Author One')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Old Reading', 'Author Two')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    reading_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>New Reading</title>
+        <author_name>Author Three</author_name>
+      </item>
+    </channel></rss>"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        shelf = request.url.params.get("shelf")
+        if shelf == "to-read":
+            return httpx.Response(404, content=b"Not Found", headers={"content-type": "text/plain"})
+        if shelf == "currently-reading":
+            return httpx.Response(200, content=reading_xml, headers={"content-type": "application/rss+xml"})
+        raise AssertionError(f"Unexpected shelf: {shelf}")
+
+    monkeypatch.setattr(
+        ingestion,
+        "_source_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+
+    counts = asyncio.run(
+        import_goodreads_shelves("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+    assert counts == {"to-read": 0, "currently-reading": 1}
+
+    con = sqlite3.connect(db_path)
+    try:
+        shelf_rows = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert shelf_rows == [
+        ("currently-reading", "New Reading", "Author Three"),
+        ("to-read", "Kept To Read", "Author One"),
+    ]
+
+def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine.ingestion import import_csv
+
+    db_path = tmp_path / "storygraph_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    csv_data = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        'Project Hail Mary,Andy Weir,,9780593135204,hardcover,to-read,2026/01/10,,,\n'
+        'Piranesi,"Susanna Clarke, Coauthor",,b4f901a2-7c4d-4f1b-9a2e-1234567890ab,digital,currently-reading,2026/02/01,,,\n'
+        'Abandoned Tome,Some Writer,,9780306406157,paperback,did-not-finish,2026/02/10,2026/02/15,2026/02/10-2026/02/15,1.5\n'
+        'The Martian,Andy Weir,,0553418025,paperback,read,2025/04/01,2025/05/01,2025/04/20-2025/05/01,4.75\n'
+    ).encode("utf-8")
+
+    result = import_csv(csv_data)
+    assert result == {"imported": 1, "source": "storygraph_csv"}
+
+    con = sqlite3.connect(db_path)
+    try:
+        reads_rows = con.execute(
+            "SELECT title, author, rating, read_at, isbn, source FROM reads"
+        ).fetchall()
+        shelves = con.execute(
+            "SELECT shelf, title, author, isbn FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+        shortlist_count = con.execute(
+            "SELECT COUNT(*) FROM candidates WHERE status='saved'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+    assert reads_rows == [
+        ("The Martian", "Andy Weir", 4.75, "2025/05/01", "9780553418026", "storygraph_csv")
+    ]
+    assert shelves == [
+        ("currently-reading", "Piranesi", "Susanna Clarke", None),
+        ("to-read", "Project Hail Mary", "Andy Weir", "9780593135204"),
+    ]
+    assert shortlist_count == 0
+
+    followup_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Project Hail Mary,Andy Weir,9780593135204,read,2026/03/01,5.0\n"
+    ).encode("utf-8")
+    assert import_csv(followup_csv) == {"imported": 1, "source": "storygraph_csv"}
+
+    con = sqlite3.connect(db_path)
+    try:
+        remaining_shelves = con.execute(
+            "SELECT shelf, title, author FROM goodreads_shelf_items"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert remaining_shelves == [
+        ("currently-reading", "Piranesi", "Susanna Clarke"),
+    ]
+
