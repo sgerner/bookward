@@ -916,8 +916,25 @@ def test_confirmed_create_skips_prune_when_clearing_hold_and_prunes_oldest_on_ne
     initialize(seed_demo=False)
     assert backups.recovery_hold_active() is True
 
+    # Verify create_backup checks recovery_hold_active() only once (under database_lock).
+    hold_checks = 0
+    real_hold_active = backups.recovery_hold_active
+
+    def counting_hold_active():
+        nonlocal hold_checks
+        hold_checks += 1
+        return real_hold_active()
+
+    monkeypatch.setattr(backups, "recovery_hold_active", counting_hold_active)
+    with pytest.raises(backups.RecoveryHoldError):
+        backups.create_backup()
+    assert hold_checks == 1
+
+    hold_checks = 0
     # Under retention=1, confirming Create backup now must NOT delete pre_disaster.
     clearing = backups.create_backup(confirm_clear_hold=True)
+    assert hold_checks == 1
+    monkeypatch.setattr(backups, "recovery_hold_active", real_hold_active)
     assert backups.recovery_hold_active() is False
     assert [item["id"] for item in backups.list_backups()] == [
         clearing["id"],
@@ -944,7 +961,7 @@ def test_confirmed_create_skips_prune_when_clearing_hold_and_prunes_oldest_on_ne
 
 
 def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog
 ):
     monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
     monkeypatch.setattr(settings, "backup_dir", "")
@@ -968,6 +985,10 @@ def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
 
     assert backups.backup_is_due() is True
     assert backups.auth_backup_is_due() is True
+    healthy_profile_status = backups.backup_status()
+    assert healthy_profile_status["recovery_hold"] is False
+    assert healthy_profile_status["next_backup_at"] is not None
+    assert backups.identity_backup_status()["recovery_hold"] is False
 
     real_profile_connect = backups.connect
     real_sqlite_connect = sqlite3.connect
@@ -988,9 +1009,22 @@ def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
     assert backups._recovery_hold_value() is True
     assert backups.recovery_hold_active() is True
     assert backups.backup_is_due() is False
+    locked_profile_status = backups.backup_status()
+    assert locked_profile_status["recovery_hold"] is True
+    assert locked_profile_status["recovery_hold_at"] is None
+    assert locked_profile_status["next_backup_at"] is None
+    assert locked_profile_status["last_error"] == "Backup status is temporarily unavailable."
+
     assert backups._auth_recovery_hold_value() is True
     assert backups.auth_recovery_hold_active() is True
     assert backups.auth_backup_is_due() is False
+    locked_auth_status = backups.identity_backup_status()
+    assert locked_auth_status["recovery_hold"] is True
+    assert locked_auth_status["recovery_hold_at"] is None
+    assert (
+        locked_auth_status["last_error"]
+        == "Identity backup status is temporarily unavailable."
+    )
 
     real_wait_for = asyncio.wait_for
 
@@ -1013,7 +1047,24 @@ def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
         finally:
             monkeypatch.setattr(asyncio, "wait_for", real_wait_for)
 
-    asyncio.run(locked_scheduler_cycle())
+    # Allow profile_ids() to return ["legacy"] so both auth and profile transient-lock log paths execute.
+    monkeypatch.setattr(profiles, "profile_ids", lambda: ["legacy"])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="afterword_engine.backups"):
+        asyncio.run(locked_scheduler_cycle())
+
+    transient_messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Scheduled identity-registry backup skipped because recovery hold status could not be read"
+        in msg
+        for msg in transient_messages
+    )
+    assert any(
+        "Scheduled Bookward backup skipped for profile legacy because recovery hold status could not be read"
+        in msg
+        for msg in transient_messages
+    )
+    assert not any("recovery hold is active" in msg for msg in transient_messages)
 
     monkeypatch.setattr(backups, "connect", real_profile_connect)
     monkeypatch.setattr(sqlite3, "connect", real_sqlite_connect)
@@ -1022,7 +1073,7 @@ def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
         item["id"] for item in backups.identity_backup_status()["backups"]
     ] == [auth_snap]
 
-    # Also verify real on-disk SQLite corruption fails closed without mocking connect.
+    # Also verify real on-disk SQLite corruption fails closed in both predicates and status readers.
     for suffix in ("", "-wal", "-shm"):
         Path(f"{settings.db}{suffix}").unlink(missing_ok=True)
         Path(f"{profiles.auth_path()}{suffix}").unlink(missing_ok=True)
@@ -1033,6 +1084,13 @@ def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
     assert backups._auth_recovery_hold_value() is True
     assert backups.backup_is_due() is False
     assert backups.auth_backup_is_due() is False
+    corrupt_profile_status = backups.backup_status()
+    assert corrupt_profile_status["recovery_hold"] is True
+    assert corrupt_profile_status["recovery_hold_at"] is None
+    assert corrupt_profile_status["next_backup_at"] is None
+    corrupt_auth_status = backups.identity_backup_status()
+    assert corrupt_auth_status["recovery_hold"] is True
+    assert corrupt_auth_status["recovery_hold_at"] is None
 
 
 def test_populated_databases_without_meta_tables_do_not_trip_recovery_hold(

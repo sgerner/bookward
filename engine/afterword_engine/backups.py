@@ -242,7 +242,7 @@ def _recovery_hold_value() -> str | bool | None:
             return value or None
     except (sqlite3.Error, OSError):
         LOGGER.warning(
-            "Could not read profile recovery hold status; treating recovery hold as active",
+            "Could not read profile recovery hold status; failing closed",
             exc_info=True,
         )
         return True
@@ -280,7 +280,10 @@ def _auth_recovery_hold_value() -> str | bool | None:
         value = (found[0] or "").strip() if found else ""
         return value or None
     except (sqlite3.Error, OSError):
-        LOGGER.exception("Could not read identity-registry recovery hold status")
+        LOGGER.warning(
+            "Could not read identity-registry recovery hold status; failing closed",
+            exc_info=True,
+        )
         return True
     finally:
         if con is not None:
@@ -320,19 +323,23 @@ def backup_status() -> dict:
     backups = list_backups()
     last_error = None
     hold_value = None
+    hold_active = False
+    path = profile_database_path()
     try:
-        with connect() as con:
-            stored = dict(
-                con.execute(
-                    "SELECT key,value FROM settings WHERE key IN (?,?)",
-                    (LAST_ERROR_KEY, RECOVERY_HOLD_KEY),
-                ).fetchall()
-            )
-            last_error = stored.get(LAST_ERROR_KEY) or None
-            hold_value = (stored.get(RECOVERY_HOLD_KEY) or "").strip() or None
-    except sqlite3.Error:
+        if path.is_file():
+            with connect() as con:
+                stored = dict(
+                    con.execute(
+                        "SELECT key,value FROM settings WHERE key IN (?,?)",
+                        (LAST_ERROR_KEY, RECOVERY_HOLD_KEY),
+                    ).fetchall()
+                )
+                last_error = stored.get(LAST_ERROR_KEY) or None
+                hold_value = (stored.get(RECOVERY_HOLD_KEY) or "").strip() or None
+                hold_active = bool(hold_value)
+    except (sqlite3.Error, OSError):
         last_error = "Backup status is temporarily unavailable."
-    hold_active = bool(hold_value)
+        hold_active = True
     interval = backup_interval_hours()
     last_success = backups[0]["created_at"] if backups else None
     next_backup = None
@@ -458,6 +465,7 @@ def identity_backup_status() -> dict:
 
     state = {}
     registry = auth_path()
+    hold_read_failed = False
     try:
         if registry.is_file():
             con = sqlite3.connect(registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
@@ -476,8 +484,9 @@ def identity_backup_status() -> dict:
                 )
             finally:
                 con.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         state[AUTH_BACKUP_ERROR_KEY] = "Identity backup status is temporarily unavailable."
+        hold_read_failed = True
 
     directory = auth_backup_directory()
     backups = []
@@ -509,7 +518,7 @@ def identity_backup_status() -> dict:
         "enabled": backup_interval_hours() > 0,
         "interval_hours": backup_interval_hours(),
         "retention_count": backup_retention_count(),
-        "recovery_hold": bool(hold_value),
+        "recovery_hold": hold_read_failed or bool(hold_value),
         "recovery_hold_at": hold_value,
         "last_success_at": state.get(AUTH_BACKUP_SUCCESS_KEY)
         or (backups[0]["created_at"] if backups else None),
@@ -804,10 +813,6 @@ def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
 
 
 def create_backup(*, confirm_clear_hold: bool = False) -> dict:
-    if recovery_hold_active() and not confirm_clear_hold:
-        raise RecoveryHoldError(
-            "Scheduled backups are paused to protect existing snapshots. Restore a backup or confirm keeping the current database first."
-        )
     try:
         with database_lock(profile_database_path()):
             hold_was_active = recovery_hold_active()
@@ -1154,12 +1159,17 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
 
         interval_enabled = backup_interval_hours() > 0
         try:
-            if interval_enabled and auth_recovery_hold_active():
+            auth_hold = _auth_recovery_hold_value() if interval_enabled else None
+            if isinstance(auth_hold, str):
                 LOGGER.warning(
                     "Scheduled identity-registry backup skipped while recovery hold is active; "
                     "new account-registry changes are not backed up until a snapshot is restored or the hold is dismissed"
                 )
-            elif auth_backup_is_due():
+            elif auth_hold is True:
+                LOGGER.warning(
+                    "Scheduled identity-registry backup skipped because recovery hold status could not be read"
+                )
+            elif interval_enabled and auth_backup_is_due():
                 await asyncio.to_thread(create_auth_backup)
         except Exception:
             LOGGER.exception("Scheduled identity-registry backup failed")
@@ -1171,13 +1181,19 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         for profile_id in active_profile_ids:
             try:
                 with profile_scope(profile_id):
-                    if interval_enabled and recovery_hold_active():
+                    profile_hold = _recovery_hold_value() if interval_enabled else None
+                    if isinstance(profile_hold, str):
                         LOGGER.warning(
                             "Scheduled Bookward backup skipped for profile %s while recovery hold is active; "
                             "new profile data is not backed up until a snapshot is restored or the hold is dismissed",
                             profile_id,
                         )
-                    elif backup_is_due():
+                    elif profile_hold is True:
+                        LOGGER.warning(
+                            "Scheduled Bookward backup skipped for profile %s because recovery hold status could not be read",
+                            profile_id,
+                        )
+                    elif interval_enabled and backup_is_due():
                         await asyncio.to_thread(create_backup)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
