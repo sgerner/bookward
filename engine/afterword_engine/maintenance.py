@@ -243,7 +243,7 @@ def prune_unattributed_telemetry(
     )
 
     # Clean up any evidence links, unreferenced batches, or shared vectors
-    # orphaned by pruned unattributed runs.
+    # orphaned by pruned unattributed runs while preserving attributed run links.
     runner.drain(
         lambda con, limit: con.execute(
             """
@@ -255,6 +255,20 @@ def prune_unattributed_telemetry(
                     SELECT 1 FROM recommendation_run_evidence e
                     WHERE e.run_id = l.run_id
                       AND e.capture_status = 'complete'
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM recommendation_impressions i
+                    JOIN recommendation_outcomes o ON o.impression_id = i.id
+                    WHERE i.run_id = l.run_id
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM recommendation_evidence_outcomes eo
+                    WHERE eo.run_id = l.run_id
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM recommendation_evidence_events ee
+                    WHERE ee.run_id = l.run_id
+                      AND ee.event_type != 'visible'
                 )
                 LIMIT ?
             )

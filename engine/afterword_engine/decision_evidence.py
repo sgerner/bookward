@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from .config import settings
-from .database import connect
+from .database import connect, transaction
 from .embeddings import content_hash
 from .identity import book_identity
 from .scoring import document
@@ -49,6 +49,7 @@ MAX_EVIDENCE_JSON_BYTES = 8 * 1024 * 1024
 MAX_STORED_EVIDENCE_BYTES = 512 * 1024 * 1024
 EVIDENCE_HIGH_WATERMARK_RATIO = 0.80
 EVIDENCE_LOW_WATERMARK_RATIO = 0.65
+EVIDENCE_ROTATION_ENABLED_KEY = "evidence_rotation_enabled"
 STORAGE_RETENTION_ENABLED_KEY = "storage_retention_enabled"
 MAX_EXPOSURES_PER_RUN = 5_000
 MAX_ARCHIVED_EVENTS_PER_RUN = 2_000
@@ -278,28 +279,79 @@ def evidence_low_watermark_bytes(max_bytes: int | None = None) -> int:
     return int(quota * EVIDENCE_LOW_WATERMARK_RATIO)
 
 
-def is_storage_retention_enabled(connection=None) -> bool:
-    """Return whether automatic retention and watermark eviction are enabled."""
-
-    if not settings.retention_enabled:
-        return False
-
+def _read_bool_setting_fail_closed(
+    key: str,
+    *,
+    default: bool,
+    label: str,
+    connection=None,
+) -> bool:
     def _read(con) -> bool:
         row = con.execute(
             "SELECT value FROM settings WHERE key=?",
-            (STORAGE_RETENTION_ENABLED_KEY,),
+            (key,),
         ).fetchone()
         if not row or row["value"] is None or str(row["value"]).strip() == "":
-            return True
+            return bool(default)
         return str(row["value"]).strip().lower() in {"1", "true", "yes", "on"}
 
-    if connection is not None:
-        return _read(connection)
     try:
+        if connection is not None:
+            return _read(connection)
         with connect() as con:
             return _read(con)
     except Exception:
-        return True
+        LOGGER.warning(
+            "Could not read %s setting; failing closed (%s disabled)",
+            key,
+            label,
+            exc_info=True,
+        )
+        return False
+
+
+def is_evidence_rotation_enabled(connection=None) -> bool:
+    """Return whether 512 MiB replay-evidence watermark rotation is enabled."""
+
+    return _read_bool_setting_fail_closed(
+        EVIDENCE_ROTATION_ENABLED_KEY,
+        default=bool(settings.evidence_rotation_enabled),
+        label="evidence rotation",
+        connection=connection,
+    )
+
+
+def set_evidence_rotation_enabled(enabled: bool, connection=None) -> bool:
+    """Persist the per-profile replay-evidence watermark rotation setting."""
+
+    normalized = bool(enabled)
+    stored = "1" if normalized else "0"
+
+    def _write(con) -> None:
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES(?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=0, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (EVIDENCE_ROTATION_ENABLED_KEY, stored),
+        )
+
+    if connection is not None:
+        _write(connection)
+    else:
+        with transaction() as con:
+            _write(con)
+    return normalized
+
+
+def is_storage_retention_enabled(connection=None) -> bool:
+    """Return whether scheduled background storage retention is enabled."""
+
+    return _read_bool_setting_fail_closed(
+        STORAGE_RETENTION_ENABLED_KEY,
+        default=bool(settings.retention_enabled),
+        label="storage retention",
+        connection=connection,
+    )
 
 
 def _prune_unreferenced_evidence_vectors(connection) -> int:
@@ -324,9 +376,27 @@ def _unreferenced_scoring_batch_ids(connection, *, limit: int = 64) -> list[str]
         )
           AND NOT EXISTS (
             SELECT 1 FROM recommendation_run_evidence_scoring_batches l
-            JOIN recommendation_run_evidence e
-              ON e.run_id = l.run_id AND e.capture_status = 'complete'
             WHERE l.score_batch_id = b.id
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM recommendation_run_evidence e
+                      WHERE e.run_id = l.run_id AND e.capture_status = 'complete'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_impressions i
+                      JOIN recommendation_outcomes o ON o.impression_id = i.id
+                      WHERE i.run_id = l.run_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_evidence_outcomes eo
+                      WHERE eo.run_id = l.run_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_evidence_events ee
+                      WHERE ee.run_id = l.run_id
+                        AND ee.event_type != 'visible'
+                  )
+              )
         )
         ORDER BY datetime(b.captured_at) ASC, b.captured_at ASC, b.rowid ASC
         LIMIT ?
@@ -352,7 +422,7 @@ def rotate_recommendation_evidence_if_needed(
     """
 
     used_before = _evidence_used_bytes(connection)
-    if not is_storage_retention_enabled(connection):
+    if not is_evidence_rotation_enabled(connection):
         return {
             "rotated_runs": 0,
             "rotated_scoring_batches": 0,
@@ -376,20 +446,43 @@ def rotate_recommendation_evidence_if_needed(
 
     target_bytes = min(low_watermark, max(0, quota - additional))
     excluded = sorted({str(item) for item in exclude_run_ids if item})
+    exclude_params: tuple[Any, ...] = tuple(excluded)
     rotated_runs = 0
     rotated_batches = 0
     removed_vectors = 0
 
-    # Clean up any dangling run->batch links whose run is missing or incomplete.
-    connection.execute(
-        """
-        DELETE FROM recommendation_run_evidence_scoring_batches
-        WHERE NOT EXISTS (
+    # Clean up dangling run->batch links only when the run has neither a complete
+    # capture nor any attributed outcomes/events.
+    link_where_clauses = [
+        """NOT EXISTS (
             SELECT 1 FROM recommendation_run_evidence e
             WHERE e.run_id = recommendation_run_evidence_scoring_batches.run_id
               AND e.capture_status = 'complete'
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_impressions i
+            JOIN recommendation_outcomes o ON o.impression_id = i.id
+            WHERE i.run_id = recommendation_run_evidence_scoring_batches.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_outcomes eo
+            WHERE eo.run_id = recommendation_run_evidence_scoring_batches.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_events ee
+            WHERE ee.run_id = recommendation_run_evidence_scoring_batches.run_id
+              AND ee.event_type != 'visible'
+        )""",
+    ]
+    if excluded:
+        marks = ",".join("?" for _ in excluded)
+        link_where_clauses.append(
+            f"recommendation_run_evidence_scoring_batches.run_id NOT IN ({marks})"
         )
-        """
+    connection.execute(
+        "DELETE FROM recommendation_run_evidence_scoring_batches WHERE "
+        + " AND ".join(link_where_clauses),
+        exclude_params,
     )
 
     while _evidence_used_bytes(connection) > target_bytes:
@@ -422,11 +515,9 @@ def rotate_recommendation_evidence_if_needed(
               AND ee.event_type != 'visible'
         )""",
     ]
-    exclude_params: tuple[Any, ...] = ()
     if excluded:
         marks = ",".join("?" for _ in excluded)
         where_clauses.append(f"e.run_id NOT IN ({marks})")
-        exclude_params = tuple(excluded)
     where_sql = "WHERE " + " AND ".join(where_clauses)
 
     while _evidence_used_bytes(connection) > target_bytes:

@@ -6,7 +6,11 @@ class Settings(BaseSettings):
     backup_dir: str = ""
     backup_interval_hours: int = 24
     backup_retention_count: int = 7
-    retention_enabled: bool = True
+    # Scheduled background row retention and 512 MiB replay-evidence watermark
+    # rotation are opt-in by default; operators can enable them globally via env
+    # or per profile in Settings -> Backup & recovery.
+    retention_enabled: bool = False
+    evidence_rotation_enabled: bool = False
     embedding_backend: str = "local"
     embedding_model: str = "hashing-768"
     embedding_url: str = "http://ollama:11434"

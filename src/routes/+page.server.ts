@@ -24,6 +24,7 @@ type BackupStatus = {
   next_backup_at: string | null;
   backups: Array<{ id: string; created_at: string; size_bytes: number }>;
   retention_enabled?: boolean;
+  evidence_rotation_enabled?: boolean;
   database_size_bytes?: number;
   wal_size_bytes?: number;
   live_size_bytes?: number;
@@ -82,6 +83,7 @@ type Overview = {
     filters: SourceFilters;
     last_status: string | null;
     last_scanned_at: string | null;
+    last_attempted_at?: string | null;
   }>;
   settings: {
     embedding_backend: string;
@@ -171,7 +173,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     last_error: null,
     next_backup_at: null,
     backups: [],
-    retention_enabled: true,
+    retention_enabled: false,
+    evidence_rotation_enabled: false,
     database_size_bytes: 0,
     wal_size_bytes: 0,
     live_size_bytes: 0,
@@ -297,7 +300,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 
 const idSchema = z.coerce.number().int().positive();
 const urlSchema = z.url();
-const fail = (statusCode: number, data: { message: string }) =>
+const fail = <T extends { message: string }>(statusCode: number, data: T) =>
   kitFail(statusCode, { ...data, error: true as const });
 const message = (error: unknown) =>
   error instanceof Error
@@ -411,6 +414,26 @@ export const actions: Actions = {
         message: enabled
           ? "Automatic storage retention enabled."
           : "Automatic storage retention paused.",
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setEvidenceRotation: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid evidence rotation setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/evidence-rotation", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Replay evidence rotation enabled."
+          : "Replay evidence rotation paused.",
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
@@ -631,12 +654,151 @@ export const actions: Actions = {
     const id = idSchema.safeParse(data.get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
     const filters = sourceFiltersFromForm(data);
+    const includeGenresRaw = formText(data, "includeGenres");
+    const excludeGenresRaw = formText(data, "excludeGenres");
+    const submittedUrlRaw = formText(data, "url");
+    const currentUrlRaw = formText(data, "currentUrl");
+    const intent = formText(data, "intent") || "save";
+    const confirmZeroMatch = formText(data, "confirmZeroMatch") === "1";
+
+    let targetUrl = "";
+    let skipLivePreview = false;
+    if (submittedUrlRaw) {
+      const parsedUrl = urlSchema.safeParse(submittedUrlRaw);
+      if (!parsedUrl.success) {
+        return fail(400, { message: "Enter a valid source URL." });
+      }
+      targetUrl = parsedUrl.data;
+    }
+
     try {
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify({ filters }),
-      });
-      return { message: "Source filters updated; a fresh scan is queued." };
+      if (!targetUrl) {
+        const overview = await engine<Overview>(
+          "/api/overview?recommendation_limit=1&decision_limit=1",
+        );
+        const existing = overview.sources.find((item) => item.id === id.data);
+        if (!existing) return fail(404, { message: "Source not found." });
+        if (existing.kind === "association" || existing.kind === "builtin") {
+          skipLivePreview = true;
+        } else {
+          targetUrl = existing.url;
+        }
+      }
+
+      let previewCount: number | null = null;
+      let previewRawCount: number | null = null;
+      let resolvedTargetUrl = targetUrl;
+      if (!skipLivePreview) {
+        const preview = await engine<{
+          count: number;
+          raw_count?: number;
+          url?: string;
+        }>(
+          "/api/sources/preview",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              url: targetUrl,
+              filters,
+            }),
+          },
+        );
+        if (typeof preview.url === "string" && preview.url.trim()) {
+          resolvedTargetUrl = preview.url.trim();
+        }
+        previewCount = preview.count;
+        previewRawCount =
+          typeof preview.raw_count === "number"
+            ? preview.raw_count
+            : preview.count;
+
+        if (intent === "preview") {
+          const messageText =
+            previewCount === 0
+              ? previewRawCount > 0
+                ? `Preview found ${previewRawCount} book${previewRawCount === 1 ? "" : "s"}, but 0 matched these filters.`
+                : "Preview found 0 recognizable books at that URL."
+              : `Preview matched ${previewCount} of ${previewRawCount} book${previewRawCount === 1 ? "" : "s"}.`;
+          return {
+            message: messageText,
+            sourcePreview: {
+              id: id.data,
+              url: resolvedTargetUrl,
+              count: previewCount,
+              rawCount: previewRawCount,
+              includeGenres: includeGenresRaw,
+              excludeGenres: excludeGenresRaw,
+            },
+          };
+        }
+
+        const urlChanged = Boolean(
+          submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw),
+        );
+        if (previewRawCount === 0 && urlChanged) {
+          return fail(400, {
+            message: "No recognizable books were found at that URL.",
+          });
+        }
+
+        if (previewCount === 0 && !confirmZeroMatch) {
+          const hasFilters = Boolean(
+            filters.include_genres.length || filters.exclude_genres.length,
+          );
+          const warningMessage =
+            previewRawCount > 0 && hasFilters
+              ? `0 of ${previewRawCount} book${previewRawCount === 1 ? "" : "s"} in this feed matched these filters. Confirm to save anyway (existing candidates will be kept).`
+              : "No books matched this source configuration. Confirm to save anyway (existing candidates will be kept).";
+          return fail(400, {
+            message: warningMessage,
+            zeroMatchConfirm: {
+              id: id.data,
+              url: submittedUrlRaw || resolvedTargetUrl,
+              rawCount: previewRawCount,
+              includeGenres: includeGenresRaw,
+              excludeGenres: excludeGenresRaw,
+            },
+          });
+        }
+      }
+
+      const updatePayload: {
+        url?: string;
+        filters: SourceFilters;
+      } = { filters };
+      if (submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw)) {
+        updatePayload.url = resolvedTargetUrl;
+      }
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify(updatePayload),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
+      if (updatePayload.url) {
+        return {
+          message:
+            previewCount === null
+              ? `Source URL and filters updated${scanSuffix}`
+              : `Source updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
+        };
+      }
+      if (previewCount === 0) {
+        return {
+          message: `Zero-match source filters confirmed and saved${scanSuffix}`,
+        };
+      }
+      return {
+        message:
+          previewCount === null
+            ? `Source filters updated${scanSuffix}`
+            : `Source filters updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -650,6 +812,26 @@ export const actions: Actions = {
         body: JSON.stringify({ lifecycle: "one_time" }),
       });
       return { message: "Source changed to a one-time import." };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  switchSourceToPermanent: async ({ request }) => {
+    const id = idSchema.safeParse((await request.formData()).get("id"));
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    try {
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ lifecycle: "permanent" }),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
+      return { message: `Source changed to a permanent feed${scanSuffix}` };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -845,17 +1027,37 @@ export const actions: Actions = {
     const apiKey = String(data.get("apiKey") || "").trim();
     const clear = data.get("clear") === "on";
     try {
-      await engine("/api/settings/google-books", {
+      const result = await engine<{
+        saved: boolean;
+        google_books_api_key_set: boolean;
+        job_ids?: Record<string, string | number | null>;
+        validation_status?: "verified" | "deferred";
+        validation_warning?: string;
+      }>("/api/settings/google-books", {
         method: "PUT",
         body: JSON.stringify({
           api_key: apiKey || null,
           clear,
         }),
       });
+      if (!clear && !apiKey && !result.google_books_api_key_set) {
+        return fail(400, { message: "Enter a Google Books API key." });
+      }
+      if (clear) {
+        return { message: "Google Books API key cleared." };
+      }
+      if (!apiKey) {
+        return { message: "Existing Google Books API key kept." };
+      }
+      if (result.validation_status === "deferred") {
+        return {
+          message: result.validation_warning
+            ? `${result.validation_warning} Metadata refresh queued.`
+            : "Google Books API key saved (live verification deferred); metadata refresh queued.",
+        };
+      }
       return {
-        message: clear
-          ? "Google Books API key cleared."
-          : "Google Books API key saved.",
+        message: "Google Books API key verified and saved; metadata refresh queued.",
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });

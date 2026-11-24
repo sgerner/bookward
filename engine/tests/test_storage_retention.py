@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
+import re
 import shutil
 import sqlite3
 from collections import namedtuple
@@ -16,10 +19,12 @@ import afterword_engine.backups as backups
 import afterword_engine.decision_evidence as decision_evidence_module
 import afterword_engine.ingestion as ingestion_module
 import afterword_engine.main as main_module
-from afterword_engine.config import settings
-from afterword_engine.database import connect, initialize, transaction
+from afterword_engine.config import Settings, settings
+from afterword_engine.database import MIGRATIONS, connect, initialize, transaction
 from afterword_engine.decision_evidence import (
     build_decision_evidence,
+    is_evidence_rotation_enabled,
+    is_storage_retention_enabled,
     load_decision_evidence,
     rotate_recommendation_evidence_if_needed,
 )
@@ -73,7 +78,6 @@ def database(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "backup_dir", str(tmp_path / "afterword-backups"))
     monkeypatch.setattr(settings, "backup_interval_hours", 24)
     monkeypatch.setattr(settings, "backup_retention_count", 7)
-    monkeypatch.setattr(settings, "retention_enabled", True)
     initialize(seed_demo=False)
     return tmp_path
 
@@ -164,6 +168,10 @@ def _build_complete_run(rec_id: int, idx: int) -> str:
 def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attribution(
     database, monkeypatch
 ):
+    assert (
+        '"base_ranker_fallback" if can_personalize else "non_ranking_request"'
+        in inspect.getsource(main_module.tracked_recommendations)
+    )
     monkeypatch.setattr(main_module, "enqueue_job", lambda *_a, **_kw: "job-noop")
     with transaction() as con:
         _source_id, candidate_ids = _seed_source_and_candidates(con)
@@ -278,6 +286,7 @@ def test_impression_fatigue_query_uses_partial_visible_index(database):
 def test_evidence_watermark_rotation_evicts_unattributed_and_protects_outcomes(
     database, monkeypatch
 ):
+    monkeypatch.setattr(settings, "evidence_rotation_enabled", True)
     with transaction() as con:
         con.execute(
             "INSERT INTO reads(title, author, rating, read_at, source) VALUES(?, ?, 5, '2026-01-10', 'test')",
@@ -429,7 +438,10 @@ def test_evidence_watermark_rotation_evicts_unattributed_and_protects_outcomes(
         assert load_decision_evidence(con, live_attributed_run)["capture_status"] == "complete"
 
 
-def test_telemetry_pruning_removes_aged_unattributed_rows_and_preserves_outcomes(database):
+def test_telemetry_pruning_removes_aged_unattributed_rows_and_preserves_outcomes(
+    database, monkeypatch
+):
+    monkeypatch.setattr(settings, "retention_enabled", True)
     now = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
     old_ts = (now - timedelta(days=TELEMETRY_RETENTION_DAYS + 30)).isoformat()
     recent_ts = (now - timedelta(days=TELEMETRY_RETENTION_DAYS - 15)).isoformat()
@@ -562,6 +574,7 @@ def test_telemetry_pruning_removes_aged_unattributed_rows_and_preserves_outcomes
 def test_embedding_triggers_scan_source_rotation_virtual_history_and_thrashing_guard(
     database, monkeypatch
 ):
+    monkeypatch.setattr(settings, "retention_enabled", True)
     assert resolve_embedding_target("fastembed", "hashing-768") == (
         "fastembed",
         "BAAI/bge-small-en-v1.5",
@@ -704,8 +717,9 @@ def test_embedding_triggers_scan_source_rotation_virtual_history_and_thrashing_g
 
 
 def test_operational_maintenance_honors_exact_retention_windows_and_protects_leases(
-    database,
+    database, monkeypatch
 ):
+    monkeypatch.setattr(settings, "retention_enabled", True)
     assert TERMINAL_JOBS_RETENTION_DAYS == 30
     assert ASSOCIATION_RUNS_RETENTION_DAYS == 30
     assert ASSOCIATION_REQUESTS_RETENTION_DAYS == 30
@@ -846,6 +860,7 @@ def test_operational_maintenance_honors_exact_retention_windows_and_protects_lea
 def test_bounded_multi_transaction_maintenance_resumes_across_passes(
     database, monkeypatch
 ):
+    monkeypatch.setattr(settings, "retention_enabled", True)
     now = datetime(2026, 11, 21, 18, 0, tzinfo=timezone.utc)
     old_iso = (now - timedelta(days=120)).isoformat()
     old_sql = (now - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
@@ -919,7 +934,265 @@ def test_bounded_multi_transaction_maintenance_resumes_across_passes(
         assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
-def test_retention_opt_out_via_env_and_profile_setting(database, monkeypatch):
+def test_migration_28_has_no_startup_deletes_and_maintenance_batches_orphan_cleanup(
+    database, monkeypatch
+):
+    assert MIGRATIONS[-1][0] == 28
+    migration_28_sql = dict(MIGRATIONS)[28]
+    sql_without_triggers = re.sub(
+        r"CREATE\s+TRIGGER\b.*?END\s*;",
+        "",
+        migration_28_sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert "DELETE" not in sql_without_triggers.upper()
+
+    with connect() as con:
+        applied = {
+            int(row[0])
+            for row in con.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        assert {27, 28} <= applied
+
+    vec = vector_blob(np.asarray([0.25, 0.25, 0.25, 0.25], dtype=np.float32))
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO embeddings(entity_type, entity_id, backend, model, vector, dimensions, content_hash) "
+            "VALUES('read_candidate', -7, 'local', 'hashing-768', ?, 4, 'virt-h'), "
+            "      ('candidate', 999999, 'local', 'hashing-768', ?, 4, 'orphan-c'), "
+            "      ('read', 999999, 'local', 'hashing-768', ?, 4, 'orphan-r')",
+            (vec, vec, vec),
+        )
+
+    monkeypatch.setattr(settings, "retention_enabled", True)
+    maint = run_storage_maintenance(batch_size=2)
+    assert maint["embeddings"]["removed_orphan_or_virtual"] == 3
+    with connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 0
+
+
+def test_link_table_cleanup_preserves_attributed_runs_without_complete_capture(
+    database, monkeypatch
+):
+    now = datetime(2026, 11, 21, 16, 0, tzinfo=timezone.utc)
+    old_ts = (now - timedelta(days=TELEMETRY_RETENTION_DAYS + 20)).isoformat()
+
+    with transaction() as con:
+        source_id, candidate_ids = _seed_source_and_candidates(con)
+        c1, c2 = candidate_ids[0], candidate_ids[1]
+        churn_cur = con.execute(
+            "INSERT INTO candidates(source_id, normalized_key, title, author, status) "
+            "VALUES(?, 'link-churn::a', 'Link Churn', 'Author', 'recommended')",
+            (source_id,),
+        )
+        churn_cid = int(churn_cur.lastrowid)
+
+        for batch_id in (
+            "batch-attr-live",
+            "batch-attr-churn",
+            "batch-attr-event",
+            "batch-unattr-1",
+            "batch-unattr-2",
+        ):
+            con.execute(
+                "INSERT INTO scoring_batches(id, schema_version, capture_status, reason, captured_at) "
+                "VALUES(?, 1, 'incomplete', 'test_fixture', ?)",
+                (batch_id, old_ts),
+            )
+
+        for run_id in (
+            "inc-attr-live",
+            "inc-attr-churn",
+            "inc-attr-event",
+            "inc-unattr-1",
+            "inc-unattr-2",
+        ):
+            con.execute(
+                "INSERT INTO recommendation_runs(id, policy, policy_version, candidate_count, created_at) "
+                "VALUES(?, 'p', 'v1', 1, ?)",
+                (run_id, old_ts),
+            )
+            if run_id != "inc-attr-event":
+                con.execute(
+                    "INSERT INTO recommendation_run_evidence("
+                    "run_id, schema_version, capture_status, reason, captured_at"
+                    ") VALUES(?, 1, 'incomplete', 'storage_quota_exceeded', ?)",
+                    (run_id, old_ts),
+                )
+
+        # 1. Incomplete capture with recommendation_outcomes row
+        imp_cur = con.execute(
+            "INSERT INTO recommendation_impressions(run_id, candidate_id, rank, score, propensity, presented_at) "
+            "VALUES('inc-attr-live', ?, 1, 88.0, 1.0, ?)",
+            (c1, old_ts),
+        )
+        imp_id = int(imp_cur.lastrowid)
+        evt_cur = con.execute(
+            "INSERT INTO recommendation_events(event_key, run_id, candidate_id, event_type, value, source, occurred_at) "
+            "VALUES('evt-inc-live', 'inc-attr-live', ?, 'read', 5.0, 'web', ?)",
+            (c1, old_ts),
+        )
+        con.execute(
+            "INSERT INTO recommendation_outcomes(impression_id, event_id, label, label_kind, confidence, attributed_at) "
+            "VALUES(?, ?, 1.0, 'explicit_rating', 1.0, ?)",
+            (imp_id, int(evt_cur.lastrowid), old_ts),
+        )
+        con.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id, score_batch_id) "
+            "VALUES('inc-attr-live', 'batch-attr-live')"
+        )
+
+        # 2. Incomplete capture whose candidate was deleted, leaving only recommendation_evidence_outcomes
+        con.execute(
+            "INSERT INTO recommendation_evidence_outcomes("
+            "run_id, event_key, event_revision, candidate_id, rank, score, propensity, presented_at, label, label_kind, confidence, attributed_at"
+            ") VALUES('inc-attr-churn', 'evt-inc-churn', 1, ?, 1, 88.0, 1.0, ?, 1.0, 'save', 0.8, ?)",
+            (churn_cid, old_ts, old_ts),
+        )
+        con.execute("DELETE FROM candidates WHERE id = ?", (churn_cid,))
+        con.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id, score_batch_id) "
+            "VALUES('inc-attr-churn', 'batch-attr-churn')"
+        )
+
+        # 3. Missing recommendation_run_evidence row with non-'visible' recommendation_evidence_events
+        con.execute(
+            "INSERT INTO recommendation_evidence_events("
+            "event_key, revision, run_id, candidate_id, event_type, source, occurred_at"
+            ") VALUES('evt-inc-action', 1, 'inc-attr-event', ?, 'save', 'web', ?)",
+            (c2, old_ts),
+        )
+        con.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id, score_batch_id) "
+            "VALUES('inc-attr-event', 'batch-attr-event')"
+        )
+
+        # 4. Unattributed incomplete capture -> eligible for link cleanup in rotation
+        con.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id, score_batch_id) "
+            "VALUES('inc-unattr-1', 'batch-unattr-1')"
+        )
+
+    monkeypatch.setattr(settings, "evidence_rotation_enabled", True)
+    with transaction() as con:
+        rotate_recommendation_evidence_if_needed(
+            con, incoming_bytes=10_000_000, max_bytes=512
+        )
+        links_after_rotation = {
+            (str(r["run_id"]), str(r["score_batch_id"]))
+            for r in con.execute(
+                "SELECT run_id, score_batch_id FROM recommendation_run_evidence_scoring_batches"
+            ).fetchall()
+        }
+        assert links_after_rotation == {
+            ("inc-attr-live", "batch-attr-live"),
+            ("inc-attr-churn", "batch-attr-churn"),
+            ("inc-attr-event", "batch-attr-event"),
+        }
+        batches_after_rotation = {
+            str(r["id"])
+            for r in con.execute("SELECT id FROM scoring_batches").fetchall()
+        }
+        assert {
+            "batch-attr-live",
+            "batch-attr-churn",
+            "batch-attr-event",
+        } <= batches_after_rotation
+        assert "batch-unattr-1" not in batches_after_rotation
+
+        # Add a second unattributed incomplete link and verify telemetry pruning also
+        # deletes only the unattributed link while preserving all attributed links.
+        con.execute(
+            "INSERT INTO recommendation_run_evidence_scoring_batches(run_id, score_batch_id) "
+            "VALUES('inc-unattr-2', 'batch-unattr-2')"
+        )
+
+    monkeypatch.setattr(settings, "retention_enabled", True)
+    run_storage_maintenance(now=now)
+
+    with connect() as con:
+        links_after_maint = {
+            (str(r["run_id"]), str(r["score_batch_id"]))
+            for r in con.execute(
+                "SELECT run_id, score_batch_id FROM recommendation_run_evidence_scoring_batches"
+            ).fetchall()
+        }
+        assert links_after_maint == {
+            ("inc-attr-live", "batch-attr-live"),
+            ("inc-attr-churn", "batch-attr-churn"),
+            ("inc-attr-event", "batch-attr-event"),
+        }
+        batches_after_maint = {
+            str(r["id"])
+            for r in con.execute("SELECT id FROM scoring_batches").fetchall()
+        }
+        assert batches_after_maint == {
+            "batch-attr-live",
+            "batch-attr-churn",
+            "batch-attr-event",
+        }
+
+
+def test_is_storage_retention_enabled_and_rotation_fail_closed_and_log(
+    database, monkeypatch, caplog
+):
+    monkeypatch.setattr(settings, "retention_enabled", True)
+    monkeypatch.setattr(settings, "evidence_rotation_enabled", True)
+
+    class _BrokenConnection:
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("simulated sqlite read failure")
+
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    assert is_storage_retention_enabled(_BrokenConnection()) is False
+    assert any(
+        "failing closed (storage retention disabled)" in rec.message
+        for rec in caplog.records
+    )
+
+    caplog.clear()
+    assert is_evidence_rotation_enabled(_BrokenConnection()) is False
+    assert any(
+        "failing closed (evidence rotation disabled)" in rec.message
+        for rec in caplog.records
+    )
+
+    def _broken_connect():
+        raise sqlite3.OperationalError("simulated connect failure")
+
+    monkeypatch.setattr(decision_evidence_module, "connect", _broken_connect)
+    monkeypatch.setattr(backups, "connect", _broken_connect)
+
+    caplog.clear()
+    assert is_storage_retention_enabled() is False
+    assert any(
+        "failing closed (storage retention disabled)" in rec.message
+        for rec in caplog.records
+    )
+
+    caplog.clear()
+    assert is_evidence_rotation_enabled() is False
+    assert any(
+        "failing closed (evidence rotation disabled)" in rec.message
+        for rec in caplog.records
+    )
+
+    caplog.clear()
+    assert backups.maintenance_is_due() is False
+    assert any("failing closed" in rec.message for rec in caplog.records)
+
+
+def test_conservative_defaults_and_decoupled_rotation_and_retention_controls(
+    database, monkeypatch
+):
+    # Fresh Settings defaults are conservative (False) unless opted in.
+    fresh_defaults = Settings(_env_file=None)
+    assert fresh_defaults.retention_enabled is False
+    assert fresh_defaults.evidence_rotation_enabled is False
+    assert is_storage_retention_enabled() is False
+    assert is_evidence_rotation_enabled() is False
+
     now = datetime(2026, 11, 21, 19, 0, tzinfo=timezone.utc)
     old_sql = (now - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
     with transaction() as con:
@@ -932,12 +1205,11 @@ def test_retention_opt_out_via_env_and_profile_setting(database, monkeypatch):
         )
     run_1 = _build_complete_run(rec_id, 1)
 
-    # 1. Global env opt-out (AFTERWORD_RETENTION_ENABLED=false)
-    monkeypatch.setattr(settings, "retention_enabled", False)
+    # 1. Conservative default: neither scheduled retention nor evidence rotation deletes anything.
     assert backups.maintenance_is_due(now) is False
-    env_maint = run_storage_maintenance(now=now)
-    assert env_maint["skipped"] is True
-    assert env_maint["reason"] == "retention_disabled"
+    default_maint = run_storage_maintenance(now=now)
+    assert default_maint["skipped"] is True
+    assert default_maint["reason"] == "retention_disabled"
     with transaction() as con:
         rot = rotate_recommendation_evidence_if_needed(
             con, incoming_bytes=10_000_000, max_bytes=1024
@@ -947,28 +1219,34 @@ def test_retention_opt_out_via_env_and_profile_setting(database, monkeypatch):
         assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
     with TestClient(app, headers=authenticated_headers()) as client:
-        status_env_off = client.get("/api/backups").json()
-        assert status_env_off["retention_enabled"] is False
-        conflict = client.post("/api/backups/retention", json={"enabled": True})
-        assert conflict.status_code == 409
+        initial_status = client.get("/api/backups").json()
+        assert initial_status["retention_enabled"] is False
+        assert initial_status["evidence_rotation_enabled"] is False
 
-        # 2. Restore global flag, toggle per-profile setting via API
-        monkeypatch.setattr(settings, "retention_enabled", True)
-        paused = client.post("/api/backups/retention", json={"enabled": False})
-        assert paused.status_code == 200
-        assert paused.json()["retention_enabled"] is False
+        # 2. Enabling evidence rotation does NOT enable scheduled table retention.
+        rot_on = client.post("/api/backups/evidence-rotation", json={"enabled": True})
+        assert rot_on.status_code == 200
+        assert rot_on.json()["evidence_rotation_enabled"] is True
+        assert rot_on.json()["status"]["retention_enabled"] is False
         assert backups.maintenance_is_due(now) is False
         assert run_storage_maintenance(now=now)["skipped"] is True
-        with connect() as con:
+        with transaction() as con:
+            rot_active = rotate_recommendation_evidence_if_needed(
+                con, incoming_bytes=10_000_000, max_bytes=1024
+            )
+            assert rot_active["rotated_runs"] == 1
             assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
-        # Even with profile setting '1', AFTERWORD_RETENTION_ENABLED=false still overrides!
-        resumed = client.post("/api/backups/retention", json={"enabled": True})
-        assert resumed.status_code == 200
-        assert resumed.json()["retention_enabled"] is True
-        monkeypatch.setattr(settings, "retention_enabled", False)
-        assert client.get("/api/backups").json()["retention_enabled"] is False
-        monkeypatch.setattr(settings, "retention_enabled", True)
+        rot_off = client.post("/api/backups/evidence-rotation", json={"enabled": False})
+        assert rot_off.status_code == 200
+        assert rot_off.json()["evidence_rotation_enabled"] is False
+
+        # 3. Enabling scheduled storage retention does NOT enable evidence rotation.
+        ret_on = client.post("/api/backups/retention", json={"enabled": True})
+        assert ret_on.status_code == 200
+        assert ret_on.json()["retention_enabled"] is True
+        assert ret_on.json()["status"]["evidence_rotation_enabled"] is False
+        assert backups.maintenance_is_due(now) is True
 
         active_maint = run_storage_maintenance(now=now)
         assert active_maint["skipped"] is False
@@ -976,10 +1254,16 @@ def test_retention_opt_out_via_env_and_profile_setting(database, monkeypatch):
         with connect() as con:
             assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
+        ret_off = client.post("/api/backups/retention", json={"enabled": False})
+        assert ret_off.status_code == 200
+        assert ret_off.json()["retention_enabled"] is False
+        assert backups.maintenance_is_due(now) is False
+
 
 def test_side_effect_free_backups_and_compaction_only_recovery(
     database, monkeypatch
 ):
+    monkeypatch.setattr(settings, "retention_enabled", True)
     db_path = Path(settings.db)
     with connect() as con:
         assert con.execute("PRAGMA auto_vacuum").fetchone()[0] == 2

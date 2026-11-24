@@ -399,7 +399,14 @@ def test_restore_missing_safety_backup_marks_rollback_failed(
     assert backups.backup_status()["last_error"] == expected_message
 
 
-def test_startup_recovery_rolls_back_an_interrupted_database_and_key_swap(database):
+class _SimulatedCrash(BaseException):
+    """Bypass except Exception blocks to model an abrupt process crash."""
+
+
+@pytest.mark.parametrize("damage_mode", ["torn_bytes", "missing_file"])
+def test_startup_recovery_rolls_back_an_interrupted_database_and_key_swap(
+    database, damage_mode
+):
     with transaction() as con:
         con.execute(
             "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
@@ -425,17 +432,547 @@ def test_startup_recovery_rolls_back_an_interrupted_database_and_key_swap(databa
             "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
             ("partial_secret", seal("partial key")),
         )
+
+    live_db = Path(settings.db)
+    if damage_mode == "torn_bytes":
+        live_db.write_bytes(b"SQLite format 3\x00torn-header-and-corrupt-pages")
+        Path(f"{settings.db}-wal").write_bytes(b"corrupt-wal-frames")
+        Path(f"{settings.db}-shm").write_bytes(b"corrupt-shm")
+    else:
+        live_db.unlink()
+        Path(f"{settings.db}-wal").write_bytes(b"orphaned-wal")
+        Path(f"{settings.db}-shm").unlink(missing_ok=True)
+
     backups._write_restore_journal(
         database / "backups" / f"{safety['id']}.sqlite3",
         database / "backups" / f"{safety['id']}.sqlite3",
     )
+    journal_path = backups._restore_journal_path()
+    assert journal_path.is_file()
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
     (database / "secret.key").unlink()
 
     assert backups.recover_interrupted_restore() is True
-    assert not (database / backups.RESTORE_JOURNAL_NAME).exists()
+    assert not journal_path.exists()
+    assert not backups._restore_journal_key_path(journal_path).exists()
+    assert stat.S_IMODE(live_db.stat().st_mode) == 0o600
+    assert stat.S_IMODE((database / "secret.key").stat().st_mode) == 0o600
     assert row("SELECT 1 FROM reads WHERE title='Safety state'") is not None
     assert row("SELECT 1 FROM reads WHERE title='Partial restore'") is None
     assert private_setting("recovery_test_secret") == "safety key"
+    assert (
+        backups.backup_status()["last_error"]
+        == "An interrupted restore was rolled back to its safety backup."
+    )
+
+
+@pytest.mark.parametrize(
+    "crash_step",
+    [
+        "before_journal",
+        "after_journal_before_swap",
+        "mid_swap",
+        "after_swap_before_journal_clear",
+    ],
+)
+def test_restore_backup_crash_injection_across_each_step(
+    database, monkeypatch, crash_step
+):
+    from afterword_engine.database import connect
+
+    # Create a target backup under a distinct generated key.
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Target backup read", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("restore_step_secret", seal("target-secret-value")),
+        )
+    target = backups.create_backup()
+
+    # Reinitialize live profile with a new key and live state before restoring.
+    Path(settings.db).unlink()
+    Path(f"{settings.db}-wal").unlink(missing_ok=True)
+    Path(f"{settings.db}-shm").unlink(missing_ok=True)
+    (database / "secret.key").unlink()
+    initialize()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Live pre-restore read", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("restore_step_secret", seal("live-secret-value")),
+        )
+    expected_live_key = (database / "secret.key").read_bytes()
+
+    with monkeypatch.context() as mp:
+        if crash_step == "before_journal":
+            mp.setattr(
+                backups,
+                "_write_restore_journal",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    _SimulatedCrash("before journal")
+                ),
+            )
+        elif crash_step == "after_journal_before_swap":
+            original_write_journal = backups._write_restore_journal
+
+            def write_then_crash(*args, **kwargs):
+                original_write_journal(*args, **kwargs)
+                raise _SimulatedCrash("after journal before swap")
+
+            mp.setattr(backups, "_write_restore_journal", write_then_crash)
+        elif crash_step == "mid_swap":
+            def crash_mid_swap(staged, key_source=None, **_kwargs):
+                assert key_source is not None
+                (database / "secret.key").write_bytes(key_source.read_bytes())
+                Path(settings.db).write_bytes(b"SQLite format 3\x00torn-mid-swap-pages")
+                Path(f"{settings.db}-wal").write_bytes(b"corrupt-mid-swap-wal")
+                staged.unlink(missing_ok=True)
+                raise _SimulatedCrash("mid swap after key replace")
+
+            mp.setattr(backups, "_replace_live_database", crash_mid_swap)
+        elif crash_step == "after_swap_before_journal_clear":
+            mp.setattr(
+                backups,
+                "_clear_restore_journal",
+                lambda: (_ for _ in ()).throw(
+                    _SimulatedCrash("after swap before clear")
+                ),
+            )
+
+        with pytest.raises(_SimulatedCrash):
+            backups.restore_backup(target["id"])
+
+    if crash_step == "before_journal":
+        assert backups.has_restore_journal() is False
+        assert backups.recover_interrupted_restore() is False
+    else:
+        assert backups.has_restore_journal() is True
+        with pytest.raises(sqlite3.OperationalError, match="interrupted restore"):
+            connect()
+        assert backups.recover_interrupted_restore() is True
+        assert backups.has_restore_journal() is False
+
+    assert (database / "secret.key").read_bytes() == expected_live_key
+    assert row("SELECT 1 FROM reads WHERE title='Live pre-restore read'") is not None
+    assert row("SELECT 1 FROM reads WHERE title='Target backup read'") is None
+    assert private_setting("restore_step_secret") == "live-secret-value"
+
+
+def test_mid_swap_crash_without_safety_key_sidecar_prevents_key_database_mismatch(
+    database, monkeypatch
+):
+    # Case 1: safety snapshot's .secret.key sidecar is missing, so rollback falls
+    # back to the pre-swap key staged alongside the restore journal.
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("sidecar_fallback_secret", seal("target-key-secret")),
+        )
+    target = backups.create_backup()
+
+    Path(settings.db).unlink()
+    Path(f"{settings.db}-wal").unlink(missing_ok=True)
+    Path(f"{settings.db}-shm").unlink(missing_ok=True)
+    (database / "secret.key").unlink()
+    initialize()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("sidecar_fallback_secret", seal("original-live-secret")),
+        )
+    original_key_bytes = (database / "secret.key").read_bytes()
+
+    def crash_after_losing_safety_sidecar(staged, key_source=None, **_kwargs):
+        journal = backups._restore_journal_path()
+        safety_id, _, _ = backups._read_restore_journal_meta(journal)
+        safety_sidecar = database / "backups" / f"{safety_id}.secret.key"
+        safety_sidecar.unlink()
+        assert key_source is not None
+        (database / "secret.key").write_bytes(key_source.read_bytes())
+        Path(settings.db).write_bytes(b"corrupt-mid-swap-db")
+        staged.unlink(missing_ok=True)
+        raise _SimulatedCrash("mid swap with missing safety sidecar")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(backups, "_replace_live_database", crash_after_losing_safety_sidecar)
+        with pytest.raises(_SimulatedCrash):
+            backups.restore_backup(target["id"])
+
+    assert (database / "secret.key").read_bytes() != original_key_bytes
+    assert backups.recover_interrupted_restore() is True
+    assert (database / "secret.key").read_bytes() == original_key_bytes
+    assert private_setting("sidecar_fallback_secret") == "original-live-secret"
+
+    # Case 2: configured AFTERWORD_SECRET_KEY means _restore_key_sidecar returns None
+    # (no sidecar on safety snapshot); rollback clears any stray generated secret.key.
+    configured_key = Fernet.generate_key().decode()
+    with monkeypatch.context() as mp:
+        mp.setenv("AFTERWORD_SECRET_KEY", configured_key)
+        (database / "secret.key").unlink(missing_ok=True)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("sidecar_fallback_secret", seal("configured-env-secret")),
+            )
+        env_safety = backups.create_backup()
+        env_safety_path = database / "backups" / f"{env_safety['id']}.sqlite3"
+        assert not (database / "backups" / f"{env_safety['id']}.secret.key").exists()
+
+        backups._write_restore_journal(env_safety_path, env_safety_path)
+        (database / "secret.key").write_bytes(Fernet.generate_key())
+        Path(settings.db).write_bytes(b"corrupt-env-key-db")
+
+        assert backups.recover_interrupted_restore() is True
+        assert not (database / "secret.key").exists()
+        assert private_setting("sidecar_fallback_secret") == "configured-env-secret"
+
+
+@pytest.mark.parametrize(
+    ("error_message", "error_code"),
+    [
+        ("disk I/O error", sqlite3.SQLITE_IOERR),
+        ("unable to open database file", sqlite3.SQLITE_CANTOPEN),
+    ],
+)
+def test_rollback_mode_tolerates_non_lock_sqlite_operational_errors(
+    database, monkeypatch, error_message, error_code
+):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Rollback operational error row", "Reader", "test"),
+        )
+    safety = backups.create_backup()
+    safety_path = database / "backups" / f"{safety['id']}.sqlite3"
+    backups._write_restore_journal(safety_path, safety_path)
+    Path(f"{settings.db}-wal").write_bytes(b"damaged-wal")
+
+    real_connect = backups.sqlite3.connect
+    live_resolved = Path(settings.db).resolve()
+
+    def connect_failing_live(target, *args, **kwargs):
+        if not kwargs.get("uri") and Path(target).resolve() == live_resolved:
+            err = sqlite3.OperationalError(error_message)
+            err.sqlite_errorcode = error_code
+            raise err
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(backups.sqlite3, "connect", connect_failing_live)
+    assert backups.recover_interrupted_restore() is True
+    assert not backups.has_restore_journal()
+    assert not Path(f"{settings.db}-wal").exists()
+    monkeypatch.setattr(backups.sqlite3, "connect", real_connect)
+    assert row("SELECT 1 FROM reads WHERE title='Rollback operational error row'") is not None
+
+
+def test_interrupted_restore_rejects_corrupt_journal_locks_and_missing_safety_snapshot(
+    database,
+):
+    safety = backups.create_backup()
+    safety_snapshot = database / "backups" / f"{safety['id']}.sqlite3"
+    journal_path = backups._restore_journal_path()
+
+    # 1. Corrupt journal JSON surfaces a journal error and keeps the fence.
+    journal_path.write_text("{corrupt-json", encoding="utf-8")
+    journal_path.chmod(0o600)
+    with pytest.raises(backups.BackupError, match="journal is invalid"):
+        backups.recover_interrupted_restore()
+    assert journal_path.is_file()
+    assert backups.backup_status()["last_error"] == "The interrupted restore journal is invalid."
+
+    # 2. Active external SQLite lock is rejected even in rollback mode.
+    backups._write_restore_journal(safety_snapshot, safety_snapshot)
+    external_lock = sqlite3.connect(settings.db)
+    external_lock.execute("BEGIN IMMEDIATE")
+    external_lock.execute(
+        "INSERT INTO reads(title,author,source) VALUES('Locked row','External','test')"
+    )
+    try:
+        with pytest.raises(
+            backups.BackupError, match="could not be safely closed for restore"
+        ):
+            backups.recover_interrupted_restore()
+        assert journal_path.is_file()
+        assert (
+            backups.backup_status()["last_error"]
+            == "The active database could not be safely closed for restore."
+        )
+    finally:
+        external_lock.rollback()
+        external_lock.close()
+
+    # 3. Missing safety snapshot preserves availability BackupError and keeps the fence.
+    safety_snapshot.unlink()
+    with pytest.raises(backups.BackupError, match="no longer available"):
+        backups.recover_interrupted_restore()
+    assert backups.backup_status()["last_error"] == "That backup is no longer available."
+    backups._clear_restore_journal()
+
+
+def test_fenced_profile_blocks_sqlite_access_and_recovers_by_restoring_another_backup_via_middleware(
+    database,
+):
+    import asyncio
+    from afterword_engine.database import connect
+    from afterword_engine.tenancy import database_path_override
+
+    headers = authenticated_headers()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Recoverable alternate snapshot", "Reader", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("alternate_backup_secret", seal("alternate-backup-key")),
+        )
+    visible_backup = backups.create_backup()
+
+    missing_safety_id = "bookward-20260101T000000Z-12345678"
+    journal_path = backups._restore_journal_path()
+    journal_path.write_text(
+        f'{{"safety_backup": "{missing_safety_id}", "selected_backup": "{visible_backup["id"]}"}}',
+        encoding="utf-8",
+    )
+    journal_path.chmod(0o600)
+
+    live_db = Path(settings.db)
+    sentinel = b"SQLite format 3\x00unrecovered-partial-bytes"
+    live_db.write_bytes(sentinel)
+    (database / "secret.key").write_bytes(Fernet.generate_key())
+    Path(f"{settings.db}-wal").unlink(missing_ok=True)
+    Path(f"{settings.db}-shm").unlink(missing_ok=True)
+
+    with pytest.raises(sqlite3.OperationalError, match="interrupted restore"):
+        connect()
+    with pytest.raises(sqlite3.OperationalError, match="interrupted restore"):
+        transaction().__enter__()
+    with pytest.raises(backups.BackupError, match="interrupted restore"):
+        backups.create_backup()
+
+    # Staged migrations under database_path_override still bypass the journal fence.
+    staged = database / "staged-migration.sqlite3"
+    with database_path_override(staged):
+        initialize(seed_demo=False)
+    assert staged.is_file()
+
+    # Scheduled backup loop must not create snapshots while fenced.
+    stop = asyncio.Event()
+
+    async def stop_soon():
+        await asyncio.sleep(0.05)
+        stop.set()
+
+    async def run_scheduler():
+        stopper = asyncio.create_task(stop_soon())
+        await backups.backup_scheduler_loop(stop)
+        await stopper
+
+    asyncio.run(run_scheduler())
+    assert [item["id"] for item in backups.list_backups()] == [visible_backup["id"]]
+
+    client = TestClient(app, headers=headers)
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/auth/config").status_code == 200
+    assert client.get("/auth/me").status_code == 200
+
+    overview_resp = client.get("/api/overview")
+    assert overview_resp.status_code == 503
+    assert overview_resp.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+    assert str(database) not in overview_resp.text
+
+    sync_resp = client.post("/api/sync", json={})
+    assert sync_resp.status_code == 503
+
+    create_resp = client.post("/api/backups/create", json={})
+    assert create_resp.status_code == 503
+
+    backups_resp = client.get("/api/backups")
+    assert backups_resp.status_code == 200
+    payload = backups_resp.json()
+    assert [item["id"] for item in payload["backups"]] == [visible_backup["id"]]
+    assert payload["last_error"] == "That backup is no longer available."
+    assert str(database) not in backups_resp.text
+    assert "secret.key" not in backups_resp.text
+
+    # Zero bytes or sidecars were written to the fenced live database before restore.
+    assert live_db.read_bytes() == sentinel
+    assert not Path(f"{settings.db}-wal").exists()
+
+    # Restoring a missing backup fails closed and leaves the fence intact.
+    bad_restore = client.post(
+        "/api/backups/bookward-20260101T000000Z-ffffffff/restore", json={}
+    )
+    assert bad_restore.status_code == 400
+    assert backups.has_restore_journal() is True
+    assert client.get("/api/overview").status_code == 503
+
+    # Restoring a valid backup passes through the middleware fence and recovers the profile.
+    recover_resp = client.post(f"/api/backups/{visible_backup['id']}/restore", json={})
+    assert recover_resp.status_code == 200
+    assert recover_resp.json()["restored_backup"] == visible_backup["id"]
+    assert backups.has_restore_journal() is False
+
+    recovered_overview = client.get("/api/overview")
+    assert recovered_overview.status_code == 200
+    assert "Recoverable alternate snapshot" in {
+        item["title"] for item in recovered_overview.json()["history"]
+    }
+    assert private_setting("alternate_backup_secret") == "alternate-backup-key"
+
+
+def test_admin_can_delete_stuck_restore_journal_and_middleware_skips_thread_hop_when_clear(
+    database, monkeypatch
+):
+    from afterword_engine import main as main_module
+    from afterword_engine import profiles
+
+    admin_headers = authenticated_headers()
+    reader = profiles.create_account("journal-reader", "journal-reader-password-long")
+    reader_session, _ = profiles.create_session(reader["id"])
+    reader_headers = {"x-bookward-session": reader_session}
+
+    journal_path = backups._restore_journal_path()
+    journal_path.write_text(
+        '{"safety_backup": "bookward-20260101T000000Z-deadbeef"}', encoding="utf-8"
+    )
+    journal_path.chmod(0o600)
+
+    client = TestClient(app)
+    assert client.get("/api/overview", headers=admin_headers).status_code == 503
+    assert (
+        client.delete(
+            "/admin/profiles/legacy/restore-journal", headers=reader_headers
+        ).status_code
+        == 403
+    )
+    assert backups.has_restore_journal("legacy") is True
+
+    assert (
+        client.delete(
+            "/admin/profiles/00000000000000000000000000000000/restore-journal",
+            headers=admin_headers,
+        ).status_code
+        == 404
+    )
+
+    cleared = client.delete(
+        "/admin/profiles/legacy/restore-journal", headers=admin_headers
+    )
+    assert cleared.status_code == 200
+    assert cleared.json() == {"cleared": True, "profile_id": "legacy"}
+    assert backups.has_restore_journal("legacy") is False
+
+    # When no journal exists, session and API-token requests must not hop via asyncio.to_thread.
+    api_token = profiles.create_profile_api_token("legacy", "Fast path check")["token"]
+    real_to_thread = main_module.asyncio.to_thread
+    recovery_thread_calls = 0
+
+    async def spy_to_thread(func, /, *args, **kwargs):
+        nonlocal recovery_thread_calls
+        if func is main_module._recover_profile_for_request:
+            recovery_thread_calls += 1
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(main_module.asyncio, "to_thread", spy_to_thread)
+    assert client.get("/api/overview", headers=admin_headers).status_code == 200
+    assert (
+        client.get(
+            "/api/v1/overview", headers={"authorization": f"Bearer {api_token}"}
+        ).status_code
+        == 200
+    )
+    assert recovery_thread_calls == 0
+
+
+def test_prune_backups_retains_safety_snapshot_referenced_by_restore_journal(
+    database, monkeypatch
+):
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    safety = backups.create_backup()
+    newer_one = backups.create_backup()
+    newer_two = backups.create_backup()
+    # Re-create safety snapshot as an older timestamped entry to verify retention protection.
+    old_id = "bookward-20200101T000000Z-abcdef01"
+    old_snapshot = database / "backups" / f"{old_id}.sqlite3"
+    old_sidecar = database / "backups" / f"{old_id}.secret.key"
+    latest_id = backups.list_backups()[0]["id"]
+    latest_snapshot = database / "backups" / f"{latest_id}.sqlite3"
+    latest_sidecar = database / "backups" / f"{latest_id}.secret.key"
+    old_snapshot.write_bytes(latest_snapshot.read_bytes())
+    old_snapshot.chmod(0o600)
+    old_sidecar.write_bytes(latest_sidecar.read_bytes())
+    old_sidecar.chmod(0o600)
+
+    backups._write_restore_journal(old_snapshot, latest_snapshot)
+    try:
+        backups._prune_backups()
+        remaining_ids = {item["id"] for item in backups.list_backups()}
+        assert old_id in remaining_ids
+        assert latest_id in remaining_ids
+        assert old_snapshot.is_file()
+        assert old_sidecar.is_file()
+    finally:
+        backups._clear_restore_journal()
+
+    backups._prune_backups()
+    assert len(backups.list_backups()) == 1
+    assert not old_snapshot.exists()
+    assert not old_sidecar.exists()
+    _ = (safety, newer_one, newer_two)
+
+
+def test_restore_backup_in_process_rollback_replaces_damaged_live_database(
+    database, monkeypatch
+):
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Target snapshot row", "Reader", "test"),
+        )
+    target = backups.create_backup()
+
+    with transaction() as con:
+        con.execute("DELETE FROM reads WHERE title='Target snapshot row'")
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Pre-restore live row", "Reader", "test"),
+        )
+
+    original_replace = backups._replace_live_database
+    calls = 0
+
+    def corrupt_on_initial_swap(
+        staged, key_source=None, *, rollback=False, clear_generated_key=False
+    ):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert rollback is False
+            Path(settings.db).write_bytes(b"corrupt-mid-swap-bytes")
+            raise OSError(28, "No space left on device")
+        assert rollback is True
+        return original_replace(
+            staged,
+            key_source,
+            rollback=rollback,
+            clear_generated_key=clear_generated_key,
+        )
+
+    monkeypatch.setattr(backups, "_replace_live_database", corrupt_on_initial_swap)
+    with pytest.raises(backups.BackupError, match="previous database remains active"):
+        backups.restore_backup(target["id"])
+
+    assert calls == 2
+    assert not backups._restore_journal_path().exists()
+    assert row("SELECT 1 FROM reads WHERE title='Pre-restore live row'") is not None
 
 
 def test_backup_scheduler_interval_and_retention(database, monkeypatch):
@@ -483,3 +1020,27 @@ def test_backup_api_lists_only_safe_metadata_and_restores_selected_snapshot(data
     assert restored.json()["restored_backup"] == backup["id"]
     assert row("SELECT 1 FROM reads WHERE title='API recovery'") is not None
     assert private_setting("api_recovery_secret") == "api secret"
+
+
+def test_unexpected_recovery_error_returns_static_503_detail(database, monkeypatch):
+    headers = authenticated_headers()
+    journal_path = backups._restore_journal_path()
+    journal_path.write_text(
+        '{"safety_backup": "bookward-20260101T000000Z-deadbeef"}', encoding="utf-8"
+    )
+    journal_path.chmod(0o600)
+    try:
+        monkeypatch.setattr(
+            "afterword_engine.main.recover_interrupted_restore",
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("unexpected internal traceback detail")
+            ),
+        )
+        client = TestClient(app, headers=headers)
+        resp = client.get("/api/overview")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == backups.RESTORE_FENCE_DETAIL
+        assert "unexpected internal traceback detail" not in resp.text
+    finally:
+        journal_path.unlink(missing_ok=True)
+
