@@ -31,6 +31,7 @@ from .backups import (
 )
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
+from . import ingestion
 from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
@@ -656,7 +657,15 @@ async def lifespan(app):
                 # A broken profile must not prevent the rest of the installation
                 # from serving. Its worker retries initialization with backoff.
                 LOGGER.exception("Could not initialize profile %s during startup", profile_id)
-    stop = asyncio.Event(); worker = asyncio.create_task(worker_loop(handle_job, stop)); scheduler = asyncio.create_task(source_scheduler_loop(stop)); digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop)); goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop)); backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
+    if not settings.enable_background_loops:
+        yield
+        return
+    stop = asyncio.Event()
+    worker = asyncio.create_task(worker_loop(handle_job, stop))
+    scheduler = asyncio.create_task(source_scheduler_loop(stop))
+    digest_scheduler = asyncio.create_task(digest_scheduler_loop(stop))
+    goodreads_scheduler = asyncio.create_task(goodreads_rss_scheduler_loop(stop))
+    backup_scheduler = asyncio.create_task(backup_scheduler_loop(stop))
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
@@ -669,8 +678,15 @@ async def lifespan(app):
                 enqueue_job("read_metadata", dedupe=True)
         except Exception:
             LOGGER.exception("Could not queue startup work for profile %s", profile_id)
-    yield
-    stop.set(); await scheduler; await digest_scheduler; await goodreads_scheduler; await backup_scheduler; await worker
+    try:
+        yield
+    finally:
+        stop.set()
+        await scheduler
+        await digest_scheduler
+        await goodreads_scheduler
+        await backup_scheduler
+        await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
@@ -1268,17 +1284,27 @@ class EngineSettings(BaseModel):
     librarr_api_key: str = ""
     librarr_media_type: str = "audiobook"
 
-    def validate_values(self):
-        if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
-        for label, value in (("embedding",self.embedding_url),("Librarr",self.librarr_url)):
-            parsed = urlparse(value) if value else None
-            if parsed and parsed.scheme not in {"http","https"}: raise ValueError(f"{label} URL must use HTTP or HTTPS")
-            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError(f"{label} URL cannot contain credentials, query parameters, or fragments")
-        if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
-        normalize_media_type(self.librarr_media_type)
-        if self.librarr_url:
-            allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
-            validate_service_url(self.librarr_url, allowed)
+    def validate_values(
+        self,
+        *,
+        validate_embedding: bool = True,
+        validate_librarr: bool = True,
+        check_librarr_host: bool = True,
+    ):
+        if validate_embedding:
+            if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
+            parsed = urlparse(self.embedding_url) if self.embedding_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("embedding URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("embedding URL cannot contain credentials, query parameters, or fragments")
+            if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
+        if validate_librarr:
+            parsed = urlparse(self.librarr_url) if self.librarr_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("Librarr URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("Librarr URL cannot contain credentials, query parameters, or fragments")
+            normalize_media_type(self.librarr_media_type)
+            if check_librarr_host and self.librarr_url:
+                allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
+                validate_service_url(self.librarr_url, allowed)
 
 
 class NYTApiKeyIn(BaseModel):
@@ -1363,6 +1389,7 @@ def tracked_recommendations(
                 offset=0,
                 identity_context=identity_context,
                 include_imported=include_imported,
+                format_urls=False,
             )
             base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
@@ -1453,6 +1480,7 @@ def tracked_recommendations(
                 start = max(0, int(offset))
                 end = None if limit is None else start + max(0, int(limit))
                 recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
         except Exception:
             # Personalization must never take the recommendation service down.
             # On malformed legacy evidence, return the existing champion order.
@@ -1849,6 +1877,24 @@ def _recommendation_rows(
     return visible[offset:end]
 
 
+def _format_recommendation_urls(items):
+    for item in items:
+        source_url = item.get("source_url", "")
+        item["cover_url"] = fallback_cover_url(
+            item["title"],
+            item["author"],
+            item.get("cover_url", ""),
+            source_url,
+        )
+        item["source_url"] = canonical_book_source_url(
+            item["title"],
+            item["author"],
+            source_url,
+            item=item,
+        )
+    return items
+
+
 def recommendation_list(
     connection=None,
     *,
@@ -1858,6 +1904,7 @@ def recommendation_list(
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
+    format_urls: bool = True,
 ):
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
@@ -1892,20 +1939,10 @@ def recommendation_list(
             include_imported=include_imported,
         )
     for item in result:
-        item["cover_url"] = fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", ""))
-        source_url = item.get("source_url", "")
-        parsed_source = urlparse(source_url)
-        if (
-            (parsed_source.hostname or "").casefold().rstrip(".")
-            in {"openlibrary.org", "www.openlibrary.org"}
-            and parsed_source.path.casefold().startswith("/people/")
-            and "/lists/" in parsed_source.path.casefold()
-        ):
-            work_url = book_openlibrary_work_id(item)
-            if work_url:
-                source_url = f"https://openlibrary.org{work_url}"
-        item["source_url"] = canonical_book_source_url(item["title"], item["author"], source_url)
-        item["genres"] = json.loads(item["genres"] or "[]"); item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = json.loads(item["genres"] or "[]")
+        item["explanation"] = json.loads(item["explanation"] or "[]")
+    if format_urls:
+        _format_recommendation_urls(result)
     return result
 
 @app.get("/api/recommendations")
@@ -2422,8 +2459,18 @@ async def goodreads_csv(file: UploadFile = File(...)):
 
 async def _sync_goodreads_rss(url: str):
     try:
-        count = await import_goodreads_rss(url)
-        shelves = await import_goodreads_shelves(url)
+        async with ingestion._source_client() as client:
+            read_result, shelf_results = await asyncio.gather(
+                import_goodreads_rss(url, client=client),
+                ingestion._fetch_goodreads_shelves(url, client=client),
+                return_exceptions=True,
+            )
+        if isinstance(read_result, BaseException):
+            raise read_result
+        if isinstance(shelf_results, BaseException):
+            raise shelf_results
+        count = read_result
+        shelves = ingestion._apply_goodreads_shelves(shelf_results)
     except Exception as exc:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         message = safe_error_message(exc, limit=300)
@@ -2506,25 +2553,48 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
+def _toggle_source_row(con, source_id: int, source) -> bool:
+    became_enabled = not source["enabled"]
+    con.execute(
+        "UPDATE sources SET enabled=1-enabled, "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+        "WHERE id=?",
+        (source_id,),
+    )
+    if not became_enabled:
+        con.execute(
+            "UPDATE candidates SET status='new', score=0, explanation='[]', "
+            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE source_id=? AND status='recommended'",
+            (source_id,),
+        )
+    return became_enabled
+
+
+@app.put("/api/sources/default/toggle")
+def toggle_default_source():
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Default source not found.")
+        source_id = source["id"]
+        became_enabled = _toggle_source_row(con, source_id, source)
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if became_enabled and source["kind"] not in {"builtin", "association"}
+        else None
+    )
+    return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
+
+
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = not source["enabled"]
-        con.execute(
-            "UPDATE sources SET enabled=1-enabled, "
-            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
-            "WHERE id=?",
-            (source_id,),
-        )
-        if not became_enabled:
-            con.execute(
-                "UPDATE candidates SET status='new', score=0, explanation='[]', "
-                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE source_id=? AND status='recommended'",
-                (source_id,),
-            )
+        became_enabled = _toggle_source_row(con, source_id, source)
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}
@@ -3129,24 +3199,51 @@ def revoke_api_token(token_id: int):
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
-    try: payload.validate_values()
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings()
-    current_values = {
-        "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
-        "embedding_model": current.get("embedding_model", settings.embedding_model),
-        "embedding_url": current.get("embedding_url", settings.embedding_url),
-        "embedding_api_key": current.get("embedding_api_key", settings.embedding_api_key),
-        "librarr_url": current.get("librarr_url", ""),
-        "librarr_api_key": current.get("librarr_api_key", ""),
-        "librarr_media_type": current.get("librarr_media_type", "audiobook"),
-    }
-    values = {**current_values, **payload.model_dump(exclude_unset=True)}
-    for key in ("embedding_api_key","librarr_api_key"):
-        if not values[key]: values[key] = current.get(key,"")
     embedding_fields = (
         "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"
     )
+    librarr_fields = (
+        "librarr_url", "librarr_api_key", "librarr_media_type"
+    )
+    updates = payload.model_dump(exclude_unset=True)
+    for key in ("embedding_api_key", "librarr_api_key"):
+        if key in updates:
+            updates[key] = updates[key].strip()
+
+    def _merge_settings(stored: dict) -> tuple[dict, dict]:
+        base = {
+            "embedding_backend": stored.get("embedding_backend", settings.embedding_backend),
+            "embedding_model": stored.get("embedding_model", settings.embedding_model),
+            "embedding_url": stored.get("embedding_url", settings.embedding_url),
+            "embedding_api_key": stored.get("embedding_api_key", settings.embedding_api_key),
+            "librarr_url": stored.get("librarr_url", ""),
+            "librarr_api_key": stored.get("librarr_api_key", ""),
+            "librarr_media_type": stored.get("librarr_media_type", "audiobook"),
+        }
+        merged = {**base, **updates}
+        for key in ("embedding_api_key", "librarr_api_key"):
+            if not merged[key]:
+                merged[key] = stored.get(key, "")
+        return base, merged
+
+    current = private_settings()
+    current_values, values = _merge_settings(current)
+    has_embedding_fields = any(key in payload.model_fields_set for key in embedding_fields)
+    has_librarr_fields = any(key in payload.model_fields_set for key in librarr_fields)
+    try:
+        EngineSettings(**values).validate_values(
+            validate_embedding=has_embedding_fields or not payload.model_fields_set,
+            validate_librarr=has_librarr_fields or not payload.model_fields_set,
+            check_librarr_host="librarr_url" in payload.model_fields_set,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc))
+    if (
+        "librarr_url" in payload.model_fields_set
+        and values["librarr_url"].strip()
+        and not values["librarr_api_key"].strip()
+    ):
+        raise HTTPException(400, "Enter a Librarr API key for the first connection.")
     embedding_changed = any(
         key in payload.model_fields_set and values[key] != current_values[key]
         for key in embedding_fields
@@ -3165,11 +3262,19 @@ async def update_settings(payload: EngineSettings):
                 400,
                 f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}",
             )
+        updates["embedding_model"] = test.model
         values["embedding_model"] = test.model
     else:
         health = {"ok": True, "checked": False, "model": values["embedding_model"]}
     with transaction() as con:
-        for key,value in values.items():
+        _, final_values = _merge_settings(private_settings(con))
+        if (
+            "librarr_url" in payload.model_fields_set
+            and final_values["librarr_url"].strip()
+            and not final_values["librarr_api_key"].strip()
+        ):
+            raise HTTPException(400, "Enter a Librarr API key for the first connection.")
+        for key, value in final_values.items():
             secret = key.endswith("api_key")
             stored = seal(value) if secret and value else value
             con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
