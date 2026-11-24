@@ -75,6 +75,7 @@
     token?: string;
     id?: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null | undefined;
   type MediaType = "ebook" | "audiobook";
@@ -183,6 +184,7 @@
     error: boolean;
     id: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null>(null);
   let optimisticNotificationId = 0;
@@ -256,12 +258,22 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
-  const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
+  const allBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const merged: PageBook[] = [];
+    for (const book of [
+      ...data.books,
+      ...data.decisions,
+      ...additionalDiscoverBooks,
+      ...additionalDecisionBooks,
+    ]) {
+      if (seen.has(book.id)) continue;
+      seen.add(book.id);
       const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
-  );
+      merged.push(status === undefined ? book : { ...book, status });
+    }
+    return merged;
+  });
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
@@ -364,6 +376,18 @@
       : filteredBooks,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
+  const selectedDigestRunId = $derived.by(() => {
+    if (!selectedDigestIds.size) return "";
+    const booksById = new Map(allBooks.map((book) => [book.id, book]));
+    let sharedRunId = "";
+    for (const id of selectedDigestIds) {
+      const runId = booksById.get(id)?.recommendation_run_id?.trim() ?? "";
+      if (runId.length < 8) return "";
+      if (!sharedRunId) sharedRunId = runId;
+      else if (sharedRunId !== runId) return "";
+    }
+    return sharedRunId;
+  });
   const digestSettings = $derived(data.profile.digest);
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
@@ -597,7 +621,7 @@
 
     formNotificationDismissDelay = currentForm?.error
       ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id
+      : currentForm?.undo_id || currentForm?.undo_decisions?.length
         ? 0
         : FORM_NOTIFICATION_DISMISS_MS;
     scheduleFormNotificationDismiss();
@@ -1547,6 +1571,9 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
+      const runId = librarrSearchBook
+        ? String(allBooks.find((book) => book.id === librarrSearchBook?.id)?.recommendation_run_id || "").trim()
+        : "";
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
@@ -1555,6 +1582,7 @@
             librarrSearchedMediaType,
             result,
             librarrSearchBook?.id,
+            runId,
           ),
         ),
       });
@@ -1563,7 +1591,6 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -1825,7 +1852,15 @@
         aria-atomic="true"
       >{visibleNotification?.message ?? ""}</div>
       {#if visibleNotification}
-        {#key visibleNotification.id ?? visibleNotification.message}
+        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
+          ? visibleNotification.undo_decisions
+          : visibleNotification.undo_id && visibleNotification.id
+            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
+            : []}
+        {@const notificationUndoKey = notificationUndoDecisions.length
+          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
+          : null}
+        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
           <div
             class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
           >
@@ -1869,24 +1904,26 @@
                   <p class="leading-relaxed text-surface-900-100">
                     {visibleNotification.message}
                   </p>
-                  {#if visibleNotification.undo_id && visibleNotification.id}
+                  {#if notificationUndoDecisions.length && notificationUndoKey}
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(notificationUndoKey)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={visibleNotification.id} />
-                      <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                        <input type="hidden" name="id" value={item.id} />
+                        <input type="hidden" name="decision_id" value={item.decision_id} />
+                      {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(`undo-${visibleNotification.undo_id}`)}
-                        aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                        disabled={isPending(notificationUndoKey)}
+                        aria-busy={isPending(notificationUndoKey)}
                         aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
@@ -1977,6 +2014,7 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -2124,14 +2162,16 @@
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
-                      </form>
-                    {:else}
+                      {#if book.status === "saved"}
+                        <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                          <ProfileField profileId={data.user?.profile_id} />
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        </form>
+                      {/if}
+                    {:else if book.status === "saved"}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
@@ -2141,20 +2181,10 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                      </form>
-                    {/if}
-                  {:else if book.status === "imported"}
-                    <button
-                      in:fly={{ y: 8, duration: motionDuration(180) }}
-                      type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
-                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                      onclick={() => openMarkRead(book)}
-                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                    </form>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
