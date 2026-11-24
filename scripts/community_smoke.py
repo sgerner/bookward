@@ -186,6 +186,17 @@ def main(
                     "password": "Disposable-smoke-password-17"}, headers={"origin": origin})
                 assert response.status_code == 303
                 assert client.get("/").status_code == 200
+                filtered = client.get(
+                    "/api/recommendations?status=recommended&limit=8&offset=0&search=Piranesi",
+                    headers={"accept": "application/json"},
+                )
+                assert filtered.status_code == 200 and isinstance(filtered.json().get("items"), list)
+                deferred = client.get(
+                    "/api/recommendations?status=maybe_later&limit=8&offset=0",
+                    headers={"accept": "application/json"},
+                )
+                assert deferred.status_code == 200 and deferred.json().get("items") == []
+
                 action_headers = {
                     "origin": origin,
                     "accept": "application/json",
