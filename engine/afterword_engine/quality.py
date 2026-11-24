@@ -729,17 +729,17 @@ async def resolve_catalog_match(
         matches: list[dict[str, Any]] = []
         query_isbn = source_isbn13 or source_isbn10
 
-        def _record_rate_limits():
+        def _record_rate_limits(traces: list[dict[str, Any]] | None = None):
             if rate_limited_providers is None:
                 return
-            for trace in fetch_trace:
+            for trace in traces if traces is not None else fetch_trace:
                 if trace.get("status") == "rate_limited" and trace.get("provider"):
                     rate_limited_providers.add(str(trace["provider"]))
 
         async def _call_provider(lookup_provider, *, isbn_arg: str = ""):
             provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
             if rate_limited_providers is not None and provider_name in rate_limited_providers:
-                fetch_trace.append(
+                return None, [
                     {
                         "provider": provider_name,
                         "fetched_at": _utc_now(),
@@ -748,18 +748,23 @@ async def resolve_catalog_match(
                         "http_status": 429,
                         "skipped": True,
                     }
-                )
-                return None
+                ]
             kwargs = {"google_books_api_key": google_books_api_key} if lookup_provider is _google_books_match else {}
-            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
-            _record_rate_limits()
-            return result
+            provider_traces: list[dict[str, Any]] = []
+            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=provider_traces, **kwargs)
+            _record_rate_limits(provider_traces)
+            return result, provider_traces
 
         if query_isbn:
-            # Query both providers so a strong identity record with sparse
-            # fields does not hide useful verified metadata from the other.
-            for lookup_provider in (_open_library_match, _google_books_match):
-                match = await _call_provider(lookup_provider, isbn_arg=query_isbn)
+            # Query both providers concurrently so a strong identity record with
+            # sparse fields does not hide useful verified metadata from the
+            # other and Open Library's 1 req/s lock never stalls Google Books.
+            stage1_results = await asyncio.gather(
+                _call_provider(_open_library_match, isbn_arg=query_isbn),
+                _call_provider(_google_books_match, isbn_arg=query_isbn),
+            )
+            for match, provider_traces in stage1_results:
+                fetch_trace.extend(provider_traces)
                 if match:
                     matches.append(match)
 
@@ -781,13 +786,23 @@ async def resolve_catalog_match(
                 if trace.get("query_kind") == "isbn"
                 and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
             }
-            for lookup_provider in (_open_library_match, _google_books_match):
-                provider_name = "openlibrary" if lookup_provider is _open_library_match else "google_books"
-                if query_isbn and provider_name in unavailable_providers:
-                    continue
-                match = await _call_provider(lookup_provider)
-                if match:
-                    matches.append(match)
+            stage2_providers = [
+                lookup_provider
+                for lookup_provider in (_open_library_match, _google_books_match)
+                if not (
+                    query_isbn
+                    and ("openlibrary" if lookup_provider is _open_library_match else "google_books")
+                    in unavailable_providers
+                )
+            ]
+            if stage2_providers:
+                stage2_results = await asyncio.gather(
+                    *(_call_provider(lookup_provider) for lookup_provider in stage2_providers)
+                )
+                for match, provider_traces in stage2_results:
+                    fetch_trace.extend(provider_traces)
+                    if match:
+                        matches.append(match)
 
         primary_unavailable = any(
             trace.get("provider") in {"openlibrary", "google_books"}
