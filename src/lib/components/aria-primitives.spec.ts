@@ -7,6 +7,7 @@ import { THEMES } from '#lib/theme.js';
 import ChipToggle, { nextChipPressed } from './ChipToggle.svelte';
 import RadioGroup, { type RadioItemState } from './RadioGroup.svelte';
 import SwitchControl, { nextSwitchChecked } from './SwitchControl.svelte';
+import ThemePicker from './ThemePicker.svelte';
 
 describe('ChipToggle primitive', () => {
 	it('renders inactive and active aria-pressed states with matching Skeleton fill classes', () => {
@@ -146,11 +147,25 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 			'utf8',
 		);
 		expect(themePickerSource).not.toContain('aria-pressed');
-		expect(themePickerSource).toContain('id="appearance-color-mode-legend"');
-		expect(themePickerSource).toContain('labelledBy="appearance-color-mode-legend"');
-		expect(themePickerSource).toContain('id="appearance-theme-legend"');
-		expect(themePickerSource).toContain('labelledBy="appearance-theme-legend"');
+		expect(themePickerSource).toContain('const headingId = $props.id()');
+		expect(themePickerSource).toContain('labelledBy={colorModeLegendId}');
+		expect(themePickerSource).toContain('labelledBy={themeLegendId}');
 		expect(themePickerSource.match(/<RadioGroup/g)).toHaveLength(2);
+
+		for (const compact of [false, true]) {
+			const { body } = render(ThemePicker, { props: { compact } });
+			const groupLabels = [...body.matchAll(/role="radiogroup"\s+aria-labelledby="([^"]+)"/g)].map(
+				(match) => match[1],
+			);
+			expect(groupLabels).toHaveLength(2);
+			expect(body).toContain(`<legend id="${groupLabels[0]}"`);
+			expect(body).toContain('>Color mode</legend>');
+			expect(body).toContain(`<legend id="${groupLabels[1]}"`);
+			expect(body).toContain('>Theme</legend>');
+
+			const ids = [...body.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+			expect(new Set(ids).size).toBe(ids.length);
+		}
 
 		const pageSource = readFileSync(
 			fileURLToPath(new URL('../../routes/+page.svelte', import.meta.url)),
