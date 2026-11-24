@@ -65,21 +65,28 @@ ordinary feedback/events for the deleted candidate. Before deleting individual
 read-history rows, pass their IDs as `read_ids=[...]`; each scoring batch that
 copied any selected read is removed as a unit, including its candidate score
 links and read/candidate vectors. Passing `read_ids=[...]` also removes scoring
-batches indexed by those IDs, serving runs linked to those batches, and
-first-party read event/outcome copies keyed to the selected ID. When Goodreads
-shelf items are removed during shelf re-import or deleted/reset explicitly, pass
-`shelf_items=[...]` or `clear_goodreads_shelves=True` to
-`purge_recommendation_evidence` in the same transaction; this removes every
-scoring batch and serving run that recorded shelf-derived boosts or explanations
-for the removed shelf items while preserving user feedback rows. This is a
+batches indexed by those IDs, pre-promotion scoring batches that recorded a
+Goodreads `to-read` boost for those read identities, serving runs linked to
+those batches, and first-party read event/outcome copies keyed to the selected
+ID. When Goodreads shelf items are removed during shelf re-import or deleted
+without being read, pass `shelf_items=[...]` to `purge_recommendation_evidence`
+in the same transaction; this removes every scoring batch and serving run that
+recorded shelf-derived boosts or explanations for the removed shelf items while
+preserving user feedback rows. Shelf rows removed because a book transitioned
+into `reads` (`import_csv`, `import_goodreads_rss`, and `_apply_goodreads_shelves`)
+intentionally retain prior batches and runs so `attribute_read_outcomes` and
+base-score provenance stay intact while the book remains in `reads`. This is a
 targeted cleanup helper, not a complete library-history privacy reset: legacy
 or unlinked serving snapshots and materialized scores/explanations may still
 reflect that history. A library or profile history reset must
 call `purge_recommendation_evidence(connection, clear_all_evidence=True)` before
 deleting live history; this clears all run snapshots, scorer batches, archived
-events/outcomes/exposures, and ordinary feedback/recommendation events. These
-helpers only purge evidence; the route remains responsible for deleting the
-live source rows in the same transaction. A read/history reset must also clear
+events/outcomes/exposures, and live `recommendation_events` while preserving
+user `feedback` (`save`/`reject`) curation rows. These helpers only purge
+evidence; the route remains responsible for deleting the live source rows (and
+explicitly deleting `feedback` alongside resetting `candidates.status` if
+shortlist/dismissed curation is also being cleared) in the same transaction. A
+read/history reset must also clear
 or recompute materialized candidate scores and explanation strings derived
 from the deleted reads before those candidates are served again; purging the
 archive alone does not remove those live derived values. The current app has

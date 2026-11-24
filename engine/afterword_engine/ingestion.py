@@ -927,6 +927,9 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                     values,
                 )
                 continue
+            # Shelf-to-read promotion intentionally preserves prior scoring batches
+            # and serving runs so `attribute_read_outcomes()` can link this completed
+            # read to preceding impressions while the book remains in `reads`.
             con.executemany(
                 "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
                 ((item[0], item[1]) for item in values),
@@ -2305,6 +2308,10 @@ def _apply_goodreads_shelves(
                     "SELECT title, author, isbn, openlibrary_work_id FROM reads"
                 ).fetchall():
                     read_keys.update(book_row_identity_match_keys(dict(row)))
+                # Intentional: books promoted from shelves into `reads` remain part
+                # of the user's library and retain prior batches/runs so read-outcome
+                # attribution and score provenance stay intact (erased via `read_ids`
+                # if the read row itself is later purged).
                 deleted_shelf_rows = [
                     row
                     for row in removed_rows
@@ -2350,6 +2357,9 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        # Shelf-to-read promotion intentionally preserves prior scoring batches and
+        # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
+        # exposures while the book remains in `reads`.
         con.executemany(
             "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
             ((item[0], item[1]) for item in read_rows),

@@ -777,29 +777,52 @@ def test_legacy_v1_scoring_batch_loads_and_replays_and_rejects_raw_shelf_payload
 ):
     from afterword_engine import scoring_evidence as scoring_evidence_module
 
-    rated_id, unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+    rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+    with transaction() as con:
+        boosted_id = _candidate(con, "Legacy V1 Boosted Book", "V. Shelf")
     with connect() as con:
         all_reads = [dict(r) for r in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
         rated_reads = [r for r in all_reads if r["id"] == rated_id]
-        candidate = _served_candidate(con, eligible_id)
+        unboosted_cand = _served_candidate(con, eligible_id)
+        boosted_cand = _served_candidate(con, boosted_id)
         read_vec = np.asarray([0.8, 0.2, 0.1], dtype=np.float32)
         cand_vec = np.asarray([0.7, 0.4, 0.2], dtype=np.float32)
-        ranked = rank_candidates(rated_reads, [read_vec], [candidate], [cand_vec])
+        boosted_vec = np.asarray([0.65, 0.45, 0.25], dtype=np.float32)
+        ranked = rank_candidates(
+            rated_reads,
+            [read_vec],
+            [unboosted_cand, boosted_cand],
+            [cand_vec, boosted_vec],
+        )
+        for item in ranked:
+            base_score = float(item["score"])
+            on_to_read = int(item["id"]) == boosted_id
+            if on_to_read:
+                item["score"] = round(min(100.0, base_score + 10.0), 1)
+                item["explanation"] = [
+                    "On your Goodreads to-read shelf",
+                    *list(item.get("explanation") or []),
+                ]
+            item["base_score"] = base_score
+            item["shelf_boost"] = round(float(item["score"]) - base_score, 1)
+            item["on_goodreads_to_read"] = on_to_read
         v2_ev = build_scoring_batch_evidence(
             con,
             captured_at="2026-10-02T00:00:00+00:00",
             read_history=all_reads,
             rated_reads=rated_reads,
-            candidates=[candidate],
+            candidates=[unboosted_cand, boosted_cand],
             ranked=ranked,
             read_vectors=[read_vec],
-            candidate_vectors={eligible_id: cand_vec},
+            candidate_vectors={eligible_id: cand_vec, boosted_id: boosted_vec},
             backend="local",
             model="test-model",
             scoring_batch_size=SCORING_BATCH_SIZE,
+            to_read_candidate_ids=[boosted_id],
         )
 
-    # Strip v2 fields to construct an authentic schema_version=1 batch payload.
+    # Strip v2 fields to construct an authentic main-produced schema_version=1 batch
+    # containing both an unboosted candidate and a +10.0 shelf-boosted candidate.
     v1_ev = dict(v2_ev)
     v1_ev["schema_version"] = 1
     v1_ev["input_selection"] = {
@@ -868,10 +891,10 @@ def test_legacy_v1_scoring_batch_loads_and_replays_and_rejects_raw_shelf_payload
             captured_at="2026-10-02T00:00:00+00:00",
             read_history=all_reads,
             rated_reads=rated_reads,
-            candidates=[candidate],
+            candidates=[unboosted_cand, boosted_cand],
             ranked=ranked,
             read_vectors=[read_vec],
-            candidate_vectors={eligible_id: cand_vec},
+            candidate_vectors={eligible_id: cand_vec, boosted_id: boosted_vec},
             backend="local",
             model="test-model",
             scoring_batch_size=SCORING_BATCH_SIZE,
@@ -884,6 +907,33 @@ def test_legacy_v1_scoring_batch_loads_and_replays_and_rejects_raw_shelf_payload
     assert replayed_v1["schema_version"] == 1
     assert replayed_v1["verification"]["matches_archived"] is True
     assert replayed_v1["verification"]["max_score_drift"] == 0.0
+    v1_replayed_by_id = {
+        int(item["candidate_id"]): item for item in replayed_v1["candidate_outputs"]
+    }
+    assert v1_replayed_by_id[boosted_id]["on_goodreads_to_read"] is True
+    assert v1_replayed_by_id[boosted_id]["shelf_boost"] > 0.0
+    assert v1_replayed_by_id[eligible_id]["on_goodreads_to_read"] is False
+    assert v1_replayed_by_id[eligible_id]["shelf_boost"] == 0.0
+
+    # Tampering with the archived v1 boosted score is caught as drift.
+    drifted_v1 = {
+        **loaded_v1,
+        "decision": {
+            **loaded_v1["decision"],
+            "candidate_outputs": [
+                (
+                    {**item, "score": round(float(item["score"]) - 5.0, 1)}
+                    if int(item["candidate_id"]) == boosted_id
+                    else dict(item)
+                )
+                for item in loaded_v1["decision"]["candidate_outputs"]
+            ],
+        },
+    }
+    drifted_replay = replay_scoring_batch(drifted_v1)
+    assert drifted_replay["verification"]["matches_archived"] is False
+    assert drifted_replay["verification"]["max_score_drift"] == 5.0
+
     assert invalid_build["capture_status"] == "incomplete"
     assert invalid_build["reason"] == "invalid_shelf_match_manifest"
 
@@ -897,7 +947,7 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
 
     _rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
 
-    # First score `eligible_id` before any Goodreads shelves exist so we have a clean non-shelf batch & run.
+    # 1. Score `eligible_id` before any Goodreads shelves exist so we have a clean non-shelf batch & run.
     assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
     with connect() as con:
         clean_served, clean_run_id = tracked_recommendations(
@@ -910,22 +960,9 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
     assert clean_run_id is not None
     assert clean_batch_id is not None
 
-    # Next add two Goodreads to-read shelf items: one matched via ISBN ("Different Edition Title")
-    # and one that will be promoted to `reads` ("Promoted Soon"), plus an unscored shelf item.
+    # 2. Score and serve `Promoted Soon` in its own shelf-boosted batch & run, then promote it to `reads`.
     with transaction() as con:
-        boosted_id = _candidate(con, "Shelf Boosted Target", "S. Shelf")
         promoted_id = _candidate(con, "Promoted Soon", "P. Writer")
-        con.execute(
-            "UPDATE candidate_quality SET isbn13='9780593135204' WHERE candidate_id=?",
-            (boosted_id,),
-        )
-        _store_vector(
-            con,
-            "candidate",
-            boosted_id,
-            _served_candidate(con, boosted_id),
-            [0.75, 0.35, 0.15],
-        )
         _store_vector(
             con,
             "candidate",
@@ -933,52 +970,26 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
             _served_candidate(con, promoted_id),
             [0.72, 0.32, 0.18],
         )
-        con.executemany(
-            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
-            "VALUES(?,?,?,?,?)",
-            [
-                (
-                    "to-read",
-                    "Different Edition Title",
-                    "S. Shelf",
-                    "9780593135204",
-                    "2026-09-01",
-                ),
-                ("to-read", "Promoted Soon", "P. Writer", None, "2026-09-02"),
-                (
-                    "to-read",
-                    "Unscored Shelf Entry",
-                    "U. Author",
-                    "9780000000111",
-                    "2026-09-03",
-                ),
-            ],
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,added_at) "
+            "VALUES('to-read','Promoted Soon','P. Writer','2026-09-02')"
         )
-
-    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 3
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 2
     with connect() as con:
-        shelf_served, shelf_run_id = tracked_recommendations(
+        promoted_served, promoted_run_id = tracked_recommendations(
             status="recommended", limit=10, offset=0, connection=con
         )
-        shelf_batch_id = con.execute(
-            "SELECT score_batch_id FROM candidates WHERE id=?", (boosted_id,)
+        promoted_batch_id = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (promoted_id,)
         ).fetchone()[0]
     with transaction() as con:
-        # Record a visible impression on `promoted_id` and a user `save` feedback row on `boosted_id`.
         con.execute(
             "UPDATE recommendation_impressions SET visible_at=presented_at "
             "WHERE run_id=? AND candidate_id=?",
-            (shelf_run_id, promoted_id),
+            (promoted_run_id, promoted_id),
         )
-        con.execute(
-            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-            (boosted_id, "save"),
-        )
-    assert shelf_batch_id != clean_batch_id
-    assert {item["id"] for item in shelf_served} >= {boosted_id, promoted_id}
+    assert {item["id"] for item in promoted_served} >= {promoted_id}
 
-    # Promoting `Promoted Soon` onto `reads` removes it from `goodreads_shelf_items`
-    # while keeping its attributed `shelf_run_id` intact.
     promoted_rss = b"""<?xml version="1.0" encoding="UTF-8"?>
     <rss version="2.0"><channel>
       <item>
@@ -1001,22 +1012,66 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
         )
         == 1
     )
-    with connect() as con:
-        assert (
-            con.execute(
-                "SELECT 1 FROM recommendation_runs WHERE id=?", (shelf_run_id,)
-            ).fetchone()
-            is not None
-        )
-        assert (
-            con.execute(
-                "SELECT run_id FROM recommendation_evidence_outcomes WHERE candidate_id=?",
-                (promoted_id,),
-            ).fetchone()["run_id"]
-            == shelf_run_id
+    with transaction() as con:
+        promoted_read = con.execute(
+            "SELECT * FROM reads WHERE title='Promoted Soon'"
+        ).fetchone()
+        _store_vector(
+            con, "read", promoted_read["id"], dict(promoted_read), [0.72, 0.32, 0.18]
         )
 
-    # Now reset both Goodreads shelves to empty feeds (user deleted their shelf items).
+    # 3. Add a separate ISBN-matched shelf item ("Different Edition Title") + unscored item, score & serve.
+    with transaction() as con:
+        boosted_id = _candidate(con, "Shelf Boosted Target", "S. Shelf")
+        con.execute(
+            "UPDATE candidate_quality SET isbn13='9780593135204' WHERE candidate_id=?",
+            (boosted_id,),
+        )
+        _store_vector(
+            con,
+            "candidate",
+            boosted_id,
+            _served_candidate(con, boosted_id),
+            [0.75, 0.35, 0.15],
+        )
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
+            "VALUES(?,?,?,?,?)",
+            [
+                (
+                    "to-read",
+                    "Different Edition Title",
+                    "S. Shelf",
+                    "9780593135204",
+                    "2026-09-01",
+                ),
+                (
+                    "to-read",
+                    "Unscored Shelf Entry",
+                    "U. Author",
+                    "9780000000111",
+                    "2026-09-03",
+                ),
+            ],
+        )
+
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 2
+    with connect() as con:
+        shelf_served, shelf_run_id = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        shelf_batch_id = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=?", (boosted_id,)
+        ).fetchone()[0]
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            (boosted_id, "save"),
+        )
+    assert len({clean_batch_id, promoted_batch_id, shelf_batch_id}) == 3
+    assert {item["id"] for item in shelf_served} >= {boosted_id}
+
+    # 4. Reset both Goodreads shelves to empty feeds (user deleted remaining shelf items).
     empty_rss = b"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel></channel></rss>"""
 
     async def fake_empty_shelves(url: str, **kwargs):
@@ -1034,7 +1089,7 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
         assert (
             con.execute("SELECT COUNT(*) FROM goodreads_shelf_items").fetchone()[0] == 0
         )
-        # Shelf-derived scoring batch & run were purged on shelf reset.
+        # Deleted shelf item's batch & run were purged on shelf reset.
         assert (
             con.execute(
                 "SELECT 1 FROM scoring_batches WHERE id=?", (shelf_batch_id,)
@@ -1052,6 +1107,26 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
                 "SELECT score_batch_id FROM candidates WHERE id=?", (boosted_id,)
             ).fetchone()[0]
             is None
+        )
+        # Promoted read's pre-promotion batch, attributed run, and outcome intentionally remain intact.
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (promoted_batch_id,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (promoted_run_id,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT run_id FROM recommendation_evidence_outcomes WHERE candidate_id=?",
+                (promoted_id,),
+            ).fetchone()["run_id"]
+            == promoted_run_id
         )
         # Unrelated non-shelf batch & run remain intact, and user `save` feedback is preserved.
         assert (
@@ -1073,18 +1148,31 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
             ).fetchone()[0]
             == 1
         )
+
+    # 5. Erasing the promoted `read` row via `read_ids` also purges its pre-promotion shelf batch & run.
+    with transaction() as con:
+        read_purged = purge_recommendation_evidence(con, read_ids=[int(promoted_read["id"])])
+        assert read_purged["scoring_batches_removed"] >= 1
+        assert read_purged["runs_removed"] >= 1
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (promoted_batch_id,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (promoted_run_id,)
+            ).fetchone()
+            is None
+        )
         clean_only_budget = con.execute(
             "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
         ).fetchone()[0]
         assert clean_only_budget > 0
 
-    # Verify `clear_goodreads_shelves=True` also purges shelf-boosted evidence even after
-    # `goodreads_shelf_items` and the candidate row itself have already been deleted.
+    # 6. Verify `shelf_items` also purges shelf-boosted evidence even after the candidate row was deleted.
     with transaction() as con:
-        promoted_read = con.execute(
-            "SELECT * FROM reads WHERE title='Promoted Soon'"
-        ).fetchone()
-        _store_vector(con, "read", promoted_read["id"], dict(promoted_read), [0.72, 0.32, 0.18])
         con.execute("UPDATE candidates SET status='new', score=0.0 WHERE id=?", (boosted_id,))
         con.execute(
             "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn) "
@@ -1098,12 +1186,21 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
     assert second_shelf_run is not None
 
     with transaction() as con:
-        con.execute("DELETE FROM goodreads_shelf_items")
         con.execute("DELETE FROM feedback WHERE candidate_id=?", (boosted_id,))
         con.execute("DELETE FROM candidates WHERE id=?", (boosted_id,))
-        purged = purge_recommendation_evidence(con, clear_goodreads_shelves=True)
-        assert purged["scoring_batches_removed"] == 1
-        assert purged["runs_removed"] == 1
+    counts_after_cand_delete = asyncio.run(
+        import_goodreads_shelves(
+            "https://www.goodreads.com/review/list_rss/12345?key=test&shelf=read"
+        )
+    )
+    assert counts_after_cand_delete == {"to-read": 0, "currently-reading": 0}
+    with connect() as con:
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (second_shelf_run,)
+            ).fetchone()
+            is None
+        )
         assert (
             con.execute(
                 "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
@@ -1186,3 +1283,60 @@ def test_scoring_batch_payload_and_budget_have_zero_growth_with_large_goodreads_
     # Total budget across all 4 batches stays under a few KiB rather than ~4x 2,500 shelf dumps.
     assert final_budget < baseline_budget * 5
     assert final_budget < 20_000
+
+
+def test_clear_all_evidence_preserves_user_feedback_rows(database):
+    _rated_id, _unrated_id, _excluded_id, eligible_id = _create_production_shape(database)
+    assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 1
+    from afterword_engine.learning import create_recommendation_run, record_event_in_connection
+
+    with connect() as con:
+        dismissed_id = int(
+            con.execute("SELECT id FROM candidates WHERE id!=? LIMIT 1", (eligible_id,)).fetchone()[0]
+        )
+        served = _served_candidate(con, eligible_id)
+        evidence = build_decision_evidence(
+            con,
+            base_pool=[served],
+            personalized_pool=[served],
+            final_pool=[served],
+            interaction_events=[],
+            cached_vectors={},
+            ranking_metadata={},
+            discovery_slate_metadata={},
+            request_context={},
+        )
+    run_id = create_recommendation_run([served], decision_evidence=evidence)
+    with transaction() as con:
+        record_event_in_connection(
+            con,
+            event_key="evt-clear-all-save-1",
+            event_type="save",
+            candidate_id=eligible_id,
+            run_id=run_id,
+        )
+        con.executemany(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            [(eligible_id, "save"), (dismissed_id, "reject")],
+        )
+        result = purge_recommendation_evidence(con, clear_all_evidence=True)
+        assert result["runs_removed"] == 1
+        assert result["scoring_batches_removed"] == 1
+        assert con.execute("SELECT COUNT(*) FROM recommendation_runs").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM scoring_batches").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM recommendation_events").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM recommendation_evidence_events").fetchone()[0] == 0
+        assert (
+            con.execute(
+                "SELECT candidate_id, action FROM feedback ORDER BY candidate_id, action"
+            ).fetchall()
+            != []
+        )
+        saved_feedback = [
+            (int(row["candidate_id"]), str(row["action"]))
+            for row in con.execute(
+                "SELECT candidate_id, action FROM feedback ORDER BY candidate_id, action"
+            ).fetchall()
+        ]
+        assert saved_feedback == sorted([(eligible_id, "save"), (dismissed_id, "reject")])
+

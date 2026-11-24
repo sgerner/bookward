@@ -159,7 +159,6 @@ def build_scoring_batch_evidence(
     model: str,
     scoring_batch_size: int,
     to_read_candidate_ids: Iterable[int] | None = None,
-    goodreads_shelf_items: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build replay inputs for the exact inputs and outputs written by a scorer job.
 
@@ -218,23 +217,6 @@ def build_scoring_batch_evidence(
                 if cid not in candidate_vector_ids:
                     raise _LimitError("invalid_shelf_match_manifest")
                 matched_to_read_set.add(cid)
-        elif goodreads_shelf_items is not None:
-            from .identity import book_row_identity_match_keys
-
-            to_read_keys: set[tuple[str, ...]] = set()
-            for srow in goodreads_shelf_items:
-                if not isinstance(srow, Mapping) or srow.get("shelf") not in {
-                    "to-read",
-                    "currently-reading",
-                }:
-                    raise _LimitError("invalid_shelf_item")
-                if srow.get("shelf") == "to-read":
-                    to_read_keys.update(book_row_identity_match_keys(srow))
-            matched_to_read_set = {
-                cid
-                for cid in candidate_ids
-                if set(book_row_identity_match_keys(by_candidate[cid])) & to_read_keys
-            }
         else:
             matched_to_read_set = set()
             for cid in candidate_ids:
@@ -864,16 +846,26 @@ def replay_scoring_batch(record_or_decision: Mapping[str, Any]) -> dict[str, Any
         vector_map[("candidate", int(item["id"]))] for item in candidate_inputs
     ]
 
+    archived_outputs = list(decision.get("candidate_outputs") or [])
     input_selection = decision.get("input_selection")
     input_selection = input_selection if isinstance(input_selection, Mapping) else {}
-    raw_to_read_ids = (
-        input_selection.get("to_read_candidate_ids") if schema_version >= 2 else ()
-    )
-    to_read_ids = {
-        int(cid)
-        for cid in (raw_to_read_ids or ())
-        if not isinstance(cid, bool)
-    }
+    if schema_version >= 2:
+        raw_to_read_ids = input_selection.get("to_read_candidate_ids") or ()
+        to_read_ids = {
+            int(cid)
+            for cid in raw_to_read_ids
+            if not isinstance(cid, bool)
+        }
+    else:
+        to_read_ids = {
+            int(item["candidate_id"])
+            for item in archived_outputs
+            if isinstance(item, Mapping)
+            and item.get("candidate_id") is not None
+            and not isinstance(item.get("candidate_id"), bool)
+            and isinstance(item.get("explanation"), list)
+            and "On your Goodreads to-read shelf" in item["explanation"]
+        }
 
     ranked = rank_candidates(
         rated_reads, read_vectors, candidate_inputs, candidate_vectors
@@ -906,7 +898,6 @@ def replay_scoring_batch(record_or_decision: Mapping[str, Any]) -> dict[str, Any
             }
         )
 
-    archived_outputs = list(decision.get("candidate_outputs") or [])
     archived_by_id = {int(item["candidate_id"]): item for item in archived_outputs}
     replayed_by_id = {int(item["candidate_id"]): item for item in replayed_outputs}
     ids_match = [int(i["candidate_id"]) for i in replayed_outputs] == [

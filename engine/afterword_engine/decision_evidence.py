@@ -1817,7 +1817,6 @@ def purge_recommendation_evidence(
     read_ids: Iterable[int] = (),
     run_ids: Iterable[str] = (),
     shelf_items: Iterable[Mapping[str, Any]] = (),
-    clear_goodreads_shelves: bool = False,
     clear_scoring_batches: bool = False,
     clear_all_evidence: bool = False,
 ) -> dict[str, int]:
@@ -1827,14 +1826,17 @@ def purge_recommendation_evidence(
     because its title, text, and vectors may also appear in shared pool
     artifacts. It also removes every scoring batch that scored that candidate.
     Read purge removes every scoring batch whose captured history included a
-    read ID and every served run with an attributed outcome for that read.
-    `shelf_items` and `clear_goodreads_shelves=True` remove scoring batches and
-    serving runs that recorded Goodreads shelf boosts or shelf-derived
-    explanations without deleting user feedback rows. `clear_scoring_batches=True`
+    read ID, every pre-promotion scoring batch that recorded a Goodreads shelf
+    boost for that read's identity, and every served run with an attributed
+    outcome for that read. `shelf_items` removes scoring batches and serving
+    runs that recorded Goodreads shelf boosts or shelf-derived explanations for
+    deleted shelf items without deleting user feedback rows. `clear_scoring_batches=True`
     removes every scorer batch, including one without candidate or read-reference
     rows. Whole-profile history reset should use `clear_all_evidence=True` to
-    also remove run snapshots and ordinary interaction history. Callers delete
-    live library/profile rows in the same outer transaction.
+    also remove run snapshots, archived events/outcomes/exposures, and live
+    `recommendation_events` while preserving user `feedback` curation rows.
+    Callers delete live library/profile rows (and `feedback`, if shortlist or
+    dismissed curation is also being reset) in the same outer transaction.
     """
 
     candidates = sorted({int(item) for item in candidate_ids if int(item) > 0})
@@ -1846,12 +1848,11 @@ def purge_recommendation_evidence(
         and not reads
         and not selected_runs
         and not shelf_rows
-        and not clear_goodreads_shelves
         and not clear_scoring_batches
         and not clear_all_evidence
     ):
         raise ValueError(
-            "Candidate IDs, read IDs, run IDs, shelf items, clear_goodreads_shelves, "
+            "Candidate IDs, read IDs, run IDs, shelf items, "
             "or clear_scoring_batches are required"
         )
     if clear_all_evidence:
@@ -1889,57 +1890,11 @@ def purge_recommendation_evidence(
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
 
     scoring_batch_ids: set[str] = set()
-    if (shelf_rows or clear_goodreads_shelves) and not clear_all_evidence:
+    if shelf_rows and not clear_all_evidence:
         from .identity import book_row_identity_match_keys
 
         matched_shelf_candidate_ids: set[int] = set()
         shelf_identity_hashes: set[str] = set()
-        if clear_goodreads_shelves:
-            shelf_rows.extend(
-                dict(row)
-                for row in connection.execute(
-                    "SELECT shelf, title, author, isbn, openlibrary_work_id "
-                    "FROM goodreads_shelf_items"
-                ).fetchall()
-            )
-            for brow in connection.execute(
-                "SELECT id, payload_encoding, payload FROM scoring_batches "
-                "WHERE capture_status='complete'"
-            ).fetchall():
-                if brow["payload_encoding"] != "zlib-json" or not brow["payload"]:
-                    continue
-                try:
-                    bpayload = json.loads(zlib.decompress(bytes(brow["payload"])))
-                except Exception:
-                    continue
-                if not isinstance(bpayload, Mapping):
-                    continue
-                boosted_ids = _batch_payload_has_any_shelf_evidence(bpayload)
-                if boosted_ids or bpayload.get("goodreads_shelf_items"):
-                    scoring_batch_ids.add(str(brow["id"]))
-                    matched_shelf_candidate_ids.update(boosted_ids)
-            selected_runs.update(
-                str(row["run_id"])
-                for row in connection.execute(
-                    "SELECT DISTINCT run_id FROM recommendation_evidence_exposures "
-                    "WHERE candidate_snapshot_json LIKE '%On your Goodreads to-read shelf%'"
-                ).fetchall()
-                if row["run_id"]
-            )
-            for rrow in connection.execute(
-                "SELECT run_id, payload_encoding, payload FROM recommendation_run_evidence "
-                "WHERE capture_status='complete'"
-            ).fetchall():
-                rid = str(rrow["run_id"])
-                if rid in selected_runs or rrow["payload_encoding"] != "zlib-json" or not rrow["payload"]:
-                    continue
-                try:
-                    raw_run = zlib.decompress(bytes(rrow["payload"]))
-                except Exception:
-                    continue
-                if b"On your Goodreads to-read shelf" in raw_run:
-                    selected_runs.add(rid)
-
         shelf_match_keys: set[tuple[str, ...]] = set()
         for srow in shelf_rows:
             shelf_match_keys.update(book_row_identity_match_keys(srow))
@@ -1972,19 +1927,14 @@ def purge_recommendation_evidence(
                     continue
                 if not isinstance(bpayload, Mapping):
                     continue
-                matched_in_batch = any(
-                    isinstance(legacy_srow, Mapping)
-                    and (set(book_row_identity_match_keys(legacy_srow)) & shelf_match_keys)
-                    for legacy_srow in (bpayload.get("goodreads_shelf_items") or ())
-                )
-                if not matched_in_batch:
-                    for cinput in bpayload.get("candidate_inputs") or ():
-                        if isinstance(cinput, Mapping) and (
-                            set(book_row_identity_match_keys(cinput)) & shelf_match_keys
-                        ):
-                            matched_in_batch = True
-                            if cinput.get("id") is not None and not isinstance(cinput.get("id"), bool):
-                                matched_shelf_candidate_ids.add(int(cinput["id"]))
+                matched_in_batch = False
+                for cinput in bpayload.get("candidate_inputs") or ():
+                    if isinstance(cinput, Mapping) and (
+                        set(book_row_identity_match_keys(cinput)) & shelf_match_keys
+                    ):
+                        matched_in_batch = True
+                        if cinput.get("id") is not None and not isinstance(cinput.get("id"), bool):
+                            matched_shelf_candidate_ids.add(int(cinput["id"]))
                 if matched_in_batch:
                     scoring_batch_ids.add(bid)
         ordered_shelf_hashes = sorted(shelf_identity_hashes)
@@ -2061,6 +2011,49 @@ def purge_recommendation_evidence(
                 reads,
             ).fetchall()
         )
+        if not clear_all_evidence:
+            from .identity import book_row_identity_match_keys
+
+            purged_read_keys: set[tuple[str, ...]] = set()
+            for rrow in connection.execute(
+                "SELECT r.title, r.author, r.isbn, r.openlibrary_work_id, "
+                "m.verified_work_id AS quality_work_id, m.identity_provider AS quality_provider "
+                f"FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id "
+                f"WHERE r.id IN ({read_marks})",
+                reads,
+            ).fetchall():
+                purged_read_keys.update(book_row_identity_match_keys(dict(rrow)))
+            if purged_read_keys:
+                for brow in connection.execute(
+                    "SELECT id, payload_encoding, payload FROM scoring_batches "
+                    "WHERE capture_status='complete'"
+                ).fetchall():
+                    bid = str(brow["id"])
+                    if (
+                        bid in scoring_batch_ids
+                        or brow["payload_encoding"] != "zlib-json"
+                        or not brow["payload"]
+                    ):
+                        continue
+                    try:
+                        bpayload = json.loads(zlib.decompress(bytes(brow["payload"])))
+                    except Exception:
+                        continue
+                    if not isinstance(bpayload, Mapping):
+                        continue
+                    boosted_ids = _batch_payload_has_any_shelf_evidence(bpayload)
+                    if not boosted_ids:
+                        continue
+                    for cinput in bpayload.get("candidate_inputs") or ():
+                        if (
+                            isinstance(cinput, Mapping)
+                            and cinput.get("id") is not None
+                            and not isinstance(cinput.get("id"), bool)
+                            and int(cinput["id"]) in boosted_ids
+                            and (set(book_row_identity_match_keys(cinput)) & purged_read_keys)
+                        ):
+                            scoring_batch_ids.add(bid)
+                            break
     if clear_scoring_batches:
         scoring_batch_ids.update(
             str(row["id"])
@@ -2157,7 +2150,6 @@ def purge_recommendation_evidence(
         )
     if clear_all_evidence:
         connection.execute("DELETE FROM recommendation_events")
-        connection.execute("DELETE FROM feedback")
         connection.execute("DELETE FROM recommendation_evidence_events")
         connection.execute("DELETE FROM recommendation_evidence_outcomes")
         connection.execute("DELETE FROM recommendation_evidence_exposures")
