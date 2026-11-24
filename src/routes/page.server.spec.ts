@@ -536,6 +536,63 @@ describe("page actions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("persists the resolved feed URL from preview while keeping the website hostname as default name", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 3,
+            url: "https://feeds.newsletter.example/books.atom",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 12, job_id: 4 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "https://www.newsletter.example");
+    const result = await actions.source!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message:
+        "Permanent source added; its first scan is queued (3 books detected).",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8000/api/sources/preview",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://www.newsletter.example",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8000/api/sources",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          name: "newsletter.example",
+          url: "https://feeds.newsletter.example/books.atom",
+          lifecycle: "permanent",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+  });
+
   it("saves normalized source genre filters", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ saved: true }), {
@@ -1077,6 +1134,165 @@ describe("page actions", () => {
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
       ids: [7, 8],
       action: "save",
+    });
+  });
+
+  it("hydrates full Digest Review picks beyond the initial 24 Discover page and exposes full-pool genres", async () => {
+    const overview = {
+      recommendation_run_id: "run-9999",
+      recommendations_has_more: true,
+      recommendation_genres: ["Fantasy", "Xenolinguistics"],
+      decision_genres: ["Historical Fiction", "Solarpunk"],
+      recommendations: [
+        {
+          id: 1,
+          title: "Top Ranked Pick",
+          author: "Writer One",
+          description: "In page one",
+          cover_url: "https://covers.example/1.jpg",
+          source_url: "https://books.example/1",
+          release_date: "2026-09-01",
+          date_kind: "day",
+          genres: ["Fantasy"],
+          score: 95,
+          explanation: ["Strong match"],
+          status: "recommended",
+          source_name: "Feed A",
+        },
+      ],
+      decisions: [],
+      decisions_has_more: false,
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const digestReviewPayload = {
+      period: "2026-W39",
+      ids: [1, 30],
+      found: true,
+      items: [
+        overview.recommendations[0],
+        {
+          id: 30,
+          title: "Rank Thirty Digest Gem",
+          author: "Writer Thirty",
+          description: "Ranked below page one",
+          cover_url: "https://covers.example/30.jpg",
+          source_url: "https://books.example/30",
+          release_date: "2026-09-15",
+          date_kind: "day",
+          genres: ["Xenolinguistics"],
+          score: 83,
+          explanation: ["Digest standout"],
+          status: "recommended",
+          source_name: "Feed B",
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/api/digest/review")) {
+        return new Response(JSON.stringify(digestReviewPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=discover&digest=1&digest_period=2026-W39"),
+      locals: { user: null },
+    } as never)) as {
+      recommendations_has_more: boolean;
+      recommendation_genres: string[];
+      decision_genres: string[];
+      digestReview: {
+        requested: boolean;
+        stale: boolean;
+        period: string | null;
+        ids: number[];
+        books: Array<{ id: number; title: string; recommendation_run_id?: string | null }>;
+      };
+    };
+
+    expect(result.recommendations_has_more).toBe(true);
+    expect(result.recommendation_genres).toEqual(["Fantasy", "Xenolinguistics"]);
+    expect(result.decision_genres).toEqual(["Historical Fiction", "Solarpunk"]);
+    expect(result.digestReview.requested).toBe(true);
+    expect(result.digestReview.ids).toEqual([1, 30]);
+    expect(result.digestReview.books).toEqual([
+      expect.objectContaining({
+        id: 1,
+        title: "Top Ranked Pick",
+        recommendation_run_id: "run-9999",
+      }),
+      expect.objectContaining({
+        id: 30,
+        title: "Rank Thirty Digest Gem",
+        recommendation_run_id: "",
+      }),
+    ]);
+  });
+
+  it("marks unknown digest periods unrequested and returns an empty digestReview.books slice", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string | URL) => {
+      if (String(input).includes("/api/digest/review")) {
+        return new Response(
+          JSON.stringify({ period: "2026-W52", ids: [], found: false }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=discover&digest=1&digest_period=2026-W52"),
+      locals: { user: null },
+    } as never)) as {
+      digestReview: {
+        requested: boolean;
+        ids: number[];
+        books: unknown[];
+      };
+    };
+
+    expect(result.digestReview).toEqual({
+      requested: false,
+      ids: [],
+      books: [],
     });
   });
 
