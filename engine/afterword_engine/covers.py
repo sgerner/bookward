@@ -876,8 +876,10 @@ async def resolve_book_metadata(
         or not supplied_url
         or (prefer_isbn_cover and has_source_isbn)
     ) and title and author:
-        for lookup in (_lookup_open_library_record, _lookup_google_books_record):
-            async def cached_lookup(query_isbn: str):
+        async def _lookup_provider_with_fallback(lookup):
+            provider_traces: list[dict[str, object]] = []
+
+            async def cached_lookup(query_isbn: str) -> dict[str, object]:
                 kwargs = (
                     {"google_books_api_key": google_books_api_key}
                     if lookup is _lookup_google_books_record
@@ -903,7 +905,7 @@ async def resolve_book_metadata(
             record = await cached_lookup(source_isbn13 or source_isbn10)
             trace = record.get("_fetch_trace")
             if isinstance(trace, dict):
-                traces.append(trace)
+                provider_traces.append(trace)
             if not record.get("provider") and has_source_isbn:
                 # An ISBN miss or contradiction can still be followed by an
                 # identity-verified title/author query. The ISBN result itself
@@ -911,11 +913,11 @@ async def resolve_book_metadata(
                 # Do not repeat a failed provider request immediately with a
                 # broader query; it cannot recover from an outage in this job.
                 if isinstance(trace, dict) and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES:
-                    continue
+                    return None, provider_traces
                 record = await cached_lookup("")
                 trace = record.get("_fetch_trace")
                 if isinstance(trace, dict):
-                    traces.append(trace)
+                    provider_traces.append(trace)
             elif (
                 prefer_isbn_cover
                 and has_source_isbn
@@ -932,7 +934,7 @@ async def resolve_book_metadata(
                 record = await cached_lookup("")
                 trace = record.get("_fetch_trace")
                 if isinstance(trace, dict):
-                    traces.append(trace)
+                    provider_traces.append(trace)
             if (
                 record.get("provider")
                 and
@@ -947,8 +949,18 @@ async def resolve_book_metadata(
                     and trace.get("query_kind") == "isbn"
                     and trace.get("identifier_verified") is True
                 ):
-                    continue
+                    return None, provider_traces
             if record.get("provider"):
+                return record, provider_traces
+            return None, provider_traces
+
+        provider_outcomes = await asyncio.gather(
+            _lookup_provider_with_fallback(_lookup_open_library_record),
+            _lookup_provider_with_fallback(_lookup_google_books_record),
+        )
+        for record, provider_traces in provider_outcomes:
+            traces.extend(provider_traces)
+            if record is not None:
                 records.append(record)
 
     description_records = [record for record in records if record.get("description")]
