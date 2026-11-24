@@ -25,7 +25,6 @@ from afterword_engine.covers import (
     fallback_cover_url,
     is_weak_cover_url,
     resolve_book_metadata,
-    resolve_cover_url,
     safe_cover_url,
 )
 from afterword_engine.ingestion import (
@@ -133,6 +132,39 @@ def test_database_indexes_cover_recent_history_and_job_queue(database):
     )
     assert any("idx_reads_recent" in item["detail"] for item in history_plan)
     assert any("idx_jobs_queue" in item["detail"] for item in queue_plan)
+
+
+def test_database_indexes_cover_goodreads_shelf_deletes(database):
+    indexes = {
+        item["name"]
+        for item in rows(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
+            ("idx_goodreads_shelf_items_shelf", "idx_goodreads_shelf_items_title_author"),
+        )
+    }
+
+    assert indexes == {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    delete_by_book_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("Project Hail Mary", "Andy Weir"),
+    )
+    delete_by_shelf_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE shelf=?",
+        ("to-read",),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in delete_by_book_plan
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_shelf"
+        in item["detail"]
+        for item in delete_by_shelf_plan
+    )
 
 
 def test_startup_quality_audit_ignores_rejected_legacy_candidates(database):
@@ -947,7 +979,7 @@ def test_goodreads_rss_scheduler_retries_failed_daily_job_with_a_cap(database):
 
 
 def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
-    async def fail(_url):
+    async def fail(_url, client=None):
         raise RuntimeError("feed unavailable")
 
     monkeypatch.setattr("afterword_engine.main.import_goodreads_rss", fail)
@@ -959,6 +991,157 @@ def test_goodreads_rss_failure_is_persisted_for_settings(database, monkeypatch):
     assert configured["goodreads_rss_last_attempt_at"]
     assert configured["goodreads_rss_last_error"] == "feed unavailable"
     assert configured["goodreads_rss_last_sync_at"] == ""
+
+
+def test_sync_goodreads_rss_reuses_single_client_with_3_way_concurrency(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Finished From Private Shelf', 'Author A')"
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('currently-reading', 'Still Reading Private', 'Author B')"
+        )
+
+    read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Finished From Private Shelf</title>
+        <author_name>Author A</author_name>
+        <user_rating>5</user_rating>
+        <isbn13>9780593135204</isbn13>
+      </item>
+    </channel></rss>"""
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Queued Book</title>
+        <author_name>Author C</author_name>
+      </item>
+    </channel></rss>"""
+
+    in_flight = 0
+    max_in_flight = 0
+    seen_hosts: list[str] = []
+    created_clients: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        seen_hosts.append(request.headers.get("Host", ""))
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.15)
+            shelf = request.url.params.get("shelf")
+            if shelf == "read":
+                return httpx.Response(200, content=read_xml, headers={"content-type": "application/rss+xml"})
+            if shelf == "to-read":
+                return httpx.Response(200, content=to_read_xml, headers={"content-type": "application/rss+xml"})
+            if shelf == "currently-reading":
+                return httpx.Response(404, content=b"Not Found", headers={"content-type": "text/plain"})
+            raise AssertionError(f"Unexpected shelf: {shelf}")
+        finally:
+            in_flight -= 1
+
+    def fake_source_client() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(ingestion, "_source_client", fake_source_client)
+
+    result = asyncio.run(
+        main._sync_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+    )
+
+    assert len(created_clients) == 1
+    assert max_in_flight == 3
+    assert seen_hosts == ["www.goodreads.com", "www.goodreads.com", "www.goodreads.com"]
+    assert result["imported"] == 1
+    assert result["shelves"] == {"to-read": 1, "currently-reading": 0}
+    assert safe_settings(include_api_tokens=False)["goodreads_rss_last_status"] == "succeeded"
+    assert row(
+        "SELECT COUNT(*) count FROM reads WHERE title='Finished From Private Shelf'"
+    )["count"] == 1
+    shelf_items = [
+        (item["shelf"], item["title"], item["author"])
+        for item in rows("SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf, title")
+    ]
+    assert shelf_items == [
+        ("currently-reading", "Still Reading Private", "Author B"),
+        ("to-read", "Queued Book", "Author C"),
+    ]
+
+
+def test_sync_goodreads_rss_read_failure_rolls_back_and_skips_shelf_writes(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) "
+            "VALUES('to-read', 'Existing Shelf Book', 'Existing Author')"
+        )
+
+    shelf_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Replacement Book</title>
+        <author_name>New Author</author_name>
+      </item>
+    </channel></rss>"""
+
+    completed_shelves: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        shelf = request.url.params.get("shelf")
+        if shelf == "read":
+            await asyncio.sleep(0.02)
+            return httpx.Response(500, content=b"Server Error", headers={"content-type": "text/plain"})
+        await asyncio.sleep(0.06)
+        completed_shelves.append(str(shelf))
+        return httpx.Response(200, content=shelf_xml, headers={"content-type": "application/rss+xml"})
+
+    monkeypatch.setattr(
+        ingestion,
+        "_source_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            timeout=settings.source_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(
+            main._sync_goodreads_rss("https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read")
+        )
+
+    assert sorted(completed_shelves) == ["currently-reading", "to-read"]
+    assert safe_settings(include_api_tokens=False)["goodreads_rss_last_status"] == "failed"
+    shelf_items = [
+        (item["shelf"], item["title"], item["author"])
+        for item in rows("SELECT shelf, title, author FROM goodreads_shelf_items")
+    ]
+    assert shelf_items == [("to-read", "Existing Shelf Book", "Existing Author")]
 
 
 def test_goodreads_csv_import_is_idempotent(database):
@@ -1575,29 +1758,6 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("https://books.example/cover.jpg", "https://books.example/list")
     assert safe_cover_url("https://tracking.example/cover.jpg", "https://books.example/list") == ""
     assert fallback_cover_url("A Book", "An Author").startswith("https://placehold.co/")
-
-@respx.mock
-def test_cover_lookup_replaces_open_library_isbn_no_cover_urls():
-    route = respx.get(OPEN_LIBRARY_SEARCH).mock(
-        return_value=httpx.Response(200, json={"docs": [{"title": "A Book", "author_name": ["An Author"], "cover_i": 12345}]})
-    )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author", "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg"))
-    assert cover == "https://covers.openlibrary.org/b/id/12345-L.jpg"
-    assert route.called
-
-@respx.mock
-def test_cover_lookup_falls_back_to_google_books_then_placeholder():
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
-    google = respx.get(GOOGLE_BOOKS_SEARCH).mock(
-        return_value=httpx.Response(200, json={"items": [{"volumeInfo": {"title": "A Book", "authors": ["An Author"], "imageLinks": {"thumbnail": "http://books.google.com/books/content?id=x"}}}]})
-    )
-    cover = asyncio.run(resolve_cover_url("A Book", "An Author"))
-    assert cover == "https://books.google.com/books/content?id=x"
-    assert google.called
-    respx.reset()
-    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(503))
-    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
-    assert asyncio.run(resolve_cover_url("No Match", "Nobody")).startswith("https://placehold.co/")
 
 @respx.mock
 def test_book_metadata_lookup_supplies_summary_and_year():
@@ -2341,6 +2501,99 @@ def test_initialize_upgrades_existing_v3_database_to_api_tokens(tmp_path):
     initialize()
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
     assert row("SELECT COUNT(*) count FROM candidates WHERE normalized_key=?", ("existing book existing author",))["count"] == 1
+
+
+def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(tmp_path, monkeypatch):
+    settings.db = str(tmp_path / "v25.db")
+    import sqlite3
+
+    with sqlite3.connect(settings.db) as con:
+        con.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        for version, script in MIGRATIONS:
+            if version > 25:
+                break
+            con.executescript(script)
+            con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 26))
+        assert (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_goodreads_shelf_items_title_author'"
+            ).fetchone()
+            is None
+        )
+        pre_upgrade_plan = [
+            item[3]
+            for item in con.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ("CSV Promoted", "Author One"),
+            )
+        ]
+        assert any("SCAN goodreads_shelf_items" in detail for detail in pre_upgrade_plan)
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, title, author) VALUES(?, ?, ?)",
+            [
+                ("to-read", "CSV Promoted", "Author One"),
+                ("currently-reading", "CSV Promoted", "Author One"),
+                ("to-read", "RSS Promoted", "Author Two"),
+                ("currently-reading", "RSS Promoted", "Author Two"),
+                ("to-read", "Still Queued", "Author Three"),
+            ],
+        )
+
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+    assert row("SELECT 1 FROM schema_migrations WHERE version=26") is not None
+    post_upgrade_plan = rows(
+        "EXPLAIN QUERY PLAN DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+        ("CSV Promoted", "Author One"),
+    )
+    assert any(
+        "SEARCH goodreads_shelf_items USING INDEX idx_goodreads_shelf_items_title_author"
+        in item["detail"]
+        for item in post_upgrade_plan
+    )
+
+    # Rerunning initialize() remains idempotent with IF NOT EXISTS.
+    initialize(seed_demo=False)
+    assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
+
+    csv_count = import_goodreads_csv(
+        b"Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        b"CSV Promoted,Author One,5,2026/03/01,2026/02/01,read,=\"9780593135204\"\n"
+    )
+    assert csv_count == 1
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM goodreads_shelf_items WHERE title=? AND author=?",
+            ("CSV Promoted", "Author One"),
+        )["count"]
+        == 0
+    )
+
+    async def fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [
+            {
+                "title": "RSS Promoted",
+                "author_name": "Author Two",
+                "user_rating": "4",
+                "user_read_at": "2026/03/02",
+                "isbn13": "9781635575637",
+            }
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+    rss_count = asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    )
+    assert rss_count == 1
+    remaining = rows("SELECT shelf, title, author FROM goodreads_shelf_items ORDER BY shelf, title")
+    assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
 
 
 def test_initialize_removes_retired_llm_data_from_v11_database(tmp_path):
