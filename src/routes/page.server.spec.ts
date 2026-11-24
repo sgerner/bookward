@@ -536,6 +536,63 @@ describe("page actions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("persists the resolved feed URL from preview while keeping the website hostname as default name", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 3,
+            url: "https://feeds.newsletter.example/books.atom",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 12, job_id: 4 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "https://www.newsletter.example");
+    const result = await actions.source!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message:
+        "Permanent source added; its first scan is queued (3 books detected).",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8000/api/sources/preview",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://www.newsletter.example",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8000/api/sources",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          name: "newsletter.example",
+          url: "https://feeds.newsletter.example/books.atom",
+          lifecycle: "permanent",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+  });
+
   it("saves normalized source genre filters", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ saved: true }), {
@@ -1172,7 +1229,100 @@ describe("page actions", () => {
     });
   });
 
-  it("validates Goodreads CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
+  it("imports a StoryGraph CSV export through the unified CSV action and names The StoryGraph", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ imported: 3, source: "storygraph_csv", job_id: "job-sg" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set(
+      "file",
+      new File(
+        ["Title,Authors,Read Status,Star Rating\nPiranesi,Susanna Clarke,read,4.75\n"],
+        "storygraph.csv",
+        { type: "text/csv" },
+      ),
+    );
+    const result = await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message: "Imported 3 books from The StoryGraph.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/import/csv",
+    );
+  });
+
+  it("retains importGoodreadsCsv compatibility and surfaces 400 format errors clearly", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ imported: 1, source: "goodreads_csv", job_id: "job-gr" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "CSV must match Goodreads or The StoryGraph export format",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const validBody = new FormData();
+    validBody.set(
+      "file",
+      new File(["Title,Author,My Rating\nDune,Frank Herbert,5\n"], "goodreads.csv", {
+        type: "text/csv",
+      }),
+    );
+    await expect(
+      actions.importGoodreadsCsv!({
+        request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+      } as never),
+    ).resolves.toEqual({
+      message: "Imported 1 book from Goodreads.",
+    });
+
+    const invalidBody = new FormData();
+    invalidBody.set(
+      "file",
+      new File(["Heading,Amount\nSomething,10\n"], "budget.csv", {
+        type: "text/csv",
+      }),
+    );
+    const failed = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: invalidBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(failed.status).toBe(400);
+    expect(failed.data.message).toContain("Goodreads or The StoryGraph");
+
+    const emptyResult = (await actions.importCsv!({
+      request: new Request("http://afterword.test", { method: "POST", body: new FormData() }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(emptyResult.status).toBe(400);
+    expect(emptyResult.data.message).toBe(
+      "Choose a Goodreads or StoryGraph CSV export.",
+    );
+  });
+
+  it("validates CSV size, catches 413 body errors, and preserves engine error statuses", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -1183,7 +1333,7 @@ describe("page actions", () => {
       } as never),
     ).resolves.toMatchObject({
       status: 400,
-      data: { message: "Choose a Goodreads CSV export.", error: true },
+      data: { message: "Choose a Goodreads or StoryGraph CSV export.", error: true },
     });
 
     const oversizedForm = new FormData();
@@ -1194,6 +1344,23 @@ describe("page actions", () => {
     await expect(
       actions.importGoodreadsCsv!({
         request: new Request("http://afterword.test", { method: "POST", body: oversizedForm }),
+      } as never),
+    ).resolves.toMatchObject({
+      status: 413,
+      data: { message: expect.stringContaining("10 MB"), error: true },
+    });
+
+    const oversizedStoryGraphForm = new FormData();
+    oversizedStoryGraphForm.set(
+      "file",
+      new File([new Uint8Array(10_000_001)], "storygraph.csv", { type: "text/csv" }),
+    );
+    await expect(
+      actions.importCsv!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: oversizedStoryGraphForm,
+        }),
       } as never),
     ).resolves.toMatchObject({
       status: 413,
@@ -1223,10 +1390,13 @@ describe("page actions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
 
     fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "This does not look like a Goodreads export" }), {
-        status: 400,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({ detail: "CSV must match Goodreads or The StoryGraph export format" }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
     );
     const invalidCsvForm = new FormData();
     invalidCsvForm.set("file", new File(["bad,csv\n"], "bad.csv", { type: "text/csv" }));
@@ -1236,7 +1406,10 @@ describe("page actions", () => {
       } as never),
     ).resolves.toMatchObject({
       status: 400,
-      data: { message: "This does not look like a Goodreads export", error: true },
+      data: {
+        message: "CSV must match Goodreads or The StoryGraph export format",
+        error: true,
+      },
     });
 
     fetchMock.mockResolvedValueOnce(
@@ -1257,7 +1430,7 @@ describe("page actions", () => {
     });
 
     fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ imported: 3 }), {
+      new Response(JSON.stringify({ imported: 3, source: "goodreads_csv" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -1268,7 +1441,7 @@ describe("page actions", () => {
       actions.importGoodreadsCsv!({
         request: new Request("http://afterword.test", { method: "POST", body: validForm }),
       } as never),
-    ).resolves.toEqual({ message: "Imported 3 Goodreads books." });
+    ).resolves.toEqual({ message: "Imported 3 books from Goodreads." });
   });
 
   it("forwards missing initial Librarr API key validation from the engine without pre-fetching overview", async () => {
