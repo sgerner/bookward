@@ -27,7 +27,7 @@ export const POST: RequestHandler = async ({ request }) => {
         api_url: typeof payload.api_url === "string" ? payload.api_url : "",
         model: typeof payload.model === "string" ? payload.model : "",
         api_key: typeof payload.api_key === "string" ? payload.api_key : "",
-        use_saved_key: payload.use_saved_key !== false,
+        use_saved_key: payload.use_saved_key === true,
       }),
     });
     return Response.json(result);

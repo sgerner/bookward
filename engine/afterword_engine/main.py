@@ -51,7 +51,9 @@ from .security import safe_error_message, validate_public_url, validate_service_
 from .llm_reranker import (
     DEFAULT_CLOUD_LLM_URL,
     DEFAULT_OLLAMA_URL,
+    can_reuse_saved_llm_key,
     discover_local_llm_models,
+    llm_url_origin,
     normalize_llm_rerank_mode,
     validate_llm_rerank_url,
     verify_llm_reranker,
@@ -1353,14 +1355,14 @@ class LLMRerankTestIn(BaseModel):
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
     model: str = Field(default="", max_length=200)
-    use_saved_key: bool = True
+    use_saved_key: bool = False
 
 
 class LLMModelsDiscoverIn(BaseModel):
     mode: str = Field(default="cloud", max_length=40)
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
-    use_saved_key: bool = True
+    use_saved_key: bool = False
 
 
 def api_token_list():
@@ -2633,15 +2635,32 @@ async def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
         mode, resolved_url = payload.validate_values(existing_effective["mode"])
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
+    supplied_key = (payload.api_key or "").strip()
+    existing_has_key = bool(existing_effective["api_key"].strip())
     if payload.clear_api_key:
         api_key = ""
         persist_api_key = True
-    elif payload.api_key is None or not payload.api_key.strip():
+    elif supplied_key:
+        api_key = supplied_key
+        persist_api_key = True
+    elif existing_has_key:
+        if not can_reuse_saved_llm_key(
+            existing_effective, mode=mode, api_url=resolved_url
+        ):
+            raise HTTPException(
+                400,
+                "Saved LLM API key can only be reused when the mode and endpoint origin match the saved settings; provide a new API key or clear the saved key",
+            )
         api_key = existing_effective["api_key"]
         persist_api_key = "llm_rerank_api_key" in current
     else:
-        api_key = payload.api_key.strip()
-        persist_api_key = True
+        api_key = ""
+        persist_api_key = False
+    if resolved_url:
+        try:
+            validate_llm_rerank_url(resolved_url, has_api_key=bool(api_key.strip()))
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     if payload.enabled and mode == "cloud" and not api_key.strip():
         raise HTTPException(400, "An API key is required when cloud LLM reranking is enabled")
     health: dict[str, Any] = {"ok": True, "checked": False, "mode": mode, "model": payload.model.strip()}
@@ -2694,12 +2713,22 @@ async def test_llm_rerank_settings(payload: LLMRerankTestIn):
         raise HTTPException(400, safe_error_message(exc)) from exc
     api_url = payload.api_url.strip()
     if not api_url:
-        api_url = DEFAULT_OLLAMA_URL if mode == "ollama" else existing["api_url"]
-    api_key = (
-        payload.api_key.strip()
-        if payload.api_key and payload.api_key.strip()
-        else (existing["api_key"] if payload.use_saved_key else "")
-    )
+        if mode == existing["mode"] and existing["api_url"].strip():
+            api_url = existing["api_url"].strip()
+        elif mode == "ollama":
+            api_url = DEFAULT_OLLAMA_URL
+    supplied_key = (payload.api_key or "").strip()
+    if supplied_key:
+        api_key = supplied_key
+    elif payload.use_saved_key:
+        if not can_reuse_saved_llm_key(existing, mode=mode, api_url=api_url):
+            raise HTTPException(
+                400,
+                "Saved LLM API key can only be reused when the mode and endpoint origin match the saved settings; provide a new API key",
+            )
+        api_key = existing["api_key"]
+    else:
+        api_key = ""
     try:
         health = await verify_llm_reranker(
             mode=mode,
@@ -2791,9 +2820,20 @@ async def _resolve_llm_models_response(
                 target_url = existing["api_url"].strip()
             elif resolved_mode == "ollama":
                 target_url = DEFAULT_OLLAMA_URL
-        resolved_key = api_key.strip() or (
-            existing["api_key"] if use_saved_key else ""
-        )
+        supplied_key = api_key.strip()
+        if supplied_key:
+            resolved_key = supplied_key
+        elif use_saved_key:
+            if not can_reuse_saved_llm_key(
+                existing, mode=resolved_mode, api_url=target_url
+            ):
+                raise HTTPException(
+                    400,
+                    "Saved LLM API key can only be reused when the mode and endpoint origin match the saved settings; provide a new API key",
+                )
+            resolved_key = existing["api_key"]
+        else:
+            resolved_key = ""
         try:
             models = await discover_local_llm_models(
                 mode=resolved_mode,
@@ -2841,12 +2881,11 @@ async def _resolve_llm_models_response(
 async def llm_models_catalog(
     mode: str = "cloud",
     api_url: str = "",
-    use_saved_key: bool = False,
 ):
     return await _resolve_llm_models_response(
         mode=mode,
         api_url=api_url,
-        use_saved_key=use_saved_key,
+        use_saved_key=False,
     )
 
 
@@ -3208,11 +3247,26 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
         api_url = DEFAULT_OLLAMA_URL
     else:
         api_url = settings.llm_rerank_api_url
-    api_key = (
-        private["llm_rerank_api_key"]
-        if "llm_rerank_api_key" in private
-        else settings.llm_rerank_api_key
+    try:
+        env_mode = normalize_llm_rerank_mode(settings.llm_rerank_mode or "cloud")
+    except ValueError:
+        env_mode = "cloud"
+    env_url = (
+        DEFAULT_OLLAMA_URL
+        if env_mode == "ollama" and settings.llm_rerank_api_url == DEFAULT_CLOUD_LLM_URL
+        else settings.llm_rerank_api_url
     )
+    if "llm_rerank_api_key" in private:
+        api_key = private["llm_rerank_api_key"]
+    elif (
+        settings.llm_rerank_api_key.strip()
+        and mode == env_mode
+        and llm_url_origin(api_url) is not None
+        and llm_url_origin(api_url) == llm_url_origin(env_url)
+    ):
+        api_key = settings.llm_rerank_api_key
+    else:
+        api_key = ""
     return {
         "enabled": enabled,
         "mode": mode,

@@ -5,7 +5,7 @@ import { POST as testPOST } from "../test/+server";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("/api/llm routes", () => {
-  it("forwards local Ollama discovery query parameters and preserves HTTP 400 SSRF rejections", async () => {
+  it("strips use_saved_key from GET model discovery and preserves HTTP 400 SSRF rejections", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -37,7 +37,7 @@ describe("/api/llm routes", () => {
       models: [{ id: "qwen2.5:7b", name: "qwen2.5:7b" }],
     });
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:8000/api/llm/models?mode=ollama&api_url=http%3A%2F%2Follama%3A11434&use_saved_key=true",
+      "http://127.0.0.1:8000/api/llm/models?mode=ollama&api_url=http%3A%2F%2Follama%3A11434",
     );
 
     const blockedRes = await GET({
@@ -51,7 +51,7 @@ describe("/api/llm routes", () => {
     });
   });
 
-  it("sends unsaved API keys in POST body for model discovery and connection testing", async () => {
+  it("defaults use_saved_key to false on POST /api/llm/models and POST /api/llm/test unless explicitly true", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -73,6 +73,17 @@ describe("/api/llm routes", () => {
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            mode: "cloud",
+            model: "gpt-4o-mini",
+            latency_ms: 21,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -84,7 +95,6 @@ describe("/api/llm routes", () => {
           mode: "openai-compatible",
           api_url: "http://vllm:8000/v1",
           api_key: "secret-key",
-          use_saved_key: true,
         }),
       }),
     } as never);
@@ -95,10 +105,10 @@ describe("/api/llm routes", () => {
       mode: "openai-compatible",
       api_url: "http://vllm:8000/v1",
       api_key: "secret-key",
-      use_saved_key: true,
+      use_saved_key: false,
     });
 
-    const probeRes = await testPOST({
+    const defaultTestRes = await testPOST({
       request: new Request("http://afterword.test/api/llm/test", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -109,11 +119,38 @@ describe("/api/llm routes", () => {
         }),
       }),
     } as never);
-    expect(probeRes.status).toBe(200);
-    await expect(probeRes.json()).resolves.toMatchObject({
-      ok: true,
+    expect(defaultTestRes.status).toBe(200);
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body)),
+    ).toEqual({
       mode: "ollama",
+      api_url: "http://ollama:11434",
       model: "qwen2.5:7b",
+      api_key: "",
+      use_saved_key: false,
+    });
+
+    const explicitSavedKeyRes = await testPOST({
+      request: new Request("http://afterword.test/api/llm/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          mode: "cloud",
+          api_url: "https://api.openai.com/v1/chat/completions",
+          model: "gpt-4o-mini",
+          use_saved_key: true,
+        }),
+      }),
+    } as never);
+    expect(explicitSavedKeyRes.status).toBe(200);
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body)),
+    ).toEqual({
+      mode: "cloud",
+      api_url: "https://api.openai.com/v1/chat/completions",
+      model: "gpt-4o-mini",
+      api_key: "",
+      use_saved_key: true,
     });
   });
 });

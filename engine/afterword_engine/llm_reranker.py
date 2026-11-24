@@ -6,14 +6,14 @@ import json
 import logging
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
 
 from .config import settings
-from .security import validate_service_url
+from .security import safe_error_message, validate_service_url
 
 LOGGER = logging.getLogger(__name__)
 
@@ -259,8 +259,50 @@ def llm_rerank_allowed_hosts(raw: str | None = None) -> set[str]:
     }
 
 
+def llm_url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return normalized (scheme, host, port) origin for an HTTP(S) URL, or None if invalid."""
+    cleaned = str(url or "").strip()
+    if not cleaned or "\\" in cleaned or any(ord(ch) < 33 or ord(ch) == 127 for ch in cleaned):
+        return None
+    try:
+        parsed = urlparse(cleaned)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.username or parsed.password:
+            return None
+        host = parsed.hostname.lower().rstrip(".")
+        port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+        if not (1 <= int(port) <= 65535):
+            return None
+    except ValueError:
+        return None
+    return (scheme, host, int(port))
+
+
+def can_reuse_saved_llm_key(
+    existing: Mapping[str, Any],
+    *,
+    mode: str,
+    api_url: str,
+) -> bool:
+    """Return True only when a non-empty saved key exists and target mode + origin match saved ones."""
+    saved_key = str(existing.get("api_key") or "").strip()
+    if not saved_key:
+        return False
+    saved_mode = str(existing.get("mode") or "").strip().lower()
+    if mode.strip().lower() != saved_mode:
+        return False
+    target_origin = llm_url_origin(api_url)
+    saved_origin = llm_url_origin(str(existing.get("api_url") or ""))
+    return target_origin is not None and target_origin == saved_origin
+
+
 def _validate_and_split_llm_origin(
-    url: str, allowed_hosts: set[str] | None = None
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = False,
 ) -> tuple[str, str, str, str]:
     cleaned = str(url or "").strip()
     if not cleaned:
@@ -305,6 +347,10 @@ def _validate_and_split_llm_origin(
     hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
     raw_host = parsed.hostname.lower().rstrip(".")
     matched_allowed = next((allowed for allowed in hosts if allowed == raw_host), None)
+    if scheme == "http" and has_api_key and matched_allowed is None:
+        raise ValueError(
+            "Plain HTTP LLM endpoints cannot be used with an API key unless the host is in LLM_RERANK_ALLOWED_HOSTS; use HTTPS instead"
+        )
     effective_host = matched_allowed if matched_allowed is not None else raw_host
     authority_host = (
         f"[{effective_host}]"
@@ -319,9 +365,14 @@ def _validate_and_split_llm_origin(
     return scheme, authority_host, port_str, raw_path
 
 
-def validate_llm_rerank_url(url: str, allowed_hosts: set[str] | None = None) -> str:
+def validate_llm_rerank_url(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = False,
+) -> str:
     scheme, authority_host, port_str, raw_path = _validate_and_split_llm_origin(
-        url, allowed_hosts
+        url, allowed_hosts, has_api_key=has_api_key
     )
     authority = f"{authority_host}:{port_str}" if port_str else authority_host
     return f"{scheme}://{authority}{raw_path}"
@@ -333,9 +384,10 @@ def _build_validated_llm_target_url(
     mode: str,
     endpoint: str,
     allowed_hosts: set[str] | None = None,
+    has_api_key: bool = False,
 ) -> str:
     scheme, authority_host, port_str, raw_path = _validate_and_split_llm_origin(
-        url, allowed_hosts
+        url, allowed_hosts, has_api_key=has_api_key
     )
     authority = f"{authority_host}:{port_str}" if port_str else authority_host
     canonical_input = f"{scheme}://{authority}{raw_path}"
@@ -503,6 +555,7 @@ async def _request_llm_completion_async(
         mode=mode,
         endpoint="chat",
         allowed_hosts=allowed_hosts,
+        has_api_key=bool(api_key.strip()),
     )
     headers = _build_headers(api_key, include_content_type=True)
     async with httpx.AsyncClient(
@@ -559,6 +612,7 @@ def _request_llm_completion_sync(
         mode=mode,
         endpoint="chat",
         allowed_hosts=allowed_hosts,
+        has_api_key=bool(api_key.strip()),
     )
     headers = _build_headers(api_key, include_content_type=True)
     with httpx.Client(
@@ -653,7 +707,9 @@ async def verify_llm_reranker(
     chosen_model = model.strip()
     if not raw_url or not chosen_model:
         raise ValueError("LLM reranking requires both an API URL and a model")
-    validate_llm_rerank_url(raw_url, allowed_hosts)
+    validate_llm_rerank_url(
+        raw_url, allowed_hosts, has_api_key=bool(api_key.strip())
+    )
     if resolved_mode == "cloud" and not api_key.strip():
         raise ValueError("An API key is required when cloud LLM reranking is enabled")
 
@@ -712,6 +768,7 @@ async def discover_local_llm_models(
         mode=resolved_mode,
         endpoint="models",
         allowed_hosts=allowed_hosts,
+        has_api_key=bool(api_key.strip()),
     )
     headers = _build_headers(api_key, include_content_type=False)
     async with httpx.AsyncClient(
@@ -799,5 +856,8 @@ def rerank_with_llm_sync(
         parsed = extract_llm_json(content)
         return _apply_parsed_rerank(candidates, parsed, top_k=k, max_delta=delta)
     except Exception as exc:
-        LOGGER.warning("LLM reranker failed; falling back to base order: %s", exc)
+        LOGGER.warning(
+            "LLM reranker failed; falling back to base order: %s",
+            safe_error_message(exc),
+        )
         return [dict(c) for c in candidates], {"applied": False, "reason": "fallback"}

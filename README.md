@@ -287,6 +287,8 @@ docker compose -f compose.yaml -f compose.gpu.yaml \
 
 If Librarr runs in another container, put both services on the same Docker network, allow its hostname through `LIBRARR_ALLOWED_HOSTS`, and use its internal URL (usually `http://librarr:5050`) in **Settings**.
 
+For local LLM reranking and model discovery, `LLM_RERANK_ALLOWED_HOSTS` defaults to `ollama` (matching `http://ollama:11434` on the Compose network). When Ollama or an OpenAI-compatible server runs on the host machine instead, add its loopback or host entry—for example `LLM_RERANK_ALLOWED_HOSTS=ollama,localhost,127.0.0.1` for a native local run (or `host.docker.internal` from Docker)—and use that URL in **Settings**.
+
 ## Configuration at a glance
 
 Copy `.env.example` to `.env` for Docker, or export variables in the shell for a local run.
@@ -312,7 +314,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `BACKUP_RETENTION_COUNT` | Number of newest automatic and manual snapshots to retain. Defaults to 7. |
 | `BACKUP_DIR` | Optional backup path inside the engine container; mount it persistently when set. Defaults to `/backups`, on its own `afterword-backups` Docker volume. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
-| `LLM_RERANK_ALLOWED_HOSTS` | Comma-separated private hostnames allowed for local Ollama or OpenAI-compatible LLM reranking and model discovery (defaults to `ollama`). |
+| `LLM_RERANK_ALLOWED_HOSTS` | Comma-separated private or loopback hostnames allowed for local Ollama or OpenAI-compatible LLM reranking and model discovery. Defaults to `ollama`; add `localhost,127.0.0.1` (or `host.docker.internal` in Docker) for a host-local server. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 

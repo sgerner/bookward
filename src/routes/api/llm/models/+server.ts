@@ -25,11 +25,9 @@ export const GET: RequestHandler = async ({ url }) => {
   try {
     const mode = (url.searchParams.get("mode") || "").trim();
     const apiUrl = (url.searchParams.get("api_url") || "").trim();
-    const useSavedKey = url.searchParams.get("use_saved_key") === "true";
     const params = new URLSearchParams();
     if (mode && mode !== "cloud") params.set("mode", mode);
     if (apiUrl) params.set("api_url", apiUrl);
-    if (useSavedKey) params.set("use_saved_key", "true");
     const query = params.toString();
     const catalog = await engine<LlmCatalogResponse>(
       query ? `/api/llm/models?${query}` : "/api/llm/models",
@@ -54,7 +52,7 @@ export const POST: RequestHandler = async ({ request }) => {
         mode: typeof payload.mode === "string" ? payload.mode : "cloud",
         api_url: typeof payload.api_url === "string" ? payload.api_url : "",
         api_key: typeof payload.api_key === "string" ? payload.api_key : "",
-        use_saved_key: payload.use_saved_key !== false,
+        use_saved_key: payload.use_saved_key === true,
       }),
     });
     return Response.json(catalog);

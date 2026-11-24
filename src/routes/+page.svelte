@@ -216,6 +216,7 @@
   let llmApiUrlOverride = $state<string | null>(null);
   let llmModelOverride = $state<string | null>(null);
   let llmApiKeyDraft = $state("");
+  let llmClearApiKey = $state(false);
   let llmTesting = $state(false);
   let llmTestStatus = $state<{ ok: boolean; message: string } | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
@@ -416,6 +417,32 @@
         ? "OpenAI-compatible"
         : "Cloud",
   );
+  function normalizedLlmOrigin(raw: string): string | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = new URL(trimmed);
+      const scheme = parsed.protocol.toLowerCase();
+      if (scheme !== "http:" && scheme !== "https:") return null;
+      if (!parsed.hostname || parsed.username || parsed.password) return null;
+      const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      const port = parsed.port || (scheme === "https:" ? "443" : "80");
+      return `${scheme}//${host}:${port}`;
+    } catch {
+      return null;
+    }
+  }
+  const effectiveLlmApiUrl = $derived(
+    llmApiUrl.trim() || (llmMode === "ollama" ? "http://ollama:11434" : ""),
+  );
+  const canReuseSavedLlmKey = $derived.by(() => {
+    if (!llmRerank.api_key_set || llmClearApiKey) return false;
+    const savedMode = (llmRerank.mode ?? "cloud") as LlmRerankMode;
+    if (llmMode !== savedMode) return false;
+    const targetOrigin = normalizedLlmOrigin(effectiveLlmApiUrl);
+    const savedOrigin = normalizedLlmOrigin(llmRerank.api_url ?? "");
+    return Boolean(targetOrigin && targetOrigin === savedOrigin);
+  });
   const filteredLocalLlmModels = $derived.by(() => {
     const q = llmLocalModelSearch.trim().toLowerCase();
     if (!q) return llmLocalModels;
@@ -528,10 +555,10 @@
     llmTestStatus = null;
     try {
       const typedKey = llmApiKeyDraft.trim();
-      const targetUrl =
-        llmApiUrl.trim() || (llmMode === "ollama" ? "http://ollama:11434" : "");
+      const targetUrl = effectiveLlmApiUrl;
+      const reuseSavedKey = !typedKey && canReuseSavedLlmKey;
       let response: Response;
-      if (typedKey) {
+      if (typedKey || reuseSavedKey) {
         response = await fetch("/api/llm/models", {
           method: "POST",
           headers: {
@@ -542,13 +569,12 @@
             mode: llmMode,
             api_url: targetUrl,
             api_key: typedKey,
-            use_saved_key: true,
+            use_saved_key: reuseSavedKey,
           }),
         });
       } else {
         const params = new URLSearchParams({
           mode: llmMode,
-          use_saved_key: "true",
         });
         if (targetUrl) params.set("api_url", targetUrl);
         response = await fetch(`/api/llm/models?${params.toString()}`, {
@@ -585,8 +611,8 @@
     llmTesting = true;
     llmTestStatus = null;
     try {
-      const targetUrl =
-        llmApiUrl.trim() || (llmMode === "ollama" ? "http://ollama:11434" : "");
+      const typedKey = llmApiKeyDraft.trim();
+      const targetUrl = effectiveLlmApiUrl;
       const response = await fetch("/api/llm/test", {
         method: "POST",
         headers: {
@@ -597,8 +623,8 @@
           mode: llmMode,
           api_url: targetUrl,
           model: llmModel.trim(),
-          api_key: llmApiKeyDraft.trim(),
-          use_saved_key: true,
+          api_key: typedKey,
+          use_saved_key: !typedKey && canReuseSavedLlmKey,
         }),
       });
       const body = await response.json();
@@ -1190,6 +1216,7 @@
         llmApiUrlOverride = null;
         llmModelOverride = null;
         llmApiKeyDraft = "";
+        llmClearApiKey = false;
       },
       rollback: () => {
         // Keep form drafts intact so the user can adjust fields on error.
@@ -3749,7 +3776,9 @@
                         llmTestStatus = null;
                       }}
                       placeholder={llmRerank.api_key_set
-                        ? "Already configured · leave blank to keep"
+                        ? canReuseSavedLlmKey
+                          ? "Already configured · leave blank to keep"
+                          : "Mode or endpoint changed · enter a new key or clear saved key"
                         : llmMode === "cloud"
                           ? "sk-…"
                           : "Optional · leave blank for keyless local servers"}
@@ -3758,7 +3787,15 @@
                   {#if llmRerank.api_key_set}
                     <label
                       class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clearApiKey" />
+                      ><input
+                        class="checkbox checkbox-sm"
+                        type="checkbox"
+                        name="clearApiKey"
+                        bind:checked={llmClearApiKey}
+                        onchange={() => {
+                          llmTestStatus = null;
+                        }}
+                      />
                       Clear saved LLM API key</label
                     >
                   {/if}
