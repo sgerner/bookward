@@ -53,7 +53,7 @@ from .security import safe_error_message, validate_public_url, validate_service_
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
 from .ranking import rank_candidates
-from .secrets import seal, unseal
+from .secrets import auth_registry_key, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
     download as librarr_download,
@@ -650,6 +650,7 @@ async def lifespan(app):
         initialize()
         legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
     identity_store.migrate_legacy_api_tokens(legacy_tokens)
+    auth_registry_key()
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -719,6 +720,20 @@ def _api_token_derivation_limiter() -> asyncio.Semaphore:
     return limiter
 
 
+@asynccontextmanager
+async def _acquire_api_token_derivation_slot():
+    limiter = _api_token_derivation_limiter()
+    acquired = False
+    try:
+        async with asyncio.timeout(identity_store.TOKEN_DERIVATION_WAIT_SECONDS):
+            await limiter.acquire()
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            limiter.release()
+
+
 @app.middleware("http")
 async def authenticate_engine_request(request: Request, call_next):
     """Select a profile only from a verified session or profile-owned API token."""
@@ -763,10 +778,19 @@ async def authenticate_engine_request(request: Request, call_next):
         candidate = bearer or api_key
         if (
             identity_store.is_valid_api_token_format(candidate)
-            and not identity_store.has_cached_api_token(candidate)
+            and not await asyncio.to_thread(identity_store.has_cached_api_token, candidate)
         ):
-            async with _api_token_derivation_limiter():
-                token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
+            try:
+                async with _acquire_api_token_derivation_slot():
+                    token = await asyncio.to_thread(
+                        identity_store.authenticate_api_token, candidate
+                    )
+            except TimeoutError:
+                return JSONResponse(
+                    {"detail": "API token verification is busy. Try again shortly."},
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
+                )
         else:
             token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
         if not token:

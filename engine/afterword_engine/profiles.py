@@ -39,6 +39,7 @@ SESSION_ABSOLUTE_DAYS = 7
 AUTH_BUSY_TIMEOUT_MS = 5000
 TOKEN_CACHE_MAX_ENTRIES = 1024
 TOKEN_DERIVATION_CONCURRENCY = max(1, min(2, (os.cpu_count() or 2) // 2))
+TOKEN_DERIVATION_WAIT_SECONDS = 5.0
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
 
@@ -136,23 +137,52 @@ class _AuthConnection(sqlite3.Connection):
 def auth_connect(*, timeout: float = 10):
     path = auth_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    created = False
     if not path.exists():
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
+            created = True
         except FileExistsError:
             pass
     busy_ms = max(1, int(AUTH_BUSY_TIMEOUT_MS))
     connect_timeout = timeout if AUTH_BUSY_TIMEOUT_MS == 5000 else max(0.001, busy_ms / 1000)
     con = sqlite3.connect(path, timeout=connect_timeout, factory=_AuthConnection)
     try:
-        path.chmod(0o600)
+        try:
+            path.chmod(0o600)
+            if _CHMOD_WARNED_IDENTITIES:
+                identity = _registry_file_identity(path)
+                if identity is not None:
+                    with _AUTH_CACHE_LOCK:
+                        _CHMOD_WARNED_IDENTITIES.discard(identity)
+        except OSError as exc:
+            if created:
+                raise
+            identity = _registry_file_identity(path)
+            should_warn = identity is None
+            if identity is not None:
+                with _AUTH_CACHE_LOCK:
+                    if identity not in _CHMOD_WARNED_IDENTITIES:
+                        _CHMOD_WARNED_IDENTITIES.add(identity)
+                        should_warn = True
+            if should_warn:
+                LOGGER.warning(
+                    "Could not restrict permissions on existing auth registry %s: %s",
+                    path,
+                    exc,
+                )
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         con.execute(f"PRAGMA busy_timeout={busy_ms}")
         return con
     except Exception:
         con.close()
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         raise
 
 
@@ -166,8 +196,8 @@ class _CachedTokenDigest:
 
 _AUTH_CACHE_LOCK = threading.Lock()
 _CACHE_REGISTRY_IDENTITY: tuple[str, int, int] | None = None
+_CHMOD_WARNED_IDENTITIES: set[tuple[str, int, int]] = set()
 _VERIFIED_TOKEN_DIGESTS: OrderedDict[str, _CachedTokenDigest] = OrderedDict()
-_TOKEN_DERIVATION_SEMAPHORE = threading.BoundedSemaphore(TOKEN_DERIVATION_CONCURRENCY)
 
 
 def _registry_file_identity(path: Path | None = None) -> tuple[str, int, int] | None:
@@ -243,6 +273,7 @@ def invalidate_auth_caches(
     with _AUTH_CACHE_LOCK:
         if clear_all:
             _VERIFIED_TOKEN_DIGESTS.clear()
+            _CHMOD_WARNED_IDENTITIES.clear()
             _CACHE_REGISTRY_IDENTITY = _registry_file_identity()
             return
         if cache_key is not None:
@@ -788,13 +819,8 @@ def authenticate_api_token(token: str):
                 return None
             current_hash = None
 
-    with _TOKEN_DERIVATION_SEMAPHORE:
-        rechecked = _get_cached_token_digest(cache_key)
-        if rechecked is not None:
-            current_hash = rechecked.token_hash
-        else:
-            current_hash = hash_api_token(token)
-        legacy_hash = legacy_hash_api_token(token)
+    current_hash = hash_api_token(token)
+    legacy_hash = legacy_hash_api_token(token)
 
     with auth_connect() as con:
         found = con.execute(_ACTIVE_TOKEN_QUERY, (current_hash,)).fetchone()

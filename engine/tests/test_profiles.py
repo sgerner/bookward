@@ -1310,8 +1310,9 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
 
 
 def test_auth_registry_key_caches_disk_secret_and_auth_connect_creates_0600_file(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
+    import logging
     import os
     import stat
     from cryptography.fernet import Fernet
@@ -1322,6 +1323,22 @@ def test_auth_registry_key_caches_disk_secret_and_auth_connect_creates_0600_file
     monkeypatch.setattr(settings, "db", str(db_one))
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     engine_secrets.clear_auth_registry_key_cache()
+
+    # Creating a brand-new registry file enforces 0600 and propagates chmod failures.
+    unwritable_chmod_db = tmp_path / "chmod-new-fail" / "afterword.db"
+    with monkeypatch.context() as m:
+        m.setattr(settings, "db", str(unwritable_chmod_db))
+        original_chmod = Path.chmod
+
+        def failing_new_chmod(self: Path, mode: int, *, follow_symlinks: bool = True):
+            if self == profiles.auth_path():
+                raise PermissionError("chmod blocked on new file")
+            return original_chmod(self, mode, follow_symlinks=follow_symlinks)
+
+        m.setattr(Path, "chmod", failing_new_chmod)
+        with pytest.raises(PermissionError, match="chmod blocked on new file"):
+            profiles.auth_connect()
+        assert not profiles.auth_path().exists()
 
     previous_umask = os.umask(0)
     try:
@@ -1341,6 +1358,49 @@ def test_auth_registry_key_caches_disk_secret_and_auth_connect_creates_0600_file
         con.execute("SELECT 1").fetchone()
     assert stat.S_IMODE(registry.stat().st_mode) == 0o600
 
+    # Pre-existing registry files owned by another uid or on bind mounts log a warning
+    # and continue rather than turning every auth request into a 500.
+    profiles.initialize_auth()
+    reader = profiles.create_account("chmod-reader", "chmod-reader-password-long")
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+    reader_session, _ = profiles.create_session(reader["id"])
+    reader_token = profiles.create_profile_api_token(reader["profile_id"], "Chmod token")["token"]
+
+    with monkeypatch.context() as m:
+        original_chmod = Path.chmod
+
+        def failing_existing_chmod(self: Path, mode: int, *, follow_symlinks: bool = True):
+            if self == registry:
+                raise PermissionError("Operation not permitted")
+            return original_chmod(self, mode, follow_symlinks=follow_symlinks)
+
+        m.setattr(Path, "chmod", failing_existing_chmod)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="afterword_engine.profiles"):
+            with profiles.auth_connect() as con:
+                assert con.execute("SELECT 1").fetchone()[0] == 1
+            with TestClient(app) as client:
+                assert (
+                    client.get(
+                        "/api/v1/me", headers={"Authorization": f"Bearer {reader_token}"}
+                    ).status_code
+                    == 200
+                )
+                assert (
+                    client.get(
+                        "/auth/me", headers={"x-bookward-session": reader_session}
+                    ).status_code
+                    == 200
+                )
+        chmod_warnings = [
+            record.message
+            for record in caplog.records
+            if "Could not restrict permissions on existing auth registry" in record.message
+        ]
+        assert len(chmod_warnings) == 1
+
+    engine_secrets.clear_auth_registry_key_cache()
     disk_reads = 0
     original_generated_key = engine_secrets._generated_key
 
@@ -1549,7 +1609,8 @@ def test_http_cached_token_revocation_and_active_account_requirement(
         )
         assert profiles.has_cached_api_token(third["token"]) is False
 
-        # Password updates and resets immediately drop cached token entries.
+        # Password updates and resets immediately drop cached token entries while
+        # personal API tokens survive password rotation (same as main).
         assert (
             client.get(
                 "/api/v1/me",
@@ -1560,8 +1621,13 @@ def test_http_cached_token_revocation_and_active_account_requirement(
         assert profiles.has_cached_api_token(status_token["token"]) is True
         profiles.update_password(reader["id"], "updated-reader-password-long")
         assert profiles.has_cached_api_token(status_token["token"]) is False
-
-        assert profiles.authenticate_api_token(status_token["token"]) is not None
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 200
+        )
         assert profiles.has_cached_api_token(status_token["token"]) is True
         profiles.reset_password(reader["id"], "reset-reader-password-long-enough")
         assert profiles.has_cached_api_token(status_token["token"]) is False
@@ -1748,8 +1814,31 @@ def test_concurrent_api_token_derivations_are_capped_without_blocking_loop_or_se
     assert profiles.authenticate_api_token(cached_bypass_token) is not None
     assert profiles.has_cached_api_token(cached_bypass_token) is True
 
+    assert not hasattr(profiles, "_TOKEN_DERIVATION_SEMAPHORE")
     invalid_tokens = [generate_api_token() for _ in range(8)]
     concurrency_cap = profiles.TOKEN_DERIVATION_CONCURRENCY
+
+    # Verify lifespan primes secret.key at startup and has_cached_api_token runs off the event loop.
+    startup_db = Path(settings.db).parent / "startup-prime" / "afterword.db"
+    with monkeypatch.context() as m:
+        import afterword_engine.secrets as engine_secrets
+
+        m.setattr(settings, "db", str(startup_db))
+        m.delenv("AFTERWORD_SECRET_KEY", raising=False)
+        engine_secrets.clear_auth_registry_key_cache()
+        assert not startup_db.with_name("secret.key").exists()
+        with TestClient(app):
+            assert startup_db.with_name("secret.key").is_file()
+            assert engine_secrets._AUTH_REGISTRY_KEY_CACHE is not None
+
+    original_has_cached = profiles.has_cached_api_token
+    has_cached_threads: list[int] = []
+
+    def tracking_has_cached(token: str | None) -> bool:
+        has_cached_threads.append(threading.get_ident())
+        return original_has_cached(token)
+
+    monkeypatch.setattr(profiles, "has_cached_api_token", tracking_has_cached)
 
     async def exercise_batch(batch: list[str], expected_status: int) -> int:
         active_derivations = 0
@@ -1812,10 +1901,83 @@ def test_concurrent_api_token_derivations_are_capped_without_blocking_loop_or_se
             assert all(item.status_code == expected_status for item in responses)
         return peak_derivations
 
+    async def check_off_loop_and_bounded_timeout() -> None:
+        event_loop_thread_id = threading.get_ident()
+        has_cached_threads.clear()
+
+        slots_filled = Event()
+        release_derivations = Event()
+        filler_lock = threading.Lock()
+        active_fillers = 0
+
+        def blocking_hash_api_token(token: str) -> str:
+            nonlocal active_fillers
+            with filler_lock:
+                active_fillers += 1
+                if active_fillers >= concurrency_cap:
+                    slots_filled.set()
+            try:
+                assert release_derivations.wait(timeout=5)
+                return hash_api_token(token)
+            finally:
+                with filler_lock:
+                    active_fillers -= 1
+
+        monkeypatch.setattr(profiles, "hash_api_token", blocking_hash_api_token)
+        monkeypatch.setattr(profiles, "TOKEN_DERIVATION_WAIT_SECONDS", 0.05)
+
+        fillers = [generate_api_token() for _ in range(concurrency_cap)]
+        overflow_cold = valid_tokens[0]
+        profiles.invalidate_auth_caches(cache_key=profiles._token_cache_key(overflow_cold))
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            held_tasks = [
+                asyncio.create_task(
+                    client.get("/api/v1/me", headers={"Authorization": f"Bearer {bad}"})
+                )
+                for bad in fillers
+            ]
+            try:
+                assert await asyncio.to_thread(slots_filled.wait, 5)
+                # Give all concurrency_cap filler tasks a turn to acquire slots.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+                overflow_res = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {overflow_cold}"},
+                )
+                assert overflow_res.status_code == 503
+                assert overflow_res.headers.get("cache-control") == "no-store"
+                assert "profile_id" not in overflow_res.text
+
+                cached_res = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {cached_bypass_token}"},
+                )
+                assert cached_res.status_code == 200
+            finally:
+                release_derivations.set()
+
+            held_responses = await asyncio.gather(*held_tasks)
+            assert all(res.status_code == 401 for res in held_responses)
+
+            # Semaphore permits were cleanly preserved after timeout: cold valid token now succeeds.
+            recovered_res = await client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {overflow_cold}"},
+            )
+            assert recovered_res.status_code == 200
+
+        assert has_cached_threads
+        assert all(tid != event_loop_thread_id for tid in has_cached_threads)
+
     assert asyncio.run(exercise_batch(valid_tokens, 200)) <= concurrency_cap
     assert asyncio.run(exercise_batch(invalid_tokens, 401)) <= concurrency_cap
     for bad in invalid_tokens:
         assert profiles.has_cached_api_token(bad) is False
+    asyncio.run(check_off_loop_and_bounded_timeout())
 
 
 def test_locked_auth_registry_fails_closed_for_cached_and_uncached_requests(
