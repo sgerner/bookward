@@ -661,4 +661,166 @@ describe('authentication boundary', () => {
 			body: { message: expect.stringContaining('10 MB') }
 		});
 	});
+
+	it('allows POST /auth/logout to clear bookward_session and redirect 303 during an engine outage', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed: ECONNREFUSED')));
+
+		const headerCases: Array<Record<string, string>> = [
+			{
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			{
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			}
+		];
+		for (const headers of headerCases) {
+			const event = eventFor(
+				new Request('http://afterword.test/auth/logout', {
+					method: 'POST',
+					headers,
+					body: new URLSearchParams({ __profile_id: 'alice-profile' })
+				}),
+				'valid-session'
+			) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+			const resolve = vi.fn();
+
+			await expect(handle({ event: event as never, resolve } as never)).rejects.toMatchObject({
+				status: 303,
+				location: '/login?manual=1'
+			});
+			expect(event.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+				httpOnly: true,
+				secure: false,
+				sameSite: 'lax',
+				path: '/'
+			});
+			expect(resolve).not.toHaveBeenCalled();
+		}
+
+		vi.stubEnv('ORIGIN', '');
+		const httpsEvent = eventFor(
+			new Request('https://books.example.com/auth/logout', {
+				method: 'POST',
+				headers: {
+					origin: 'https://books.example.com',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		await expect(handle({ event: httpsEvent as never, resolve: vi.fn() } as never)).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
+		});
+		expect(httpsEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/'
+		});
+	});
+
+	it('returns JSON 401 for unauthenticated or expired enhanced SvelteKit actions outside /auth/* while redirecting native posts and /auth/logout', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+
+		const noSessionAction = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		const noSessionResponse = await handle({
+			event: eventFor(noSessionAction),
+			resolve: vi.fn()
+		} as never);
+		expect(noSessionResponse.status).toBe(401);
+		await expect(noSessionResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ detail: 'Session expired' }), {
+					status: 401,
+					headers: { 'content-type': 'application/json' }
+				})
+			)
+		);
+		const expiredEvent = eventFor(
+			new Request('http://afterword.test/?/decide', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile', id: '7', status: 'saved' })
+			}),
+			'expired-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const expiredResponse = await handle({
+			event: expiredEvent as never,
+			resolve: vi.fn()
+		} as never);
+		expect(expiredResponse.status).toBe(401);
+		expect(expiredEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/'
+		});
+		await expect(expiredResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		const nativePost = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		await expect(
+			handle({ event: eventFor(nativePost), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: `/login?next=${encodeURIComponent('/?/decide')}`
+		});
+
+		const logoutWithoutSession = new Request('http://afterword.test/auth/logout', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams()
+		});
+		await expect(
+			handle({ event: eventFor(logoutWithoutSession), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
+		});
+	});
 });

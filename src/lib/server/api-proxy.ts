@@ -1,5 +1,6 @@
 const env = process.env;
 import type { RequestEvent } from "@sveltejs/kit";
+import { sanitizeEngineMessage } from "#lib/server/engine.js";
 
 const engineBase = (env.ENGINE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 const forwardedHeaders = [
@@ -83,6 +84,60 @@ export async function proxyApi(event: RequestEvent) {
   }
 
   const responseHeaders = corsHeaders(event.request, methods);
+  if (!upstream.ok) {
+    for (const name of ["etag", "location", "www-authenticate"]) {
+      const value = upstream.headers.get(name);
+      if (value) responseHeaders.set(name, value);
+    }
+    responseHeaders.set("content-type", "application/json");
+    responseHeaders.set("cache-control", "no-store");
+    if (event.request.method === "HEAD") {
+      await upstream.body?.cancel().catch(() => {});
+      return new Response(null, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: responseHeaders,
+      });
+    }
+    const rawBody = await upstream.text().catch(() => "");
+    let rawDetail: unknown = rawBody || undefined;
+    if (rawBody.trim()) {
+      try {
+        const parsed = JSON.parse(rawBody) as unknown;
+        rawDetail =
+          parsed && typeof parsed === "object" && "detail" in parsed
+            ? (parsed as { detail?: unknown }).detail
+            : parsed;
+      } catch {
+        rawDetail = rawBody;
+      }
+    }
+    const sanitizedDetail =
+      upstream.status < 500 &&
+      Array.isArray(rawDetail) &&
+      rawDetail.every((item) => Boolean(item && typeof item === "object"))
+        ? rawDetail.map((item) => {
+            const entry = item as { type?: unknown; loc?: unknown; msg?: unknown };
+            return {
+              ...(typeof entry.type === "string" ? { type: entry.type } : {}),
+              ...(Array.isArray(entry.loc)
+                ? {
+                    loc: entry.loc.filter(
+                      (part): part is string | number =>
+                        typeof part === "string" || typeof part === "number",
+                    ),
+                  }
+                : {}),
+              msg: sanitizeEngineMessage(entry.msg, upstream.status),
+            };
+          })
+        : sanitizeEngineMessage(rawDetail, upstream.status);
+    return new Response(JSON.stringify({ detail: sanitizedDetail }), {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: responseHeaders,
+    });
+  }
   for (const name of ["cache-control", "content-type", "etag", "location", "www-authenticate"]) {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);

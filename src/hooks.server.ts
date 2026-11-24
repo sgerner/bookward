@@ -139,6 +139,14 @@ function isUnhydratedFormPost(request: Request, path: string) {
 	return accept.includes('text/html') && !accept.startsWith('application/json');
 }
 
+/**
+ * Enhanced SvelteKit form actions (`x-sveltekit-action: true`) outside `/auth/*`
+ * intentionally receive a JSON 401 (`{ detail, message }`) instead of an HTML
+ * 303 redirect to `/login` when the session is missing or expired. That lets
+ * `use:enhance` / `fetch` surface an explicit authentication error rather than
+ * following a cross-route login HTML response, while native unhydrated form
+ * posts and `/auth/logout` continue to redirect with HTTP 303.
+ */
 function wantsJsonAuthError(request: Request, path: string) {
 	return path.startsWith('/api/') || (request.headers.get('x-sveltekit-action') === 'true' && !path.startsWith('/auth/'));
 }
@@ -223,6 +231,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 
 	if (!session && path !== '/login' && !callback) {
+		// Enhanced SvelteKit actions outside `/auth/*` get JSON 401; native form posts redirect.
 		if (wantsJsonAuthError(event.request, path)) return jsonError(401, AUTH_REQUIRED_DETAIL);
 		if (path === '/auth/logout') throw redirect(303, '/login?manual=1');
 		const next = `${event.url.pathname}${event.url.search}`;
@@ -235,12 +244,17 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (lookup.status === 'unauthenticated') {
 		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		if (callback) return withSecurityHeaders(await resolve(event));
+		// Enhanced SvelteKit actions outside `/auth/*` get JSON 401; native form posts redirect.
 		if (wantsJsonAuthError(event.request, path)) return jsonError(401, AUTH_REQUIRED_DETAIL);
 		if (path === '/auth/logout') throw redirect(303, '/login?manual=1');
 		throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
 	}
 	if (lookup.status === 'unavailable') {
 		if (path.startsWith('/api/') || mutation) {
+			if (path === '/auth/logout') {
+				event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
+				throw redirect(303, '/login?manual=1');
+			}
 			return jsonError(503, ENGINE_UNAVAILABLE_MESSAGE);
 		}
 		if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
