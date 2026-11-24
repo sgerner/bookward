@@ -35,7 +35,7 @@ from .identity import (
     read_metadata_identity_hash,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
-from .security import resolve_public_target
+from .security import redact_url, resolve_public_target, sanitize_pinned_error_message
 from .subjects import normalize_subjects
 
 GOODREADS_TIP_RE = re.compile(
@@ -853,7 +853,8 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
     pinned = original.copy_with(host=address)
     default_port = 443 if original.scheme == "https" else 80
     host_header = hostname if original.port in (None, default_port) else f"{hostname}:{original.port}"
-    public_request = client.build_request(method, original, params=params)
+    unpinned_url = client.build_request(method, original, params=params).url
+    public_request = client.build_request(method, redact_url(unpinned_url))
     try:
         response = await client.request(
             method,
@@ -863,17 +864,17 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
             extensions={"sni_hostname": hostname},
         )
     except httpx.RequestError as exc:
-        sanitized = (
-            str(exc)
-            .replace(f"[{address}]", hostname)
-            .replace(address, hostname)
+        sanitized = sanitize_pinned_error_message(
+            exc,
+            address=address,
+            hostname=hostname,
         )
         try:
             rewritten = type(exc)(sanitized, request=public_request)
         except TypeError:
             rewritten = httpx.RequestError(sanitized, request=public_request)
         raise rewritten from None
-    response._request = public_request
+    response.request = public_request
     return response
 
 
@@ -1187,8 +1188,6 @@ def _read_metadata_attempt_is_due(read, retry_before):
     traces = attempt.get("fetch_trace", []) if isinstance(attempt, dict) else []
     transient_statuses = {
         "request_error",
-        "http_error",
-        "credential_error",
         "rate_limited",
         "server_error",
         "timeout",
@@ -1653,8 +1652,6 @@ async def refresh_read_metadata(
                         and trace.get("status")
                         in {
                             "request_error",
-                            "http_error",
-                            "credential_error",
                             "rate_limited",
                             "server_error",
                             "timeout",
@@ -3096,9 +3093,7 @@ def _persist_metadata_field_provenance(
 _TRANSIENT_METADATA_TRACE_STATUSES = frozenset(
     {
         "rate_limited",
-        "credential_error",
         "server_error",
-        "http_error",
         "request_error",
         "timeout",
         "provider_unavailable",
@@ -3106,24 +3101,57 @@ _TRANSIENT_METADATA_TRACE_STATUSES = frozenset(
 )
 
 
-def _candidate_metadata_failure_is_transient(item: dict) -> bool:
+def _trace_failure_is_transient(trace: dict) -> bool:
+    status = trace.get("status")
+    if status in _TRANSIENT_METADATA_TRACE_STATUSES:
+        return True
+    if status in {"credential_error", "http_error"}:
+        return False
+    http_status = trace.get("http_status")
+    return isinstance(http_status, int) and (
+        http_status in {408, 429} or http_status >= 500
+    )
+
+
+def _candidate_metadata_retry_status(item: dict) -> str:
     provenance = item.get("_metadata_provenance")
     if not isinstance(provenance, dict):
-        return False
+        return ""
     traces = provenance.get("fetch_trace")
     if not isinstance(traces, list):
-        return False
+        return ""
+    has_transient = False
+    has_google_transient = False
+    has_google_credential_error = False
     for trace in traces:
         if not isinstance(trace, dict):
             continue
-        if trace.get("status") in _TRANSIENT_METADATA_TRACE_STATUSES:
-            return True
+        is_google = trace.get("provider") == "google_books"
+        if _trace_failure_is_transient(trace):
+            has_transient = True
+            if is_google:
+                has_google_transient = True
+            continue
         http_status = trace.get("http_status")
-        if isinstance(http_status, int) and (
-            http_status in {400, 401, 403, 429} or http_status >= 500
+        if is_google and (
+            trace.get("status") == "credential_error"
+            or (isinstance(http_status, int) and http_status in {400, 401, 403})
         ):
-            return True
-    return False
+            has_google_credential_error = True
+    if has_google_transient:
+        return "google_books_transient"
+    if has_transient:
+        return "transient"
+    if has_google_credential_error:
+        return "google_books_error"
+    return ""
+
+
+def _candidate_metadata_failure_is_transient(item: dict) -> bool:
+    return _candidate_metadata_retry_status(item) in {
+        "transient",
+        "google_books_transient",
+    }
 
 
 def candidate_metadata_refresh_remaining(
@@ -3163,7 +3191,7 @@ def candidate_metadata_refresh_remaining(
             q.metadata_version!=?
             OR q.metadata_checked_at IS NULL
             OR q.metadata_checked_at<=CASE
-              WHEN q.metadata_retry_status='transient' THEN ?
+              WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ?
               WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%'
                 OR c.cover_url LIKE 'https://placehold.co/%'
               THEN ? ELSE ? END
@@ -3203,7 +3231,7 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
         "OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0) "
         "AND (q.metadata_version!=? OR q.metadata_checked_at IS NULL OR "
         "q.metadata_checked_at<=CASE "
-        "WHEN q.metadata_retry_status='transient' THEN ? "
+        "WHEN q.metadata_retry_status IN ('transient','google_books_transient') THEN ? "
         "WHEN c.cover_url='' OR c.cover_url LIKE '%/b/isbn/%' "
         "OR c.cover_url LIKE 'https://placehold.co/%' THEN ? ELSE ? END) "
         "ORDER BY CASE WHEN q.metadata_version!=? THEN 0 ELSE 1 END,"
@@ -3347,9 +3375,7 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
                 or not genres
             )
             metadata_retry_status = (
-                "transient"
-                if still_sparse and _candidate_metadata_failure_is_transient(item)
-                else ""
+                _candidate_metadata_retry_status(item) if still_sparse else ""
             )
             con.execute(
                 """UPDATE candidate_quality SET metadata_checked_at=?,metadata_version=?,

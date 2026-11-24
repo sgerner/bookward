@@ -654,6 +654,56 @@ describe("page actions", () => {
     expect(permanentResult).toEqual({
       message: "Source changed to a permanent feed; a fresh scan is queued.",
     });
+
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 4, raw_count: 4 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 7, enabled: 0, job_id: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ id: 7, enabled: 0, lifecycle: "permanent", job_id: null }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+
+    const disabledSaveForm = new FormData();
+    disabledSaveForm.set("id", "7");
+    disabledSaveForm.set("url", "https://books.example/disabled-feed");
+    disabledSaveForm.set("currentUrl", "https://books.example/new-feed");
+    disabledSaveForm.set("intent", "save");
+    const disabledSaveResult = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: disabledSaveForm,
+      }),
+    } as never);
+    expect(disabledSaveResult).toEqual({
+      message: "Source updated (4 books matched).",
+    });
+
+    const disabledPermanentForm = new FormData();
+    disabledPermanentForm.set("id", "7");
+    const disabledPermanentResult = await actions.switchSourceToPermanent!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: disabledPermanentForm,
+      }),
+    } as never);
+    expect(disabledPermanentResult).toEqual({
+      message: "Source changed to a permanent feed.",
+    });
   });
 
   it("validates Google Books key updates and reports queued metadata refreshes", async () => {
@@ -672,6 +722,21 @@ describe("page actions", () => {
           JSON.stringify({
             saved: true,
             google_books_api_key_set: true,
+            validation_status: "deferred",
+            validation_warning:
+              "Google Books was temporarily unreachable; key saved without live verification.",
+            job_ids: { metadata: 10, read_metadata: 11 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            saved: true,
+            google_books_api_key_set: true,
+            validation_status: "verified",
+            validation_warning: "",
             job_ids: { metadata: 11, read_metadata: 12 },
           }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -689,6 +754,19 @@ describe("page actions", () => {
     } as never)) as { status: number; data: { message: string } };
     expect(rejected.status).toBe(400);
     expect(rejected.data.message).toContain("Google Books rejected the API key");
+
+    const deferredForm = new FormData();
+    deferredForm.set("apiKey", "deferred-google-key");
+    const deferred = await actions.configureGoogleBooks!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: deferredForm,
+      }),
+    } as never);
+    expect(deferred).toEqual({
+      message:
+        "Google Books was temporarily unreachable; key saved without live verification. Metadata refresh queued.",
+    });
 
     const goodForm = new FormData();
     goodForm.set("apiKey", "valid-google-key");

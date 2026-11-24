@@ -578,7 +578,7 @@ async def handle_job(kind: str):
             return {"skipped": "managed_by_association_provider", "source_id": source_id}
         if not source["enabled"]:
             return {"skipped": "disabled", "source_id": source_id}
-        if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
+        if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
@@ -610,7 +610,10 @@ async def handle_job(kind: str):
             sources = rows(
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
-                "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
+                "AND (lifecycle='permanent' OR ("
+                "lifecycle='one_time' AND last_scanned_at IS NULL "
+                "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
+                "))"
             )
         for source in sources:
             try:
@@ -2500,7 +2503,8 @@ def toggle_source(source_id:int):
         became_enabled = not source["enabled"]
         con.execute(
             "UPDATE sources SET enabled=1-enabled, "
-            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
+            "last_attempted_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_attempted_at END "
             "WHERE id=?",
             (source_id,),
         )
@@ -2550,6 +2554,16 @@ def update_nyt_settings(payload: NYTApiKeyIn):
     return {"saved": True, "api_key_set": bool(api_key)}
 
 
+def _one_time_source_completed(source) -> bool:
+    return bool(
+        source["last_scanned_at"]
+        or (
+            source["last_attempted_at"]
+            and str(source["last_status"] or "") in {"empty:0", "filtered:0"}
+        )
+    )
+
+
 def _clear_google_books_metadata_lockouts(con) -> bool:
     con.execute(
         """UPDATE candidate_quality
@@ -2557,28 +2571,24 @@ def _clear_google_books_metadata_lockouts(con) -> bool:
             metadata_retry_status='',
             updated_at=CURRENT_TIMESTAMP
         WHERE metadata_checked_at IS NOT NULL
-          AND (
-            metadata_retry_status!=''
-            OR candidate_id IN (
-              SELECT id FROM candidates
-              WHERE status!='rejected'
-                AND (
-                  cover_url='' OR cover_url LIKE '%/b/isbn/%'
-                  OR cover_url LIKE 'https://placehold.co/%'
-                  OR description='' OR release_date IS NULL
-                  OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0
-                )
-            )
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
           )"""
     )
     requeued = con.execute(
         """UPDATE candidate_quality
         SET quality_status='pending',
+            metadata_retry_status='',
             updated_at=CURRENT_TIMESTAMP
         WHERE quality_status='quarantine'
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
           AND (
             flags_json LIKE '%catalog_provider_unavailable%'
             OR flags_json LIKE '%catalog_provider_rate_limited%'
+          )
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
           )"""
     ).rowcount
     con.execute(
@@ -2591,6 +2601,36 @@ def _clear_google_books_metadata_lockouts(con) -> bool:
             OR cover_url LIKE 'https://placehold.co/%'
             OR release_date=''
             OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.last_attempt.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.last_attempt.fetch_trace')
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.fetch_trace')
+                ELSE '[]'
+              END
+            )
+            WHERE json_extract(value, '$.provider')='google_books'
+              AND (
+                json_extract(value, '$.status') IN (
+                  'credential_error',
+                  'rate_limited',
+                  'server_error',
+                  'request_error',
+                  'timeout',
+                  'provider_unavailable'
+                )
+                OR json_extract(value, '$.http_status') IN (400, 401, 403, 408, 429)
+                OR (
+                  json_type(value, '$.http_status')='integer'
+                  AND json_extract(value, '$.http_status')>=500
+                )
+              )
           )"""
     )
     return bool(requeued)
@@ -2610,6 +2650,7 @@ def _queue_google_books_metadata_recovery(*, requeued_quality: bool) -> dict[str
 async def update_google_books_settings(payload: GoogleBooksKeyIn):
     current = private_settings().get("association_google_books_api_key", "")
     submitted_new_key = False
+    validation: dict[str, str] | None = None
     if payload.clear:
         api_key = ""
     elif payload.api_key is None or not payload.api_key.strip():
@@ -2618,7 +2659,7 @@ async def update_google_books_settings(payload: GoogleBooksKeyIn):
         api_key = payload.api_key.strip()
         submitted_new_key = True
         try:
-            await validate_google_books_api_key(api_key)
+            validation = await validate_google_books_api_key(api_key)
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     stored = seal(api_key) if api_key else ""
@@ -2641,6 +2682,18 @@ async def update_google_books_settings(payload: GoogleBooksKeyIn):
         "saved": True,
         "google_books_api_key_set": bool(api_key),
         **({"job_ids": job_ids} if job_ids else {}),
+        **(
+            {
+                "validation_status": validation["status"],
+                **(
+                    {"validation_warning": validation["warning"]}
+                    if validation.get("warning")
+                    else {}
+                ),
+            }
+            if validation
+            else {}
+        ),
     }
 
 
@@ -2774,7 +2827,7 @@ def update_source(source_id: int, payload: SourceUpdateIn):
     values = []
     with transaction() as con:
         source = con.execute(
-            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_scanned_at "
+            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
             "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
@@ -2822,7 +2875,7 @@ def update_source(source_id: int, payload: SourceUpdateIn):
             effective_lifecycle == "one_time"
             and next_url is None
             and payload.filters is None
-            and source["last_scanned_at"]
+            and _one_time_source_completed(source)
         )
     )
     job_id = (
@@ -3021,9 +3074,12 @@ async def update_association_settings(payload: AssociationSettingsIn):
     }
     if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
         raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    google_validation: dict[str, str] | None = None
     if submitted_new_google_key:
         try:
-            await validate_google_books_api_key(values["association_google_books_api_key"])
+            google_validation = await validate_google_books_api_key(
+                values["association_google_books_api_key"]
+            )
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     requeued_quality = False
@@ -3040,7 +3096,15 @@ async def update_association_settings(payload: AssociationSettingsIn):
             requeued_quality = _clear_google_books_metadata_lockouts(con)
     if submitted_new_google_key:
         _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
-    return {"saved": True, "associations": safe_association_settings()}
+    return {
+        "saved": True,
+        "associations": safe_association_settings(),
+        **(
+            {"google_books_validation_warning": google_validation["warning"]}
+            if google_validation and google_validation.get("warning")
+            else {}
+        ),
+    }
 
 
 def _association_provider_name(value: str) -> str:

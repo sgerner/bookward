@@ -557,29 +557,35 @@ export const actions: Actions = {
       if (submittedUrlRaw && (!currentUrlRaw || submittedUrlRaw !== currentUrlRaw)) {
         updatePayload.url = targetUrl;
       }
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify(updatePayload),
-      });
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify(updatePayload),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
       if (updatePayload.url) {
         return {
           message:
             previewCount === null
-              ? "Source URL and filters updated; a fresh scan is queued."
-              : `Source updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched); a fresh scan is queued.`,
+              ? `Source URL and filters updated${scanSuffix}`
+              : `Source updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
         };
       }
       if (previewCount === 0) {
         return {
-          message:
-            "Zero-match source filters confirmed and saved; a fresh scan is queued.",
+          message: `Zero-match source filters confirmed and saved${scanSuffix}`,
         };
       }
       return {
         message:
           previewCount === null
-            ? "Source filters updated; a fresh scan is queued."
-            : `Source filters updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched); a fresh scan is queued.`,
+            ? `Source filters updated${scanSuffix}`
+            : `Source filters updated (${previewCount} book${previewCount === 1 ? "" : "s"} matched)${scanSuffix}`,
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
@@ -602,11 +608,18 @@ export const actions: Actions = {
     const id = idSchema.safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
     try {
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify({ lifecycle: "permanent" }),
-      });
-      return { message: "Source changed to a permanent feed; a fresh scan is queued." };
+      const updated = await engine<{ job_id?: string | number | null }>(
+        `/api/sources/${id.data}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ lifecycle: "permanent" }),
+        },
+      );
+      const scanSuffix =
+        !("job_id" in updated) || Boolean(updated.job_id)
+          ? "; a fresh scan is queued."
+          : ".";
+      return { message: `Source changed to a permanent feed${scanSuffix}` };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -834,7 +847,9 @@ export const actions: Actions = {
       const result = await engine<{
         saved: boolean;
         google_books_api_key_set: boolean;
-        job_ids?: Record<string, number | null>;
+        job_ids?: Record<string, string | number | null>;
+        validation_status?: "verified" | "deferred";
+        validation_warning?: string;
       }>("/api/settings/google-books", {
         method: "PUT",
         body: JSON.stringify({
@@ -845,12 +860,21 @@ export const actions: Actions = {
       if (!clear && !apiKey && !result.google_books_api_key_set) {
         return fail(400, { message: "Enter a Google Books API key." });
       }
+      if (clear) {
+        return { message: "Google Books API key cleared." };
+      }
+      if (!apiKey) {
+        return { message: "Existing Google Books API key kept." };
+      }
+      if (result.validation_status === "deferred") {
+        return {
+          message: result.validation_warning
+            ? `${result.validation_warning} Metadata refresh queued.`
+            : "Google Books API key saved (live verification deferred); metadata refresh queued.",
+        };
+      }
       return {
-        message: clear
-          ? "Google Books API key cleared."
-          : apiKey
-            ? "Google Books API key verified and saved; metadata refresh queued."
-            : "Existing Google Books API key kept.",
+        message: "Google Books API key verified and saved; metadata refresh queued.",
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });

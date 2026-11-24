@@ -2693,7 +2693,7 @@
                                     value="save"
                                     disabled={isPending(`source-filters-${source.id}`)}
                                     aria-busy={isPending(`source-filters-${source.id}`)}
-                                  >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} {source.kind !== "association" && source.kind !== "builtin" ? "Save & rescan" : "Save filters"}</button>
+                                  >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} {source.kind !== "association" && source.kind !== "builtin" ? (source.enabled ? "Save & rescan" : "Save URL & filters") : "Save filters"}</button>
                                 </div>
                               </form>
                             </details>

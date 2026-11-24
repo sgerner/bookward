@@ -97,6 +97,8 @@ def _classify_catalog_http_error(response: httpx.Response) -> str:
         return "credential_error"
     if status_code in {400, 401}:
         return "credential_error"
+    if status_code == 408:
+        return "timeout"
     if status_code >= 500:
         return "server_error"
     return "http_error"
@@ -1310,8 +1312,8 @@ def fallback_cover_url(title: str, author: str, supplied: object = "", source_ur
 async def validate_google_books_api_key(
     api_key: str,
     client: httpx.AsyncClient | None = None,
-) -> None:
-    """Verify a non-empty Google Books API key with a minimal live search probe."""
+) -> dict[str, str]:
+    """Verify a non-empty Google Books API key without blocking on transient outages."""
 
     key = str(api_key or "").strip()
     if not key:
@@ -1329,9 +1331,10 @@ async def validate_google_books_api_key(
         else:
             response = await client.get(GOOGLE_BOOKS_SEARCH, params=params)
     except httpx.HTTPError as exc:
-        raise ValueError(
-            f"Could not reach Google Books to validate the API key: {_scrub(exc)}"
-        ) from exc
+        return {
+            "status": "deferred",
+            "warning": f"Could not reach Google Books right now ({_scrub(exc)}); key saved for later use.",
+        }
 
     try:
         payload = response.json()
@@ -1342,22 +1345,26 @@ async def validate_google_books_api_key(
     if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
         detail = _scrub(payload["error"].get("message") or "").strip()
 
-    if response.status_code in {400, 401, 403}:
-        suffix = f": {detail}" if detail else "."
+    error_kind = _classify_catalog_http_error(response) if response.is_error else ""
+    if error_kind == "credential_error":
         raise ValueError(
-            f"Google Books rejected the API key (HTTP {response.status_code}{suffix})"
+            f"Google Books rejected the API key (HTTP {response.status_code})."
             if not detail
             else f"Google Books rejected the API key (HTTP {response.status_code}: {detail})"
         )
-    if response.status_code == 429:
-        raise ValueError(
-            "Google Books rate-limited the validation check (HTTP 429). Check project quota or try again shortly."
-        )
+    if error_kind == "rate_limited":
+        return {
+            "status": "deferred",
+            "warning": f"Google Books rate-limited live verification (HTTP {response.status_code}); key saved.",
+        }
     if response.is_error:
-        raise ValueError(
-            f"Google Books could not validate the API key (HTTP {response.status_code})."
-        )
+        return {
+            "status": "deferred",
+            "warning": f"Google Books returned HTTP {response.status_code} during live verification; key saved.",
+        }
     if not isinstance(payload, dict) or "error" in payload:
-        raise ValueError(
-            "Google Books returned an unexpected response while validating the API key."
-        )
+        return {
+            "status": "deferred",
+            "warning": "Google Books returned an unexpected verification response; key saved.",
+        }
+    return {"status": "verified", "warning": ""}
