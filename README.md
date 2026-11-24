@@ -39,9 +39,9 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 ## Why Bookward?
 
-- **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads credentials. The default Docker binding is localhost.
+- **Your data stays with you.** Bookward is self-hosted, uses SQLite, and does not ask for Goodreads or StoryGraph credentials. The default Docker binding is localhost.
 - **Recommendations are explainable.** Each book includes a match score, source, and plain-language reasons instead of an unexplained ranking.
-- **You control the inputs.** Import your Goodreads history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
+- **You control the inputs.** Import your Goodreads or The StoryGraph history, keep or disable the bundled upcoming-book sample, and add public lists from publishers, booksellers, newsletters, or other trusted sources.
 - **Discovery stays focused.** Shortlist recommendations, mark books Read to add them to your history, or find them in Librarr. Bookward does not track reading progress.
 - **Automation is optional and gentle.** Scheduled source refreshes and weekly Discord or email digests are off until you choose them. Delivery is recorded and retryable.
 - **It is comfortable to use.** The responsive interface includes keyboard-friendly controls, a skip-to-content link, accessible labels, light/dark/system modes, and reduced-motion support.
@@ -50,7 +50,7 @@ Choose the feeds that shape your recommendations. A permanent source can refresh
 
 ### For readers
 
-- Import a complete Goodreads CSV export (up to 10 MB or 20,000 books), including ratings and read dates.
+- Import a complete Goodreads or The StoryGraph CSV export (up to 10 MB or 20,000 books), including fractional ratings and read dates.
 - Refresh recent Goodreads reads through a public read-shelf RSS feed.
 - Combine reading history with author, subject, and text-similarity signals.
 - Review recommendations in Discover, then shortlist, pass, or set one aside for later. Undo a recent choice, or revisit passed and deferred books from Past decisions. Mark a shortlisted book Read to add it to your history, with an optional rating.
@@ -96,7 +96,7 @@ curl https://your-bookward-host.example/api/v1/recommendations \
 The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
 
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
-- `GET /api/v1/recommendations` — filter with `status=recommended|saved|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
 - `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, `maybe_later`, or `restore`. Only `reject` is a negative learning signal; `maybe_later` is neutral.
 - `POST /api/v1/recommendations/{id}/undo` — send `{"decision_id":123}` from a recent feedback response to undo the latest choice.
 - `GET /api/v1/sources` — list configured sources.
@@ -111,7 +111,7 @@ Keep the engine port private; the versioned web proxy is the intended external A
 
 Bookward ranks books that it can find through your enabled sources; it does not invent titles or search every book in print. The ranking process is:
 
-1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads CSV and RSS imports describe what you have read and how you rated it.
+1. **Build a candidate pool.** The bundled demo list, public feeds, and one-time imports provide books to consider. Goodreads and StoryGraph CSV exports and Goodreads RSS imports describe what you have read and how you rated it.
 2. **Fill in available details.** The engine checks catalog sources for descriptions, subjects, publication dates, and covers. It prefers a synopsis over an opening sentence, checks returned identifiers, and combines useful fields from verified records. Rated reads with valid ISBNs also receive a separate metadata cache. It removes books it recognizes as already read or already shortlisted from the recommendation feed.
 3. **Compare book text.** The engine turns each book's title, author, description, and available subjects into a numeric representation called an *embedding*. For the default local provider, similar representations mainly reflect shared words and two-word phrases. Optional model-based providers can also match related wording. Read documents retain their existing title/author, stored genres and description template; the separate enriched-read metadata cache is not injected into those documents. Candidate documents use their available description and up to eight normalized subjects. Representations are cached and refreshed when source text changes.
    Before reuse, the engine also checks that a matching cache entry decodes to its declared, finite float32 vector shape. Each scoring pass carries the validated read-vector dimension into its separate candidate-vector lookup, so cached or newly generated candidates with a different dimension are rejected before cache writes. Forced rebuilds apply the same cross-set check before replacing the active vectors.
@@ -153,7 +153,7 @@ The default hashing provider runs on the Bookward engine host. If you choose a r
 ## How the app fits together
 
 ~~~
-Goodreads CSV / RSS + trusted public lists
+Goodreads / StoryGraph CSV / RSS + trusted public lists
                     |
                     v
           FastAPI engine + SQLite
@@ -189,7 +189,7 @@ git clone https://github.com/sgerner/bookward.git
 cd bookward
 
 npm ci
-uv sync --project engine --extra dev --frozen
+uv sync --project engine --extra dev --locked
 ~~~
 
 `.npmrc` blocks npm install scripts during `npm ci`, so `.svelte-kit` types are synced when you run `npm run dev`, `npm run check`, or `npm run build`.
@@ -229,7 +229,7 @@ On a new install, open `/login` and choose a username and password for the first
 
 ### 4. Make it yours
 
-1. Open **Settings** and import a full Goodreads CSV export. RSS is useful for incremental refreshes, but a CSV export is the way to bring in your complete history.
+1. Open **Settings** and import a full Goodreads or StoryGraph CSV export. RSS is useful for incremental Goodreads refreshes, but a CSV export is the way to bring in your complete history.
 2. Open **Sources** and keep only the public lists you trust. Add your own permanent feeds or one-time imports when you find a good list.
 3. Review the explanation on each recommendation, then shortlist the books you want to keep.
 4. Optionally connect Librarr under **Settings** and choose ebook or audiobook as the default waitlist format.
@@ -296,7 +296,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `ORIGIN` | Canonical browser origin embedded in the web build. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
-| `BODY_SIZE_LIMIT` | Maximum HTTP request body accepted by the Node web server; defaults to `12M` so Goodreads CSV exports up to 10 MB (20,000 books) can upload. |
+| `BODY_SIZE_LIMIT` | Maximum HTTP request body accepted by the Node web server; defaults to `12M` so Goodreads or StoryGraph CSV exports up to 10 MB (20,000 books) can upload. |
 | `AFTERWORD_AUTH_USERNAME` / `AFTERWORD_AUTH_PASSWORD` | Optional one-time bootstrap credentials for the first administrator, or compatibility migration from existing Basic authentication. |
 | `ENGINE_SERVICE_SECRET` | Private credential shared by the web and engine containers. |
 | `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | Optional OpenID Connect provider configuration. |
@@ -326,9 +326,7 @@ npm test
 npm run build
 
 # Engine
-uv sync --project engine --extra dev --frozen
-uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
-uv export --project engine --locked --only-group build --format requirements.txt --no-annotate --no-header | diff -u engine/build-requirements.lock -
+uv sync --project engine --extra dev --locked
 uv run --project engine python -c 'import pathlib, tomllib; d = tomllib.loads(pathlib.Path("engine/pyproject.toml").read_text(encoding="utf-8")); req, grp = d["build-system"]["requires"], d["dependency-groups"]["build"]; assert req == grp, f"build-system.requires ({req}) != dependency-groups.build ({grp})"'
 uv run --project engine pytest -q engine/tests
 uv run --project engine python -m compileall -q engine/afterword_engine
@@ -336,11 +334,15 @@ uv run --project engine python -m compileall -q engine/afterword_engine
 # First-run web/engine integration, with isolated temporary data (requires the web build)
 uv run --project engine python scripts/community_smoke.py
 
-# Container smoke build
-docker compose build
+# Optional container validation and disposable container smoke check
+docker compose --profile ollama -f compose.yaml config --quiet
+docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
+ORIGIN=http://127.0.0.1:3000 docker compose -p bookward-smoke up --build -d
+BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
+docker compose -p bookward-smoke down -v
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
 
 ## Contributing
 
@@ -384,11 +386,11 @@ The UI intentionally shows a retryable 503 page when the engine is unavailable. 
 
 The default local embedder is intentionally small and predictable. FastEmbed, Ollama, and remote providers may download a model or take longer during their first indexing pass. Check **Settings** and the engine terminal for progress.
 
-### Goodreads import is incomplete
+### CSV or Goodreads import is incomplete
 
-Use the full Goodreads CSV export for historical data. The RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
+Use a full Goodreads or StoryGraph CSV export for historical data. The Goodreads RSS feed is designed for incremental refreshes of recent reads, not for reconstructing an entire library.
 
-Goodreads CSV and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
+Goodreads CSV, StoryGraph CSV, and manual historical imports contribute time-based read outcomes only when they include a valid completion date. Their import time is not treated as the date the book was read; current manual read marks still use their creation time when no date is supplied.
 
 ### Librarr works in Docker but not locally (or vice versa)
 
