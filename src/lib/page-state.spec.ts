@@ -3,6 +3,7 @@ import {
   READING_HISTORY_SCORE_BATCH_SIZE,
   applyReadingHistoryScores,
   buildViewUrl,
+  createUrlNavigationController,
   isSameNavigationUrl,
   mergeLoadedBooks,
   readUrlViewState,
@@ -10,7 +11,10 @@ import {
   reconcilePagedBooks,
   runReadingHistoryScoreBatches,
   sortReadingHistory,
+  type DecisionFilter,
   type ReadingHistoryScorePatch,
+  type UrlViewState,
+  type View,
 } from "./page-state";
 
 type TestBook = {
@@ -124,6 +128,221 @@ describe("URL view state helpers", () => {
       decisionFilter: "read",
     });
     expect(isSameNavigationUrl(current, next)).toBe(false);
+  });
+
+  it("traverses multi-step tab and History sub-filter pushState history across Browser Back and Forward popstate without loops", () => {
+    const historyStack: URL[] = [new URL("http://bookward.test/")];
+    let historyIndex = 0;
+    let pushCount = 0;
+    let popCount = 0;
+    let scrollCount = 0;
+    let readingHistoryLoads = 0;
+    let readingHistoryState: "idle" | "ready" = "idle";
+    const evaluatedViews: View[] = [];
+    let state: UrlViewState = readUrlViewState(historyStack[0]);
+
+    const runReactiveEffects = () => {
+      // Mirrors +page.svelte's reactive $effect on (page.shallow?.url ?? page.url)
+      // and the automatic Read-history loader $effect when state === "idle".
+      controller.syncFromUrl(new URL(historyStack[historyIndex].href));
+      if (
+        state.view === "decisions" &&
+        state.decisionFilter === "read" &&
+        readingHistoryState === "idle"
+      ) {
+        readingHistoryLoads += 1;
+        readingHistoryState = "ready";
+      }
+    };
+
+    const controller = createUrlNavigationController({
+      getState: () => ({ ...state }),
+      setState: (patch) => {
+        state = { ...state, ...patch };
+      },
+      getDigestReviewRequested: () => false,
+      getCurrentLocationUrl: () => new URL(historyStack[historyIndex].href),
+      pushUrl: (nextUrl) => {
+        pushCount += 1;
+        historyStack.splice(historyIndex + 1);
+        historyStack.push(new URL(nextUrl.href));
+        historyIndex = historyStack.length - 1;
+        // SvelteKit shallow pushState updates page.shallow.url, triggering syncFromUrl.
+        runReactiveEffects();
+      },
+      scrollToTop: () => {
+        scrollCount += 1;
+      },
+      onViewEvaluated: (view) => {
+        evaluatedViews.push(view);
+      },
+      onRequestReadingHistoryLoad: () => {
+        if (readingHistoryState === "idle") {
+          readingHistoryLoads += 1;
+          readingHistoryState = "ready";
+        }
+      },
+    });
+
+    const browserStep = (delta: -1 | 1) => {
+      const targetIndex = historyIndex + delta;
+      expect(targetIndex).toBeGreaterThanOrEqual(0);
+      expect(targetIndex).toBeLessThan(historyStack.length);
+      historyIndex = targetIndex;
+      popCount += 1;
+      // Mirrors both window popstate listener and SvelteKit page.shallow $effect firing.
+      controller.syncFromUrl(new URL(historyStack[historyIndex].href));
+      runReactiveEffects();
+    };
+
+    // Initial mount sync does not push history or scroll.
+    runReactiveEffects();
+    expect(pushCount).toBe(0);
+    expect(scrollCount).toBe(0);
+
+    // Clicking already-active Discover tab is a no-op.
+    controller.go("discover");
+    expect(pushCount).toBe(0);
+    expect(historyStack).toHaveLength(1);
+
+    // 8-step forward click sequence across tabs, History sub-filters, and Home.
+    controller.go("saved");
+    controller.go("saved"); // duplicate active tab click
+    controller.go("decisions");
+    controller.selectDecisionFilter("maybe_later");
+    controller.selectDecisionFilter("maybe_later"); // duplicate active sub-filter click
+    controller.selectDecisionFilter("rejected");
+    controller.selectDecisionFilter("read");
+    controller.go("sources");
+    controller.go("settings");
+    controller.goHome();
+
+    const expectedTrail: Array<{
+      path: string;
+      view: View;
+      filter: DecisionFilter;
+    }> = [
+      { path: "/", view: "discover", filter: "all" },
+      { path: "/?view=saved", view: "saved", filter: "all" },
+      { path: "/?view=decisions", view: "decisions", filter: "all" },
+      {
+        path: "/?view=decisions&filter=maybe_later",
+        view: "decisions",
+        filter: "maybe_later",
+      },
+      {
+        path: "/?view=decisions&filter=rejected",
+        view: "decisions",
+        filter: "rejected",
+      },
+      {
+        path: "/?view=decisions&filter=read",
+        view: "decisions",
+        filter: "read",
+      },
+      { path: "/?view=sources", view: "sources", filter: "all" },
+      { path: "/?view=settings", view: "settings", filter: "all" },
+      { path: "/", view: "discover", filter: "all" },
+    ];
+
+    expect(pushCount).toBe(8);
+    expect(historyStack).toHaveLength(9);
+    expect(
+      historyStack.map((entry) => entry.pathname + entry.search),
+    ).toEqual(expectedTrail.map((entry) => entry.path));
+    // Sub-filter switches within History do not reset scroll; 5 view changes do.
+    expect(scrollCount).toBe(5);
+    expect(readingHistoryLoads).toBe(1);
+    expect(evaluatedViews.length).toBeGreaterThan(0);
+
+    // Simulate a read-history invalidation (e.g. Mark Read or import) before Back traversal.
+    readingHistoryState = "idle";
+
+    // Traverse all 8 steps Backward via popstate: zero pushState calls, constant history length.
+    for (let index = expectedTrail.length - 2; index >= 0; index -= 1) {
+      browserStep(-1);
+      const expected = expectedTrail[index];
+      expect(historyStack[historyIndex].pathname + historyStack[historyIndex].search).toBe(
+        expected.path,
+      );
+      expect(state).toEqual({
+        view: expected.view,
+        decisionFilter: expected.filter,
+        digestMode: false,
+      });
+    }
+    expect(pushCount).toBe(8);
+    expect(historyStack).toHaveLength(9);
+    expect(readingHistoryLoads).toBe(2);
+
+    // Traverse all 8 steps Forward via popstate: zero pushState calls, exact restoration.
+    for (let index = 1; index < expectedTrail.length; index += 1) {
+      browserStep(1);
+      const expected = expectedTrail[index];
+      expect(historyStack[historyIndex].pathname + historyStack[historyIndex].search).toBe(
+        expected.path,
+      );
+      expect(state).toEqual({
+        view: expected.view,
+        decisionFilter: expected.filter,
+        digestMode: false,
+      });
+    }
+    expect(popCount).toBe(16);
+    expect(pushCount).toBe(8);
+    expect(historyStack).toHaveLength(9);
+  });
+
+  it("clears digest selection when navigating away from Discover and restores digestMode on Browser Back", () => {
+    const historyStack: URL[] = [
+      new URL("http://bookward.test/?view=discover&digest=1&digest_period=2026-W40"),
+    ];
+    let historyIndex = 0;
+    let digestExitedCount = 0;
+    let state: UrlViewState = readUrlViewState(historyStack[0], true);
+
+    const controller = createUrlNavigationController({
+      getState: () => ({ ...state }),
+      setState: (patch) => {
+        state = { ...state, ...patch };
+      },
+      getDigestReviewRequested: () => true,
+      getCurrentLocationUrl: () => new URL(historyStack[historyIndex].href),
+      pushUrl: (nextUrl) => {
+        historyStack.splice(historyIndex + 1);
+        historyStack.push(new URL(nextUrl.href));
+        historyIndex = historyStack.length - 1;
+      },
+      onExitDigestMode: () => {
+        digestExitedCount += 1;
+      },
+    });
+
+    expect(state).toEqual({
+      view: "discover",
+      decisionFilter: "all",
+      digestMode: true,
+    });
+
+    controller.go("saved");
+    expect(digestExitedCount).toBe(1);
+    expect(historyStack[historyIndex].pathname + historyStack[historyIndex].search).toBe(
+      "/?view=saved",
+    );
+    expect(state).toEqual({
+      view: "saved",
+      decisionFilter: "all",
+      digestMode: false,
+    });
+
+    // Browser Back restores digestMode from ?view=discover&digest=1&digest_period=2026-W40.
+    historyIndex -= 1;
+    controller.syncFromUrl(historyStack[historyIndex]);
+    expect(state).toEqual({
+      view: "discover",
+      decisionFilter: "all",
+      digestMode: true,
+    });
   });
 });
 

@@ -222,6 +222,145 @@ export function isSameNavigationUrl(left: UrlLike, right: UrlLike): boolean {
   );
 }
 
+export type UrlNavigationControllerOptions = {
+  getState: () => UrlViewState;
+  setState: (patch: Partial<UrlViewState>) => void;
+  getDigestReviewRequested: () => boolean;
+  getCurrentLocationUrl: () => URL | null;
+  pushUrl: (url: URL) => void;
+  scrollToTop?: () => void;
+  onViewEvaluated?: (view: View) => void;
+  onResetDecisionPagination?: () => void;
+  onClearDecisionsError?: () => void;
+  onExitDigestMode?: () => void;
+  onRequestReadingHistoryLoad?: () => void;
+};
+
+export function createUrlNavigationController(
+  options: UrlNavigationControllerOptions,
+) {
+  return {
+    syncFromUrl(url: UrlLike) {
+      const nextUrlState = readUrlViewState(
+        url,
+        options.getDigestReviewRequested(),
+      );
+      const previous = options.getState();
+
+      options.onViewEvaluated?.(nextUrlState.view);
+      if (previous.view !== nextUrlState.view) {
+        options.setState({ view: nextUrlState.view });
+        options.scrollToTop?.();
+      }
+      if (previous.decisionFilter !== nextUrlState.decisionFilter) {
+        options.setState({ decisionFilter: nextUrlState.decisionFilter });
+        options.onResetDecisionPagination?.();
+        options.onClearDecisionsError?.();
+      }
+      if (previous.digestMode !== nextUrlState.digestMode) {
+        options.setState({ digestMode: nextUrlState.digestMode });
+        if (!nextUrlState.digestMode) {
+          options.onExitDigestMode?.();
+        }
+      }
+    },
+
+    selectDecisionFilter(nextFilter: DecisionFilter) {
+      const current = options.getState();
+      const filterChanged = current.decisionFilter !== nextFilter;
+      options.setState({ decisionFilter: nextFilter });
+      if (filterChanged) {
+        options.onResetDecisionPagination?.();
+      }
+      options.onClearDecisionsError?.();
+      if (nextFilter === "read") {
+        options.onRequestReadingHistoryLoad?.();
+      }
+      const currentUrl = options.getCurrentLocationUrl();
+      if (currentUrl && current.view === "decisions") {
+        const nextUrl = buildViewUrl(currentUrl, {
+          view: "decisions",
+          decisionFilter: nextFilter,
+        });
+        if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+          options.pushUrl(nextUrl);
+        }
+      }
+    },
+
+    go(view: View, nextDecisionFilter?: DecisionFilter) {
+      const current = options.getState();
+      const targetFilter: DecisionFilter =
+        view === "decisions"
+          ? (nextDecisionFilter ??
+            (current.view === "decisions" ? current.decisionFilter : "all"))
+          : "all";
+      if (
+        view === current.view &&
+        (nextDecisionFilter === undefined ||
+          targetFilter === current.decisionFilter)
+      ) {
+        return;
+      }
+      const viewChanged = view !== current.view;
+      const keepDigestMode = view === "discover" && current.digestMode;
+      const exitedDigestMode = view !== "discover" && current.digestMode;
+
+      options.onViewEvaluated?.(view);
+      options.setState({
+        view,
+        decisionFilter: targetFilter,
+        digestMode: keepDigestMode,
+      });
+      if (exitedDigestMode) {
+        options.onExitDigestMode?.();
+      }
+      if (view === "decisions") {
+        options.onResetDecisionPagination?.();
+        if (targetFilter === "read") {
+          options.onRequestReadingHistoryLoad?.();
+        }
+      }
+      const currentUrl = options.getCurrentLocationUrl();
+      if (currentUrl) {
+        const nextUrl = buildViewUrl(currentUrl, {
+          view,
+          decisionFilter: targetFilter,
+          digestMode: keepDigestMode,
+          clearDigestPeriod: !keepDigestMode,
+        });
+        if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+          options.pushUrl(nextUrl);
+        }
+        if (viewChanged) {
+          options.scrollToTop?.();
+        }
+      }
+    },
+
+    goHome() {
+      const current = options.getState();
+      options.onViewEvaluated?.("discover");
+      options.setState({
+        view: "discover",
+        decisionFilter: "all",
+        digestMode: false,
+      });
+      if (current.digestMode) {
+        options.onExitDigestMode?.();
+      }
+      const currentUrl = options.getCurrentLocationUrl();
+      if (currentUrl) {
+        const nextUrl = new URL("/", currentUrl.origin);
+        if (!isSameNavigationUrl(currentUrl, nextUrl)) {
+          options.pushUrl(nextUrl);
+        }
+        options.scrollToTop?.();
+      }
+    },
+  };
+}
+
 export function mergeLoadedBooks<T extends { id: number; status: string }>(
   serverBooks: readonly T[],
   serverDecisions: readonly T[],

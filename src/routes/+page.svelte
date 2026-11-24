@@ -68,8 +68,7 @@
   import { modalFocus } from "#lib/actions/modal-focus.js";
   import {
     applyReadingHistoryScores,
-    buildViewUrl,
-    isSameNavigationUrl,
+    createUrlNavigationController,
     READING_HISTORY_SCORE_BATCH_SIZE,
     readUrlViewState,
     reconcileBookMutation,
@@ -1077,52 +1076,48 @@
     }
     return task;
   }
-  function syncFromUrl(url: Parameters<typeof readUrlViewState>[0]) {
-    const nextUrlState = readUrlViewState(url, data.digestReview.requested);
-    const previousView = untrack(() => activeView);
-    const previousFilter = untrack(() => decisionFilter);
-    const previousDigest = untrack(() => digestMode);
-
-    revealedApiToken = tokenForView(
-      nextUrlState.view,
-      untrack(() => revealedApiToken),
-    );
-    if (previousView !== nextUrlState.view) {
-      activeView = nextUrlState.view;
+  const urlNavigation = createUrlNavigationController({
+    getState: () =>
+      untrack(() => ({
+        view: activeView,
+        decisionFilter,
+        digestMode,
+      })),
+    setState: (patch) => {
+      if (patch.view !== undefined) activeView = patch.view;
+      if (patch.decisionFilter !== undefined) decisionFilter = patch.decisionFilter;
+      if (patch.digestMode !== undefined) digestMode = patch.digestMode;
+    },
+    getDigestReviewRequested: () => data.digestReview.requested,
+    getCurrentLocationUrl: () =>
+      typeof window !== "undefined" ? new URL(window.location.href) : null,
+    pushUrl: (nextUrl) => pushState(nextUrl, {}),
+    scrollToTop: () => {
       if (typeof window !== "undefined") {
         window.scrollTo(0, 0);
       }
-    }
-    if (previousFilter !== nextUrlState.decisionFilter) {
-      decisionFilter = nextUrlState.decisionFilter;
+    },
+    onViewEvaluated: (view) => {
+      revealedApiToken = tokenForView(view, untrack(() => revealedApiToken));
+    },
+    onResetDecisionPagination: () => {
       readingHistoryVisibleCount = 30;
+    },
+    onClearDecisionsError: () => {
       decisionsLoadError = "";
-    }
-    if (previousDigest !== nextUrlState.digestMode) {
-      digestMode = nextUrlState.digestMode;
-      if (!nextUrlState.digestMode) {
-        clearDigestSelection();
-      }
-    }
+    },
+    onExitDigestMode: () => {
+      clearDigestSelection();
+    },
+    onRequestReadingHistoryLoad: () => {
+      void loadReadingHistory();
+    },
+  });
+  function syncFromUrl(url: Parameters<typeof readUrlViewState>[0]) {
+    urlNavigation.syncFromUrl(url);
   }
   function selectDecisionFilter(nextFilter: DecisionFilter) {
-    const filterChanged = decisionFilter !== nextFilter;
-    decisionFilter = nextFilter;
-    if (filterChanged) {
-      readingHistoryVisibleCount = 30;
-    }
-    decisionsLoadError = "";
-    if (nextFilter === "read") void loadReadingHistory();
-    if (typeof window !== "undefined" && activeView === "decisions") {
-      const currentUrl = new URL(window.location.href);
-      const nextUrl = buildViewUrl(currentUrl, {
-        view: "decisions",
-        decisionFilter: nextFilter,
-      });
-      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
-        pushState(nextUrl, {});
-      }
-    }
+    urlNavigation.selectDecisionFilter(nextFilter);
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -1146,43 +1141,7 @@
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
   function go(view: View, nextDecisionFilter?: DecisionFilter) {
-    const targetFilter =
-      view === "decisions"
-        ? (nextDecisionFilter ?? (activeView === "decisions" ? decisionFilter : "all"))
-        : "all";
-    if (
-      view === activeView &&
-      (nextDecisionFilter === undefined || targetFilter === decisionFilter)
-    ) {
-      return;
-    }
-    const viewChanged = view !== activeView;
-    revealedApiToken = tokenForView(view, revealedApiToken);
-    activeView = view;
-    decisionFilter = targetFilter;
-    if (view !== "discover" && digestMode) {
-      digestMode = false;
-      clearDigestSelection();
-    }
-    if (view === "decisions") {
-      readingHistoryVisibleCount = 30;
-      if (targetFilter === "read") void loadReadingHistory();
-    }
-    if (typeof window !== "undefined") {
-      const currentUrl = new URL(window.location.href);
-      const nextUrl = buildViewUrl(currentUrl, {
-        view,
-        decisionFilter: targetFilter,
-        digestMode: view === "discover" && digestMode,
-        clearDigestPeriod: view !== "discover" || !digestMode,
-      });
-      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
-        pushState(nextUrl, {});
-      }
-      if (viewChanged) {
-        window.scrollTo(0, 0);
-      }
-    }
+    urlNavigation.go(view, nextDecisionFilter);
   }
   function onHomeClick(event: MouseEvent) {
     if (
@@ -1196,21 +1155,7 @@
       return;
     }
     event.preventDefault();
-    revealedApiToken = tokenForView("discover", revealedApiToken);
-    activeView = "discover";
-    decisionFilter = "all";
-    if (digestMode) {
-      digestMode = false;
-      clearDigestSelection();
-    }
-    if (typeof window !== "undefined") {
-      const currentUrl = new URL(window.location.href);
-      const nextUrl = new URL("/", currentUrl.origin);
-      if (!isSameNavigationUrl(currentUrl, nextUrl)) {
-        pushState(nextUrl, {});
-      }
-      window.scrollTo(0, 0);
-    }
+    urlNavigation.goHome();
   }
   async function goToLibrarrSettings() {
     go("settings");
