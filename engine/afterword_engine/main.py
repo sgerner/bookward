@@ -1754,41 +1754,39 @@ async def reading_history_scores(
     ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
-    resolved_offset = offset.default if hasattr(offset, "default") else int(offset)
-    resolved_limit = limit.default if hasattr(limit, "default") else int(limit)
-    with connect() as connection:
-        items = [dict(item) for item in connection.execute(
-            "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
-            (resolved_limit, resolved_offset),
-        ).fetchall()]
-        if not items:
-            return []
-        candidate_keys = list(dict.fromkeys(
-            normalize_key(item["title"], item["author"]) for item in items
-        ))
-        placeholders = ",".join("?" for _ in candidate_keys)
-        existing_candidates = (
-            [dict(item) for item in connection.execute(
-                "SELECT c.title,c.author,c.description,c.genres,c.status,"
-                "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
-                "FROM candidates c "
-                "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-                "LEFT JOIN sources s ON s.id=c.source_id "
-                f"WHERE c.status!='new' AND c.normalized_key IN ({placeholders}) "
-                "ORDER BY c.updated_at DESC,c.id DESC",
-                candidate_keys,
+    try:
+        with connect() as connection:
+            items = [dict(item) for item in connection.execute(
+                "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
+                "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()]
-            if candidate_keys else []
-        )
-        config = private_settings(connection)
-        rated_reads = [
-            dict(item)
-            for item in connection.execute(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            ).fetchall()
-        ]
-        try:
+            if not items:
+                return []
+            candidate_keys = list(dict.fromkeys(
+                normalize_key(item["title"], item["author"]) for item in items
+            ))
+            placeholders = ",".join("?" for _ in candidate_keys)
+            existing_candidates = (
+                [dict(item) for item in connection.execute(
+                    "SELECT c.title,c.author,c.description,c.genres,c.status,"
+                    "q.quality_score,q.quality_status,s.weight source_weight,s.name source_name "
+                    "FROM candidates c "
+                    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    f"WHERE c.status!='new' AND c.normalized_key IN ({placeholders}) "
+                    "ORDER BY c.updated_at DESC,c.id DESC",
+                    candidate_keys,
+                ).fetchall()]
+                if candidate_keys else []
+            )
+            config = private_settings(connection)
+            rated_reads = [
+                dict(item)
+                for item in connection.execute(
+                    "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+                ).fetchall()
+            ]
             embedder = get_embedder(
                 config.get("embedding_backend"),
                 config.get("embedding_model"),
@@ -1798,63 +1796,58 @@ async def reading_history_scores(
             embedding_cache_digest = _read_embedding_cache_digest(
                 connection, embedder.name, embedder.model
             )
-        except Exception:
-            LOGGER.exception("Could not calculate current-profile reading history scores")
-            raise
-    candidates_by_identity = {}
-    for candidate in existing_candidates:
-        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
-        candidates_by_identity.setdefault(key, candidate)
-    virtual_candidates = []
-    for item in items:
-        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
-        matched = candidates_by_identity.get(key)
-        virtual = {
-            "id": -int(item["id"]),
-            "title": item["title"],
-            "author": item["author"],
-            "description": matched.get("description", "") if matched else "",
-            "genres": matched.get("genres", "[]") if matched else "[]",
-            "source_weight": (matched.get("source_weight") or 1) if matched else 1,
-        }
-        if matched:
-            quality_score = float(matched.get("quality_score") or 0)
-            virtual["catalog_confidence"] = (
-                quality_score
-                if quality_score > 0
-                else 0.85 if matched.get("quality_status") == "accepted" else 0
-            )
-            virtual["source_name"] = matched.get("source_name") or ""
-        virtual_candidates.append(virtual)
+        candidates_by_identity = {}
+        for candidate in existing_candidates:
+            key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+            candidates_by_identity.setdefault(key, candidate)
+        virtual_candidates = []
+        for item in items:
+            key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+            matched = candidates_by_identity.get(key)
+            virtual = {
+                "id": -int(item["id"]),
+                "title": item["title"],
+                "author": item["author"],
+                "description": matched.get("description", "") if matched else "",
+                "genres": matched.get("genres", "[]") if matched else "[]",
+                "source_weight": (matched.get("source_weight") or 1) if matched else 1,
+            }
+            if matched:
+                quality_score = float(matched.get("quality_score") or 0)
+                virtual["catalog_confidence"] = (
+                    quality_score
+                    if quality_score > 0
+                    else 0.85 if matched.get("quality_status") == "accepted" else 0
+                )
+                virtual["source_name"] = matched.get("source_name") or ""
+            virtual_candidates.append(virtual)
 
-    try:
-        if virtual_candidates:
-            read_vectors = await _cached_rated_read_vectors(
-                embedder, config, rated_reads, embedding_cache_digest
-            )
-            candidate_vectors = await cached_vectors(
-                embedder,
-                "read_candidate",
-                virtual_candidates,
-                expected_dimensions=_vector_dimensions(read_vectors),
-            )
-            ranked = rank_candidates(
-                rated_reads,
-                read_vectors,
-                virtual_candidates,
-                candidate_vectors,
-                exclude_candidate_identity=True,
-            )
-            ranked_by_id = {int(item["id"]): item for item in ranked}
-            return [
-                {
-                    "id": int(item["id"]),
-                    "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
-                    "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
-                    "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
-                }
-                for item in items
-            ]
+        read_vectors = await _cached_rated_read_vectors(
+            embedder, config, rated_reads, embedding_cache_digest
+        )
+        candidate_vectors = await cached_vectors(
+            embedder,
+            "read_candidate",
+            virtual_candidates,
+            expected_dimensions=_vector_dimensions(read_vectors),
+        )
+        ranked = rank_candidates(
+            rated_reads,
+            read_vectors,
+            virtual_candidates,
+            candidate_vectors,
+            exclude_candidate_identity=True,
+        )
+        ranked_by_id = {int(item["id"]): item for item in ranked}
+        return [
+            {
+                "id": int(item["id"]),
+                "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
+                "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
+                "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
+            }
+            for item in items
+        ]
     except Exception:
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise

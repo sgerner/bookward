@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 import sqlite3
 
@@ -6,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auth_helpers import authenticated_headers
-from afterword_engine import database as engine_database, main, profiles
+from afterword_engine import main, profiles
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, transaction
 from afterword_engine.embeddings import get_embedder
@@ -209,4 +210,129 @@ def test_rated_read_vector_cache_reuses_vectors_across_batches_and_scopes_invali
     assert read_vector_computations == 4
     for cache_key in main._RATED_READ_VECTOR_CACHE:
         assert "super-secret-api-key" not in repr(cache_key)
+
+
+def test_rated_read_vector_cache_evicts_least_recently_used_entry_past_8_entries(
+    database, monkeypatch
+):
+    _seed_reads(12)
+    assert main._RATED_READ_VECTOR_CACHE_MAX_ENTRIES == 8
+    read_vector_computations = 0
+    real_cached_vectors = main.cached_vectors
+
+    async def counting_cached_vectors(embedder, entity_type, items, expected_dimensions=None):
+        nonlocal read_vector_computations
+        if entity_type == "read":
+            read_vector_computations += 1
+        return await real_cached_vectors(
+            embedder,
+            entity_type,
+            items,
+            expected_dimensions=expected_dimensions,
+        )
+
+    monkeypatch.setattr(main, "cached_vectors", counting_cached_vectors)
+
+    def set_model(model_name: str):
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES('embedding_model',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (model_name,),
+            )
+
+    for index in range(1, 9):
+        set_model(f"local-hash-v{index}")
+        asyncio.run(main.reading_history_scores(offset=0, limit=12))
+
+    assert len(main._RATED_READ_VECTOR_CACHE) == 8
+    assert read_vector_computations == 8
+
+    # Touch v1 so it becomes MRU and v2 becomes the oldest (LRU) entry.
+    set_model("local-hash-v1")
+    asyncio.run(main.reading_history_scores(offset=0, limit=12))
+    assert read_vector_computations == 8
+
+    # Adding a 9th distinct entry evicts v2 while keeping v1 cached.
+    set_model("local-hash-v9")
+    asyncio.run(main.reading_history_scores(offset=0, limit=12))
+    assert len(main._RATED_READ_VECTOR_CACHE) == 8
+    assert read_vector_computations == 9
+
+    set_model("local-hash-v1")
+    asyncio.run(main.reading_history_scores(offset=0, limit=12))
+    assert read_vector_computations == 9
+
+    set_model("local-hash-v2")
+    asyncio.run(main.reading_history_scores(offset=0, limit=12))
+    assert len(main._RATED_READ_VECTOR_CACHE) == 8
+    assert read_vector_computations == 10
+
+
+def test_reading_history_scores_partial_batch_error_logs_once_and_retries_from_failed_offset(
+    database, monkeypatch, caplog
+):
+    _seed_reads(230)
+    read_vector_computations = 0
+    fail_next_candidate_batch = False
+    real_cached_vectors = main.cached_vectors
+
+    async def fault_injecting_cached_vectors(
+        embedder, entity_type, items, expected_dimensions=None
+    ):
+        nonlocal read_vector_computations, fail_next_candidate_batch
+        if entity_type == "read":
+            read_vector_computations += 1
+        if entity_type == "read_candidate" and fail_next_candidate_batch:
+            fail_next_candidate_batch = False
+            raise RuntimeError("Transient embedding failure on second batch")
+        return await real_cached_vectors(
+            embedder,
+            entity_type,
+            items,
+            expected_dimensions=expected_dimensions,
+        )
+
+    monkeypatch.setattr(main, "cached_vectors", fault_injecting_cached_vectors)
+
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        headers = authenticated_headers()
+
+        reading_history_score_offset = 0
+        first_response = client.get(
+            f"/api/reading-history/scores?offset={reading_history_score_offset}&limit=200",
+            headers=headers,
+        )
+        assert first_response.status_code == 200
+        first_scores = first_response.json()
+        assert len(first_scores) == 200
+        assert read_vector_computations == 1
+        reading_history_score_offset += 200
+
+        fail_next_candidate_batch = True
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger=main.LOGGER.name):
+            failed_response = client.get(
+                f"/api/reading-history/scores?offset={reading_history_score_offset}&limit=200",
+                headers=headers,
+            )
+        assert failed_response.status_code == 500
+        matching_logs = [
+            record
+            for record in caplog.records
+            if "Could not calculate current-profile reading history scores"
+            in record.getMessage()
+        ]
+        assert len(matching_logs) == 1
+
+        # Retrying from readingHistoryScoreOffset (200) succeeds without recomputing rated-read vectors.
+        retry_response = client.get(
+            f"/api/reading-history/scores?offset={reading_history_score_offset}&limit=200",
+            headers=headers,
+        )
+        assert retry_response.status_code == 200
+        retry_scores = retry_response.json()
+        assert len(retry_scores) == 30
+        assert read_vector_computations == 1
+        assert len({item["id"] for item in [*first_scores, *retry_scores]}) == 230
 

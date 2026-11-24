@@ -67,4 +67,20 @@ describe("reading-history scores endpoint", () => {
     }
     expect(engineMock).not.toHaveBeenCalled();
   });
+
+  it("forwards upstream engine errors cleanly so failed batches can be retried", async () => {
+    engineMock.mockRejectedValueOnce(
+      Object.assign(new Error("Upstream score batch failed."), { status: 502 }),
+    );
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/reading-history/scores?offset=200&limit=200",
+      ),
+    } as never);
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      message: "Upstream score batch failed.",
+    });
+  });
 });
