@@ -1,12 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
+import { DEFAULT_MODE, DEFAULT_THEME, getThemeColor } from '#lib/theme.js';
 import AccountPage from './+page.svelte';
+
+const layoutThemeData = {
+	theme: DEFAULT_THEME,
+	mode: DEFAULT_MODE,
+	themeCss: null,
+	themeColor: getThemeColor(DEFAULT_THEME, 'dark')
+} as const;
 
 describe('account page SSR', () => {
 	it('requires SSO confirmation before rendering the local credential enrollment form and disables disconnecting the sole SSO login', () => {
 		const { body } = render(AccountPage, {
 			props: {
 				data: {
+					...layoutThemeData,
 					user: {
 						id: 'sso-1',
 						profile_id: 'sso-profile',
@@ -54,6 +63,7 @@ describe('account page SSR', () => {
 		const { body } = render(AccountPage, {
 			props: {
 				data: {
+					...layoutThemeData,
 					user: {
 						id: 'sso-1',
 						profile_id: 'sso-profile',
@@ -100,6 +110,7 @@ describe('account page SSR', () => {
 		const { body } = render(AccountPage, {
 			props: {
 				data: {
+					...layoutThemeData,
 					user: {
 						id: 'legacy-1',
 						profile_id: 'legacy-profile',

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { render } from 'svelte/server';
+import { DEFAULT_MODE, DEFAULT_THEME, getThemeColor } from '#lib/theme.js';
 import AdminPage from './+page.svelte';
 
 describe('admin page SSR', () => {
@@ -7,6 +8,10 @@ describe('admin page SSR', () => {
 		const { body } = render(AdminPage, {
 			props: {
 				data: {
+					theme: DEFAULT_THEME,
+					mode: DEFAULT_MODE,
+					themeCss: null,
+					themeColor: getThemeColor(DEFAULT_THEME, 'dark'),
 					user: {
 						id: 'admin-1',
 						profile_id: 'legacy',
