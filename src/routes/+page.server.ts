@@ -391,16 +391,35 @@ export const actions: Actions = {
   },
   undoDecision: async ({ request }) => {
     const data = await request.formData();
-    const id = idSchema.safeParse(data.get("id"));
-    const decisionId = idSchema.safeParse(data.get("decision_id"));
-    if (!id.success || !decisionId.success)
+    const rawIds = data.getAll("id");
+    const rawDecisionIds = data.getAll("decision_id");
+    if (!rawIds.length || rawIds.length !== rawDecisionIds.length)
       return fail(400, { message: "This decision can no longer be undone." });
+    const seen = new Set<string>();
+    const decisions: Array<{ id: number; decision_id: number }> = [];
+    for (let index = 0; index < rawIds.length; index += 1) {
+      const id = idSchema.safeParse(rawIds[index]);
+      const decisionId = idSchema.safeParse(rawDecisionIds[index]);
+      if (!id.success || !decisionId.success)
+        return fail(400, { message: "This decision can no longer be undone." });
+      const key = `${id.data}:${decisionId.data}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      decisions.push({ id: id.data, decision_id: decisionId.data });
+    }
     try {
-      await engine(`/api/recommendations/${id.data}/undo`, {
+      if (decisions.length === 1) {
+        await engine(`/api/recommendations/${decisions[0].id}/undo`, {
+          method: "POST",
+          body: JSON.stringify({ decision_id: decisions[0].decision_id }),
+        });
+        return { message: "Decision undone." };
+      }
+      await engine("/api/recommendations/bulk-undo", {
         method: "POST",
-        body: JSON.stringify({ decision_id: decisionId.data }),
+        body: JSON.stringify({ decisions }),
       });
-      return { message: "Decision undone." };
+      return { message: "Decisions undone." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -542,12 +561,9 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  toggleDefault: async ({ request }) => {
+  toggleDefault: async () => {
     try {
-      const overview = await engine<Overview>("/api/overview");
-      const source = overview.sources.find((item) => item.is_default);
-      if (!source) return fail(404, { message: "Default source not found." });
-      await engine(`/api/sources/${source.id}/toggle`, {
+      await engine("/api/sources/default/toggle", {
         method: "PUT",
         body: "{}",
       });
@@ -632,18 +648,9 @@ export const actions: Actions = {
         message: "Enter a valid Librarr URL, API key, and media type.",
       });
     try {
-      const overview = await engine<Overview>("/api/overview");
-      if (!key.data && !overview.settings.librarr_api_key_set)
-        return fail(400, {
-          message: "Enter a Librarr API key for the first connection.",
-        });
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
-          embedding_backend: overview.settings.embedding_backend,
-          embedding_model: overview.settings.embedding_model,
-          embedding_url: overview.settings.embedding_url,
-          embedding_api_key: "",
           librarr_url: url.data,
           librarr_api_key: key.data,
           librarr_media_type: mediaType.data,
@@ -678,7 +685,6 @@ export const actions: Actions = {
     if (!backend.success || !model.success)
       return fail(400, { message: "Choose an embedding backend and model." });
     try {
-      const overview = await engine<Overview>("/api/overview");
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -686,9 +692,6 @@ export const actions: Actions = {
           embedding_model: model.data,
           embedding_url: String(data.get("url") || ""),
           embedding_api_key: String(data.get("apiKey") || ""),
-          librarr_url: overview.settings.librarr_url,
-          librarr_api_key: "",
-          librarr_media_type: overview.settings.librarr_media_type,
         }),
       });
       return { message: "Embedding provider saved and checked." };
@@ -964,7 +967,10 @@ export const actions: Actions = {
     const uniqueIds = [...new Set(ids)];
     if (!uniqueIds.length) return fail(400, { message: "Select at least one book first." });
     try {
-      const result = await engine<{ updated?: number }>(
+      const result = await engine<{
+        updated?: number;
+        decisions?: Array<{ id: number; decision_id: number }>;
+      }>(
         "/api/recommendations/bulk-feedback",
         {
           method: "POST",
@@ -975,7 +981,24 @@ export const actions: Actions = {
           }),
         },
       );
-      return { message: `${result.updated ?? uniqueIds.length} book${(result.updated ?? uniqueIds.length) === 1 ? "" : "s"} added to your shortlist.` };
+      const count = result.updated ?? uniqueIds.length;
+      const undoDecisions = (result.decisions ?? []).filter(
+        (item) =>
+          idSchema.safeParse(item?.id).success &&
+          idSchema.safeParse(item?.decision_id).success,
+      );
+      return {
+        message: `${count} book${count === 1 ? "" : "s"} added to your shortlist.`,
+        ...(undoDecisions.length
+          ? {
+              undo_decisions: undoDecisions,
+              undo_label:
+                undoDecisions.length === 1
+                  ? "shortlisting this book"
+                  : `shortlisting ${undoDecisions.length} books`,
+            }
+          : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
