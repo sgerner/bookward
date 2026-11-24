@@ -970,6 +970,172 @@ def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants
     assert bob_epoch == 0
 
 
+def test_worker_loop_does_not_block_event_loop_when_profile_lock_is_held(identity_store):
+    alice = profiles.create_account("locked-alice", "locked-alice-password-with-length")
+    bob = profiles.create_account("unlocked-bob", "unlocked-bob-password-with-length")
+    for account in (alice, bob):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+
+    with profile_scope(alice["profile_id"]):
+        enqueue_job("alice_blocked")
+        alice_path = profile_database_path()
+    with profile_scope(bob["profile_id"]):
+        bob_job_id = enqueue_job("bob_unblocked")
+
+    writer_held = Event()
+    release_writer = Event()
+
+    def hold_alice_writer():
+        with database_lock(alice_path):
+            writer_held.set()
+            release_writer.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_alice_writer)
+    assert writer_held.wait(timeout=2)
+
+    bob_done = asyncio.Event()
+    stop = asyncio.Event()
+    max_tick_gap = 0.0
+
+    async def monitor_loop():
+        nonlocal max_tick_gap
+        last = time.monotonic()
+        while not stop.is_set():
+            await asyncio.sleep(0.02)
+            now_mono = time.monotonic()
+            max_tick_gap = max(max_tick_gap, now_mono - last)
+            last = now_mono
+
+    async def handler(kind):
+        if kind == "bob_unblocked":
+            bob_done.set()
+            return {"bob": True}
+        stop.set()
+        return {"alice": True}
+
+    async def run():
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        monitor = asyncio.create_task(monitor_loop())
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Event loop remained responsive while Alice's exclusive writer lock was held.
+            assert max_tick_gap < 0.25
+            release_writer.set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            release_writer.set()
+            stop.set()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release_writer.set()
+        future.result(timeout=2)
+        holder.shutdown(wait=True)
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        assert (
+            con.execute("SELECT status FROM jobs WHERE id=?", (bob_job_id,)).fetchone()[0]
+            == "complete"
+        )
+
+
+def test_lifespan_legacy_recovery_failure_is_guarded_and_old_schema_safety_snapshot_recovers(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "legacy-startup.db"
+    monkeypatch.setattr(settings, "db", str(database_path))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin(
+        "startup-admin", "startup-admin-password-with-length"
+    )
+    alice = profiles.create_account(
+        "startup-alice", "startup-alice-password-with-length"
+    )
+    alice_session, _ = profiles.create_session(alice["id"])
+    admin_session, _ = profiles.create_session(admin["id"])
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Legacy safety read','Author','manual')"
+            )
+        legacy_safety = backups.create_backup()
+        broken_journal = backups._restore_journal_path()
+        broken_journal.write_text('{"safety_backup":"bookward-20260101T000000Z-missing0","selected_backup":"bookward-20260101T000000Z-missing0"}')
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice healthy read','Alice','manual')"
+            )
+
+    # 1. Broken legacy restore journal logs an error during lifespan startup without
+    #    crashing /api/health or healthy secondary tenant profiles.
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        alice_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": alice_session}
+        )
+        assert alice_overview.status_code == 200
+        assert {item["title"] for item in alice_overview.json()["history"]} == {
+            "Alice healthy read"
+        }
+
+    # 2. Old-schema safety snapshot (missing newer tables and missing jobs / settings.updated_at)
+    #    recovers cleanly during lifespan startup and migrates to the latest schema.
+    with profile_scope("legacy"):
+        safety_file = backups.backup_directory() / f"{legacy_safety['id']}.sqlite3"
+        with sqlite3.connect(safety_file) as con:
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+            con.execute("DROP TABLE IF EXISTS goodreads_shelf_items")
+            con.execute("DROP INDEX IF EXISTS idx_jobs_status_heartbeat")
+            con.execute("DROP TABLE IF EXISTS jobs")
+            existing_settings = con.execute(
+                "SELECT key,value,secret FROM settings"
+            ).fetchall()
+            con.execute("DROP TABLE settings")
+            con.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0)"
+            )
+            con.executemany(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?)",
+                existing_settings,
+            )
+            con.execute("DELETE FROM schema_migrations WHERE version >= 21")
+            con.commit()
+        backups._write_restore_journal(safety_file, safety_file)
+
+    with TestClient(app) as client:
+        legacy_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": admin_session}
+        )
+        assert legacy_overview.status_code == 200
+        assert "Legacy safety read" in {
+            item["title"] for item in legacy_overview.json()["history"]
+        }
+
+    with profile_scope("legacy"), connect() as con:
+        assert not backups._restore_journal_path().exists()
+        assert (
+            con.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            == MIGRATIONS[-1][0]
+        )
+        assert current_restore_epoch() >= 1
+
+
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):
     database_path = tmp_path / "upgrade.db"
     monkeypatch.setattr(settings, "db", str(database_path))

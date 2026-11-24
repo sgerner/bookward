@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .database import bind_restore_epoch, rows, transaction, connect
+from .database import fenced_async, rows, transaction, connect
 from .embeddings import get_embedder, content_hash, vector_blob
 from .ranking import normalized_vector_matrix as _normalized_vectors, rank_candidates
 from .identity import ReadIdentityIndex
@@ -35,27 +35,8 @@ def document(item):
         if str(value or "").strip()
     )
 
+@fenced_async
 async def cached_vectors(
-    embedder,
-    entity_type,
-    items,
-    *,
-    force=False,
-    persist=True,
-    expected_dimensions=None,
-):
-    with bind_restore_epoch():
-        return await _cached_vectors_inner(
-            embedder,
-            entity_type,
-            items,
-            force=force,
-            persist=persist,
-            expected_dimensions=expected_dimensions,
-        )
-
-
-async def _cached_vectors_inner(
     embedder,
     entity_type,
     items,
@@ -221,12 +202,8 @@ def _max_cosine_similarities(vectors, references, default):
 
     return best
 
+@fenced_async
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
-    with bind_restore_epoch():
-        return await _score_all_inner(backend, model, url, api_key, embedder=embedder)
-
-
-async def _score_all_inner(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
     read_history = rows("SELECT * FROM reads ORDER BY id")
     read_metadata_rows = rows(
@@ -397,6 +374,7 @@ async def _score_all_inner(backend=None, model=None, url=None, api_key=None, emb
     return len(candidates)
 
 
+@fenced_async
 async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=None):
     """Generate a fresh embedding set for every stored read and candidate.
 
@@ -406,11 +384,6 @@ async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=Non
     vectors for the selected provider are replaced only after the complete
     replacement set has been generated successfully.
     """
-    with bind_restore_epoch():
-        return await _rebuild_all_embeddings_inner(backend, model, url, api_key)
-
-
-async def _rebuild_all_embeddings_inner(backend=None, model=None, url=None, api_key=None):
     embedder = get_embedder(backend, model, url, api_key)
     reads = rows("SELECT * FROM reads")
     candidates = rows("SELECT * FROM candidates")

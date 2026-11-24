@@ -2,14 +2,23 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 import re
 
 from .config import settings
 
+
+@dataclass
+class _RestoreEpochBinding:
+    path: str
+    generation: int | None = None
+    epoch: int | None = None
+
+
 _profile_id: ContextVar[str | None] = ContextVar("bookward_profile_id", default=None)
 _database_override: ContextVar[Path | None] = ContextVar("bookward_database_override", default=None)
-_restore_epoch_fence: ContextVar[tuple[str, int] | None] = ContextVar(
+_restore_epoch_fence: ContextVar[_RestoreEpochBinding | None] = ContextVar(
     "bookward_restore_epoch_fence", default=None
 )
 _PROFILE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -50,21 +59,48 @@ def database_path_override(path: str | Path):
         _database_override.reset(token)
 
 
-def bound_restore_epoch(path: str | Path | None = None) -> int | None:
+def active_restore_epoch_binding(
+    path: str | Path | None = None,
+) -> _RestoreEpochBinding | None:
     fence = _restore_epoch_fence.get()
     if fence is None:
         return None
     target = str(Path(path) if path is not None else profile_database_path())
-    bound_path, epoch = fence
-    return epoch if bound_path == target else None
+    return fence if fence.path == target else None
+
+
+def bound_restore_epoch(path: str | Path | None = None) -> int | None:
+    binding = active_restore_epoch_binding(path)
+    return binding.epoch if binding is not None else None
 
 
 @contextmanager
 def restore_epoch_scope(epoch: int, path: str | Path | None = None):
     target = str(Path(path) if path is not None else profile_database_path())
-    token = _restore_epoch_fence.set((target, max(0, int(epoch))))
+    binding = _RestoreEpochBinding(path=target, generation=None, epoch=max(0, int(epoch)))
+    token = _restore_epoch_fence.set(binding)
     try:
-        yield
+        yield binding
+    finally:
+        _restore_epoch_fence.reset(token)
+
+
+@contextmanager
+def restore_epoch_latch_scope(
+    *,
+    generation: int,
+    epoch: int | None = None,
+    path: str | Path | None = None,
+):
+    target = str(Path(path) if path is not None else profile_database_path())
+    binding = _RestoreEpochBinding(
+        path=target,
+        generation=int(generation),
+        epoch=None if epoch is None else max(0, int(epoch)),
+    )
+    token = _restore_epoch_fence.set(binding)
+    try:
+        yield binding
     finally:
         _restore_epoch_fence.reset(token)
 

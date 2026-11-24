@@ -1,3 +1,4 @@
+import functools
 import json
 import sqlite3
 import threading
@@ -17,7 +18,13 @@ from .covers import (
 from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import bound_restore_epoch, profile_database_path, restore_epoch_scope
+from .tenancy import (
+    active_restore_epoch_binding,
+    bound_restore_epoch,
+    profile_database_path,
+    restore_epoch_latch_scope,
+    restore_epoch_scope,
+)
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
 RESTORE_EPOCH_KEY = "restore_epoch"
@@ -1063,6 +1070,7 @@ class _ProfileDatabaseLock:
         self._connections = 0
         self._connections_by_thread: dict[int, int] = {}
         self._restoring_count = 0
+        self._quiesce_deadlines: dict[int, list[float]] = {}
         self._active_jobs: set[_ActiveWorkerJob] = set()
         self._active_schedulers: set[tuple[object, int]] = set()
 
@@ -1070,12 +1078,35 @@ class _ProfileDatabaseLock:
         with self._condition:
             return self._restoring_count > 0
 
+    def is_locked(self) -> bool:
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            return (
+                (self._restoring_count > 0 and self._writer != owner)
+                or self._writer not in (None, owner)
+                or (
+                    bool(self._waiting_writers)
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            )
+
     @contextmanager
     def scheduler_guard(self):
         owner = threading.get_ident()
         entry = (object(), owner)
         with self._condition:
-            if self._restoring_count > 0:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if (
+                self._restoring_count > 0
+                or self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
                 allowed = False
             else:
                 allowed = True
@@ -1116,15 +1147,18 @@ class _ProfileDatabaseLock:
             done.set()
 
     @contextmanager
-    def quiesce(self, timeout: float = RESTORE_QUIESCENCE_TIMEOUT_SECONDS):
+    def quiesce(self, timeout: float | None = None):
+        if timeout is None:
+            timeout = RESTORE_QUIESCENCE_TIMEOUT_SECONDS
         current_thread = threading.get_ident()
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._condition:
             self._restoring_count += 1
+            self._quiesce_deadlines.setdefault(current_thread, []).append(deadline)
             jobs_to_cancel = list(self._active_jobs)
         try:
             for job_handle in jobs_to_cancel:
                 job_handle.cancel()
-            deadline = time.monotonic() + max(0.0, timeout)
             for job_handle in jobs_to_cancel:
                 if job_handle.loop_thread_id == current_thread:
                     continue
@@ -1139,9 +1173,14 @@ class _ProfileDatabaseLock:
                     if remaining <= 0:
                         break
                     self._condition.wait(timeout=remaining)
-            yield
+            yield deadline
         finally:
             with self._condition:
+                stack = self._quiesce_deadlines.get(current_thread)
+                if stack:
+                    stack.pop()
+                    if not stack:
+                        del self._quiesce_deadlines[current_thread]
                 self._restoring_count -= 1
                 self._condition.notify_all()
 
@@ -1176,20 +1215,80 @@ class _ProfileDatabaseLock:
                 self._connections_by_thread[owner] = count - 1
             self._condition.notify_all()
 
-    def acquire(self) -> None:
+    @contextmanager
+    def shared(self):
+        owner = self.acquire_connection()
+        try:
+            yield self
+        finally:
+            self.release_connection(owner)
+
+    @contextmanager
+    def try_shared(self):
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if (
+                (self._restoring_count > 0 and self._writer != owner)
+                or self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
+                acquired = False
+            else:
+                acquired = True
+                self._connections += 1
+                self._connections_by_thread[owner] = (
+                    self._connections_by_thread.get(owner, 0) + 1
+                )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self.release_connection(owner)
+
+    def acquire(self, deadline: float | None = None) -> None:
         owner = threading.get_ident()
         with self._condition:
             if self._writer == owner:
                 self._write_depth += 1
                 return
+            effective_deadline = deadline
+            if effective_deadline is None:
+                stack = self._quiesce_deadlines.get(owner)
+                if stack:
+                    effective_deadline = stack[-1]
             self._waiting_writers += 1
             try:
                 while self._writer is not None or self._connections:
-                    self._condition.wait()
+                    if effective_deadline is not None:
+                        remaining = effective_deadline - time.monotonic()
+                        if remaining <= 0:
+                            from .backups import BackupError
+
+                            raise BackupError(
+                                "The active database could not be safely closed for restore."
+                            )
+                        self._condition.wait(timeout=remaining)
+                    else:
+                        self._condition.wait()
                 self._writer = owner
                 self._write_depth = 1
             finally:
                 self._waiting_writers -= 1
+                if self._writer != owner:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def exclusive(self, deadline: float | None = None):
+        self.acquire(deadline)
+        try:
+            yield self
+        finally:
+            self.release()
 
     def release(self) -> None:
         owner = threading.get_ident()
@@ -1309,6 +1408,16 @@ def connect():
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("PRAGMA busy_timeout=5000")
             _restrict_database_files()
+        binding = active_restore_epoch_binding(db_path)
+        if (
+            binding is not None
+            and binding.epoch is None
+            and (
+                binding.generation is None
+                or profile_restore_generation(db_path) == binding.generation
+            )
+        ):
+            binding.epoch = read_restore_epoch(con)
         return con
     except Exception:
         con.close()
@@ -1391,17 +1500,63 @@ def bind_restore_epoch(epoch: int | None = None):
 
 
 @contextmanager
+def bind_request_restore_epoch(path: str | Path | None = None):
+    target_path = Path(path) if path is not None else profile_database_path()
+    existing = active_restore_epoch_binding(target_path)
+    if existing is not None:
+        yield existing
+        return
+    with restore_epoch_latch_scope(
+        generation=profile_restore_generation(target_path),
+        path=target_path,
+    ) as binding:
+        yield binding
+
+
+def fenced_async(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with bind_request_restore_epoch():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+def scheduler_fenced(*, default=None):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with database_lock().scheduler_guard() as can_schedule:
+                if not can_schedule:
+                    return default() if callable(default) else default
+                with bind_request_restore_epoch():
+                    return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+@contextmanager
 def transaction():
     con = connect()
     try:
         con.execute("BEGIN IMMEDIATE")
-        expected_epoch = bound_restore_epoch()
-        if expected_epoch is not None:
+        binding = active_restore_epoch_binding()
+        if binding is not None:
             actual_epoch = read_restore_epoch(con)
-            if actual_epoch != expected_epoch:
+            if (
+                binding.generation is not None
+                and profile_restore_generation() != binding.generation
+            ):
                 raise RestoreEpochError(
-                    f"Profile restore epoch changed ({expected_epoch} -> {actual_epoch})"
+                    f"Profile restore generation changed during operation (epoch -> {actual_epoch})"
                 )
+            if binding.epoch is not None and actual_epoch != binding.epoch:
+                raise RestoreEpochError(
+                    f"Profile restore epoch changed ({binding.epoch} -> {actual_epoch})"
+                )
+            binding.epoch = actual_epoch
         yield con
         con.commit()
     except Exception:
@@ -1541,7 +1696,7 @@ def initialize(*, seed_demo: bool = True):
                 ) from exc
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
-            (RESTORE_EPOCH_KEY, "0"),
+            (RESTORE_EPOCH_KEY, str(recorded_restore_epoch(db_path))),
         )
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
