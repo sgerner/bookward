@@ -1977,39 +1977,76 @@ def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
     return str(parsed.copy_set_param("shelf", shelf))
 
 
-async def import_goodreads_shelves(
+DEFAULT_GOODREADS_SHELVES: tuple[str, ...] = ("to-read", "currently-reading")
+GoodreadsShelfRow = tuple[str, str, str, str | None, str | None]
+
+
+def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShelfRow]:
+    feed = feedparser.parse(content)
+    entries = list(feed.entries[:500])
+    shelf_rows: list[GoodreadsShelfRow] = []
+    for entry in entries:
+        title = str(entry.get("title", "")).strip()[:500]
+        author = str(
+            entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
+        ).strip()[:300]
+        if not title:
+            continue
+        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+        shelf_rows.append(
+            (
+                shelf,
+                title,
+                author,
+                isbn,
+                _read_date_value(entry.get("user_date_added")),
+            )
+        )
+    return shelf_rows
+
+
+async def _fetch_goodreads_shelf(
     read_rss_url: str,
-    shelves: tuple[str, ...] = ("to-read", "currently-reading"),
+    shelf: str,
+    client: httpx.AsyncClient,
+) -> list[GoodreadsShelfRow] | None:
+    try:
+        shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
+        content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True, client=client)
+    except Exception:
+        return None
+    return _parse_goodreads_shelf_rows(shelf, content)
+
+
+async def _fetch_goodreads_shelves(
+    read_rss_url: str,
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, list[GoodreadsShelfRow] | None]:
+    if not shelves:
+        return {}
+    if client is None:
+        async with _source_client() as owned_client:
+            fetched = await asyncio.gather(
+                *(_fetch_goodreads_shelf(read_rss_url, shelf, owned_client) for shelf in shelves)
+            )
+    else:
+        fetched = await asyncio.gather(
+            *(_fetch_goodreads_shelf(read_rss_url, shelf, client) for shelf in shelves)
+        )
+    return dict(zip(shelves, fetched))
+
+
+def _apply_goodreads_shelves(
+    fetched_shelves: dict[str, list[GoodreadsShelfRow] | None],
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
-    """Import Goodreads non-read shelves separately from completed ``reads``."""
     imported: dict[str, int] = {}
     for shelf in shelves:
-        try:
-            shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
-            content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True)
-        except Exception:
+        shelf_rows = fetched_shelves.get(shelf)
+        if shelf_rows is None:
             imported[shelf] = 0
             continue
-        feed = feedparser.parse(content)
-        entries = list(feed.entries[:500])
-        shelf_rows = []
-        for entry in entries:
-            title = str(entry.get("title", "")).strip()[:500]
-            author = str(
-                entry.get("author_name") or entry.get("book_author_name") or "Unknown author"
-            ).strip()[:300]
-            if not title:
-                continue
-            isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
-            shelf_rows.append(
-                (
-                    shelf,
-                    title,
-                    author,
-                    isbn,
-                    _read_date_value(entry.get("user_date_added")),
-                )
-            )
         with transaction() as con:
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
             con.executemany(
@@ -2025,9 +2062,23 @@ async def import_goodreads_shelves(
     return imported
 
 
-async def import_goodreads_rss(url: str):
+async def import_goodreads_shelves(
+    read_rss_url: str,
+    shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, int]:
+    """Import Goodreads non-read shelves separately from completed ``reads``."""
+    fetched_shelves = await _fetch_goodreads_shelves(
+        read_rss_url,
+        shelves=shelves,
+        client=client,
+    )
+    return _apply_goodreads_shelves(fetched_shelves, shelves=shelves)
+
+
+async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None):
     url = validate_goodreads_rss_url(url)
-    content, _ = await fetch_bytes(url, allow_goodreads_http=True)
+    content, _ = await fetch_bytes(url, allow_goodreads_http=True, client=client)
     feed = feedparser.parse(content)
     count = 0
     read_rows = []
