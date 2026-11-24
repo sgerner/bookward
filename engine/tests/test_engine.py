@@ -573,6 +573,20 @@ def test_source_fetch_follows_and_repins_public_redirects(monkeypatch):
     assert final.calls[0].request.headers["host"] == "redirect.example.test"
 
 
+def test_discover_feed_urls_rejects_non_default_ports():
+    html_doc = b"""
+    <html><head>
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:8443/feed.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:443/default.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/plain.xml" />
+    </head></html>
+    """
+    assert discover_feed_urls(html_doc, "https://newsletter.example.test/archive/") == [
+        "https://newsletter.example.test/default.xml",
+        "https://newsletter.example.test/plain.xml",
+    ]
+
+
 def test_discover_feed_urls_resolves_relative_links_deduplicates_and_deprioritizes_comments():
     html_doc = b"""
     <html>

@@ -2579,6 +2579,10 @@ def _canonical_feed_candidate_url(raw_href: str, base_url: str) -> str:
         return ""
     if resolved.scheme != "https" or not resolved.host or resolved.username or resolved.password:
         return ""
+    # httpx reports the scheme default (443) as None; a page author must not be
+    # able to point discovery at an arbitrary port on a public host.
+    if resolved.port is not None:
+        return ""
     host = resolved.host.lower().rstrip(".")
     if host in BLOCKED_HOSTS or host.endswith(".local"):
         return ""
