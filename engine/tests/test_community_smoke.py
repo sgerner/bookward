@@ -352,3 +352,46 @@ def test_passing_run_keeps_stderr_silent_and_cleans_up_tempdir(capsys):
     )
     assert captured.err == ""
     assert _smoke_temp_dirs() == before_dirs
+
+
+def test_local_services_run_in_isolated_tempdir_cwd(tmp_path):
+    cwd_record = tmp_path / "service-cwd.txt"
+    record_cwd_code = (
+        "import os, pathlib\n"
+        f"pathlib.Path({str(cwd_record)!r}).write_text(os.getcwd())\n"
+    ) + IDLE_SERVICE_CODE
+
+    smoke.main(
+        engine_cmd=[sys.executable, "-c", record_cwd_code],
+        web_cmd=[sys.executable, "-c", MOCK_WEB_SERVER_CODE, "pass"],
+    )
+
+    recorded = Path(cwd_record.read_text(encoding="utf-8")).resolve()
+    repo_root = SCRIPT.parents[1].resolve()
+    assert recorded != repo_root
+    assert recorded.name.startswith("bookward-smoke-")
+
+
+def test_parse_smoke_url_and_external_url_mode(monkeypatch, capsys):
+    assert smoke.parse_smoke_url(" http://127.0.0.1:3000/ ") == (
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3000",
+    )
+    with pytest.raises(ValueError, match="BOOKWARD_SMOKE_URL"):
+        smoke.parse_smoke_url("not-a-url")
+
+    import subprocess
+
+    port = smoke.free_port()
+    env = dict(__import__("os").environ, PORT=str(port), PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen([sys.executable, "-c", MOCK_WEB_SERVER_CODE, "pass"], env=env)
+    try:
+        monkeypatch.setenv("BOOKWARD_SMOKE_URL", f"http://127.0.0.1:{port}")
+        smoke.main()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    captured = capsys.readouterr()
+    assert "PASS: setup, sign-in/out" in captured.out
+
