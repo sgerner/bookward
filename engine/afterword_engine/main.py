@@ -1315,17 +1315,27 @@ class EngineSettings(BaseModel):
     librarr_api_key: str = ""
     librarr_media_type: str = "audiobook"
 
-    def validate_values(self):
-        if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
-        for label, value in (("embedding",self.embedding_url),("Librarr",self.librarr_url)):
-            parsed = urlparse(value) if value else None
-            if parsed and parsed.scheme not in {"http","https"}: raise ValueError(f"{label} URL must use HTTP or HTTPS")
-            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError(f"{label} URL cannot contain credentials, query parameters, or fragments")
-        if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
-        normalize_media_type(self.librarr_media_type)
-        if self.librarr_url:
-            allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
-            validate_service_url(self.librarr_url, allowed)
+    def validate_values(
+        self,
+        *,
+        validate_embedding: bool = True,
+        validate_librarr: bool = True,
+        check_librarr_host: bool = True,
+    ):
+        if validate_embedding:
+            if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
+            parsed = urlparse(self.embedding_url) if self.embedding_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("embedding URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("embedding URL cannot contain credentials, query parameters, or fragments")
+            if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
+        if validate_librarr:
+            parsed = urlparse(self.librarr_url) if self.librarr_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("Librarr URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("Librarr URL cannot contain credentials, query parameters, or fragments")
+            normalize_media_type(self.librarr_media_type)
+            if check_librarr_host and self.librarr_url:
+                allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
+                validate_service_url(self.librarr_url, allowed)
 
 
 class NYTApiKeyIn(BaseModel):
@@ -2534,25 +2544,48 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
+def _toggle_source_row(con, source_id: int, source) -> bool:
+    became_enabled = not source["enabled"]
+    con.execute(
+        "UPDATE sources SET enabled=1-enabled, "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+        "WHERE id=?",
+        (source_id,),
+    )
+    if not became_enabled:
+        con.execute(
+            "UPDATE candidates SET status='new', score=0, explanation='[]', "
+            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE source_id=? AND status='recommended'",
+            (source_id,),
+        )
+    return became_enabled
+
+
+@app.put("/api/sources/default/toggle")
+def toggle_default_source():
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Default source not found.")
+        source_id = source["id"]
+        became_enabled = _toggle_source_row(con, source_id, source)
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if became_enabled and source["kind"] not in {"builtin", "association"}
+        else None
+    )
+    return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
+
+
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = not source["enabled"]
-        con.execute(
-            "UPDATE sources SET enabled=1-enabled, "
-            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
-            "WHERE id=?",
-            (source_id,),
-        )
-        if not became_enabled:
-            con.execute(
-                "UPDATE candidates SET status='new', score=0, explanation='[]', "
-                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE source_id=? AND status='recommended'",
-                (source_id,),
-            )
+        became_enabled = _toggle_source_row(con, source_id, source)
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
         if became_enabled and source["kind"] not in {"builtin", "association"}
@@ -3159,24 +3192,51 @@ def revoke_api_token(token_id: int):
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
-    try: payload.validate_values()
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings()
-    current_values = {
-        "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
-        "embedding_model": current.get("embedding_model", settings.embedding_model),
-        "embedding_url": current.get("embedding_url", settings.embedding_url),
-        "embedding_api_key": current.get("embedding_api_key", settings.embedding_api_key),
-        "librarr_url": current.get("librarr_url", ""),
-        "librarr_api_key": current.get("librarr_api_key", ""),
-        "librarr_media_type": current.get("librarr_media_type", "audiobook"),
-    }
-    values = {**current_values, **payload.model_dump(exclude_unset=True)}
-    for key in ("embedding_api_key","librarr_api_key"):
-        if not values[key]: values[key] = current.get(key,"")
     embedding_fields = (
         "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"
     )
+    librarr_fields = (
+        "librarr_url", "librarr_api_key", "librarr_media_type"
+    )
+    updates = payload.model_dump(exclude_unset=True)
+    for key in ("embedding_api_key", "librarr_api_key"):
+        if key in updates:
+            updates[key] = updates[key].strip()
+
+    def _merge_settings(stored: dict) -> tuple[dict, dict]:
+        base = {
+            "embedding_backend": stored.get("embedding_backend", settings.embedding_backend),
+            "embedding_model": stored.get("embedding_model", settings.embedding_model),
+            "embedding_url": stored.get("embedding_url", settings.embedding_url),
+            "embedding_api_key": stored.get("embedding_api_key", settings.embedding_api_key),
+            "librarr_url": stored.get("librarr_url", ""),
+            "librarr_api_key": stored.get("librarr_api_key", ""),
+            "librarr_media_type": stored.get("librarr_media_type", "audiobook"),
+        }
+        merged = {**base, **updates}
+        for key in ("embedding_api_key", "librarr_api_key"):
+            if not merged[key]:
+                merged[key] = stored.get(key, "")
+        return base, merged
+
+    current = private_settings()
+    current_values, values = _merge_settings(current)
+    has_embedding_fields = any(key in payload.model_fields_set for key in embedding_fields)
+    has_librarr_fields = any(key in payload.model_fields_set for key in librarr_fields)
+    try:
+        EngineSettings(**values).validate_values(
+            validate_embedding=has_embedding_fields or not payload.model_fields_set,
+            validate_librarr=has_librarr_fields or not payload.model_fields_set,
+            check_librarr_host="librarr_url" in payload.model_fields_set,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc))
+    if (
+        "librarr_url" in payload.model_fields_set
+        and values["librarr_url"].strip()
+        and not values["librarr_api_key"].strip()
+    ):
+        raise HTTPException(400, "Enter a Librarr API key for the first connection.")
     embedding_changed = any(
         key in payload.model_fields_set and values[key] != current_values[key]
         for key in embedding_fields
@@ -3195,11 +3255,19 @@ async def update_settings(payload: EngineSettings):
                 400,
                 f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}",
             )
+        updates["embedding_model"] = test.model
         values["embedding_model"] = test.model
     else:
         health = {"ok": True, "checked": False, "model": values["embedding_model"]}
     with transaction() as con:
-        for key,value in values.items():
+        _, final_values = _merge_settings(private_settings(con))
+        if (
+            "librarr_url" in payload.model_fields_set
+            and final_values["librarr_url"].strip()
+            and not final_values["librarr_api_key"].strip()
+        ):
+            raise HTTPException(400, "Enter a Librarr API key for the first connection.")
+        for key, value in final_values.items():
             secret = key.endswith("api_key")
             stored = seal(value) if secret and value else value
             con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
