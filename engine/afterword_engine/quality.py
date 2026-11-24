@@ -794,7 +794,9 @@ async def resolve_catalog_match(
             and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
             for trace in fetch_trace
         )
-        if not any(accepted(value) for value in matches) and not query_isbn:
+        if not any(accepted(value) for value in matches) and (
+            not query_isbn or primary_unavailable
+        ):
             if rate_limited_providers is not None and "apple_books" in rate_limited_providers:
                 fetch_trace.append(
                     {
@@ -1079,6 +1081,80 @@ async def _audit_one(
         failure_flags = ["catalog_provider_unavailable"]
         if match and match.get("provider_rate_limited"):
             failure_flags.append("catalog_provider_rate_limited")
+        existing_status = str(
+            candidate.get("_existing_quality_status")
+            or candidate.get("quality_status")
+            or ""
+        )
+        existing_version = str(
+            candidate.get("_existing_audit_version")
+            or candidate.get("audit_version")
+            or ""
+        )
+        existing_provider = str(
+            candidate.get("_existing_provider")
+            or candidate.get("provider")
+            or ""
+        ).strip()
+        if (
+            unavailable
+            and existing_status == "accepted"
+            and existing_version != "legacy-pending-audit-v1"
+            and (existing_provider or existing_version == "builtin-curated-v1")
+        ):
+            raw_existing_flags = candidate.get("_existing_flags_json")
+            if raw_existing_flags is None:
+                raw_existing_flags = candidate.get("flags_json")
+            if raw_existing_flags is None:
+                raw_existing_flags = candidate.get("flags")
+            existing_flags: list[str] = []
+            if isinstance(raw_existing_flags, str):
+                try:
+                    parsed_flags = json.loads(raw_existing_flags)
+                    if isinstance(parsed_flags, list):
+                        existing_flags = [str(item) for item in parsed_flags if item]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_flags = []
+            elif isinstance(raw_existing_flags, list):
+                existing_flags = [str(item) for item in raw_existing_flags if item]
+            preserved_flags = [
+                item
+                for item in existing_flags
+                if item not in {"catalog_provider_unavailable", "catalog_provider_rate_limited"}
+            ]
+            existing_score = candidate.get("_existing_quality_score")
+            if existing_score is None:
+                existing_score = candidate.get("quality_score")
+            existing_title_match = candidate.get("_existing_title_match")
+            if existing_title_match is None:
+                existing_title_match = candidate.get("title_match")
+            existing_author_match = candidate.get("_existing_author_match")
+            if existing_author_match is None:
+                existing_author_match = candidate.get("author_match")
+            return {
+                "candidate_id": int(candidate["id"]),
+                "quality_status": "accepted",
+                "quality_score": float(existing_score or 0.0),
+                "flags": sorted(set(flags + preserved_flags + failure_flags)),
+                "provider": existing_provider,
+                "provider_id": str(
+                    candidate.get("_existing_provider_id")
+                    or candidate.get("provider_id")
+                    or ""
+                ).strip(),
+                "work_id": str(
+                    candidate.get("_existing_work_id")
+                    or candidate.get("work_id")
+                    or ""
+                ).strip(),
+                "isbn13": source_isbn13
+                or str(candidate.get("_existing_quality_isbn13") or "").strip(),
+                "isbn10": source_isbn10
+                or str(candidate.get("_existing_quality_isbn10") or "").strip(),
+                "title_match": float(existing_title_match or 0.0),
+                "author_match": float(existing_author_match or 0.0),
+                "metadata_provenance": match.get("metadata_provenance", {}),
+            }
         return {
             "candidate_id": int(candidate["id"]),
             "quality_status": "quarantine",
@@ -1139,7 +1215,7 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND COALESCE(q.audit_version,'')!=? "
         "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
-        "OR (q.quality_status='quarantine' AND q.audit_version=? "
+        "OR (q.quality_status IN ('accepted','quarantine') AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
         "AND datetime(q.audited_at)<=datetime(?)) "
         "OR (q.quality_status='accepted' AND q.audit_version=? "
@@ -1194,7 +1270,7 @@ def candidate_quality_audit_candidates(
             except (TypeError, ValueError, json.JSONDecodeError):
                 flags = []
             expired_provider_outage = bool(
-                status == "quarantine"
+                status in {"quarantine", "accepted"}
                 and candidate.get("audit_version") == QUALITY_VERSION
                 and isinstance(flags, list)
                 and "catalog_provider_unavailable" in flags
@@ -1235,13 +1311,29 @@ def candidate_quality_audit_candidates(
         return []
     placeholders = ",".join("?" for _ in selected_ids)
     return rows(
-        "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
-        "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
-        "LEFT JOIN sources s ON s.id=c.source_id "
-        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-        f"WHERE c.id IN ({placeholders}) ORDER BY c.id",
+        f"{_AUDIT_CANDIDATE_SELECT} WHERE c.id IN ({placeholders}) ORDER BY c.id",
         tuple(selected_ids),
     )
+
+
+_AUDIT_CANDIDATE_SELECT = (
+    "SELECT c.*,s.url AS source_root,"
+    "q.quality_status AS _existing_quality_status,"
+    "q.quality_score AS _existing_quality_score,"
+    "q.flags_json AS _existing_flags_json,"
+    "q.provider AS _existing_provider,"
+    "q.provider_id AS _existing_provider_id,"
+    "q.work_id AS _existing_work_id,"
+    "q.isbn13 AS _existing_quality_isbn13,"
+    "q.isbn10 AS _existing_quality_isbn10,"
+    "q.title_match AS _existing_title_match,"
+    "q.author_match AS _existing_author_match,"
+    "q.audit_version AS _existing_audit_version,"
+    "q.metadata_provider AS _metadata_provider,"
+    "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
+    "LEFT JOIN sources s ON s.id=c.source_id "
+    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
+)
 
 
 def has_candidate_quality_audit_candidates(*, now: datetime | None = None) -> bool:
@@ -1501,13 +1593,7 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
             limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE
         )
     else:
-        query = (
-            "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
-            "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status!='rejected' ORDER BY c.id"
-        )
+        query = f"{_AUDIT_CANDIDATE_SELECT} WHERE c.status!='rejected' ORDER BY c.id"
         params: tuple[object, ...] = ()
         if limit is not None:
             query += " LIMIT ?"

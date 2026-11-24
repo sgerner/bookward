@@ -1770,23 +1770,13 @@ def _recommendation_identity_context(connection=None):
         read_rows, read_metadata_rows
     )
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
-    try:
-        shortlist_rows = fetch(
-            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-            "q.provider_id AS quality_provider_id,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status IN ('saved','imported')"
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such column: q.provider_id" not in str(exc).casefold():
-            raise
-        shortlist_rows = fetch(
-            "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status IN ('saved','imported')"
-        )
+    shortlist_rows = fetch(
+        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.status IN ('saved','imported')"
+    )
     shortlisted_keys = book_identity_match_index(shortlist_rows)
     return read_identity_index, shortlisted_keys
 
@@ -1826,35 +1816,24 @@ def _recommendation_rows(
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"c.status IN ({placeholders})")
             params.extend(statuses)
-    def _build_recommendation_query(include_provider_id: bool = True) -> str:
-        provider_id_select = "q.provider_id AS quality_provider_id," if include_provider_id else ""
-        return (
-            "SELECT c.*,s.name source_name,q.metadata_confidence,"
-            "q.work_id quality_work_id,"
-            f"q.provider quality_provider,{provider_id_select}"
-            "q.isbn13 quality_isbn13,"
-            "q.isbn10 quality_isbn10 "
-            "FROM candidates c "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
-        )
-
-    query = _build_recommendation_query(True)
-    if connection is not None:
-        try:
-            result = [dict(item) for item in connection.execute(query, params).fetchall()]
-        except sqlite3.OperationalError as exc:
-            if "no such column: q.provider_id" not in str(exc).casefold():
-                raise
-            result = [
-                dict(item)
-                for item in connection.execute(_build_recommendation_query(False), params).fetchall()
-            ]
-    else:
-        result = rows(query, params)
+    query = (
+        "SELECT c.*,s.name source_name,q.metadata_confidence,"
+        "q.work_id quality_work_id,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
+        "q.isbn10 quality_isbn10 "
+        "FROM candidates c "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+    )
+    result = (
+        [dict(item) for item in connection.execute(query, params).fetchall()]
+        if connection is not None
+        else rows(query, params)
+    )
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     read_identity_index, shortlisted_keys = identity_context

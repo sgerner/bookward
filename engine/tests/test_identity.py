@@ -163,9 +163,17 @@ def test_identity_index_matches_isbn_editions_and_provider_scoped_work_ids():
         {
             "title": "A Quiet Harbor: Collector's Edition",
             "author": "Nora Bell",
-            "work_id": "",
-            "provider": "apple_books",
-            "provider_id": "1729854123",
+            "quality_work_id": "",
+            "quality_provider": "apple_books",
+            "quality_provider_id": "1729854123",
+        }
+    ) & apple_keys
+    assert book_row_identity_match_keys(
+        {
+            "title": "A Quiet Harbor: Collector's Edition",
+            "author": "Nora Bell",
+            "quality_work_id": "1729854123",
+            "quality_provider": "apple_books",
         }
     ) & apple_keys
     assert not book_row_identity_match_keys(
@@ -174,6 +182,23 @@ def test_identity_index_matches_isbn_editions_and_provider_scoped_work_ids():
             "author": "Someone Else",
             "quality_work_id": "1729854123",
             "quality_provider": "google_books",
+        }
+    ) & apple_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "Different Book",
+            "author": "Someone Else",
+            "quality_work_id": "",
+            "quality_provider": "google_books",
+            "quality_provider_id": "1729854123",
+        }
+    ) & apple_keys
+    assert not book_row_identity_match_keys(
+        {
+            "title": "Different Book",
+            "author": "Someone Else",
+            "provider": "apple_books",
+            "provider_id": "1729854123",
         }
     ) & apple_keys
     assert not book_row_identity_match_keys(
@@ -652,11 +677,89 @@ def test_serving_and_dedupe_match_apple_books_provider_id_when_work_id_empty(dat
             cid: con.execute("SELECT status FROM candidates WHERE id=?", (cid,)).fetchone()["status"]
             for cid in (saved_id, shortlisted_dup_id, high_id, low_id)
         }
+        quality_rows = {
+            cid: dict(
+                con.execute(
+                    "SELECT quality_status, flags_json FROM candidate_quality WHERE candidate_id=?",
+                    (cid,),
+                ).fetchone()
+            )
+            for cid in (saved_id, shortlisted_dup_id, high_id, low_id)
+        }
     assert deduped == 2
     assert statuses[saved_id] == "saved"
     assert statuses[shortlisted_dup_id] == "rejected"
     assert statuses[high_id] == "recommended"
     assert statuses[low_id] == "rejected"
+    assert quality_rows[shortlisted_dup_id]["quality_status"] == "rejected"
+    assert json.loads(quality_rows[shortlisted_dup_id]["flags_json"]) == ["shortlisted_overlap"]
+    assert quality_rows[low_id]["quality_status"] == "rejected"
+    assert json.loads(quality_rows[low_id]["flags_json"]) == ["duplicate_identity"]
+    assert quality_rows[high_id]["quality_status"] == "accepted"
+    # Soft-rejected catalog duplicates must not appear in user Decision Archive.
+    assert recommendation_list(status="decisions", limit=None) == []
+
+
+def test_read_row_with_provider_id_and_different_provider_does_not_match():
+    indexed = ReadIdentityIndex.from_reads(
+        [
+            {
+                "title": "Read Shelf Book",
+                "author": "Read Shelf Author",
+                "provider": "goodreads",
+                "provider_id": "1729854123",
+            },
+            {
+                "title": "Another Read Book",
+                "author": "Another Read Author",
+                "provider": "google_books",
+                "provider_id": "vol-999",
+            },
+            {
+                "title": "Mixed Prefix Read",
+                "author": "Mixed Prefix Author",
+                "work_id_provider": "apple_books",
+                "provider": "goodreads",
+                "provider_id": "888777666",
+            },
+        ]
+    )
+
+    assert not indexed.matches(
+        {
+            "title": "Unrelated Apple Candidate",
+            "author": "Different Author",
+            "quality_work_id": "",
+            "quality_provider": "apple_books",
+            "quality_provider_id": "1729854123",
+        }
+    )
+    assert not indexed.matches(
+        {
+            "title": "Unrelated Apple Work Candidate",
+            "author": "Different Author",
+            "quality_work_id": "888777666",
+            "quality_provider": "apple_books",
+            "quality_provider_id": "888777666",
+        }
+    )
+    assert not indexed.matches(
+        {
+            "title": "Unrelated Google Candidate",
+            "author": "Different Author",
+            "quality_work_id": "vol-999",
+            "quality_provider": "google_books",
+            "quality_provider_id": "vol-999",
+        }
+    )
+    assert not indexed.matches(
+        {
+            "title": "Unrelated Goodreads Candidate",
+            "author": "Different Author",
+            "quality_work_id": "1729854123",
+            "quality_provider": "goodreads",
+        }
+    )
 
 
 def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():
