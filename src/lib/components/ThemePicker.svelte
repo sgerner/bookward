@@ -92,7 +92,7 @@
 				<h2 id={headingId} class="text-lg font-semibold">Appearance</h2>
 				<p class="mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
 			</div>
-			<button type="button" class="btn-icon btn-icon-sm preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
+			<button type="button" class="btn-icon btn-icon-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
 		</div>
 
 		<fieldset class="min-w-0 space-y-2 border-0 p-0">

@@ -182,6 +182,21 @@ describe("recommendations endpoint", () => {
         status: "saved",
         source_name: "A source",
       },
+      {
+        id: 9,
+        title: "An Imported Book",
+        author: "A Reader",
+        description: "",
+        cover_url: "",
+        source_url: "",
+        release_date: null,
+        date_kind: "unknown",
+        genres: [],
+        score: 70,
+        explanation: [],
+        status: "imported",
+        source_name: "A source",
+      },
     ]);
 
     const response = await GET({
@@ -190,10 +205,42 @@ describe("recommendations endpoint", () => {
     } as never);
 
     expect(response.status).toBe(200);
-    expect((await response.json()).items[0]).toMatchObject({
-      id: 8,
-      status: "saved",
-    });
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 8, status: "saved" }),
+      expect.objectContaining({ id: 9, status: "imported" }),
+    ]);
+  });
+
+  it("allows filtering shortlist books by status=imported", async () => {
+    engineMock.mockResolvedValue([
+      {
+        id: 9,
+        title: "An Imported Book",
+        author: "A Reader",
+        description: "",
+        cover_url: "",
+        source_url: "",
+        release_date: null,
+        date_kind: "unknown",
+        genres: [],
+        score: 70,
+        explanation: [],
+        status: "imported",
+        source_name: "A source",
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL("http://bookward.test/api/recommendations?status=imported&limit=8&offset=0"),
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=imported&limit=9&offset=0",
+    );
+    expect((await response.json()).items).toEqual([
+      expect.objectContaining({ id: 9, status: "imported" }),
+    ]);
   });
 
   it("allows the browser to request the past decisions archive", async () => {
@@ -248,5 +295,56 @@ describe("recommendations endpoint", () => {
       Array.from({ length: 24 }, (_, index) => index + 1),
     );
     expect(payload.has_more).toBe(true);
+  });
+
+  it("forwards trimmed search and genre filters across unread and decision statuses", async () => {
+    engineMock.mockResolvedValue([recommendation(35)]);
+
+    const discoverResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=recommended&limit=8&offset=0&search=%20quasar%20cipher%20&genre=%20Science%20Fiction%20",
+      ),
+    } as never);
+    expect(discoverResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=recommended&limit=9&offset=0&search=quasar+cipher&genre=Science+Fiction",
+    );
+
+    const deferredResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=maybe_later&limit=8&offset=8&search=solarpunk",
+      ),
+    } as never);
+    expect(deferredResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=maybe_later&limit=9&offset=8&search=solarpunk",
+    );
+
+    const passedResponse = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=rejected&limit=8&offset=0&genre=Mystery&search=%20%20",
+      ),
+    } as never);
+    expect(passedResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith(
+      "/api/recommendations?status=rejected&limit=9&offset=0&genre=Mystery",
+    );
+  });
+
+  it("rejects oversized search or genre filters before contacting the engine", async () => {
+    const longSearch = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&search=${"a".repeat(201)}`,
+      ),
+    } as never);
+    expect(longSearch.status).toBe(400);
+
+    const longGenre = await GET({
+      url: new URL(
+        `http://bookward.test/api/recommendations?status=recommended&genre=${"g".repeat(101)}`,
+      ),
+    } as never);
+    expect(longGenre.status).toBe(400);
+    expect(engineMock).not.toHaveBeenCalled();
   });
 });

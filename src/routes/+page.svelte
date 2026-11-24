@@ -49,6 +49,7 @@
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
     buildLibrarrDownloadPayload,
@@ -62,6 +63,7 @@
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
   type View = "discover" | "saved" | "decisions" | "sources" | "settings";
+  type FilterableView = "discover" | "saved" | "decisions";
   type NavItem = {
     id: View;
     label: string;
@@ -105,21 +107,43 @@
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state(0);
   let markReadRatingGroup = $state<{ focusFirst: () => void } | null>(null);
-  let filter = $state("");
-  let genreFilter = $state("");
+  let discoverSearch = $state("");
+  let savedSearch = $state("");
+  let decisionsSearch = $state("");
+  let discoverGenre = $state("");
+  let savedGenre = $state("");
+  let decisionsGenre = $state("");
   let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
   let expandedRecommendationDetails = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const DECISION_PAGE_SIZE = 24;
+  const FILTER_DEBOUNCE_MS = 180;
   const FORM_NOTIFICATION_DISMISS_MS = 5000;
   const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
+  let unfilteredDiscoverOffset = $state(0);
+  let unfilteredDiscoverHasMore = $state(false);
+  let filteredDiscoverBooks = $state<PageBook[]>([]);
+  let filteredDiscoverOffset = $state(0);
+  let filteredDiscoverHasMore = $state(false);
+  let filteredDiscoverLoadedKey = $state("");
+  let filteredDiscoverPending = $state(false);
+  let discoverFilterAbortController: AbortController | null = null;
+  let discoverFilterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let discoverHasMore = $state(true);
+  let unfilteredDecisionOffset = $state(0);
+  let queriedDecisionBooks = $state<PageBook[]>([]);
+  let queriedDecisionOffset = $state(0);
+  let queriedDecisionsHasMore = $state(false);
+  let queriedDecisionLoadedKey = $state("");
+  let queriedDecisionPending = $state(false);
+  let decisionQueryAbortController: AbortController | null = null;
+  let decisionQueryDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let previousQueriedDecisionStatus = "decisions";
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
   let decisionsHasMoreOverride = $state<boolean | null>(null);
@@ -141,6 +165,7 @@
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
+  let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
   let pendingActions = $state(new Set<string>());
@@ -242,79 +267,254 @@
       icon: Settings2,
     },
   ];
-  function matchesBookFilter(book: PageBook) {
-    const query = filter.trim().toLowerCase();
-    const selectedGenre = genreFilter.trim().toLowerCase();
+  function searchForView(view: FilterableView) {
+    if (view === "saved") return savedSearch;
+    if (view === "decisions") return decisionsSearch;
+    return discoverSearch;
+  }
+  function setSearchForView(view: FilterableView, value: string) {
+    if (view === "saved") savedSearch = value;
+    else if (view === "decisions") decisionsSearch = value;
+    else discoverSearch = value;
+  }
+  function genreForView(view: FilterableView) {
+    if (view === "saved") return savedGenre;
+    if (view === "decisions") return decisionsGenre;
+    return discoverGenre;
+  }
+  function setGenreForView(view: FilterableView, value: string) {
+    if (view === "saved") savedGenre = value;
+    else if (view === "decisions") decisionsGenre = value;
+    else discoverGenre = value;
+  }
+  function mergeGenres(...lists: ReadonlyArray<ReadonlyArray<string>>) {
+    const seen = new Map<string, string>();
+    for (const list of lists) {
+      for (const raw of list) {
+        const cleaned = raw.trim();
+        if (cleaned && !seen.has(cleaned.toLowerCase())) {
+          seen.set(cleaned.toLowerCase(), cleaned);
+        }
+      }
+    }
+    return [...seen.values()].sort((left, right) => left.localeCompare(right));
+  }
+  function matchesBookFilter(book: PageBook, searchQuery: string, selectedGenre: string) {
+    const query = searchQuery.trim().toLowerCase();
+    const genre = selectedGenre.trim().toLowerCase();
     return (
       (!query ||
-        `${book.title} ${book.author} ${book.genres.join(" ")}`
+        `${book.title} ${book.author} ${book.genres.join(" ")} ${book.synopsis}`
           .toLowerCase()
           .includes(query)) &&
-      (!selectedGenre ||
-        book.genres.some((genre) => genre.trim().toLowerCase() === selectedGenre))
+      (!genre ||
+        book.genres.some((item) => item.trim().toLowerCase() === genre))
     );
+  }
+  function withStatusOverride(book: PageBook): PageBook {
+    const status = bookStatusOverrides[book.id];
+    return status === undefined ? book : { ...book, status };
   }
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
+  const digestSettings = $derived(data.profile.digest);
+  const digestVisible = $derived(
+    digestMode &&
+      (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
+  );
+  const digestRequested = $derived(
+    digestVisible && data.digestReview.requested,
+  );
   const allBooks = $derived.by(() => {
-    const seen = new Set<number>();
-    const merged: PageBook[] = [];
+    const byId = new Map<number, PageBook>();
     for (const book of [
       ...data.books,
+      ...(data.digestReview.books ?? []),
       ...data.decisions,
       ...additionalDiscoverBooks,
+      ...filteredDiscoverBooks,
       ...additionalDecisionBooks,
+      ...queriedDecisionBooks,
     ]) {
-      if (seen.has(book.id)) continue;
-      seen.add(book.id);
-      const status = bookStatusOverrides[book.id];
-      merged.push(status === undefined ? book : { ...book, status });
+      if (!byId.has(book.id)) {
+        byId.set(book.id, withStatusOverride(book));
+      }
     }
-    return merged;
+    return [...byId.values()];
   });
-  const decisionsHasMore = $derived(
-    decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
+  const activeDigestReviewBooks = $derived.by(() => {
+    if (Array.isArray(data.digestReview.books)) {
+      return data.digestReview.books
+        .map(withStatusOverride)
+        .filter((book) => book.status === "recommended");
+    }
+    return allBooks.filter(
+      (book) => book.status === "recommended" && data.digestReview.ids.includes(book.id),
+    );
+  });
+  const unfilteredDiscoverBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const items: PageBook[] = [];
+    for (const raw of [...data.books, ...additionalDiscoverBooks]) {
+      if (seen.has(raw.id)) continue;
+      seen.add(raw.id);
+      const book = withStatusOverride(raw);
+      if (book.status === "recommended") items.push(book);
+    }
+    return items;
+  });
+  const hasActiveDiscoverFilter = $derived(
+    !digestRequested && Boolean(discoverSearch.trim() || discoverGenre.trim()),
   );
-  const discoverBooks = $derived(
-    allBooks.filter(
-      (book) => book.status === "recommended" && matchesBookFilter(book),
-    ),
+  const activeDiscoverFilterKey = $derived(
+    `${discoverSearch.trim().toLowerCase()}\u0000${discoverGenre.trim().toLowerCase()}`,
   );
-  const savedBooks = $derived(allBooks.filter((book) => book.status === "saved" || book.status === "imported"));
+  const discoverBooks = $derived.by(() => {
+    if (!hasActiveDiscoverFilter) return unfilteredDiscoverBooks;
+    if (filteredDiscoverLoadedKey === activeDiscoverFilterKey) {
+      return filteredDiscoverBooks
+        .map(withStatusOverride)
+        .filter(
+          (book) =>
+            book.status === "recommended" &&
+            matchesBookFilter(book, discoverSearch, discoverGenre),
+        );
+    }
+    return unfilteredDiscoverBooks.filter((book) =>
+      matchesBookFilter(book, discoverSearch, discoverGenre),
+    );
+  });
+  const effectiveDiscoverHasMore = $derived(
+    digestRequested
+      ? false
+      : hasActiveDiscoverFilter
+        ? filteredDiscoverLoadedKey === activeDiscoverFilterKey && filteredDiscoverHasMore
+        : unfilteredDiscoverHasMore,
+  );
+  const discoverViewBooks = $derived(
+    digestVisible
+      ? digestRequested
+        ? activeDigestReviewBooks.filter((book) =>
+            matchesBookFilter(book, discoverSearch, discoverGenre),
+          )
+        : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)
+      : discoverBooks,
+  );
+  const discoverViewVisibleBooks = $derived(
+    digestRequested
+      ? discoverViewBooks
+      : discoverViewBooks.slice(0, discoverVisibleCount),
+  );
+  const savedBooks = $derived(
+    allBooks.filter((book) => book.status === "saved" || book.status === "imported"),
+  );
   const shortlistTotalCount = $derived(savedBooks.length);
   const shortlistBooks = $derived.by(() =>
     savedBooks
-      .filter(matchesBookFilter)
+      .filter((book) => matchesBookFilter(book, savedSearch, savedGenre))
       .sort((left, right) => {
         if (shortlistSort === "title") return left.title.localeCompare(right.title);
         if (shortlistSort === "author") return left.author.localeCompare(right.author) || left.title.localeCompare(right.title);
         return right.score - left.score || left.title.localeCompare(right.title);
       }),
   );
-  const genreFilterBooks = $derived(
-    activeView === "saved"
-      ? savedBooks
-      : activeView === "decisions"
-        ? decisionFilter === "read"
-          ? []
-          : allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status))
-        : allBooks.filter((book) => book.status === "recommended"),
+  const isQueriedDecisionMode = $derived(
+    decisionFilter !== "read" &&
+      (decisionFilter !== "all" ||
+        Boolean(decisionsSearch.trim() || decisionsGenre.trim())),
   );
-  const bookGenres = $derived(
-    [...new Set(genreFilterBooks.flatMap((book) => book.genres).map((genre) => genre.trim()).filter(Boolean))]
-      .sort((left, right) => left.localeCompare(right)),
+  const activeDecisionApiStatus = $derived(
+    decisionFilter === "maybe_later" || decisionFilter === "rejected"
+      ? decisionFilter
+      : "decisions",
   );
-  const decisionBooks = $derived(
-    allBooks.filter(
+  const activeDecisionQueryKey = $derived(
+    `${activeDecisionApiStatus}\u0000${decisionsSearch.trim().toLowerCase()}\u0000${decisionsGenre.trim().toLowerCase()}`,
+  );
+  const unfilteredDecisionBooks = $derived.by(() => {
+    const decisionIdSet = new Set(
+      [...data.decisions, ...additionalDecisionBooks].map((book) => book.id),
+    );
+    const optimisticNewDecisions = allBooks.filter(
       (book) =>
-        ["rejected", "maybe_later"].includes(book.status) &&
-        (decisionFilter === "all" || book.status === decisionFilter) &&
-        matchesBookFilter(book),
-    ),
+        !decisionIdSet.has(book.id) &&
+        ["rejected", "maybe_later"].includes(book.status),
+    );
+    const seen = new Set<number>(optimisticNewDecisions.map((book) => book.id));
+    const ordered = [...optimisticNewDecisions];
+    for (const raw of [...data.decisions, ...additionalDecisionBooks]) {
+      if (seen.has(raw.id)) continue;
+      seen.add(raw.id);
+      const book = withStatusOverride(raw);
+      if (["rejected", "maybe_later"].includes(book.status)) {
+        ordered.push(book);
+      }
+    }
+    return ordered;
+  });
+  const decisionBooks = $derived.by(() => {
+    if (!isQueriedDecisionMode) return unfilteredDecisionBooks;
+    const matchesDecisionTab = (book: PageBook) =>
+      ["rejected", "maybe_later"].includes(book.status) &&
+      (decisionFilter === "all" || book.status === decisionFilter) &&
+      matchesBookFilter(book, decisionsSearch, decisionsGenre);
+    if (queriedDecisionLoadedKey === activeDecisionQueryKey) {
+      const queriedIdSet = new Set(queriedDecisionBooks.map((book) => book.id));
+      const optimisticMatches = allBooks.filter(
+        (book) =>
+          bookStatusOverrides[book.id] !== undefined &&
+          !queriedIdSet.has(book.id) &&
+          matchesDecisionTab(book),
+      );
+      return [
+        ...optimisticMatches,
+        ...queriedDecisionBooks.map(withStatusOverride).filter(matchesDecisionTab),
+      ];
+    }
+    return unfilteredDecisionBooks.filter(matchesDecisionTab);
+  });
+  const decisionsHasMore = $derived(
+    isQueriedDecisionMode
+      ? queriedDecisionLoadedKey === activeDecisionQueryKey && queriedDecisionsHasMore
+      : decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
+  const discoverGenres = $derived(
+    digestRequested
+      ? mergeGenres(...activeDigestReviewBooks.map((book) => book.genres))
+      : mergeGenres(
+          data.recommendation_genres ?? [],
+          ...unfilteredDiscoverBooks.map((book) => book.genres),
+          ...filteredDiscoverBooks.map((book) => book.genres),
+        ),
+  );
+  const savedGenres = $derived(
+    mergeGenres(...savedBooks.map((book) => book.genres)),
+  );
+  const decisionGenres = $derived(
+    decisionFilter === "read"
+      ? []
+      : mergeGenres(
+          data.decision_genres ?? [],
+          ...data.decisions.map((book) => book.genres),
+          ...additionalDecisionBooks.map((book) => book.genres),
+          ...queriedDecisionBooks.map((book) => book.genres),
+        ),
+  );
+  function genresForView(view: FilterableView) {
+    if (view === "saved") return savedGenres;
+    if (view === "decisions") return decisionGenres;
+    return discoverGenres;
+  }
+  function canonicalGenreForView(view: FilterableView, rawGenre: string) {
+    const target = rawGenre.trim().toLowerCase();
+    return (
+      genresForView(view).find((genre) => genre.toLowerCase() === target) ??
+      rawGenre.trim()
+    );
+  }
   const filteredReadingHistory = $derived.by(() => {
-    const query = filter.trim().toLowerCase();
+    const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
       if (readingHistoryRatingFilter === "rated") return item.rating !== null && item.rating > 0;
       if (readingHistoryRatingFilter === "unrated") return item.rating === null || item.rating <= 0;
@@ -362,18 +562,6 @@
   const scoredReadingHistoryCount = $derived(
     readingHistory.filter((item) => item.algorithm_score !== null).length,
   );
-  const filteredBooks = $derived(
-    activeView === "saved"
-      ? shortlistBooks
-      : activeView === "decisions"
-        ? decisionBooks
-        : discoverBooks,
-  );
-  const visibleBooks = $derived(
-    activeView === "discover"
-      ? filteredBooks.slice(0, discoverVisibleCount)
-      : filteredBooks,
-  );
   const selectedDigestCount = $derived(selectedDigestIds.size);
   const selectedDigestRunId = $derived.by(() => {
     if (!selectedDigestIds.size) return "";
@@ -387,7 +575,6 @@
     }
     return sharedRunId;
   });
-  const digestSettings = $derived(data.profile.digest);
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
   );
@@ -495,13 +682,10 @@
   const digestEmail = $derived(
     digestEmailOverride ?? digestSettings.channels.includes("email"),
   );
-  const digestVisible = $derived(
-    digestMode &&
-      (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
-  );
   const hasMoreDiscoverBooks = $derived(
     activeView === "discover" &&
-      (visibleBooks.length < filteredBooks.length || discoverHasMore),
+      (discoverViewVisibleBooks.length < discoverViewBooks.length ||
+        effectiveDiscoverHasMore),
   );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
@@ -704,10 +888,11 @@
     readingHistoryScoreTask = task;
     return task;
   }
-  function selectDecisionFilter(filter: "all" | "maybe_later" | "rejected" | "read") {
-    decisionFilter = filter;
+  function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+    decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
-    if (filter === "read") void loadReadingHistory();
+    decisionsLoadError = "";
+    if (nextFilter === "read") void loadReadingHistory();
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -721,12 +906,7 @@
     expandedRecommendationDetails = next;
   }
   function readingSourceLabel(source: string) {
-    return ({
-      goodreads_csv: "Goodreads CSV export",
-      goodreads_rss: "Goodreads read shelf RSS",
-      manual: "Added in Bookward",
-      demo: "Demo data",
-    } as Record<string, string>)[source] ?? (source || "Unknown source");
+    return formatReadingSourceLabel(source);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -833,12 +1013,25 @@
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
+              key === "csv-import" ||
               key === "goodreads-csv")
           ) {
             readingHistory = [];
             readingHistoryState = "idle";
           }
           if (succeeded) change?.commit?.();
+          if (
+            succeeded &&
+            (key === "sync" ||
+              key === "rebuild-embeddings" ||
+              key === "goodreads-rss" ||
+              key === "goodreads-csv" ||
+              key === "source" ||
+              key.startsWith("source-"))
+          ) {
+            if (hasActiveDiscoverFilter) reloadFilteredDiscover();
+            if (isQueriedDecisionMode) reloadQueriedDecisions();
+          }
         } catch (error) {
           rollback();
           announceActionError(
@@ -861,14 +1054,49 @@
     return pendingActions.has(key);
   }
 
+  function applyCommittedStatusToClientSlices(id: number, status: string) {
+    const knownBook = allBooks.find((item) => item.id === id);
+    const prevFilteredDiscover = filteredDiscoverBooks.find((item) => item.id === id);
+    if (prevFilteredDiscover && prevFilteredDiscover.status === "recommended" && status !== "recommended") {
+      filteredDiscoverOffset = Math.max(0, filteredDiscoverOffset - 1);
+    }
+    const prevQueriedDecision = queriedDecisionBooks.find((item) => item.id === id);
+    const wasDecision = prevQueriedDecision && ["rejected", "maybe_later"].includes(prevQueriedDecision.status);
+    const isDecision = ["rejected", "maybe_later"].includes(status);
+    if (wasDecision && !isDecision) {
+      queriedDecisionOffset = Math.max(0, queriedDecisionOffset - 1);
+    }
+    const updateSlice = (items: PageBook[]) =>
+      items.some((item) => item.id === id)
+        ? items.map((item) => (item.id === id ? { ...item, status } : item))
+        : items;
+    additionalDiscoverBooks = updateSlice(additionalDiscoverBooks);
+    filteredDiscoverBooks = updateSlice(filteredDiscoverBooks);
+    additionalDecisionBooks = updateSlice(additionalDecisionBooks);
+    if (
+      isDecision &&
+      !prevQueriedDecision &&
+      queriedDecisionLoadedKey !== "" &&
+      knownBook &&
+      (decisionFilter === "all" || decisionFilter === status) &&
+      matchesBookFilter(knownBook, decisionsSearch, decisionsGenre)
+    ) {
+      queriedDecisionBooks = [{ ...knownBook, status }, ...queriedDecisionBooks];
+      queriedDecisionOffset += 1;
+    } else {
+      queriedDecisionBooks = updateSlice(queriedDecisionBooks);
+    }
+  }
+
   function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
-    const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
+    const book = allBooks.find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
         if (bookStatusOverrides[id] !== status) return;
+        applyCommittedStatusToClientSlices(id, status);
         const next = { ...bookStatusOverrides };
         delete next[id];
         bookStatusOverrides = next;
@@ -1106,85 +1334,278 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  async function fetchInitialFilteredDiscover(
+    key: string,
+    searchQuery: string,
+    selectedGenre: string,
+  ) {
+    discoverFilterAbortController?.abort();
+    const controller = new AbortController();
+    discoverFilterAbortController = controller;
+    discoverLoading = true;
+    discoverLoadError = "";
+    try {
+      const params = new URLSearchParams({
+        status: "recommended",
+        limit: String(DISCOVER_PAGE_SIZE),
+        offset: "0",
+      });
+      if (searchQuery) params.set("search", searchQuery);
+      if (selectedGenre) params.set("genre", selectedGenre);
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+        signal: controller.signal,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        message?: string;
+      };
+      if (discoverFilterAbortController !== controller) return;
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Recommendations could not be loaded.");
+      }
+      filteredDiscoverBooks = payload.items;
+      filteredDiscoverOffset = payload.items.length;
+      filteredDiscoverHasMore = payload.has_more === true;
+      filteredDiscoverLoadedKey = key;
+      filteredDiscoverPending = false;
+      discoverVisibleCount = DISCOVER_PAGE_SIZE;
+    } catch (error) {
+      if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
+      discoverLoadError =
+        error instanceof Error
+          ? error.message
+          : "Recommendations could not be loaded.";
+      filteredDiscoverBooks = [];
+      filteredDiscoverOffset = 0;
+      filteredDiscoverHasMore = false;
+      filteredDiscoverLoadedKey = key;
+      filteredDiscoverPending = false;
+    } finally {
+      if (discoverFilterAbortController === controller) {
+        discoverFilterAbortController = null;
+        discoverLoading = false;
+      }
+    }
+  }
+
+  function reloadFilteredDiscover() {
+    if (!hasActiveDiscoverFilter) return;
+    filteredDiscoverPending = true;
+    void fetchInitialFilteredDiscover(
+      activeDiscoverFilterKey,
+      discoverSearch.trim(),
+      discoverGenre.trim(),
+    );
+  }
+
   async function loadMoreDiscover() {
-    if (discoverLoading) return;
-    if (discoverVisibleCount < filteredBooks.length) {
+    if (discoverLoading || filteredDiscoverPending || digestRequested) return;
+    if (discoverVisibleCount < discoverViewBooks.length) {
       discoverVisibleCount = Math.min(
         discoverVisibleCount + DISCOVER_PAGE_SIZE,
-        filteredBooks.length,
+        discoverViewBooks.length,
       );
       return;
     }
-    if (!discoverHasMore) return;
+    if (!effectiveDiscoverHasMore) return;
 
+    const filteredMode = hasActiveDiscoverFilter;
+    const expectedFilterKey = activeDiscoverFilterKey;
+    const searchQuery = discoverSearch.trim();
+    const selectedGenre = discoverGenre.trim();
+    const offset = filteredMode ? filteredDiscoverOffset : unfilteredDiscoverOffset;
+    const controller = new AbortController();
+    discoverFilterAbortController = controller;
     discoverLoading = true;
     discoverLoadError = "";
-    const offset = allBooks.filter((book) => book.status === "recommended").length;
     try {
       const params = new URLSearchParams({
         status: "recommended",
         limit: String(DISCOVER_PAGE_SIZE),
         offset: String(offset),
       });
-      const response = await fetch(`/api/recommendations?${params.toString()}`, { headers: profileHeaders });
+      if (filteredMode && searchQuery) params.set("search", searchQuery);
+      if (filteredMode && selectedGenre) params.set("genre", selectedGenre);
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+        signal: controller.signal,
+      });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
       };
+      if (discoverFilterAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
         throw new Error(payload.message || "Recommendations could not be loaded.");
       }
-      const existing = new Set(allBooks.map((book) => book.id));
-      additionalDiscoverBooks = [
-        ...additionalDiscoverBooks,
-        ...payload.items.filter((book) => !existing.has(book.id)),
-      ];
-      discoverHasMore = payload.has_more === true;
+      if (filteredMode) {
+        if (activeDiscoverFilterKey !== expectedFilterKey) return;
+        const existing = new Set(filteredDiscoverBooks.map((book) => book.id));
+        filteredDiscoverBooks = [
+          ...filteredDiscoverBooks,
+          ...payload.items.filter((book) => !existing.has(book.id)),
+        ];
+        filteredDiscoverOffset = offset + payload.items.length;
+        filteredDiscoverHasMore = payload.has_more === true;
+      } else {
+        const existing = new Set(
+          [...data.books, ...additionalDiscoverBooks].map((book) => book.id),
+        );
+        additionalDiscoverBooks = [
+          ...additionalDiscoverBooks,
+          ...payload.items.filter((book) => !existing.has(book.id)),
+        ];
+        unfilteredDiscoverOffset = offset + payload.items.length;
+        unfilteredDiscoverHasMore = payload.has_more === true;
+      }
       discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
-      discoverLoadError = error instanceof Error ? error.message : "Recommendations could not be loaded.";
+      if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
+      discoverLoadError =
+        error instanceof Error
+          ? error.message
+          : "Recommendations could not be loaded.";
     } finally {
-      discoverLoading = false;
+      if (discoverFilterAbortController === controller) {
+        discoverFilterAbortController = null;
+        discoverLoading = false;
+      }
     }
   }
 
-  async function loadMoreDecisions() {
-    if (decisionsLoading || !decisionsHasMore) return;
+  async function fetchInitialQueriedDecisions(
+    key: string,
+    apiStatus: string,
+    searchQuery: string,
+    selectedGenre: string,
+  ) {
+    decisionQueryAbortController?.abort();
+    const controller = new AbortController();
+    decisionQueryAbortController = controller;
     decisionsLoading = true;
     decisionsLoadError = "";
-    const offset = data.decisions.length + additionalDecisionBooks.length;
     try {
       const params = new URLSearchParams({
-        status: "decisions",
+        status: apiStatus,
         limit: String(DECISION_PAGE_SIZE),
-        offset: String(offset),
+        offset: "0",
       });
+      if (searchQuery) params.set("search", searchQuery);
+      if (selectedGenre) params.set("genre", selectedGenre);
       const response = await fetch(`/api/recommendations?${params.toString()}`, {
         headers: profileHeaders,
+        signal: controller.signal,
       });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
       };
+      if (decisionQueryAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
         throw new Error(payload.message || "Past decisions could not be loaded.");
       }
-      const existing = new Set(
-        [...data.decisions, ...additionalDecisionBooks].map((book) => book.id),
-      );
-      additionalDecisionBooks = [
-        ...additionalDecisionBooks,
-        ...payload.items.filter((book) => !existing.has(book.id)),
-      ];
-      decisionsHasMoreOverride = payload.has_more === true;
+      queriedDecisionBooks = payload.items;
+      queriedDecisionOffset = payload.items.length;
+      queriedDecisionsHasMore = payload.has_more === true;
+      queriedDecisionLoadedKey = key;
+      queriedDecisionPending = false;
     } catch (error) {
+      if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
+      decisionsLoadError =
+        error instanceof Error
+          ? error.message
+          : "Past decisions could not be loaded.";
+      queriedDecisionBooks = [];
+      queriedDecisionOffset = 0;
+      queriedDecisionsHasMore = false;
+      queriedDecisionLoadedKey = key;
+      queriedDecisionPending = false;
+    } finally {
+      if (decisionQueryAbortController === controller) {
+        decisionQueryAbortController = null;
+        decisionsLoading = false;
+      }
+    }
+  }
+
+  function reloadQueriedDecisions() {
+    if (!isQueriedDecisionMode) return;
+    queriedDecisionPending = true;
+    void fetchInitialQueriedDecisions(
+      activeDecisionQueryKey,
+      activeDecisionApiStatus,
+      decisionsSearch.trim(),
+      decisionsGenre.trim(),
+    );
+  }
+
+  async function loadMoreDecisions() {
+    if (decisionsLoading || queriedDecisionPending || !decisionsHasMore) return;
+    const queriedMode = isQueriedDecisionMode;
+    const expectedKey = activeDecisionQueryKey;
+    const apiStatus = activeDecisionApiStatus;
+    const searchQuery = decisionsSearch.trim();
+    const selectedGenre = decisionsGenre.trim();
+    const offset = queriedMode ? queriedDecisionOffset : unfilteredDecisionOffset;
+    const controller = new AbortController();
+    decisionQueryAbortController = controller;
+    decisionsLoading = true;
+    decisionsLoadError = "";
+    try {
+      const params = new URLSearchParams({
+        status: apiStatus,
+        limit: String(DECISION_PAGE_SIZE),
+        offset: String(offset),
+      });
+      if (queriedMode && searchQuery) params.set("search", searchQuery);
+      if (queriedMode && selectedGenre) params.set("genre", selectedGenre);
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+        signal: controller.signal,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        message?: string;
+      };
+      if (decisionQueryAbortController !== controller) return;
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Past decisions could not be loaded.");
+      }
+      if (queriedMode) {
+        if (activeDecisionQueryKey !== expectedKey) return;
+        const existing = new Set(queriedDecisionBooks.map((book) => book.id));
+        queriedDecisionBooks = [
+          ...queriedDecisionBooks,
+          ...payload.items.filter((book) => !existing.has(book.id)),
+        ];
+        queriedDecisionOffset = offset + payload.items.length;
+        queriedDecisionsHasMore = payload.has_more === true;
+      } else {
+        const existing = new Set(
+          [...data.decisions, ...additionalDecisionBooks].map((book) => book.id),
+        );
+        additionalDecisionBooks = [
+          ...additionalDecisionBooks,
+          ...payload.items.filter((book) => !existing.has(book.id)),
+        ];
+        unfilteredDecisionOffset = offset + payload.items.length;
+        decisionsHasMoreOverride = payload.has_more === true;
+      }
+    } catch (error) {
+      if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError = error instanceof Error
         ? error.message
         : "Past decisions could not be loaded.";
     } finally {
-      decisionsLoading = false;
+      if (decisionQueryAbortController === controller) {
+        decisionQueryAbortController = null;
+        decisionsLoading = false;
+      }
     }
   }
 
@@ -1396,10 +1817,19 @@
 
   $effect(() => {
     const nextBooks = data.books;
-    if (previousDataBooks === nextBooks) return;
+    const nextHasMore = Boolean(data.recommendations_has_more);
+    if (
+      previousDataBooks === nextBooks &&
+      previousDataRecommendationsHasMore === nextHasMore
+    )
+      return;
     previousDataBooks = nextBooks;
+    previousDataRecommendationsHasMore = nextHasMore;
     additionalDiscoverBooks = [];
-    discoverHasMore = true;
+    unfilteredDiscoverOffset = nextBooks.filter(
+      (book) => book.status === "recommended",
+    ).length;
+    unfilteredDiscoverHasMore = nextHasMore;
     discoverLoadError = "";
   });
 
@@ -1413,21 +1843,121 @@
     previousDataDecisions = nextDecisions;
     previousDataDecisionsHasMore = nextHasMore;
     additionalDecisionBooks = [];
+    unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
   });
 
   $effect(() => {
-    activeView;
-    filter;
-    genreFilter;
+    discoverSearch;
+    discoverGenre;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;
   });
 
   $effect(() => {
-    const selected = genreFilter.trim().toLowerCase();
-    if (selected && !bookGenres.some((genre) => genre.toLowerCase() === selected)) {
-      genreFilter = "";
+    if (discoverFilterDebounceTimer) {
+      clearTimeout(discoverFilterDebounceTimer);
+      discoverFilterDebounceTimer = null;
+    }
+    const filtered = hasActiveDiscoverFilter;
+    const key = activeDiscoverFilterKey;
+    const loadedKey = untrack(() => filteredDiscoverLoadedKey);
+    const searchQuery = discoverSearch.trim();
+    const selectedGenre = discoverGenre.trim();
+    if (!filtered) {
+      discoverFilterAbortController?.abort();
+      discoverFilterAbortController = null;
+      filteredDiscoverPending = false;
+      filteredDiscoverBooks = [];
+      filteredDiscoverOffset = 0;
+      filteredDiscoverHasMore = false;
+      filteredDiscoverLoadedKey = "";
+      discoverLoading = false;
+      discoverLoadError = "";
+      return;
+    }
+    if (loadedKey === key) return;
+    filteredDiscoverPending = true;
+    discoverLoadError = "";
+    discoverFilterDebounceTimer = setTimeout(() => {
+      discoverFilterDebounceTimer = null;
+      void fetchInitialFilteredDiscover(key, searchQuery, selectedGenre);
+    }, FILTER_DEBOUNCE_MS);
+    return () => {
+      if (discoverFilterDebounceTimer) {
+        clearTimeout(discoverFilterDebounceTimer);
+        discoverFilterDebounceTimer = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    if (decisionQueryDebounceTimer) {
+      clearTimeout(decisionQueryDebounceTimer);
+      decisionQueryDebounceTimer = null;
+    }
+    const queried = isQueriedDecisionMode;
+    const key = activeDecisionQueryKey;
+    const apiStatus = activeDecisionApiStatus;
+    const loadedKey = untrack(() => queriedDecisionLoadedKey);
+    const searchQuery = decisionsSearch.trim();
+    const selectedGenre = decisionsGenre.trim();
+    if (!queried) {
+      decisionQueryAbortController?.abort();
+      decisionQueryAbortController = null;
+      queriedDecisionPending = false;
+      queriedDecisionBooks = [];
+      queriedDecisionOffset = 0;
+      queriedDecisionsHasMore = false;
+      queriedDecisionLoadedKey = "";
+      previousQueriedDecisionStatus = apiStatus;
+      decisionsLoading = false;
+      decisionsLoadError = "";
+      return;
+    }
+    const statusChanged = previousQueriedDecisionStatus !== apiStatus;
+    previousQueriedDecisionStatus = apiStatus;
+    if (loadedKey === key) return;
+    queriedDecisionPending = true;
+    decisionsLoadError = "";
+    const delay = statusChanged || loadedKey === "" && !searchQuery && !selectedGenre
+      ? 0
+      : FILTER_DEBOUNCE_MS;
+    if (delay === 0) {
+      void fetchInitialQueriedDecisions(key, apiStatus, searchQuery, selectedGenre);
+      return;
+    }
+    decisionQueryDebounceTimer = setTimeout(() => {
+      decisionQueryDebounceTimer = null;
+      void fetchInitialQueriedDecisions(key, apiStatus, searchQuery, selectedGenre);
+    }, delay);
+    return () => {
+      if (decisionQueryDebounceTimer) {
+        clearTimeout(decisionQueryDebounceTimer);
+        decisionQueryDebounceTimer = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    const selected = discoverGenre.trim().toLowerCase();
+    if (selected && !discoverGenres.some((genre) => genre.toLowerCase() === selected)) {
+      discoverGenre = "";
+    }
+  });
+
+  $effect(() => {
+    const selected = savedGenre.trim().toLowerCase();
+    if (selected && !savedGenres.some((genre) => genre.toLowerCase() === selected)) {
+      savedGenre = "";
+    }
+  });
+
+  $effect(() => {
+    if (decisionFilter === "read") return;
+    const selected = decisionsGenre.trim().toLowerCase();
+    if (selected && !decisionGenres.some((genre) => genre.toLowerCase() === selected)) {
+      decisionsGenre = "";
     }
   });
 
@@ -1445,15 +1975,28 @@
 
   $effect(() => {
     const sentinel = loadMoreSentinel;
+    const canLoadMore = hasMoreDiscoverBooks;
+    const loading = discoverLoading;
+    const pending = filteredDiscoverPending;
+    const hasError = Boolean(discoverLoadError);
+    const visibleCount = discoverViewVisibleBooks.length;
+    const serverOffset = hasActiveDiscoverFilter
+      ? filteredDiscoverOffset
+      : unfilteredDiscoverOffset;
+    void visibleCount;
+    void serverOffset;
     if (
       !sentinel ||
-      !hasMoreDiscoverBooks ||
+      !canLoadMore ||
+      loading ||
+      pending ||
+      hasError ||
       typeof IntersectionObserver === "undefined"
     )
       return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) loadMoreDiscover();
+        if (entries.some((entry) => entry.isIntersecting)) void loadMoreDiscover();
       },
       { rootMargin: "240px 0px" },
     );
@@ -1574,6 +2117,9 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
+      const runId = librarrSearchBook
+        ? String(allBooks.find((book) => book.id === librarrSearchBook?.id)?.recommendation_run_id || "").trim()
+        : "";
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
@@ -1582,6 +2128,7 @@
             librarrSearchedMediaType,
             result,
             librarrSearchBook?.id,
+            runId,
           ),
         ),
       });
@@ -1590,7 +2137,6 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -1733,6 +2279,10 @@
     }
     return () => {
       lifecycle.abort();
+      if (discoverFilterDebounceTimer) clearTimeout(discoverFilterDebounceTimer);
+      if (decisionQueryDebounceTimer) clearTimeout(decisionQueryDebounceTimer);
+      discoverFilterAbortController?.abort();
+      decisionQueryAbortController?.abort();
       void telemetry.flush({ beacon: true });
       telemetry.destroy();
       window.removeEventListener("popstate", onPopState);
@@ -1944,30 +2494,44 @@
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
 
-        {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : view === "saved" ? shortlistBooks : decisionBooks}
-        {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
-        {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
+        {@const viewSearch = searchForView(view)}
+        {@const viewGenre = genreForView(view)}
+        {@const viewGenres = genresForView(view)}
+        {@const viewHasFilter = Boolean(viewSearch.trim() || viewGenre.trim())}
+        {@const viewBooks = view === "discover" ? discoverViewBooks : view === "saved" ? shortlistBooks : decisionBooks}
+        {@const viewVisibleBooks = view === "discover" ? discoverViewVisibleBooks : viewBooks}
+        {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || effectiveDiscoverHasMore)}
+        {@const viewInitialLoading = (view === "discover" && hasActiveDiscoverFilter && (filteredDiscoverPending || (discoverLoading && filteredDiscoverLoadedKey !== activeDiscoverFilterKey))) || (view === "decisions" && isQueriedDecisionMode && (queriedDecisionPending || (decisionsLoading && queriedDecisionLoadedKey !== activeDecisionQueryKey)))}
+        {@const viewFilterError = view === "discover" && hasActiveDiscoverFilter ? discoverLoadError : view === "decisions" && isQueriedDecisionMode ? decisionsLoadError : ""}
         <section class="mb-8 flex min-w-0 flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="min-w-0 break-words text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex min-w-0 w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
-              <div class="input flex min-h-11 w-full min-w-0 items-center gap-2 sm:flex-1">
-                <Search size={17} class="shrink-0 text-surface-600-400" />
-                <input
-                  bind:value={filter}
-                  class="input-ghost min-w-0 flex-1"
-                  aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
-                  placeholder={view === "saved" ? "Search shortlist" : "Search books"}
-                />
-                {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+              <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
+                <label class="flex min-h-11 min-w-0 flex-1 cursor-text items-center gap-2 self-stretch pl-3 pr-2">
+                  <Search size={17} class="shrink-0 text-surface-600-400" />
+                  <input
+                    value={viewSearch}
+                    oninput={(event) => setSearchForView(view, event.currentTarget.value)}
+                    class="input-ghost min-h-11 min-w-0 flex-1 self-stretch"
+                    aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
+                    placeholder={view === "saved" ? "Search shortlist" : "Search books"}
+                  />
+                </label>
+                {#if viewSearch}<button type="button" class="btn-icon btn-icon-sm mr-1.5 min-h-8 min-w-8 shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => setSearchForView(view, "")}><X size={15} /></button>{/if}
               </div>
-              {#if bookGenres.length && !(view === "decisions" && decisionFilter === "read")}
+              {#if viewGenres.length && !(view === "decisions" && decisionFilter === "read")}
                 <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
                   Genre
-                  <select class="select mt-1 min-h-11 w-full preset-tonal-surface" bind:value={genreFilter} aria-label={view === "saved" ? "Filter shortlist by genre" : "Filter books by genre"}>
+                  <select
+                    class="select mt-1 min-h-11 w-full preset-tonal-surface"
+                    value={viewGenre}
+                    onchange={(event) => setGenreForView(view, event.currentTarget.value)}
+                    aria-label={view === "saved" ? "Filter shortlist by genre" : view === "decisions" ? "Filter past decisions by genre" : "Filter books by genre"}
+                  >
                     <option value="">All genres</option>
-                    {#each bookGenres as genre (genre)}<option value={genre}>{genre}</option>{/each}
+                    {#each viewGenres as genre (genre)}<option value={genre} selected={viewGenre.toLowerCase() === genre.toLowerCase()}>{genre}</option>{/each}
                   </select>
                 </label>
               {/if}
@@ -1986,12 +2550,11 @@
         {#if view === "decisions"}
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => (decisionFilter = "all")}>All</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => (decisionFilter = "maybe_later")}>Maybe later</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => (decisionFilter = "rejected")}>Passed</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
-            {#if decisionFilter !== "read" && decisionsHasMore}<p class="mt-3 text-sm text-surface-600-400" role="status">Search and filters include {allBooks.filter((book) => ["rejected", "maybe_later"].includes(book.status)).length} loaded decisions. Load more to include older books.</p>{/if}
           </section>
         {/if}
         {#if view !== "decisions" || decisionFilter !== "read"}
@@ -2040,17 +2603,6 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              {#if view === "discover" && digestVisible && book.status === "recommended"}
-                <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
-                  <input
-                    class="checkbox size-5 accent-secondary-500"
-                    type="checkbox"
-                    checked={selectedDigestIds.has(book.id)}
-                    onchange={() => toggleDigestBook(book.id)}
-                    aria-label={`Select ${book.title} for shortlist`}
-                  />
-                </label>
-              {/if}
               <div
                 class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
               >
@@ -2079,17 +2631,28 @@
                   <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                 </button>
               </div>
-              <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
+              <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
+                  {#if view === "discover" && digestVisible && book.status === "recommended"}
+                    <label class="grid size-8 shrink-0 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg sm:absolute sm:left-3 sm:top-3 sm:z-30" title={`Select ${book.title}`}>
+                      <input
+                        class="checkbox size-6 accent-secondary-500"
+                        type="checkbox"
+                        checked={selectedDigestIds.has(book.id)}
+                        onchange={() => toggleDigestBook(book.id)}
+                        aria-label={`Select ${book.title} for shortlist`}
+                      />
+                    </label>
+                  {/if}
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
-                  {#each book.genres.slice(0, 2) as genre (genre)}{@const genrePressed = genreFilter.trim().toLowerCase() === genre.trim().toLowerCase()}<ChipToggle pressed={genrePressed} label={genre} ariaLabel={`${genre} filter`} onToggle={(next) => { genreFilter = next ? (bookGenres.find((item) => item.toLowerCase() === genre.trim().toLowerCase()) ?? genre.trim()) : ""; }} />{/each}
+                  {#each book.genres.slice(0, 2) as genre (genre)}{@const genrePressed = viewGenre.trim().toLowerCase() === genre.trim().toLowerCase()}<ChipToggle pressed={genrePressed} label={genre} ariaLabel={`${genre} filter`} onToggle={(next) => setGenreForView(view, next ? canonicalGenreForView(view, genre) : "")} />{/each}
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
-                      class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
+                      class="btn btn-icon btn-xs min-h-8 min-w-8 preset-tonal-surface shrink-0"
                       href={book.source_url}
                       target="_blank"
                       rel="noreferrer"
@@ -2161,14 +2724,16 @@
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
-                      </form>
-                    {:else}
+                      {#if book.status === "saved"}
+                        <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                          <ProfileField profileId={data.user?.profile_id} />
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        </form>
+                      {/if}
+                    {:else if book.status === "saved"}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
@@ -2178,20 +2743,10 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                      </form>
-                    {/if}
-                  {:else if book.status === "imported"}
-                    <button
-                      in:fly={{ y: 8, duration: motionDuration(180) }}
-                      type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
-                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                      onclick={() => openMarkRead(book)}
-                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                    </form>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -2201,21 +2756,30 @@
                 </div>
               </div>
             </article>
-          {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
-              <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
-              <div>
-                <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : filter || genreFilter ? "No books match these filters" : view === "decisions" ? "No past decisions" : digestVisible ? "No digest picks yet" : view === "saved" ? "No shortlist books match these filters" : "You are all caught up"}</h2>
-                <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : filter || genreFilter ? "Change the search or genre filter to see more books." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+          {:else}
+            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status">
+                <RefreshCw size={17} class="animate-spin" />{view === "decisions" ? "Loading past decisions…" : "Searching recommendations…"}
               </div>
-              {#if view === "saved"}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
-              {#if view === "discover" && !filter && !genreFilter && !digestVisible && !discoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
-                <ProfileField profileId={data.user?.profile_id} />
-                <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
-                  {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
-                </button>
-              </form>{/if}
-            </div>{/each}
-          {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex justify-center pt-1">
+            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
+                <p class="text-sm text-surface-700-300">{viewFilterError}</p>
+                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
+              </div>
+            {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
+                <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
+                <div>
+                  <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : view === "saved" && viewHasFilter ? "No shortlist books match these filters" : viewHasFilter ? "No books match these filters" : view === "decisions" && decisionFilter === "maybe_later" ? "No deferred books" : view === "decisions" && decisionFilter === "rejected" ? "No passed books" : view === "decisions" ? "No past decisions" : digestRequested ? "No unread digest picks left" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
+                  <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : view === "saved" && viewHasFilter ? "Change the shortlist search or genre filter to see your saved books." : viewHasFilter ? "Change the search or genre filter to see more books." : view === "decisions" && decisionFilter === "maybe_later" ? "Books you set aside with Maybe later will appear here." : view === "decisions" && decisionFilter === "rejected" ? "Books you pass on will appear here." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestRequested ? "You have already acted on the books from this digest, or open View all to browse Discover." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
+                </div>
+                {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
+                {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+                  <ProfileField profileId={data.user?.profile_id} />
+                  <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
+                    {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
+                  </button>
+                </form>{/if}
+              </div>{/if}{/each}
+          {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
+              {#if discoverLoadError}<p class="text-sm text-error-600-400" role="alert">{discoverLoadError}</p>{/if}
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
@@ -2355,8 +2919,8 @@
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
-                  <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <h2 class="font-semibold text-surface-950-50">{decisionsSearch || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{decisionsSearch || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -2549,7 +3113,7 @@
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
                                   <span aria-hidden="true"> · </span>
                                   <form
-                                    class="inline"
+                                    class="inline-flex"
                                     method="POST"
                                     action="?/switchSourceToOneTime"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
@@ -2557,7 +3121,7 @@
                                     <ProfileField profileId={data.user?.profile_id} />
                                     <input type="hidden" name="id" value={source.id} />
                                     <button
-                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
                                       disabled={isPending(`source-lifecycle-${source.id}`)}
                                       aria-busy={isPending(`source-lifecycle-${source.id}`)}
@@ -2568,8 +3132,8 @@
                                 {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {/if}
                             </span>
-                            <details class="mt-3 w-full max-w-full">
-                              <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                            <details class="mt-2 w-full max-w-full">
+                              <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                 Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
                                   ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                   : ""}
@@ -2746,7 +3310,7 @@
                       <option value="one_time">One-time import · scan once</option>
                     </select></label
                   ><details class="mt-4 border-l-2 border-tertiary-500/30 pl-3">
-                    <summary class="cursor-pointer text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
+                    <summary class="min-h-8 cursor-pointer py-2 text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
                       Optional filters
                     </summary>
                     <div class="mt-3 space-y-3">
@@ -2950,9 +3514,9 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
-                action="?/importGoodreadsCsv"
+                action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("goodreads-csv")}
+                use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex items-center justify-between gap-4">
@@ -2964,7 +3528,7 @@
                     <h2
                       class="truncate text-lg font-semibold text-surface-950-50"
                     >
-                      Goodreads export
+                      CSV library export
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
@@ -2972,11 +3536,11 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import the books on your Goodreads read shelf, with their ratings and read dates.
+                  Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
                   class="mt-5 block min-w-0 text-sm font-medium text-surface-800-200"
-                  >Goodreads CSV<input
+                  >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
                     type="file"
@@ -2986,9 +3550,9 @@
                 ><button
                   class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
-                  disabled={isPending("goodreads-csv")}
-                  aria-busy={isPending("goodreads-csv")}
-                  >{#if isPending("goodreads-csv")}<RefreshCw
+                  disabled={isPending("csv-import")}
+                  aria-busy={isPending("csv-import")}
+                  >{#if isPending("csv-import")}<RefreshCw
                       size={16}
                       class="animate-spin"
                     />{:else}<Upload size={16} />{/if} Import CSV</button
@@ -3236,7 +3800,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Add a Google Books API key to prevent rate-limit throttling when verifying and enriching new book candidates.
                   <a
-                    class="inline-flex items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://developers.google.com/books/docs/v1/using"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3262,8 +3826,8 @@
                   >
                   {#if data.profile.google_books_api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clear" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clear" />
                       Clear saved API key</label
                     >
                   {/if}
@@ -3307,7 +3871,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Optionally rerank top recommendations with an OpenAI-compatible LLM. Pick a provider and model from
                   <a
-                    class="font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://models.dev"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3407,9 +3971,9 @@
                   <ProfileField profileId={data.user?.profile_id} />
                   <input type="hidden" name="provider" value={llmProvider} />
                   <label
-                    class="flex items-center gap-3 text-sm font-medium text-surface-800-200"
+                    class="flex min-h-11 cursor-pointer items-center gap-3 text-sm font-medium text-surface-800-200"
                     ><input
-                      class="checkbox"
+                      class="checkbox size-6 shrink-0"
                       type="checkbox"
                       name="enabled"
                       checked={llmEnabled}
@@ -3457,8 +4021,8 @@
                   >
                   {#if llmRerank.api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clearApiKey" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clearApiKey" />
                       Clear saved LLM API key</label
                     >
                   {/if}
@@ -3655,7 +4219,7 @@
                             </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 min-w-0 space-y-3">
                               <label class="block min-w-0 text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
-                              {#if digestSettings.discord_webhook_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
+                              {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
@@ -3686,7 +4250,7 @@
                                 <label class="block min-w-0 text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value="" placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
                                 <label class="block min-w-0 text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
-                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
+                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
                             </div>{:else}<input type="hidden" name="emailTo" value={digestSettings.email_to} /><input type="hidden" name="emailFrom" value={digestSettings.email_from} /><input type="hidden" name="smtpHost" value={digestSettings.smtp_host} /><input type="hidden" name="smtpPort" value={digestSettings.smtp_port} /><input type="hidden" name="smtpSecurity" value={digestSettings.smtp_security} />{/if}
                           </div>
                         </div>
@@ -3832,7 +4396,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm shrink-0 rounded-full preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 rounded-full preset-tonal-surface"
             aria-label="Close Mark Read dialog"
             data-modal-initial-focus
             onclick={closeMarkRead}
@@ -3943,7 +4507,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm shrink-0 preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface"
             aria-label="Close Librarr search"
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
@@ -3957,9 +4521,9 @@
             }}
           >
             <label
-              class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
+              class="input flex min-h-12 min-w-0 flex-1 cursor-text items-center gap-2 py-0!"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
+                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch focus:outline-none focus:ring-0"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"
@@ -4044,7 +4608,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -4094,7 +4658,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}
