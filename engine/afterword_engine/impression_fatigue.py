@@ -77,12 +77,12 @@ def apply_impression_fatigue(
         penalty = min(max(0.0, float(max_penalty)), excess_days * max(0.0, float(penalty_per_day)))
         if penalty > 0:
             base_score = float(copy.get("score") or 0.0)
-            copy["score"] = round(max(0.0, base_score - penalty), 1)
+            copy["score"] = round(max(0.0, base_score - penalty), 2)
             copy["fatigue_penalty"] = round(penalty, 2)
             explanation = copy.get("explanation")
             explanation_list = list(explanation) if isinstance(explanation, list) else []
             fatigue_reason = (
-                "Lowered slightly after appearing on several recent days without a decision"
+                "Lowered after appearing on several recent days without a decision"
             )
             if fatigue_reason not in explanation_list:
                 copy["explanation"] = [*explanation_list, fatigue_reason]

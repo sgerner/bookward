@@ -23,7 +23,7 @@ from .database import rows
 from .embeddings import content_hash
 from .identity import book_identity
 from .scoring import document
-from .subjects import normalize_subjects, subject_display_map
+from .subjects import normalize_subjects, resolve_subject_label, subject_display_map
 
 
 MAX_INTERACTION_EVENTS = 5_000
@@ -668,7 +668,7 @@ def personalize_recommendations(
                 else:
                     subject_key = feature.removeprefix("subject:")
                     subject_labels = subject_display_map(item.get("genres"), limit=8)
-                    subject_label = subject_labels.get(subject_key, subject_key)
+                    subject_label = resolve_subject_label(subject_key, subject_labels)
                     detail = f"subject {subject_label}"
                 message += f" ({detail})"
             if message not in explanation:

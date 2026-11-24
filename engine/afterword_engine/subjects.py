@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import re
 import unicodedata
@@ -70,6 +71,12 @@ def normalize_subjects(value: object, limit: int = 8) -> list[str]:
     return subjects
 
 
+def _sentence_case_if_lower(value: str) -> str:
+    if value and value == value.lower() and any(ch.isalpha() for ch in value):
+        return value[:1].upper() + value[1:]
+    return value
+
+
 def subject_display_map(value: object, limit: int = 8) -> dict[str, str]:
     """Map normalized subject keys to display-cased subject labels."""
 
@@ -77,5 +84,20 @@ def subject_display_map(value: object, limit: int = 8) -> dict[str, str]:
     for subject in normalize_subjects(value, limit=limit):
         key = _subject_key(subject)
         if key and key not in mapping:
-            mapping[key] = subject
+            mapping[key] = _sentence_case_if_lower(subject)
     return mapping
+
+
+def resolve_subject_label(
+    raw_subject: str,
+    subject_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve a display-cased subject label without falling back to lowercase."""
+
+    cleaned = str(raw_subject or "").strip()
+    if not cleaned:
+        return ""
+    key = _subject_key(cleaned)
+    if subject_labels and key in subject_labels:
+        return subject_labels[key]
+    return _sentence_case_if_lower(cleaned)

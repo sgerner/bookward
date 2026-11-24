@@ -168,7 +168,7 @@ def test_weekly_digest_lines_prefer_positive_or_source_reason_and_drop_legacy_ja
             "author": "Writer C",
             "score": 72.5,
             "explanation": [
-                "Lowered slightly after appearing on several recent days without a decision",
+                "Lowered after appearing on several recent days without a decision",
                 "Reduced: books from the 1970s tend to score lower in your reading history",
             ],
         },
@@ -179,7 +179,7 @@ def test_weekly_digest_lines_prefer_positive_or_source_reason_and_drop_legacy_ja
     assert "imported" not in text
     assert '1–2★ book ("Bad Read")' not in text
     assert "Moved up for variety" not in text
-    assert "Lowered slightly" not in text
+    assert "Lowered after appearing" not in text
     assert "Raised using books you shortlisted, added to Librarr, or rated highly (subject Sci-Fi)" in text
     assert "From Booker Longlist" in text
     assert "• Caveat First Legacy — Writer A (ranking score 84)" in text

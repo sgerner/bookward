@@ -43,7 +43,7 @@ function sampleBook(overrides: Record<string, unknown> = {}) {
       'Similar to "The Dispossessed" (5★)',
       "Raised using books you shortlisted, added to Librarr, or rated highly (subject Science fiction)",
       "From Curated Sci-Fi",
-      "Lowered slightly after appearing on several recent days without a decision",
+      "Lowered after appearing on several recent days without a decision",
     ],
     reason: 'Similar to "The Dispossessed" (5★)',
     status: "recommended",
@@ -141,7 +141,7 @@ describe("recommendation card presentation", () => {
     expect(body).not.toContain("Book summary");
     expect(body).toMatch(/<ul[^>]*>[\s\S]*<li>Similar to "The Dispossessed" \(5★\)<\/li>/);
     expect(body).toContain(
-      "<li>Lowered slightly after appearing on several recent days without a decision</li>",
+      "<li>Lowered after appearing on several recent days without a decision</li>",
     );
 
     // Inline synopsis appears before the collapsible rationale disclosure.

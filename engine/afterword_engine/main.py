@@ -1627,86 +1627,26 @@ def reading_history():
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
         ).fetchall()]
-        matched_candidates = []
-        candidate_keys = [
-            key
-            for key in dict.fromkeys(
-                normalize_key(item["title"], item["author"]) for item in items
-            )
-            if key
-        ]
+        existing_scores = []
+        candidate_keys = list(dict.fromkeys(
+            normalize_key(item["title"], item["author"]) for item in items
+        ))
         for start in range(0, len(candidate_keys), 500):
             key_batch = candidate_keys[start:start + 500]
             placeholders = ",".join("?" for _ in key_batch)
-            matched_candidates.extend(connection.execute(
-                "SELECT id,title,author,normalized_key FROM candidates "
-                f"WHERE normalized_key IN ({placeholders}) "
+            existing_scores.extend(connection.execute(
+                "SELECT title,author,score FROM candidates "
+                f"WHERE status!='new' AND normalized_key IN ({placeholders}) "
                 "ORDER BY updated_at DESC,id DESC",
                 key_batch,
             ).fetchall())
-        if items:
-            matched_candidates.extend(connection.execute(
-                "SELECT c.id,c.title,c.author,c.normalized_key "
-                "FROM candidates c "
-                "JOIN reads r ON LOWER(TRIM(r.title))=LOWER(TRIM(c.title)) "
-                "AND LOWER(TRIM(r.author))=LOWER(TRIM(c.author)) "
-                "ORDER BY c.updated_at DESC,c.id DESC"
-            ).fetchall())
-        candidate_ids_by_norm_key: dict[str, list[int]] = {}
-        candidate_ids_by_identity: dict[str, list[int]] = {}
-        seen_candidate_ids: set[int] = set()
-        impression_scores: dict[int, float | None] = {}
-        for candidate in matched_candidates:
-            cid = int(candidate["id"])
-            norm_key = str(candidate["normalized_key"] or "")
-            if norm_key:
-                bucket = candidate_ids_by_norm_key.setdefault(norm_key, [])
-                if cid not in bucket:
-                    bucket.append(cid)
-            identity = book_identity(candidate["title"], candidate["author"])
-            if identity != "\x1f":
-                id_bucket = candidate_ids_by_identity.setdefault(identity, [])
-                if cid not in id_bucket:
-                    id_bucket.append(cid)
-            if cid in seen_candidate_ids:
-                continue
-            seen_candidate_ids.add(cid)
-            impression = connection.execute(
-                "SELECT i.score "
-                "FROM recommendation_impressions i "
-                "JOIN recommendation_runs r ON r.id = i.run_id "
-                "LEFT JOIN recommendation_evidence_exposures ex "
-                "ON ex.run_id = i.run_id AND ex.candidate_id = i.candidate_id "
-                "WHERE i.candidate_id = ? "
-                "AND COALESCE(json_extract(r.metadata, '$.status'), 'all') IN ('all', 'recommended') "
-                "AND COALESCE(json_extract(ex.candidate_snapshot_json, '$.status'), 'recommended') = 'recommended' "
-                "ORDER BY i.presented_at DESC "
-                "LIMIT 1",
-                (cid,),
-            ).fetchone()
-            impression_scores[cid] = (
-                round(float(impression["score"]), 1)
-                if impression is not None and impression["score"] is not None
-                else None
-            )
+    scores = {}
+    for candidate in existing_scores:
+        key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
+        scores.setdefault(key, candidate["score"])
     for item in items:
-        norm_key = normalize_key(item["title"], item["author"])
-        identity = book_identity(item["title"], item["author"])
-        candidate_ids = []
-        for cid in (
-            *candidate_ids_by_norm_key.get(norm_key, ()),
-            *candidate_ids_by_identity.get(identity, ()),
-        ):
-            if cid not in candidate_ids:
-                candidate_ids.append(cid)
-        item["rank_score"] = next(
-            (
-                impression_scores[cid]
-                for cid in candidate_ids
-                if impression_scores.get(cid) is not None
-            ),
-            None,
-        )
+        key = (str(item["title"]).strip().casefold(), str(item["author"]).strip().casefold())
+        item["rank_score"] = scores.get(key)
         item["algorithm_score"] = None
         item["algorithm_explanation"] = []
         item["metadata_confidence"] = None

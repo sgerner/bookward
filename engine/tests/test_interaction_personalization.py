@@ -319,6 +319,28 @@ def test_mixed_punctuation_subject_casing_preserved_in_explanation():
     assert "subject Historical Mystery" in by_id[402]["explanation"][-1]
 
 
+def test_lowercase_genres_and_missing_display_map_entries_never_fall_back_to_lowercase(monkeypatch):
+    events = [interaction(i, "save", "solar myth") for i in range(1, 7)]
+    events.extend(interaction(6 + i, "reject", "dark thriller") for i in range(1, 7))
+    ranked, diagnostics = personalize_recommendations(
+        [candidate(410, "solar myth", 50)],
+        events,
+        now=NOW,
+    )
+    assert diagnostics["applied"] is True
+    assert "subject Solar myth" in ranked[0]["explanation"][-1]
+    assert "subject solar myth" not in ranked[0]["explanation"][-1]
+
+    monkeypatch.setattr(ip, "subject_display_map", lambda *_, **__: {})
+    ranked_fallback, _ = personalize_recommendations(
+        [candidate(411, "solar myth", 50)],
+        events,
+        now=NOW,
+    )
+    assert "subject Solar myth" in ranked_fallback[0]["explanation"][-1]
+    assert "subject solar myth" not in ranked_fallback[0]["explanation"][-1]
+
+
 def test_recommendation_list_normalizes_legacy_stored_explanations(tmp_path, monkeypatch):
     from afterword_engine.config import settings
     from afterword_engine.database import initialize, transaction

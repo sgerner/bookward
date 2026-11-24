@@ -6,9 +6,9 @@ from typing import Any
 
 import numpy as np
 
-from .identity import book_identity
+from .identity import book_author_identity_key, book_identity
 from .read_dates import read_day as _read_day
-from .subjects import _subject_key, normalize_subjects, subject_display_map
+from .subjects import normalize_subjects, resolve_subject_label, subject_display_map
 
 
 _BATCH_SIZE = 64
@@ -27,6 +27,8 @@ _LEGACY_PERSONALIZATION_PREFIXES = (
     "Raised using books you saved, imported, or positively rated",
 )
 _PERSONALIZATION_POSITIVE_PREFIX = "Raised using books you shortlisted, added to Librarr, or rated highly"
+_LEGACY_FATIGUE_REASON = "Lowered slightly after appearing on several recent days without a decision"
+_FATIGUE_REASON = "Lowered after appearing on several recent days without a decision"
 _PAREN_DETAILS_RE = re.compile(r"^((?:Raised|Lowered) using [^(]+\()([^()]+)(\))$")
 
 
@@ -39,23 +41,13 @@ def _normalize_feature_token(
     stripped = token.strip()
     if stripped.startswith("subject "):
         raw_subject = stripped[len("subject "):].strip()
-        key = _subject_key(raw_subject)
-        display_subject = subject_labels.get(key)
-        if not display_subject:
-            if raw_subject and raw_subject == raw_subject.lower() and any(ch.isalpha() for ch in raw_subject):
-                display_subject = raw_subject[:1].upper() + raw_subject[1:]
-            else:
-                display_subject = raw_subject
+        display_subject = resolve_subject_label(raw_subject, subject_labels)
         return f"subject {display_subject}" if display_subject else stripped
     if stripped.startswith("author "):
         raw_author = stripped[len("author "):].strip()
-        if (
-            candidate_author
-            and " ".join(raw_author.casefold().split()) == " ".join(candidate_author.casefold().split())
-        ):
+        candidate_key = book_author_identity_key(candidate_author)
+        if candidate_author and candidate_key and book_author_identity_key(raw_author) == candidate_key:
             return f"author {candidate_author}"
-        if raw_author and raw_author == raw_author.lower() and any(ch.isalpha() for ch in raw_author):
-            return f"author {raw_author.title()}"
         return stripped
     return stripped
 
@@ -124,7 +116,9 @@ def normalize_explanation_items(
         if not item:
             continue
         lowered_raw = item.casefold()
-        if "held-out ratings" in lowered_raw:
+        if item == _LEGACY_FATIGUE_REASON:
+            item = _FATIGUE_REASON
+        elif "held-out ratings" in lowered_raw:
             is_negative_era = lowered_raw.startswith("reduced") or bool(
                 re.search(r"(?:adjusted\s*)?-\d", lowered_raw)
             )

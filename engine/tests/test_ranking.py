@@ -358,3 +358,37 @@ def test_author_penalty_explains_prior_low_ratings_and_orders_positives_source_c
     assert source_idx < sparse_caveat_idx
 
     assert "Reduced: you rated a book by this author poorly" in ranked[11]["explanation"]
+
+
+def test_normalize_explanation_items_preserves_author_particles_and_prefixes_without_title_mangling():
+    from afterword_engine.ranking import normalize_explanation_items
+
+    # Matching candidate author restores exact catalog casing (including particles, prefixes, initials).
+    assert normalize_explanation_items(
+        [
+            "Raised using books you saved, imported, or positively rated (author melissa de la cruz)",
+        ],
+        author="Melissa de la Cruz",
+    ) == [
+        "Raised using books you shortlisted, added to Librarr, or rated highly (author Melissa de la Cruz)"
+    ]
+    assert normalize_explanation_items(
+        [
+            "Raised using books you saved, imported, or positively rated (author ian mcdonald)",
+        ],
+        author="Ian McDonald",
+    ) == [
+        "Raised using books you shortlisted, added to Librarr, or rated highly (author Ian McDonald)"
+    ]
+
+    # Without a matching candidate author, raw author tokens are never mangled via .title().
+    unmatched = normalize_explanation_items(
+        [
+            "Raised using books you shortlisted, added to Librarr, or rated highly (author de la cruz, author mcdonald)",
+        ]
+    )
+    assert unmatched == [
+        "Raised using books you shortlisted, added to Librarr, or rated highly (author de la cruz, author mcdonald)"
+    ]
+    assert "De La Cruz" not in unmatched[0]
+    assert "Mcdonald" not in unmatched[0]
