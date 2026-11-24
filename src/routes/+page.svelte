@@ -50,7 +50,15 @@
     type UndoBanner,
   } from "#lib/notification-channels.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
-  import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
+  import {
+    buildLibrarrDownloadPayload,
+    canRetryLibrarrSearch,
+    finalizeLibrarrStreamState,
+    librarrFormatChangeAction,
+    readLibrarrSearchStream,
+    resolveLibrarrResultFormat,
+    shouldShowLibrarrEmptyBanner,
+  } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
@@ -145,6 +153,7 @@
   } | null>(null);
   let librarrQuery = $state("");
   let librarrMediaType = $state<MediaType>("audiobook");
+  let librarrSearchedMediaType = $state<MediaType>("audiobook");
   let librarrResults = $state<LibrarrResult[]>([]);
   let librarrSearchState = $state<"idle" | "searching" | "ready" | "error">(
     "idle",
@@ -1279,11 +1288,7 @@
     );
   }
   function resultFormat(result: LibrarrResult) {
-    return resultText(
-      result,
-      ["media_type", "format", "type"],
-      librarrMediaType,
-    );
+    return resolveLibrarrResultFormat(result, librarrSearchedMediaType);
   }
   function resultScore(result: LibrarrResult) {
     const value = result.score;
@@ -1315,7 +1320,9 @@
     librarrSearchBook = book;
     librarrQuery = `${book.title} ${book.author}`.trim().slice(0, 200);
     librarrMediaType = configuredLibrarrMediaType;
+    librarrSearchedMediaType = configuredLibrarrMediaType;
     librarrResults = [];
+    librarrSearchState = "idle";
     librarrSearchError = "";
     librarrSearchMessage = "";
     librarrAdded = new Set();
@@ -1464,6 +1471,26 @@
     observer.observe(sentinel);
     return () => observer.disconnect();
   });
+  function handleLibrarrMediaTypeChange(event: Event) {
+    const nextMediaType: MediaType =
+      (event.currentTarget as HTMLSelectElement).value === "ebook"
+        ? "ebook"
+        : "audiobook";
+    librarrMediaType = nextMediaType;
+    librarrSearchAbortController?.abort();
+    librarrSearchAbortController = null;
+    const action = librarrFormatChangeAction(librarrQuery, nextMediaType);
+    if (action.shouldSearch) {
+      void searchLibrarr();
+      return;
+    }
+    librarrSearchedMediaType = action.searchedMediaType;
+    librarrResults = [];
+    librarrAdded = new Set();
+    librarrSearchState = action.state;
+    librarrSearchError = "";
+    librarrSearchMessage = "";
+  }
   async function searchLibrarr() {
     const query = librarrQuery.trim();
     librarrSearchAbortController?.abort();
@@ -1473,6 +1500,8 @@
       librarrSearchError = "Enter at least two characters.";
       return;
     }
+    const searchedMediaType = librarrMediaType;
+    librarrSearchedMediaType = searchedMediaType;
     const controller = new AbortController();
     librarrSearchAbortController = controller;
     librarrResults = [];
@@ -1483,7 +1512,7 @@
     try {
       const params = new URLSearchParams({
         q: query,
-        media_type: librarrMediaType,
+        media_type: searchedMediaType,
       });
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
       let response = await fetch(`/api/librarr/search/stream?${params.toString()}`, {
@@ -1516,6 +1545,9 @@
               Boolean(item && typeof item === "object" && !Array.isArray(item)),
             )
           : [];
+        if (librarrSearchAbortController === controller) {
+          librarrSearchState = "ready";
+        }
       } else {
         if (!response.ok) {
           const payload = (await response.json().catch(() => ({}))) as {
@@ -1529,12 +1561,12 @@
           if (librarrSearchAbortController === controller) librarrResults = results;
         });
         if (librarrSearchAbortController !== controller) return;
-        if (!progress.completed) {
-          librarrSearchError = "Librarr ended the stream before search finished. Showing any results received.";
-        }
-      }
-      if (librarrSearchAbortController === controller) {
-        librarrSearchState = "ready";
+        const outcome = finalizeLibrarrStreamState(
+          progress.completed,
+          librarrResults.length,
+        );
+        librarrSearchState = outcome.state;
+        librarrSearchError = outcome.error;
       }
     } catch (error) {
       if (controller.signal.aborted || librarrSearchAbortController !== controller) return;
@@ -1558,7 +1590,13 @@
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
-        body: JSON.stringify({ media_type: librarrMediaType, candidate_id: librarrSearchBook?.id, result }),
+        body: JSON.stringify(
+          buildLibrarrDownloadPayload(
+            librarrSearchedMediaType,
+            result,
+            librarrSearchBook?.id,
+          ),
+        ),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
@@ -3989,6 +4027,7 @@
               id="librarr-media-type"
               class="select min-h-12 sm:mx-1 sm:w-40"
               bind:value={librarrMediaType}
+              onchange={handleLibrarrMediaTypeChange}
               ><option value="audiobook">Audiobook</option><option value="ebook"
                 >Ebook</option
               ></select
@@ -4013,11 +4052,22 @@
             </div>{/if}
           {#if librarrSearchError}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
-              class="mt-4 flex items-start gap-2 preset-tonal-error p-3 text-sm"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3 preset-tonal-error p-3 text-sm"
               role="alert"
             >
-              <CircleHelp size={16} class="mt-0.5 shrink-0" />
-              <span>{librarrSearchError}</span>
+              <div class="flex min-w-0 flex-1 items-start gap-2">
+                <CircleHelp size={16} class="mt-0.5 shrink-0" />
+                <span>{librarrSearchError}</span>
+              </div>
+              {#if canRetryLibrarrSearch(librarrSearchState, librarrQuery)}
+                <button
+                  type="button"
+                  class="btn btn-sm min-h-9 shrink-0 preset-tonal-surface"
+                  onclick={() => void searchLibrarr()}
+                >
+                  <RefreshCw size={14} /> Retry
+                </button>
+              {/if}
             </div>{/if}
           {#if librarrSearchState === "searching" && librarrResults.length === 0}
             <div
@@ -4037,14 +4087,14 @@
               Searching Librarr… {librarrResults.length} matches so far
             </div>
           {/if}
-          {#if librarrSearchState === "ready" && librarrResults.length === 0}
+          {#if shouldShowLibrarrEmptyBanner(librarrSearchState, librarrResults.length, librarrSearchError)}
             <div
               in:fade={{ duration: motionDuration(160) }}
               class="grid min-h-48 place-items-center text-center text-sm text-surface-700-300"
             >
               <div>
                 <BookOpen size={24} class="mx-auto mb-3 text-primary-500" />
-                <p>No {librarrMediaType} results found.</p>
+                <p>No {librarrSearchedMediaType} results found.</p>
                 <p class="mt-1">Try a title, author, or a shorter search.</p>
               </div>
             </div>
