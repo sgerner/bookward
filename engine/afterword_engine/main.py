@@ -9,7 +9,6 @@ import secrets
 import sqlite3
 import time
 import uuid
-import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -3136,29 +3135,7 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
     return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
 
 
-_MODELS_DEV_FAILURE_COOLDOWN_SECONDS = 60.0
-_MODELS_DEV_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
-    weakref.WeakKeyDictionary()
-)
-_MODELS_DEV_CACHE: dict[str, object] = {
-    "expires_at": 0.0,
-    "retry_after": 0.0,
-    "last_error": "",
-    "providers": [],
-}
-
-
-def _models_dev_lock() -> asyncio.Lock:
-    loop = asyncio.get_running_loop()
-    lock = _MODELS_DEV_LOCKS.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _MODELS_DEV_LOCKS[loop] = lock
-    return lock
-
-
-def _models_dev_clock() -> float:
-    return time.monotonic()
+_MODELS_DEV_CACHE: dict[str, object] = {"expires_at": 0.0, "providers": []}
 _KNOWN_LLM_CHAT_URLS = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "google": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -3227,56 +3204,35 @@ async def llm_models_catalog():
     directly in Settings.
     """
 
-    now = _models_dev_clock()
+    now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
-    if now < float(_MODELS_DEV_CACHE.get("retry_after") or 0.0):
+    try:
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _resp, raw_catalog = await stream_json_async(
+                client,
+                "GET",
+                "https://models.dev/api.json",
+                max_bytes=settings.models_dev_max_bytes,
+                size_error="models.dev catalog response is too large",
+            )
+        if not isinstance(raw_catalog, dict):
+            raise ValueError("models.dev catalog must be a JSON object")
+        providers = _normalize_models_dev_catalog(raw_catalog)
+        _MODELS_DEV_CACHE["providers"] = providers
+        _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
+        return {"providers": providers, "cached": False}
+    except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        detail = str(_MODELS_DEV_CACHE.get("last_error") or "Request failed")
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}")
-
-    async with _models_dev_lock():
-        now = _models_dev_clock()
-        cached = _MODELS_DEV_CACHE.get("providers") or []
-        if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
-            return {"providers": cached, "cached": True}
-        if now < float(_MODELS_DEV_CACHE.get("retry_after") or 0.0):
-            if cached:
-                return {"providers": cached, "cached": True, "stale": True}
-            detail = str(_MODELS_DEV_CACHE.get("last_error") or "Request failed")
-            raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}")
-        try:
-            async with httpx.AsyncClient(
-                timeout=12.0,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                _resp, raw_catalog = await stream_json_async(
-                    client,
-                    "GET",
-                    "https://models.dev/api.json",
-                    max_bytes=settings.models_dev_max_bytes,
-                    size_error="models.dev catalog response is too large",
-                )
-            if not isinstance(raw_catalog, dict):
-                raise ValueError("models.dev catalog must be a JSON object")
-            providers = _normalize_models_dev_catalog(raw_catalog)
-            fetched_at = _models_dev_clock()
-            _MODELS_DEV_CACHE["providers"] = providers
-            _MODELS_DEV_CACHE["expires_at"] = fetched_at + 3600.0
-            _MODELS_DEV_CACHE["retry_after"] = 0.0
-            _MODELS_DEV_CACHE["last_error"] = ""
-            return {"providers": providers, "cached": False}
-        except Exception as exc:
-            failed_at = _models_dev_clock()
-            detail = safe_error_message(exc)
-            _MODELS_DEV_CACHE["retry_after"] = failed_at + _MODELS_DEV_FAILURE_COOLDOWN_SECONDS
-            _MODELS_DEV_CACHE["last_error"] = detail
-            if cached:
-                return {"providers": cached, "cached": True, "stale": True}
-            raise HTTPException(502, f"Unable to fetch models.dev catalog: {detail}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
 
 
 @app.put("/api/sources/{source_id}")

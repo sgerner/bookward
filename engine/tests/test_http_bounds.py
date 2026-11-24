@@ -4,6 +4,8 @@ import gzip
 import json
 from pathlib import Path
 import socket
+import tracemalloc
+import zlib
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -13,6 +15,7 @@ import respx
 
 from auth_helpers import authenticated_headers
 from afterword_engine import covers, digest, embeddings, ingestion, librarr, llm_reranker, main, quality
+from afterword_engine.association_sources.common import fetch_pinned_association_json
 from afterword_engine.association_sources.google_books import GoogleBooksClient
 from afterword_engine.association_sources.librarything import LibraryThingClient
 from afterword_engine.association_sources.openlibrary import OpenLibraryClient
@@ -432,32 +435,79 @@ def test_google_books_preview_error_redacts_api_key(database, monkeypatch) -> No
 
 
 def test_gzip_compressed_bomb_counts_decompressed_bytes_async_and_sync() -> None:
-    decompressed = b'{"pad":"' + (b"z" * 500_000) + b'"}'
-    compressed = gzip.compress(decompressed)
-    assert len(compressed) < 5_000
+    # Single raw compressed chunk expanding to 20 MB (~20 KB on wire) must abort
+    # incrementally around max_bytes without allocating the full 20 MB payload.
+    compressed = gzip.compress(b'{"pad":"' + (b"z" * 20_000_000) + b'"}')
+    raw_deflator = zlib.compressobj(level=6, wbits=-zlib.MAX_WBITS)
+    raw_deflate = raw_deflator.compress(b'{"pad":"' + (b"y" * 10_000_000) + b'"}') + raw_deflator.flush()
+    assert len(compressed) < 30_000
+    assert len(raw_deflate) < 20_000
+
+    async_gzip_stream = CountingAsyncStream(compressed, 1)
+    async_deflate_stream = CountingAsyncStream(raw_deflate, 1)
+    sync_gzip_stream = CountingSyncStream(compressed, 1)
 
     def async_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/deflate":
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "deflate",
+                    "content-length": str(len(raw_deflate)),
+                },
+                stream=async_deflate_stream,
+                request=request,
+            )
         return httpx.Response(
             200,
-            content=compressed,
             headers={
                 "content-type": "application/json",
                 "content-encoding": "gzip",
                 "content-length": str(len(compressed)),
             },
+            stream=async_gzip_stream,
+            request=request,
+        )
+
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+                "content-length": str(len(compressed)),
+            },
+            stream=sync_gzip_stream,
             request=request,
         )
 
     async def run_async():
         async with httpx.AsyncClient(transport=httpx.MockTransport(async_handler)) as client:
-            await stream_json_async(client, "GET", "https://example.test/bomb", max_bytes=100_000)
+            with pytest.raises(ResponseTooLargeError):
+                await stream_json_async(client, "GET", "https://example.test/bomb", max_bytes=100_000)
+            with pytest.raises(ResponseTooLargeError):
+                await stream_json_async(client, "GET", "https://example.test/deflate", max_bytes=100_000)
 
-    with pytest.raises(ResponseTooLargeError):
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
         asyncio.run(run_async())
+        _cur_async, peak_async = tracemalloc.get_traced_memory()
 
-    with httpx.Client(transport=httpx.MockTransport(async_handler)) as sync_client:
-        with pytest.raises(ResponseTooLargeError):
-            stream_json_sync(sync_client, "GET", "https://example.test/bomb", max_bytes=100_000)
+        tracemalloc.reset_peak()
+        with httpx.Client(transport=httpx.MockTransport(sync_handler)) as sync_client:
+            with pytest.raises(ResponseTooLargeError):
+                stream_json_sync(sync_client, "GET", "https://example.test/bomb", max_bytes=100_000)
+        _cur_sync, peak_sync = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert async_gzip_stream.closed is True
+    assert async_deflate_stream.closed is True
+    assert sync_gzip_stream.closed is True
+    assert peak_async < 2_000_000
+    assert peak_sync < 2_000_000
 
 
 def test_public_response_materialization_and_json_content_type_guards(monkeypatch) -> None:
@@ -751,65 +801,26 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
     assert discord_stream.chunks_yielded == 3
     assert discord_stream.closed is True
 
-
-def test_models_dev_single_flight_and_60_second_failure_cooldown(monkeypatch) -> None:
-    monkeypatch.setitem(main._MODELS_DEV_CACHE, "providers", [])
-    monkeypatch.setitem(main._MODELS_DEV_CACHE, "expires_at", 0.0)
-    monkeypatch.setitem(main._MODELS_DEV_CACHE, "retry_after", 0.0)
-    monkeypatch.setitem(main._MODELS_DEV_CACHE, "last_error", "")
-
-    now = [1000.0]
-    monkeypatch.setattr(main, "_models_dev_clock", lambda: now[0])
-
-    upstream_calls = 0
-
-    async def slow_catalog_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal upstream_calls
-        upstream_calls += 1
-        await asyncio.sleep(0.02)
-        return httpx.Response(
-            200,
-            json={
-                "openai": {
-                    "name": "OpenAI",
-                    "api": "https://api.openai.com/v1",
-                    "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
-                }
-            },
-            request=request,
+    # Non-Discord webhook hosts are rejected by validate_discord_webhook_url before sending.
+    with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+        asyncio.run(
+            digest._send_discord(
+                {"discord_webhook_url": "https://evil.example.test/api/webhooks/1/secret"},
+                {"content": "hi"},
+            )
         )
 
+
+def test_models_dev_catalog_enforces_byte_cap_and_serves_stale_cache(monkeypatch) -> None:
+    monkeypatch.setitem(main._MODELS_DEV_CACHE, "providers", [])
+    monkeypatch.setitem(main._MODELS_DEV_CACHE, "expires_at", 0.0)
+
     real_async_client = httpx.AsyncClient
+    initial_calls = 0
 
-    def make_client(*args, **kwargs):
-        return real_async_client(*args, transport=httpx.MockTransport(slow_catalog_handler), **kwargs)
-
-    monkeypatch.setattr(main.httpx, "AsyncClient", make_client)
-
-    async def five_cold_calls():
-        return await asyncio.gather(*(main.llm_models_catalog() for _ in range(5)))
-
-    results = asyncio.run(five_cold_calls())
-    assert upstream_calls == 1
-    assert sum(1 for item in results if item["cached"] is False) == 1
-    assert sum(1 for item in results if item["cached"] is True) == 4
-    assert all(item["providers"][0]["id"] == "openai" for item in results)
-
-    # Reset cache and verify 503 failure suppresses retries for 60 seconds.
-    main._MODELS_DEV_CACHE["providers"] = []
-    main._MODELS_DEV_CACHE["expires_at"] = 0.0
-    main._MODELS_DEV_CACHE["retry_after"] = 0.0
-    main._MODELS_DEV_CACHE["last_error"] = ""
-
-    failure_calls = 0
-    should_fail = True
-
-    async def flaky_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal failure_calls
-        failure_calls += 1
-        await asyncio.sleep(0.01)
-        if should_fail:
-            return httpx.Response(503, text="Service Unavailable", request=request)
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initial_calls
+        initial_calls += 1
         return httpx.Response(
             200,
             json={
@@ -825,43 +836,22 @@ def test_models_dev_single_flight_and_60_second_failure_cooldown(monkeypatch) ->
         main.httpx,
         "AsyncClient",
         lambda *args, **kwargs: real_async_client(
-            *args, transport=httpx.MockTransport(flaky_handler), **kwargs
+            *args, transport=httpx.MockTransport(ok_handler), **kwargs
         ),
     )
-
-    async def five_failing_calls():
-        return await asyncio.gather(
-            *(main.llm_models_catalog() for _ in range(5)),
-            return_exceptions=True,
-        )
-
-    outcomes = asyncio.run(five_failing_calls())
-    assert failure_calls == 1
-    assert all(isinstance(item, HTTPException) and item.status_code == 502 for item in outcomes)
-
-    # At +59 seconds, retries are still suppressed without calling upstream.
-    now[0] += 59.0
-    should_fail = False
-    with pytest.raises(HTTPException) as suppressed_exc:
-        asyncio.run(main.llm_models_catalog())
-    assert suppressed_exc.value.status_code == 502
-    assert failure_calls == 1
-
-    # At +60 seconds, cooldown expires and upstream recovers.
-    now[0] += 1.5
     recovered = asyncio.run(main.llm_models_catalog())
-    assert failure_calls == 2
+    cached_hit = asyncio.run(main.llm_models_catalog())
+    assert initial_calls == 1
     assert recovered["cached"] is False
+    assert cached_hit["cached"] is True
     assert recovered["providers"][0]["id"] == "anthropic"
 
-    # Expired stale cache returns stale=True on oversized >10 MB models.dev stream and suppresses retries.
+    # Expired stale cache returns stale=True when an oversized stream exceeds models_dev_max_bytes.
     monkeypatch.setattr(settings, "models_dev_max_bytes", 150_000)
+    main._MODELS_DEV_CACHE["expires_at"] = 0.0
     oversized_models = CountingAsyncStream(b"m" * 50_000, 10)  # 500 KB > 150 KB
-    oversized_calls = 0
 
     def oversized_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal oversized_calls
-        oversized_calls += 1
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
@@ -876,14 +866,230 @@ def test_models_dev_single_flight_and_60_second_failure_cooldown(monkeypatch) ->
             *args, transport=httpx.MockTransport(oversized_handler), **kwargs
         ),
     )
-    now[0] += 3601.0  # expire cached anthropic entry
-    stale_first = asyncio.run(main.llm_models_catalog())
-    stale_second = asyncio.run(main.llm_models_catalog())
-    assert oversized_calls == 1
+    stale = asyncio.run(main.llm_models_catalog())
     assert oversized_models.chunks_yielded == 4
     assert oversized_models.closed is True
-    assert stale_first == {"providers": recovered["providers"], "cached": True, "stale": True}
-    assert stale_second == {"providers": recovered["providers"], "cached": True, "stale": True}
+    assert stale == {"providers": recovered["providers"], "cached": True, "stale": True}
+
+    # Cold cache surfaces 502 when models.dev exceeds models_dev_max_bytes.
+    main._MODELS_DEV_CACHE["providers"] = []
+    main._MODELS_DEV_CACHE["expires_at"] = 0.0
+    cold_oversized = CountingAsyncStream(b"m" * 50_000, 10)
+    monkeypatch.setattr(
+        main.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: real_async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    stream=cold_oversized,
+                    request=req,
+                )
+            ),
+            **kwargs,
+        ),
+    )
+    with pytest.raises(HTTPException) as cold_exc:
+        asyncio.run(main.llm_models_catalog())
+    assert cold_exc.value.status_code == 502
+    assert cold_oversized.chunks_yielded == 4
+    assert cold_oversized.closed is True
+
+
+def test_streaming_pinned_requests_redact_query_secrets_and_sanitize_errors(
+    database, monkeypatch
+) -> None:
+    pin_public_dns(monkeypatch)
+
+    class MidStreamTimeoutStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'{"partial":'
+            raise httpx.ReadTimeout(f"Timed out reading from {PINNED_IP}:443")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    ok_stream = CountingAsyncStream(b'{"ok":true}', 1)
+    status_err_stream = CountingAsyncStream(b'{"error":"denied"}', 1)
+    mid_timeout_stream = MidStreamTimeoutStream()
+
+    def ingestion_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == PINNED_IP
+        assert request.headers["host"] == "feeds.example.test"
+        if request.url.path == "/ok.json":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=ok_stream,
+                request=request,
+            )
+        if request.url.path == "/denied.xml":
+            return httpx.Response(
+                401,
+                headers={"content-type": "application/xml"},
+                stream=status_err_stream,
+                request=request,
+            )
+        if request.url.path == "/connect-timeout":
+            raise httpx.ConnectTimeout(
+                f"Timed out connecting to {PINNED_IP}:443 for https://{PINNED_IP}/connect-timeout?token=secret-123"
+            )
+        if request.url.path == "/read-timeout":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=mid_timeout_stream,
+                request=request,
+            )
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    async def run_ingestion_checks():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(ingestion_handler),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            async with ingestion._request_pinned(
+                client,
+                "GET",
+                "https://feeds.example.test/ok.json?token=secret-123",
+            ) as resp:
+                public_req_url = str(resp.request.url)
+
+            with pytest.raises(httpx.HTTPStatusError) as status_exc:
+                await ingestion.fetch_bytes(
+                    "https://feeds.example.test/denied.xml?token=secret-123",
+                    client=client,
+                )
+
+            with pytest.raises(httpx.ConnectTimeout) as connect_exc:
+                await ingestion.fetch_bytes(
+                    "https://feeds.example.test/connect-timeout?token=secret-123",
+                    client=client,
+                )
+
+            with pytest.raises(httpx.ReadTimeout) as read_exc:
+                await ingestion.fetch_bytes(
+                    "https://feeds.example.test/read-timeout?token=secret-123",
+                    client=client,
+                )
+            return public_req_url, status_exc.value, connect_exc.value, read_exc.value
+
+    public_req_url, status_err, connect_err, read_err = asyncio.run(run_ingestion_checks())
+    assert public_req_url == "https://feeds.example.test/ok.json?[redacted]"
+    assert ok_stream.closed is True
+    assert status_err_stream.closed is True
+    assert mid_timeout_stream.closed is True
+
+    for err in (status_err, connect_err, read_err):
+        assert PINNED_IP not in str(err)
+        assert "secret-123" not in str(err)
+        assert err.request.url.host == "feeds.example.test"
+        assert "secret-123" not in str(err.request.url)
+        assert "[redacted]" in str(err.request.url)
+
+    # Verify the same guarantees on fetch_pinned_association_json across 200, 401, ConnectTimeout, and mid-stream ReadTimeout.
+    assoc_ok_stream = CountingAsyncStream(b'{"items":[]}', 1)
+    assoc_401_stream = CountingAsyncStream(b'{"error":"invalid key"}', 1)
+    assoc_read_timeout = MidStreamTimeoutStream()
+    observed_assoc_urls: list[str] = []
+
+    with respx.mock:
+        respx.get(f"https://{PINNED_IP}/assoc/ok").mock(
+            return_value=httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=assoc_ok_stream,
+            )
+        )
+        respx.get(f"https://{PINNED_IP}/assoc/denied").mock(
+            return_value=httpx.Response(
+                401,
+                headers={"content-type": "application/json"},
+                stream=assoc_401_stream,
+            )
+        )
+        respx.get(f"https://{PINNED_IP}/assoc/connect-timeout").mock(
+            side_effect=httpx.ConnectTimeout(
+                f"Connect timeout to {PINNED_IP}:443 for https://{PINNED_IP}/assoc/connect-timeout?key=assoc-secret-999"
+            )
+        )
+        respx.get(f"https://{PINNED_IP}/assoc/read-timeout").mock(
+            return_value=httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=assoc_read_timeout,
+            )
+        )
+
+        payload, _headers = asyncio.run(
+            fetch_pinned_association_json(
+                "https://assoc.example.test/assoc/ok",
+                params={"key": "assoc-secret-999"},
+                provider="google_books",
+                request_key="ok",
+                source_label="Association Test",
+                timeout_seconds=5.0,
+                max_bytes=65536,
+                on_response=lambda resp: observed_assoc_urls.append(str(resp.request.url)),
+            )
+        )
+        assert payload == {"items": []}
+        assert observed_assoc_urls == ["https://assoc.example.test/assoc/ok?[redacted]"]
+        assert assoc_ok_stream.closed is True
+
+        with pytest.raises(httpx.HTTPStatusError) as assoc_status_exc:
+            asyncio.run(
+                fetch_pinned_association_json(
+                    "https://assoc.example.test/assoc/denied",
+                    params={"key": "assoc-secret-999"},
+                    provider="google_books",
+                    request_key="denied",
+                    source_label="Association Test",
+                    timeout_seconds=5.0,
+                    max_bytes=65536,
+                )
+            )
+        assert assoc_401_stream.closed is True
+
+        with pytest.raises(httpx.ConnectTimeout) as assoc_connect_exc:
+            asyncio.run(
+                fetch_pinned_association_json(
+                    "https://assoc.example.test/assoc/connect-timeout",
+                    params={"key": "assoc-secret-999"},
+                    provider="google_books",
+                    request_key="connect-timeout",
+                    source_label="Association Test",
+                    timeout_seconds=5.0,
+                    max_bytes=65536,
+                )
+            )
+
+        with pytest.raises(httpx.ReadTimeout) as assoc_read_exc:
+            asyncio.run(
+                fetch_pinned_association_json(
+                    "https://assoc.example.test/assoc/read-timeout",
+                    params={"key": "assoc-secret-999"},
+                    provider="google_books",
+                    request_key="read-timeout",
+                    source_label="Association Test",
+                    timeout_seconds=5.0,
+                    max_bytes=65536,
+                )
+            )
+        assert assoc_read_timeout.closed is True
+
+    for err in (assoc_status_exc.value, assoc_connect_exc.value, assoc_read_exc.value):
+        assert PINNED_IP not in str(err)
+        assert "assoc-secret-999" not in str(err)
+        assert err.request.url.host == "assoc.example.test"
+        assert "assoc-secret-999" not in str(err.request.url)
+        assert "[redacted]" in str(err.request.url)
 
 
 def test_google_books_key_validation_and_error_streams_enforce_byte_caps(monkeypatch) -> None:

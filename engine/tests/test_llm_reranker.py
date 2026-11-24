@@ -203,8 +203,6 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
 
     monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "providers", [])
     monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "expires_at", 0.0)
-    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "retry_after", 0.0)
-    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "last_error", "")
     monkeypatch.setattr(main_module.httpx, "AsyncClient", FakeClient)
 
     first = asyncio.run(main_module.llm_models_catalog())
