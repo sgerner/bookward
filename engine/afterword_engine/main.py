@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -33,6 +33,7 @@ from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
 from . import ingestion
 from .ingestion import (
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     validate_goodreads_rss_url,
@@ -79,6 +80,7 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    validate_candidate_run_id,
     _impression_precedes,
     _read_label,
     _read_time,
@@ -1373,6 +1375,15 @@ class BulkFeedbackIn(BaseModel):
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
+class BulkUndoItemIn(BaseModel):
+    id: int = Field(gt=0)
+    decision_id: int = Field(gt=0)
+
+
+class BulkUndoFeedbackIn(BaseModel):
+    decisions: list[BulkUndoItemIn] = Field(min_length=1, max_length=100)
+
+
 class ApiTokenCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
@@ -1386,17 +1397,27 @@ class EngineSettings(BaseModel):
     librarr_api_key: str = ""
     librarr_media_type: str = "audiobook"
 
-    def validate_values(self):
-        if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
-        for label, value in (("embedding",self.embedding_url),("Librarr",self.librarr_url)):
-            parsed = urlparse(value) if value else None
-            if parsed and parsed.scheme not in {"http","https"}: raise ValueError(f"{label} URL must use HTTP or HTTPS")
-            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError(f"{label} URL cannot contain credentials, query parameters, or fragments")
-        if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
-        normalize_media_type(self.librarr_media_type)
-        if self.librarr_url:
-            allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
-            validate_service_url(self.librarr_url, allowed)
+    def validate_values(
+        self,
+        *,
+        validate_embedding: bool = True,
+        validate_librarr: bool = True,
+        check_librarr_host: bool = True,
+    ):
+        if validate_embedding:
+            if self.embedding_backend not in {"local","fastembed","ollama","openai-compatible"}: raise ValueError("Unsupported embedding backend")
+            parsed = urlparse(self.embedding_url) if self.embedding_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("embedding URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("embedding URL cannot contain credentials, query parameters, or fragments")
+            if self.embedding_backend in {"ollama","openai-compatible"} and not self.embedding_url: raise ValueError("Remote embedding providers require an endpoint URL")
+        if validate_librarr:
+            parsed = urlparse(self.librarr_url) if self.librarr_url else None
+            if parsed and parsed.scheme not in {"http","https"}: raise ValueError("Librarr URL must use HTTP or HTTPS")
+            if parsed and (parsed.username or parsed.password or parsed.query or parsed.fragment): raise ValueError("Librarr URL cannot contain credentials, query parameters, or fragments")
+            normalize_media_type(self.librarr_media_type)
+            if check_librarr_host and self.librarr_url:
+                allowed = {host.strip().lower() for host in settings.librarr_allowed_hosts.split(",") if host.strip()}
+                validate_service_url(self.librarr_url, allowed)
 
 
 class NYTApiKeyIn(BaseModel):
@@ -1993,6 +2014,7 @@ def recommendation_list(
     include_imported: bool = False,
     format_urls: bool = True,
 ):
+    effective_include_imported = include_imported or status in {"saved", "imported", "all"}
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     if recommended_limit is not None and status is None and offset == 0:
@@ -2008,13 +2030,15 @@ def recommendation_list(
                 statuses=("saved", "imported", "new"),
                 limit=None,
                 identity_context=identity_context,
-                include_imported=include_imported,
+                include_imported=effective_include_imported,
             )
         )
     else:
         statuses = (
             ("rejected", "maybe_later")
             if status == "decisions"
+            else ("saved", "imported")
+            if status == "saved" and effective_include_imported
             else None if not status or status == "all" else (status,)
         )
         result = _recommendation_rows(
@@ -2023,7 +2047,7 @@ def recommendation_list(
             limit=limit,
             offset=offset,
             identity_context=identity_context,
-            include_imported=include_imported,
+            include_imported=effective_include_imported,
         )
     for item in result:
         item["genres"] = json.loads(item["genres"] or "[]")
@@ -2035,7 +2059,7 @@ def recommendation_list(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -2045,6 +2069,7 @@ def recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            include_imported=status in {"saved", "imported", "all"},
         )
     for item in values:
         item["recommendation_run_id"] = run_id
@@ -2180,76 +2205,89 @@ def feedback(candidate_id: int, payload: FeedbackIn):
         "id": candidate_id,
         "status": status,
     }
-    if payload.action in {"save", "reject", "maybe_later"}:
+    if (
+        payload.action in {"save", "reject", "maybe_later", "restore"}
+        and previous_status
+        and previous_status != "read"
+    ):
         result["decision_id"] = int(feedback_id)
     return result
+
+
+def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
+    decision = con.execute(
+        "SELECT id,action,previous_status,undone_at FROM feedback "
+        "WHERE id=? AND candidate_id=?",
+        (decision_id, candidate_id),
+    ).fetchone()
+    if (
+        not decision
+        or not decision["previous_status"]
+        or decision["previous_status"] == "read"
+    ):
+        raise HTTPException(404, "Undo is no longer available")
+    if decision["undone_at"]:
+        raise HTTPException(409, "This decision has already been undone")
+    if decision["action"] not in {"save", "reject", "maybe_later", "restore"}:
+        raise HTTPException(404, "Undo is no longer available")
+    latest = con.execute(
+        "SELECT id FROM feedback WHERE candidate_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (candidate_id,),
+    ).fetchone()
+    if not latest or int(latest["id"]) != decision_id:
+        raise HTTPException(409, "Only the latest decision can be undone")
+    current = con.execute(
+        "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+    ).fetchone()
+    if not current:
+        raise HTTPException(404, "Recommendation not found")
+    expected_status = {
+        "save": "saved",
+        "reject": "rejected",
+        "maybe_later": "maybe_later",
+        "restore": "recommended",
+    }[decision["action"]]
+    if current["status"] != expected_status:
+        raise HTTPException(409, "The recommendation changed after this decision")
+    previous_status = str(decision["previous_status"])
+    con.execute(
+        "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (previous_status, candidate_id),
+    )
+    con.execute(
+        "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
+        (decision_id,),
+    )
+    con.execute(
+        "DELETE FROM recommendation_outcomes WHERE event_id=("
+        "SELECT id FROM recommendation_events WHERE event_key=?)",
+        (f"feedback:{decision_id}",),
+    )
+    compensation = (
+        "librarr_import" if previous_status == "imported"
+        else "save" if previous_status == "saved"
+        else "reject" if previous_status == "rejected"
+        else "maybe_later" if previous_status == "maybe_later"
+        else "restore"
+    )
+    try:
+        record_event_in_connection(
+            con,
+            event_key=f"undo-feedback:{decision_id}",
+            candidate_id=candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": candidate_id, "status": previous_status}
 
 
 @app.post("/api/recommendations/{candidate_id}/undo")
 def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
     with transaction() as con:
-        decision = con.execute(
-            "SELECT id,action,previous_status,undone_at FROM feedback "
-            "WHERE id=? AND candidate_id=?",
-            (payload.decision_id, candidate_id),
-        ).fetchone()
-        if not decision or not decision["previous_status"]:
-            raise HTTPException(404, "Undo is no longer available")
-        if decision["undone_at"]:
-            raise HTTPException(409, "This decision has already been undone")
-        if decision["action"] not in {"save", "reject", "maybe_later"}:
-            raise HTTPException(404, "Undo is no longer available")
-        latest = con.execute(
-            "SELECT id FROM feedback WHERE candidate_id=? "
-            "ORDER BY id DESC LIMIT 1",
-            (candidate_id,),
-        ).fetchone()
-        if not latest or int(latest["id"]) != payload.decision_id:
-            raise HTTPException(409, "Only the latest decision can be undone")
-        current = con.execute(
-            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
-        ).fetchone()
-        if not current:
-            raise HTTPException(404, "Recommendation not found")
-        expected_status = {
-            "save": "saved",
-            "reject": "rejected",
-            "maybe_later": "maybe_later",
-            "restore": "recommended",
-        }[decision["action"]]
-        if current["status"] != expected_status:
-            raise HTTPException(409, "The recommendation changed after this decision")
-        previous_status = str(decision["previous_status"])
-        con.execute(
-            "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (previous_status, candidate_id),
-        )
-        con.execute(
-            "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
-            (payload.decision_id,),
-        )
-        con.execute(
-            "DELETE FROM recommendation_outcomes WHERE event_id=("
-            "SELECT id FROM recommendation_events WHERE event_key=?)",
-            (f"feedback:{payload.decision_id}",),
-        )
-        compensation = (
-            "save" if previous_status in {"saved", "imported"}
-            else "reject" if previous_status == "rejected"
-            else "maybe_later" if previous_status == "maybe_later"
-            else "restore"
-        )
-        try:
-            record_event_in_connection(
-                con,
-                event_key=f"undo-feedback:{payload.decision_id}",
-                candidate_id=candidate_id,
-                event_type=compensation,
-                source="ui_undo",
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    return {"id": candidate_id, "status": previous_status}
+        return _undo_feedback_in_connection(con, candidate_id, payload.decision_id)
 
 
 @app.post("/api/recommendations/{candidate_id}/read")
@@ -2300,17 +2338,23 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
 def bulk_feedback(payload: BulkFeedbackIn):
     status = {"save": "saved", "reject": "rejected", "restore": "recommended"}[payload.action]
     ids = list(dict.fromkeys(payload.ids))
+    decisions = []
     with transaction() as con:
         placeholders = ",".join("?" for _ in ids)
         found = {
-            int(item["id"])
-            for item in con.execute(f"SELECT id FROM candidates WHERE id IN ({placeholders})", ids).fetchall()
+            int(item["id"]): str(item["status"])
+            for item in con.execute(
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+            ).fetchall()
         }
-        for candidate_id in found:
+        for candidate_id in ids:
+            if candidate_id not in found:
+                continue
+            previous_status = found[candidate_id]
             con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
             feedback_id = con.execute(
-                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                (candidate_id, payload.action),
+                "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
+                (candidate_id, payload.action, previous_status),
             ).lastrowid
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
@@ -2327,7 +2371,29 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-    return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
+            if (
+                payload.action in {"save", "reject", "restore"}
+                and previous_status
+                and previous_status != "read"
+            ):
+                decisions.append({"id": candidate_id, "decision_id": int(feedback_id)})
+    return {
+        "updated": len(found),
+        "skipped": len(ids) - len(found),
+        "status": status,
+        "ids": sorted(found),
+        "decisions": decisions,
+    }
+
+
+@app.post("/api/recommendations/bulk-undo")
+def bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    items = list(dict.fromkeys((item.id, item.decision_id) for item in payload.decisions))
+    restored = []
+    with transaction() as con:
+        for candidate_id, decision_id in items:
+            restored.append(_undo_feedback_in_connection(con, candidate_id, decision_id))
+    return {"undone": len(restored), "items": restored}
 
 
 def telemetry_events(payload: TelemetryBatchIn):
@@ -2352,13 +2418,56 @@ def telemetry_events(payload: TelemetryBatchIn):
 def post_telemetry_events(payload: TelemetryBatchIn):
     return telemetry_events(payload)
 
+class LibrarrImportIn(BaseModel):
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+def _record_librarr_import_in_connection(con, candidate_id: int, *, run_id: str | None = None):
+    next_seq = int(
+        con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM recommendation_events").fetchone()[0]
+    )
+    return record_event_in_connection(
+        con,
+        event_key=f"librarr-import:{int(candidate_id)}:{next_seq:08d}",
+        candidate_id=int(candidate_id),
+        event_type="librarr_import",
+        run_id=run_id,
+        source="librarr",
+        label=1.0,
+        label_kind="librarr_import",
+        confidence=0.7,
+    )
+
+
 @app.post("/api/recommendations/{candidate_id}/import")
-async def import_librarr(candidate_id: int):
-    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
-    if not candidate: raise HTTPException(404, "Recommendation not found")
+async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    run_id = payload.run_id if payload else None
+    with connect() as con:
+        candidate_row = con.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "Recommendation not found")
+        candidate = dict(candidate_row)
+        try:
+            validate_candidate_run_id(con, candidate_id, run_id)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     key = hashlib.sha256(f"{candidate_id}:{candidate['normalized_key']}".encode()).hexdigest()
     existing = row("SELECT * FROM librarr_imports WHERE idempotency_key=? AND status='complete'", (key,))
-    if existing: return {"id":candidate_id,"status":"imported","remote_id":existing["remote_id"],"duplicate":True}
+    if existing:
+        if candidate["status"] not in {"saved", "imported", "read"}:
+            raise HTTPException(409, "Shortlist this book before importing it")
+        with transaction() as con:
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else str(candidate["status"])
+            if current_status != "read":
+                if current_status != "imported":
+                    con.execute(
+                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                        (candidate_id,),
+                    )
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": existing["remote_id"], "duplicate": True}
     if candidate["status"] != "saved": raise HTTPException(409, "Shortlist this book before importing it")
     config = private_settings()
     if not config.get("librarr_url") or not config.get("librarr_api_key"): raise HTTPException(409, "Connect Librarr first")
@@ -2376,10 +2485,16 @@ async def import_librarr(candidate_id: int):
             response.raise_for_status()
             try: data = response.json()
             except ValueError: data = {}
+        remote_id = str(data.get("id", "imported"))
         with transaction() as con:
-            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
-            con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
-        return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
+            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else "imported"
+            if current_status != "read":
+                con.execute("UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'", (candidate_id,))
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": remote_id}
     except (httpx.HTTPError, ValueError) as exc:
         message = safe_error_message(exc, limit=1000)
         with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(message,key))
@@ -2441,50 +2556,44 @@ class LibrarrDownloadIn(BaseModel):
     media_type: str = "audiobook"
     result: dict[str, Any]
     candidate_id: int | None = Field(default=None, gt=0)
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 @app.post("/api/librarr/download")
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
-        candidate = row("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)) if payload.candidate_id else None
-        if payload.candidate_id and not candidate:
-            raise HTTPException(404, "Recommendation not found")
+        with connect() as con:
+            candidate_row = (
+                con.execute("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)).fetchone()
+                if payload.candidate_id
+                else None
+            )
+            if payload.candidate_id and not candidate_row:
+                raise HTTPException(404, "Recommendation not found")
+            candidate = dict(candidate_row) if candidate_row else None
+            validate_candidate_run_id(con, int(candidate["id"]) if candidate else None, payload.run_id)
         encoded = json.dumps(payload.result, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{media}:{encoded}".encode()).hexdigest()
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         result = await librarr_download(config, payload.result, media, key)
         response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
         if candidate:
-            status = candidate["status"]
-            if status == "saved":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
+            with transaction() as con:
+                current = con.execute(
+                    "SELECT status FROM candidates WHERE id=?", (candidate["id"],)
+                ).fetchone()
+                status = str(current["status"]) if current else str(candidate["status"])
+                if status != "read":
+                    if status != "imported":
+                        con.execute(
+                            "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                            (candidate["id"],),
+                        )
+                    status = "imported"
+                    _record_librarr_import_in_connection(
+                        con, int(candidate["id"]), run_id=payload.run_id
                     )
-                status = "imported"
-            elif status != "imported":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
-                    )
-                    feedback_id = con.execute(
-                        "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                        (candidate["id"], "save"),
-                    ).lastrowid
-                    record_event_in_connection(
-                        con,
-                        event_key=f"feedback:{feedback_id}",
-                        candidate_id=int(candidate["id"]),
-                        event_type="save",
-                        source="librarr",
-                        label=1.0,
-                        label_kind="explicit_feedback",
-                        confidence=0.9,
-                    )
-                status = "saved"
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
     except ValueError as exc:
@@ -2492,16 +2601,29 @@ async def download_librarr(payload: LibrarrDownloadIn):
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
-@app.post("/api/import/goodreads/csv")
-async def goodreads_csv(file: UploadFile = File(...)):
+async def _import_csv_upload(file: UploadFile):
     content = bytearray()
     while chunk := await file.read(1024 * 1024):
         content.extend(chunk)
         if len(content) > 10_000_000: raise HTTPException(413, "CSV is larger than 10 MB")
-    try: count = import_goodreads_csv(bytes(content))
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
+    try: result = import_csv(bytes(content))
+    except ValueError as exc: raise HTTPException(400, safe_error_message(exc))
     enqueue_job("read_work_identities", dedupe=True)
-    return {"imported":count,"job_id":enqueue_job("score", dedupe=True)}
+    return {
+        "imported": result["imported"],
+        "source": result["source"],
+        "job_id": enqueue_job("score", dedupe=True),
+    }
+
+
+@app.post("/api/import/csv")
+async def reading_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
+
+
+@app.post("/api/import/goodreads/csv")
+async def goodreads_csv(file: UploadFile = File(...)):
+    return await _import_csv_upload(file)
 
 
 async def _sync_goodreads_rss(url: str):
@@ -2608,25 +2730,48 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
+def _toggle_source_row(con, source_id: int, source) -> bool:
+    became_enabled = not source["enabled"]
+    con.execute(
+        "UPDATE sources SET enabled=1-enabled, "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+        "WHERE id=?",
+        (source_id,),
+    )
+    if not became_enabled:
+        con.execute(
+            "UPDATE candidates SET status='new', score=0, explanation='[]', "
+            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE source_id=? AND status='recommended'",
+            (source_id,),
+        )
+    return became_enabled
+
+
+@app.put("/api/sources/default/toggle")
+def toggle_default_source():
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Default source not found.")
+        source_id = source["id"]
+        became_enabled = _toggle_source_row(con, source_id, source)
+    job_id = (
+        enqueue_job(f"source:{source_id}", dedupe=True)
+        if became_enabled and source["kind"] not in {"builtin", "association"}
+        else None
+    )
+    return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
+
+
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = not source["enabled"]
-        con.execute(
-            "UPDATE sources SET enabled=1-enabled, "
-            "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
-            "WHERE id=?",
-            (source_id,),
-        )
-        if not became_enabled:
-            con.execute(
-                "UPDATE candidates SET status='new', score=0, explanation='[]', "
-                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-                "WHERE source_id=? AND status='recommended'",
-                (source_id,),
-            )
+        became_enabled = _toggle_source_row(con, source_id, source)
     if became_enabled and source["kind"] not in {"builtin", "association"}:
         _bump_source_scan_generation(source_id)
         job_id = enqueue_followup_job(f"source:{source_id}")
@@ -3345,24 +3490,51 @@ def revoke_api_token(token_id: int):
 
 @app.put("/api/settings")
 async def update_settings(payload: EngineSettings):
-    try: payload.validate_values()
-    except ValueError as exc: raise HTTPException(400,safe_error_message(exc))
-    current = private_settings()
-    current_values = {
-        "embedding_backend": current.get("embedding_backend", settings.embedding_backend),
-        "embedding_model": current.get("embedding_model", settings.embedding_model),
-        "embedding_url": current.get("embedding_url", settings.embedding_url),
-        "embedding_api_key": current.get("embedding_api_key", settings.embedding_api_key),
-        "librarr_url": current.get("librarr_url", ""),
-        "librarr_api_key": current.get("librarr_api_key", ""),
-        "librarr_media_type": current.get("librarr_media_type", "audiobook"),
-    }
-    values = {**current_values, **payload.model_dump(exclude_unset=True)}
-    for key in ("embedding_api_key","librarr_api_key"):
-        if not values[key]: values[key] = current.get(key,"")
     embedding_fields = (
         "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"
     )
+    librarr_fields = (
+        "librarr_url", "librarr_api_key", "librarr_media_type"
+    )
+    updates = payload.model_dump(exclude_unset=True)
+    for key in ("embedding_api_key", "librarr_api_key"):
+        if key in updates:
+            updates[key] = updates[key].strip()
+
+    def _merge_settings(stored: dict) -> tuple[dict, dict]:
+        base = {
+            "embedding_backend": stored.get("embedding_backend", settings.embedding_backend),
+            "embedding_model": stored.get("embedding_model", settings.embedding_model),
+            "embedding_url": stored.get("embedding_url", settings.embedding_url),
+            "embedding_api_key": stored.get("embedding_api_key", settings.embedding_api_key),
+            "librarr_url": stored.get("librarr_url", ""),
+            "librarr_api_key": stored.get("librarr_api_key", ""),
+            "librarr_media_type": stored.get("librarr_media_type", "audiobook"),
+        }
+        merged = {**base, **updates}
+        for key in ("embedding_api_key", "librarr_api_key"):
+            if not merged[key]:
+                merged[key] = stored.get(key, "")
+        return base, merged
+
+    current = private_settings()
+    current_values, values = _merge_settings(current)
+    has_embedding_fields = any(key in payload.model_fields_set for key in embedding_fields)
+    has_librarr_fields = any(key in payload.model_fields_set for key in librarr_fields)
+    try:
+        EngineSettings(**values).validate_values(
+            validate_embedding=has_embedding_fields or not payload.model_fields_set,
+            validate_librarr=has_librarr_fields or not payload.model_fields_set,
+            check_librarr_host="librarr_url" in payload.model_fields_set,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_error_message(exc))
+    if (
+        "librarr_url" in payload.model_fields_set
+        and values["librarr_url"].strip()
+        and not values["librarr_api_key"].strip()
+    ):
+        raise HTTPException(400, "Enter a Librarr API key for the first connection.")
     embedding_changed = any(
         key in payload.model_fields_set and values[key] != current_values[key]
         for key in embedding_fields
@@ -3381,11 +3553,19 @@ async def update_settings(payload: EngineSettings):
                 400,
                 f"Embedding provider check failed: {safe_error_message(health.get('error','unknown error'))}",
             )
+        updates["embedding_model"] = test.model
         values["embedding_model"] = test.model
     else:
         health = {"ok": True, "checked": False, "model": values["embedding_model"]}
     with transaction() as con:
-        for key,value in values.items():
+        _, final_values = _merge_settings(private_settings(con))
+        if (
+            "librarr_url" in payload.model_fields_set
+            and final_values["librarr_url"].strip()
+            and not final_values["librarr_api_key"].strip()
+        ):
+            raise HTTPException(400, "Enter a Librarr API key for the first connection.")
+        for key, value in final_values.items():
             secret = key.endswith("api_key")
             stored = seal(value) if secret and value else value
             con.execute("INSERT INTO settings(key,value,secret) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",(key,stored,1 if secret else 0))
@@ -3478,7 +3658,7 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -3488,6 +3668,11 @@ def api_recommendations(
 @api_v1.post("/recommendations/bulk-feedback")
 def api_bulk_feedback(payload: BulkFeedbackIn):
     return bulk_feedback(payload)
+
+
+@api_v1.post("/recommendations/bulk-undo")
+def api_bulk_undo_feedback(payload: BulkUndoFeedbackIn):
+    return bulk_undo_feedback(payload)
 
 
 @api_v1.post("/recommendations/{candidate_id}/feedback")
@@ -3506,8 +3691,8 @@ def api_telemetry_events(payload: TelemetryBatchIn):
 
 
 @api_v1.post("/recommendations/{candidate_id}/import")
-async def api_import_librarr(candidate_id: int):
-    return await import_librarr(candidate_id)
+async def api_import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    return await import_librarr(candidate_id, payload)
 
 
 @api_v1.get("/sources")

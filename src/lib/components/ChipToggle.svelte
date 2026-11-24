@@ -14,7 +14,7 @@
 		activeClass = 'preset-filled-secondary-500',
 		inactiveClass = 'preset-tonal-secondary',
 		focusClass = 'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500',
-		class: className = 'badge badge-sm',
+		class: className = 'badge badge-sm min-h-8 min-w-8 px-2.5',
 		disabled = false,
 		onToggle,
 		children,

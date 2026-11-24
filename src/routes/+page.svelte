@@ -48,6 +48,7 @@
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
     buildLibrarrDownloadPayload,
@@ -74,6 +75,7 @@
     token?: string;
     id?: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
     editSource?: {
       id: number;
@@ -187,6 +189,7 @@
     error: boolean;
     id: number;
     undo_id?: number;
+    undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
   } | null>(null);
   let optimisticNotificationId = 0;
@@ -262,12 +265,22 @@
   function sourceEnabled(source: { id: number; enabled: number }) {
     return sourceEnabledOverrides[source.id] ?? Boolean(source.enabled);
   }
-  const allBooks = $derived(
-    [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].map((book) => {
+  const allBooks = $derived.by(() => {
+    const seen = new Set<number>();
+    const merged: PageBook[] = [];
+    for (const book of [
+      ...data.books,
+      ...data.decisions,
+      ...additionalDiscoverBooks,
+      ...additionalDecisionBooks,
+    ]) {
+      if (seen.has(book.id)) continue;
+      seen.add(book.id);
       const status = bookStatusOverrides[book.id];
-      return status === undefined ? book : { ...book, status };
-    }),
-  );
+      merged.push(status === undefined ? book : { ...book, status });
+    }
+    return merged;
+  });
   const decisionsHasMore = $derived(
     decisionsHasMoreOverride ?? Boolean(data.decisions_has_more),
   );
@@ -370,6 +383,18 @@
       : filteredBooks,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
+  const selectedDigestRunId = $derived.by(() => {
+    if (!selectedDigestIds.size) return "";
+    const booksById = new Map(allBooks.map((book) => [book.id, book]));
+    let sharedRunId = "";
+    for (const id of selectedDigestIds) {
+      const runId = booksById.get(id)?.recommendation_run_id?.trim() ?? "";
+      if (runId.length < 8) return "";
+      if (!sharedRunId) sharedRunId = runId;
+      else if (sharedRunId !== runId) return "";
+    }
+    return sharedRunId;
+  });
   const digestSettings = $derived(data.profile.digest);
   const defaultSourceEnabled = $derived(
     defaultSourceEnabledOverride ?? Boolean(data.profile.default_source_enabled),
@@ -603,7 +628,7 @@
 
     formNotificationDismissDelay = currentForm?.error
       ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id
+      : currentForm?.undo_id || currentForm?.undo_decisions?.length
         ? 0
         : FORM_NOTIFICATION_DISMISS_MS;
     scheduleFormNotificationDismiss();
@@ -704,12 +729,7 @@
     expandedRecommendationDetails = next;
   }
   function readingSourceLabel(source: string) {
-    return ({
-      goodreads_csv: "Goodreads CSV export",
-      goodreads_rss: "Goodreads read shelf RSS",
-      manual: "Added in Bookward",
-      demo: "Demo data",
-    } as Record<string, string>)[source] ?? (source || "Unknown source");
+    return formatReadingSourceLabel(source);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -816,6 +836,7 @@
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
+              key === "csv-import" ||
               key === "goodreads-csv")
           ) {
             readingHistory = [];
@@ -1628,6 +1649,9 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
+      const runId = librarrSearchBook
+        ? String(allBooks.find((book) => book.id === librarrSearchBook?.id)?.recommendation_run_id || "").trim()
+        : "";
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
@@ -1636,6 +1660,7 @@
             librarrSearchedMediaType,
             result,
             librarrSearchBook?.id,
+            runId,
           ),
         ),
       });
@@ -1644,7 +1669,6 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -1906,7 +1930,15 @@
         aria-atomic="true"
       >{visibleNotification?.message ?? ""}</div>
       {#if visibleNotification}
-        {#key visibleNotification.id ?? visibleNotification.message}
+        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
+          ? visibleNotification.undo_decisions
+          : visibleNotification.undo_id && visibleNotification.id
+            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
+            : []}
+        {@const notificationUndoKey = notificationUndoDecisions.length
+          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
+          : null}
+        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
           <div
             class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
           >
@@ -1950,24 +1982,26 @@
                   <p class="leading-relaxed text-surface-900-100">
                     {visibleNotification.message}
                   </p>
-                  {#if visibleNotification.undo_id && visibleNotification.id}
+                  {#if notificationUndoDecisions.length && notificationUndoKey}
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(`undo-${visibleNotification.undo_id}`)}
+                      use:enhance={setPending(notificationUndoKey)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={visibleNotification.id} />
-                      <input type="hidden" name="decision_id" value={visibleNotification.undo_id} />
+                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                        <input type="hidden" name="id" value={item.id} />
+                        <input type="hidden" name="decision_id" value={item.decision_id} />
+                      {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(`undo-${visibleNotification.undo_id}`)}
-                        aria-busy={isPending(`undo-${visibleNotification.undo_id}`)}
+                        disabled={isPending(notificationUndoKey)}
+                        aria-busy={isPending(notificationUndoKey)}
                         aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(`undo-${visibleNotification.undo_id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
@@ -1997,15 +2031,17 @@
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
-              <div class="input flex min-h-11 w-full min-w-0 items-center gap-2 sm:flex-1">
-                <Search size={17} class="shrink-0 text-surface-600-400" />
-                <input
-                  bind:value={filter}
-                  class="input-ghost min-w-0 flex-1"
-                  aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
-                  placeholder={view === "saved" ? "Search shortlist" : "Search books"}
-                />
-                {#if filter}<button type="button" class="btn-icon btn-icon-sm shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
+              <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
+                <label class="flex min-h-11 min-w-0 flex-1 cursor-text items-center gap-2 self-stretch pl-3 pr-2">
+                  <Search size={17} class="shrink-0 text-surface-600-400" />
+                  <input
+                    bind:value={filter}
+                    class="input-ghost min-h-11 min-w-0 flex-1 self-stretch"
+                    aria-label={view === "saved" ? "Search shortlist" : view === "decisions" && decisionFilter === "read" ? "Search reading history" : view === "decisions" ? "Search past decisions" : "Search recommendations"}
+                    placeholder={view === "saved" ? "Search shortlist" : "Search books"}
+                  />
+                </label>
+                {#if filter}<button type="button" class="btn-icon btn-icon-sm mr-1.5 min-h-8 min-w-8 shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => (filter = "")}><X size={15} /></button>{/if}
               </div>
               {#if bookGenres.length && !(view === "decisions" && decisionFilter === "read")}
                 <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
@@ -2058,6 +2094,7 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
+                  {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
@@ -2084,17 +2121,6 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              {#if view === "discover" && digestVisible && book.status === "recommended"}
-                <label class="absolute left-3 top-3 z-30 grid size-8 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg" title={`Select ${book.title}`}>
-                  <input
-                    class="checkbox size-5 accent-secondary-500"
-                    type="checkbox"
-                    checked={selectedDigestIds.has(book.id)}
-                    onchange={() => toggleDigestBook(book.id)}
-                    aria-label={`Select ${book.title} for shortlist`}
-                  />
-                </label>
-              {/if}
               <div
                 class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
               >
@@ -2123,8 +2149,19 @@
                   <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                 </button>
               </div>
-              <div class="relative z-10 flex min-w-0 flex-col gap-2 sm:gap-2.5 p-3 sm:p-4">
+              <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
+                  {#if view === "discover" && digestVisible && book.status === "recommended"}
+                    <label class="grid size-8 shrink-0 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg sm:absolute sm:left-3 sm:top-3 sm:z-30" title={`Select ${book.title}`}>
+                      <input
+                        class="checkbox size-6 accent-secondary-500"
+                        type="checkbox"
+                        checked={selectedDigestIds.has(book.id)}
+                        onchange={() => toggleDigestBook(book.id)}
+                        aria-label={`Select ${book.title} for shortlist`}
+                      />
+                    </label>
+                  {/if}
                   <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
@@ -2133,7 +2170,7 @@
                   {#if typeof book.metadata_confidence === "number" && book.metadata_confidence < 0.65}<span class="badge badge-sm preset-tonal-warning" title="Sparse catalog details reduced this recommendation's score">Limited metadata</span>{/if}
                   {#if book.source_url}<a
                       in:scale={{ duration: motionDuration(180) }}
-                      class="btn btn-icon btn-xs preset-tonal-surface shrink-0"
+                      class="btn btn-icon btn-xs min-h-8 min-w-8 preset-tonal-surface shrink-0"
                       href={book.source_url}
                       target="_blank"
                       rel="noreferrer"
@@ -2205,14 +2242,16 @@
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
-                      </form>
-                    {:else}
+                      {#if book.status === "saved"}
+                        <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                          <ProfileField profileId={data.user?.profile_id} />
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        </form>
+                      {/if}
+                    {:else if book.status === "saved"}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
@@ -2222,20 +2261,10 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                      </form>
-                    {/if}
-                  {:else if book.status === "imported"}
-                    <button
-                      in:fly={{ y: 8, duration: motionDuration(180) }}
-                      type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
-                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                      onclick={() => openMarkRead(book)}
-                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                    </form>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -2400,7 +2429,7 @@
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
                   <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -2591,7 +2620,7 @@
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
                                   <span aria-hidden="true"> · </span>
                                   <form
-                                    class="inline"
+                                    class="inline-flex"
                                     method="POST"
                                     action="?/switchSourceLifecycle"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
@@ -2600,7 +2629,7 @@
                                     <input type="hidden" name="id" value={source.id} />
                                     <input type="hidden" name="lifecycle" value="permanent" />
                                     <button
-                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
                                       disabled={isPending(`source-lifecycle-${source.id}`)}
                                       aria-busy={isPending(`source-lifecycle-${source.id}`)}
@@ -2614,7 +2643,7 @@
                                 {#if source.kind !== "association" && source.kind !== "builtin"}
                                   <span aria-hidden="true"> · </span>
                                   <form
-                                    class="inline"
+                                    class="inline-flex"
                                     method="POST"
                                     action="?/switchSourceLifecycle"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
@@ -2623,7 +2652,7 @@
                                     <input type="hidden" name="id" value={source.id} />
                                     <input type="hidden" name="lifecycle" value="one_time" />
                                     <button
-                                      class="font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
+                                      class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
                                       disabled={isPending(`source-lifecycle-${source.id}`)}
                                       aria-busy={isPending(`source-lifecycle-${source.id}`)}
@@ -2634,7 +2663,7 @@
                                 {formatSourceScan(source.last_scanned_at, source.last_status)}
                               {/if}
                             </span>
-                            <div class="mt-3 flex flex-col gap-2">
+                            <div class="mt-2 flex flex-col gap-1">
                               {#if source.is_custom}
                                 <details
                                   class="w-full max-w-full"
@@ -2644,11 +2673,11 @@
                                     setSourceEditOpen(source.id, isOpen);
                                   }}
                                 >
-                                  <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                  <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                     Edit source
                                   </summary>
                                   <form
-                                    class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    class="mt-2 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
                                     method="POST"
                                     action="?/editSource"
                                     use:enhance={enhanceSourceEdit(source.id)}
@@ -2698,13 +2727,13 @@
                               {/if}
                               {#if source.kind !== "association" && source.kind !== "builtin"}
                                 <details class="w-full max-w-full">
-                                  <summary class="cursor-pointer text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                  <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
                                     Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
                                       ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
                                       : ""}
                                   </summary>
                                   <form
-                                    class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    class="mt-2 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
                                     method="POST"
                                     action="?/configureSourceFilters"
                                     use:enhance={setPending(`source-filters-${source.id}`)}
@@ -2902,7 +2931,7 @@
                       <option value="one_time">One-time import · scan once</option>
                     </select></label
                   ><details class="mt-4 border-l-2 border-tertiary-500/30 pl-3">
-                    <summary class="cursor-pointer text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
+                    <summary class="min-h-8 cursor-pointer py-2 text-sm font-medium text-tertiary-600-400 hover:text-tertiary-500-300">
                       Optional filters
                     </summary>
                     <div class="mt-3 space-y-3">
@@ -3106,9 +3135,9 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
-                action="?/importGoodreadsCsv"
+                action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("goodreads-csv")}
+                use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex items-center justify-between gap-4">
@@ -3120,7 +3149,7 @@
                     <h2
                       class="truncate text-lg font-semibold text-surface-950-50"
                     >
-                      Goodreads export
+                      CSV library export
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
@@ -3128,11 +3157,11 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import the books on your Goodreads read shelf, with their ratings and read dates.
+                  Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
-                  >Goodreads CSV<input
+                  >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
                     type="file"
@@ -3142,9 +3171,9 @@
                 ><button
                   class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
-                  disabled={isPending("goodreads-csv")}
-                  aria-busy={isPending("goodreads-csv")}
-                  >{#if isPending("goodreads-csv")}<RefreshCw
+                  disabled={isPending("csv-import")}
+                  aria-busy={isPending("csv-import")}
+                  >{#if isPending("csv-import")}<RefreshCw
                       size={16}
                       class="animate-spin"
                     />{:else}<Upload size={16} />{/if} Import CSV</button
@@ -3392,7 +3421,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Add a Google Books API key to prevent rate-limit throttling when verifying and enriching new book candidates.
                   <a
-                    class="inline-flex items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center gap-1 font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://developers.google.com/books/docs/v1/using"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3418,8 +3447,8 @@
                   >
                   {#if data.profile.google_books_api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clear" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clear" />
                       Clear saved API key</label
                     >
                   {/if}
@@ -3463,7 +3492,7 @@
                 <p class="text-sm leading-6 text-surface-700-300">
                   Optionally rerank top recommendations with an OpenAI-compatible LLM. Pick a provider and model from
                   <a
-                    class="font-medium text-primary-600-400 underline underline-offset-2"
+                    class="inline-flex min-h-6 items-center font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://models.dev"
                     target="_blank"
                     rel="noopener noreferrer"
@@ -3563,9 +3592,9 @@
                   <ProfileField profileId={data.user?.profile_id} />
                   <input type="hidden" name="provider" value={llmProvider} />
                   <label
-                    class="flex items-center gap-3 text-sm font-medium text-surface-800-200"
+                    class="flex min-h-11 cursor-pointer items-center gap-3 text-sm font-medium text-surface-800-200"
                     ><input
-                      class="checkbox"
+                      class="checkbox size-6 shrink-0"
                       type="checkbox"
                       name="enabled"
                       checked={llmEnabled}
@@ -3613,8 +3642,8 @@
                   >
                   {#if llmRerank.api_key_set}
                     <label
-                      class="flex items-center gap-2 text-xs text-surface-700-300"
-                      ><input class="checkbox checkbox-sm" type="checkbox" name="clearApiKey" />
+                      class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
+                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clearApiKey" />
                       Clear saved LLM API key</label
                     >
                   {/if}
@@ -3811,7 +3840,7 @@
                             </div>
                             {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
                               <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
-                              {#if digestSettings.discord_webhook_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
+                              {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
@@ -3842,7 +3871,7 @@
                                 <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value="" placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
                                 <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
-                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex items-center gap-2 text-xs text-surface-700-300"><input class="checkbox checkbox-sm" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
+                              {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" /> Clear saved credentials</label>{/if}
                             </div>{:else}<input type="hidden" name="emailTo" value={digestSettings.email_to} /><input type="hidden" name="emailFrom" value={digestSettings.email_from} /><input type="hidden" name="smtpHost" value={digestSettings.smtp_host} /><input type="hidden" name="smtpPort" value={digestSettings.smtp_port} /><input type="hidden" name="smtpSecurity" value={digestSettings.smtp_security} />{/if}
                           </div>
                         </div>
@@ -4001,7 +4030,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm shrink-0 rounded-full preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 rounded-full preset-tonal-surface"
             aria-label="Close Mark Read dialog"
             data-modal-initial-focus
             onclick={closeMarkRead}
@@ -4100,7 +4129,7 @@
         open
         in:scale={{ duration: motionDuration(220) }}
         out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 flex card max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
+        class="relative m-0 card flex max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
         aria-labelledby="librarr-search-title"
         aria-modal="true"
         onclick={(event) => event.stopPropagation()}
@@ -4124,7 +4153,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-icon btn-sm preset-tonal-surface"
+            class="btn btn-icon btn-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface"
             aria-label="Close Librarr search"
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
@@ -4138,9 +4167,9 @@
             }}
           >
             <label
-              class="input flex min-h-12 min-w-0 flex-1 items-center gap-2"
+              class="input flex min-h-12 min-w-0 flex-1 cursor-text items-center gap-2 py-0!"
               ><Search size={17} class="shrink-0 text-surface-600-400" /><input
-                class="input-ghost min-w-0 flex-1 focus:outline-none focus:ring-0"
+                class="input-ghost min-h-12 min-w-0 flex-1 self-stretch focus:outline-none focus:ring-0"
                 data-modal-initial-focus
                 bind:value={librarrQuery}
                 aria-label="Search Librarr by title or author"
@@ -4225,7 +4254,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-9 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -4275,7 +4304,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}
