@@ -46,7 +46,7 @@ EVENT_TYPES = {
     "restore",
     "read",
 }
-HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv"})
+HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv", "storygraph_csv"})
 INACTIVE_CANDIDATE_STATUSES = frozenset({"rejected", "maybe_later", "hidden"})
 READ_OUTCOME_LABEL_KINDS = (
     "completed_unrated",
