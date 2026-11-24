@@ -1137,6 +1137,165 @@ describe("page actions", () => {
     });
   });
 
+  it("hydrates full Digest Review picks beyond the initial 24 Discover page and exposes full-pool genres", async () => {
+    const overview = {
+      recommendation_run_id: "run-9999",
+      recommendations_has_more: true,
+      recommendation_genres: ["Fantasy", "Xenolinguistics"],
+      decision_genres: ["Historical Fiction", "Solarpunk"],
+      recommendations: [
+        {
+          id: 1,
+          title: "Top Ranked Pick",
+          author: "Writer One",
+          description: "In page one",
+          cover_url: "https://covers.example/1.jpg",
+          source_url: "https://books.example/1",
+          release_date: "2026-09-01",
+          date_kind: "day",
+          genres: ["Fantasy"],
+          score: 95,
+          explanation: ["Strong match"],
+          status: "recommended",
+          source_name: "Feed A",
+        },
+      ],
+      decisions: [],
+      decisions_has_more: false,
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const digestReviewPayload = {
+      period: "2026-W39",
+      ids: [1, 30],
+      found: true,
+      items: [
+        overview.recommendations[0],
+        {
+          id: 30,
+          title: "Rank Thirty Digest Gem",
+          author: "Writer Thirty",
+          description: "Ranked below page one",
+          cover_url: "https://covers.example/30.jpg",
+          source_url: "https://books.example/30",
+          release_date: "2026-09-15",
+          date_kind: "day",
+          genres: ["Xenolinguistics"],
+          score: 83,
+          explanation: ["Digest standout"],
+          status: "recommended",
+          source_name: "Feed B",
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/api/digest/review")) {
+        return new Response(JSON.stringify(digestReviewPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=discover&digest=1&digest_period=2026-W39"),
+      locals: { user: null },
+    } as never)) as {
+      recommendations_has_more: boolean;
+      recommendation_genres: string[];
+      decision_genres: string[];
+      digestReview: {
+        requested: boolean;
+        stale: boolean;
+        period: string | null;
+        ids: number[];
+        books: Array<{ id: number; title: string; recommendation_run_id?: string | null }>;
+      };
+    };
+
+    expect(result.recommendations_has_more).toBe(true);
+    expect(result.recommendation_genres).toEqual(["Fantasy", "Xenolinguistics"]);
+    expect(result.decision_genres).toEqual(["Historical Fiction", "Solarpunk"]);
+    expect(result.digestReview.requested).toBe(true);
+    expect(result.digestReview.ids).toEqual([1, 30]);
+    expect(result.digestReview.books).toEqual([
+      expect.objectContaining({
+        id: 1,
+        title: "Top Ranked Pick",
+        recommendation_run_id: "run-9999",
+      }),
+      expect.objectContaining({
+        id: 30,
+        title: "Rank Thirty Digest Gem",
+        recommendation_run_id: "",
+      }),
+    ]);
+  });
+
+  it("marks unknown digest periods unrequested and returns an empty digestReview.books slice", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string | URL) => {
+      if (String(input).includes("/api/digest/review")) {
+        return new Response(
+          JSON.stringify({ period: "2026-W52", ids: [], found: false }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=discover&digest=1&digest_period=2026-W52"),
+      locals: { user: null },
+    } as never)) as {
+      digestReview: {
+        requested: boolean;
+        ids: number[];
+        books: unknown[];
+      };
+    };
+
+    expect(result.digestReview).toEqual({
+      requested: false,
+      ids: [],
+      books: [],
+    });
+  });
+
   it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {

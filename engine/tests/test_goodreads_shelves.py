@@ -1237,3 +1237,76 @@ def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_
         ("currently-reading", "Piranesi", "Susanna Clarke"),
     ]
 
+
+def test_server_filters_and_digest_review_exclude_goodreads_shelf_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine import profiles
+
+    db_path = tmp_path / "filters_and_digest_review_shelves.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+    profiles.initialize_auth()
+
+    con = sqlite3.connect(db_path)
+    try:
+        def insert_candidate(title: str, author: str, score: float, genres: list[str]) -> int:
+            cur = con.execute(
+                """
+                INSERT INTO candidates (
+                    source_id, normalized_key, title, author, description, cover_url,
+                    release_date, date_kind, genres, source_url, score, explanation, status
+                ) VALUES (1, ?, ?, ?, 'Speculative archive mystery.', '', '2026-10-01', 'day', ?, '', ?, '["Match"]', 'recommended')
+                """,
+                (normalize_key(title, author), title, author, json.dumps(genres), score),
+            )
+            cid = int(cur.lastrowid)
+            con.execute(
+                """
+                INSERT OR REPLACE INTO candidate_quality (
+                    candidate_id, quality_status, quality_score, metadata_confidence, audited_at
+                ) VALUES (?, 'accepted', 0.95, 0.9, CURRENT_TIMESTAMP)
+                """,
+                (cid,),
+            )
+            return cid
+
+        visible_id = insert_candidate("Visible Archive", "Cara Author", 92.0, ["Speculative"])
+        queued_id = insert_candidate("Queued Archive", "Cara Author", 95.0, ["Speculative"])
+        reading_id = insert_candidate("Reading Archive", "Cara Author", 94.0, ["Speculative"])
+
+        con.executemany(
+            "INSERT INTO goodreads_shelf_items(shelf, source, title, author) VALUES(?, 'goodreads_csv', ?, ?)",
+            [
+                ("to-read", "Queued Archive", "Cara Author"),
+                ("currently-reading", "Reading Archive", "Cara Author"),
+            ],
+        )
+        con.execute(
+            """
+            INSERT INTO notification_deliveries (
+                id, period_key, channel, status, recipient, candidate_ids, attempts, sent_at
+            ) VALUES ('deliv-w44', '2026-W44', 'discord', 'sent', 'webhook', ?, 1, CURRENT_TIMESTAMP)
+            """,
+            (json.dumps([queued_id, reading_id, visible_id]),),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        filtered = client.get(
+            "/api/recommendations",
+            params={"status": "recommended", "search": "archive", "genre": "Speculative"},
+        )
+        assert filtered.status_code == 200
+        assert [item["id"] for item in filtered.json()] == [visible_id]
+
+        review = client.get("/api/digest/review", params={"period": "2026-W44"})
+        assert review.status_code == 200
+        review_payload = review.json()
+        assert review_payload["found"] is True
+        assert review_payload["ids"] == [queued_id, reading_id, visible_id]
+        assert [item["id"] for item in review_payload["items"]] == [visible_id]
+
+
