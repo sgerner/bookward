@@ -1,4 +1,3 @@
-import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { engineStatus, engine } from "#lib/server/engine.js";
 
@@ -22,8 +21,8 @@ const errorMessage = (error: unknown) =>
 export const GET: RequestHandler = async () => {
   try {
     const items = await engine<ReadingHistoryItem[]>("/api/reading-history");
-    return json({ items });
+    return Response.json({ items });
   } catch (error) {
-    return json({ message: errorMessage(error) }, { status: engineStatus(error) });
+    return Response.json({ message: errorMessage(error) }, { status: engineStatus(error) });
   }
 };
