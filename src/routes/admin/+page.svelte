@@ -24,7 +24,7 @@
 
 <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:btn focus:preset-filled-primary-500">Skip to content</a>
 <main id="main-content" tabindex="-1" class="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-	<a href="/" class="text-primary-600-400">← Bookward</a>
+	<a href="/" class="inline-flex min-h-11 items-center text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Manage accounts</h1>
 	<p class="mt-2 text-surface-700-300">Each account opens one private profile. Existing data stays with the original administrator profile.</p>
 	{#if form?.message && form.error}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>{:else if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
