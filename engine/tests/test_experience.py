@@ -11,7 +11,7 @@ import pytest
 ENGINE = Path(__file__).parents[1]
 sys.path.insert(0, str(ENGINE / "scripts"))
 import evaluate_experience as experience
-from afterword_engine.ingestion import _read_metadata_identity_hash
+from afterword_engine.identity import read_metadata_identity_hash
 from afterword_engine.subjects import normalize_subjects
 
 
@@ -112,7 +112,7 @@ def test_subject_verification_hashes_all_twelve_but_topic_features_stay_capped_a
     genres = [f"subject {index}" for index in range(1, 12)] + ["Fiction"]
     original = {
         "read_id": read["id"],
-        "identity_hash": _read_metadata_identity_hash(read),
+        "identity_hash": read_metadata_identity_hash(read),
         "genres": genres,
     }
     normalized_twelve = normalize_subjects(

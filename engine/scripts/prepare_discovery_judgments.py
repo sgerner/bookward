@@ -15,8 +15,11 @@ import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import evaluate_typed_retrieval as typed
 import evaluate_ranking as historical
-from afterword_engine.ingestion import _read_metadata_identity_hash
-from afterword_engine.identity import book_identity, book_identity_matches
+from afterword_engine.identity import (
+    book_identity,
+    book_identity_matches,
+    read_metadata_identity_hash,
+)
 
 
 def write(path,value):
@@ -30,7 +33,7 @@ def complete_reads(corpus):
     for original in corpus['reads']:
         read=dict(original)
         meta=metadata.get(int(read['id']))
-        if meta and meta.get('identity_hash')==_read_metadata_identity_hash(read):
+        if meta and meta.get('identity_hash')==read_metadata_identity_hash(read):
             for key in ('open_library_work_id','isbn','isbn10','isbn13'):
                 if meta.get(key) and not read.get(key): read[key]=meta[key]
         result.append(read)
