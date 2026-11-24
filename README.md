@@ -96,7 +96,7 @@ curl https://your-bookward-host.example/api/v1/recommendations \
 The v1 API supports recommendations and feedback, source listing and management, Goodreads RSS imports, sync and scoring jobs, job status, and the Librarr search/download integration. The most commonly used routes are:
 
 - `GET /api/v1/overview` — recommendations, reading history, sources, and safe settings.
-- `GET /api/v1/recommendations` — filter with `status=recommended|saved|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
+- `GET /api/v1/recommendations` — filter with `status=recommended|saved|imported|decisions|rejected|maybe_later|all`, cap with `limit`, and page with `offset`.
 - `POST /api/v1/recommendations/{id}/feedback` — send `{"action":"save"}`, `reject`, `maybe_later`, or `restore`. Only `reject` is a negative learning signal; `maybe_later` is neutral.
 - `POST /api/v1/recommendations/{id}/undo` — send `{"decision_id":123}` from a recent feedback response to undo the latest choice.
 - `GET /api/v1/sources` — list configured sources.
@@ -189,7 +189,7 @@ git clone https://github.com/sgerner/bookward.git
 cd bookward
 
 npm ci
-uv sync --project engine --extra dev --frozen
+uv sync --project engine --extra dev --locked
 ~~~
 
 `.npmrc` blocks npm install scripts during `npm ci`, so `.svelte-kit` types are synced when you run `npm run dev`, `npm run check`, or `npm run build`.
@@ -326,9 +326,7 @@ npm test
 npm run build
 
 # Engine
-uv sync --project engine --extra dev --frozen
-uv export --project engine --locked --no-dev --format requirements.txt --no-annotate --no-header --no-emit-project | diff -u engine/requirements.lock -
-uv export --project engine --locked --only-group build --format requirements.txt --no-annotate --no-header | diff -u engine/build-requirements.lock -
+uv sync --project engine --extra dev --locked
 uv run --project engine python -c 'import pathlib, tomllib; d = tomllib.loads(pathlib.Path("engine/pyproject.toml").read_text(encoding="utf-8")); req, grp = d["build-system"]["requires"], d["dependency-groups"]["build"]; assert req == grp, f"build-system.requires ({req}) != dependency-groups.build ({grp})"'
 uv run --project engine pytest -q engine/tests
 uv run --project engine python -m compileall -q engine/afterword_engine
@@ -340,7 +338,7 @@ uv run --project engine python scripts/community_smoke.py
 docker compose build
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
 
 ## Contributing
 
