@@ -14,9 +14,7 @@ import json
 import re
 from typing import Any
 
-from .database import normalize_key
-from .identity import book_openlibrary_work_id
-from .isbn import isbn_parts
+from .identity import book_openlibrary_work_id, read_metadata_identity_hash
 from .read_dates import read_day
 
 
@@ -44,20 +42,6 @@ def _strict_work_id(value: Any) -> str:
     raw = str(value or "").strip()
     canonical = book_openlibrary_work_id({"openlibrary_work_id": raw})
     return canonical if raw and canonical == raw else ""
-
-
-def _read_identity_hash(read: Mapping[str, Any]) -> str:
-    isbn13, isbn10 = isbn_parts(read.get("isbn"))
-    identity = {
-        "title": normalize_key(str(read.get("title") or ""), ""),
-        "author": normalize_key("", str(read.get("author") or "")),
-        "source_isbn": re.sub(r"[^0-9xX]", "", str(read.get("isbn") or "")).upper(),
-        "isbn13": isbn13,
-        "isbn10": isbn10,
-        "openlibrary_work_id": book_openlibrary_work_id(read),
-    }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_year(value: Any) -> int | None:
@@ -218,7 +202,7 @@ def _verified_read_year(
 ) -> int | None:
     if not isinstance(metadata, Mapping):
         return None
-    if str(metadata.get("identity_hash") or "") != _read_identity_hash(read):
+    if str(metadata.get("identity_hash") or "") != read_metadata_identity_hash(read):
         return None
     work_id = _strict_work_id(metadata.get("verified_work_id"))
     current_work_id = book_openlibrary_work_id(read)
@@ -318,7 +302,7 @@ def attach_publication_years(
             read_ledger.get(read_id, ()),
         )
         metadata = read_metadata.get(read_id)
-        if (metadata and metadata.get("identity_hash") == _read_identity_hash(read)):
+        if (metadata and metadata.get("identity_hash") == read_metadata_identity_hash(read)):
             work_id = _strict_work_id(metadata.get("verified_work_id"))
             current_work_id = book_openlibrary_work_id(read)
             if work_id and (not current_work_id or current_work_id == work_id):
