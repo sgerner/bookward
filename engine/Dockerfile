@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir --no-deps --require-hashes -r requirements.txt \
     && rm requirements.txt
 COPY --from=build /wheels /wheels
 RUN pip install --no-cache-dir --no-deps --no-index --find-links /wheels bookward-engine \
+    && pip check \
     && rm -rf /wheels
 RUN useradd --create-home --uid 10001 afterword \
     && mkdir -p /data /backups \
