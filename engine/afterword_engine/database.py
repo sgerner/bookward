@@ -12,7 +12,7 @@ from .covers import (
     fallback_cover_url,
     is_weak_cover_url,
 )
-from .identity import book_identity, book_identity_matches
+from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
 from .tenancy import profile_database_path
@@ -985,6 +985,13 @@ MIGRATIONS = [
             ON reads(COALESCE(read_at, created_at) DESC, id DESC);
         """,
     ),
+    (
+        26,
+        """
+        CREATE INDEX IF NOT EXISTS idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1449,10 +1456,6 @@ def initialize(*, seed_demo: bool = True):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
     _restrict_database_files()
-
-def normalize_key(title: str, author: str):
-    import re
-    return re.sub(r"[^a-z0-9]+", " ", f"{title} {author}".lower()).strip()
 
 def rows(query: str, params=()):
     with connect() as con:

@@ -1,8 +1,10 @@
+import { isHttpError } from "@sveltejs/kit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { actions, load } from "./+page.server";
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -184,6 +186,32 @@ describe("page actions", () => {
     ]);
     expect(fetchMock.mock.calls[0][0]).toContain("/api/overview?recommendation_limit=24");
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("x-bookward-session");
+  });
+
+  it("throws a 503 string error without deprecation warnings when the engine is unavailable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:8000"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    let thrown: unknown;
+    try {
+      await load({
+        url: new URL("http://afterword.test/"),
+        locals: { user: null },
+      } as never);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(isHttpError(thrown, 503)).toBe(true);
+    if (isHttpError(thrown, 503)) {
+      expect(thrown.body.message).toBe(
+        "Bookward's recommendation engine is unavailable. connect ECONNREFUSED 127.0.0.1:8000",
+      );
+    }
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("marks a recommended book as read with an optional rating and no device session", async () => {
