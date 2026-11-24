@@ -3483,7 +3483,10 @@
                       name="apiKey"
                       type="password"
                       placeholder={llmRerank.api_key_set
-                        ? "Already configured · leave blank to keep"
+                        ? llmApiUrl.trim() !== llmRerank.api_url.trim() ||
+                          llmProvider.trim() !== llmRerank.provider.trim()
+                          ? "Enter new API key for updated endpoint"
+                          : "Already configured · leave blank to keep"
                         : "sk-…"}
                     /></label
                   >

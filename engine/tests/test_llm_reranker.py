@@ -199,7 +199,6 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
 
 
 def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> None:
-    import asyncio
     import socket
     import httpx
     import pytest
@@ -210,9 +209,29 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
 
     assert Settings().llm_rerank_timeout_seconds == 8.0
     monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (
+                    host
+                    if host in {"127.0.0.1", "169.254.169.254"}
+                    else "93.184.216.34",
+                    port or 80,
+                ),
+            )
+        ],
+    )
 
     for blocked in (
         "https://",
+        "http://llm.example/v1/chat/completions",
+        "http://93.184.216.34/v1/chat/completions",
         "http://127.0.0.1:11434/v1/chat/completions",
         "http://169.254.169.254/latest/meta-data/",
         "https://localhost:8443/v1",
@@ -234,11 +253,11 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
             http_called = True
 
     monkeypatch.setattr(reranker_module.httpx, "Client", ForbiddenClient)
-    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", ForbiddenClient)
 
     candidates = [{"id": 1, "score": 80.0}, {"id": 2, "score": 78.0}]
     for blocked in (
         "https://",
+        "http://llm.example/v1/chat/completions",
         "http://127.0.0.1:11434/v1",
         "http://169.254.169.254/v1",
     ):
@@ -254,15 +273,21 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
         assert "sk-secret-key" not in sync_diag.get("error", "")
         assert [item["id"] for item in sync_items] == [1, 2]
         with pytest.raises(ValueError) as exc_info:
-            asyncio.run(
-                probe_llm_reranker(
-                    api_url=blocked,
-                    api_key="sk-secret-key",
-                    model="gpt-4o-mini",
-                )
+            probe_llm_reranker(
+                api_url=blocked,
+                api_key="sk-secret-key",
+                model="gpt-4o-mini",
             )
         assert "sk-secret-key" not in str(exc_info.value)
     assert http_called is False
+
+    # Keyless target preparation permits public HTTP only when no key is attached.
+    target_url, host_headers, ext = reranker_module._prepare_llm_request_target(
+        "http://llm.example/v1", has_api_key=False
+    )
+    assert target_url == "http://93.184.216.34/v1/chat/completions"
+    assert host_headers == {"Host": "llm.example"}
+    assert ext is None
 
     # Allowlisting an internal host permits it and configures httpx safely while still blocking redirects.
     monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "127.0.0.1,ollama")
@@ -669,30 +694,37 @@ def test_circuit_breaker_persists_redacted_errors_and_serves_base_rankings_per_p
 def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unchanged(
     tmp_path: Path, monkeypatch
 ) -> None:
+    import inspect
     import httpx
     from fastapi.testclient import TestClient
     from auth_helpers import authenticated_headers
     import afterword_engine.llm_reranker as reranker_module
     import afterword_engine.main as main_module
 
+    assert not inspect.iscoroutinefunction(reranker_module.probe_llm_reranker)
+    assert not inspect.iscoroutinefunction(main_module.update_llm_rerank_settings)
+    assert not inspect.iscoroutinefunction(main_module.test_llm_rerank_settings)
+
     _setup_temp_engine_db(tmp_path, monkeypatch)
     probe_calls = 0
     should_fail = False
+    captured_auth_headers: list[str] = []
 
-    class ProbeAsyncClient:
+    class ProbeSyncClient:
         def __init__(self, *args, **kwargs) -> None:
             assert kwargs.get("follow_redirects") is False
             assert kwargs.get("trust_env") is False
 
-        async def __aenter__(self):
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *args) -> None:
+        def __exit__(self, *args) -> None:
             return None
 
-        async def post(self, url: str, **kwargs):
+        def post(self, url: str, **kwargs):
             nonlocal probe_calls
             probe_calls += 1
+            captured_auth_headers.append(kwargs.get("headers", {}).get("Authorization", ""))
             if should_fail:
                 return httpx.Response(
                     401,
@@ -705,7 +737,7 @@ def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unc
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", ProbeAsyncClient)
+    monkeypatch.setattr(reranker_module.httpx, "Client", ProbeSyncClient)
     headers = authenticated_headers()
     client = TestClient(main_module.app, headers=headers)
     if True:
@@ -724,18 +756,32 @@ def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unc
         assert disabled_resp.json()["checked"] is False
         assert probe_calls == 0
 
-        # SSRF URLs are rejected before probing or saving.
-        ssrf_resp = client.put(
-            "/api/settings/llm-rerank",
-            json={
-                "enabled": True,
-                "provider": "custom",
-                "api_url": "http://169.254.169.254/v1/chat/completions",
-                "model": "gpt-4o-mini",
-                "api_key": "sk-saved",
-            },
-        )
-        assert ssrf_resp.status_code == 400
+        # SSRF and cleartext public HTTP URLs are rejected before probing or saving.
+        for rejected_url in (
+            "http://169.254.169.254/v1/chat/completions",
+            "http://llm.example/v1/chat/completions",
+        ):
+            bad_resp = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "provider": "custom",
+                    "api_url": rejected_url,
+                    "model": "gpt-4o-mini",
+                    "api_key": "sk-saved",
+                },
+            )
+            assert bad_resp.status_code == 400
+            bad_test = client.post(
+                "/api/settings/llm-rerank/test",
+                json={
+                    "provider": "custom",
+                    "api_url": rejected_url,
+                    "model": "gpt-4o-mini",
+                    "api_key": "sk-saved",
+                },
+            )
+            assert bad_test.status_code == 400
         assert probe_calls == 0
 
         # Enabling when upstream probe fails returns 502 with redacted error and does not enable reranking.
@@ -789,22 +835,270 @@ def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unc
         assert unchanged_save.json()["checked"] is False
         assert probe_calls == 2
 
-        # Explicit connection test always verifies live model response.
+        # Changing model on the SAME normalized URL/origin & provider with blank key reuses stored key.
+        same_origin_model_change = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": True,
+                "provider": "openai",
+                "api_url": "https://llm.example/v1",
+                "model": "gpt-4o",
+            },
+        )
+        assert same_origin_model_change.status_code == 200
+        assert same_origin_model_change.json()["checked"] is True
+        assert probe_calls == 3
+        assert captured_auth_headers[-1] == "Bearer sk-good-secret"
+
+        # Explicit connection test with unchanged URL & blank key reuses stored key.
         test_ok = client.post(
             "/api/settings/llm-rerank/test",
             json={
                 "provider": "openai",
                 "api_url": "https://llm.example/v1/chat/completions",
-                "model": "gpt-4o-mini",
+                "model": "gpt-4o",
             },
         )
         assert test_ok.status_code == 200
         assert test_ok.json()["ok"] is True
-        assert probe_calls == 3
+        assert probe_calls == 4
+        assert captured_auth_headers[-1] == "Bearer sk-good-secret"
 
 
-def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) -> None:
-    import asyncio
+def test_changed_url_or_provider_with_blank_key_never_sends_stored_or_env_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import httpx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+    from afterword_engine.config import settings
+
+    _setup_temp_engine_db(tmp_path, monkeypatch)
+    sent_requests: list[dict] = []
+
+    class RecordingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url: str, **kwargs):
+            sent_requests.append({"url": url, "headers": dict(kwargs.get("headers") or {})})
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", RecordingClient)
+    headers = authenticated_headers()
+    client = TestClient(main_module.app, headers=headers)
+
+    # 1. Stored profile key: changing URL or provider with blank key is rejected without probing.
+    _seed_llm_settings(
+        enabled=True,
+        api_url="https://llm.example/v1/chat/completions",
+        api_key="sk-stored-profile-secret",
+        model="gpt-4o-mini",
+    )
+
+    changed_url_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "provider": "openai",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+            "api_key": "",
+        },
+    )
+    assert changed_url_save.status_code == 400
+    assert sent_requests == []
+    assert (
+        main_module.safe_llm_rerank_settings()["api_url"]
+        == "https://llm.example/v1/chat/completions"
+    )
+
+    changed_url_test = client.post(
+        "/api/settings/llm-rerank/test",
+        json={
+            "provider": "openai",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+            "api_key": "",
+        },
+    )
+    assert changed_url_test.status_code == 400
+    assert sent_requests == []
+
+    changed_provider_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "provider": "groq",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert changed_provider_save.status_code == 400
+    assert sent_requests == []
+
+    # Saving disabled settings with a changed URL and blank key drops the stored key instead of rebinding it.
+    disabled_url_change = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": False,
+            "provider": "custom",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert disabled_url_change.status_code == 200
+    assert disabled_url_change.json()["llm_rerank"]["api_key_set"] is False
+    assert sent_requests == []
+
+    followup_test = client.post(
+        "/api/settings/llm-rerank/test",
+        json={
+            "provider": "custom",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert followup_test.status_code == 400
+    assert sent_requests == []
+
+    # 2. Deployment env key: never sent to a custom URL on save, test, or serving; reused only on matching default URL.
+    (tmp_path / "env_profile").mkdir(parents=True, exist_ok=True)
+    _setup_temp_engine_db(tmp_path / "env_profile", monkeypatch)
+    client = TestClient(main_module.app, headers=authenticated_headers())
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-deployment-env-secret")
+
+    env_hijack_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "provider": "",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert env_hijack_save.status_code == 400
+    assert sent_requests == []
+
+    env_hijack_test = client.post(
+        "/api/settings/llm-rerank/test",
+        json={
+            "provider": "",
+            "api_url": "https://attacker.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert env_hijack_test.status_code == 400
+    assert sent_requests == []
+
+    # Even if a custom URL is present in profile settings without a profile key, effective settings omit env key.
+    _seed_llm_settings(
+        enabled=True,
+        api_url="https://attacker.example/v1/chat/completions",
+        api_key="",
+        model="gpt-4o-mini",
+    )
+    assert main_module.effective_llm_rerank_settings()["api_key"] == ""
+
+    # Fresh profile using the exact default origin & provider can reuse the operator env key.
+    (tmp_path / "env_default_ok").mkdir(parents=True, exist_ok=True)
+    _setup_temp_engine_db(tmp_path / "env_default_ok", monkeypatch)
+    client = TestClient(main_module.app, headers=authenticated_headers())
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-deployment-env-secret")
+    env_default_test = client.post(
+        "/api/settings/llm-rerank/test",
+        json={
+            "provider": "",
+            "api_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert env_default_test.status_code == 200
+    assert len(sent_requests) == 1
+    assert sent_requests[0]["headers"]["Authorization"] == "Bearer sk-deployment-env-secret"
+    assert sent_requests[0]["headers"]["Host"] == "api.openai.com"
+
+
+def test_empty_payload_trips_circuit_breaker_while_empty_adjustments_list_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import httpx
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+
+    _setup_temp_engine_db(tmp_path, monkeypatch)
+    _seed_llm_settings()
+
+    response_content = '{"adjustments": []}'
+    llm_calls = 0
+
+    class PayloadClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url: str, **kwargs):
+            nonlocal llm_calls
+            llm_calls += 1
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": response_content}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", PayloadClient)
+
+    # Valid no-op schema `{"adjustments": []}` succeeds, caches, and leaves circuit breaker closed.
+    noop_overview = main_module.overview_payload(recommendation_limit=24)
+    assert llm_calls == 1
+    assert noop_overview["settings"]["llm_rerank"]["last_status"] == "succeeded"
+    assert noop_overview["settings"]["llm_rerank"]["cooldown_until"] == ""
+    cached_noop = main_module.overview_payload(recommendation_limit=24)
+    assert llm_calls == 1
+    assert len(cached_noop["recommendations"]) == len(noop_overview["recommendations"])
+
+    # Schema-noncompliant `{}` (missing both adjustments and rankings) trips the 300s circuit breaker.
+    reranker_module.clear_llm_rerank_state(clear_all=True)
+    response_content = "{}"
+    broken_overview = main_module.overview_payload(recommendation_limit=24)
+    assert llm_calls == 2
+    llm_state = broken_overview["settings"]["llm_rerank"]
+    assert llm_state["last_status"] == "failed"
+    assert "adjustments or rankings" in llm_state["last_error"]
+    assert llm_state["cooldown_until"] != ""
+
+    # Next request short-circuits via open circuit breaker without calling upstream again.
+    after_trip = main_module.overview_payload(recommendation_limit=24)
+    assert llm_calls == 2
+    assert len(after_trip["recommendations"]) == len(broken_overview["recommendations"])
+
+
+def test_request_target_pins_resolved_ip_and_hmac_isolates_api_keys_and_modes(
+    monkeypatch,
+) -> None:
     import socket
     import httpx
     import pytest
@@ -825,17 +1119,17 @@ def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) 
 
     captured: list[dict] = []
 
-    class InspectingAsyncClient:
+    class InspectingSyncClient:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def __aenter__(self):
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *args) -> None:
+        def __exit__(self, *args) -> None:
             return None
 
-        async def post(self, url: str, **kwargs):
+        def post(self, url: str, **kwargs):
             captured.append({"url": url, **kwargs})
             return httpx.Response(
                 200,
@@ -843,33 +1137,29 @@ def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) 
                 request=httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", InspectingAsyncClient)
-    probe_res = asyncio.run(
-        reranker_module.probe_llm_reranker(
-            api_url="https://llm.example:8443/v1",
-            api_key="sk-probe-key",
-            model="gpt-4o-mini",
-        )
+    monkeypatch.setattr(reranker_module.httpx, "Client", InspectingSyncClient)
+    probe_res = reranker_module.probe_llm_reranker(
+        api_url="https://llm.example:8443/v1",
+        api_key="sk-probe-key",
+        model="gpt-4o-mini",
     )
     assert probe_res == {"ok": True, "checked": True, "model": "gpt-4o-mini"}
     assert captured[-1]["url"] == "https://93.184.216.34:8443/v1/chat/completions"
     assert captured[-1]["headers"]["Host"] == "llm.example:8443"
     assert captured[-1]["extensions"] == {"sni_hostname": "llm.example"}
 
-    # Allowlisted internal hosts use the operator-configured host directly without SNI override.
+    # Allowlisted internal hosts permit HTTP and use the operator-configured host directly without SNI override.
     monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
-    asyncio.run(
-        reranker_module.probe_llm_reranker(
-            api_url="http://ollama:11434/v1",
-            api_key="sk-local",
-            model="llama3.2",
-        )
+    reranker_module.probe_llm_reranker(
+        api_url="http://ollama:11434/v1",
+        api_key="sk-local",
+        model="llama3.2",
     )
     assert captured[-1]["url"] == "http://ollama:11434/v1/chat/completions"
     assert "Host" not in captured[-1]["headers"]
     assert "extensions" not in captured[-1]
 
-    # PBKDF2 fingerprints isolate slate cache keys and circuit-breaker state across API keys.
+    # HMAC-SHA256 fingerprints isolate slate cache keys and circuit-breaker state across API keys and modes.
     k1 = reranker_module.build_slate_cache_key(
         messages=[{"role": "user", "content": "{}"}],
         interaction_events=None,
@@ -878,6 +1168,7 @@ def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) 
         model="gpt-4o-mini",
         top_k=24,
         max_delta=1.2,
+        mode="cloud",
     )
     k2 = reranker_module.build_slate_cache_key(
         messages=[{"role": "user", "content": "{}"}],
@@ -887,32 +1178,65 @@ def test_request_target_pins_resolved_ip_and_kdf_isolates_api_keys(monkeypatch) 
         model="gpt-4o-mini",
         top_k=24,
         max_delta=1.2,
+        mode="cloud",
+    )
+    k3_mode = reranker_module.build_slate_cache_key(
+        messages=[{"role": "user", "content": "{}"}],
+        interaction_events=None,
+        api_url="https://llm.example/v1",
+        api_key="sk-key-one",
+        model="gpt-4o-mini",
+        top_k=24,
+        max_delta=1.2,
+        mode="ollama",
     )
     assert k1 != k2
+    assert k1 != k3_mode
     assert "sk-key-one" not in k1
 
     reranker_module.trip_circuit_breaker(
-        "profile-kdf-test",
+        "profile-hmac-test",
         api_url="https://llm.example/v1",
         api_key="sk-key-one",
         model="gpt-4o-mini",
         error="HTTP 401",
+        mode="cloud",
     )
     assert (
         reranker_module.get_circuit_breaker_state(
-            "profile-kdf-test",
+            "profile-hmac-test",
             api_url="https://llm.example/v1",
             api_key="sk-key-one",
             model="gpt-4o-mini",
+            mode="cloud",
         )
         is not None
     )
     assert (
         reranker_module.get_circuit_breaker_state(
-            "profile-kdf-test",
+            "profile-hmac-test",
             api_url="https://llm.example/v1",
             api_key="sk-key-two",
             model="gpt-4o-mini",
+            mode="cloud",
+        )
+        is None
+    )
+    reranker_module.trip_circuit_breaker(
+        "profile-hmac-test",
+        api_url="https://llm.example/v1",
+        api_key="sk-key-one",
+        model="gpt-4o-mini",
+        error="HTTP 401",
+        mode="cloud",
+    )
+    assert (
+        reranker_module.get_circuit_breaker_state(
+            "profile-hmac-test",
+            api_url="https://llm.example/v1",
+            api_key="sk-key-one",
+            model="gpt-4o-mini",
+            mode="ollama",
         )
         is None
     )
