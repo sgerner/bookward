@@ -30,6 +30,7 @@ from afterword_engine.covers import (
 from afterword_engine.ingestion import (
     _nyt_request_url,
     _source_client,
+    discover_feed_urls,
     enrich_book_metadata,
     enrich_goodreads_blog_items,
     fetch_bytes,
@@ -40,6 +41,7 @@ from afterword_engine.ingestion import (
     normalize_source_filters,
     normalize_stored_candidate_subjects,
     parse_book_items,
+    preview_source,
     refresh_missing_candidate_metadata,
     scan_source,
 )
@@ -603,6 +605,296 @@ def test_source_fetch_follows_and_repins_public_redirects(monkeypatch):
     content, content_type = asyncio.run(fetch_bytes("https://books.example.test/list"))
     assert content == b"books" and content_type == "text/plain"
     assert final.calls[0].request.headers["host"] == "redirect.example.test"
+
+
+def test_discover_feed_urls_rejects_non_default_ports():
+    html_doc = b"""
+    <html><head>
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:8443/feed.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:443/default.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/plain.xml" />
+    </head></html>
+    """
+    assert discover_feed_urls(html_doc, "https://newsletter.example.test/archive/") == [
+        "https://newsletter.example.test/default.xml",
+        "https://newsletter.example.test/plain.xml",
+    ]
+
+
+def test_discover_feed_urls_resolves_relative_links_deduplicates_and_deprioritizes_comments():
+    html_doc = b"""
+    <html>
+      <head>
+        <link rel="stylesheet" href="/site.css" />
+        <link rel="alternate" type="text/xml+oembed" href="/oembed.xml" />
+        <link rel="alternate" type="application/rss+xml" title="Comments Feed" href="/comments/feed.xml#latest" />
+        <link rel="alternate" type="application/rss+xml" href="http://newsletter.example.test/insecure.xml" />
+        <link rel="alternate" type="application/rss+xml" href="https://localhost/local.xml" />
+        <link rel="alternate" type="application/rss+xml" href="https://127.0.0.1/loopback.xml" />
+        <link rel="alternate" type="application/rss+xml" href="/archive/index.html#self" />
+        <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/#root" />
+        <link rel="alternate" type="application/rss+xml; charset=utf-8" title="Main RSS" href="feed.xml#top" />
+        <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/archive/feed.xml" />
+        <link rel="ALTERNATE" type="APPLICATION/ATOM+XML" title="Atom Feed" href="../feeds/books.atom#entries" />
+      </head>
+    </html>
+    """
+    discovered = discover_feed_urls(
+        html_doc,
+        "https://newsletter.example.test/archive/index.html",
+        original_url="https://newsletter.example.test",
+    )
+    assert discovered == [
+        "https://newsletter.example.test/archive/feed.xml",
+        "https://newsletter.example.test/feeds/books.atom",
+        "https://newsletter.example.test/comments/feed.xml",
+    ]
+
+
+@respx.mock
+def test_preview_source_autodiscovers_atom_after_redirect_and_prioritizes_populated_feed(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    respx.get("https://93.184.216.34/").mock(
+        return_value=httpx.Response(
+            302,
+            headers={"location": "https://www.newsletter.example.test/blog/"},
+        )
+    )
+    respx.get("https://93.184.216.34/blog/").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html>
+              <head>
+                <link rel="alternate" type="application/rss+xml" title="Post Comments" href="/blog/comments/feed.xml" />
+                <link rel="alternate" type="application/rss+xml" title="Empty RSS" href="rss.xml" />
+                <link rel="alternate" type="application/atom+xml" title="Books Atom" href="../atom.xml#feed" />
+                <link rel="alternate" type="application/rss+xml" title="Backup RSS" href="/backup.xml" />
+              </head>
+              <body><h1>Newsletter Home</h1><p>Weekly dispatches for readers.</p></body>
+            </html>
+            """,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+    )
+    empty_rss = respx.get("https://93.184.216.34/blog/rss.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+    atom_feed = respx.get("https://93.184.216.34/atom.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>Book Dispatches</title>
+              <entry>
+                <title>The Left Hand of Darkness</title>
+                <author><name>Ursula K. Le Guin</name></author>
+                <link rel="alternate" href="/posts/left-hand" />
+                <summary>A classic science fiction novel.</summary>
+              </entry>
+            </feed>
+            """,
+            headers={"content-type": "application/atom"},
+        )
+    )
+    backup_rss = respx.get("https://93.184.216.34/backup.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    comments_rss = respx.get("https://93.184.216.34/blog/comments/feed.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+
+    _, _, redirected_url = asyncio.run(
+        fetch_bytes("https://newsletter.example.test/", return_url=True)
+    )
+    assert redirected_url == "https://www.newsletter.example.test/blog/"
+
+    preview = asyncio.run(preview_source("https://newsletter.example.test/"))
+    assert preview["url"] == "https://www.newsletter.example.test/atom.xml"
+    assert preview["content_type"] == "application/atom"
+    assert preview["count"] == 1
+    assert preview["sample"][0]["title"] == "The Left Hand of Darkness"
+    assert preview["sample"][0]["author"] == "Ursula K. Le Guin"
+    assert (
+        preview["sample"][0]["source_url"]
+        == "https://www.newsletter.example.test/posts/left-hand"
+    )
+    assert empty_rss.called and atom_feed.called
+    assert not backup_rss.called
+    assert not comments_rss.called
+
+
+@respx.mock
+def test_autodiscovery_enforces_ssrf_caps_fetches_and_keeps_direct_html_single_fetch(
+    monkeypatch,
+):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        ip = "127.0.0.1" if host == "private.example.test" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    private_route = respx.get("https://127.0.0.1/internal.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    respx.get("https://93.184.216.34/empty-home").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html><head>
+              <link rel="alternate" type="application/rss+xml" href="http://books.example.test/http-only.xml" />
+              <link rel="alternate" type="application/rss+xml" href="https://private.example.test/internal.xml" />
+              <link rel="alternate" type="application/rss+xml" href="/nested-html" />
+              <link rel="alternate" type="application/rss+xml" href="/redirect-private" />
+              <link rel="alternate" type="application/rss+xml" href="/empty-3.xml" />
+              <link rel="alternate" type="application/rss+xml" href="/fourth.xml" />
+            </head><body><p>No books directly on homepage.</p></body></html>
+            """,
+            headers={"content-type": "text/html"},
+        )
+    )
+    nested_html = respx.get("https://93.184.216.34/nested-html").mock(
+        return_value=httpx.Response(
+            200,
+            text='<html><head><link rel="alternate" type="application/rss+xml" href="/nested.xml" /></head></html>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    nested_feed = respx.get("https://93.184.216.34/nested.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    redirect_private = respx.get("https://93.184.216.34/redirect-private").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://private.example.test/internal.xml"}
+        )
+    )
+    empty_three = respx.get("https://93.184.216.34/empty-3.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+    fourth_feed = respx.get("https://93.184.216.34/fourth.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel><item><title>Unreached Book</title></item></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+
+    empty_preview = asyncio.run(preview_source("https://books.example.test/empty-home"))
+    assert empty_preview["count"] == 0
+    assert empty_preview["url"] == "https://books.example.test/empty-home"
+    assert not private_route.called
+    assert nested_html.called and redirect_private.called and empty_three.called
+    assert not nested_feed.called
+    assert not fourth_feed.called
+
+    respx.get("https://93.184.216.34/direct-books").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html>
+              <head>
+                <link rel="alternate" type="application/rss+xml" href="/unused-feed.xml" />
+                <script type="application/ld+json">
+                  {"@type": "Book", "name": "Direct JSON-LD Book", "author": "A Writer"}
+                </script>
+              </head>
+              <body></body>
+            </html>
+            """,
+            headers={"content-type": "text/html"},
+        )
+    )
+    unused_feed = respx.get("https://93.184.216.34/unused-feed.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    direct_preview = asyncio.run(preview_source("https://books.example.test/direct-books"))
+    assert direct_preview["count"] == 1
+    assert direct_preview["url"] == "https://books.example.test/direct-books"
+    assert not unused_feed.called
+
+
+@respx.mock
+def test_source_endpoints_persist_resolved_feed_url_and_reject_duplicate_canonical_feed(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    for path in ("/", "/about"):
+        respx.get(f"https://93.184.216.34{path}").mock(
+            return_value=httpx.Response(
+                200,
+                text='<html><head><link rel="alternate" type="application/rss+xml" href="/feed.xml" /></head></html>',
+                headers={"content-type": "text/html"},
+            )
+        )
+    respx.get("https://93.184.216.34/feed.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="""<?xml version="1.0"?>
+            <rss version="2.0"><channel>
+              <item><title>Orbital</title><author>Samantha Harvey</author></item>
+            </channel></rss>""",
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        first_preview = client.post(
+            "/api/sources/preview", json={"url": "https://newsletter.example.test/"}
+        )
+        assert first_preview.status_code == 200
+        assert first_preview.json()["url"] == "https://newsletter.example.test/feed.xml"
+        assert first_preview.json()["count"] == 1
+
+        created = client.post(
+            "/api/sources",
+            json={
+                "name": "newsletter.example.test",
+                "url": first_preview.json()["url"],
+                "enabled": False,
+            },
+        )
+        assert created.status_code == 200
+        stored = row("SELECT name, url FROM sources WHERE id=?", (created.json()["id"],))
+        assert stored["name"] == "newsletter.example.test"
+        assert stored["url"] == "https://newsletter.example.test/feed.xml"
+
+        second_preview = client.post(
+            "/api/sources/preview", json={"url": "https://newsletter.example.test/about"}
+        )
+        assert second_preview.status_code == 200
+        assert second_preview.json()["url"] == "https://newsletter.example.test/feed.xml"
+
+        duplicate = client.post(
+            "/api/sources",
+            json={
+                "name": "Duplicate feed",
+                "url": second_preview.json()["url"],
+                "enabled": False,
+            },
+        )
+        assert duplicate.status_code == 409
+        assert "already exists" in duplicate.json()["detail"]
 
 @respx.mock
 def test_scan_source_persists_provider_metadata(database, monkeypatch):
