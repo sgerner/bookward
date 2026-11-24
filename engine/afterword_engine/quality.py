@@ -13,8 +13,11 @@ failure and leaves the row in quarantine for a later retry.
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
+import logging
 import re
+import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -42,29 +45,303 @@ from .covers import (
     metadata_client,
     safe_cover_url,
 )
-from .database import persist_metadata_field_provenance, private_setting, rows, transaction
+from .database import connect, persist_metadata_field_provenance, private_setting, rows, transaction
 from .identity import (
     ReadIdentityIndex,
+    _AUTHOR_SUFFIXES,
     _title_without_format_suffix,
+    book_author_identity_key,
     book_identity,
     book_identity_match_index,
     book_row_identity_match_keys,
     canonical_part,
-    catalog_author_similarity,
-    catalog_derivative_subjects_conflict,
-    catalog_language_allowed,
-    catalog_title_similarity,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
+LOGGER = logging.getLogger(__name__)
 QUALITY_VERSION = "candidate-quality-v5"
 _NON_CATALOG_PROVIDERS = frozenset({"source", "penguinrandomhouse"})
+_POLLUTION_FLAGS = frozenset(
+    {
+        "catalog_homonym_author",
+        "catalog_derivative_edition",
+        "catalog_foreign_language",
+    }
+)
 APPLE_BOOKS_SEARCH = "https://itunes.apple.com/search"
 CATALOG_CONCURRENCY = 8
 CATALOG_LIMIT = 10
 CATALOG_PROVIDER_RETRY_HOURS = 24
 QUALITY_AUDIT_BATCH_SIZE = 50
+QUALITY_AUDIT_SUBBATCH_SIZE = 10
+QUALITY_AUDIT_TIME_BUDGET_SECONDS = 30.0
+_audit_monotonic = time.monotonic
+
+_TRAILING_PAREN = re.compile(r"\s*\([^()]{2,80}\)\s*$")
+_AUTHOR_SPLIT = re.compile(r"\s*(?:,|;|&|\band\b)\s*", re.IGNORECASE)
+_DERIVATIVE_CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "summary",
+        re.compile(
+            r"\b(?:summar(?:y|ies)|cliff\s*notes|cliffs\s*notes|spark\s*notes|"
+            r"instaread|blinkist|supersummary|bookcaps|quickread|key\s+takeaways)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "study_guide",
+        re.compile(
+            r"\b(?:study\s+guides?|study\s+aids?|student\s+guides?|teacher'?s?\s+guides?|"
+            r"reading\s+guides?|reader'?s?\s+guides?|discussion\s+guides?|book\s+club\s+guides?|"
+            r"literature\s+guides?|book\s+notes|study\s+notes)\b"
+            r"|\b(?:summary|review)\s+(?:and|&)\s+analysis\b"
+            r"|\b(?:detailed|critical|comprehensive|character)\s+analysis\b"
+            r"|^\s*(?:a\s+)?(?:guide|analysis|review|notes|overview)\s+(?:of|to|for|on)\b"
+            r"|\([^()]*\b(?:analysis|study|discussion\s+questions)\b[^()]*\)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "workbook",
+        re.compile(r"\b(?:workbooks?|exercise\s+books?)\b", re.IGNORECASE),
+    ),
+    (
+        "companion",
+        re.compile(
+            r"\b(?:companions?|unofficial\s+guides?|unauthorized\s+(?:guide|companion|biography)|"
+            r"trivia\s+(?:and|&|book|guide|questions))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "box_set",
+        re.compile(
+            r"\b(?:box\s*sets?|boxed\s+sets?|omnibus|complete\s+collection|"
+            r"[2-9]\s*-?\s*in\s*-?\s*1|(?:two|three|four)\s+in\s+one)\b"
+            r"|\b\d+\s*-?\s*book\s+(?:set|bundle|collection|pack)\b"
+            r"|\b(?:books|volumes|vols\.?)\s+\d+\s*(?:-|–|—|to|through)\s*\d+\b"
+            r"|#\s*\d+\s*(?:-|–|—)\s*\d+\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+_FOREIGN_TITLE_LANGUAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "es",
+        re.compile(
+            r"\b(?:spanish\s+(?:edition|language|version)|edici[oó]n\s+en\s+espa[nñ]ol|"
+            r"versi[oó]n\s+en\s+espa[nñ]ol|en\s+espa[nñ]ol|in\s+spanish)\b"
+            r"|[\(\[\-–—:]\s*(?:spanish|espa[nñ]ol)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "fr",
+        re.compile(
+            r"\b(?:french\s+(?:edition|language|version)|[eé]dition\s+fran[cç]aise|"
+            r"version\s+fran[cç]aise|en\s+fran[cç]ais|in\s+french)\b"
+            r"|[\(\[\-–—:]\s*(?:french|fran[cç]ais)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "de",
+        re.compile(
+            r"\b(?:german\s+(?:edition|language|version)|deutsche\s+ausgabe|"
+            r"auf\s+deutsch|in\s+german)\b"
+            r"|[\(\[\-–—:]\s*(?:german|deutsch)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "it",
+        re.compile(
+            r"\b(?:italian\s+(?:edition|language|version)|edizione\s+italiana|in\s+italian)\b"
+            r"|[\(\[\-–—:]\s*(?:italian|italiano)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pt",
+        re.compile(
+            r"\b(?:portuguese\s+(?:edition|language|version)|edi[cç][aã]o\s+em\s+portugu[eê]s|"
+            r"in\s+portuguese)\b"
+            r"|[\(\[\-–—:]\s*(?:portuguese|portugu[eê]s)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ru",
+        re.compile(
+            r"\b(?:russian\s+(?:edition|language|version)|in\s+russian)\b"
+            r"|[\(\[\-–—:]\s*russian\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ja",
+        re.compile(
+            r"\b(?:japanese\s+(?:edition|language|version)|in\s+japanese)\b"
+            r"|[\(\[\-–—:]\s*japanese\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "zh",
+        re.compile(
+            r"\b(?:chinese\s+(?:edition|language|version)|in\s+chinese)\b"
+            r"|[\(\[\-–—:]\s*chinese\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ko",
+        re.compile(
+            r"\b(?:korean\s+(?:edition|language|version)|in\s+korean)\b"
+            r"|[\(\[\-–—:]\s*korean\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "nl",
+        re.compile(
+            r"\b(?:dutch\s+(?:edition|language|version)|nederlandse\s+editie|in\s+dutch)\b"
+            r"|[\(\[\-–—:]\s*(?:dutch|nederlands)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pl",
+        re.compile(
+            r"\b(?:polish\s+(?:edition|language|version)|wydanie\s+polskie|in\s+polish)\b"
+            r"|[\(\[\-–—:]\s*(?:polish|polski)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "sv",
+        re.compile(
+            r"\b(?:swedish\s+(?:edition|language|version)|svensk\s+utg[aå]va|in\s+swedish)\b"
+            r"|[\(\[\-–—:]\s*(?:swedish|svenska)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "tr",
+        re.compile(
+            r"\b(?:turkish\s+(?:edition|language|version)|t[uü]rk[cç]e\s+bask[iı]|in\s+turkish)\b"
+            r"|[\(\[\-–—:]\s*(?:turkish|t[uü]rk[cç]e)\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ar",
+        re.compile(
+            r"\b(?:arabic\s+(?:edition|language|version)|in\s+arabic)\b"
+            r"|[\(\[\-–—:]\s*arabic\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "he",
+        re.compile(
+            r"\b(?:hebrew\s+(?:edition|language|version)|in\s+hebrew)\b"
+            r"|[\(\[\-–—:]\s*hebrew\s*[\)\]]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "foreign",
+        re.compile(r"\b(?:foreign|translated)\s+(?:language\s+)?edition\b", re.IGNORECASE),
+    ),
+)
+_LANGUAGE_CODE_ALIASES: dict[str, str] = {
+    "en": "en",
+    "eng": "en",
+    "english": "en",
+    "es": "es",
+    "spa": "es",
+    "spanish": "es",
+    "fr": "fr",
+    "fre": "fr",
+    "fra": "fr",
+    "french": "fr",
+    "de": "de",
+    "ger": "de",
+    "deu": "de",
+    "german": "de",
+    "it": "it",
+    "ita": "it",
+    "italian": "it",
+    "pt": "pt",
+    "por": "pt",
+    "portuguese": "pt",
+    "ru": "ru",
+    "rus": "ru",
+    "russian": "ru",
+    "ja": "ja",
+    "jpn": "ja",
+    "japanese": "ja",
+    "zh": "zh",
+    "chi": "zh",
+    "zho": "zh",
+    "chinese": "zh",
+    "ko": "ko",
+    "kor": "ko",
+    "korean": "ko",
+    "nl": "nl",
+    "dut": "nl",
+    "nld": "nl",
+    "dutch": "nl",
+    "pl": "pl",
+    "pol": "pl",
+    "polish": "pl",
+    "sv": "sv",
+    "swe": "sv",
+    "swedish": "sv",
+    "tr": "tr",
+    "tur": "tr",
+    "turkish": "tr",
+    "ar": "ar",
+    "ara": "ar",
+    "arabic": "ar",
+    "he": "he",
+    "heb": "he",
+    "hebrew": "he",
+    "cs": "cs",
+    "cze": "cs",
+    "ces": "cs",
+    "el": "el",
+    "gre": "el",
+    "ell": "el",
+    "hu": "hu",
+    "hun": "hu",
+    "ro": "ro",
+    "rum": "ro",
+    "ron": "ro",
+    "uk": "uk",
+    "ukr": "uk",
+    "ca": "ca",
+    "cat": "ca",
+    "id": "id",
+    "ind": "id",
+    "vi": "vi",
+    "vie": "vi",
+    "th": "th",
+    "tha": "th",
+    "hi": "hi",
+    "hin": "hi",
+}
+_IGNORED_LANGUAGE_CODES = {"", "und", "mul", "zxx", "mis", "unknown", "none", "null"}
+_DERIVATIVE_SUBJECT_PATTERN = re.compile(
+    r"^(?:study\s+aids?(?:\s*/.*)?|book\s+notes|cliff\s*notes|cliffs\s*notes|spark\s*notes)$",
+    re.IGNORECASE,
+)
+_ONLY_DERIVATIVE_SUBJECT_PATTERN = re.compile(
+    r"^(?:study\s+guides?|workbooks?|summaries)$",
+    re.IGNORECASE,
+)
 UNKNOWN_AUTHOR_RE = re.compile(
     r"^(?:unknown(?:\s+author)?|n/?a|none|null|various(?:\s+authors?)?|anonymous|staff)$",
     re.IGNORECASE,
@@ -84,12 +361,352 @@ def _tokens(value: object) -> set[str]:
     return set(canonical_part(value).split())
 
 
-def _title_similarity(left: object, right: object) -> float:
-    return catalog_title_similarity(left, right)
+def _author_tokens(value: object) -> list[str]:
+    tokens = canonical_part(value).split()
+    while len(tokens) > 1 and tokens[-1] in _AUTHOR_SUFFIXES:
+        tokens.pop()
+    return tokens
+
+
+def _split_author_values(value: object) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value if item]
+    else:
+        raw_items = [str(value or "")]
+    parts: list[str] = []
+    for raw in raw_items:
+        for piece in _AUTHOR_SPLIT.split(raw):
+            cleaned = piece.strip()
+            if cleaned:
+                parts.append(cleaned)
+    return parts
+
+
+def _single_author_matches(left: object, right: object) -> bool:
+    key_a = book_author_identity_key(left)
+    key_b = book_author_identity_key(right)
+    if not key_a or not key_b:
+        return False
+    norm_a = canonical_part(left)
+    norm_b = canonical_part(right)
+    if key_a == key_b or (norm_a and norm_a == norm_b):
+        return True
+    parts_a = _author_tokens(left)
+    parts_b = _author_tokens(right)
+    return bool(
+        len(parts_a) >= 2
+        and len(parts_b) >= 2
+        and parts_a[-1] == parts_b[-1]
+        and parts_a[0][0] == parts_b[0][0]
+        and (
+            parts_a[0] == parts_b[0]
+            or len(parts_a[0]) == 1
+            or len(parts_b[0]) == 1
+        )
+    )
+
+
+def _single_author_similarity(left: object, right: object) -> float:
+    key_a = book_author_identity_key(left)
+    key_b = book_author_identity_key(right)
+    if not key_a or not key_b:
+        return 0.0
+    norm_a = canonical_part(left)
+    norm_b = canonical_part(right)
+    if key_a == key_b or (norm_a and norm_a == norm_b):
+        return 1.0
+    parts_a = _author_tokens(left)
+    parts_b = _author_tokens(right)
+    if not parts_a or not parts_b:
+        return 0.0
+    token_a, token_b = set(parts_a), set(parts_b)
+    shared = token_a & token_b
+    overlap = len(shared) / max(1, len(token_a | token_b))
+    if _single_author_matches(left, right):
+        return max(overlap, 0.85)
+    surname_match = len(parts_a) >= 2 and len(parts_b) >= 2 and parts_a[-1] == parts_b[-1]
+    conflicting_given_names = (
+        len(parts_a) >= 2
+        and len(parts_b) >= 2
+        and parts_a[0] != parts_b[0]
+        and len(parts_a[0]) > 1
+        and len(parts_b[0]) > 1
+    )
+    if conflicting_given_names:
+        return 0.55 if surname_match else min(0.55, overlap)
+    surname_score = 0.55 if surname_match else 0.0
+    return max(overlap, surname_score)
 
 
 def _author_similarity(left: object, right: object) -> float:
-    return catalog_author_similarity(left, right)
+    left_parts = _split_author_values(left)
+    right_parts = _split_author_values(right)
+    if not left_parts or not right_parts:
+        return 0.0
+    best = 0.0
+    if isinstance(left, str) and isinstance(right, str):
+        best = _single_author_similarity(left, right)
+    for left_author in left_parts:
+        for right_author in right_parts:
+            best = max(best, _single_author_similarity(left_author, right_author))
+    return best
+
+
+def _author_has_homonym_conflict(left: object, right: object) -> bool:
+    if _author_similarity(left, right) >= 0.65:
+        return False
+    for left_author in _split_author_values(left):
+        parts_a = _author_tokens(left_author)
+        if len(parts_a) < 2 or len(parts_a[0]) <= 1:
+            continue
+        for right_author in _split_author_values(right):
+            parts_b = _author_tokens(right_author)
+            if (
+                len(parts_b) >= 2
+                and len(parts_b[0]) > 1
+                and parts_a[-1] == parts_b[-1]
+                and parts_a[0] != parts_b[0]
+            ):
+                return True
+    return False
+
+
+def _non_latin_scripts(value: object) -> set[str]:
+    scripts: set[str] = set()
+    for char in unicodedata.normalize("NFKC", str(value or "")):
+        if not char.isalpha():
+            continue
+        code = ord(char)
+        if 0x0400 <= code <= 0x052F:
+            scripts.add("cyrillic")
+        elif (
+            0x3040 <= code <= 0x30FF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x4E00 <= code <= 0x9FFF
+        ):
+            scripts.add("cjk")
+        elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF:
+            scripts.add("hangul")
+        elif 0x0600 <= code <= 0x06FF or 0x0750 <= code <= 0x077F:
+            scripts.add("arabic")
+        elif 0x0590 <= code <= 0x05FF:
+            scripts.add("hebrew")
+        elif 0x0900 <= code <= 0x097F:
+            scripts.add("devanagari")
+        elif 0x0E00 <= code <= 0x0E7F:
+            scripts.add("thai")
+        elif 0x0370 <= code <= 0x03FF:
+            scripts.add("greek")
+    return scripts
+
+
+def catalog_edition_markers(title: object) -> tuple[set[str], set[str]]:
+    raw = unicodedata.normalize("NFKC", str(title or "")).strip()
+    if not raw:
+        return set(), set()
+    derivatives = {
+        category
+        for category, pattern in _DERIVATIVE_CATEGORY_PATTERNS
+        if pattern.search(raw)
+    }
+    foreign_languages = {
+        lang
+        for lang, pattern in _FOREIGN_TITLE_LANGUAGE_PATTERNS
+        if pattern.search(raw)
+    }
+    return derivatives, foreign_languages
+
+
+def _strip_foreign_edition_suffix(title: object) -> str:
+    raw = _title_without_format_suffix(title)
+    for _lang, pattern in _FOREIGN_TITLE_LANGUAGE_PATTERNS:
+        raw = pattern.sub("", raw).strip()
+    raw = re.sub(r"\s*\(\s*\)\s*|\s*\[\s*\]\s*", " ", raw).strip(" -–—:()[]")
+    return raw
+
+
+def catalog_title_allowed(requested_title: object, catalog_title: object) -> bool:
+    req_deriv, req_langs = catalog_edition_markers(requested_title)
+    cat_deriv, cat_langs = catalog_edition_markers(catalog_title)
+    if req_deriv != cat_deriv:
+        return False
+    if cat_langs - req_langs:
+        return False
+    if _non_latin_scripts(catalog_title) - _non_latin_scripts(requested_title):
+        return False
+    return True
+
+
+def catalog_derivative_subjects_conflict(requested_title: object, raw_subjects: object) -> bool:
+    req_deriv, _ = catalog_edition_markers(requested_title)
+    if req_deriv & {"summary", "study_guide", "workbook", "companion"}:
+        return False
+    if isinstance(raw_subjects, str):
+        items: list[object] = [raw_subjects]
+    elif isinstance(raw_subjects, (list, tuple, set)):
+        items = list(raw_subjects)
+    else:
+        return False
+    cleaned: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("name") or item.get("subject") or item.get("value") or item.get("text") or ""
+        text = " ".join(unicodedata.normalize("NFKC", str(item or "")).split()).strip()
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return False
+    if any(_DERIVATIVE_SUBJECT_PATTERN.match(subject) for subject in cleaned):
+        return True
+    return all(
+        _DERIVATIVE_SUBJECT_PATTERN.match(subject) or _ONLY_DERIVATIVE_SUBJECT_PATTERN.match(subject)
+        for subject in cleaned
+    )
+
+
+def catalog_language_codes(catalog_languages: object) -> set[str]:
+    codes: set[str] = set()
+
+    def collect(value: object) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key in ("key", "code", "language", "value"):
+                if value.get(key):
+                    collect(value[key])
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                collect(item)
+            return
+        raw = unicodedata.normalize("NFKC", str(value)).strip()
+        if not raw:
+            return
+        for token in re.split(r"[\s,;|]+", raw):
+            cleaned = token.strip().casefold()
+            if cleaned.startswith("/languages/"):
+                cleaned = cleaned[len("/languages/") :]
+            cleaned = cleaned.strip("/").replace("_", "-")
+            primary = cleaned.split("-", 1)[0]
+            if primary in _IGNORED_LANGUAGE_CODES:
+                continue
+            codes.add(_LANGUAGE_CODE_ALIASES.get(primary, primary))
+
+    collect(catalog_languages)
+    return codes
+
+
+def catalog_language_allowed(requested_title: object, catalog_languages: object) -> bool:
+    codes = catalog_language_codes(catalog_languages)
+    if not codes:
+        return True
+    _req_deriv, req_langs = catalog_edition_markers(requested_title)
+    specific_langs = req_langs - {"foreign"}
+    if specific_langs:
+        return bool(codes & specific_langs)
+    if "foreign" in req_langs:
+        return bool(codes - {"en"})
+    if _non_latin_scripts(requested_title):
+        return True
+    return "en" in codes
+
+
+def _string_title_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    token_a = set(a.split())
+    token_b = set(b.split())
+    shared = token_a & token_b
+    overlap = len(shared) / max(1, len(token_a | token_b))
+    return max(overlap, SequenceMatcher(None, a, b).ratio())
+
+
+def _title_similarity(left: object, right: object) -> float:
+    if not catalog_title_allowed(left, right):
+        return 0.0
+    a = canonical_part(left)
+    b = canonical_part(right)
+    score = _string_title_similarity(a, b)
+    if score == 1.0:
+        return 1.0
+    stripped_a = canonical_part(_title_without_format_suffix(left))
+    stripped_b = canonical_part(_title_without_format_suffix(right))
+    if stripped_a != a or stripped_b != b:
+        score = max(score, _string_title_similarity(stripped_a, stripped_b))
+    _, req_langs = catalog_edition_markers(left)
+    _, cat_langs = catalog_edition_markers(right)
+    if req_langs or cat_langs:
+        lang_stripped_a = canonical_part(_strip_foreign_edition_suffix(left))
+        lang_stripped_b = canonical_part(_strip_foreign_edition_suffix(right))
+        if lang_stripped_a and lang_stripped_b:
+            score = max(score, _string_title_similarity(lang_stripped_a, lang_stripped_b))
+    raw_left = str(left or "").strip()
+    raw_right = str(right or "").strip()
+    if bool(_TRAILING_PAREN.search(raw_left)) != bool(_TRAILING_PAREN.search(raw_right)):
+        base_a = canonical_part(_TRAILING_PAREN.sub("", raw_left))
+        base_b = canonical_part(_TRAILING_PAREN.sub("", raw_right))
+        if len(base_a.split()) >= 2 and len(base_b.split()) >= 2:
+            score = max(score, _string_title_similarity(base_a, base_b))
+    return score
+
+
+def _catalog_item_targets_work(
+    requested_title: object,
+    requested_author: object,
+    catalog_title: object,
+    catalog_author: object,
+    *,
+    isbn_matched: bool = False,
+) -> bool:
+    if isbn_matched:
+        return True
+    if _author_similarity(requested_author, catalog_author) < 0.65:
+        return False
+    req_key = canonical_part(_title_without_format_suffix(requested_title))
+    if not req_key:
+        return False
+    cat_full = canonical_part(catalog_title)
+    cat_stripped = canonical_part(_strip_foreign_edition_suffix(catalog_title))
+    cat_base = canonical_part(_TRAILING_PAREN.sub("", str(catalog_title or "").strip()))
+    return bool(
+        _string_title_similarity(req_key, cat_stripped) >= 0.82
+        or _string_title_similarity(req_key, cat_base) >= 0.82
+        or (len(req_key) >= 4 and f" {req_key} " in f" {cat_full} ")
+    )
+
+
+def _record_item_pollution_flags(
+    pollution_flags: set[str] | None,
+    *,
+    requested_title: object,
+    requested_author: object,
+    catalog_title: object,
+    catalog_author: object,
+    isbn_matched: bool = False,
+) -> None:
+    if pollution_flags is None:
+        return
+    req_deriv, req_langs = catalog_edition_markers(requested_title)
+    cat_deriv, cat_langs = catalog_edition_markers(catalog_title)
+    if _catalog_item_targets_work(
+        requested_title,
+        requested_author,
+        catalog_title,
+        catalog_author,
+        isbn_matched=isbn_matched,
+    ):
+        if req_deriv != cat_deriv:
+            pollution_flags.add("catalog_derivative_edition")
+        if (cat_langs - req_langs) or (_non_latin_scripts(catalog_title) - _non_latin_scripts(requested_title)):
+            pollution_flags.add("catalog_foreign_language")
+    req_key = canonical_part(_title_without_format_suffix(requested_title))
+    cat_key = canonical_part(_title_without_format_suffix(catalog_title))
+    if _string_title_similarity(req_key, cat_key) >= 0.82 and _author_has_homonym_conflict(
+        requested_author, catalog_author
+    ):
+        pollution_flags.add("catalog_homonym_author")
 
 
 def _is_accepted_match(match: dict[str, Any] | None) -> bool:
@@ -355,6 +972,7 @@ async def _open_library_match(
     isbn: str = "",
     expected_isbn: str = "",
     trace: list[dict[str, Any]] | None = None,
+    pollution_flags: set[str] | None = None,
 ) -> dict[str, Any] | None:
     query_title = _title_without_format_suffix(title) or title
     params = {
@@ -387,15 +1005,32 @@ async def _open_library_match(
         if isbn and not _query_isbn_matches(isbn, raw_identifiers):
             mismatched_identifiers += 1
             continue
-        if not catalog_language_allowed(title, doc.get("language")):
-            continue
-        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, raw_identifiers)
-        if not doc_verified and catalog_derivative_subjects_conflict(title, doc.get("subject")):
-            continue
         authors = doc.get("author_name") or []
         if isinstance(authors, str):
             authors = [authors]
         catalog_author = ", ".join(str(value) for value in authors if value)
+        catalog_title = str(doc.get("title") or "")
+        if not catalog_language_allowed(title, doc.get("language")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author, isbn_matched=bool(isbn)
+            ):
+                pollution_flags.add("catalog_foreign_language")
+            continue
+        doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, raw_identifiers)
+        if not doc_verified and catalog_derivative_subjects_conflict(title, doc.get("subject")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author, isbn_matched=bool(isbn)
+            ):
+                pollution_flags.add("catalog_derivative_edition")
+            continue
+        _record_item_pollution_flags(
+            pollution_flags,
+            requested_title=title,
+            requested_author=author,
+            catalog_title=catalog_title,
+            catalog_author=catalog_author,
+            isbn_matched=bool(isbn),
+        )
         projected_identifiers = _isbn_provenance_values(target_isbn, raw_identifiers)
         isbn13, isbn10 = _first_isbn(projected_identifiers)
         cover = ""
@@ -462,6 +1097,7 @@ async def _google_books_match(
     expected_isbn: str = "",
     trace: list[dict[str, Any]] | None = None,
     google_books_api_key: str = "",
+    pollution_flags: set[str] | None = None,
 ) -> dict[str, Any] | None:
     query_title = _title_without_format_suffix(title) or title
     params = {
@@ -495,6 +1131,8 @@ async def _google_books_match(
         authors = info.get("authors") or []
         if isinstance(authors, str):
             authors = [authors]
+        catalog_author = ", ".join(str(value) for value in authors if value)
+        catalog_title = str(info.get("title") or "")
         raw_identifiers = info.get("industryIdentifiers", [])
         if not isinstance(raw_identifiers, list):
             raw_identifiers = []
@@ -506,10 +1144,26 @@ async def _google_books_match(
             mismatched_identifiers += 1
             continue
         if not catalog_language_allowed(title, info.get("language")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author, isbn_matched=bool(isbn)
+            ):
+                pollution_flags.add("catalog_foreign_language")
             continue
         doc_evidence, doc_verified = _isbn_identifier_evidence(target_isbn, identifiers)
         if not doc_verified and catalog_derivative_subjects_conflict(title, info.get("categories")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author, isbn_matched=bool(isbn)
+            ):
+                pollution_flags.add("catalog_derivative_edition")
             continue
+        _record_item_pollution_flags(
+            pollution_flags,
+            requested_title=title,
+            requested_author=author,
+            catalog_title=catalog_title,
+            catalog_author=catalog_author,
+            isbn_matched=bool(isbn),
+        )
         projected_identifiers = _isbn_provenance_values(target_isbn, identifiers)
         isbn13, isbn10 = _first_isbn(projected_identifiers)
         image_links = info.get("imageLinks") or {}
@@ -576,6 +1230,7 @@ async def _apple_books_match(
     isbn: str = "",
     media: str = "ebook",
     trace: list[dict[str, Any]] | None = None,
+    pollution_flags: set[str] | None = None,
 ) -> dict[str, Any] | None:
     if isbn:
         return None
@@ -605,9 +1260,24 @@ async def _apple_books_match(
         if not track_id or not catalog_title:
             continue
         if not catalog_language_allowed(title, item.get("language") or item.get("languageCodesISO2A")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author
+            ):
+                pollution_flags.add("catalog_foreign_language")
             continue
         if catalog_derivative_subjects_conflict(title, item.get("genres")):
+            if pollution_flags is not None and _catalog_item_targets_work(
+                title, author, catalog_title, catalog_author
+            ):
+                pollution_flags.add("catalog_derivative_edition")
             continue
+        _record_item_pollution_flags(
+            pollution_flags,
+            requested_title=title,
+            requested_author=author,
+            catalog_title=catalog_title,
+            catalog_author=catalog_author,
+        )
         description = _clean_metadata_text(item.get("description"))
         description_kind = "synopsis" if description else ""
         release_date, release_date_kind = _publication_date(item.get("releaseDate"))
@@ -665,6 +1335,7 @@ async def resolve_catalog_match(
     google_books_api_key: str = "",
     existing_fields_complete: bool = False,
     rate_limited_providers: set[str] | None = None,
+    pollution_flags_out: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve identity first, then choose metadata independently per field."""
 
@@ -679,7 +1350,10 @@ async def resolve_catalog_match(
     )
     existing = cache.get(key)
     if existing is not None:
-        return await existing
+        cached_result = await existing
+        if pollution_flags_out is not None:
+            pollution_flags_out.update(getattr(existing, "_pollution_flags", ()))
+        return cached_result
 
     def accepted(match: dict[str, Any] | None) -> bool:
         return bool(
@@ -688,6 +1362,8 @@ async def resolve_catalog_match(
             and match.get("title_match", 0) >= 0.82
             and match.get("author_match", 0) >= 0.65
         )
+
+    detected_pollution: set[str] = set()
 
     async def lookup():
         fetch_trace: list[dict[str, Any]] = []
@@ -722,7 +1398,15 @@ async def resolve_catalog_match(
             )
             if query_isbn and not isbn_arg:
                 kwargs["expected_isbn"] = query_isbn
-            result = await lookup_provider(title, author, client, isbn=isbn_arg, trace=fetch_trace, **kwargs)
+            result = await lookup_provider(
+                title,
+                author,
+                client,
+                isbn=isbn_arg,
+                trace=fetch_trace,
+                pollution_flags=detected_pollution,
+                **kwargs,
+            )
             _record_rate_limits()
             return result
 
@@ -771,7 +1455,12 @@ async def resolve_catalog_match(
             and (rate_limited_providers is None or "apple_books" not in rate_limited_providers)
         ):
             apple_match = await _apple_books_match(
-                title, author, client, media="ebook", trace=fetch_trace
+                title,
+                author,
+                client,
+                media="ebook",
+                trace=fetch_trace,
+                pollution_flags=detected_pollution,
             )
             _record_rate_limits()
             if apple_match:
@@ -780,24 +1469,30 @@ async def resolve_catalog_match(
                 rate_limited_providers is None or "apple_books" not in rate_limited_providers
             ):
                 audio_match = await _apple_books_match(
-                    title, author, client, media="audiobook", trace=fetch_trace
+                    title,
+                    author,
+                    client,
+                    media="audiobook",
+                    trace=fetch_trace,
+                    pollution_flags=detected_pollution,
                 )
                 _record_rate_limits()
                 if audio_match:
                     matches.append(audio_match)
 
+        provider_unavailable = any(
+            trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+            for trace in fetch_trace
+        )
+        provider_rate_limited = any(
+            trace.get("status") == "rate_limited" for trace in fetch_trace
+        )
+
         if not matches:
-            unavailable = any(
-                trace.get("provider") in {"openlibrary", "google_books"}
-                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
-                for trace in fetch_trace
-            )
-            if unavailable:
+            if provider_unavailable:
                 return {
                     "provider_lookup_unavailable": True,
-                    "provider_rate_limited": any(
-                        trace.get("status") == "rate_limited" for trace in fetch_trace
-                    ),
+                    "provider_rate_limited": provider_rate_limited,
                     "quality_score": 0.0,
                     "title_match": 0.0,
                     "author_match": 0.0,
@@ -870,14 +1565,10 @@ async def resolve_catalog_match(
                 "fetch_trace": fetch_trace,
                 "source_payloads": [],
             }
-            identity_record["provider_lookup_unavailable"] = any(
-                trace.get("provider") in {"openlibrary", "google_books"}
-                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
-                for trace in fetch_trace
-            )
-            identity_record["provider_rate_limited"] = any(
-                trace.get("status") == "rate_limited" for trace in fetch_trace
-            )
+            identity_record["provider_lookup_unavailable"] = provider_unavailable
+            identity_record["provider_rate_limited"] = provider_rate_limited
+            if detected_pollution:
+                identity_record["pollution_flags"] = sorted(detected_pollution)
             return identity_record
 
         has_isbn_verified = bool(
@@ -1036,6 +1727,8 @@ async def resolve_catalog_match(
                 kind=str(date_record.get("release_date_kind") or "date"),
                 source_field=str(date_record.get("release_date_source_field") or ""),
             )
+        result["provider_lookup_unavailable"] = provider_unavailable
+        result["provider_rate_limited"] = provider_rate_limited
         result["metadata_provenance"] = {
             "fetched_at": _utc_now(),
             "normalization_version": METADATA_NORMALIZATION_VERSION,
@@ -1050,8 +1743,12 @@ async def resolve_catalog_match(
         return result
 
     task = asyncio.create_task(lookup())
+    setattr(task, "_pollution_flags", detected_pollution)
     cache[key] = task
-    return await task
+    resolved = await task
+    if pollution_flags_out is not None:
+        pollution_flags_out.update(detected_pollution)
+    return resolved
 
 
 def _publication_date_kind(value: object) -> str:
@@ -1082,6 +1779,7 @@ async def _audit_one(
             "flags": flags,
             **source_identifiers,
         }
+    pollution_flags: set[str] = set()
     match = await resolve_catalog_match(
         candidate["title"],
         candidate["author"],
@@ -1092,7 +1790,42 @@ async def _audit_one(
         google_books_api_key=google_books_api_key,
         existing_fields_complete=_candidate_fields_complete(candidate),
         rate_limited_providers=rate_limited_providers,
+        pollution_flags_out=pollution_flags,
     )
+    if isinstance(match, dict):
+        if isinstance(match.get("pollution_flags"), list):
+            pollution_flags.update(str(item) for item in match["pollution_flags"] if item)
+        if match.get("catalog_title") or match.get("catalog_author"):
+            _record_item_pollution_flags(
+                pollution_flags,
+                requested_title=candidate["title"],
+                requested_author=candidate["author"],
+                catalog_title=match.get("catalog_title", ""),
+                catalog_author=match.get("catalog_author", ""),
+            )
+        elif (
+            float(match.get("title_match", 0) or 0) >= 0.82
+            and 0.5 <= float(match.get("author_match", 0) or 0) <= 0.55
+        ):
+            pollution_flags.add("catalog_homonym_author")
+
+    accepted = _is_accepted_match(match)
+    if accepted and match is not None:
+        accepted_flags = list(flags)
+        if match.get("provider_lookup_unavailable"):
+            accepted_flags.append("catalog_provider_unavailable")
+            if match.get("provider_rate_limited"):
+                accepted_flags.append("catalog_provider_rate_limited")
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "accepted",
+            "quality_score": match["quality_score"],
+            **match,
+            "flags": sorted(set(accepted_flags)),
+            "isbn13": source_isbn13 or match.get("isbn13", ""),
+            "isbn10": source_isbn10 or match.get("isbn10", ""),
+        }
+
     if not match or match.get("provider_lookup_unavailable"):
         unavailable = bool(match and match.get("provider_lookup_unavailable"))
         failure_flags = ["catalog_provider_unavailable"]
@@ -1102,36 +1835,39 @@ async def _audit_one(
             "candidate_id": int(candidate["id"]),
             "quality_status": "quarantine",
             "quality_score": 0.0,
-            "flags": sorted(set(flags + (failure_flags if unavailable else ["catalog_unmatched"]))),
+            "provider_lookup_unavailable": unavailable,
+            "flags": sorted(
+                set(
+                    flags
+                    + (
+                        failure_flags
+                        if unavailable
+                        else ["catalog_unmatched", *(pollution_flags & _POLLUTION_FLAGS)]
+                    )
+                )
+            ),
             **({"metadata_provenance": match.get("metadata_provenance", {})} if unavailable else {}),
-            **source_identifiers,
-        }
-    accepted = _is_accepted_match(match)
-    if not accepted:
-        return {
-            "candidate_id": int(candidate["id"]),
-            "quality_status": "quarantine",
-            "quality_score": match["quality_score"],
-            "title_match": match["title_match"],
-            "author_match": match["author_match"],
-            "flags": sorted(set(flags + ["catalog_match_ambiguous"])),
-            "provider": "",
-            "provider_id": "",
-            "work_id": "",
             **source_identifiers,
         }
     return {
         "candidate_id": int(candidate["id"]),
-        "quality_status": "accepted",
+        "quality_status": "quarantine",
         "quality_score": match["quality_score"],
-        "flags": flags,
-        **match,
-        "isbn13": source_isbn13 or match.get("isbn13", ""),
-        "isbn10": source_isbn10 or match.get("isbn10", ""),
+        "title_match": match["title_match"],
+        "author_match": match["author_match"],
+        "flags": sorted(
+            set(flags + ["catalog_match_ambiguous", *(pollution_flags & _POLLUTION_FLAGS)])
+        ),
+        "provider": "",
+        "provider_id": "",
+        "work_id": "",
+        **source_identifiers,
     }
 
 
 def _candidate_fields_complete(candidate: dict[str, Any]) -> bool:
+    if "catalog_provider_unavailable" in str(candidate.get("_flags_json") or ""):
+        return False
     prior_version = str(candidate.get("_audit_version") or "")
     if prior_version and prior_version != QUALITY_VERSION and (
         candidate.get("_has_catalog_provenance") or candidate.get("_metadata_provider")
@@ -1189,12 +1925,120 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "COALESCE(q.quality_status,'pending')='pending' "
         "OR q.audit_version='legacy-pending-audit-v1' "
         "OR (q.quality_status IN ('accepted','quarantine') "
-        "AND COALESCE(q.audit_version,'')!=?) "
-        "OR (q.quality_status='quarantine' AND q.audit_version=? "
+        "AND COALESCE(q.audit_version,'')!=? "
+        "AND (COALESCE(c.isbn13,'')!='' OR COALESCE(c.isbn10,'')!='' "
+        "OR COALESCE(q.isbn13,'')!='' OR COALESCE(q.isbn10,'')!='' "
+        "OR LOWER(COALESCE(c.source_url,'')) LIKE '%amazon.%' "
+        "OR (q.quality_status='accepted' AND ("
+        "COALESCE(q.provider,'')!='' OR COALESCE(q.metadata_provider,'')!='' "
+        "OR EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
+        "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
+        "AND mfp.provider NOT IN ('source','penguinrandomhouse')))))) "
+        "OR (q.quality_status IN ('accepted','quarantine') AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
         "AND datetime(q.audited_at)<=datetime(?)))"
     )
     return predicate, (QUALITY_VERSION, QUALITY_VERSION, retry_before)
+
+
+def _due_audit_reason(candidate: Mapping[str, Any]) -> str | None:
+    audit_version = str(candidate.get("audit_version") or "")
+    if audit_version == "builtin-curated-v1":
+        return None
+    status = str(candidate.get("quality_status") or "pending")
+    if status == "pending":
+        return "pending"
+    if audit_version == "legacy-pending-audit-v1":
+        return "legacy_pending"
+    try:
+        flags = json.loads(candidate.get("flags_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        flags = []
+    if (
+        status in {"accepted", "quarantine"}
+        and audit_version == QUALITY_VERSION
+        and isinstance(flags, list)
+        and "catalog_provider_unavailable" in flags
+    ):
+        return "outage_retry"
+    if status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION:
+        c_isbn13 = str(candidate.get("c_isbn13") or "").strip()
+        c_isbn10 = str(candidate.get("c_isbn10") or "").strip()
+        q_isbn13 = str(candidate.get("q_isbn13") or "").strip()
+        q_isbn10 = str(candidate.get("q_isbn10") or "").strip()
+        eligibility_isbn13 = c_isbn13 or q_isbn13
+        eligibility_isbn10 = c_isbn10 or q_isbn10
+        valid_isbn = any(
+            isbn_parts_from_source(
+                [eligibility_isbn13, eligibility_isbn10],
+                str(candidate.get("source_url") or ""),
+            )
+        )
+        if valid_isbn:
+            return "prior_version_isbn"
+        if c_isbn13 or c_isbn10 or q_isbn13 or q_isbn10:
+            return None
+        has_catalog_attribution = bool(
+            str(candidate.get("q_provider") or "").strip()
+            or str(candidate.get("q_metadata_provider") or "").strip()
+            or candidate.get("has_catalog_provenance")
+        )
+        if status == "accepted" and has_catalog_attribution:
+            return "prior_version_catalog"
+    return None
+
+
+def _due_candidate_quality_page_rows(
+    predicate: str,
+    params: tuple[str, ...],
+    *,
+    page_size: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    return rows(
+        "SELECT c.id,c.isbn13 AS c_isbn13,c.isbn10 AS c_isbn10,c.source_url,"
+        "q.quality_status,q.audit_version,q.flags_json,"
+        "q.isbn13 AS q_isbn13,q.isbn10 AS q_isbn10,"
+        "q.provider AS q_provider,q.metadata_provider AS q_metadata_provider,"
+        "EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
+        "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
+        "AND mfp.provider NOT IN ('source','penguinrandomhouse')) AS has_catalog_provenance "
+        "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
+        "ORDER BY c.id LIMIT ? OFFSET ?",
+        (*params, page_size, offset),
+    )
+
+
+def _due_candidate_quality_breakdown(*, now: datetime | None = None) -> tuple[int, dict[str, int]]:
+    predicate, params = candidate_quality_audit_eligibility(now)
+    page_size = 250
+    offset = 0
+    total = 0
+    breakdown: dict[str, int] = {}
+    while True:
+        page = _due_candidate_quality_page_rows(
+            predicate, params, page_size=page_size, offset=offset
+        )
+        if not page:
+            break
+        for candidate in page:
+            reason = _due_audit_reason(candidate)
+            if reason:
+                total += 1
+                breakdown[reason] = breakdown.get(reason, 0) + 1
+        offset += len(page)
+        if len(page) < page_size:
+            break
+    return total, breakdown
+
+
+def count_candidate_quality_audit_candidates(*, now: datetime | None = None) -> int:
+    """Return the exact number of candidates currently due for quality recovery."""
+
+    total, _ = _due_candidate_quality_breakdown(now=now)
+    return total
 
 
 def candidate_quality_audit_candidates(
@@ -1202,7 +2046,7 @@ def candidate_quality_audit_candidates(
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Select a bounded batch due for quality audit, including non-ISBN prior-version rows."""
+    """Select a bounded batch due for quality audit."""
 
     batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
     predicate, params = candidate_quality_audit_eligibility(now)
@@ -1210,32 +2054,13 @@ def candidate_quality_audit_candidates(
     selected_ids: list[int] = []
     offset = 0
     while len(selected_ids) < batch_limit:
-        page = rows(
-            "SELECT c.id,q.quality_status,q.audit_version,q.flags_json "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
-            "ORDER BY c.id LIMIT ? OFFSET ?",
-            (*params, page_size, offset),
+        page = _due_candidate_quality_page_rows(
+            predicate, params, page_size=page_size, offset=offset
         )
         if not page:
             break
         for candidate in page:
-            status = str(candidate.get("quality_status") or "pending")
-            audit_version = str(candidate.get("audit_version") or "")
-            legacy_pending = audit_version == "legacy-pending-audit-v1"
-            try:
-                flags = json.loads(candidate.get("flags_json") or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                flags = []
-            expired_provider_outage = bool(
-                status == "quarantine"
-                and audit_version == QUALITY_VERSION
-                and isinstance(flags, list)
-                and "catalog_provider_unavailable" in flags
-            )
-            prior_version = status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION
-            if status == "pending" or legacy_pending or expired_provider_outage or prior_version:
+            if _due_audit_reason(candidate):
                 selected_ids.append(int(candidate["id"]))
             if len(selected_ids) >= batch_limit:
                 break
@@ -1246,7 +2071,9 @@ def candidate_quality_audit_candidates(
         return []
     placeholders = ",".join("?" for _ in selected_ids)
     selected = rows(
-        "SELECT c.*,s.url AS source_root,q.audit_version AS _audit_version,"
+        "SELECT c.*,s.url AS source_root,q.quality_status AS _quality_status,"
+        "q.audit_version AS _audit_version,q.flags_json AS _flags_json,"
+        "q.provider AS _provider,q.provider_id AS _provider_id,"
         "q.metadata_provider AS _metadata_provider,"
         "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -1278,22 +2105,43 @@ def _provenance_payload_genres(raw_payload: object) -> list[str]:
     return []
 
 
-def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> bool:
+def _plan_store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     candidate_id = int(candidate["id"])
-    status = result.get("quality_status", "quarantine")
-    flags = result.get("flags", [])
-    transient_outage = isinstance(flags, list) and "catalog_provider_unavailable" in flags
+    status = str(result.get("quality_status", "quarantine") or "quarantine")
+    raw_flags = result.get("flags", [])
+    flags = [str(item) for item in raw_flags] if isinstance(raw_flags, list) else []
+    transient_outage = (
+        "catalog_provider_unavailable" in flags
+        or bool(result.get("provider_lookup_unavailable"))
+    )
+    if transient_outage and "catalog_provider_unavailable" not in flags:
+        flags = sorted(set([*flags, "catalog_provider_unavailable"]))
+    has_explicit_pollution = bool(_POLLUTION_FLAGS & set(flags)) and not transient_outage
 
     prior_quality = con.execute(
-        "SELECT quality_status,audit_version,metadata_provider,metadata_provider_id "
-        "FROM candidate_quality WHERE candidate_id=?",
+        "SELECT quality_status,quality_score,flags_json,provider,provider_id,work_id,"
+        "isbn13,isbn10,title_match,author_match,audit_version,audited_at,metadata_provider,"
+        "metadata_provider_id FROM candidate_quality WHERE candidate_id=?",
         (candidate_id,),
     ).fetchone()
+    prior_status = str(
+        (prior_quality["quality_status"] if prior_quality else candidate.get("_quality_status")) or ""
+    )
     prior_audit_version = str(
         candidate.get("_audit_version")
         or (prior_quality["audit_version"] if prior_quality else "")
         or ""
     )
+    try:
+        prior_flags = json.loads(
+            str(
+                (prior_quality["flags_json"] if prior_quality else candidate.get("_flags_json"))
+                or "[]"
+            )
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        prior_flags = []
+    had_prior_outage = isinstance(prior_flags, list) and "catalog_provider_unavailable" in prior_flags
     existing_provider = str(
         candidate.get("_metadata_provider")
         or (prior_quality["metadata_provider"] if prior_quality else "")
@@ -1305,6 +2153,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         or ""
     )
     is_prior_version = bool(prior_audit_version and prior_audit_version != QUALITY_VERSION)
+    can_reconcile_catalog_fields = (is_prior_version or had_prior_outage) and not transient_outage
 
     provenance_rows = con.execute(
         "SELECT field,provider,provider_id,source_payload FROM metadata_field_provenance "
@@ -1313,13 +2162,11 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
     ).fetchall()
     source_provenance_fields: set[str] = set()
     catalog_provenance_fields: set[str] = set()
-    provenance_by_field: set[str] = set()
     catalog_recorded_genres: list[str] = []
     source_recorded_genres: list[str] = []
     for prov_row in provenance_rows:
         field_name = str(prov_row["field"] or "")
         provider_name = str(prov_row["provider"] or "")
-        provenance_by_field.add(field_name)
         if provider_name in _NON_CATALOG_PROVIDERS:
             source_provenance_fields.add(field_name)
             if field_name == "genres":
@@ -1341,12 +2188,9 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             raw_existing_genres = [raw_existing_genres] if raw_existing_genres.strip() else []
     normalized_existing_genres = _catalog_genres(raw_existing_genres, limit=METADATA_GENRE_LIMIT)
 
-    is_catalog_description = "description" not in source_provenance_fields and (
-        "description" in catalog_provenance_fields
-        or (
-            "description" not in provenance_by_field
-            and bool(existing_provider and existing_provider not in _NON_CATALOG_PROVIDERS)
-        )
+    is_catalog_description = (
+        "description" not in source_provenance_fields
+        and "description" in catalog_provenance_fields
     )
     is_catalog_cover = (
         "cover_url" not in source_provenance_fields and "cover_url" in catalog_provenance_fields
@@ -1371,8 +2215,212 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         preserved_source_genres = normalized_existing_genres
 
     if status != "accepted":
-        next_metadata_provider = existing_provider if transient_outage else ""
-        next_metadata_provider_id = existing_provider_id if transient_outage else ""
+        has_prior_verified_acceptance = bool(
+            prior_quality is not None
+            and prior_status == "accepted"
+            and (
+                str(prior_quality["provider"] or "").strip()
+                or str(prior_quality["metadata_provider"] or "").strip()
+                or prior_quality["audited_at"] is not None
+                or catalog_provenance_fields
+            )
+        )
+        if transient_outage and has_prior_verified_acceptance:
+            return {
+                "branch": "preserve_accepted_outage",
+                "effective_status": "accepted",
+                "flags": flags,
+                "prior_quality": prior_quality,
+                "existing_provider": existing_provider,
+                "existing_provider_id": existing_provider_id,
+                "any_candidate_change": False,
+                "cleared_fields": [],
+            }
+        clear_description = bool(has_explicit_pollution and is_catalog_description and existing_description)
+        clear_cover = bool(has_explicit_pollution and is_catalog_cover and existing_cover)
+        clear_date = bool(has_explicit_pollution and is_catalog_date and existing_release_date)
+        clear_genres = bool(has_explicit_pollution and preserved_source_genres != normalized_existing_genres)
+        cleared_fields = [
+            name
+            for name, cleared in (
+                ("description", clear_description),
+                ("cover_url", clear_cover),
+                ("release_date", clear_date),
+                ("genres", clear_genres),
+            )
+            if cleared
+        ]
+        keep_existing_provider = transient_outage or not has_explicit_pollution
+        return {
+            "branch": "non_accepted",
+            "effective_status": status,
+            "flags": flags,
+            "next_metadata_provider": existing_provider if keep_existing_provider else "",
+            "next_metadata_provider_id": existing_provider_id if keep_existing_provider else "",
+            "clear_description": clear_description,
+            "clear_cover": clear_cover,
+            "clear_date": clear_date,
+            "clear_genres": clear_genres,
+            "preserved_source_genres": preserved_source_genres,
+            "delete_catalog_provenance": bool(has_explicit_pollution and catalog_provenance_fields),
+            "any_candidate_change": False,
+            "cleared_fields": cleared_fields,
+        }
+
+    description = _text(result.get("description"), 4000)
+    description_candidate = result.get("description_candidate")
+    if not isinstance(description_candidate, dict):
+        description_candidate = {}
+    can_upgrade_opening_sentence = bool(
+        existing_description
+        and description_candidate.get("kind") == "synopsis"
+        and description_candidate.get("opening_sentence")
+        and existing_description == _clean_metadata_text(description_candidate.get("opening_sentence"), 1500)
+        and existing_provider
+        and existing_provider == str(description_candidate.get("provider") or "")
+        and existing_provider_id == str(description_candidate.get("provider_id") or "")
+        and description
+    )
+    if is_catalog_description:
+        if description:
+            store_description = description != existing_description or can_upgrade_opening_sentence
+            next_description = description
+        elif can_reconcile_catalog_fields and existing_description:
+            store_description = True
+            next_description = ""
+        else:
+            store_description = False
+            next_description = existing_description
+    else:
+        store_description = bool(description and (not existing_description or can_upgrade_opening_sentence))
+        next_description = description if store_description else existing_description
+
+    cover_url = str(result.get("cover_url") or "")
+    if is_catalog_cover:
+        if cover_url:
+            store_cover = cover_url != existing_cover
+            next_cover = cover_url
+        elif can_reconcile_catalog_fields and existing_cover:
+            store_cover = True
+            next_cover = ""
+        else:
+            store_cover = False
+            next_cover = existing_cover
+    else:
+        store_cover = bool(
+            cover_url
+            and (
+                not existing_cover
+                or "/b/isbn/" in existing_cover
+                or existing_cover.startswith("https://placehold.co/")
+            )
+        )
+        next_cover = cover_url if store_cover else existing_cover
+
+    release_date = _text(result.get("release_date"), 32)
+    next_release_date: str | None = existing_release_date or None
+    next_release_date_kind = existing_date_kind
+    store_release_date = False
+    if is_catalog_date:
+        if release_date:
+            candidate_date_kind = str(result.get("release_date_kind") or "catalog")
+            if release_date != existing_release_date or candidate_date_kind != existing_date_kind:
+                store_release_date = True
+                next_release_date = release_date
+                next_release_date_kind = candidate_date_kind
+        elif can_reconcile_catalog_fields and existing_release_date:
+            store_release_date = True
+            next_release_date = None
+            next_release_date_kind = "unknown"
+    elif release_date and not existing_release_date:
+        store_release_date = True
+        next_release_date = release_date
+        next_release_date_kind = str(result.get("release_date_kind") or "catalog")
+
+    result_genres = _catalog_genres(result.get("genres", []), limit=METADATA_GENRE_LIMIT)
+    if transient_outage:
+        merged_genres = (
+            _catalog_genres(normalized_existing_genres + result_genres, limit=METADATA_GENRE_LIMIT)
+            if result_genres
+            else normalized_existing_genres
+        )
+    else:
+        genre_base = (
+            preserved_source_genres
+            if "genres" in catalog_provenance_fields and (can_reconcile_catalog_fields or result_genres)
+            else normalized_existing_genres
+        )
+        merged_genres = _catalog_genres(genre_base + result_genres, limit=METADATA_GENRE_LIMIT)
+    store_genres = merged_genres != normalized_existing_genres
+
+    cleared_fields: list[str] = []
+    if store_description and not next_description and existing_description:
+        cleared_fields.append("description")
+    if store_cover and not next_cover and existing_cover:
+        cleared_fields.append("cover_url")
+    if store_release_date and not next_release_date and existing_release_date:
+        cleared_fields.append("release_date")
+    if store_genres and len(merged_genres) < len(normalized_existing_genres):
+        cleared_fields.append("genres")
+
+    return {
+        "branch": "accepted",
+        "effective_status": "accepted",
+        "flags": flags,
+        "transient_outage": transient_outage,
+        "can_reconcile_catalog_fields": can_reconcile_catalog_fields,
+        "existing_provider": existing_provider,
+        "existing_provider_id": existing_provider_id,
+        "catalog_provenance_fields": catalog_provenance_fields,
+        "is_catalog_description": is_catalog_description,
+        "is_catalog_cover": is_catalog_cover,
+        "is_catalog_date": is_catalog_date,
+        "description": description,
+        "store_description": store_description,
+        "next_description": next_description,
+        "store_cover": store_cover,
+        "next_cover": next_cover,
+        "store_release_date": store_release_date,
+        "next_release_date": next_release_date,
+        "next_release_date_kind": next_release_date_kind,
+        "result_genres": result_genres,
+        "merged_genres": merged_genres,
+        "store_genres": store_genres,
+        "any_candidate_change": bool(
+            store_description or store_cover or store_release_date or store_genres
+        ),
+        "cleared_fields": cleared_fields,
+    }
+
+
+def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> bool:
+    candidate_id = int(candidate["id"])
+    plan = _plan_store_result(con, candidate, result)
+    flags = plan["flags"]
+
+    if plan["branch"] == "preserve_accepted_outage":
+        prior_quality = plan["prior_quality"]
+        con.execute(
+            """UPDATE candidate_quality SET
+                flags_json=?,
+                isbn13=CASE WHEN isbn13!='' THEN isbn13 ELSE ? END,
+                isbn10=CASE WHEN isbn10!='' THEN isbn10 ELSE ? END,
+                audit_version=?,
+                audited_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE candidate_id=?""",
+            (
+                json.dumps(flags, separators=(",", ":")),
+                str(result.get("isbn13", "")),
+                str(result.get("isbn10", "")),
+                QUALITY_VERSION,
+                candidate_id,
+            ),
+        )
+        return False
+
+    if plan["branch"] == "non_accepted":
+        status = plan["effective_status"]
         con.execute(
             """INSERT INTO candidate_quality(
                 candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
@@ -1408,8 +2456,8 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 float(result.get("title_match", 0) or 0),
                 float(result.get("author_match", 0) or 0),
                 QUALITY_VERSION,
-                next_metadata_provider,
-                next_metadata_provider_id,
+                plan["next_metadata_provider"],
+                plan["next_metadata_provider_id"],
             ),
         )
         if status == "rejected" and candidate.get("status") in {"new", "recommended"}:
@@ -1417,120 +2465,60 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
                 "UPDATE candidates SET status='rejected',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (candidate_id,),
             )
-        if not transient_outage:
-            clear_description = bool(is_catalog_description and existing_description)
-            clear_cover = bool(is_catalog_cover and existing_cover)
-            clear_date = bool(is_catalog_date and existing_release_date)
-            clear_genres = preserved_source_genres != normalized_existing_genres
-            if clear_description or clear_cover or clear_date or clear_genres:
-                cleaned_genres_json = json.dumps(
-                    preserved_source_genres, ensure_ascii=False, separators=(",", ":")
-                )
-                con.execute(
-                    """UPDATE candidates SET
-                        description=CASE WHEN ?=1 THEN '' ELSE description END,
-                        cover_url=CASE WHEN ?=1 THEN '' ELSE cover_url END,
-                        release_date=CASE WHEN ?=1 THEN NULL ELSE release_date END,
-                        date_kind=CASE WHEN ?=1 THEN 'unknown' ELSE date_kind END,
-                        genres=CASE WHEN ?=1 THEN ? ELSE genres END,
-                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (
-                        int(clear_description),
-                        int(clear_cover),
-                        int(clear_date),
-                        int(clear_date),
-                        int(clear_genres),
-                        cleaned_genres_json,
-                        candidate_id,
-                    ),
-                )
-            if catalog_provenance_fields:
-                con.execute(
-                    "DELETE FROM metadata_field_provenance "
-                    "WHERE entity_type='candidate' AND entity_id=? "
-                    "AND provider NOT IN ('source','penguinrandomhouse')",
-                    (candidate_id,),
-                )
+        if (
+            plan["clear_description"]
+            or plan["clear_cover"]
+            or plan["clear_date"]
+            or plan["clear_genres"]
+        ):
+            cleaned_genres_json = json.dumps(
+                plan["preserved_source_genres"], ensure_ascii=False, separators=(",", ":")
+            )
+            con.execute(
+                """UPDATE candidates SET
+                    description=CASE WHEN ?=1 THEN '' ELSE description END,
+                    cover_url=CASE WHEN ?=1 THEN '' ELSE cover_url END,
+                    release_date=CASE WHEN ?=1 THEN NULL ELSE release_date END,
+                    date_kind=CASE WHEN ?=1 THEN 'unknown' ELSE date_kind END,
+                    genres=CASE WHEN ?=1 THEN ? ELSE genres END,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (
+                    int(plan["clear_description"]),
+                    int(plan["clear_cover"]),
+                    int(plan["clear_date"]),
+                    int(plan["clear_date"]),
+                    int(plan["clear_genres"]),
+                    cleaned_genres_json,
+                    candidate_id,
+                ),
+            )
+        if plan["delete_catalog_provenance"]:
+            con.execute(
+                "DELETE FROM metadata_field_provenance "
+                "WHERE entity_type='candidate' AND entity_id=? "
+                "AND provider NOT IN ('source','penguinrandomhouse')",
+                (candidate_id,),
+            )
         return False
 
-    description = _text(result.get("description"), 4000)
-    description_candidate = result.get("description_candidate")
-    if not isinstance(description_candidate, dict):
-        description_candidate = {}
-    can_upgrade_opening_sentence = bool(
-        existing_description
-        and description_candidate.get("kind") == "synopsis"
-        and description_candidate.get("opening_sentence")
-        and existing_description == _clean_metadata_text(description_candidate.get("opening_sentence"), 1500)
-        and existing_provider
-        and existing_provider == str(description_candidate.get("provider") or "")
-        and existing_provider_id == str(description_candidate.get("provider_id") or "")
-        and description
-    )
-    if is_catalog_description:
-        if description:
-            store_description = description != existing_description or can_upgrade_opening_sentence
-            next_description = description
-        elif is_prior_version and existing_description:
-            store_description = True
-            next_description = ""
-        else:
-            store_description = False
-            next_description = existing_description
-    else:
-        store_description = bool(description and (not existing_description or can_upgrade_opening_sentence))
-        next_description = description if store_description else existing_description
-
-    cover_url = str(result.get("cover_url") or "")
-    if is_catalog_cover:
-        if cover_url:
-            store_cover = cover_url != existing_cover
-            next_cover = cover_url
-        elif is_prior_version and existing_cover:
-            store_cover = True
-            next_cover = ""
-        else:
-            store_cover = False
-            next_cover = existing_cover
-    else:
-        store_cover = bool(
-            cover_url
-            and (
-                not existing_cover
-                or "/b/isbn/" in existing_cover
-                or existing_cover.startswith("https://placehold.co/")
-            )
-        )
-        next_cover = cover_url if store_cover else existing_cover
-
-    release_date = _text(result.get("release_date"), 32)
-    next_release_date: str | None = existing_release_date or None
-    next_release_date_kind = existing_date_kind
-    store_release_date = False
-    if is_catalog_date:
-        if release_date:
-            candidate_date_kind = str(result.get("release_date_kind") or "catalog")
-            if release_date != existing_release_date or candidate_date_kind != existing_date_kind:
-                store_release_date = True
-                next_release_date = release_date
-                next_release_date_kind = candidate_date_kind
-        elif is_prior_version and existing_release_date:
-            store_release_date = True
-            next_release_date = None
-            next_release_date_kind = "unknown"
-    elif release_date and not existing_release_date:
-        store_release_date = True
-        next_release_date = release_date
-        next_release_date_kind = str(result.get("release_date_kind") or "catalog")
-
-    result_genres = _catalog_genres(result.get("genres", []), limit=METADATA_GENRE_LIMIT)
-    genre_base = (
-        preserved_source_genres
-        if "genres" in catalog_provenance_fields and (is_prior_version or result_genres)
-        else normalized_existing_genres
-    )
-    merged_genres = _catalog_genres(genre_base + result_genres, limit=METADATA_GENRE_LIMIT)
-    store_genres = merged_genres != normalized_existing_genres
+    store_description = plan["store_description"]
+    next_description = plan["next_description"]
+    store_cover = plan["store_cover"]
+    next_cover = plan["next_cover"]
+    store_release_date = plan["store_release_date"]
+    next_release_date = plan["next_release_date"]
+    next_release_date_kind = plan["next_release_date_kind"]
+    result_genres = plan["result_genres"]
+    merged_genres = plan["merged_genres"]
+    store_genres = plan["store_genres"]
+    is_catalog_description = plan["is_catalog_description"]
+    is_catalog_cover = plan["is_catalog_cover"]
+    is_catalog_date = plan["is_catalog_date"]
+    catalog_provenance_fields = plan["catalog_provenance_fields"]
+    can_reconcile_catalog_fields = plan["can_reconcile_catalog_fields"]
+    existing_provider = plan["existing_provider"]
+    existing_provider_id = plan["existing_provider_id"]
+    description = plan["description"]
     genres_json = json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":"))
 
     selected_fields = []
@@ -1577,7 +2565,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             updated_at=CURRENT_TIMESTAMP""",
         (
             candidate_id,
-            status,
+            "accepted",
             float(result.get("quality_score", 0) or 0),
             json.dumps(flags, separators=(",", ":")),
             str(result.get("provider", "")),
@@ -1593,7 +2581,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         ),
     )
 
-    any_candidate_change = store_description or store_cover or store_release_date or store_genres
+    any_candidate_change = plan["any_candidate_change"]
     if any_candidate_change:
         con.execute(
             """UPDATE candidates SET
@@ -1614,13 +2602,13 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         )
 
     provenance_refresh_fields = set()
-    if store_description or (is_catalog_description and is_prior_version):
+    if store_description or (is_catalog_description and can_reconcile_catalog_fields):
         provenance_refresh_fields.add("description")
-    if store_genres or ("genres" in catalog_provenance_fields and is_prior_version):
+    if store_genres or ("genres" in catalog_provenance_fields and can_reconcile_catalog_fields):
         provenance_refresh_fields.add("genres")
-    if store_cover or (is_catalog_cover and is_prior_version):
+    if store_cover or (is_catalog_cover and can_reconcile_catalog_fields):
         provenance_refresh_fields.add("cover_url")
-    if store_release_date or (is_catalog_date and is_prior_version):
+    if store_release_date or (is_catalog_date and can_reconcile_catalog_fields):
         provenance_refresh_fields.add("release_date")
 
     for field in provenance_refresh_fields:
@@ -1638,7 +2626,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         "release_date": ("release_date_provider", "release_date_provider_id"),
     }
     provenance_fields_to_write = list(selected_fields)
-    if is_prior_version:
+    if can_reconcile_catalog_fields:
         existing_selected = {field for field, _, _ in provenance_fields_to_write}
         if "description" in provenance_refresh_fields and next_description and is_catalog_description and "description" not in existing_selected:
             provenance_fields_to_write.append(("description", result.get("description_provider"), result.get("description_provider_id")))
@@ -1752,8 +2740,62 @@ def _dedupe_and_hide(con) -> int:
     return changed
 
 
-async def audit_candidates(*, only_pending: bool = False, limit: int | None = None) -> dict[str, Any]:
+def _update_running_audit_job_progress(progress: float) -> None:
+    clamped = max(0.0, min(0.99, round(float(progress), 4)))
+    with transaction() as con:
+        con.execute(
+            "UPDATE jobs SET progress=? "
+            "WHERE status='running' AND kind IN ('candidate_quality','candidate_quality_recovery')",
+            (clamped,),
+        )
+
+
+async def audit_candidates(
+    *,
+    only_pending: bool = False,
+    limit: int | None = None,
+    dry_run: bool = False,
+    count_only: bool = False,
+    max_duration_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Audit and enrich candidates, returning a deterministic quality report."""
+
+    if count_only:
+        due_total, breakdown = _due_candidate_quality_breakdown()
+        if only_pending:
+            effective_limit = (
+                max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
+                if limit is not None
+                else QUALITY_AUDIT_BATCH_SIZE
+            )
+            selected_count = min(due_total, effective_limit)
+            remaining_count = max(0, due_total - selected_count)
+        else:
+            total_active = int(
+                rows("SELECT COUNT(*) AS count FROM candidates WHERE status!='rejected'")[0]["count"]
+                or 0
+            )
+            selected_count = (
+                min(total_active, max(1, int(limit))) if limit is not None else total_active
+            )
+            remaining_count = max(0, total_active - selected_count)
+        return {
+            "count_only": True,
+            "dry_run": True,
+            "only_pending": only_pending,
+            "due": due_total,
+            "selected": selected_count,
+            "remaining": remaining_count,
+            "breakdown": breakdown,
+            "audited": 0,
+            "accepted": 0,
+            "quarantine": 0,
+            "rejected": 0,
+            "deduped": 0,
+            "enriched": 0,
+            "quality_version": QUALITY_VERSION,
+        }
 
     if only_pending:
         candidates = candidate_quality_audit_candidates(
@@ -1761,7 +2803,9 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
         )
     else:
         query = (
-            "SELECT c.*,s.url AS source_root,q.audit_version AS _audit_version,"
+            "SELECT c.*,s.url AS source_root,q.quality_status AS _quality_status,"
+            "q.audit_version AS _audit_version,q.flags_json AS _flags_json,"
+            "q.provider AS _provider,q.provider_id AS _provider_id,"
             "q.metadata_provider AS _metadata_provider,"
             "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
             "LEFT JOIN sources s ON s.id=c.source_id "
@@ -1773,15 +2817,60 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
             query += " LIMIT ?"
             params = (max(1, int(limit)),)
         candidates = _attach_catalog_provenance_flags(rows(query, params))
+
     if not candidates:
+        if dry_run:
+            return {
+                "dry_run": True,
+                "audited": 0,
+                "accepted": 0,
+                "quarantine": 0,
+                "rejected": 0,
+                "deduped": 0,
+                "enriched": 0,
+                "would_enrich": 0,
+                "would_clear": 0,
+                "remaining": 0,
+                "timed_out": False,
+                "elapsed_seconds": 0.0,
+                "quality_version": QUALITY_VERSION,
+            }
         with transaction() as con:
             deduped = _dedupe_and_hide(con)
-        return {"audited": 0, "accepted": 0, "quarantine": 0, "rejected": 0, "deduped": deduped, "enriched": 0}
+        return {
+            "audited": 0,
+            "accepted": 0,
+            "quarantine": 0,
+            "rejected": 0,
+            "deduped": deduped,
+            "enriched": 0,
+            "remaining": 0,
+            "timed_out": False,
+            "elapsed_seconds": 0.0,
+            "quality_version": QUALITY_VERSION,
+        }
 
+    effective_max_duration: float | None
+    if max_duration_seconds is not None:
+        effective_max_duration = max(0.0, float(max_duration_seconds))
+    elif only_pending:
+        effective_max_duration = QUALITY_AUDIT_TIME_BUDGET_SECONDS
+    else:
+        effective_max_duration = None
+
+    started_at = _audit_monotonic()
     semaphore = asyncio.Semaphore(CATALOG_CONCURRENCY)
     cache: dict[tuple[str, ...], asyncio.Task[dict[str, Any] | None]] = {}
     rate_limited_providers: set[str] = set()
     google_books_api_key = private_setting("association_google_books_api_key", "").strip()
+    counts = {"accepted": 0, "quarantine": 0, "rejected": 0}
+    enriched = 0
+    would_enrich = 0
+    would_clear = 0
+    audited_count = 0
+    timed_out = False
+    total_selected = len(candidates)
+
     async with metadata_client() as client:
         async def run(candidate):
             async with semaphore:
@@ -1793,22 +2882,89 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
                     rate_limited_providers=rate_limited_providers,
                 )
 
-        results = await asyncio.gather(*(run(candidate) for candidate in candidates))
+        for start in range(0, total_selected, QUALITY_AUDIT_SUBBATCH_SIZE):
+            if (
+                start > 0
+                and effective_max_duration is not None
+                and (_audit_monotonic() - started_at) >= effective_max_duration
+            ):
+                timed_out = True
+                break
+            chunk = candidates[start : start + QUALITY_AUDIT_SUBBATCH_SIZE]
+            chunk_results = await asyncio.gather(*(run(candidate) for candidate in chunk))
+            audited_count += len(chunk)
+            if dry_run:
+                with connect() as con:
+                    for candidate, result in zip(chunk, chunk_results):
+                        plan = _plan_store_result(con, candidate, result)
+                        eff_status = plan["effective_status"]
+                        counts[eff_status] = counts.get(eff_status, 0) + 1
+                        if plan["any_candidate_change"]:
+                            would_enrich += 1
+                        if plan["cleared_fields"]:
+                            would_clear += 1
+            else:
+                with transaction() as con:
+                    for candidate, result in zip(chunk, chunk_results):
+                        plan = _plan_store_result(con, candidate, result)
+                        eff_status = plan["effective_status"]
+                        counts[eff_status] = counts.get(eff_status, 0) + 1
+                        if _store_result(con, candidate, result):
+                            enriched += 1
+                _update_running_audit_job_progress(audited_count / max(1, total_selected))
 
-    counts = {"accepted": 0, "quarantine": 0, "rejected": 0}
-    enriched = 0
+            elapsed_so_far = max(0.0, _audit_monotonic() - started_at)
+            snapshot = {
+                "audited": audited_count,
+                "selected": total_selected,
+                "accepted": counts["accepted"],
+                "quarantine": counts["quarantine"],
+                "rejected": counts["rejected"],
+                "enriched": would_enrich if dry_run else enriched,
+                "elapsed_seconds": round(elapsed_so_far, 3),
+                "dry_run": dry_run,
+            }
+            if progress_callback is not None:
+                progress_callback(snapshot)
+            LOGGER.info(
+                "Candidate quality audit progress: %d/%d audited (accepted=%d quarantine=%d rejected=%d elapsed=%.2fs dry_run=%s)",
+                audited_count,
+                total_selected,
+                counts["accepted"],
+                counts["quarantine"],
+                counts["rejected"],
+                elapsed_so_far,
+                dry_run,
+            )
+
+    elapsed = round(max(0.0, _audit_monotonic() - started_at), 3)
+    if dry_run:
+        due_total = count_candidate_quality_audit_candidates() if only_pending else total_selected
+        return {
+            "dry_run": True,
+            "audited": audited_count,
+            **counts,
+            "deduped": 0,
+            "enriched": 0,
+            "would_enrich": would_enrich,
+            "would_clear": would_clear,
+            "remaining": max(0, due_total - audited_count),
+            "timed_out": timed_out,
+            "elapsed_seconds": elapsed,
+            "quality_version": QUALITY_VERSION,
+        }
+
     with transaction() as con:
-        for candidate, result in zip(candidates, results):
-            status = result.get("quality_status", "quarantine")
-            counts[status] = counts.get(status, 0) + 1
-            if _store_result(con, candidate, result):
-                enriched += 1
         deduped = _dedupe_and_hide(con)
+    remaining = count_candidate_quality_audit_candidates() if only_pending else 0
     return {
-        "audited": len(candidates),
+        "audited": audited_count,
         **counts,
         "deduped": deduped,
         "enriched": enriched,
+        "remaining": remaining,
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
         "quality_version": QUALITY_VERSION,
     }
 
@@ -1831,9 +2987,12 @@ def quality_summary() -> dict[str, Any]:
             flags = []
         for flag in flags if isinstance(flags, list) else []:
             flag_counts[str(flag)] = flag_counts.get(str(flag), 0) + 1
+    due_total, due_breakdown = _due_candidate_quality_breakdown()
     return {
         "statuses": summary,
         "identifiers": identifiers,
         "flags": dict(sorted(flag_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "due": due_total,
+        "due_breakdown": due_breakdown,
         "version": QUALITY_VERSION,
     }

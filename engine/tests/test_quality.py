@@ -223,13 +223,16 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
     quality_isbn_quarantine = add_candidate("Old Quarantine Quality ISBN", "A Writer")
-    v4_no_isbn_accepted = add_candidate("V4 Accepted Without ISBN", "A Writer")
+    v4_no_isbn_catalog_accepted = add_candidate("V4 Catalog Accepted Without ISBN", "A Writer")
+    v4_no_isbn_unattributed = add_candidate("V4 Unattributed Accepted Without ISBN", "A Writer")
     v4_no_isbn_quarantine = add_candidate("V4 Quarantine Without ISBN", "A Writer")
     invalid_isbn = add_candidate("Invalid ISBN", "A Writer", isbn13="9780307474279")
     current_accepted = add_candidate("Current Accepted Without ISBN", "A Writer")
     curated = add_candidate("Curated Seed", "A Writer", isbn13="9780307474278")
     expired_outage = add_candidate("Expired Outage", "A Writer")
+    expired_accepted_outage = add_candidate("Expired Accepted Outage", "A Writer")
     fresh_outage = add_candidate("Fresh Outage", "A Writer", isbn13="9780307474278")
+    fresh_accepted_outage = add_candidate("Fresh Accepted Outage", "A Writer")
     pending = add_candidate("Pending Without ISBN", "A Writer")
     legacy_pending = add_candidate("Legacy Pending Without ISBN", "A Writer")
     reference_time = datetime(2026, 10, 2, tzinfo=timezone.utc)
@@ -240,13 +243,16 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
             (old_quarantine, "quarantine", "candidate-quality-v2"),
             (quality_isbn_accepted, "accepted", "candidate-quality-v3"),
             (quality_isbn_quarantine, "quarantine", "candidate-quality-v2"),
-            (v4_no_isbn_accepted, "accepted", "candidate-quality-v4"),
+            (v4_no_isbn_catalog_accepted, "accepted", "candidate-quality-v4"),
+            (v4_no_isbn_unattributed, "accepted", "candidate-quality-v4"),
             (v4_no_isbn_quarantine, "quarantine", "candidate-quality-v4"),
             (invalid_isbn, "accepted", "candidate-quality-v3"),
             (current_accepted, "accepted", QUALITY_VERSION),
             (curated, "accepted", "builtin-curated-v1"),
             (expired_outage, "quarantine", QUALITY_VERSION),
+            (expired_accepted_outage, "accepted", QUALITY_VERSION),
             (fresh_outage, "quarantine", QUALITY_VERSION),
+            (fresh_accepted_outage, "accepted", QUALITY_VERSION),
             (pending, "pending", QUALITY_VERSION),
             (legacy_pending, "accepted", "legacy-pending-audit-v1"),
         ):
@@ -255,13 +261,19 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
                 (status, version, candidate_id),
             )
         con.execute(
-            "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
-            ('["catalog_provider_unavailable"]', "2026-09-30T22:00:00+00:00", expired_outage),
+            "UPDATE candidate_quality SET provider='openlibrary',provider_id='/works/OLV4W' WHERE candidate_id=?",
+            (v4_no_isbn_catalog_accepted,),
         )
-        con.execute(
-            "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
-            ('["catalog_provider_unavailable"]', "2026-10-01T12:00:00+00:00", fresh_outage),
-        )
+        for outage_cid in (expired_outage, expired_accepted_outage):
+            con.execute(
+                "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+                ('["catalog_provider_unavailable"]', "2026-09-30T22:00:00+00:00", outage_cid),
+            )
+        for fresh_cid in (fresh_outage, fresh_accepted_outage):
+            con.execute(
+                "UPDATE candidate_quality SET flags_json=?,audited_at=? WHERE candidate_id=?",
+                ('["catalog_provider_unavailable"]', "2026-10-01T12:00:00+00:00", fresh_cid),
+            )
         con.execute(
             "UPDATE candidate_quality SET isbn13=? WHERE candidate_id=?",
             ("9780307474278", quality_isbn_accepted),
@@ -295,19 +307,22 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         old_quarantine,
         quality_isbn_accepted,
         quality_isbn_quarantine,
-        v4_no_isbn_accepted,
-        v4_no_isbn_quarantine,
-        invalid_isbn,
+        v4_no_isbn_catalog_accepted,
         expired_outage,
+        expired_accepted_outage,
         pending,
         legacy_pending,
     } <= selected_ids
     selected_by_id = {int(item["id"]): item for item in selected}
     assert selected_by_id[quality_isbn_accepted]["isbn13"] == ""
     assert selected_by_id[quality_isbn_quarantine]["isbn10"] == ""
+    assert invalid_isbn not in selected_ids
+    assert v4_no_isbn_unattributed not in selected_ids
+    assert v4_no_isbn_quarantine not in selected_ids
     assert current_accepted not in selected_ids
     assert curated not in selected_ids
     assert fresh_outage not in selected_ids
+    assert fresh_accepted_outage not in selected_ids
     assert len(candidate_quality_audit_candidates(limit=500, now=reference_time)) == 50
     assert has_candidate_quality_audit_candidates(now=reference_time)
 
@@ -1196,3 +1211,548 @@ def test_store_result_replaces_polluted_v4_catalog_description_keeps_source_and_
     assert refreshed_hashes[("candidate", catalog_cid)] != initial_hashes[("candidate", catalog_cid)]
     assert refreshed_hashes[("candidate", source_cid)] == initial_hashes[("candidate", source_cid)]
     assert refreshed_hashes[("read", read_id)] == initial_hashes[("read", read_id)]
+
+
+@respx.mock
+def test_total_provider_outage_on_prior_version_accepted_preserves_status_and_metadata(database):
+    candidate_id = add_candidate(
+        "Outage Resilient Book",
+        "A Writer",
+        isbn13="9780307474278",
+        status="recommended",
+    )
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected' WHERE id!=?", (candidate_id,))
+        con.execute(
+            "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind=?,genres=? WHERE id=?",
+            (
+                "Verified v4 synopsis that must survive an outage.",
+                "https://covers.openlibrary.org/b/id/777-L.jpg",
+                "2021-05-04",
+                "day",
+                json.dumps(["Literary fiction"]),
+                candidate_id,
+            ),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=1.0,"
+            "audit_version='candidate-quality-v4',audited_at='2026-09-01 00:00:00',"
+            "provider='openlibrary',provider_id='/works/OLPRIORW',work_id='/works/OLPRIORW',"
+            "isbn13='9780307474278',metadata_provider='openlibrary',metadata_provider_id='/works/OLPRIORW' "
+            "WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        for field, payload in (
+            ("description", {"payload": {"description": "Verified v4 synopsis that must survive an outage."}}),
+            ("cover_url", {"payload": {"cover_id": "777"}}),
+            ("release_date", {"payload": {"publication_date": "2021-05-04"}}),
+            ("genres", {"payload": {"genres": ["Literary fiction"]}}),
+        ):
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,?,'openlibrary','/works/OLPRIORW',1.0,?)",
+                (candidate_id, field, json.dumps(payload)),
+            )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(503, json={"error": "unavailable"}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503, json={"error": "unavailable"}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503, json={"error": "unavailable"}))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["audited"] == 1
+    assert result["accepted"] == 1
+    assert result["quarantine"] == 0
+
+    after_candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    after_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert after_quality["quality_status"] == "accepted"
+    assert after_quality["provider"] == "openlibrary"
+    assert after_quality["work_id"] == "/works/OLPRIORW"
+    assert after_quality["audit_version"] == QUALITY_VERSION
+    assert "catalog_provider_unavailable" in json.loads(after_quality["flags_json"])
+    assert after_candidate["description"] == "Verified v4 synopsis that must survive an outage."
+    assert after_candidate["cover_url"] == "https://covers.openlibrary.org/b/id/777-L.jpg"
+    assert after_candidate["release_date"] == "2021-05-04"
+    assert json.loads(after_candidate["genres"]) == ["Literary fiction"]
+    assert len(
+        rows(
+            "SELECT field FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+            (candidate_id,),
+        )
+    ) == 4
+
+    # Not immediately retried before backoff expires, but retried after 24h.
+    assert candidate_quality_audit_candidates(limit=10) == []
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+    assert [int(item["id"]) for item in candidate_quality_audit_candidates(limit=10)] == [candidate_id]
+
+
+@respx.mock
+def test_partial_outage_sparse_accepted_match_preserves_prior_fields_and_reaudits_after_backoff(database):
+    candidate_id = add_candidate(
+        "Partial Outage Book",
+        "A Writer",
+        isbn13="9780307474278",
+        status="recommended",
+    )
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected' WHERE id!=?", (candidate_id,))
+        con.execute(
+            "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind=?,genres=? WHERE id=?",
+            (
+                "Rich Open Library synopsis from v4.",
+                "https://covers.openlibrary.org/b/id/888-L.jpg",
+                "2020-08-18",
+                "day",
+                json.dumps(["Science fiction", "Space opera"]),
+                candidate_id,
+            ),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=1.0,"
+            "audit_version='candidate-quality-v4',audited_at='2026-09-01 00:00:00',"
+            "provider='openlibrary',provider_id='/works/OLRICH1W',work_id='/works/OLRICH1W',"
+            "isbn13='9780307474278',metadata_provider='openlibrary',metadata_provider_id='/works/OLRICH1W' "
+            "WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        for field, payload in (
+            ("description", {"payload": {"description": "Rich Open Library synopsis from v4."}}),
+            ("cover_url", {"payload": {"cover_id": "888"}}),
+            ("release_date", {"payload": {"publication_date": "2020-08-18"}}),
+            ("genres", {"payload": {"genres": ["Science fiction", "Space opera"]}}),
+        ):
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,?,'openlibrary','/works/OLRICH1W',1.0,?)",
+                (candidate_id, field, json.dumps(payload)),
+            )
+
+    ol_healthy = [False]
+
+    def ol_handler(_request):
+        if not ol_healthy[0]:
+            raise httpx.ReadTimeout("Open Library timed out")
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLRICH1W",
+                        "title": "Partial Outage Book",
+                        "author_name": ["A Writer"],
+                        "isbn": ["9780307474278"],
+                        "description": "Updated verified v5 Open Library synopsis after recovery.",
+                        "cover_i": 999,
+                        "first_publish_date": "2020-08-18",
+                        "subject": ["Science fiction", "Hard science fiction"],
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+
+    def gb_sparse_handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "gb-sparse-vol",
+                        "volumeInfo": {
+                            "title": "Partial Outage Book",
+                            "authors": ["A Writer"],
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": "9780307474278"}
+                            ],
+                            "language": "en",
+                        },
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(side_effect=gb_sparse_handler)
+
+    # 1. During Open Library timeout, Google Books returns an accepted sparse record.
+    first = asyncio.run(audit_candidates(only_pending=True))
+    assert first["audited"] == 1
+    assert first["accepted"] == 1
+    assert first["enriched"] == 0
+
+    during_outage_candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    during_outage_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert during_outage_quality["quality_status"] == "accepted"
+    assert during_outage_quality["audit_version"] == QUALITY_VERSION
+    assert "catalog_provider_unavailable" in json.loads(during_outage_quality["flags_json"])
+    assert during_outage_candidate["description"] == "Rich Open Library synopsis from v4."
+    assert during_outage_candidate["cover_url"] == "https://covers.openlibrary.org/b/id/888-L.jpg"
+    assert during_outage_candidate["release_date"] == "2020-08-18"
+    assert json.loads(during_outage_candidate["genres"]) == ["Science fiction", "Space opera"]
+    assert {
+        item["field"]
+        for item in rows(
+            "SELECT field FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+            (candidate_id,),
+        )
+    } == {"description", "cover_url", "release_date", "genres"}
+
+    # 2. Not re-selected before the 24h provider backoff expires.
+    assert candidate_quality_audit_candidates(limit=10) == []
+
+    # 3. After 24h backoff expires, the v5 accepted row IS re-audited, refreshes metadata,
+    #    and clears catalog_provider_unavailable so it does not loop forever.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (candidate_id,),
+        )
+    assert [int(item["id"]) for item in candidate_quality_audit_candidates(limit=10)] == [candidate_id]
+
+    ol_healthy[0] = True
+    recovered = asyncio.run(audit_candidates(only_pending=True))
+    assert recovered["audited"] == 1
+    assert recovered["accepted"] == 1
+    assert recovered["enriched"] == 1
+
+    after_recovery_candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    after_recovery_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (candidate_id,))
+    assert after_recovery_quality["quality_status"] == "accepted"
+    assert json.loads(after_recovery_quality["flags_json"]) == []
+    assert after_recovery_candidate["description"] == "Updated verified v5 Open Library synopsis after recovery."
+    assert after_recovery_candidate["cover_url"] == "https://covers.openlibrary.org/b/id/999-L.jpg"
+    assert json.loads(after_recovery_candidate["genres"]) == ["Science fiction", "Hard science fiction"]
+    assert candidate_quality_audit_candidates(limit=10) == []
+
+
+@respx.mock
+def test_unmatched_and_ambiguous_quarantine_preserve_catalog_fields_unlike_explicit_pollution(database):
+    unmatched_id = add_candidate("Obscure Small Press Novel", "Clara Vance", status="saved")
+    ambiguous_id = add_candidate("Collected Essays", "Clara Vance", status="saved")
+    polluted_id = add_candidate("Starlight Atlas", "Clara Vance", status="saved")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='rejected' WHERE id NOT IN (?,?,?)",
+            (unmatched_id, ambiguous_id, polluted_id),
+        )
+        for cid in (unmatched_id, ambiguous_id, polluted_id):
+            con.execute(
+                "UPDATE candidates SET description=?,cover_url=?,release_date=?,date_kind=?,genres=? WHERE id=?",
+                (
+                    f"Existing catalog description for {cid}.",
+                    f"https://covers.openlibrary.org/b/id/{cid}00-L.jpg",
+                    "2019-03-15",
+                    "day",
+                    json.dumps(["Essays"]),
+                    cid,
+                ),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+                "provider='openlibrary',provider_id='/works/OLPRIORW',work_id='/works/OLPRIORW',"
+                "metadata_provider='openlibrary',metadata_provider_id='/works/OLPRIORW' WHERE candidate_id=?",
+                (cid,),
+            )
+            for field, payload in (
+                ("description", {"payload": {"description": f"Existing catalog description for {cid}."}}),
+                ("cover_url", {"payload": {"cover_id": f"{cid}00"}}),
+                ("release_date", {"payload": {"publication_date": "2019-03-15"}}),
+                ("genres", {"payload": {"genres": ["Essays"]}}),
+            ):
+                con.execute(
+                    "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                    "VALUES('candidate',?,?,'openlibrary','/works/OLPRIORW',0.9,?)",
+                    (cid, field, json.dumps(payload)),
+                )
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        if "Obscure Small Press" in title:
+            return httpx.Response(200, json={"docs": []})
+        if "Collected Essays" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLSUBTITLEW",
+                            "title": "Collected Essays on Modern Architecture and Urban Memory",
+                            "author_name": ["Clara Vance"],
+                            "language": ["eng"],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLGUIDE99W",
+                        "title": "Study Guide: Starlight Atlas",
+                        "author_name": ["Clara Vance"],
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    outcome = asyncio.run(audit_candidates(only_pending=True))
+    assert outcome["quarantine"] == 3
+
+    for preserved_cid, expected_flag in (
+        (unmatched_id, "catalog_unmatched"),
+        (ambiguous_id, "catalog_match_ambiguous"),
+    ):
+        cand = row("SELECT * FROM candidates WHERE id=?", (preserved_cid,))
+        qual = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (preserved_cid,))
+        flags = json.loads(qual["flags_json"])
+        assert qual["quality_status"] == "quarantine"
+        assert expected_flag in flags
+        assert cand["description"] == f"Existing catalog description for {preserved_cid}."
+        assert cand["cover_url"] == f"https://covers.openlibrary.org/b/id/{preserved_cid}00-L.jpg"
+        assert cand["release_date"] == "2019-03-15"
+        assert json.loads(cand["genres"]) == ["Essays"]
+        assert len(
+            rows(
+                "SELECT field FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+                (preserved_cid,),
+            )
+        ) == 4
+
+    polluted_cand = row("SELECT * FROM candidates WHERE id=?", (polluted_id,))
+    polluted_qual = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (polluted_id,))
+    assert "catalog_derivative_edition" in json.loads(polluted_qual["flags_json"])
+    assert polluted_cand["description"] == ""
+    assert polluted_cand["cover_url"] == ""
+    assert polluted_cand["release_date"] is None
+    assert json.loads(polluted_cand["genres"]) == []
+    assert rows(
+        "SELECT field FROM metadata_field_provenance WHERE entity_type='candidate' AND entity_id=?",
+        (polluted_id,),
+    ) == []
+
+
+@respx.mock
+def test_legacy_description_without_provenance_is_preserved_when_cover_came_from_catalog(database):
+    sparse_accepted_id = add_candidate("Legacy Blurb Book", "Marilynne Robinson", isbn13="9780307474278")
+    polluted_homonym_id = add_candidate("Home", "Marilynne Robinson")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET status='rejected' WHERE id NOT IN (?,?)",
+            (sparse_accepted_id, polluted_homonym_id),
+        )
+        for cid in (sparse_accepted_id, polluted_homonym_id):
+            con.execute(
+                "UPDATE candidates SET description=?,cover_url=? WHERE id=?",
+                (
+                    "Source-scraped description saved before provenance tracking.",
+                    "https://covers.openlibrary.org/b/id/555-L.jpg",
+                    cid,
+                ),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+                "provider='openlibrary',provider_id='/works/OLLEGACYCOV',work_id='/works/OLLEGACYCOV',"
+                "metadata_provider='openlibrary',metadata_provider_id='/works/OLLEGACYCOV' WHERE candidate_id=?",
+                (cid,),
+            )
+            # Only cover_url has catalog provenance; description has NO provenance row.
+            con.execute(
+                "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+                "VALUES('candidate',?,'cover_url','openlibrary','/works/OLLEGACYCOV',0.95,'{}')",
+                (cid,),
+            )
+
+    def ol_handler(request):
+        isbn = request.url.params.get("isbn", "")
+        title = request.url.params.get("title", "")
+        if isbn == "9780307474278" or "Legacy Blurb Book" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLLEGACYCOV",
+                            "title": "Legacy Blurb Book",
+                            "author_name": ["Marilynne Robinson"],
+                            "isbn": ["9780307474278"],
+                            "language": ["eng"],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLHOMONYM9W",
+                        "title": "Home",
+                        "author_name": ["Michael Robinson"],
+                        "description": "Wrong homonym blurb.",
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 1
+    assert result["quarantine"] == 1
+
+    accepted_after = row("SELECT description,cover_url FROM candidates WHERE id=?", (sparse_accepted_id,))
+    assert accepted_after["description"] == "Source-scraped description saved before provenance tracking."
+    assert accepted_after["cover_url"] == ""
+
+    homonym_after = row("SELECT description,cover_url FROM candidates WHERE id=?", (polluted_homonym_id,))
+    assert homonym_after["description"] == "Source-scraped description saved before provenance tracking."
+    assert homonym_after["cover_url"] == ""
+
+
+@respx.mock
+def test_audit_count_only_dry_run_time_budget_progress_and_endpoints(database, monkeypatch):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_mod
+
+    def valid_isbn13(idx: int) -> str:
+        prefix = f"978030747{idx:03d}"
+        checksum = (10 - sum(int(ch) * (1 if pos % 2 == 0 else 3) for pos, ch in enumerate(prefix)) % 10) % 10
+        return f"{prefix}{checksum}"
+
+    cids = []
+    isbn_to_idx: dict[str, int] = {}
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+    for idx in range(15):
+        isbn = valid_isbn13(idx)
+        isbn_to_idx[isbn] = idx
+        cid = add_candidate(f"Timed Book {idx}", "A Writer", isbn13=isbn)
+        cids.append(cid)
+    with transaction() as con:
+        for idx, cid in enumerate(cids):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+                "provider='openlibrary',provider_id=?,work_id=? WHERE candidate_id=?",
+                (f"/works/OLOLD{idx}W", f"OLOLD{idx}W", cid),
+            )
+
+    # 1. count_only makes zero HTTP requests and mutates nothing.
+    def ol_handler(request: httpx.Request) -> httpx.Response:
+        isbn = request.url.params.get("isbn", "")
+        idx = isbn_to_idx.get(isbn, 0)
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OLTIMED{idx}W",
+                        "title": f"Timed Book {idx}",
+                        "author_name": ["A Writer"],
+                        "isbn": [isbn or valid_isbn13(idx)],
+                        "description": "Fresh synopsis.",
+                        "language": ["eng"],
+                    }
+                ]
+            },
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    count_report = asyncio.run(engine_main.candidate_audit(payload=None, dry_run=False, count_only=True, only_pending=True, limit=10))
+    assert count_report["count_only"] is True
+    assert count_report["due"] == 15
+    assert count_report["selected"] == 10
+    assert count_report["remaining"] == 5
+    assert count_report["breakdown"] == {"prior_version_isbn": 15}
+    assert len(ol_route.calls) == 0
+
+    summary = engine_main.candidate_quality()
+    assert summary["due"] == 15
+    assert summary["due_breakdown"] == {"prior_version_isbn": 15}
+
+    # 2. dry_run previews enrichments without mutating SQLite rows.
+    dry_report = asyncio.run(
+        engine_main.candidate_audit(payload=None, dry_run=True, count_only=False, only_pending=True, limit=5)
+    )
+    assert dry_report["dry_run"] is True
+    assert dry_report["audited"] == 5
+    assert dry_report["enriched"] == 0
+    assert dry_report["would_enrich"] >= 1
+    assert row("SELECT description FROM candidates WHERE id=?", (cids[0],))["description"] == ""
+    assert row("SELECT audit_version FROM candidate_quality WHERE candidate_id=?", (cids[0],))["audit_version"] == "candidate-quality-v4"
+
+    # 3. Wall-clock max_duration_seconds bounds sub-batches and updates running job progress.
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,progress) VALUES('job-progress-1','candidate_quality_recovery','running',0)"
+        )
+    fake_now = [100.0]
+
+    def fake_monotonic():
+        return fake_now[0]
+
+    monkeypatch.setattr(quality_mod, "_audit_monotonic", fake_monotonic)
+    progress_events: list[dict[str, object]] = []
+
+    def on_progress(snapshot):
+        progress_events.append(snapshot)
+        fake_now[0] += 35.0
+
+    bounded = asyncio.run(
+        audit_candidates(
+            only_pending=True,
+            limit=15,
+            max_duration_seconds=30.0,
+            progress_callback=on_progress,
+        )
+    )
+    assert bounded["audited"] == quality_mod.QUALITY_AUDIT_SUBBATCH_SIZE
+    assert bounded["timed_out"] is True
+    assert bounded["remaining"] == 5
+    assert len(progress_events) == 1
+    job_progress = row("SELECT progress FROM jobs WHERE id='job-progress-1'")["progress"]
+    assert 0.6 <= job_progress < 1.0
+
+    # 4. Continuous recovery chain defers immediate followup once chain budget is exhausted.
+    chain_clock = [500.0]
+    monkeypatch.setattr(engine_main, "_recovery_monotonic", lambda: chain_clock[0])
+    engine_main._recovery_chain_started_at.clear()
+
+    async def fast_score(*_args, **_kwargs):
+        return 0
+
+    async def fake_bounded_audit(*, only_pending=False, limit=None):
+        assert only_pending is True
+        chain_clock[0] += engine_main.QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + 5.0
+        return {"audited": 1, "accepted": 1, "quarantine": 0, "rejected": 0, "enriched": 0}
+
+    monkeypatch.setattr(engine_main, "score_all", fast_score)
+    monkeypatch.setattr(engine_main, "audit_candidates", fake_bounded_audit)
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='candidate_quality_recovery'")
+
+    recovery_outcome = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))
+    assert recovery_outcome["followup_deferred"] is True
+    assert row("SELECT COUNT(*) AS count FROM jobs WHERE kind='candidate_quality_recovery' AND status='queued'")["count"] == 0
+
+    # Periodic scheduler later starts a fresh bounded recovery window.
+    monkeypatch.setattr(engine_main, "candidate_metadata_refresh_remaining", lambda: 0)
+    monkeypatch.setattr(engine_main, "read_metadata_refresh_remaining", lambda: 0)
+    requeued = engine_main._queue_due_enrichment_retries()
+    assert "candidate_quality_recovery" in requeued

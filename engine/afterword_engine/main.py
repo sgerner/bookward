@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -121,8 +121,11 @@ GOODREADS_RSS_MAX_ATTEMPTS = 3
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 ENRICHMENT_RETRY_POLL_SECONDS = 300
+QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS = 120.0
 GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
+_recovery_monotonic = time.monotonic
+_recovery_chain_started_at: dict[str, float] = {}
 
 
 class LocalLoginIn(BaseModel):
@@ -291,6 +294,7 @@ def _queue_due_enrichment_retries():
 
     queued = {}
     if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+        _recovery_chain_started_at.pop(current_profile_id(), None)
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -555,8 +559,23 @@ async def handle_job(kind: str):
         )
         return {**quality, "scored": scored}
     if kind == "candidate_quality_recovery":
+        profile_key = current_profile_id()
+        started = _recovery_chain_started_at.setdefault(profile_key, _recovery_monotonic())
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
+        followup_deferred = False
+        if has_candidate_quality_audit_candidates():
+            if (_recovery_monotonic() - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+                _enqueue_candidate_quality_followup()
+            else:
+                _recovery_chain_started_at.pop(profile_key, None)
+                followup_deferred = True
+                LOGGER.info(
+                    "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
+                    profile_key,
+                    QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
+                )
+        else:
+            _recovery_chain_started_at.pop(profile_key, None)
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
@@ -564,7 +583,7 @@ async def handle_job(kind: str):
             config.get("embedding_url"),
             config.get("embedding_api_key"),
         )
-        return {**quality, "scored": scored}
+        return {**quality, "scored": scored, "followup_deferred": followup_deferred}
     if kind.startswith("source:"):
         try:
             source_id = int(kind.partition(":")[2])
@@ -2863,10 +2882,40 @@ async def sync():
 async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
-@app.post("/api/candidates/audit")
-async def candidate_audit():
-    """Queue a full catalog identity and quality audit."""
+class CandidateAuditIn(BaseModel):
+    dry_run: bool = False
+    count_only: bool = False
+    only_pending: bool = True
+    limit: int | None = Field(default=None, ge=1, le=500)
 
+
+@app.post("/api/candidates/audit")
+async def candidate_audit(
+    payload: CandidateAuditIn | None = Body(default=None),
+    dry_run: bool = Query(default=False),
+    count_only: bool = Query(default=False),
+    only_pending: bool | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+):
+    """Queue a catalog audit, or preview scope via count_only/dry_run."""
+
+    effective_dry_run = bool(dry_run or (payload and payload.dry_run))
+    effective_count_only = bool(count_only or (payload and payload.count_only))
+    if effective_dry_run or effective_count_only:
+        effective_only_pending = (
+            only_pending
+            if only_pending is not None
+            else (payload.only_pending if payload is not None else True)
+        )
+        effective_limit = (
+            limit if limit is not None else (payload.limit if payload is not None else None)
+        )
+        return await audit_candidates(
+            only_pending=effective_only_pending,
+            limit=effective_limit,
+            dry_run=effective_dry_run,
+            count_only=effective_count_only,
+        )
     return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
 
 @app.get("/api/candidates/quality")

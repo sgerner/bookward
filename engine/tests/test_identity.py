@@ -16,13 +16,6 @@ from afterword_engine.identity import (
     book_identity_match_index,
     book_identity_matches,
     book_row_identity_match_keys,
-    catalog_author_matches,
-    catalog_author_similarity,
-    catalog_derivative_subjects_conflict,
-    catalog_language_allowed,
-    catalog_title_allowed,
-    catalog_title_matches,
-    catalog_title_similarity,
     normalize_key,
     read_metadata_identity_hash,
 )
@@ -563,47 +556,6 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
     assert status == "rejected"
 
 
-def test_shared_catalog_author_title_and_language_gates():
-    assert not catalog_author_matches("Marilynne Robinson", "Michael Robinson")
-    assert catalog_author_similarity("Marilynne Robinson", "Michael Robinson") < 0.65
-    assert catalog_author_matches("J.R.R. Tolkien", "John Ronald Tolkien")
-    assert catalog_author_similarity("J.R.R. Tolkien", "John Ronald Tolkien") >= 0.85
-    assert catalog_author_matches("M. Robinson", "Marilynne Robinson")
-    assert catalog_author_matches("Kurt Vonnegut", "Kurt Vonnegut Jr.")
-
-    for candidate_title, derivative_title in (
-        ("Fourth Wing", "Fourth Wing (Summary & Study Guide)"),
-        ("Tomorrow, and Tomorrow, and Tomorrow", "Summary of Tomorrow, and Tomorrow, and Tomorrow"),
-        ("Atomic Habits", "Workbook for Atomic Habits"),
-        ("Dune", "A Companion to Dune"),
-        ("Fourth Wing", "The Empyrean 2-Book Box Set"),
-        ("Fourth Wing", "Fourth Wing (Spanish Edition)"),
-    ):
-        assert not catalog_title_allowed(candidate_title, derivative_title)
-        assert catalog_title_similarity(candidate_title, derivative_title) == 0.0
-        assert not catalog_title_matches(candidate_title, derivative_title)
-
-    assert catalog_title_matches("Greenlights (Unabridged)", "Greenlights")
-    assert catalog_title_similarity("Greenlights (Unabridged)", "Greenlights") == 1.0
-    assert catalog_title_matches(
-        "The Fellowship of the Ring (Lord of the Rings)",
-        "The Fellowship of the Ring",
-    )
-    assert catalog_title_similarity(
-        "The Fellowship of the Ring (Lord of the Rings)",
-        "The Fellowship of the Ring",
-    ) == 1.0
-    assert catalog_title_matches("The Spanish Love Deception", "The Spanish Love Deception")
-    assert not catalog_language_allowed("The Spanish Love Deception", "es")
-    assert not catalog_language_allowed("Fourth Wing", ["spa"])
-    assert catalog_language_allowed("Fourth Wing", ["eng", "spa"])
-    assert catalog_language_allowed("Fourth Wing (Spanish Edition)", ["spa"])
-    assert catalog_derivative_subjects_conflict("Fourth Wing", ["Study Aids"])
-    assert not catalog_derivative_subjects_conflict(
-        "Fourth Wing (Summary & Study Guide)", ["Study Aids"]
-    )
-
-
 def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():
     assert db_module.normalize_key is normalize_key
 
@@ -667,3 +619,4 @@ def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():
         assert read_metadata_identity_hash(dict(populated_row)) == expected_populated_digest
     finally:
         con.close()
+

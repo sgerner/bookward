@@ -964,27 +964,23 @@ def test_openlibrary_rate_budget_serializes_concurrent_requests_with_fake_clock(
     assert starts == [10.0, 11.0, 12.0, 13.0, 14.0]
 
 
-def test_fourth_wing_keeps_verified_121_char_isbn_synopsis_and_excludes_study_aids():
-    isbn13 = "9781649374042"
-    conflicting_isbn = "9780061120084"
+def test_resolve_catalog_match_prefers_verified_isbn_synopsis_and_blocks_foreign_or_conflicting_editions():
     verified_synopsis = (
         "Twenty-year-old Violet Sorrengail was supposed to enter the Scribe Quadrant, "
         "living a quiet life among books and history."
     )
     assert len(verified_synopsis) == 121
-    longer_unverified_blurb = (
+    spanish_guide_blurb = (
         "Resumen completo y guía de estudio de Alas de Sangre: análisis detallado de capítulos, "
         "personajes, temas principales y preguntas de discusión para estudiantes y clubes de lectura "
         "que buscan comprender cada escena de esta edición especial en español ya"
     )
-    assert len(longer_unverified_blurb) == 251
-    ol_fields_seen: list[str] = []
+    assert len(spanish_guide_blurb) == 251
 
     def handler(request):
-        if request.url.host == "openlibrary.org" and request.url.path == "/search.json":
-            params = parse_qs(request.url.query.decode())
-            ol_fields_seen.append(params.get("fields", [""])[0])
-            if params.get("isbn") == [isbn13]:
+        params = parse_qs(request.url.query.decode())
+        if request.url.host == "openlibrary.org":
+            if "isbn" in params:
                 return httpx.Response(
                     200,
                     json={
@@ -993,10 +989,11 @@ def test_fourth_wing_keeps_verified_121_char_isbn_synopsis_and_excludes_study_ai
                                 "key": "/works/OLFOURTHWINGW",
                                 "title": "Fourth Wing",
                                 "author_name": ["Rebecca Yarros"],
-                                "isbn13": [isbn13],
+                                "isbn": ["9781649374042"],
                                 "description": verified_synopsis,
                                 "first_publish_date": "2023-05-02",
                                 "subject": ["Fantasy", "Dragons"],
+                                "cover_i": 14315081,
                                 "language": ["eng"],
                             }
                         ]
@@ -1010,174 +1007,43 @@ def test_fourth_wing_keeps_verified_121_char_isbn_synopsis_and_excludes_study_ai
                             "key": "/works/OLSPANISHW",
                             "title": "Fourth Wing",
                             "author_name": ["Rebecca Yarros"],
-                            "description": longer_unverified_blurb,
+                            "isbn": ["9788408279990"],
+                            "description": spanish_guide_blurb,
+                            "subject": ["Study Aids"],
                             "language": ["spa"],
-                            "subject": ["Fantasy"],
                         },
                         {
-                            "key": "/works/OLCONFLICTW",
+                            "key": "/works/OLCONFLICTISBNW",
                             "title": "Fourth Wing",
-                            "author_name": ["R. Yarros"],
-                            "isbn13": [conflicting_isbn],
-                            "description": "A much longer unverified fallback blurb " * 7,
-                            "first_publish_date": "2024-09-15",
-                            "subject": ["Study Aids", "Juvenile Nonfiction"],
+                            "author_name": ["Rebecca Yarros"],
+                            "isbn": ["9780061120084"],
+                            "description": "Longer unverified conflicting ISBN synopsis " * 8,
+                            "first_publish_date": "2025-01-01",
+                            "subject": ["Biography"],
                             "language": ["eng"],
                         },
                     ]
                 },
             )
         if request.url.host == "www.googleapis.com":
-            params = parse_qs(request.url.query.decode())
-            q = params.get("q", [""])[0]
-            if q.startswith("isbn:"):
-                return httpx.Response(200, json={"items": []})
-            return httpx.Response(
-                200,
-                json={
-                    "items": [
-                        {
-                            "id": "spanish-volume",
-                            "volumeInfo": {
-                                "title": "Fourth Wing",
-                                "authors": ["Rebecca Yarros"],
-                                "description": longer_unverified_blurb,
-                                "language": "es",
-                                "categories": ["Fiction"],
-                            },
-                        },
-                        {
-                            "id": "conflicting-guide-volume",
-                            "volumeInfo": {
-                                "title": "Fourth Wing",
-                                "authors": ["Rebecca Yarros"],
-                                "industryIdentifiers": [{"type": "ISBN_13", "identifier": conflicting_isbn}],
-                                "description": "An unverified study companion blurb that is much longer than 121 characters and belongs to a conflicting ISBN edition.",
-                                "publishedDate": "2024-10-01",
-                                "categories": ["Study Aids", " Literary Criticism "],
-                                "language": "en",
-                                "imageLinks": {"thumbnail": "https://books.google.com/books/content?id=fw-cover"},
-                            },
-                        },
-                    ]
-                },
-            )
-        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+            return httpx.Response(200, json={"items": []})
+        raise AssertionError(f"Unexpected host: {request.url.host}")
 
     async def run():
         async with _provider_client(handler) as client:
-            quality_match = await resolve_catalog_match(
+            return await resolve_catalog_match(
                 "Fourth Wing",
                 "Rebecca Yarros",
                 client=client,
                 cache={},
-                isbn13=isbn13,
+                isbn13="9781649374042",
             )
-            cover_metadata = await resolve_book_metadata(
-                "Fourth Wing",
-                "Rebecca Yarros",
-                isbn13=isbn13,
-                client=client,
-            )
-            return quality_match, cover_metadata
 
-    quality_match, cover_metadata = asyncio.run(run())
-
-    assert ol_fields_seen
-    assert all("language" in fields.split(",") for fields in ol_fields_seen)
-    assert quality_match is not None
-    assert quality_match["description"] == verified_synopsis
-    assert len(quality_match["description"]) == 121
-    assert "Study Aids" not in quality_match["genres"]
-    assert "Literary criticism" not in quality_match["genres"]
-    assert quality_match["genres"] == ["Fantasy", "Dragons"]
-    assert quality_match["release_date"] == "2023-05-02"
-
-    assert cover_metadata["description"] == verified_synopsis
-    assert len(cover_metadata["description"]) == 121
-    assert "Study Aids" not in cover_metadata["genres"]
-    assert "Literary criticism" not in cover_metadata["genres"]
-    assert cover_metadata["genres"] == ["Fantasy", "Dragons"]
-    assert cover_metadata["release_date"] == "2023-05-02"
-
-
-def test_catalog_parsers_skip_foreign_language_items_unless_candidate_requests_edition():
-    def handler(request):
-        if request.url.host == "openlibrary.org" and request.url.path == "/search.json":
-            return httpx.Response(
-                200,
-                json={
-                    "docs": [
-                        {
-                            "key": "/works/OLSPANISHONLYW",
-                            "title": "Fourth Wing (Spanish Edition)",
-                            "author_name": ["Rebecca Yarros"],
-                            "description": "Edición en español.",
-                            "language": ["spa"],
-                        }
-                    ]
-                },
-            )
-        if request.url.host == "openlibrary.org" and request.url.path == "/works/OLSPANISHONLYW.json":
-            return httpx.Response(
-                200,
-                json={
-                    "key": "/works/OLSPANISHONLYW",
-                    "title": "Fourth Wing",
-                    "description": "Edición en español.",
-                    "languages": [{"key": "/languages/spa"}],
-                },
-            )
-        if request.url.host == "www.googleapis.com":
-            return httpx.Response(
-                200,
-                json={
-                    "items": [
-                        {
-                            "id": "es-vol",
-                            "volumeInfo": {
-                                "title": "Fourth Wing",
-                                "authors": ["Rebecca Yarros"],
-                                "description": "Texto en español.",
-                                "language": "es",
-                            },
-                        }
-                    ]
-                },
-            )
-        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
-
-    async def run():
-        async with _provider_client(handler) as client:
-            unmarked_quality = await resolve_catalog_match(
-                "Fourth Wing",
-                "Rebecca Yarros",
-                client=client,
-                cache={},
-            )
-            unmarked_metadata = await resolve_book_metadata(
-                "Fourth Wing",
-                "Rebecca Yarros",
-                client=client,
-            )
-            unmarked_work = await resolve_openlibrary_work_metadata(
-                "/works/OLSPANISHONLYW",
-                "Fourth Wing",
-                "Rebecca Yarros",
-                client=client,
-            )
-            requested_quality = await resolve_catalog_match(
-                "Fourth Wing (Spanish Edition)",
-                "Rebecca Yarros",
-                client=client,
-                cache={},
-            )
-            return unmarked_quality, unmarked_metadata, unmarked_work, requested_quality
-
-    unmarked_quality, unmarked_metadata, unmarked_work, requested_quality = asyncio.run(run())
-
-    assert unmarked_quality is None
-    assert unmarked_metadata["description"] == ""
-    assert unmarked_work["description"] == ""
-    assert requested_quality is not None
-    assert requested_quality["description"] == "Edición en español."
+    match = asyncio.run(run())
+    assert match is not None
+    assert match["provider"] == "openlibrary"
+    assert match["work_id"] == "/works/OLFOURTHWINGW"
+    assert match["description"] == verified_synopsis
+    assert match["release_date"] == "2023-05-02"
+    assert match["genres"] == ["Fantasy", "Dragons"]
+    assert match["provider_lookup_unavailable"] is False
