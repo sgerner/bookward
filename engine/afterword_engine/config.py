@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     llm_rerank_model: str = "gpt-4o-mini"
     llm_rerank_allowed_hosts: str = ""
     llm_rerank_top_k: int = 24
-    llm_rerank_timeout_seconds: float = 8.0
+    llm_rerank_timeout_seconds: float = 25.0
     llm_rerank_max_delta: float = 1.2
     # A shared secret between the SvelteKit server and engine. Leave blank only
     # when both containers communicate on a private network.

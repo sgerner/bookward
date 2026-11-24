@@ -87,6 +87,7 @@ type Overview = {
     digest: DigestSettings;
     llm_rerank?: {
       enabled: boolean;
+      mode?: string;
       provider: string;
       api_url: string;
       model: string;
@@ -261,6 +262,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       ...overview.settings,
       llm_rerank: {
         enabled: overview.settings.llm_rerank?.enabled ?? false,
+        mode: overview.settings.llm_rerank?.mode ?? "",
         provider: overview.settings.llm_rerank?.provider ?? "",
         api_url:
           overview.settings.llm_rerank?.api_url ??
@@ -805,6 +807,7 @@ export const actions: Actions = {
   configureLlmRerank: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
+    const rawMode = data.get("mode");
     const provider = String(data.get("provider") || "").trim();
     const apiUrl = String(data.get("apiUrl") || "").trim();
     const model = String(data.get("model") || "").trim();
@@ -822,6 +825,7 @@ export const actions: Actions = {
           method: "PUT",
           body: JSON.stringify({
             enabled,
+            ...(rawMode !== null ? { mode: String(rawMode).trim() } : {}),
             provider,
             api_url: apiUrl,
             model,
@@ -841,6 +845,7 @@ export const actions: Actions = {
   },
   testLlmRerank: async ({ request }) => {
     const data = await request.formData();
+    const rawMode = data.get("mode");
     const provider = String(data.get("provider") || "").trim();
     const apiUrl = String(data.get("apiUrl") || "").trim();
     const model = String(data.get("model") || "").trim();
@@ -857,6 +862,7 @@ export const actions: Actions = {
         {
           method: "POST",
           body: JSON.stringify({
+            ...(rawMode !== null ? { mode: String(rawMode).trim() } : {}),
             provider,
             api_url: apiUrl,
             model,

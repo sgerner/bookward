@@ -8,6 +8,7 @@ export type LlmCatalogProviderChoice = {
 
 export type LlmRerankSettingsView = {
   enabled: boolean;
+  mode?: string;
   provider: string;
   api_url: string;
   model: string;

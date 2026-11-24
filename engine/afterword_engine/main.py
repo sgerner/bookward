@@ -1329,6 +1329,7 @@ class GoogleBooksKeyIn(BaseModel):
 
 class LLMRerankSettingsIn(BaseModel):
     enabled: bool = False
+    mode: str | None = Field(default=None, max_length=40)
     provider: str = Field(default="", max_length=120)
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
@@ -1345,6 +1346,7 @@ class LLMRerankSettingsIn(BaseModel):
 
 
 class LLMRerankTestIn(BaseModel):
+    mode: str | None = Field(default=None, max_length=40)
     provider: str | None = Field(default=None, max_length=120)
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
@@ -1481,7 +1483,6 @@ def tracked_recommendations(
     pool_summary: dict[str, Any] | None = None,
     _connection_slot: _ManagedConnection | None = None,
 ):
-    reopened_connection = None
     ranking_at = datetime.now(timezone.utc)
     is_filtered = bool((search and search.strip()) or (genre and genre.strip()))
     base_pool = personalized_pool = final_pool = None
@@ -1500,101 +1501,135 @@ def tracked_recommendations(
         "max_score_adjustment": 0.0,
     }
     can_personalize = status in (None, "", "all", "recommended")
-    try:
-        if can_personalize:
-            try:
-                # Score the full eligible recommendation pool before pagination so
-                # a learned preference can promote a strong match from below the
-                # unpersonalized page boundary.
-                ranked = recommendation_list(
+    if can_personalize:
+        try:
+            # Score the full eligible recommendation pool before pagination so
+            # a learned preference can promote a strong match from below the
+            # unpersonalized page boundary.
+            ranked = recommendation_list(
+                connection,
+                status=status,
+                limit=None,
+                offset=0,
+                identity_context=identity_context,
+                include_imported=include_imported,
+                format_urls=False,
+            )
+            if not is_filtered:
+                base_pool = [dict(item) for item in ranked]
+            interaction_events = load_interaction_events(connection)
+            # The event primary key orders actions; cached vectors are keyed by
+            # candidate id. Normalize only the cache inputs so learner event
+            # ordering and latest-event semantics keep their original ids.
+            cache_events = [
+                {**event, "id": event["candidate_id"]}
+                for event in interaction_events
+            ]
+            cached_vectors = load_cached_candidate_vectors(
+                [*ranked, *cache_events], connection
+            )
+            interaction_vectors = {
+                int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
+                for event in interaction_events
+                if int(event["candidate_id"]) in cached_vectors
+            }
+            ranked, diagnostics = personalize_recommendations(
+                ranked,
+                interaction_events,
+                now=ranking_at,
+                interaction_vectors=interaction_vectors,
+                candidate_vectors=cached_vectors,
+            )
+            if settings.impression_fatigue_enabled:
+                visible_day_counts = load_unacted_visible_impression_counts(
                     connection,
-                    status=status,
-                    limit=None,
-                    offset=0,
-                    identity_context=identity_context,
-                    include_imported=include_imported,
-                    format_urls=False,
-                )
-                if not is_filtered:
-                    base_pool = [dict(item) for item in ranked]
-                interaction_events = load_interaction_events(connection)
-                # The event primary key orders actions; cached vectors are keyed by
-                # candidate id. Normalize only the cache inputs so learner event
-                # ordering and latest-event semantics keep their original ids.
-                cache_events = [
-                    {**event, "id": event["candidate_id"]}
-                    for event in interaction_events
-                ]
-                cached_vectors = load_cached_candidate_vectors(
-                    [*ranked, *cache_events], connection
-                )
-                interaction_vectors = {
-                    int(event["candidate_id"]): cached_vectors[int(event["candidate_id"])]
-                    for event in interaction_events
-                    if int(event["candidate_id"]) in cached_vectors
-                }
-                ranked, diagnostics = personalize_recommendations(
-                    ranked,
-                    interaction_events,
+                    window_days=settings.impression_fatigue_window_days,
                     now=ranking_at,
-                    interaction_vectors=interaction_vectors,
-                    candidate_vectors=cached_vectors,
                 )
-                if settings.impression_fatigue_enabled:
-                    visible_day_counts = load_unacted_visible_impression_counts(
-                        connection,
-                        window_days=settings.impression_fatigue_window_days,
-                        now=ranking_at,
-                    )
-                    ranked, fatigue_diagnostics = apply_impression_fatigue(
-                        ranked,
-                        visible_day_counts,
-                        grace_days=settings.impression_fatigue_grace_days,
-                        penalty_per_day=settings.impression_fatigue_penalty_per_day,
-                        max_penalty=settings.impression_fatigue_max_penalty,
-                    )
-                    diagnostics["impression_fatigue"] = fatigue_diagnostics
-                if not is_filtered:
-                    personalized_pool = [dict(item) for item in ranked]
-                learning_metadata.update(diagnostics)
-                recommended = [
-                    item for item in ranked if item.get("status") == "recommended"
-                ]
-                if recommended:
-                    diversified, discovery_metadata = diversify_discovery_slate(
-                        recommended, cached_vectors
-                    )
-                    llm_cfg = effective_llm_rerank_settings(connection, private)
-                    if not is_filtered and llm_cfg["enabled"] and llm_cfg["api_key"].strip():
-                        top_k = max(0, int(settings.llm_rerank_top_k))
-                        skip_zero_head = (
-                            top_k <= 0
-                            or (
-                                recommended_limit is not None
-                                and int(recommended_limit) <= 0
-                            )
-                            or (limit is not None and int(limit) <= 0)
+                ranked, fatigue_diagnostics = apply_impression_fatigue(
+                    ranked,
+                    visible_day_counts,
+                    grace_days=settings.impression_fatigue_grace_days,
+                    penalty_per_day=settings.impression_fatigue_penalty_per_day,
+                    max_penalty=settings.impression_fatigue_max_penalty,
+                )
+                diagnostics["impression_fatigue"] = fatigue_diagnostics
+            if not is_filtered:
+                personalized_pool = [dict(item) for item in ranked]
+            learning_metadata.update(diagnostics)
+            recommended = [
+                item for item in ranked if item.get("status") == "recommended"
+            ]
+            if recommended:
+                diversified, discovery_metadata = diversify_discovery_slate(
+                    recommended, cached_vectors
+                )
+                llm_cfg = effective_llm_rerank_settings(connection, private)
+                if not is_filtered and llm_cfg["enabled"] and llm_cfg["api_key"].strip():
+                    top_k = max(0, int(settings.llm_rerank_top_k))
+                    skip_zero_head = (
+                        top_k <= 0
+                        or (
+                            recommended_limit is not None
+                            and int(recommended_limit) <= 0
                         )
-                        if skip_zero_head:
+                        or (limit is not None and int(limit) <= 0)
+                    )
+                    if skip_zero_head:
+                        learning_metadata["llm_rerank"] = {
+                            "applied": False,
+                            "reason": "skipped_zero_head",
+                        }
+                    elif int(offset) >= top_k:
+                        learning_metadata["llm_rerank"] = {
+                            "applied": False,
+                            "reason": "skipped_offset",
+                        }
+                    elif len(diversified) < 2:
+                        learning_metadata["llm_rerank"] = {
+                            "applied": False,
+                            "reason": "insufficient_candidates",
+                        }
+                    else:
+                        profile_key = llm_reranker.current_llm_profile_key()
+                        llm_mode = llm_cfg.get("mode", "")
+                        circuit = llm_reranker.get_circuit_breaker_state(
+                            profile_key,
+                            api_url=llm_cfg["api_url"],
+                            api_key=llm_cfg["api_key"],
+                            model=llm_cfg["model"],
+                            top_k=top_k,
+                            max_delta=settings.llm_rerank_max_delta,
+                            mode=llm_mode,
+                        )
+                        if circuit is not None:
                             learning_metadata["llm_rerank"] = {
                                 "applied": False,
-                                "reason": "skipped_zero_head",
-                            }
-                        elif int(offset) >= top_k:
-                            learning_metadata["llm_rerank"] = {
-                                "applied": False,
-                                "reason": "skipped_offset",
-                            }
-                        elif len(diversified) < 2:
-                            learning_metadata["llm_rerank"] = {
-                                "applied": False,
-                                "reason": "insufficient_candidates",
+                                "reason": "circuit_open",
+                                "cooldown_until": circuit.get("cooldown_until", ""),
                             }
                         else:
-                            profile_key = llm_reranker.current_llm_profile_key()
-                            llm_mode = llm_cfg.get("mode", "")
-                            circuit = llm_reranker.get_circuit_breaker_state(
-                                profile_key,
+                            read_rows = (
+                                [
+                                    dict(r)
+                                    for r in connection.execute(
+                                        "SELECT title, author, rating FROM reads ORDER BY id"
+                                    ).fetchall()
+                                ]
+                                if connection is not None
+                                else rows(
+                                    "SELECT title, author, rating FROM reads ORDER BY id"
+                                )
+                            )
+                            prompt_messages = llm_reranker.build_rerank_prompt(
+                                read_rows,
+                                diversified,
+                                interaction_events=interaction_events,
+                                top_k=top_k,
+                            )
+                            cache_key = llm_reranker.build_slate_cache_key(
+                                messages=prompt_messages,
+                                interaction_events=interaction_events,
                                 api_url=llm_cfg["api_url"],
                                 api_key=llm_cfg["api_key"],
                                 model=llm_cfg["model"],
@@ -1602,239 +1637,171 @@ def tracked_recommendations(
                                 max_delta=settings.llm_rerank_max_delta,
                                 mode=llm_mode,
                             )
-                            if circuit is not None:
-                                learning_metadata["llm_rerank"] = {
-                                    "applied": False,
-                                    "reason": "circuit_open",
-                                    "cooldown_until": circuit.get("cooldown_until", ""),
-                                }
+                            cached_payload = llm_reranker.get_cached_slate_payload(
+                                profile_key, cache_key
+                            )
+                            if cached_payload is not None:
+                                diversified, llm_diag = (
+                                    llm_reranker.apply_cached_llm_payload(
+                                        diversified,
+                                        cached_payload,
+                                        top_k=top_k,
+                                        max_delta=settings.llm_rerank_max_delta,
+                                    )
+                                )
+                                learning_metadata["llm_rerank"] = llm_diag
                             else:
-                                read_rows = (
-                                    [
-                                        dict(r)
-                                        for r in connection.execute(
-                                            "SELECT title, author, rating FROM reads ORDER BY id"
-                                        ).fetchall()
+                                pre_llm_head = {
+                                    int(c["id"]): dict(c)
+                                    for c in diversified[:top_k]
+                                    if c.get("id") is not None
+                                }
+                                if _connection_slot is not None:
+                                    _connection_slot.release()
+                                    connection = None
+                                diversified, llm_diag = (
+                                    llm_reranker.rerank_with_llm_sync(
+                                        read_rows,
+                                        diversified,
+                                        interaction_events=interaction_events,
+                                        api_url=llm_cfg["api_url"],
+                                        api_key=llm_cfg["api_key"],
+                                        model=llm_cfg["model"],
+                                        top_k=top_k,
+                                        max_delta=settings.llm_rerank_max_delta,
+                                        prebuilt_messages=prompt_messages,
+                                    )
+                                )
+                                llm_diag = dict(llm_diag)
+                                cache_entry = llm_diag.pop("_cache_payload", None)
+                                if llm_diag.get("applied"):
+                                    if cache_entry is None:
+                                        derived_entries = []
+                                        for item in diversified[:top_k]:
+                                            cid = item.get("id")
+                                            if cid is None or int(cid) not in pre_llm_head:
+                                                continue
+                                            prev = pre_llm_head[int(cid)]
+                                            delta_val = round(
+                                                float(item.get("score") or 0.0)
+                                                - float(prev.get("score") or 0.0),
+                                                4,
+                                            )
+                                            prev_exp = list(prev.get("explanation") or [])
+                                            cur_exp = list(item.get("explanation") or [])
+                                            reason_text = ""
+                                            if len(cur_exp) > len(prev_exp):
+                                                tail_exp = str(cur_exp[-1])
+                                                if ": " in tail_exp:
+                                                    reason_text = tail_exp.split(": ", 1)[1]
+                                            derived_entries.append(
+                                                {
+                                                    "id": int(cid),
+                                                    "delta": delta_val,
+                                                    "reason": reason_text,
+                                                }
+                                            )
+                                        cache_entry = {
+                                            "mode": "adjustments",
+                                            "entries": derived_entries,
+                                        }
+                                    llm_reranker.set_cached_slate_payload(
+                                        profile_key, cache_key, cache_entry
+                                    )
+                                    llm_reranker.clear_circuit_breaker(profile_key)
+                                    _persist_llm_rerank_status(
+                                        status="succeeded",
+                                        error="",
+                                        private=private,
+                                    )
+                                elif llm_diag.get("reason") == "fallback":
+                                    err_msg = llm_reranker.sanitize_llm_error(
+                                        llm_diag.get("error")
+                                        or "LLM reranking request failed",
+                                        api_key=llm_cfg["api_key"],
+                                    )
+                                    circuit_state = llm_reranker.trip_circuit_breaker(
+                                        profile_key,
+                                        api_url=llm_cfg["api_url"],
+                                        api_key=llm_cfg["api_key"],
+                                        model=llm_cfg["model"],
+                                        error=err_msg,
+                                        top_k=top_k,
+                                        max_delta=settings.llm_rerank_max_delta,
+                                        mode=llm_mode,
+                                    )
+                                    llm_diag["cooldown_until"] = circuit_state[
+                                        "cooldown_until"
                                     ]
-                                    if connection is not None
-                                    else rows(
-                                        "SELECT title, author, rating FROM reads ORDER BY id"
+                                    _persist_llm_rerank_status(
+                                        status="failed",
+                                        error=err_msg,
+                                        private=private,
                                     )
-                                )
-                                prompt_messages = llm_reranker.build_rerank_prompt(
-                                    read_rows,
-                                    diversified,
-                                    interaction_events=interaction_events,
-                                    top_k=top_k,
-                                )
-                                cache_key = llm_reranker.build_slate_cache_key(
-                                    messages=prompt_messages,
-                                    interaction_events=interaction_events,
-                                    api_url=llm_cfg["api_url"],
-                                    api_key=llm_cfg["api_key"],
-                                    model=llm_cfg["model"],
-                                    top_k=top_k,
-                                    max_delta=settings.llm_rerank_max_delta,
-                                    mode=llm_mode,
-                                )
-                                cached_payload = llm_reranker.get_cached_slate_payload(
-                                    profile_key, cache_key
-                                )
-                                if cached_payload is not None:
-                                    diversified, llm_diag = (
-                                        llm_reranker.apply_cached_llm_payload(
-                                            diversified,
-                                            cached_payload,
-                                            top_k=top_k,
-                                            max_delta=settings.llm_rerank_max_delta,
-                                        )
-                                    )
-                                    learning_metadata["llm_rerank"] = llm_diag
-                                else:
-                                    pre_llm_head = {
-                                        int(c["id"]): dict(c)
-                                        for c in diversified[:top_k]
-                                        if c.get("id") is not None
-                                    }
-                                    had_supplied_connection = connection is not None
-                                    if _connection_slot is not None:
-                                        _connection_slot.release()
-                                        connection = None
-                                    elif connection is not None:
-                                        connection.close()
-                                        connection = None
-                                    diversified, llm_diag = (
-                                        llm_reranker.rerank_with_llm_sync(
-                                            read_rows,
-                                            diversified,
-                                            interaction_events=interaction_events,
-                                            api_url=llm_cfg["api_url"],
-                                            api_key=llm_cfg["api_key"],
-                                            model=llm_cfg["model"],
-                                            top_k=top_k,
-                                            max_delta=settings.llm_rerank_max_delta,
-                                            prebuilt_messages=prompt_messages,
-                                        )
-                                    )
-                                    llm_diag = dict(llm_diag)
-                                    cache_entry = llm_diag.pop("_cache_payload", None)
-                                    if llm_diag.get("applied"):
-                                        if cache_entry is None:
-                                            derived_entries = []
-                                            for item in diversified[:top_k]:
-                                                cid = item.get("id")
-                                                if cid is None or int(cid) not in pre_llm_head:
-                                                    continue
-                                                prev = pre_llm_head[int(cid)]
-                                                delta_val = round(
-                                                    float(item.get("score") or 0.0)
-                                                    - float(prev.get("score") or 0.0),
-                                                    4,
-                                                )
-                                                prev_exp = list(prev.get("explanation") or [])
-                                                cur_exp = list(item.get("explanation") or [])
-                                                reason_text = ""
-                                                if len(cur_exp) > len(prev_exp):
-                                                    tail_exp = str(cur_exp[-1])
-                                                    if ": " in tail_exp:
-                                                        reason_text = tail_exp.split(": ", 1)[1]
-                                                derived_entries.append(
-                                                    {
-                                                        "id": int(cid),
-                                                        "delta": delta_val,
-                                                        "reason": reason_text,
-                                                    }
-                                                )
-                                            cache_entry = {
-                                                "mode": "adjustments",
-                                                "entries": derived_entries,
-                                            }
-                                        llm_reranker.set_cached_slate_payload(
-                                            profile_key, cache_key, cache_entry
-                                        )
-                                        llm_reranker.clear_circuit_breaker(profile_key)
-                                        _persist_llm_rerank_status(
-                                            status="succeeded",
-                                            error="",
-                                            private=private,
-                                        )
-                                    elif llm_diag.get("reason") == "fallback":
-                                        err_msg = llm_reranker.sanitize_llm_error(
-                                            llm_diag.get("error")
-                                            or "LLM reranking request failed",
-                                            api_key=llm_cfg["api_key"],
-                                        )
-                                        circuit_state = llm_reranker.trip_circuit_breaker(
-                                            profile_key,
-                                            api_url=llm_cfg["api_url"],
-                                            api_key=llm_cfg["api_key"],
-                                            model=llm_cfg["model"],
-                                            error=err_msg,
-                                            top_k=top_k,
-                                            max_delta=settings.llm_rerank_max_delta,
-                                            mode=llm_mode,
-                                        )
-                                        llm_diag["cooldown_until"] = circuit_state[
-                                            "cooldown_until"
-                                        ]
-                                        _persist_llm_rerank_status(
-                                            status="failed",
-                                            error=err_msg,
-                                            private=private,
-                                        )
-                                    learning_metadata["llm_rerank"] = llm_diag
-                                    if _connection_slot is not None:
-                                        connection = _connection_slot.ensure()
-                                    elif had_supplied_connection:
-                                        reopened_connection = connect()
-                                        connection = reopened_connection
-                    ranked = diversified + [
-                        item for item in ranked if item.get("status") != "recommended"
-                    ]
-                else:
-                    discovery_metadata = empty_discovery_slate_diagnostics(
-                        "no_recommended_candidates"
-                    )
-                if pool_summary is not None:
-                    all_recommended = [
-                        item for item in ranked if item.get("status") == "recommended"
-                    ]
-                    pool_summary["recommended_total"] = len(all_recommended)
-                    pool_summary["recommendation_genres"] = _distinct_genres(
-                        all_recommended
-                    )
-                if not is_filtered:
-                    final_pool = [dict(item) for item in ranked]
-                else:
-                    ranked = [
-                        item
-                        for item in ranked
-                        if _matches_recommendation_filter(
-                            item, search=search, genre=genre
-                        )
-                    ]
-                if recommended_limit is not None and status is None and offset == 0:
-                    recommended = [
-                        item for item in ranked if item.get("status") == "recommended"
-                    ]
-                    remaining = [
-                        item
-                        for item in ranked
-                        if item.get("status") in {"saved", "imported", "new"}
-                    ]
-                    recommendations = (
-                        recommended[: max(0, int(recommended_limit))] + remaining
-                    )
-                else:
-                    start = max(0, int(offset))
-                    end = None if limit is None else start + max(0, int(limit))
-                    recommendations = ranked[start:end]
-                _format_recommendation_urls(recommendations)
-            except Exception:
-                # Personalization must never take the recommendation service down.
-                # On malformed legacy evidence, return the existing champion order.
-                LOGGER.exception(
-                    "Interaction personalization failed; serving the base ranking"
-                )
-                if _connection_slot is not None and connection is None:
-                    connection = _connection_slot.ensure()
-                if pool_summary is not None:
-                    fallback_recommended = _recommendation_rows(
-                        connection,
-                        statuses=("recommended",),
-                        limit=None,
-                        identity_context=identity_context,
-                    )
-                    pool_summary["recommended_total"] = len(fallback_recommended)
-                    pool_summary["recommendation_genres"] = _distinct_genres(
-                        fallback_recommended
-                    )
-                recommendations = recommendation_list(
-                    connection,
-                    status=status,
-                    limit=limit,
-                    offset=offset,
-                    search=search,
-                    genre=genre,
-                    recommended_limit=recommended_limit,
-                    identity_context=identity_context,
-                    include_imported=include_imported,
-                )
-                learning_metadata = {
-                    "mode": "base_ranker_fallback",
-                    "scope": "installation",
-                    "applied": False,
-                    "observed_books": 0,
-                    "qualified_features": 0,
-                    "semantic_evidence_books": 0,
-                    "semantic_adjusted_candidates": 0,
-                    "adjusted_candidates": 0,
-                    "max_score_adjustment": 0.0,
-                }
+                                learning_metadata["llm_rerank"] = llm_diag
+                                if _connection_slot is not None:
+                                    connection = _connection_slot.ensure()
+                ranked = diversified + [
+                    item for item in ranked if item.get("status") != "recommended"
+                ]
+            else:
                 discovery_metadata = empty_discovery_slate_diagnostics(
-                    "base_ranker_fallback"
+                    "no_recommended_candidates"
                 )
-        else:
+            if pool_summary is not None:
+                all_recommended = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                pool_summary["recommended_total"] = len(all_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(
+                    all_recommended
+                )
+            if not is_filtered:
+                final_pool = [dict(item) for item in ranked]
+            else:
+                ranked = [
+                    item
+                    for item in ranked
+                    if _matches_recommendation_filter(
+                        item, search=search, genre=genre
+                    )
+                ]
+            if recommended_limit is not None and status is None and offset == 0:
+                recommended = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                remaining = [
+                    item
+                    for item in ranked
+                    if item.get("status") in {"saved", "imported", "new"}
+                ]
+                recommendations = (
+                    recommended[: max(0, int(recommended_limit))] + remaining
+                )
+            else:
+                start = max(0, int(offset))
+                end = None if limit is None else start + max(0, int(limit))
+                recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
+        except Exception:
+            # Personalization must never take the recommendation service down.
+            # On malformed legacy evidence, return the existing champion order.
+            LOGGER.exception(
+                "Interaction personalization failed; serving the base ranking"
+            )
+            if _connection_slot is not None and connection is None:
+                connection = _connection_slot.ensure()
+            if pool_summary is not None:
+                fallback_recommended = _recommendation_rows(
+                    connection,
+                    statuses=("recommended",),
+                    limit=None,
+                    identity_context=identity_context,
+                )
+                pool_summary["recommended_total"] = len(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(
+                    fallback_recommended
+                )
             recommendations = recommendation_list(
                 connection,
                 status=status,
@@ -1846,62 +1813,85 @@ def tracked_recommendations(
                 identity_context=identity_context,
                 include_imported=include_imported,
             )
-        # Keep exploration outside the scorer and behind an environment flag.  A
-        # disabled deployment receives the same deterministic order and scores as
-        # before, while enabled traffic records exact tail propensities.
-        if settings.exploration_enabled:
-            recommendations = epsilon_tail_explore(
-                recommendations,
-                epsilon=settings.exploration_epsilon,
-                stable_top_k=settings.exploration_stable_top_k,
-            )
-        if is_filtered:
-            decision_evidence = {
-                "schema_version": 1,
-                "capture_status": "incomplete",
-                "reason": "filtered_query",
-                "captured_at": ranking_at.isoformat(),
+            learning_metadata = {
+                "mode": "base_ranker_fallback",
+                "scope": "installation",
+                "applied": False,
+                "observed_books": 0,
+                "qualified_features": 0,
+                "semantic_evidence_books": 0,
+                "semantic_adjusted_candidates": 0,
+                "adjusted_candidates": 0,
+                "max_score_adjustment": 0.0,
             }
-        elif base_pool is not None and personalized_pool is not None and final_pool is not None:
-            decision_evidence = build_decision_evidence(
-                connection,
-                base_pool=base_pool,
-                personalized_pool=personalized_pool,
-                final_pool=final_pool,
-                interaction_events=interaction_events,
-                cached_vectors=cached_vectors,
-                ranking_metadata=learning_metadata,
-                discovery_slate_metadata=discovery_metadata,
-                request_context={
-                    "status": status,
-                    "limit": limit,
-                    "offset": offset,
-                    "recommended_limit": recommended_limit,
-                    "ranking_at": ranking_at.isoformat(),
-                    "exploration_enabled": settings.exploration_enabled,
-                    "exploration_epsilon": settings.exploration_epsilon,
-                    "exploration_stable_top_k": settings.exploration_stable_top_k,
-                },
+            discovery_metadata = empty_discovery_slate_diagnostics(
+                "base_ranker_fallback"
             )
-        else:
-            decision_evidence = {
-                "schema_version": 1,
-                "capture_status": "incomplete",
-                "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
-                "captured_at": ranking_at.isoformat(),
-            }
-        run_id = create_recommendation_run(
-            recommendations,
-            decision_evidence=decision_evidence,
+    else:
+        recommendations = recommendation_list(
+            connection,
             status=status,
             limit=limit,
+            offset=offset,
+            search=search,
+            genre=genre,
+            recommended_limit=recommended_limit,
+            identity_context=identity_context,
+            include_imported=include_imported,
+        )
+    # Keep exploration outside the scorer and behind an environment flag.  A
+    # disabled deployment receives the same deterministic order and scores as
+    # before, while enabled traffic records exact tail propensities.
+    if settings.exploration_enabled:
+        recommendations = epsilon_tail_explore(
+            recommendations,
+            epsilon=settings.exploration_epsilon,
+            stable_top_k=settings.exploration_stable_top_k,
+        )
+    if is_filtered:
+        decision_evidence = {
+            "schema_version": 1,
+            "capture_status": "incomplete",
+            "reason": "filtered_query",
+            "captured_at": ranking_at.isoformat(),
+        }
+    elif base_pool is not None and personalized_pool is not None and final_pool is not None:
+        decision_evidence = build_decision_evidence(
+            connection,
+            base_pool=base_pool,
+            personalized_pool=personalized_pool,
+            final_pool=final_pool,
+            interaction_events=interaction_events,
+            cached_vectors=cached_vectors,
             ranking_metadata=learning_metadata,
             discovery_slate_metadata=discovery_metadata,
+            request_context={
+                "status": status,
+                "limit": limit,
+                "offset": offset,
+                "recommended_limit": recommended_limit,
+                "ranking_at": ranking_at.isoformat(),
+                "exploration_enabled": settings.exploration_enabled,
+                "exploration_epsilon": settings.exploration_epsilon,
+                "exploration_stable_top_k": settings.exploration_stable_top_k,
+            },
         )
-        return recommendations, run_id
-    finally:
-        if reopened_connection is not None:
-            reopened_connection.close()
+    else:
+        decision_evidence = {
+            "schema_version": 1,
+            "capture_status": "incomplete",
+            "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
+            "captured_at": ranking_at.isoformat(),
+        }
+    run_id = create_recommendation_run(
+        recommendations,
+        decision_evidence=decision_evidence,
+        status=status,
+        limit=limit,
+        ranking_metadata=learning_metadata,
+        discovery_slate_metadata=discovery_metadata,
+    )
+    return recommendations, run_id
 
 
 def overview_payload(
@@ -3137,6 +3127,14 @@ def _saved_llm_target_matches(
     provider: str | None,
     mode: str | None = None,
 ) -> bool:
+    """Return True only when target_url, provider, and mode match the saved target.
+
+    Note: legacy rows storing a blank `llm_rerank_api_url` alongside a stored key
+    have `saved_origin == ""`, so enabled saves require providing a fresh API key
+    rather than implicitly binding the legacy key to `settings.llm_rerank_api_url`.
+    Likewise, saving with reranking disabled and a blank URL passes `target_url=""`,
+    which returns False and drops any stored key instead of leaving an unbound secret.
+    """
     saved_url = (
         current["llm_rerank_api_url"].strip()
         if "llm_rerank_api_url" in current
@@ -3170,6 +3168,10 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
     stored_key = current.get("llm_rerank_api_key", "").strip()
     env_key = settings.llm_rerank_api_key.strip()
     provided_key = "" if payload.clear_api_key else (payload.api_key or "").strip()
+    saved_mode = current.get("llm_rerank_mode", "").strip().lower()
+    effective_mode = (
+        saved_mode if payload.mode is None else payload.mode.strip().lower()
+    )
     req_url = payload.api_url.strip()
     effective_url = req_url or settings.llm_rerank_api_url
     effective_model = payload.model.strip() or settings.llm_rerank_model
@@ -3177,7 +3179,7 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
         current,
         target_url=req_url if (not payload.enabled and not req_url) else effective_url,
         provider=payload.provider,
-        mode=getattr(payload, "mode", ""),
+        mode=payload.mode,
     )
 
     if payload.clear_api_key:
@@ -3209,7 +3211,8 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
     if payload.enabled and not effective_key:
         if not same_saved_target and not payload.clear_api_key and (stored_key or env_key):
             raise HTTPException(
-                400, "Provide a new API key when changing the LLM API URL or provider"
+                400,
+                "Provide a new API key when changing the LLM API URL, provider, or mode",
             )
         raise HTTPException(400, "An API key is required when LLM reranking is enabled")
 
@@ -3221,6 +3224,7 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
         or effective_key != current_effective["api_key"]
         or payload.provider.strip().lower()
         != current_effective.get("provider", "").strip().lower()
+        or effective_mode != current_effective.get("mode", "").strip().lower()
     )
     checked = False
     if payload.enabled and llm_changed:
@@ -3241,6 +3245,7 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
 
     values = {
         "llm_rerank_enabled": "1" if payload.enabled else "0",
+        "llm_rerank_mode": effective_mode,
         "llm_rerank_provider": payload.provider.strip(),
         "llm_rerank_api_url": req_url,
         "llm_rerank_model": payload.model.strip(),
@@ -3303,7 +3308,7 @@ def test_llm_rerank_settings(payload: LLMRerankTestIn = LLMRerankTestIn()):
         current,
         target_url=api_url,
         provider=payload.provider,
-        mode=getattr(payload, "mode", None),
+        mode=payload.mode,
     )
 
     if payload.clear_api_key:
@@ -3322,7 +3327,7 @@ def test_llm_rerank_settings(payload: LLMRerankTestIn = LLMRerankTestIn()):
         if not api_key:
             if not same_saved_target and not payload.clear_api_key and (stored_key or env_key):
                 raise ValueError(
-                    "Provide an API key when testing a different LLM API URL or provider"
+                    "Provide an API key when testing a different LLM API URL, provider, or mode"
                 )
             raise ValueError("An API key is required to test the LLM reranker")
     except ValueError as exc:
@@ -3338,7 +3343,11 @@ def test_llm_rerank_settings(payload: LLMRerankTestIn = LLMRerankTestIn()):
         and api_key == current_effective["api_key"]
     )
     profile_key = llm_reranker.current_llm_profile_key()
-    llm_mode = current_effective.get("mode", "")
+    llm_mode = (
+        current_effective.get("mode", "")
+        if payload.mode is None
+        else payload.mode.strip().lower()
+    )
     try:
         result = llm_reranker.probe_llm_reranker(
             api_url=normalized_url,
@@ -3854,6 +3863,7 @@ def safe_llm_rerank_settings(connection=None, private=None) -> dict:
     )
     return {
         "enabled": effective["enabled"],
+        "mode": effective.get("mode", ""),
         "provider": effective["provider"],
         "api_url": effective["api_url"],
         "model": effective["model"],

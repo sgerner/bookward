@@ -207,7 +207,7 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
     from afterword_engine.llm_reranker import probe_llm_reranker, validate_llm_api_url
     from afterword_engine.main import LLMRerankSettingsIn
 
-    assert Settings().llm_rerank_timeout_seconds == 8.0
+    assert Settings().llm_rerank_timeout_seconds == 25.0
     monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
     monkeypatch.setattr(
         socket,
@@ -1240,3 +1240,154 @@ def test_request_target_pins_resolved_ip_and_hmac_isolates_api_keys_and_modes(
         )
         is None
     )
+
+
+def test_mode_persistence_and_blank_url_credential_hygiene(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import httpx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+    from afterword_engine.database import row, transaction
+    from afterword_engine.secrets import seal
+
+    _setup_temp_engine_db(tmp_path, monkeypatch)
+    sent_requests: list[dict] = []
+
+    class InspectingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def post(self, url: str, **kwargs):
+            sent_requests.append(
+                {"url": url, "headers": dict(kwargs.get("headers") or {})}
+            )
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", InspectingClient)
+    client = TestClient(main_module.app, headers=authenticated_headers())
+
+    # 1. Saving with an explicit `mode` persists `llm_rerank_mode` and exposes it via safe settings.
+    initial_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "mode": "cloud",
+            "provider": "openai",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4o-mini",
+            "api_key": "sk-mode-secret",
+        },
+    )
+    assert initial_save.status_code == 200
+    assert initial_save.json()["llm_rerank"]["mode"] == "cloud"
+    assert row("SELECT value FROM settings WHERE key='llm_rerank_mode'")["value"] == "cloud"
+    assert len(sent_requests) == 1
+
+    # 2. Blank-key model-only saves reuse the stored key both when `mode` matches ("cloud")
+    # and when `mode` is omitted (`None`, preserving the saved mode).
+    same_mode_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "mode": "cloud",
+            "provider": "openai",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4o",
+        },
+    )
+    assert same_mode_save.status_code == 200
+    assert same_mode_save.json()["llm_rerank"]["mode"] == "cloud"
+    assert sent_requests[-1]["headers"]["Authorization"] == "Bearer sk-mode-secret"
+
+    omitted_mode_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "provider": "openai",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4.1-mini",
+        },
+    )
+    assert omitted_mode_save.status_code == 200
+    assert omitted_mode_save.json()["llm_rerank"]["mode"] == "cloud"
+    assert sent_requests[-1]["headers"]["Authorization"] == "Bearer sk-mode-secret"
+
+    # 3. Changing `mode` with a blank key rejects both save and test with 400 before probing.
+    prior_count = len(sent_requests)
+    changed_mode_save = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "mode": "openai-compatible",
+            "provider": "openai",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4.1-mini",
+        },
+    )
+    assert changed_mode_save.status_code == 400
+    assert "Provide a new API key" in changed_mode_save.json()["detail"]
+
+    changed_mode_test = client.post(
+        "/api/settings/llm-rerank/test",
+        json={
+            "mode": "openai-compatible",
+            "provider": "openai",
+            "api_url": "https://llm.example/v1/chat/completions",
+            "model": "gpt-4.1-mini",
+        },
+    )
+    assert changed_mode_test.status_code == 400
+    assert "Provide an API key" in changed_mode_test.json()["detail"]
+    assert len(sent_requests) == prior_count
+
+    # 4. Documented edge cases:
+    # - Legacy row with stored blank URL + stored key returns 400 "Provide a new API key" on model-only save.
+    # - Saving with reranking disabled and a blank URL drops the stored key.
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('llm_rerank_api_url','',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('llm_rerank_api_key',?,1)",
+            (seal("sk-legacy-blank-url"),),
+        )
+    legacy_model_only = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": True,
+            "mode": "cloud",
+            "provider": "openai",
+            "api_url": "https://api.openai.com/v1/chat/completions",
+            "model": "gpt-4o",
+        },
+    )
+    assert legacy_model_only.status_code == 400
+    assert "Provide a new API key" in legacy_model_only.json()["detail"]
+    assert len(sent_requests) == prior_count
+
+    disabled_blank_url = client.put(
+        "/api/settings/llm-rerank",
+        json={
+            "enabled": False,
+            "mode": "cloud",
+            "provider": "openai",
+            "api_url": "",
+            "model": "gpt-4o",
+        },
+    )
+    assert disabled_blank_url.status_code == 200
+    assert disabled_blank_url.json()["llm_rerank"]["api_key_set"] is False
+    assert row("SELECT value FROM settings WHERE key='llm_rerank_api_key'")["value"] == ""
