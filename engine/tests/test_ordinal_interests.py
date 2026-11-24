@@ -130,9 +130,16 @@ def test_bottom_tail_ties_match_the_raw_ranking_report():
     ratings = np.array([1] + [3] * 19 + [5], dtype=float)
     scores = np.full(21, 50.0)
     result = evaluator.metric_set(ratings, scores)
+    reversed_result = evaluator.metric_set(ratings[::-1], scores[::-1])
     reference = raw_ranking_metrics(ratings, scores)
+    reversed_reference = raw_ranking_metrics(ratings[::-1], scores[::-1])
 
-    assert result["bottom20_low_count"] == reference["low_rated_in_bottom_20"] == 0
+    assert result["bottom20_low_count"] == pytest.approx(20 / 21)
+    assert reference["low_rated_in_bottom_20"] == pytest.approx(20 / 21)
+    assert reversed_result["bottom20_low_count"] == pytest.approx(result["bottom20_low_count"])
+    assert reversed_reference["low_rated_in_bottom_20"] == pytest.approx(
+        reference["low_rated_in_bottom_20"]
+    )
 
 
 def test_ordinal_fit_rejects_fractional_or_out_of_range_ratings():
