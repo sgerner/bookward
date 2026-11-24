@@ -25,20 +25,20 @@ function deferred<T>() {
 }
 
 describe("reading history rating helpers", () => {
-  it("accepts whole numbers 1 through 5 and explicit null/empty string for unrated", () => {
+  it("accepts whole numbers 1 through 5 and explicit null for unrated", () => {
     for (const rating of [1, 2, 3, 4, 5]) {
       expect(parseWholeStarRating(rating)).toEqual({ ok: true, value: rating });
       expect(parseWholeStarRating(String(rating))).toEqual({ ok: true, value: rating });
       expect(parseWholeStarRating(` ${rating} `)).toEqual({ ok: true, value: rating });
     }
     expect(parseWholeStarRating(null)).toEqual({ ok: true, value: null });
-    expect(parseWholeStarRating("")).toEqual({ ok: true, value: null });
-    expect(parseWholeStarRating("   ")).toEqual({ ok: true, value: null });
   });
 
-  it("rejects missing (undefined), out-of-range, fractional, boolean, and malformed rating values", () => {
+  it("rejects missing (undefined), empty strings, out-of-range, fractional, boolean, and malformed rating values", () => {
     for (const invalid of [
       undefined,
+      "",
+      "   ",
       0,
       -1,
       6,

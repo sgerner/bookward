@@ -191,7 +191,6 @@
   let expandedReadingDetails = $state<number[]>([]);
   let historyRatingOverrides = $state<Record<number, number | null>>({});
   let pendingRatingIds = $state(new Set<number>());
-  let discoverNeedsRefresh = $state(false);
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
@@ -1000,10 +999,10 @@
   }
   const ratingController = createReadingHistoryRatingController({
     saveRating: async (id, nextRating) => {
-      const response = await fetch("/api/reading-history", {
+      const response = await fetch(`/api/reading-history/${id}`, {
         method: "PUT",
         headers: { "content-type": "application/json", ...profileHeaders },
-        body: JSON.stringify({ id, rating: nextRating }),
+        body: JSON.stringify({ rating: nextRating }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         item?: { rating?: number | null };
@@ -1024,13 +1023,11 @@
       );
     },
     onCommittedSuccess: ({ title, rating }) => {
-      discoverNeedsRefresh = true;
       announceActionSuccess(formatRatingConfirmation(title, rating));
       void refreshReadingHistoryScores();
     },
     onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
       if (serverMutatedBeforeFailure) {
-        discoverNeedsRefresh = true;
         void refreshReadingHistoryScores();
       }
       announceActionError(
@@ -1072,14 +1069,6 @@
     revealedApiToken = tokenForView(view, revealedApiToken);
     activeView = view;
     if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
-    if (view === "discover" && discoverNeedsRefresh) {
-      discoverNeedsRefresh = false;
-      additionalDiscoverBooks = [];
-      discoverVisibleCount = DISCOVER_PAGE_SIZE;
-      unfilteredDiscoverHasMore = Boolean(data.recommendations_has_more);
-      reloadFilteredDiscover();
-      void invalidateAll();
-    }
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("view", view);
@@ -4628,36 +4617,32 @@
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-w-0 flex-col gap-2.5 rounded-xl preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
-                        <div class="flex min-w-0 items-center gap-3">
-                          <BookOpen size={15} class="shrink-0 text-primary-500" />
-                          <div class="min-w-0 flex-1">
-                            <span
-                              class="block truncate text-sm font-medium text-surface-950-50"
-                              >{item.title}</span
-                            ><small
-                              class="block truncate text-xs text-surface-700-300"
-                              >{item.author}</small
-                            >
-                          </div>
-                          {#if item.rating !== null && item.rating > 0}<span
-                              in:scale={{ duration: motionDuration(150) }}
-                              class="shrink-0"
-                              ><StarRatingBadge
-                                rating={item.rating}
-                                class="badge badge-sm shrink-0 preset-tonal-secondary"
-                              /></span
-                            >{:else}<span class="badge badge-sm shrink-0 preset-tonal-surface">Unrated</span>{/if}
+                        <BookOpen size={15} class="shrink-0 text-primary-500" />
+                        <div class="min-w-0 flex-1">
+                          <span
+                            class="block truncate text-sm font-medium text-surface-950-50"
+                            >{item.title}</span
+                          ><small
+                            class="block truncate text-xs text-surface-700-300"
+                            >{item.author}</small
+                          >
                         </div>
-                        <StarRating
-                          value={item.rating}
-                          label={`Rating for ${item.title}`}
-                          busy={pendingRatingIds.has(item.id)}
-                          groupKey={`recent-${item.id}`}
-                          onchange={(nextRating, trigger, clearedViaButton) =>
-                            void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
-                        />
+                        {#if item.rating}<StarRatingBadge
+                            rating={item.rating}
+                            class="shrink-0 text-xs font-semibold text-primary-600-400"
+                          />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}

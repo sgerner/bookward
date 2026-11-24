@@ -24,9 +24,6 @@ export function parseWholeStarRating(raw: unknown): ParsedValue<number | null> {
   }
   if (typeof raw === "string") {
     const trimmed = raw.trim();
-    if (trimmed === "") {
-      return { ok: true, value: null };
-    }
     if (/^[1-5]$/.test(trimmed)) {
       return { ok: true, value: Number(trimmed) };
     }

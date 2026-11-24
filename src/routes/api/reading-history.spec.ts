@@ -8,13 +8,15 @@ vi.mock("#lib/server/engine.js", async (importOriginal) => ({
   engine: engineMock,
 }));
 
-import { GET, PUT } from "./reading-history/+server";
-import { PUT as PUT_BY_ID } from "./reading-history/[id]/+server";
+import * as collectionRoute from "./reading-history/+server";
+import { PUT } from "./reading-history/[id]/+server";
 
 afterEach(() => vi.clearAllMocks());
 
 describe("reading-history endpoints", () => {
-  it("loads reading history items from the engine", async () => {
+  it("loads reading history items via GET on /api/reading-history and exposes no collection write route", async () => {
+    expect("PUT" in collectionRoute).toBe(false);
+
     engineMock.mockResolvedValue([
       {
         id: 3,
@@ -31,7 +33,7 @@ describe("reading-history endpoints", () => {
       },
     ]);
 
-    const response = await GET({} as never);
+    const response = await collectionRoute.GET({} as never);
     expect(response.status).toBe(200);
     expect(engineMock).toHaveBeenCalledWith("/api/reading-history");
     expect(await response.json()).toEqual({
@@ -45,7 +47,7 @@ describe("reading-history endpoints", () => {
     });
   });
 
-  it("updates and clears ratings via PUT on /api/reading-history", async () => {
+  it("updates and clears ratings via PUT on /api/reading-history/[id]", async () => {
     engineMock.mockResolvedValueOnce({
       id: 3,
       title: "The Left Hand of Darkness",
@@ -58,10 +60,11 @@ describe("reading-history endpoints", () => {
     });
 
     const putResponse = await PUT({
-      request: new Request("http://bookward.test/api/reading-history", {
+      params: { id: "3" },
+      request: new Request("http://bookward.test/api/reading-history/3", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: 3, rating: 5 }),
+        body: JSON.stringify({ rating: 5 }),
       }),
     } as never);
 
@@ -95,10 +98,11 @@ describe("reading-history endpoints", () => {
     });
 
     const clearResponse = await PUT({
-      request: new Request("http://bookward.test/api/reading-history", {
+      params: { id: "3" },
+      request: new Request("http://bookward.test/api/reading-history/3", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: 3, rating: null }),
+        body: JSON.stringify({ rating: null }),
       }),
     } as never);
 
@@ -113,7 +117,7 @@ describe("reading-history endpoints", () => {
     });
   });
 
-  it("supports PUT on /api/reading-history/[id] and rejects invalid IDs or missing rating keys", async () => {
+  it("coerces valid digit strings and rejects invalid IDs, missing rating keys, empty strings, or out-of-range ratings with 400", async () => {
     engineMock.mockResolvedValue({
       id: 12,
       title: "Piranesi",
@@ -125,7 +129,7 @@ describe("reading-history endpoints", () => {
       job_id: "job-score-2",
     });
 
-    const response = await PUT_BY_ID({
+    const response = await PUT({
       params: { id: "12" },
       request: new Request("http://bookward.test/api/reading-history/12", {
         method: "PUT",
@@ -140,57 +144,51 @@ describe("reading-history endpoints", () => {
       body: JSON.stringify({ rating: 4 }),
     });
 
-    const missingKeyResponse = await PUT_BY_ID({
-      params: { id: "12" },
-      request: new Request("http://bookward.test/api/reading-history/12", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({}),
-      }),
-    } as never);
-    expect(missingKeyResponse.status).toBe(400);
-
-    const badIdResponse = await PUT_BY_ID({
-      params: { id: "0" },
-      request: new Request("http://bookward.test/api/reading-history/0", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ rating: 3 }),
-      }),
-    } as never);
-    expect(badIdResponse.status).toBe(400);
-    expect(engineMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("rejects missing rating keys, non-integers, or out-of-range ratings before contacting the engine", async () => {
     for (const badBody of [
-      { id: 3 },
-      { id: 3, rating: 0 },
-      { id: 3, rating: 6 },
-      { id: 3, rating: 3.5 },
-      { id: 3, rating: true },
-      { id: 0, rating: 4 },
+      {},
+      { rating: "" },
+      { rating: "   " },
+      { rating: 0 },
+      { rating: 6 },
+      { rating: 3.5 },
+      { rating: true },
+      { rating: "five" },
     ]) {
-      const response = await PUT({
-        request: new Request("http://bookward.test/api/reading-history", {
+      const badRatingResponse = await PUT({
+        params: { id: "12" },
+        request: new Request("http://bookward.test/api/reading-history/12", {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(badBody),
         }),
       } as never);
-      expect(response.status).toBe(400);
+      expect(badRatingResponse.status).toBe(400);
     }
-    expect(engineMock).not.toHaveBeenCalled();
+
+    for (const badId of ["0", "-3", "abc"]) {
+      const badIdResponse = await PUT({
+        params: { id: badId },
+        request: new Request(`http://bookward.test/api/reading-history/${badId}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ rating: 3 }),
+        }),
+      } as never);
+      expect(badIdResponse.status).toBe(400);
+    }
+
+    expect(engineMock).toHaveBeenCalledTimes(1);
   });
 
   it("forwards upstream engine errors and statuses for client rollback", async () => {
     engineMock.mockRejectedValue(new EngineError("Read entry not found", 404));
 
     const response = await PUT({
-      request: new Request("http://bookward.test/api/reading-history", {
+      params: { id: "999" },
+      request: new Request("http://bookward.test/api/reading-history/999", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: 999, rating: 5 }),
+        body: JSON.stringify({ rating: 5 }),
       }),
     } as never);
 

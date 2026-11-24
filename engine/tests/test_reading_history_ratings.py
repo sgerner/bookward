@@ -73,16 +73,18 @@ def test_inline_rating_set_change_clear_and_validation(database):
     recent_match = next(item for item in overview["history"] if item["id"] == read_id)
     assert recent_match["rating"] == 1
 
-    # Clear rating back to Unrated (explicit null and empty string)
+    # Clear rating back to Unrated via explicit null
     clear_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": None})
     assert clear_resp.status_code == 200
     assert clear_resp.json()["rating"] is None
     assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] is None
 
-    client.put(f"/api/reading-history/{read_id}", json={"rating": 4})
-    empty_clear = client.put(f"/api/reading-history/{read_id}", json={"rating": ""})
-    assert empty_clear.status_code == 200
-    assert empty_clear.json()["rating"] is None
+    # Empty or whitespace-only strings are rejected with 400 (never silently clearing)
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": 4}).status_code == 200
+    for blank in ("", "   "):
+        empty_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": blank})
+        assert empty_resp.status_code == 400
+        assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == 4
 
     # Reject invalid ratings and missing IDs
     for invalid in [0, -1, 6, 3.5, 4.0, True, False, "0", "6", "4.5", "five", [], {}]:
@@ -130,6 +132,7 @@ def test_public_v1_reading_history_rating_authentication_and_profile_isolation(d
     assert rated.json()["rating"] == 4
 
     assert v1_client.put(f"/api/v1/reading-history/{read_id}", json={}).status_code == 422
+    assert v1_client.put(f"/api/v1/reading-history/{read_id}", json={"rating": ""}).status_code == 400
     assert row("SELECT rating FROM reads WHERE id=?", (read_id,))["rating"] == 4
 
     cleared = v1_client.put(f"/api/v1/reading-history/{read_id}", json={"rating": None})

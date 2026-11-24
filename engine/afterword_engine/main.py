@@ -1315,7 +1315,10 @@ class ReadingHistoryRatingIn(BaseModel):
         if isinstance(value, str):
             trimmed = value.strip()
             if trimmed == "":
-                return None
+                raise HTTPException(
+                    400,
+                    "Rating must be a whole number between 1 and 5, or null for unrated",
+                )
             if trimmed in {"1", "2", "3", "4", "5"}:
                 return int(trimmed)
             raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
