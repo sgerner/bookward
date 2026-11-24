@@ -38,7 +38,18 @@ from afterword_engine.ranking import (
     rank_candidates,
 )
 from evaluate_historical_ratings import raw_ranking_metrics, whole_day_cuts
-from evaluate_ranking import baseline, content_hash, document, load_corpus, prepare, read_time
+from evaluate_ranking import (
+    assess_candidate_provenance,
+    baseline,
+    content_hash,
+    document,
+    feedback_history_available_at,
+    load_corpus,
+    prepare,
+    prepare_feedback_streaks,
+    read_time,
+    summarize_same_run_cohort,
+)
 
 VARIANTS = ('current', 'kernel_unshrunk', 'author_stronger', 'kernel_ess2', 'kernel_ess5', 'cosine_centered', 'negative_top5')
 HYPOTHESES = {
@@ -382,8 +393,43 @@ def score_changes(current, candidate):
             'changed_by_at_least_5_points': int(np.sum(np.abs(delta) >= 5)), 'n': int(len(delta))}
 
 
-def feedback_replay(data, records, selected, selected_formula):
-    """Summarize logged saves/rejects as a separate, untuned intent diagnostic."""
+def _cohort_experiment_summary(entries, variant_names, *, include_original):
+    usable = len(entries)
+    saves = sum(int(bool(row['saved'])) for row in entries)
+    rejects = usable - saves
+    if not usable:
+        out = {
+            'usable': 0,
+            'saves': 0,
+            'rejects': 0,
+            'metrics': {name: None for name in variant_names},
+        }
+        if include_original:
+            out['original_formula'] = None
+        return out
+    labels = np.asarray([bool(row['saved']) for row in entries], dtype=bool)
+    out = {
+        'usable': usable,
+        'saves': saves,
+        'rejects': rejects,
+        'metrics': {
+            name: feedback_metrics(
+                labels,
+                np.asarray([float(row['scores'][name]) for row in entries], dtype=np.float64),
+            )
+            for name in variant_names
+        },
+    }
+    if include_original:
+        out['original_formula'] = feedback_metrics(
+            labels,
+            np.asarray([float(row['original_score']) for row in entries], dtype=np.float64),
+        )
+    return out
+
+
+def feedback_replay(data, records, selected, selected_formula, *, strict_provenance=False):
+    """Summarize logged saves/rejects in stratified cohorts without cross-regime pooling."""
     candidates = {item['id']: item for item in data.get('candidates', [])}
     candidate_cache = {
         entry['entity_id']: entry
@@ -391,29 +437,21 @@ def feedback_replay(data, records, selected, selected_formula):
         if entry['entity_type'] == 'candidate'
         and (entry['backend'], entry['model']) == selected
     }
-    dated_events = [
-        (read_time(event.get('created_at')), event)
-        for event in data.get('feedback', [])
-        if not event.get('undone_at')
-    ]
-    latest = {}
-    for when, event in sorted(
-        ((when, event) for when, event in dated_events if when is not None),
-        key=lambda pair: (pair[0], pair[1]['id']),
-    ):
-        latest[event['candidate_id']] = (when, event)
+    streaks, streak_info = prepare_feedback_streaks(data)
+    any_known_created_at = any(
+        read_time(item.get('created_at')) is not None for _, item, _ in records
+    )
 
-    labels = []
     feedback_variants = tuple(dict.fromkeys(('current', selected_formula)))
-    variant_scores = {name: [] for name in feedback_variants}
-    original_scores = []
+    cold_start_entries = []
+    history_backed_entries = []
+    all_entries = []
+    evaluated_candidates = []
     parity_count = 0
     parity_mismatches = 0
     parity_max_error = 0.0
-    source_weight_present = 0
-    catalog_confidence_present = 0
     excluded = 0
-    for candidate_id, (when, event) in latest.items():
+    for candidate_id, (when, event) in streaks.items():
         item, entry = candidates.get(candidate_id), candidate_cache.get(candidate_id)
         if event.get('action') not in {'save', 'reject'} or not item or not entry:
             excluded += 1
@@ -425,19 +463,19 @@ def feedback_replay(data, records, selected, selected_formula):
         if len(vector) != entry['dimensions'] or not np.isfinite(vector).all():
             excluded += 1
             continue
-        identity = book_identity(item.get('title', ''), item.get('author', ''))
-        prior = [
-            (row_date, row_item, row_vector)
-            for row_date, row_item, row_vector in records
-            if row_date.date() < when.date()
-            and book_identity(row_item.get('title', ''), row_item.get('author', '')) != identity
-        ]
-        if not prior:
-            excluded += 1
-            continue
-        prior.sort(key=lambda row: row[1].get('id', 0))
-        histories = [row[1] for row in prior]
-        history_vectors = np.stack([row[2] for row in prior])
+        prior, _counts = feedback_history_available_at(
+            records,
+            when,
+            item,
+            allow_missing_created_at=not any_known_created_at,
+        )
+        prior.sort(key=lambda row: row[0].get('id', 0))
+        histories = [row[0] for row in prior]
+        history_vectors = (
+            np.stack([row[1] for row in prior])
+            if prior
+            else np.empty((0, len(vector)), dtype=np.float32)
+        )
         scored = scores_for_group(histories, history_vectors, [item], vector[None, :])
         exact_score = float(
             rank_candidates(histories, history_vectors, [item], vector[None, :])[0]['score']
@@ -446,58 +484,98 @@ def feedback_replay(data, records, selected, selected_formula):
         parity_count += 1
         parity_mismatches += int(score_error > 1e-8)
         parity_max_error = max(parity_max_error, score_error)
-        for name in feedback_variants:
-            variant_scores[name].append(float(np.round(scored[name][0], 1)))
-        original_scores.append(float(baseline(histories, history_vectors, [item], vector[None, :])[0]))
-        source_weight_present += int(item.get('source_weight') is not None)
-        catalog_confidence_present += int(
-            item.get('catalog_confidence') is not None or item.get('quality_score') is not None
-        )
-        labels.append(event['action'] == 'save')
 
-    if not labels:
-        return {
-            'usable': 0,
-            'excluded': int(excluded),
-            'exact_ranker_parity_check': {
-                'compared_predictions': parity_count,
-                'mismatches_at_served_precision': parity_mismatches,
-                'max_score_error_points': parity_max_error,
-            },
+        entry_scores = {
+            name: float(np.round(scored[name][0], 1))
+            for name in feedback_variants
         }
+        saved = event['action'] == 'save'
+        evaluated_candidates.append(item)
+        row_record = {
+            'candidate_id': candidate_id,
+            'saved': saved,
+            'when': when,
+            'run_id': event.get('run_id'),
+            'visible_at': event.get('visible_at'),
+            'scores': entry_scores,
+            'original_score': (
+                float(baseline(histories, history_vectors, [item], vector[None, :])[0])
+                if prior
+                else None
+            ),
+        }
+        all_entries.append(row_record)
+        if prior:
+            history_backed_entries.append(row_record)
+        else:
+            cold_start_entries.append(row_record)
+
     parity = {
         'compared_predictions': parity_count,
         'mismatches_at_served_precision': parity_mismatches,
         'max_score_error_points': parity_max_error,
     }
+    if not all_entries:
+        return {
+            'usable': 0,
+            'excluded': int(excluded),
+            'exact_ranker_parity_check': parity,
+        }
     require_exact_ranker_parity(parity)
-    labels = np.asarray(labels, dtype=bool)
+    provenance = assess_candidate_provenance(evaluated_candidates, strict=strict_provenance)
+    cold_summary = _cohort_experiment_summary(
+        cold_start_entries, feedback_variants, include_original=False
+    )
+    history_summary = _cohort_experiment_summary(
+        history_backed_entries, feedback_variants, include_original=True
+    )
+    same_run_summary = summarize_same_run_cohort(
+        all_entries,
+        feedback_variants,
+        lambda lbls, scrs: {
+            'auc': feedback_metrics(lbls, scrs)['save_auc'],
+            'precision_at_20': feedback_metrics(lbls, scrs)['top20_save_rate'],
+        },
+    )
+    total_saves = sum(int(bool(row['saved'])) for row in all_entries)
+    total_usable = len(all_entries)
     result = {
-        'usable': int(len(labels)),
-        'saves': int(labels.sum()),
-        'rejects': int((~labels).sum()),
+        'usable': total_usable,
+        'saves': total_saves,
+        'rejects': total_usable - total_saves,
         'excluded': int(excluded),
+        'pooled_across_regimes': False,
         'exact_ranker_parity_check': parity,
         'candidate_feature_coverage': {
-            'usable_candidates': int(len(labels)),
-            'with_source_weight': source_weight_present,
-            'with_catalog_confidence_or_quality_score': catalog_confidence_present,
-            'missing_fields_use_ranker_defaults': True,
+            'usable_candidates': provenance['usable_candidates'],
+            'with_source_weight': provenance['with_source_weight'],
+            'missing_source_weight': provenance['missing_source_weight'],
+            'with_catalog_confidence_or_quality_score': provenance[
+                'with_catalog_confidence_or_quality_score'
+            ],
+            'missing_catalog_confidence': provenance['missing_catalog_confidence'],
+            'status': provenance['status'],
+            'warnings': provenance['warnings'],
+            'missing_fields_use_ranker_defaults': bool(provenance['warnings']),
         },
+        'streak_preparation': streak_info,
         'protocol': (
-            'Latest non-undone save/reject per candidate; read history is restricted to earlier '
-            'calendar days. This is a separate, untuned intent diagnostic without exposure correction.'
+            'Earliest timestamp of each candidate unbroken save/reject streak; read history is '
+            'restricted to earlier calendar days and rows created on or before the decision time, '
+            'with multi-identifier ReadIdentityIndex edition exclusion. Cold-start zero-history, '
+            'history-backed, and same-run slates are reported separately without pooling.'
         ),
-        'metrics': {
-            name: feedback_metrics(labels, np.asarray(scores))
-            for name, scores in variant_scores.items()
+        'cohorts': {
+            'cold_start_zero_history': cold_summary,
+            'history_backed': history_summary,
+            'same_run_slates': same_run_summary,
         },
-        'original_formula': feedback_metrics(labels, np.asarray(original_scores)),
+        'metrics': history_summary['metrics'],
+        'original_formula': history_summary['original_formula'],
         'limitations': (
             'Sparse logged actions do not estimate the causal effect of ranking or exposure. '
-            'The SQLite loader does not join source weight or catalog confidence; use the enriched '
-            'JSON export to reproduce those production inputs. When either field is absent, the '
-            'ranker uses its documented default, so parity applies to the fields supplied.'
+            'Zero-history cold-start actions, history-backed actions, and within-run slates are '
+            'stratified to avoid pooled regime inversions.'
         ),
     }
     return result
@@ -509,11 +587,18 @@ def main():
     parser.add_argument('--model', help='embedding model to evaluate')
     parser.add_argument('--bootstrap-iterations', type=int, default=2000)
     parser.add_argument('--bootstrap-seed', type=int, default=20260930)
+    parser.add_argument(
+        '--require-catalog-provenance',
+        action='store_true',
+        help='fail closed when evaluated feedback candidates lack source_weight or catalog_confidence',
+    )
     args = parser.parse_args()
     if args.bootstrap_iterations < 0:
         parser.error('--bootstrap-iterations must be non-negative')
 
     data = load_corpus(args.corpus)
+    if args.require_catalog_provenance and data.get('candidates'):
+        assess_candidate_provenance(data['candidates'], strict=True)
     records, selected, excluded = prepare(data, args.backend, args.model)
     items, vectors, ratings, dates, predictions, parity = replay(records)
     cuts = whole_day_cuts(records)[1]
@@ -546,7 +631,11 @@ def main():
         ],
     }
     fitted['feedback_diagnostic'] = feedback_replay(
-        data, records, selected, fitted['selected_on_validation']
+        data,
+        records,
+        selected,
+        fitted['selected_on_validation'],
+        strict_provenance=args.require_catalog_provenance,
     )
     print(json.dumps(fitted, indent=2, allow_nan=False))
 
