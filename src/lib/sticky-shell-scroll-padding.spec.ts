@@ -26,7 +26,10 @@ function collectElements(node: unknown): ElementMatch[] {
   const record = node as Record<string, unknown>;
   const found: ElementMatch[] = [];
 
-  if (record.type === "RegularElement" && typeof record.name === "string") {
+  if (
+    (record.type === "RegularElement" || record.type === "Component") &&
+    typeof record.name === "string"
+  ) {
     const rawAttributes = (record.attributes as Array<{
       type: string;
       name?: string;
@@ -99,12 +102,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     expect(librarrClasses).toContain("scroll-mt-4");
     expect(librarrClasses).not.toContain("scroll-mt-24");
 
-    const srOnlySwitches = elements.filter(
-      (el) =>
-        el.name === "input" &&
-        (el.attributes.get("class") ?? "").split(/\s+/).includes("sr-only") &&
-        el.attributes.get("role") === "switch",
-    );
+    const srOnlySwitches = elements.filter((el) => el.name === "SwitchControl");
     expect(srOnlySwitches.length).toBeGreaterThanOrEqual(4);
     for (const control of srOnlySwitches) {
       expect(control.start).toBeGreaterThanOrEqual(shell.start);
@@ -120,7 +118,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
     }
   });
 
-  it("defines scoped root scroll-padding and sr-only switch scroll-margin-block rules in layout.css", () => {
+  it("defines scoped root scroll-padding and switch scroll-margin-block rules in layout.css", () => {
     const css = readRelative("../routes/layout.css");
 
     expect(css).toMatch(
@@ -130,7 +128,7 @@ describe("sticky shell scroll padding (WCAG 2.2 C43)", () => {
       /@media\s*\(min-width:\s*48rem\)\s*\{\s*html:has\(\[data-sticky-shell\]\)\s*\{\s*scroll-padding-bottom:\s*0;\s*\}\s*\}/s,
     );
     expect(css).toMatch(
-      /\[data-sticky-shell\]\s+input\.sr-only\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
+      /\[data-sticky-shell\]\s+\[role=["']switch["']\]\s*\{\s*scroll-margin-block:\s*4rem;\s*\}/s,
     );
     expect(css).not.toMatch(/(?:^|\n)\s*html\s*\{[^}]*scroll-padding/s);
   });

@@ -49,7 +49,7 @@ export function sanitizeEngineMessage(detail: string | undefined, status: number
 
 export const GOODREADS_CSV_MAX_BYTES = 10_000_000;
 export const GOODREADS_CSV_LIMIT_MESSAGE =
-  'Goodreads CSV exports must be 10 MB or smaller (up to 20,000 books). Choose a smaller CSV file and try again.';
+  'Goodreads or StoryGraph CSV exports must be 10 MB or smaller (up to 20,000 books). Choose a smaller CSV file and try again.';
 
 export function isPayloadTooLarge(error: unknown): boolean {
   let current: unknown = error;

@@ -1,5 +1,6 @@
 import { error as httpError, fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
+import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
@@ -44,9 +45,7 @@ export const actions: Actions = {
 			const result = await engine<{ session_token: string; max_age: number }>('/auth/password/change', {
 				method: 'POST', body: JSON.stringify({ current_password, new_password })
 			});
-			cookies.set('bookward_session', result.session_token, {
-				httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/', maxAge: result.max_age
-			});
+			cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 			return { message: 'Password updated.' };
 		} catch (error) {
 			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Password could not be updated.' });

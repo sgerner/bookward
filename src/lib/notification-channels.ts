@@ -7,9 +7,16 @@ export type TransientNotice = {
 	error: boolean;
 };
 
-export type UndoBanner = {
+export type UndoDecisionItem = {
 	id: number;
-	undo_id: number;
+	decision_id: number;
+};
+
+export type UndoBanner = {
+	key: string;
+	decisions: UndoDecisionItem[];
+	id?: number;
+	undo_id?: number;
 	message: string;
 	undo_label?: string;
 };
@@ -24,6 +31,7 @@ export type NotificationFormPayload = {
 	error?: boolean;
 	id?: number;
 	undo_id?: number;
+	undo_decisions?: UndoDecisionItem[];
 	undo_label?: string;
 } | null | undefined;
 
@@ -110,10 +118,18 @@ export function createNotificationChannels(
 			if (form === lastForm) return;
 			lastForm = form;
 			if (!form?.message || !form.message.trim()) return;
-			if (form.undo_id && form.id) {
+			const decisions: UndoDecisionItem[] = form.undo_decisions?.length
+				? form.undo_decisions
+				: form.undo_id && form.id
+					? [{ id: form.id, decision_id: form.undo_id }]
+					: [];
+			if (decisions.length) {
+				const single = decisions.length === 1 ? decisions[0] : undefined;
 				undoBanner = {
-					id: form.id,
-					undo_id: form.undo_id,
+					key: `undo-${decisions.map((item) => item.decision_id).join('-')}`,
+					decisions,
+					id: single?.id ?? form.id,
+					undo_id: single?.decision_id ?? form.undo_id,
 					message: form.message.trim(),
 					undo_label: form.undo_label
 				};
@@ -140,14 +156,31 @@ export function createNotificationChannels(
 			undoBanner = null;
 			emit();
 		},
+		clearUndoKey(key: string) {
+			if (undoBanner?.key !== key) return;
+			undoBanner = null;
+			emit();
+		},
 		clearUndoDecision(decisionId: number) {
-			if (undoBanner?.undo_id !== decisionId) return;
+			if (!undoBanner?.decisions.some((item) => item.decision_id === decisionId)) return;
 			undoBanner = null;
 			emit();
 		},
 		clearUndoForBook(bookId: number) {
-			if (undoBanner?.id !== bookId) return;
-			undoBanner = null;
+			if (!undoBanner?.decisions.some((item) => item.id === bookId)) return;
+			const remaining = undoBanner.decisions.filter((item) => item.id !== bookId);
+			if (!remaining.length) {
+				undoBanner = null;
+			} else {
+				const single = remaining.length === 1 ? remaining[0] : undefined;
+				undoBanner = {
+					...undoBanner,
+					key: `undo-${remaining.map((item) => item.decision_id).join('-')}`,
+					decisions: remaining,
+					id: single?.id,
+					undo_id: single?.decision_id
+				};
+			}
 			emit();
 		},
 		setPointerInside(inside: boolean) {

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     source_max_bytes: int = 2_000_000
     source_max_items: int = 250
     source_sync_interval_hours: int = 24
+    enable_background_loops: bool = True
     # Contact address included in identified Open Library requests.  The
     # provider remains usable without one, but Open Library asks applications
     # making regular requests to identify themselves.
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     # the internal engine URL so Docker installs can link to the web service.
     public_url: str = "http://localhost:5173"
     librarr_allowed_hosts: str = "librarr"
+    smtp_allowed_hosts: str = ""
     # Exploration is deliberately opt-in.  The ranking path and response
     # order remain deterministic until an operator enables this flag.
     exploration_enabled: bool = False

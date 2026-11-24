@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 from urllib.parse import parse_qs, urlparse
 
@@ -7,6 +8,7 @@ import pytest
 
 from afterword_engine import covers
 from afterword_engine import ingestion
+from afterword_engine.config import settings
 from afterword_engine.covers import (
     GOOGLE_BOOKS_SEARCH,
     OPEN_LIBRARY_SEARCH,
@@ -15,15 +17,9 @@ from afterword_engine.covers import (
     resolve_book_metadata,
     resolve_openlibrary_work_metadata,
 )
+from afterword_engine.database import initialize, normalize_key, row, rows, transaction
+from afterword_engine.isbn import isbn_parts_from_source
 from afterword_engine.quality import _audit_one, resolve_catalog_match
-
-
-@pytest.fixture(autouse=True)
-def no_real_rate_limit_wait(monkeypatch):
-    async def advance_without_wait(delay):
-        return None
-
-    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_without_wait)
 
 
 def _provider_client(handler):
@@ -170,6 +166,526 @@ def test_penguin_random_house_description_rejects_nonproduct_urls_without_fetch(
         "isbn13": "9780306406157",
     }))
     assert result == {}
+
+
+def test_publishers_weekly_grid_parser_scopes_covers_skips_cta_and_recovers_isbns():
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    markup = """<table>
+      <tr>
+        <td class="starredreview-grid">
+          <a href="/9780306406157"><img src="/cover/9780306406157"></a>
+          <h3><a href="/9780306406157">First Starred Book</a></h3>
+          <h4>Ada Writer. Press One, $28 (320p) ISBN 978-0-306-40615-7</h4>
+          <p><a href="/9780306406157">Complete Review &#187;</a></p>
+        </td>
+        <td class="starredreview-grid">
+          <a href="/0061120081"><img src="/cover/0061120081"></a>
+          <h3><a href="/0061120081">Second Starred Book</a></h3>
+          <h4>By Grace Author</h4>
+          <p><a href="/0061120081">Read Full Review &raquo;</a></p>
+        </td>
+      </tr>
+      <tr>
+        <td class="starredreview-grid">
+          <img src="/cover/row2-left.jpg">
+          <h3><a href="/books/left">Row Two Left</a></h3>
+          <h4>By Left Writer</h4>
+          <p>Complete Review »</p>
+        </td>
+        <td class="starredreview-grid">
+          <h3><a href="/9780306406150">Row Two Missing Cover</a></h3>
+          <h4>Right Writer. Press Two, $26 ISBN 978-0-306-40615-0</h4>
+          <p><a href="/9780306406150">Complete Review »</a></p>
+        </td>
+      </tr>
+      <tr>
+        <td><img src="/cover/single-row.jpg"></td>
+        <td class="starredreview-grid">
+          <h3><a href="/books/single-row">Single Row Fallback</a></h3>
+          <h4>Solo Writer. Press Three, $24 (240p) ISBN 0-306-40615-2</h4>
+          <p>A crisp literary mystery. <a href="/books/single-row">Complete Review »</a></p>
+        </td>
+      </tr>
+    </table>""".encode("utf-8")
+
+    items = ingestion.parse_book_items(markup, "text/html", source_url)
+    by_title = {item["title"]: item for item in items}
+
+    assert set(by_title) == {
+        "First Starred Book",
+        "Second Starred Book",
+        "Row Two Left",
+        "Row Two Missing Cover",
+        "Single Row Fallback",
+    }
+    assert by_title["First Starred Book"]["cover_url"] == "https://www.publishersweekly.com/cover/9780306406157"
+    assert by_title["First Starred Book"]["description"] == ""
+    assert by_title["First Starred Book"]["isbn13"] == "9780306406157"
+
+    assert by_title["Second Starred Book"]["cover_url"] == "https://www.publishersweekly.com/cover/0061120081"
+    assert by_title["Second Starred Book"]["description"] == ""
+    assert by_title["Second Starred Book"]["isbn13"] == "9780061120084"
+    assert by_title["Second Starred Book"]["isbn10"] == "0061120081"
+
+    assert by_title["Row Two Left"]["cover_url"] == "https://www.publishersweekly.com/cover/row2-left.jpg"
+    assert by_title["Row Two Missing Cover"]["cover_url"] == ""
+    assert "isbn13" not in by_title["Row Two Missing Cover"]
+    assert "isbn10" not in by_title["Row Two Missing Cover"]
+
+    assert by_title["Single Row Fallback"]["cover_url"] == "https://www.publishersweekly.com/cover/single-row.jpg"
+    assert by_title["Single Row Fallback"]["description"] == "A crisp literary mystery."
+    assert by_title["Single Row Fallback"]["isbn13"] == "9780306406157"
+    assert by_title["Single Row Fallback"]["isbn10"] == "0306406152"
+
+    assert isbn_parts_from_source((), "https://publishersweekly.com/978-0-306-40615-7") == ("9780306406157", "")
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/reviews/review.html?isbn=978-0-306-40615-7",
+        )
+        == ("9780306406157", "")
+    )
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/reviews?isbn10=0-06-112008-1",
+        )
+        == ("9780061120084", "0061120081")
+    )
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/reviews/review.html?isbn=9780306406150",
+        )
+        == ("", "")
+    )
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/pw/by-topic/industry-news/article/9780306406157.html") == ("", "")
+    assert (
+        isbn_parts_from_source(
+            (),
+            "https://www.publishersweekly.com/pw/by-topic/industry-news/article.html?isbn=9780306406157",
+        )
+        == ("", "")
+    )
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/search?isbn=9780306406157") == ("", "")
+    assert isbn_parts_from_source((), "https://www.publishersweekly.com/?isbn=9780306406157") == ("", "")
+    assert isbn_parts_from_source((), "https://publishersweekly.com.evil.example/9780306406157") == ("", "")
+    assert isbn_parts_from_source((), "https://example.com/9780306406157") == ("", "")
+
+
+def test_publishers_weekly_cta_skip_allows_catalog_synopsis_and_keeps_curated_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "pw-cta.db"))
+    initialize(seed_demo=False)
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    markup = """<table><tr>
+      <td class="starredreview-grid">
+        <img src="/cover/cta.jpg">
+        <h3><a href="/9780306406157">CTA Starred Novel</a></h3>
+        <h4>Ada Writer. Press One, $28 ISBN 978-0-306-40615-7</h4>
+        <p><a href="/9780306406157">Complete Review »</a></p>
+      </td>
+      <td class="starredreview-grid">
+        <img src="/cover/curated.jpg">
+        <h3><a href="/0061120081">Curated Starred Novel</a></h3>
+        <h4>Grace Author. Press Two, $27 ISBN 0-06-112008-1</h4>
+        <p>Editorial review excerpt kept intact.</p>
+      </td>
+    </tr></table>""".encode("utf-8")
+
+    async def fake_fetch(_url, client=None):
+        return markup, "text/html"
+
+    def provider_handler(request):
+        if request.url.host == "openlibrary.org":
+            isbn_param = request.url.params.get("isbn", "")
+            title = "CTA Starred Novel" if isbn_param == "9780306406157" else "Curated Starred Novel"
+            author = "Ada Writer" if isbn_param == "9780306406157" else "Grace Author"
+            work_key = "/works/OLCTA1W" if isbn_param == "9780306406157" else "/works/OLCUR1W"
+            return httpx.Response(
+                200,
+                json={"docs": [{
+                    "key": work_key,
+                    "title": title,
+                    "author_name": [author],
+                    "isbn": [isbn_param] if isbn_param else [],
+                    "description": f"Catalog synopsis for {title}.",
+                    "subject": ["Literary fiction"],
+                    "first_publish_year": 2026,
+                }]},
+            )
+        return httpx.Response(200, json={"items": []})
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(provider_handler))
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    assert asyncio.run(ingestion.scan_source(source)) == 2
+
+    cta_candidate = row("SELECT id,description,isbn13 FROM candidates WHERE title='CTA Starred Novel'")
+    curated_candidate = row("SELECT id,description,isbn13 FROM candidates WHERE title='Curated Starred Novel'")
+    assert cta_candidate["description"] == "Catalog synopsis for CTA Starred Novel."
+    assert cta_candidate["isbn13"] == "9780306406157"
+    assert curated_candidate["description"] == "Editorial review excerpt kept intact."
+    assert curated_candidate["isbn13"] == "9780061120084"
+
+    cta_provenance = row(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (cta_candidate["id"],),
+    )
+    curated_provenance = row(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='description'",
+        (curated_candidate["id"],),
+    )
+    assert cta_provenance["provider"] == "openlibrary"
+    assert curated_provenance["provider"] == "source"
+
+
+def test_scan_source_bounds_chunked_enrichment_and_hydrates_stored_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "batch-scan.db"))
+    initialize(seed_demo=False)
+    batch_size = ingestion.SOURCE_METADATA_ENRICHMENT_BATCH_SIZE
+    total_incomplete = batch_size * 2 + 5
+
+    prh_url = "https://www.penguinrandomhouse.com/books/new-releases/"
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET filters=? WHERE url=?",
+            (json.dumps({"include_genres": ["science fiction"]}), prh_url),
+        )
+        source_id = con.execute("SELECT id FROM sources WHERE url=?", (prh_url,)).fetchone()[0]
+        for index in range(2):
+            title = f"Stored Complete {index}"
+            con.execute(
+                """INSERT INTO candidates(
+                    title,author,description,cover_url,release_date,date_kind,genres,isbn13,source_url,source_id,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    "Known Writer",
+                    "Stored synopsis.",
+                    f"https://covers.openlibrary.org/b/id/{900 + index}-L.jpg",
+                    "2026-05-01",
+                    "day",
+                    json.dumps(["Science fiction"]),
+                    _isbn13_with_prefix(900 + index),
+                    f"https://www.penguinrandomhouse.com/books/{900 + index}/stored/",
+                    source_id,
+                    normalize_key(title, "Known Writer"),
+                ),
+            )
+
+    feed_items = [
+        {
+            "title": f"Stored Complete {index}",
+            "author": "Known Writer",
+            "description": "",
+            "cover_url": f"https://images.penguinrandomhouse.com/cover/{900 + index}",
+            "source_url": f"https://www.penguinrandomhouse.com/books/{900 + index}/stored/",
+            "release_date": "2026-05-01",
+            "date_kind": "day",
+            "genres": [],
+        }
+        for index in range(2)
+    ] + [
+        {
+            "title": f"Release {index}",
+            "author": "Feed Writer",
+            "description": "",
+            "cover_url": f"https://images.penguinrandomhouse.com/cover/{index}",
+            "source_url": f"https://www.penguinrandomhouse.com/books/{1000 + index}/release-{index}/",
+            "release_date": "2026-06-01",
+            "date_kind": "day",
+            "genres": [],
+        }
+        for index in range(total_incomplete)
+    ]
+
+    prh_batches = []
+    catalog_batches = []
+
+    async def fake_fetch(_url):
+        return "text/html", [dict(item) for item in feed_items]
+
+    async def fake_prh_enrich(items):
+        prh_batches.append([item["title"] for item in items])
+        return [
+            {
+                **item,
+                "description": f"Publisher synopsis for {item['title']}.",
+                "isbn13": _isbn13_with_prefix(2000 + offset),
+            }
+            for offset, item in enumerate(items)
+        ]
+
+    async def fake_catalog_enrich(items):
+        catalog_batches.append([item["title"] for item in items])
+        return [{**item, "genres": ["Science fiction"]} for item in items]
+
+    monkeypatch.setattr(ingestion, "_fetch_and_parse_source", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", fake_prh_enrich)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", fake_catalog_enrich)
+
+    source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    collected = asyncio.run(ingestion.scan_source(source))
+    assert collected == total_incomplete + 2
+    assert [len(batch) for batch in prh_batches] == [batch_size, batch_size, 5]
+    assert [len(batch) for batch in catalog_batches] == [batch_size, batch_size, 5]
+    enriched_titles = {title for batch in catalog_batches for title in batch}
+    assert "Stored Complete 0" not in enriched_titles
+    assert "Stored Complete 1" not in enriched_titles
+    assert f"Release {total_incomplete - 1}" in enriched_titles
+    stored_cover = row("SELECT cover_url FROM candidates WHERE title='Stored Complete 0'")["cover_url"]
+    assert stored_cover == "https://covers.openlibrary.org/b/id/900-L.jpg"
+
+    # Warm rescan: previously enriched candidates hydrate from SQLite; only new incomplete item is enriched.
+    prh_batches.clear()
+    catalog_batches.clear()
+    feed_items.append({
+        "title": "Brand New Release",
+        "author": "Feed Writer",
+        "description": "",
+        "cover_url": "https://images.penguinrandomhouse.com/cover/new",
+        "source_url": "https://www.penguinrandomhouse.com/books/5000/brand-new-release/",
+        "release_date": "2026-07-01",
+        "date_kind": "day",
+        "genres": [],
+    })
+    second_collected = asyncio.run(ingestion.scan_source(source))
+    assert second_collected == total_incomplete + 3
+    assert prh_batches == [["Brand New Release"]]
+    assert catalog_batches == [["Brand New Release"]]
+
+
+def test_scan_source_warm_rescan_skips_items_missing_genres_or_release_date(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "warm-rescan-sparse.db"))
+    initialize(seed_demo=False)
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    prh_product_url = "https://www.penguinrandomhouse.com/books/777/genreless-prh-book/"
+    markup = f"""<table>
+      <tr>
+        <td class="starredreview-grid">
+          <img src="/cover/genreless.jpg">
+          <h3><a href="/9780306406157">Genreless Starred Book</a></h3>
+          <h4>Ada Writer. Press One, $28 ISBN 978-0-306-40615-7</h4>
+          <p><a href="/9780306406157">Complete Review »</a></p>
+        </td>
+        <td class="starredreview-grid">
+          <img src="/cover/dateless.jpg">
+          <h3><a href="/0061120081">Dateless Starred Book</a></h3>
+          <h4>Grace Author. Press Two, $27 ISBN 0-06-112008-1</h4>
+          <p>Editorial blurb without publication date.</p>
+        </td>
+        <td class="starredreview-grid">
+          <img src="https://images.penguinrandomhouse.com/cover/9780143127741">
+          <h3><a href="{prh_product_url}">Genreless PRH Book</a></h3>
+          <h4>By Solo Author</h4>
+          <p>Publisher blurb already present, cover present, genres absent.</p>
+        </td>
+      </tr>
+    </table>""".encode("utf-8")
+
+    product_fetches = []
+    catalog_requests = []
+
+    async def fake_fetch(url, client=None):
+        if url == source_url:
+            return markup, "text/html"
+        product_fetches.append(url)
+        return b"<html></html>", "text/html"
+
+    def provider_handler(request):
+        catalog_requests.append(str(request.url))
+        if request.url.host == "openlibrary.org":
+            isbn_param = request.url.params.get("isbn", "")
+            if isbn_param == "9780306406157":
+                # Supplies synopsis and release_date, but never genres.
+                return httpx.Response(
+                    200,
+                    json={"docs": [{
+                        "key": "/works/OLGENRELESS1W",
+                        "title": "Genreless Starred Book",
+                        "author_name": ["Ada Writer"],
+                        "isbn": ["9780306406157"],
+                        "description": "Catalog synopsis without subjects.",
+                        "subject": [],
+                        "first_publish_year": 2026,
+                    }]},
+                )
+            if isbn_param == "9780061120084":
+                # Supplies genres, but never release_date.
+                return httpx.Response(
+                    200,
+                    json={"docs": [{
+                        "key": "/works/OLDATELESS1W",
+                        "title": "Dateless Starred Book",
+                        "author_name": ["Grace Author"],
+                        "isbn": ["9780061120084"],
+                        "subject": ["Literary fiction"],
+                    }]},
+                )
+        return httpx.Response(200, json={"docs": [], "items": []})
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "metadata_client", lambda: _provider_client(provider_handler))
+
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert catalog_requests
+    # PRH book already has description and non-weak cover, so PRH product page is not fetched for missing genres.
+    assert product_fetches == []
+
+    genreless = row(
+        "SELECT c.id,c.genres,c.release_date,q.metadata_checked_at,q.metadata_version "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.title='Genreless Starred Book'"
+    )
+    dateless = row(
+        "SELECT c.id,c.genres,c.release_date,q.metadata_checked_at,q.metadata_version "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.title='Dateless Starred Book'"
+    )
+    assert json.loads(genreless["genres"]) == []
+    assert genreless["release_date"] == "2026-01-01"
+    assert genreless["metadata_checked_at"]
+    assert genreless["metadata_version"] == covers.METADATA_NORMALIZATION_VERSION
+    assert json.loads(dateless["genres"]) == ["Literary fiction"]
+    assert dateless["release_date"] is None
+    assert dateless["metadata_checked_at"]
+
+    # Warm rescan within retry window must make zero PRH or catalog enrichment calls.
+    catalog_requests.clear()
+
+    async def fail_if_enriched(_items):
+        raise AssertionError("warm rescan should not re-enrich recently checked sparse items")
+
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", fail_if_enriched)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", fail_if_enriched)
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert catalog_requests == []
+    assert product_fetches == []
+
+    # Once metadata_checked_at ages past CANDIDATE_METADATA_RETRY_DAYS, item becomes eligible again.
+    expired_checked_at = (
+        datetime.now(timezone.utc)
+        - timedelta(days=ingestion.CANDIDATE_METADATA_RETRY_DAYS + 1)
+    ).isoformat(timespec="microseconds")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET metadata_checked_at=? WHERE candidate_id=?",
+            (expired_checked_at, genreless["id"]),
+        )
+
+    retried_titles = []
+
+    async def passthrough_prh(items):
+        return items
+
+    async def record_retry(items):
+        retried_titles.extend(item["title"] for item in items)
+        return items
+
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough_prh)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", record_retry)
+    assert asyncio.run(ingestion.scan_source(source)) == 3
+    assert retried_titles == ["Genreless Starred Book"]
+
+
+def test_scan_source_commits_completed_chunks_before_mid_scan_failure_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "chunk-failure.db"))
+    initialize(seed_demo=False)
+    monkeypatch.setattr(ingestion, "SOURCE_METADATA_ENRICHMENT_BATCH_SIZE", 2)
+    monkeypatch.setattr(ingestion, "SOURCE_METADATA_ENRICHMENT_MAX_BATCHES", 2)
+
+    source_url = "https://www.publishersweekly.com/pw/reviews/starred.html"
+    source = row("SELECT * FROM sources WHERE url=?", (source_url,))
+    with transaction() as con:
+        con.execute(
+            """INSERT INTO candidates(
+                title,author,description,cover_url,source_url,source_id,status,normalized_key
+            ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                "Stale Prior Candidate",
+                "Prior Writer",
+                "Prior blurb.",
+                "https://www.publishersweekly.com/cover/stale.jpg",
+                source_url,
+                source["id"],
+                "new",
+                normalize_key("Stale Prior Candidate", "Prior Writer"),
+            ),
+        )
+
+    # 5 incomplete items in inline HTML -> capped to 2 batches * 2 = 4 items on first scan.
+    cards_html = "\n".join(
+        f"""<tr><td class="starredreview-grid">
+          <img src="/cover/book-{idx}.jpg">
+          <h3><a href="/books/book-{idx}">Chunk Book {idx}</a></h3>
+          <h4>By Author {idx}</h4>
+          <p>Complete Review »</p>
+        </td></tr>"""
+        for idx in range(5)
+    )
+    markup = f"<table>{cards_html}</table>".encode("utf-8")
+
+    async def fake_fetch(_url, client=None):
+        return markup, "text/html"
+
+    seen_batches = []
+    fail_second_chunk = True
+
+    async def passthrough_prh(items):
+        return items
+
+    async def flaky_catalog_enrich(items):
+        titles = [item["title"] for item in items]
+        seen_batches.append(titles)
+        if fail_second_chunk and len(seen_batches) == 2:
+            raise RuntimeError("transient catalog timeout in chunk 2")
+        return [
+            {
+                **item,
+                "description": f"Enriched synopsis for {item['title']}.",
+                "genres": ["Literary fiction"],
+            }
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(ingestion, "enrich_penguin_random_house_items", passthrough_prh)
+    monkeypatch.setattr(ingestion, "enrich_book_metadata", flaky_catalog_enrich)
+
+    with pytest.raises(RuntimeError, match="transient catalog timeout in chunk 2"):
+        asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source["id"],))))
+
+    assert seen_batches == [["Chunk Book 0", "Chunk Book 1"], ["Chunk Book 2", "Chunk Book 3"]]
+    persisted_after_failure = rows(
+        "SELECT c.title,c.description,q.metadata_checked_at "
+        "FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id "
+        "WHERE c.source_id=? ORDER BY c.title",
+        (source["id"],),
+    )
+    persisted_by_title = {item["title"]: item for item in persisted_after_failure}
+    # Chunk 1 committed its two enriched books; stale candidate was NOT prematurely deleted; last_status stayed unset.
+    assert set(persisted_by_title) == {"Chunk Book 0", "Chunk Book 1", "Stale Prior Candidate"}
+    assert persisted_by_title["Chunk Book 0"]["description"] == "Enriched synopsis for Chunk Book 0."
+    assert persisted_by_title["Chunk Book 0"]["metadata_checked_at"]
+    assert persisted_by_title["Chunk Book 1"]["metadata_checked_at"]
+    assert row("SELECT last_status FROM sources WHERE id=?", (source["id"],))["last_status"] is None
+
+    # Retry scan after transient failure clears: Chunk 0 & 1 are skipped via metadata_checked_at,
+    # remaining unchecked books (Chunk Book 2, 3, 4) are enriched, and stale candidate is cleaned up.
+    seen_batches.clear()
+    fail_second_chunk = False
+    collected = asyncio.run(ingestion.scan_source(row("SELECT * FROM sources WHERE id=?", (source["id"],))))
+    assert collected == 5
+    assert seen_batches == [["Chunk Book 2", "Chunk Book 3"], ["Chunk Book 4"]]
+    final_titles = {
+        item["title"]
+        for item in rows("SELECT title FROM candidates WHERE source_id=?", (source["id"],))
+    }
+    assert final_titles == {f"Chunk Book {idx}" for idx in range(5)}
+    assert row("SELECT last_status FROM sources WHERE id=?", (source["id"],))["last_status"] == "ok:5"
 
 
 def test_source_description_is_preserved_and_legacy_opening_upgrade_is_exact_record_only():
@@ -970,3 +1486,473 @@ def test_openlibrary_rate_budget_serializes_concurrent_requests_with_fake_clock(
     asyncio.run(run())
 
     assert starts == [10.0, 11.0, 12.0, 13.0, 14.0]
+
+
+def test_resolvers_call_google_books_without_waiting_on_openlibrary_slot_and_preserve_trace_order(
+    monkeypatch,
+):
+    requested_isbn = "9780307474278"
+    call_order: list[str] = []
+    active_gate: list[asyncio.Event] = []
+
+    async def gated_openlibrary_slot():
+        await asyncio.wait_for(active_gate[0].wait(), timeout=2.0)
+
+    monkeypatch.setattr(covers, "wait_for_openlibrary_request_slot", gated_openlibrary_slot)
+
+    def handler(request):
+        if request.url.host == "openlibrary.org":
+            call_order.append("openlibrary")
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [{
+                        "key": "/works/OL123456W",
+                        "title": "Concurrent Book",
+                        "author_name": ["A Writer"],
+                        "isbn": [requested_isbn],
+                        "first_sentence": ["Short opening."],
+                        "subject": ["Historical fiction"],
+                        "first_publish_year": 2021,
+                    }],
+                },
+            )
+        if request.url.host == "www.googleapis.com":
+            call_order.append("google_books")
+            active_gate[0].set()
+            return httpx.Response(
+                200,
+                json={
+                    "items": [{
+                        "id": "gb-concurrent-1",
+                        "volumeInfo": {
+                            "title": "Concurrent Book",
+                            "authors": ["A Writer"],
+                            "description": "A complete verified Google Books synopsis.",
+                            "categories": ["Mystery"],
+                            "publishedDate": "2021-06-15",
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": requested_isbn}
+                            ],
+                            "imageLinks": {
+                                "thumbnail": "https://books.google.com/books/content?id=gb-concurrent-1"
+                            },
+                        },
+                    }],
+                },
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    async def run_covers():
+        active_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        async with _provider_client(handler) as client:
+            return await resolve_book_metadata(
+                "Concurrent Book",
+                "A Writer",
+                isbn13=requested_isbn,
+                client=client,
+            )
+
+    metadata = asyncio.run(run_covers())
+    assert call_order == ["google_books", "openlibrary"]
+    assert [t["provider"] for t in metadata["metadata_provenance"]["fetch_trace"]] == [
+        "openlibrary",
+        "google_books",
+    ]
+    assert [p["provider"] for p in metadata["metadata_provenance"]["source_payloads"]] == [
+        "openlibrary",
+        "google_books",
+    ]
+    _filtered, evidence, verified_work_id = ingestion._verified_read_metadata(
+        metadata,
+        {
+            "title": "Concurrent Book",
+            "author": "A Writer",
+            "isbn": requested_isbn,
+            "openlibrary_work_id": "",
+        },
+    )
+    assert evidence["provider"] == "openlibrary"
+    assert verified_work_id == "/works/OL123456W"
+
+    async def run_quality():
+        active_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        async with _provider_client(handler) as client:
+            return await resolve_catalog_match(
+                "Concurrent Book",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=requested_isbn,
+            )
+
+    match = asyncio.run(run_quality())
+    assert match is not None
+    assert call_order == ["google_books", "openlibrary"]
+    assert match["provider"] == "openlibrary"
+    assert match["work_id"] == "/works/OL123456W"
+    assert match["description_provider"] == "google_books"
+    assert [t["provider"] for t in match["metadata_provenance"]["fetch_trace"]] == [
+        "openlibrary",
+        "google_books",
+    ]
+    assert [p["provider"] for p in match["metadata_provenance"]["source_payloads"]] == [
+        "openlibrary",
+        "google_books",
+    ]
+
+
+def test_provisional_isbn_skips_quality_fallback_and_runs_metadata_fallbacks_concurrently(
+    monkeypatch,
+):
+    provisional_isbn = "9780307474278"
+    quality_calls: list[tuple[str, str]] = []
+
+    def provisional_quality_handler(request):
+        provider = "openlibrary" if request.url.host == "openlibrary.org" else "google_books"
+        kind = _fallback_test_query(request)
+        quality_calls.append((provider, kind))
+        if provider == "openlibrary":
+            return httpx.Response(200, json={"docs": []})
+        return httpx.Response(
+            200,
+            json={
+                "items": [{
+                    "id": "gb-provisional",
+                    "volumeInfo": {
+                        "title": "Upcoming Release",
+                        "authors": ["A Writer"],
+                        "description": "Publisher verified synopsis for upcoming release.",
+                        "categories": ["Literary fiction"],
+                        "publishedDate": "2027-02-01",
+                        "industryIdentifiers": [
+                            {"type": "ISBN_13", "identifier": provisional_isbn}
+                        ],
+                        "imageLinks": {
+                            "thumbnail": "https://books.google.com/books/content?id=gb-provisional"
+                        },
+                    },
+                }],
+            },
+        )
+
+    async def run_quality():
+        async with _provider_client(provisional_quality_handler) as client:
+            return await resolve_catalog_match(
+                "Upcoming Release",
+                "A Writer",
+                client=client,
+                cache={},
+                isbn13=provisional_isbn,
+            )
+
+    match = asyncio.run(run_quality())
+    assert match is not None
+    assert match["provider"] == "google_books"
+    assert sorted(quality_calls) == [("google_books", "isbn"), ("openlibrary", "isbn")]
+
+    fallback_gate: list[asyncio.Event] = []
+    metadata_events: list[tuple[str, str]] = []
+
+    async def wait_until_google_fallback():
+        await asyncio.wait_for(fallback_gate[0].wait(), timeout=2.0)
+
+    monkeypatch.setattr(covers, "wait_for_openlibrary_request_slot", wait_until_google_fallback)
+
+    def metadata_fallback_handler(request):
+        provider = "openlibrary" if request.url.host == "openlibrary.org" else "google_books"
+        kind = _fallback_test_query(request)
+        metadata_events.append((provider, kind))
+        if provider == "google_books":
+            if kind == "isbn":
+                return httpx.Response(200, json={"items": []})
+            fallback_gate[0].set()
+            return _fallback_test_record("google_books")
+        if kind == "isbn":
+            return httpx.Response(200, json={"docs": []})
+        return _fallback_test_record("openlibrary")
+
+    async def run_metadata():
+        fallback_gate[:] = [asyncio.Event()]
+        async with _provider_client(metadata_fallback_handler) as client:
+            return await resolve_book_metadata(
+                "Fallback Book",
+                "A Writer",
+                isbn13=provisional_isbn,
+                client=client,
+            )
+
+    metadata = asyncio.run(run_metadata())
+    assert metadata_events[:2] == [("google_books", "isbn"), ("google_books", "title")]
+    assert [(t["provider"], t["query_kind"]) for t in metadata["metadata_provenance"]["fetch_trace"]] == [
+        ("openlibrary", "isbn"),
+        ("openlibrary", "title_author"),
+        ("google_books", "isbn"),
+        ("google_books", "title_author"),
+    ]
+
+
+@pytest.mark.parametrize("resolver_kind", ["quality", "covers"])
+def test_concurrent_workers_space_openlibrary_starts_with_fake_clock_without_blocking_google(
+    monkeypatch, resolver_kind
+):
+    clock = [10.0]
+    ol_starts: list[float] = []
+    gb_starts: list[float] = []
+    ol_inflight = 0
+    ol_peak = 0
+    gb_inflight = 0
+    gb_peak = 0
+
+    monkeypatch.setattr(covers, "_openlibrary_rate_clock", lambda loop: clock[0])
+
+    async def advance_clock(delay: float) -> None:
+        await asyncio.sleep(0)
+        clock[0] += delay
+
+    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_clock)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ol_inflight, ol_peak, gb_inflight, gb_peak
+        if request.url.host == "openlibrary.org":
+            ol_starts.append(clock[0])
+            ol_inflight += 1
+            ol_peak = max(ol_peak, ol_inflight)
+            await asyncio.sleep(0)
+            ol_inflight -= 1
+            return httpx.Response(200, json={"docs": []})
+        if request.url.host == "www.googleapis.com":
+            gb_starts.append(clock[0])
+            q = request.url.params.get("q", "")
+            isbn = q.split("isbn:")[1] if q.startswith("isbn:") else _isbn13_with_prefix(99)
+            idx = int(isbn[3:12]) if q.startswith("isbn:") else int(q.split("Book ")[1].split(" ")[0])
+            gb_inflight += 1
+            gb_peak = max(gb_peak, gb_inflight)
+            await asyncio.sleep(0)
+            gb_inflight -= 1
+            return httpx.Response(
+                200,
+                json={
+                    "items": [{
+                        "id": f"bench-vol-{idx}",
+                        "volumeInfo": {
+                            "title": f"Book {idx}",
+                            "authors": ["Bench Author"],
+                            "description": "Verified benchmark synopsis.",
+                            "categories": ["Literary fiction"],
+                            "publishedDate": "2026-06-01",
+                            "industryIdentifiers": [{"type": "ISBN_13", "identifier": isbn}],
+                            "imageLinks": {
+                                "thumbnail": f"https://books.google.com/books/content?id=bench-{idx}"
+                            },
+                        },
+                    }],
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    async def run():
+        semaphore = asyncio.Semaphore(8)
+        cache = {}
+        # Include 12 distinct books plus a duplicate of Book 1 to verify single-flight cache sharing.
+        book_indices = [*range(1, 13), 1]
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async def worker(idx: int):
+                async with semaphore:
+                    if resolver_kind == "quality":
+                        return await resolve_catalog_match(
+                            f"Book {idx}",
+                            "Bench Author",
+                            client=client,
+                            cache=cache,
+                            isbn13=_isbn13_with_prefix(idx),
+                        )
+                    return await resolve_book_metadata(
+                        f"Book {idx}",
+                        "Bench Author",
+                        client=client,
+                        lookup_cache=cache,
+                    )
+
+            return await asyncio.gather(*(worker(index) for index in book_indices))
+
+    results = asyncio.run(run())
+    assert len(results) == 13
+    assert results[0] == results[-1]
+    assert ol_peak == 1
+    assert gb_peak == 8
+    assert len(ol_starts) == 12
+    assert len(gb_starts) == 12
+    assert gb_starts[:8] == [10.0] * 8
+    assert all(
+        later - earlier >= covers.OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS
+        for earlier, later in zip(ol_starts, ol_starts[1:])
+    )
+    assert ol_starts == [10.0 + offset for offset in range(12)]
+
+
+@pytest.mark.parametrize(
+    ("failing_provider", "failure_mode"),
+    [
+        ("openlibrary", "http_503"),
+        ("openlibrary", "connect_error"),
+        ("google_books", "http_503"),
+        ("google_books", "connect_error"),
+        ("google_books", "http_429"),
+    ],
+)
+def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
+    monkeypatch, failing_provider, failure_mode
+):
+    requested_isbn = "9780307474278"
+    call_order: list[str] = []
+    ol_gate: list[asyncio.Event] = []
+
+    async def gated_openlibrary_slot():
+        await asyncio.wait_for(ol_gate[0].wait(), timeout=2.0)
+
+    monkeypatch.setattr(covers, "wait_for_openlibrary_request_slot", gated_openlibrary_slot)
+
+    def fail_response(request: httpx.Request) -> httpx.Response:
+        if failure_mode == "connect_error":
+            raise httpx.ConnectError("simulated provider network failure", request=request)
+        if failure_mode == "http_429":
+            return httpx.Response(429, json={"error": {"message": "quota exceeded"}})
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "openlibrary.org":
+            call_order.append("openlibrary")
+            if failing_provider == "openlibrary":
+                return fail_response(request)
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [{
+                        "key": "/works/OLSURVIVEW",
+                        "title": "Resilient Book",
+                        "author_name": ["Steady Author"],
+                        "isbn": [requested_isbn],
+                        "description": "Verified Open Library synopsis when Google fails.",
+                        "subject": ["Literary fiction"],
+                        "first_publish_year": 2022,
+                        "cover_i": 54321,
+                    }],
+                },
+            )
+        if request.url.host == "www.googleapis.com":
+            call_order.append("google_books")
+            ol_gate[0].set()
+            if failing_provider == "google_books":
+                return fail_response(request)
+            return httpx.Response(
+                200,
+                json={
+                    "items": [{
+                        "id": "gb-survive-1",
+                        "volumeInfo": {
+                            "title": "Resilient Book",
+                            "authors": ["Steady Author"],
+                            "description": "Verified Google Books synopsis when Open Library fails.",
+                            "categories": ["Literary fiction"],
+                            "publishedDate": "2022-09-10",
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": requested_isbn}
+                            ],
+                            "imageLinks": {
+                                "thumbnail": "https://books.google.com/books/content?id=gb-survive-1"
+                            },
+                        },
+                    }],
+                },
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url.host}{request.url.path}")
+
+    expected_survivor = "google_books" if failing_provider == "openlibrary" else "openlibrary"
+    expected_failure_status = (
+        "request_error"
+        if failure_mode == "connect_error"
+        else "rate_limited"
+        if failure_mode == "http_429"
+        else "server_error"
+        if failure_mode == "http_503"
+        else "http_error"
+    )
+    # The audit path (quality.py) keeps the coarser ``http_error`` status for 5xx.
+    expected_audit_failure_status = (
+        "request_error"
+        if failure_mode == "connect_error"
+        else "rate_limited"
+        if failure_mode == "http_429"
+        else "http_error"
+    )
+
+    async def run_covers():
+        ol_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        async with _provider_client(handler) as client:
+            return await resolve_book_metadata(
+                "Resilient Book",
+                "Steady Author",
+                isbn13=requested_isbn,
+                client=client,
+            )
+
+    metadata = asyncio.run(run_covers())
+    assert call_order == ["google_books", "openlibrary"]
+    assert metadata["provider"] == expected_survivor
+    assert metadata["description"].startswith(
+        "Verified Google Books synopsis"
+        if expected_survivor == "google_books"
+        else "Verified Open Library synopsis"
+    )
+    assert metadata["genres"] == ["Literary fiction"]
+    assert metadata["cover_url"] != ""
+    assert metadata["release_date"].startswith("2022-")
+    cover_traces = metadata["metadata_provenance"]["fetch_trace"]
+    assert [t["provider"] for t in cover_traces] == ["openlibrary", "google_books"]
+    failed_cover_trace = next(t for t in cover_traces if t["provider"] == failing_provider)
+    assert failed_cover_trace["status"] == expected_failure_status
+
+    async def run_audit():
+        ol_gate[:] = [asyncio.Event()]
+        call_order.clear()
+        rate_limited: set[str] = set()
+        async with _provider_client(handler) as client:
+            first = await _audit_one(
+                {"id": 101, "title": "Resilient Book", "author": "Steady Author", "isbn13": requested_isbn},
+                client,
+                {},
+                rate_limited_providers=rate_limited,
+            )
+            second = None
+            if failure_mode == "http_429":
+                ol_gate[:] = [asyncio.Event()]
+                ol_gate[0].set()
+                second = await _audit_one(
+                    {"id": 102, "title": "Resilient Book", "author": "Steady Author", "isbn13": requested_isbn},
+                    client,
+                    {},
+                    rate_limited_providers=rate_limited,
+                )
+            return first, second
+
+    audit_result, skipped_followup = asyncio.run(run_audit())
+    assert audit_result["quality_status"] == "accepted"
+    assert audit_result["provider"] == expected_survivor
+    assert audit_result["flags"] == []
+    audit_traces = audit_result["metadata_provenance"]["fetch_trace"]
+    assert [t["provider"] for t in audit_traces] == ["openlibrary", "google_books"]
+    failed_audit_trace = next(t for t in audit_traces if t["provider"] == failing_provider)
+    assert failed_audit_trace["status"] == expected_audit_failure_status
+    if skipped_followup is not None:
+        assert skipped_followup["quality_status"] == "accepted"
+        assert skipped_followup["flags"] == []
+        skipped_gb_trace = next(
+            t for t in skipped_followup["metadata_provenance"]["fetch_trace"]
+            if t["provider"] == "google_books"
+        )
+        assert skipped_gb_trace["skipped"] is True
+        assert skipped_gb_trace["status"] == "rate_limited"

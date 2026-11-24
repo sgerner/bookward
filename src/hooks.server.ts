@@ -7,9 +7,13 @@ import {
 	engine,
 	isPayloadTooLarge
 } from '#lib/server/engine.js';
+import {
+	SESSION_COOKIE,
+	sessionCookieDeleteOptions,
+	sessionRefreshCookieOptions
+} from '#lib/server/cookies.js';
 import { withSessionToken } from '#lib/server/request-context.js';
 
-const SESSION_COOKIE = 'bookward_session';
 const ORIGIN_ERROR_DETAIL = 'Request origin could not be verified';
 const AUTH_REQUIRED_DETAIL = 'Authentication required. Sign in again to continue.';
 const STALE_PROFILE_DETAIL = 'This page belongs to a different profile. Reload before continuing.';
@@ -209,7 +213,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 		const lookup = await sessionUser(session);
 		if (lookup.status === 'authenticated') throw redirect(303, '/');
 		if (lookup.status === 'unauthenticated') {
-			event.cookies.delete(SESSION_COOKIE, { path: '/' });
+			event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		} else {
 			event.locals.engineUnavailable = true;
 		}
@@ -229,7 +233,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const lookup = await sessionUser(session);
 	if (lookup.status === 'unauthenticated') {
-		event.cookies.delete(SESSION_COOKIE, { path: '/' });
+		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
 		if (callback) return withSecurityHeaders(await resolve(event));
 		if (wantsJsonAuthError(event.request, path)) return jsonError(401, AUTH_REQUIRED_DETAIL);
 		if (path === '/auth/logout') throw redirect(303, '/login?manual=1');
@@ -272,9 +276,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 	event.locals.user = user;
 	if (user.must_change_password && path !== '/account' && !path.startsWith('/auth/')) throw redirect(303, '/account?force_password_change=1');
-	event.cookies.set(SESSION_COOKIE, session, {
-		httpOnly: true, secure: event.url.protocol === 'https:', sameSite: 'lax', path: '/', maxAge: 24 * 60 * 60
-	});
+	event.cookies.set(SESSION_COOKIE, session, sessionRefreshCookieOptions(event.url));
 	const response = await withSessionToken(session, () => resolve(event));
 	response.headers.set('cache-control', 'private, no-store');
 	return withSecurityHeaders(response);

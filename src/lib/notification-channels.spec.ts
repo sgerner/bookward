@@ -29,6 +29,8 @@ describe('split notification channels', () => {
 		});
 
 		expect(channels.getState().undoBanner).toEqual({
+			key: 'undo-55',
+			decisions: [{ id: 9, decision_id: 55 }],
 			id: 9,
 			undo_id: 55,
 			message: 'Saved to your shortlist.',
@@ -40,6 +42,8 @@ describe('split notification channels', () => {
 
 		expect(channels.getState().transientNotice).toBeNull();
 		expect(channels.getState().undoBanner).toEqual({
+			key: 'undo-55',
+			decisions: [{ id: 9, decision_id: 55 }],
 			id: 9,
 			undo_id: 55,
 			message: 'Saved to your shortlist.',
