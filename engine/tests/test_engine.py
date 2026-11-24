@@ -3893,7 +3893,14 @@ def test_disabling_builtin_demo_source_purges_demo_reads_derived_evidence_and_pr
     assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
     assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
     assert row("SELECT COUNT(*) count FROM recommendation_evidence_vectors")["count"] == 0
-    assert row("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1")["used_bytes"] == 0
+    expected_exposure_bytes = row(
+        "SELECT COALESCE(SUM(160 + length(CAST(candidate_snapshot_json AS BLOB))), 0) bytes "
+        "FROM recommendation_evidence_exposures"
+    )["bytes"]
+    assert (
+        row("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1")["used_bytes"]
+        == expected_exposure_bytes
+    )
     assert row("SELECT status,score FROM candidates WHERE id=?", (builtin_candidate_id,)) == {
         "status": "new",
         "score": 0.0,
@@ -4216,6 +4223,281 @@ def test_migration_28_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monke
     assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 4
     assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 1
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+
+
+def _seed_shared_run_with_demo_and_real_data():
+    """Create a serving run shared by a demo read outcome, a real read outcome, and real feedback."""
+    from datetime import datetime, timedelta, timezone
+    from afterword_engine.learning import attribute_read_outcomes
+
+    past_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    real_read_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        piranesi_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,80,'recommended',?)",
+            (
+                "Piranesi",
+                "Susanna Clarke",
+                "A house of infinite halls and statues flooded by tides.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("Piranesi", "Susanna Clarke"),
+            ),
+        ).lastrowid
+        dune_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,88,'recommended',?)",
+            (
+                "Dune",
+                "Frank Herbert",
+                "Politics and ecology on a desert world.",
+                json.dumps(["science fiction"]),
+                web_source_id,
+                normalize_key("Dune", "Frank Herbert"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id IN (?,?)",
+            (piranesi_candidate_id, dune_candidate_id),
+        )
+
+    assert asyncio.run(score_all("local", "hashing-768")) >= 5
+    served, shared_run_id = tracked_recommendations()
+    assert len(served) >= 5 and shared_run_id
+    builtin_ids = [
+        int(item["id"])
+        for item in served
+        if int(item["id"]) not in {piranesi_candidate_id, dune_candidate_id}
+    ]
+    feedback_candidate_id, mark_read_candidate_id = builtin_ids[0], builtin_ids[1]
+
+    with transaction() as con:
+        for rank_offset, cid in enumerate(
+            (piranesi_candidate_id, dune_candidate_id, mark_read_candidate_id),
+            start=90,
+        ):
+            con.execute(
+                "INSERT INTO recommendation_impressions"
+                "(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+                "VALUES(?,?,?,82.0,1.0,?,?) "
+                "ON CONFLICT(run_id,candidate_id) DO UPDATE SET presented_at=excluded.presented_at, visible_at=excluded.visible_at",
+                (shared_run_id, cid, rank_offset, past_ts, past_ts),
+            )
+        real_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) "
+            "VALUES('Dune','Frank Herbert',5,?,'goodreads_csv')",
+            (real_read_ts,),
+        ).lastrowid
+
+    profiles.initialize_auth()
+    client = TestClient(app, headers=authenticated_headers())
+    fb = client.post(
+        f"/api/recommendations/{feedback_candidate_id}/feedback",
+        json={"action": "save", "run_id": shared_run_id},
+    )
+    assert fb.status_code == 200
+    feedback_decision_id = fb.json()["decision_id"]
+
+    attributed = attribute_read_outcomes()
+    assert attributed["reads_attributed"] == 2
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes o "
+            "JOIN recommendation_impressions i ON i.id=o.impression_id "
+            "WHERE i.run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == 3
+    )
+    return {
+        "shared_run_id": shared_run_id,
+        "piranesi_candidate_id": piranesi_candidate_id,
+        "dune_candidate_id": dune_candidate_id,
+        "real_read_id": real_read_id,
+        "feedback_candidate_id": feedback_candidate_id,
+        "feedback_event_key": f"feedback:{feedback_decision_id}",
+        "mark_read_candidate_id": mark_read_candidate_id,
+    }
+
+
+def test_runtime_purge_and_migration_28_preserve_real_outcomes_and_feedback_on_shared_run(
+    tmp_path, monkeypatch
+):
+    from afterword_engine.database import initialize as init_db
+
+    # 1. Runtime purge_demo_reads via manual Mark Read on a shared run.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-runtime.db"))
+    init_db(seed_demo=True)
+    ctx = _seed_shared_run_with_demo_and_real_data()
+    shared_run_id = ctx["shared_run_id"]
+    real_event_key = f"read:{ctx['real_read_id']:08d}"
+    feedback_event_key = ctx["feedback_event_key"]
+    impression_count_before = row(
+        "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+    exposure_count_before = row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+
+    client = TestClient(app, headers=authenticated_headers())
+    marked = client.post(
+        f"/api/recommendations/{ctx['mark_read_candidate_id']}/read",
+        json={"rating": 4},
+    )
+    assert marked.status_code == 200
+    manual_read_id = marked.json()["read_id"]
+    manual_event_key = f"manual-read:{ctx['mark_read_candidate_id']}:{manual_read_id:08d}"
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (shared_run_id,)) == {"ok": 1}
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == impression_count_before
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == exposure_count_before
+    )
+    # Demo outcome and event are gone, while real read outcome, explicit feedback outcome,
+    # and the newly recorded manual read outcome on the shared run all remain intact.
+    remaining_events = rows(
+        "SELECT event_key, run_id, event_type FROM recommendation_events ORDER BY event_key"
+    )
+    assert {item["event_key"] for item in remaining_events} == {
+        feedback_event_key,
+        manual_event_key,
+        real_event_key,
+    }
+    assert all(item["run_id"] == shared_run_id for item in remaining_events)
+    remaining_outcomes = rows(
+        "SELECT o.read_id, o.label_kind, e.event_key "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "ORDER BY e.event_key"
+    )
+    assert remaining_outcomes == [
+        {
+            "read_id": None,
+            "label_kind": "explicit_feedback",
+            "event_key": feedback_event_key,
+        },
+        {
+            "read_id": manual_read_id,
+            "label_kind": "rating_positive",
+            "event_key": manual_event_key,
+        },
+        {
+            "read_id": ctx["real_read_id"],
+            "label_kind": "rating_positive",
+            "event_key": real_event_key,
+        },
+    ]
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_outcomes WHERE run_id=?",
+            (shared_run_id,),
+        )
+    } == {feedback_event_key, manual_event_key, real_event_key}
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_events WHERE run_id=?",
+            (shared_run_id,),
+        )
+    } == {feedback_event_key, manual_event_key, real_event_key}
+
+    # 2. Migration 28 on a shared run with demo outcome + real outcome + real feedback.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-28.db"))
+    init_db(seed_demo=True)
+    mctx = _seed_shared_run_with_demo_and_real_data()
+    mrun_id = mctx["shared_run_id"]
+    m_real_event_key = f"read:{mctx['real_read_id']:08d}"
+    m_feedback_event_key = mctx["feedback_event_key"]
+    m_impressions_before = row(
+        "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+        (mrun_id,),
+    )["count"]
+    m_exposures_before = row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+        (mrun_id,),
+    )["count"]
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=28")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE id=?", (mctx["real_read_id"],))["count"] == 1
+    assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (mrun_id,)) == {"ok": 1}
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+            (mrun_id,),
+        )["count"]
+        == m_impressions_before
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+            (mrun_id,),
+        )["count"]
+        == m_exposures_before
+    )
+    assert rows(
+        "SELECT event_key, run_id FROM recommendation_events ORDER BY event_key"
+    ) == [
+        {"event_key": m_feedback_event_key, "run_id": mrun_id},
+        {"event_key": m_real_event_key, "run_id": mrun_id},
+    ]
+    assert rows(
+        "SELECT o.read_id, o.label_kind, e.event_key "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "ORDER BY e.event_key"
+    ) == [
+        {
+            "read_id": None,
+            "label_kind": "explicit_feedback",
+            "event_key": m_feedback_event_key,
+        },
+        {
+            "read_id": mctx["real_read_id"],
+            "label_kind": "rating_positive",
+            "event_key": m_real_event_key,
+        },
+    ]
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_outcomes WHERE run_id=?",
+            (mrun_id,),
+        )
+    } == {m_feedback_event_key, m_real_event_key}
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_events WHERE run_id=?",
+            (mrun_id,),
+        )
+    } == {m_feedback_event_key, m_real_event_key}
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
 
 
 def test_storygraph_csv_imports_completed_books_fractional_ratings_dates_and_isbns(database):

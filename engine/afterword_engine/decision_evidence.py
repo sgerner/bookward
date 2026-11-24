@@ -1198,6 +1198,7 @@ def purge_recommendation_evidence(
     run_ids: Iterable[str] = (),
     clear_scoring_batches: bool = False,
     clear_all_evidence: bool = False,
+    preserve_runs: bool = False,
 ) -> dict[str, int]:
     """Explicitly erase archived and live evidence for selected identities.
 
@@ -1239,10 +1240,15 @@ def purge_recommendation_evidence(
     read_event_keys: list[str] = []
     if reads:
         key_set = {f"read:{read_id:08d}" for read_id in reads}
-        for start in range(0, len(reads), 200):
-            batch = reads[start : start + 200]
-            glob_clauses = " OR ".join("event_key GLOB ?" for _ in batch)
-            patterns = [f"manual-read:[0-9]*:{read_id:08d}" for read_id in batch]
+        for start in range(0, len(reads), 150):
+            batch = reads[start : start + 150]
+            glob_clauses = " OR ".join(
+                "event_key GLOB ? OR event_key GLOB ?" for _ in batch
+            )
+            patterns: list[str] = []
+            for read_id in batch:
+                patterns.append(f"manual-read:[0-9]*:{read_id:08d}")
+                patterns.append(f"attribution:read:{read_id:08d}:*")
             for table in (
                 "recommendation_events",
                 "recommendation_evidence_events",
@@ -1297,15 +1303,17 @@ def purge_recommendation_evidence(
             ).fetchall()
         )
     if reads:
-        read_marks = ",".join("?" for _ in reads)
-        scoring_batch_ids.update(
-            str(row["batch_id"])
-            for row in connection.execute(
-                "SELECT DISTINCT batch_id FROM scoring_batch_reads "
-                f"WHERE read_id IN ({read_marks})",
-                reads,
-            ).fetchall()
-        )
+        for start in range(0, len(reads), 400):
+            batch = reads[start : start + 400]
+            read_marks = ",".join("?" for _ in batch)
+            scoring_batch_ids.update(
+                str(row["batch_id"])
+                for row in connection.execute(
+                    "SELECT DISTINCT batch_id FROM scoring_batch_reads "
+                    f"WHERE read_id IN ({read_marks})",
+                    batch,
+                ).fetchall()
+            )
     if clear_scoring_batches:
         scoring_batch_ids.update(
             str(row["id"])
@@ -1341,29 +1349,53 @@ def purge_recommendation_evidence(
                 batch,
             )
             connection.execute(
+                "DELETE FROM recommendation_run_evidence_scoring_batches "
+                f"WHERE score_batch_id IN ({batch_marks})",
+                batch,
+            )
+            connection.execute(
                 f"DELETE FROM scoring_batches WHERE id IN ({batch_marks})", batch
             )
 
     run_list = sorted(selected_runs)
     removed_runs = 0
     if run_list:
-        run_marks = ",".join("?" for _ in run_list)
-        removed_runs = int(
-            connection.execute(
-                f"SELECT COUNT(*) count FROM recommendation_runs WHERE id IN ({run_marks})",
-                run_list,
-            ).fetchone()["count"]
-        )
-        # Existing run_id links use ON DELETE SET NULL, so remove those mutable
-        # event rows explicitly before deleting the parent run.
-        connection.execute(
-            f"DELETE FROM recommendation_events WHERE run_id IN ({run_marks})",
-            run_list,
-        )
-        connection.execute(
-            f"DELETE FROM recommendation_runs WHERE id IN ({run_marks})",
-            run_list,
-        )
+        for start in range(0, len(run_list), 400):
+            batch = run_list[start : start + 400]
+            run_marks = ",".join("?" for _ in batch)
+            if preserve_runs:
+                removed_runs += int(
+                    connection.execute(
+                        f"SELECT COUNT(*) count FROM recommendation_run_evidence WHERE run_id IN ({run_marks})",
+                        batch,
+                    ).fetchone()["count"]
+                )
+                connection.execute(
+                    "DELETE FROM recommendation_run_evidence_scoring_batches "
+                    f"WHERE run_id IN ({run_marks})",
+                    batch,
+                )
+                connection.execute(
+                    f"DELETE FROM recommendation_run_evidence WHERE run_id IN ({run_marks})",
+                    batch,
+                )
+            else:
+                removed_runs += int(
+                    connection.execute(
+                        f"SELECT COUNT(*) count FROM recommendation_runs WHERE id IN ({run_marks})",
+                        batch,
+                    ).fetchone()["count"]
+                )
+                # Existing run_id links use ON DELETE SET NULL, so remove those mutable
+                # event rows explicitly before deleting the parent run.
+                connection.execute(
+                    f"DELETE FROM recommendation_events WHERE run_id IN ({run_marks})",
+                    batch,
+                )
+                connection.execute(
+                    f"DELETE FROM recommendation_runs WHERE id IN ({run_marks})",
+                    batch,
+                )
     if candidates:
         connection.execute(
             f"DELETE FROM recommendation_events WHERE candidate_id IN ({marks})",

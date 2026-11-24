@@ -1044,6 +1044,7 @@ MIGRATIONS = [
             SELECT 1 FROM temp._m28_demo_reads r
             WHERE e.event_key = printf('read:%08d', r.id)
                OR e.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR e.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR (
             e.event_type = 'read'
@@ -1064,6 +1065,7 @@ MIGRATIONS = [
             SELECT 1 FROM temp._m28_demo_reads r
             WHERE ee.event_key = printf('read:%08d', r.id)
                OR ee.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR ee.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
@@ -1073,6 +1075,7 @@ MIGRATIONS = [
             SELECT 1 FROM temp._m28_demo_reads r
             WHERE eo.event_key = printf('read:%08d', r.id)
                OR eo.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR eo.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
 
@@ -1232,38 +1235,25 @@ MIGRATIONS = [
            OR event_id IN (
                SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
            )
-           OR impression_id IN (
-               SELECT id FROM recommendation_impressions
-               WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
-           )
            OR event_id IN (
                SELECT id FROM recommendation_events
-               WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
+               WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events)
            );
         DELETE FROM recommendation_events
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
-           OR id IN (
+        WHERE id IN (
                SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
            )
            OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
-        DELETE FROM recommendation_impressions
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
+        DELETE FROM recommendation_evidence_outcomes
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+        DELETE FROM recommendation_evidence_events
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         DELETE FROM recommendation_run_evidence_vectors
         WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
         DELETE FROM recommendation_run_evidence_candidates
         WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
-        DELETE FROM recommendation_evidence_exposures
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
-        DELETE FROM recommendation_evidence_outcomes
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
-        DELETE FROM recommendation_evidence_events
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs)
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
         DELETE FROM recommendation_run_evidence
         WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
-        DELETE FROM recommendation_runs
-        WHERE id IN (SELECT run_id FROM temp._m28_demo_runs);
 
         DELETE FROM recommendation_evidence_vectors
         WHERE (
@@ -1708,13 +1698,16 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
         if item.get("candidate_id") is not None
     }
     demo_event_ids = {int(item["id"]) for item in orphan_demo_events}
-    for start in range(0, len(demo_ids), 200):
-        batch = demo_ids[start : start + 200]
-        clauses = " OR ".join("event_key = ? OR event_key GLOB ?" for _ in batch)
+    for start in range(0, len(demo_ids), 150):
+        batch = demo_ids[start : start + 150]
+        clauses = " OR ".join(
+            "event_key = ? OR event_key GLOB ? OR event_key GLOB ?" for _ in batch
+        )
         params: list[str] = []
         for read_id in batch:
             params.append(f"read:{read_id:08d}")
             params.append(f"manual-read:[0-9]*:{read_id:08d}")
+            params.append(f"attribution:read:{read_id:08d}:*")
         for event_row in con.execute(
             f"SELECT id, candidate_id FROM recommendation_events WHERE {clauses}",
             params,
@@ -1768,7 +1761,10 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
     )
     if demo_ids or orphan_run_ids:
         purge_recommendation_evidence(
-            con, read_ids=demo_ids, run_ids=orphan_run_ids
+            con,
+            read_ids=demo_ids,
+            run_ids=orphan_run_ids,
+            preserve_runs=True,
         )
 
     orphan_event_keys = sorted(
