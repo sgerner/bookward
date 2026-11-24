@@ -536,6 +536,63 @@ describe("page actions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("persists the resolved feed URL from preview while keeping the website hostname as default name", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 3,
+            url: "https://feeds.newsletter.example/books.atom",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 12, job_id: 4 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("url", "https://www.newsletter.example");
+    const result = await actions.source!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({
+      message:
+        "Permanent source added; its first scan is queued (3 books detected).",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8000/api/sources/preview",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://www.newsletter.example",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8000/api/sources",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          name: "newsletter.example",
+          url: "https://feeds.newsletter.example/books.atom",
+          lifecycle: "permanent",
+          filters: { include_genres: [], exclude_genres: [] },
+        }),
+      }),
+    );
+  });
+
   it("saves normalized source genre filters", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ saved: true }), {
