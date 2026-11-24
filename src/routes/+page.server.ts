@@ -182,9 +182,10 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   try {
     overview = await overviewRequest;
   } catch (cause) {
-    throw httpError(503, {
-      message: `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    });
+    throw httpError(
+      503,
+      `Bookward's recommendation engine is unavailable. ${message(cause)}`,
+    );
   }
   const [backupStatus, rawCatalogQuality] = await Promise.all([
     backupStatusRequest,

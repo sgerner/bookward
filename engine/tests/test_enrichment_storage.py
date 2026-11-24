@@ -9,6 +9,7 @@ import pytest
 from afterword_engine.config import settings
 from afterword_engine.covers import METADATA_NORMALIZATION_VERSION
 from afterword_engine.database import MIGRATIONS, initialize, row, rows, transaction
+from afterword_engine.identity import read_metadata_identity_hash
 from afterword_engine import ingestion
 from afterword_engine.ingestion import refresh_missing_candidate_metadata
 from afterword_engine import main as engine_main
@@ -219,7 +220,7 @@ def test_known_work_negative_metadata_respects_retry_cooldown(
             (
                 read_id,
                 "",
-                ingestion._read_metadata_identity_hash(read),
+                read_metadata_identity_hash(read),
                 json.dumps(attempt),
                 checked_at,
             ),
@@ -250,7 +251,7 @@ def test_known_work_identity_change_bypasses_negative_retry_cooldown(database):
             (
                 read_id,
                 "",
-                ingestion._read_metadata_identity_hash(read),
+                read_metadata_identity_hash(read),
                 json.dumps({"attempt_status": "no_verified_record", "fetch_trace": []}),
                 datetime.now(timezone.utc).isoformat(),
             ),
