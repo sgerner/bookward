@@ -1,6 +1,7 @@
 const env = process.env;
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
+import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { safeNext } from '#lib/server/safe-next.js';
 
@@ -34,10 +35,7 @@ export const actions: Actions = {
 			if (error instanceof EngineError && error.status === 401) return fail(401, { message: 'Username or password is incorrect.' });
 			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Sign-in is unavailable.' });
 		}
-		cookies.set('bookward_session', result.session_token, {
-			httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/',
-			maxAge: result.max_age
-		});
+		cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 		throw redirect(303, safeNext(form.get('next')));
 	},
 	setup: async ({ request, cookies, url }) => {
@@ -51,10 +49,7 @@ export const actions: Actions = {
 		} catch (error) {
 			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Account setup is unavailable.' });
 		}
-		cookies.set('bookward_session', result.session_token, {
-			httpOnly: true, secure: url.protocol === 'https:', sameSite: 'lax', path: '/',
-			maxAge: result.max_age
-		});
+		cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 		throw redirect(303, '/');
 	}
 };
