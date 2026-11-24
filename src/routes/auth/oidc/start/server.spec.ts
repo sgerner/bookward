@@ -32,6 +32,38 @@ describe('OIDC login start route', () => {
 		}));
 	});
 
+	it('omits Secure on OIDC cookies over plain HTTP and matches delete flags on link intent', async () => {
+		engine.mockResolvedValue({ authorization_url: 'https://auth.example/authorize', csrf: 'csrf-value' });
+		const cookies = { set: vi.fn(), delete: vi.fn() };
+
+		await expect(GET({
+			url: new URL('http://192.168.1.50:3000/auth/oidc/start?intent=login&next=%2F'),
+			cookies,
+		} as never)).rejects.toMatchObject({ status: 302, location: 'https://auth.example/authorize' });
+
+		for (const name of ['oidc_state', 'oidc_intent', 'oidc_next']) {
+			expect(cookies.set).toHaveBeenCalledWith(name, expect.any(String), {
+				httpOnly: true,
+				secure: false,
+				sameSite: 'lax',
+				path: '/auth/oidc',
+				maxAge: 600,
+			});
+		}
+
+		const linkCookies = { set: vi.fn(), delete: vi.fn() };
+		await expect(GET({
+			url: new URL('http://192.168.1.50:3000/auth/oidc/start?intent=link'),
+			cookies: linkCookies,
+		} as never)).rejects.toMatchObject({ status: 302, location: 'https://auth.example/authorize' });
+		expect(linkCookies.delete).toHaveBeenCalledWith('oidc_next', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/auth/oidc',
+		});
+	});
+
 	it('returns to the login form when the provider returns an unsafe URL', async () => {
 		engine.mockResolvedValue({ authorization_url: 'http://auth.example/authorize', csrf: 'csrf-value' });
 
