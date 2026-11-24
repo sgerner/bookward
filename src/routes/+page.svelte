@@ -2828,7 +2828,7 @@
                       {#if data.backupStatus.recovery_hold}
                         <label class="mb-3 flex items-start gap-2 text-xs leading-5 text-surface-800-200">
                           <input class="checkbox mt-0.5 shrink-0" type="checkbox" name="confirmClearHold" value="CONFIRM" required />
-                          <span>Clear the recovery hold and snapshot this current database (older backups may be pruned to {data.backupStatus.retention_count}).</span>
+                          <span>Clear the recovery hold and snapshot this current database (existing snapshots stay intact now; later backups prune to {data.backupStatus.retention_count}).</span>
                         </label>
                       {/if}
                       <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>

@@ -229,7 +229,7 @@ def _set_last_error(message: str) -> None:
         LOGGER.exception("Could not persist backup status")
 
 
-def _recovery_hold_value() -> str | None:
+def _recovery_hold_value() -> str | bool | None:
     path = profile_database_path()
     if not path.is_file():
         return None
@@ -240,8 +240,12 @@ def _recovery_hold_value() -> str | None:
             ).fetchone()
             value = (found["value"] or "").strip() if found else ""
             return value or None
-    except sqlite3.Error:
-        return None
+    except (sqlite3.Error, OSError):
+        LOGGER.warning(
+            "Could not read profile recovery hold status; treating recovery hold as active",
+            exc_info=True,
+        )
+        return True
 
 
 def recovery_hold_active() -> bool:
@@ -259,7 +263,7 @@ def dismiss_recovery_hold(*, confirm: bool = False) -> dict:
     return backup_status()
 
 
-def _auth_recovery_hold_value() -> str | None:
+def _auth_recovery_hold_value() -> str | bool | None:
     from .profiles import auth_path
 
     registry = auth_path()
@@ -275,9 +279,9 @@ def _auth_recovery_hold_value() -> str | None:
         ).fetchone()
         value = (found[0] or "").strip() if found else ""
         return value or None
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         LOGGER.exception("Could not read identity-registry recovery hold status")
-        return None
+        return True
     finally:
         if con is not None:
             con.close()
@@ -295,14 +299,20 @@ def dismiss_auth_recovery_hold(*, confirm: bool = False) -> dict:
     from .profiles import auth_path
 
     path = auth_path()
-    if not path.is_file():
-        raise BackupError("The Bookward identity registry is not available.")
-    con = sqlite3.connect(path, timeout=30)
-    try:
-        con.execute("DELETE FROM auth_meta WHERE key=?", (AUTH_BACKUP_HOLD_KEY,))
-        con.commit()
-    finally:
-        con.close()
+    with database_lock(path):
+        if not path.is_file():
+            raise BackupError("The Bookward identity registry is not available.")
+        con = sqlite3.connect(path, timeout=30)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM auth_meta WHERE key=?", (AUTH_BACKUP_HOLD_KEY,))
+            con.commit()
+        except Exception:
+            if con.in_transaction:
+                con.rollback()
+            raise
+        finally:
+            con.close()
     return identity_backup_status()
 
 
@@ -800,7 +810,8 @@ def create_backup(*, confirm_clear_hold: bool = False) -> dict:
         )
     try:
         with database_lock(profile_database_path()):
-            if recovery_hold_active() and not confirm_clear_hold:
+            hold_was_active = recovery_hold_active()
+            if hold_was_active and not confirm_clear_hold:
                 raise RecoveryHoldError(
                     "Scheduled backups are paused to protect existing snapshots. Restore a backup or confirm keeping the current database first."
                 )
@@ -813,7 +824,8 @@ def create_backup(*, confirm_clear_hold: bool = False) -> dict:
                     "updated_at=CURRENT_TIMESTAMP",
                     (LAST_ERROR_KEY, ""),
                 )
-            _prune_backups()
+            if not hold_was_active:
+                _prune_backups()
         return _backup_record(path)
     except RecoveryHoldError:
         raise
@@ -1139,15 +1151,33 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         from .profiles import profile_ids
         from .tenancy import profile_scope
+
+        interval_enabled = backup_interval_hours() > 0
         try:
-            if auth_backup_is_due():
+            if interval_enabled and auth_recovery_hold_active():
+                LOGGER.warning(
+                    "Scheduled identity-registry backup skipped while recovery hold is active; "
+                    "new account-registry changes are not backed up until a snapshot is restored or the hold is dismissed"
+                )
+            elif auth_backup_is_due():
                 await asyncio.to_thread(create_auth_backup)
         except Exception:
             LOGGER.exception("Scheduled identity-registry backup failed")
-        for profile_id in profile_ids():
+        try:
+            active_profile_ids = profile_ids()
+        except Exception:
+            LOGGER.exception("Could not list profiles for scheduled backups")
+            active_profile_ids = []
+        for profile_id in active_profile_ids:
             try:
                 with profile_scope(profile_id):
-                    if backup_is_due():
+                    if interval_enabled and recovery_hold_active():
+                        LOGGER.warning(
+                            "Scheduled Bookward backup skipped for profile %s while recovery hold is active; "
+                            "new profile data is not backed up until a snapshot is restored or the hold is dismissed",
+                            profile_id,
+                        )
+                    elif backup_is_due():
                         await asyncio.to_thread(create_backup)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)

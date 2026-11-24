@@ -528,7 +528,7 @@ def _wipe_live_data_volume(data_root: Path) -> None:
 
 @pytest.mark.parametrize("retention", [1, 7, 100])
 def test_fresh_volume_boot_with_25h_snapshots_pauses_scheduler_across_retention(
-    tmp_path: Path, monkeypatch, retention: int
+    tmp_path: Path, monkeypatch, caplog, retention: int
 ):
     monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
     monkeypatch.setattr(settings, "backup_dir", "")
@@ -594,17 +594,17 @@ def test_fresh_volume_boot_with_25h_snapshots_pauses_scheduler_across_retention(
         assert backups.backup_status()["next_backup_at"] is None
         assert [item["id"] for item in backups.list_backups()] == [legacy_snap]
 
-    # Run backup_scheduler_loop through a live poll cycle and verify nothing is pruned.
+    # Run backup_scheduler_loop through two poll cycles: verify warnings log each cycle and nothing is pruned.
     real_wait_for = asyncio.wait_for
 
-    async def fast_scheduler_cycle():
+    async def fast_scheduler_cycles():
         stop = asyncio.Event()
         waits = 0
 
         async def quick_wait(coro, timeout):
             nonlocal waits
             waits += 1
-            if waits == 1:
+            if waits in (1, 2):
                 coro.close()
                 raise TimeoutError
             stop.set()
@@ -616,7 +616,30 @@ def test_fresh_volume_boot_with_25h_snapshots_pauses_scheduler_across_retention(
         finally:
             monkeypatch.setattr(asyncio, "wait_for", real_wait_for)
 
-    asyncio.run(fast_scheduler_cycle())
+    with caplog.at_level(logging.WARNING, logger="afterword_engine.backups"):
+        asyncio.run(fast_scheduler_cycles())
+
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert (
+        sum(
+            "Scheduled identity-registry backup skipped while recovery hold is active"
+            in msg
+            for msg in warning_messages
+        )
+        == 2
+    )
+    assert (
+        sum(
+            "Scheduled Bookward backup skipped for profile legacy while recovery hold is active"
+            in msg
+            for msg in warning_messages
+        )
+        == 2
+    )
 
     # Simulate repeated container restarts against the already-initialized /data volume.
     profiles.initialize_auth()
@@ -824,7 +847,13 @@ def test_recovery_hold_api_exposes_safe_metadata_and_requires_confirmation(
         headers=admin_headers,
     )
     assert confirmed_create.status_code == 200
-    assert confirmed_create.json()["status"]["recovery_hold"] is False
+    confirmed_payload = confirmed_create.json()
+    assert confirmed_payload["status"]["recovery_hold"] is False
+    assert [item["id"] for item in confirmed_payload["status"]["backups"]] == [
+        confirmed_payload["backup"]["id"],
+        aged,
+    ]
+    assert (backups.backup_directory() / f"{aged}.secret.key").is_file()
 
     auth_status = client.get("/admin/auth-backups", headers=admin_headers)
     assert auth_status.status_code == 200
@@ -856,3 +885,283 @@ def test_recovery_hold_api_exposes_safe_metadata_and_requires_confirmation(
     )
     assert dismissed_auth.status_code == 200
     assert dismissed_auth.json()["status"]["recovery_hold"] is False
+
+
+def test_confirmed_create_skips_prune_when_clearing_hold_and_prunes_oldest_on_next_backup(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    initialize(seed_demo=False)
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Pre-disaster read", "Author", "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("pre_hold_secret", seal("pre-disaster-key-check")),
+        )
+    pre_disaster = _backdate_profile_snapshot(
+        backups.create_backup()["id"],
+        datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+
+    _wipe_live_data_volume(tmp_path)
+    initialize(seed_demo=False)
+    assert backups.recovery_hold_active() is True
+
+    # Under retention=1, confirming Create backup now must NOT delete pre_disaster.
+    clearing = backups.create_backup(confirm_clear_hold=True)
+    assert backups.recovery_hold_active() is False
+    assert [item["id"] for item in backups.list_backups()] == [
+        clearing["id"],
+        pre_disaster,
+    ]
+    assert (backups.backup_directory() / f"{pre_disaster}.secret.key").is_file()
+    assert (backups.backup_directory() / f"{clearing['id']}.secret.key").is_file()
+
+    # Under retention=2, a subsequent normal backup evicts only the oldest snapshot (pre_disaster).
+    clearing_aged = _backdate_profile_snapshot(
+        clearing["id"],
+        datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    monkeypatch.setattr(settings, "backup_retention_count", 2)
+    subsequent = backups.create_backup()
+    assert [item["id"] for item in backups.list_backups()] == [
+        subsequent["id"],
+        clearing_aged,
+    ]
+    assert not (backups.backup_directory() / f"{pre_disaster}.sqlite3").exists()
+    assert not (backups.backup_directory() / f"{pre_disaster}.secret.key").exists()
+    assert (backups.backup_directory() / f"{clearing_aged}.secret.key").is_file()
+    assert (backups.backup_directory() / f"{subsequent['id']}.secret.key").is_file()
+
+
+def test_recovery_hold_checks_fail_closed_on_sqlite_errors(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        legacy_snap = _backdate_profile_snapshot(
+            backups.create_backup()["id"],
+            datetime.now(timezone.utc) - timedelta(hours=25),
+        )
+    auth_snap = _backdate_auth_snapshot(
+        backups.create_auth_backup()["id"],
+        datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+
+    assert backups.backup_is_due() is True
+    assert backups.auth_backup_is_due() is True
+
+    real_profile_connect = backups.connect
+    real_sqlite_connect = sqlite3.connect
+
+    def locked_profile_connect(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    auth_file_resolved = str(profiles.auth_path().resolve())
+
+    def locked_auth_sqlite_connect(target, *args, **kwargs):
+        if auth_file_resolved in str(target):
+            raise sqlite3.OperationalError("database is locked")
+        return real_sqlite_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(backups, "connect", locked_profile_connect)
+    monkeypatch.setattr(sqlite3, "connect", locked_auth_sqlite_connect)
+
+    assert backups._recovery_hold_value() is True
+    assert backups.recovery_hold_active() is True
+    assert backups.backup_is_due() is False
+    assert backups._auth_recovery_hold_value() is True
+    assert backups.auth_recovery_hold_active() is True
+    assert backups.auth_backup_is_due() is False
+
+    real_wait_for = asyncio.wait_for
+
+    async def locked_scheduler_cycle():
+        stop = asyncio.Event()
+        waits = 0
+
+        async def quick_wait(coro, timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                coro.close()
+                raise TimeoutError
+            stop.set()
+            return await real_wait_for(coro, timeout=1)
+
+        monkeypatch.setattr(asyncio, "wait_for", quick_wait)
+        try:
+            await backups.backup_scheduler_loop(stop)
+        finally:
+            monkeypatch.setattr(asyncio, "wait_for", real_wait_for)
+
+    asyncio.run(locked_scheduler_cycle())
+
+    monkeypatch.setattr(backups, "connect", real_profile_connect)
+    monkeypatch.setattr(sqlite3, "connect", real_sqlite_connect)
+    assert [item["id"] for item in backups.list_backups()] == [legacy_snap]
+    assert [
+        item["id"] for item in backups.identity_backup_status()["backups"]
+    ] == [auth_snap]
+
+    # Also verify real on-disk SQLite corruption fails closed without mocking connect.
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{settings.db}{suffix}").unlink(missing_ok=True)
+        Path(f"{profiles.auth_path()}{suffix}").unlink(missing_ok=True)
+    Path(settings.db).write_bytes(b"not a valid sqlite file")
+    profiles.auth_path().write_bytes(b"not a valid sqlite file")
+
+    assert backups._recovery_hold_value() is True
+    assert backups._auth_recovery_hold_value() is True
+    assert backups.backup_is_due() is False
+    assert backups.auth_backup_is_due() is False
+
+
+def test_populated_databases_without_meta_tables_do_not_trip_recovery_hold(
+    tmp_path: Path, monkeypatch
+):
+    from afterword_engine.database import SCHEMA
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    initialize(seed_demo=False)
+    backups.create_backup()
+    backups.create_auth_backup()
+
+    # Replace live profile DB with a populated v1 database that predates schema_migrations.
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{settings.db}{suffix}").unlink(missing_ok=True)
+    with sqlite3.connect(settings.db) as con:
+        con.executescript(SCHEMA)
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES(?,?,?)",
+            ("Existing book", "Author", "test"),
+        )
+        con.commit()
+    with sqlite3.connect(profiles.auth_path()) as con:
+        con.execute("DROP TABLE auth_meta")
+        con.commit()
+
+    profiles.initialize_auth()
+    initialize(seed_demo=False)
+
+    assert backups.auth_recovery_hold_active() is False
+    assert backups.recovery_hold_active() is False
+    assert row("SELECT 1 FROM reads WHERE title='Existing book'") is not None
+
+
+def test_dismiss_auth_hold_uses_database_lock_and_lifespan_recovers_before_auth_init(
+    tmp_path: Path, monkeypatch
+):
+    import afterword_engine.main as main_mod
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "afterword.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    auth_snap = backups.create_auth_backup()["id"]
+    _wipe_live_data_volume(tmp_path)
+
+    # If an interrupted legacy restore fails during lifespan startup, initialize_auth()
+    # must not run first and set an auth recovery hold on a freshly created registry.
+    def fail_interrupted_restore():
+        raise backups.BackupError("simulated interrupted restore failure")
+
+    monkeypatch.setattr(
+        main_mod, "recover_interrupted_restore", fail_interrupted_restore
+    )
+
+    async def run_failing_lifespan():
+        async with lifespan(app):
+            pass
+
+    with pytest.raises(backups.BackupError, match="simulated interrupted restore"):
+        asyncio.run(run_failing_lifespan())
+    assert not profiles.auth_path().exists()
+
+    # Verify ordering on normal startup: recover_interrupted_restore("legacy") runs before initialize_auth().
+    events: list[tuple[str, str | None]] = []
+    real_init_auth = profiles.initialize_auth
+
+    def record_recover():
+        from afterword_engine.tenancy import current_profile_id
+
+        events.append(("recover", current_profile_id()))
+        return False
+
+    def record_init_auth():
+        events.append(("initialize_auth", None))
+        return real_init_auth()
+
+    async def noop_worker(_handler, stop):
+        await stop.wait()
+
+    async def noop_loop(stop):
+        await stop.wait()
+
+    monkeypatch.setattr(main_mod, "recover_interrupted_restore", record_recover)
+    monkeypatch.setattr(profiles, "initialize_auth", record_init_auth)
+    monkeypatch.setattr(main_mod, "worker_loop", noop_worker)
+    monkeypatch.setattr(main_mod, "source_scheduler_loop", noop_loop)
+    monkeypatch.setattr(main_mod, "digest_scheduler_loop", noop_loop)
+    monkeypatch.setattr(main_mod, "goodreads_rss_scheduler_loop", noop_loop)
+    monkeypatch.setattr(main_mod, "backup_scheduler_loop", noop_loop)
+
+    async def run_healthy_lifespan():
+        async with lifespan(app):
+            pass
+
+    asyncio.run(run_healthy_lifespan())
+    assert events[:2] == [("recover", "legacy"), ("initialize_auth", None)]
+    assert backups.auth_recovery_hold_active() is True
+    assert [
+        item["id"] for item in backups.identity_backup_status()["backups"]
+    ] == [auth_snap]
+
+    # Verify dismiss_auth_recovery_hold acquires database_lock(auth_path()).
+    locked_paths: list[Path] = []
+    real_database_lock = backups.database_lock
+
+    class TrackingLockWrapper:
+        def __init__(self, path):
+            self._path = Path(path)
+            self._lock = real_database_lock(path)
+
+        def __enter__(self):
+            self._lock.__enter__()
+            locked_paths.append(self._path)
+            return self._lock
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._lock.__exit__(exc_type, exc_val, exc_tb)
+
+    monkeypatch.setattr(backups, "database_lock", TrackingLockWrapper)
+    dismissed = backups.dismiss_auth_recovery_hold(confirm=True)
+    assert dismissed["recovery_hold"] is False
+    assert locked_paths == [profiles.auth_path()]

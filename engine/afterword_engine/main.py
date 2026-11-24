@@ -644,9 +644,10 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
-    identity_store.initialize_auth()
     with profile_scope("legacy"):
         recover_interrupted_restore()
+    identity_store.initialize_auth()
+    with profile_scope("legacy"):
         initialize()
         legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
     identity_store.migrate_legacy_api_tokens(legacy_tokens)
