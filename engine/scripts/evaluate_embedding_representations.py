@@ -34,7 +34,8 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path[:0] = [str(SCRIPTS), str(ENGINE)]
 
 from afterword_engine.embeddings import content_hash
-from afterword_engine.ingestion import _clean_text, _read_metadata_identity_hash
+from afterword_engine.identity import read_metadata_identity_hash
+from afterword_engine.ingestion import _clean_text
 from afterword_engine.ranking import (
     _KERNEL_ESS_PRIOR,
     _KERNEL_FULL_HISTORY,
@@ -135,7 +136,7 @@ def build_text_views(
         if item is None or not row.get("verified_work_id"):
             invalid_metadata += 1
             continue
-        if row.get("identity_hash") != _read_metadata_identity_hash(item):
+        if row.get("identity_hash") != read_metadata_identity_hash(item):
             invalid_metadata += 1
             continue
         if read_id in metadata_rows:
