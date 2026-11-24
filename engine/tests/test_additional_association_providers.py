@@ -9,17 +9,27 @@ from fastapi.testclient import TestClient
 
 from auth_helpers import authenticated_headers
 
+from afterword_engine.association_sources.common import (
+    DEFAULT_USER_AGENT,
+    fetch_pinned_association_json,
+)
 from afterword_engine.association_sources.google_books import (
+    GOOGLE_BOOKS_PROVIDER,
+    GOOGLE_BOOKS_USER_AGENT,
     GoogleBooksAssociatedProvider,
     GoogleBooksClient,
 )
 from afterword_engine.association_sources.librarything import (
     LIBRARYTHING_PROVIDER,
+    LIBRARYTHING_USER_AGENT,
     LibraryThingClient,
     LibraryThingProvider,
     librarything_requests_today,
 )
-from afterword_engine.association_sources.openlibrary import OpenLibraryClient
+from afterword_engine.association_sources.openlibrary import (
+    OPEN_LIBRARY_USER_AGENT,
+    OpenLibraryClient,
+)
 from afterword_engine.associations import RateLimiter, run_association_provider
 from afterword_engine.config import settings
 from afterword_engine.database import initialize, row, rows, transaction
@@ -403,3 +413,227 @@ def test_association_settings_and_run_api_are_shadow_only(database):
         assert queued.status_code == 200 and queued.json()["job_id"]
         preview = client.get("/api/associations/settings")
         assert preview.json()["librarything_api_key_set"] is False
+
+
+def test_association_user_agents_alias_default_user_agent():
+    assert DEFAULT_USER_AGENT == "Bookward/0.1 (+self-hosted book recommender)"
+    assert GOOGLE_BOOKS_USER_AGENT == DEFAULT_USER_AGENT
+    assert OPEN_LIBRARY_USER_AGENT == DEFAULT_USER_AGENT
+    assert LIBRARYTHING_USER_AGENT == DEFAULT_USER_AGENT
+
+
+@respx.mock
+def test_fetch_pinned_association_json_pins_ip_sets_sni_and_records_ok(database, monkeypatch):
+    public_dns(monkeypatch)
+    route = respx.get("https://93.184.216.34:8443/v1/items").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"Cache-Control": "public, max-age=60"},
+            json={"items": [1, 2]},
+        )
+    )
+
+    payload, headers = asyncio.run(
+        fetch_pinned_association_json(
+            "https://api.example.test:8443/v1/items",
+            provider="example_provider",
+            request_key="items?q=book",
+            source_label="Example",
+            params={"q": "book"},
+            timeout_seconds=5.0,
+            max_bytes=1024,
+        )
+    )
+
+    assert payload == {"items": [1, 2]}
+    assert headers["cache-control"] == "public, max-age=60"
+    assert route.call_count == 1
+    request = route.calls[0].request
+    assert request.headers["host"] == "api.example.test:8443"
+    assert request.headers["user-agent"] == DEFAULT_USER_AGENT
+    assert request.extensions["sni_hostname"] == "api.example.test"
+    assert dict(request.url.params) == {"q": "book"}
+    assert rows(
+        "SELECT provider, request_key, status FROM association_requests"
+    ) == [
+        {
+            "provider": "example_provider",
+            "request_key": "items?q=book",
+            "status": "ok",
+        }
+    ]
+
+
+@respx.mock
+def test_fetch_pinned_association_json_dns_failure_skips_error_telemetry(database, monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+        ],
+    )
+    route = respx.get("https://127.0.0.1/v1/items").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    with pytest.raises(ValueError, match="Private, loopback, and link-local"):
+        asyncio.run(
+            fetch_pinned_association_json(
+                "https://api.example.test/v1/items",
+                provider="example_provider",
+                request_key="items",
+                source_label="Example",
+                timeout_seconds=5.0,
+                max_bytes=1024,
+            )
+        )
+
+    assert route.call_count == 0
+    assert rows("SELECT * FROM association_requests") == []
+
+
+@respx.mock
+def test_fetch_pinned_association_json_enforces_guards_and_on_response_boundary(
+    database, monkeypatch
+):
+    public_dns(monkeypatch)
+    route = respx.get("https://93.184.216.34/v1/items")
+
+    route.mock(return_value=httpx.Response(503, json={"error": "unavailable"}))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(
+            fetch_pinned_association_json(
+                "https://api.example.test/v1/items",
+                provider="example_provider",
+                request_key="status-error",
+                source_label="Example",
+                timeout_seconds=5.0,
+                max_bytes=1024,
+            )
+        )
+
+    route.mock(return_value=httpx.Response(200, content=b'{"oversized": true}'))
+    with pytest.raises(ValueError, match="Example response is too large"):
+        asyncio.run(
+            fetch_pinned_association_json(
+                "https://api.example.test/v1/items",
+                provider="example_provider",
+                request_key="too-large",
+                source_label="Example",
+                timeout_seconds=5.0,
+                max_bytes=5,
+            )
+        )
+
+    route.mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+    with pytest.raises(ValueError, match="Example response must be an object"):
+        asyncio.run(
+            fetch_pinned_association_json(
+                "https://api.example.test/v1/items",
+                provider="example_provider",
+                request_key="mapping-required",
+                source_label="Example",
+                timeout_seconds=5.0,
+                max_bytes=1024,
+                require_mapping=True,
+            )
+        )
+
+    raw_payload, _ = asyncio.run(
+        fetch_pinned_association_json(
+            "https://api.example.test/v1/items",
+            provider="example_provider",
+            request_key="mapping-optional",
+            source_label="Example",
+            timeout_seconds=5.0,
+            max_bytes=1024,
+            require_mapping=False,
+        )
+    )
+    assert raw_payload == ["not", "an", "object"]
+
+    route.mock(return_value=httpx.Response(200, json={"ok": True}))
+
+    def fail_on_response(_response: httpx.Response) -> None:
+        raise RuntimeError("response callback failure")
+
+    with pytest.raises(RuntimeError, match="response callback failure"):
+        asyncio.run(
+            fetch_pinned_association_json(
+                "https://api.example.test/v1/items",
+                provider="example_provider",
+                request_key="callback-error",
+                source_label="Example",
+                timeout_seconds=5.0,
+                max_bytes=1024,
+                on_response=fail_on_response,
+            )
+        )
+
+    recorded = {
+        (item["request_key"], item["status"])
+        for item in rows("SELECT request_key, status FROM association_requests")
+    }
+    assert recorded == {
+        ("status-error", "error"),
+        ("too-large", "error"),
+        ("mapping-required", "error"),
+        ("mapping-optional", "ok"),
+        ("callback-error", "error"),
+    }
+
+
+@respx.mock
+def test_clients_preserve_byte_caps_mapping_guards_and_google_ttl_boundary(
+    database, monkeypatch
+):
+    import afterword_engine.association_sources.google_books as google_books_module
+
+    public_dns(monkeypatch)
+    monkeypatch.setattr(settings, "source_max_bytes", 24)
+
+    respx.get("https://93.184.216.34/books/v1/volumes").mock(
+        return_value=httpx.Response(200, json={"items": ["exceeds-twenty-four-bytes"]})
+    )
+    respx.get("https://93.184.216.34/search.json").mock(
+        return_value=httpx.Response(200, json=["raw-list"])
+    )
+    respx.get("https://93.184.216.34/api/multirecommendations.php").mock(
+        return_value=httpx.Response(
+            200,
+            json={"request": [], "recommendations": ["exceeds-twenty-four-bytes"]},
+        )
+    )
+
+    google_client = GoogleBooksClient(rate_limiter=RateLimiter(0))
+    with pytest.raises(ValueError, match="Google Books response is too large"):
+        asyncio.run(google_client.get_json("/books/v1/volumes", {"q": "test"}))
+
+    openlibrary_client = OpenLibraryClient(rate_limiter=RateLimiter(0))
+    assert asyncio.run(openlibrary_client.get_json("/search.json")) == ["raw-list"]
+
+    librarything_client = LibraryThingClient("lt-secret", rate_limiter=RateLimiter(0))
+    lt_payload = asyncio.run(librarything_client.recommendations(["9781111111111"]))
+    assert lt_payload["recommendations"] == ["exceeds-twenty-four-bytes"]
+
+    monkeypatch.setattr(settings, "source_max_bytes", 2_000_000)
+    respx.get("https://93.184.216.34/books/v1/volumes").mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    def broken_ttl(_headers):
+        raise ValueError("invalid cache header")
+
+    monkeypatch.setattr(google_books_module, "_cache_ttl", broken_ttl)
+    with pytest.raises(ValueError, match="invalid cache header"):
+        asyncio.run(google_client.get_json("/books/v1/volumes", {"q": "ttl-check"}))
+
+    google_statuses = [
+        item["status"]
+        for item in rows(
+            "SELECT status FROM association_requests WHERE provider=? ORDER BY id",
+            (GOOGLE_BOOKS_PROVIDER,),
+        )
+    ]
+    assert google_statuses == ["error", "error"]
