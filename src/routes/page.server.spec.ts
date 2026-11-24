@@ -393,7 +393,11 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
 
-    expect(result).toEqual({ message: "Decision undone." });
+    expect(result).toEqual({
+      message: "Decision undone.",
+      id: 9,
+      status: "recommended",
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/api/recommendations/9/undo",
       expect.objectContaining({
@@ -401,6 +405,53 @@ describe("page actions", () => {
         body: JSON.stringify({ decision_id: 55 }),
       }),
     );
+  });
+
+  it("returns the server-restored status from undoDecision and importLibrar without guessing", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 9, status: "imported" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 12, status: "imported" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const undoBody = new FormData();
+    undoBody.set("id", "9");
+    undoBody.set("decision_id", "77");
+    const undoResult = await actions.undoDecision!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: undoBody,
+      }),
+    } as never);
+    expect(undoResult).toEqual({
+      message: "Decision undone.",
+      id: 9,
+      status: "imported",
+    });
+
+    const importBody = new FormData();
+    importBody.set("id", "12");
+    const importResult = await actions.importLibrar!({
+      request: new Request("http://afterword.test/?view=saved", {
+        method: "POST",
+        body: importBody,
+      }),
+    } as never);
+    expect(importResult).toEqual({
+      message: "Book added to the Librarr wishlist.",
+      id: 12,
+      status: "imported",
+    });
   });
 
   it("rejects an invalid URL when adding a custom source without contacting the engine", async () => {

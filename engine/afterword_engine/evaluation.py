@@ -301,6 +301,10 @@ def ips_ndcg_at_k(
                 all_gains.append(label * weight)
         all_gains.sort(reverse=True)
         idcg = sum(gain / math.log2(position + 2) for position, gain in enumerate(all_gains[:k]))
+        # Discovery runs with observed top-K outcomes but zero ideal gain
+        # (e.g. an all-pass triage session) intentionally score 0.0 to match
+        # ips_precision_at_k; completely censored runs exited above, and
+        # non-discovery runs are excluded by load_rows.
         per_run.append(dcg / idcg if idcg > 0 else 0.0)
     return sum(per_run) / len(per_run) if per_run else None
 
@@ -502,18 +506,54 @@ def _read_json_or_sqlite(path: Path) -> dict[str, Any]:
         )}
 
 
+_DISCOVERY_RUN_STATUSES = frozenset({"", "recommended", "all"})
+
+
+def _is_discovery_run(run: Mapping[str, Any]) -> bool:
+    direct_status = run.get("status")
+    if direct_status is not None and (
+        not isinstance(direct_status, str)
+        or direct_status.strip().lower() not in _DISCOVERY_RUN_STATUSES
+    ):
+        return False
+    raw_metadata = run.get("metadata")
+    if raw_metadata is None or raw_metadata == "":
+        return True
+    if isinstance(raw_metadata, str):
+        try:
+            metadata = json.loads(raw_metadata)
+        except (TypeError, ValueError):
+            return False
+    elif isinstance(raw_metadata, Mapping):
+        metadata = raw_metadata
+    else:
+        return False
+    if not isinstance(metadata, Mapping):
+        return False
+    status = metadata.get("status")
+    if status is None:
+        return True
+    return isinstance(status, str) and status.strip().lower() in _DISCOVERY_RUN_STATUSES
+
+
 def load_rows(source: str | Path | Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Load joined recommendation impressions and observed outcomes."""
+    """Load joined discovery recommendation impressions and observed outcomes."""
 
     data = dict(source) if isinstance(source, Mapping) else _read_json_or_sqlite(Path(source))
     runs = {str(row["id"]): row for row in data.get("recommendation_runs", [])}
+    excluded_run_ids = {
+        run_id for run_id, row in runs.items() if not _is_discovery_run(row)
+    }
     impressions = data.get("recommendation_impressions", [])
     outcomes_by_impression: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
     for outcome in data.get("recommendation_outcomes", []):
         outcomes_by_impression[outcome.get("impression_id")].append(outcome)
     values: list[dict[str, Any]] = []
     for impression in impressions:
-        run = runs.get(str(impression.get("run_id")), {})
+        run_key = str(impression.get("run_id"))
+        if run_key in excluded_run_ids:
+            continue
+        run = runs.get(run_key, {})
         candidates = outcomes_by_impression.get(impression.get("id"), [])
         outcome = None
         if candidates:

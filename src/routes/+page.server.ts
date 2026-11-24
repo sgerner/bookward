@@ -386,11 +386,18 @@ export const actions: Actions = {
     if (!id.success || !decisionId.success)
       return fail(400, { message: "This decision can no longer be undone." });
     try {
-      await engine(`/api/recommendations/${id.data}/undo`, {
-        method: "POST",
-        body: JSON.stringify({ decision_id: decisionId.data }),
-      });
-      return { message: "Decision undone." };
+      const result = await engine<{ id?: number; status?: string }>(
+        `/api/recommendations/${id.data}/undo`,
+        {
+          method: "POST",
+          body: JSON.stringify({ decision_id: decisionId.data }),
+        },
+      );
+      return {
+        message: "Decision undone.",
+        id: typeof result.id === "number" ? result.id : id.data,
+        ...(typeof result.status === "string" ? { status: result.status } : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -671,11 +678,19 @@ export const actions: Actions = {
     const id = idSchema.safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid book." });
     try {
-      await engine(`/api/recommendations/${id.data}/import`, {
-        method: "POST",
-        body: "{}",
-      });
-      return { message: "Book added to the Librarr wishlist." };
+      const result = await engine<{ id?: number; status?: string }>(
+        `/api/recommendations/${id.data}/import`,
+        {
+          method: "POST",
+          body: "{}",
+        },
+      );
+      return {
+        message: "Book added to the Librarr wishlist.",
+        ...(typeof result.status === "string"
+          ? { id: typeof result.id === "number" ? result.id : id.data, status: result.status }
+          : {}),
+      };
     } catch (error) {
       return fail(502, { message: message(error) });
     }

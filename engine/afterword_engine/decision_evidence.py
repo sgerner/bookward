@@ -663,17 +663,21 @@ def archive_served_exposures(
     run_id: str,
     recommendations: Iterable[Mapping[str, Any]],
     presented_at: str,
+    offset: int = 0,
     ranks: Sequence[int] | None = None,
 ) -> int:
     """Copy actual returned slots into the cleanup-independent evidence tables."""
 
+    if isinstance(offset, bool) or int(offset) < 0:
+        raise ValueError("Exposure offset must be a non-negative integer")
     items = list(recommendations)
     if not items:
         return 0
+    start_rank = int(offset) + 1
     resolved_ranks = (
         [int(rank) for rank in ranks]
         if ranks is not None
-        else list(range(1, len(items) + 1))
+        else list(range(start_rank, start_rank + len(items)))
     )
     if len(resolved_ranks) != len(items):
         LOGGER.warning("Recommendation exposure ranks did not match recommendation count")

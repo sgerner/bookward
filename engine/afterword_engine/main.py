@@ -75,11 +75,16 @@ from .digest import (
     validate_digest_config,
 )
 from .learning import (
+    DISCOVERY_RUN_STATUSES,
     EVENT_TYPES,
+    NON_DISCOVERY_ITEM_STATUSES,
     RUN_ID_RE,
+    active_profile_key,
     append_recommendation_run_impressions,
     create_recommendation_run,
     build_decision_evidence,
+    is_discovery_run_metadata,
+    is_matching_run_profile,
     record_event_in_connection,
     record_events,
     _impression_precedes,
@@ -1403,6 +1408,7 @@ def tracked_recommendations(
         "max_score_adjustment": 0.0,
     }
     can_personalize = status in (None, "", "all", "recommended")
+    should_track = bool(track_run and can_personalize)
     ensure_set = {int(cid) for cid in ensure_candidate_ids if int(cid) > 0}
     logged_items: list[dict[str, Any]] | None = None
     logged_ranks: list[int] | None = None
@@ -1514,7 +1520,7 @@ def tracked_recommendations(
                             served_recommended.append(item)
                             served_ranks.append(full_rank)
                             served_ids.add(int(item["id"]))
-                if settings.exploration_enabled and served_recommended:
+                if should_track and settings.exploration_enabled and served_recommended:
                     rank_by_id = {
                         int(item["id"]): rank
                         for rank, item in zip(served_ranks, served_recommended)
@@ -1536,7 +1542,7 @@ def tracked_recommendations(
                 start = max(0, int(offset))
                 end = None if limit is None else start + max(0, int(limit))
                 recommendations = ranked[start:end]
-                if settings.exploration_enabled:
+                if should_track and settings.exploration_enabled:
                     recommendations = epsilon_tail_explore(
                         recommendations,
                         epsilon=settings.exploration_epsilon,
@@ -1547,8 +1553,14 @@ def tracked_recommendations(
                     if impression_limit is None
                     else recommendations[:max(0, int(impression_limit))]
                 )
-                logged_items = imp_slice
-                logged_ranks = list(range(start + 1, start + len(imp_slice) + 1))
+                logged_pairs = [
+                    (rank, item)
+                    for rank, item in enumerate(imp_slice, start + 1)
+                    if str(item.get("status") or "").strip().lower()
+                    not in NON_DISCOVERY_ITEM_STATUSES
+                ]
+                logged_items = [item for _, item in logged_pairs]
+                logged_ranks = [rank for rank, _ in logged_pairs]
             _format_recommendation_urls(recommendations)
         except Exception:
             # Personalization must never take the recommendation service down.
@@ -1565,7 +1577,7 @@ def tracked_recommendations(
                 identity_context=identity_context,
                 include_imported=include_imported,
             )
-            if settings.exploration_enabled:
+            if should_track and settings.exploration_enabled:
                 recommendations = epsilon_tail_explore(
                     recommendations,
                     epsilon=settings.exploration_epsilon,
@@ -1578,12 +1590,19 @@ def tracked_recommendations(
                 logged_ranks = list(range(1, len(logged_items) + 1))
             else:
                 start = max(0, int(offset))
-                logged_items = (
+                imp_slice = (
                     recommendations
                     if impression_limit is None
                     else recommendations[:max(0, int(impression_limit))]
                 )
-                logged_ranks = list(range(start + 1, start + len(logged_items) + 1))
+                logged_pairs = [
+                    (rank, item)
+                    for rank, item in enumerate(imp_slice, start + 1)
+                    if str(item.get("status") or "").strip().lower()
+                    not in NON_DISCOVERY_ITEM_STATUSES
+                ]
+                logged_items = [item for _, item in logged_pairs]
+                logged_ranks = [rank for rank, _ in logged_pairs]
             learning_metadata = {
                 "mode": "base_ranker_fallback",
                 "scope": "installation",
@@ -1608,8 +1627,16 @@ def tracked_recommendations(
             identity_context=identity_context,
             include_imported=include_imported,
         )
-    should_track = bool(track_run and can_personalize)
     if not should_track:
+        for item in recommendations:
+            item["recommendation_run_id"] = ""
+        return recommendations, ""
+    items_to_log = [
+        item
+        for item in (logged_items if logged_items is not None else recommendations)
+        if str(item.get("status") or "").strip().lower() not in NON_DISCOVERY_ITEM_STATUSES
+    ]
+    if not items_to_log:
         for item in recommendations:
             item["recommendation_run_id"] = ""
         return recommendations, ""
@@ -1641,15 +1668,20 @@ def tracked_recommendations(
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
         }
-    items_to_log = logged_items if logged_items is not None else recommendations
+    resolved_logged_ranks = (
+        logged_ranks
+        if logged_ranks is not None and len(logged_ranks) == len(items_to_log)
+        else list(range(max(0, int(offset)) + 1, max(0, int(offset)) + len(items_to_log) + 1))
+    )
     run_id = create_recommendation_run(
         items_to_log,
         decision_evidence=decision_evidence,
         status=status,
         limit=impression_limit if impression_limit is not None else limit,
+        offset=max(0, int(offset)),
         ranking_metadata=learning_metadata,
         discovery_slate_metadata=discovery_metadata,
-        ranks=logged_ranks,
+        ranks=resolved_logged_ranks,
     )
     logged_ids = {int(item["id"]) for item in items_to_log}
     for item in recommendations:
@@ -1698,24 +1730,22 @@ def paginated_run_recommendations(
 ):
     if not RUN_ID_RE.fullmatch(run_id):
         raise HTTPException(400, "Invalid recommendation run")
-    run_exists = (
-        connection.execute(
-            "SELECT 1 FROM recommendation_runs WHERE id=?",
-            (run_id,),
-        ).fetchone()
-        is not None
-    )
-    if not run_exists or status not in (None, "", "all", "recommended"):
-        return tracked_recommendations(
-            connection=connection,
-            status=status,
-            limit=limit,
-            offset=offset,
-            track_run=track_run,
-            impression_limit=impression_limit,
-        )
+    normalized_status = (status or "").strip().lower()
+    if normalized_status not in DISCOVERY_RUN_STATUSES:
+        raise HTTPException(400, "Invalid recommendation run")
+    current_profile = active_profile_key()
+    run_row = connection.execute(
+        "SELECT id, metadata FROM recommendation_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    if (
+        run_row is None
+        or not is_discovery_run_metadata(run_row["metadata"])
+        or not is_matching_run_profile(run_row["metadata"], current_profile)
+    ):
+        raise HTTPException(400, "Invalid recommendation run")
 
-    target_status = "recommended" if status in (None, "", "recommended") else status
+    target_status = "recommended"
     current_pool = recommendation_list(
         connection,
         status=target_status,
@@ -1773,11 +1803,17 @@ def paginated_run_recommendations(
         else min(len(page_items), max(0, int(impression_limit)))
     )
     if track_run and imp_count > 0:
-        append_recommendation_run_impressions(
-            run_id,
-            page_items[:imp_count],
-            ranks=page_ranks[:imp_count],
-        )
+        try:
+            appended = append_recommendation_run_impressions(
+                run_id,
+                page_items[:imp_count],
+                ranks=page_ranks[:imp_count],
+                expected_profile_id=current_profile,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+        if not appended:
+            raise HTTPException(400, "Invalid recommendation run")
     for idx, item in enumerate(page_items):
         item["recommendation_run_id"] = run_id if (track_run and idx < imp_count) else ""
     return page_items, (run_id if track_run else "")
@@ -2286,15 +2322,20 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     impression = None
     if read_time is not None:
         prior_impressions = con.execute(
-            "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-            "FROM recommendation_impressions WHERE candidate_id=? "
-            "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+            "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+            "r.metadata AS run_metadata "
+            "FROM recommendation_impressions i "
+            "JOIN recommendation_runs r ON r.id=i.run_id "
+            "WHERE i.candidate_id=? "
+            "ORDER BY COALESCE(i.visible_at,i.presented_at) DESC,i.id DESC",
             (candidate["id"],),
         ).fetchall()
         impression = next(
             (
-                item for item in prior_impressions
-                if _impression_precedes(item, read_time, day_precision)
+                item
+                for item in prior_impressions
+                if is_discovery_run_metadata(item["run_metadata"])
+                and _impression_precedes(item, read_time, day_precision)
             ),
             None,
         )

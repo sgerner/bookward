@@ -470,3 +470,157 @@ def test_public_v1_endpoints_keep_backward_compatible_contract(seeded_db):
     recs = v1_recs.json()
     assert len(recs) == 5
     assert "x-bookward-recommendation-run" in v1_recs.headers
+
+
+def test_paginated_run_recommendations_rejects_non_discovery_or_cross_profile_run_id(
+    seeded_db,
+):
+    from afterword_engine import profiles
+
+    client = TestClient(app, headers=authenticated_headers())
+    overview = client.get(
+        "/api/overview?recommendation_limit=24&decision_limit=24"
+    ).json()
+    valid_run_id = overview["recommendation_run_id"]
+    assert valid_run_id
+
+    # Unknown run_id is rejected without minting a new run or appending impressions.
+    unknown = client.get(
+        "/api/recommendations?status=recommended&limit=8&offset=24&run_id=missing-run-1234"
+    )
+    assert unknown.status_code == 400
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 1
+
+    # Passing a valid discovery run_id to a non-discovery status query is rejected.
+    wrong_query_status = client.get(
+        f"/api/recommendations?status=saved&limit=8&offset=0&run_id={valid_run_id}"
+    )
+    assert wrong_query_status.status_code == 400
+
+    # Historical/legacy non-discovery runs in recommendation_runs cannot receive impressions.
+    with transaction() as con:
+        for bad_run_id, bad_meta in (
+            ("legacy-saved-run-01", json.dumps({"status": "saved"})),
+            ("legacy-decisions-01", json.dumps({"status": "decisions"})),
+            ("other-profile-meta", json.dumps({"status": "recommended", "profile_id": "deadbeef" * 4})),
+            ("malformed-meta-run", "{not-json"),
+        ):
+            con.execute(
+                "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count,metadata) "
+                "VALUES(?,?,?,?,?)",
+                (bad_run_id, "rating-neighborhood", "v1", 0, bad_meta),
+            )
+
+    for bad_run_id in (
+        "legacy-saved-run-01",
+        "legacy-decisions-01",
+        "other-profile-meta",
+        "malformed-meta-run",
+    ):
+        resp = client.get(
+            f"/api/recommendations?status=recommended&limit=8&offset=24&run_id={bad_run_id}"
+        )
+        assert resp.status_code == 400
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+                (bad_run_id,),
+            )["count"]
+            == 0
+        )
+
+    # A second profile cannot append or read pagination against the first profile's run_id.
+    from afterword_engine.tenancy import profile_scope
+
+    second_account = profiles.create_account(
+        "second-reader", "test-password-with-sufficient-length"
+    )
+    with profile_scope(second_account["profile_id"]):
+        initialize(seed_demo=False)
+    second_session, _ = profiles.create_session(second_account["id"])
+    other_client = TestClient(app, headers={"x-bookward-session": second_session})
+    cross_profile = other_client.get(
+        f"/api/recommendations?status=recommended&limit=8&offset=0&run_id={valid_run_id}"
+    )
+    assert cross_profile.status_code == 400
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+            (valid_run_id,),
+        )["count"]
+        == 24
+    )
+
+
+def test_untracked_recommendations_skip_exploration_reordering(seeded_db, monkeypatch):
+    _, candidate_ids = seeded_db
+    monkeypatch.setattr(settings, "exploration_enabled", True)
+    monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
+    monkeypatch.setattr(settings, "exploration_stable_top_k", 4)
+
+    client = TestClient(app, headers=authenticated_headers())
+    for _ in range(5):
+        overview = client.get(
+            "/api/overview?recommendation_limit=24&decision_limit=24&track_run=false"
+        )
+        assert overview.status_code == 200
+        payload = overview.json()
+        assert payload["recommendation_run_id"] == ""
+        returned_ids = [
+            item["id"]
+            for item in payload["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert returned_ids == candidate_ids[:24]
+
+        recs = client.get(
+            "/api/recommendations?status=recommended&limit=24&offset=0&track_run=false"
+        )
+        assert recs.status_code == 200
+        assert [item["id"] for item in recs.json()] == candidate_ids[:24]
+
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_impressions")["count"] == 0
+
+
+def test_load_rows_excludes_historical_non_discovery_runs_from_ndcg():
+    dataset = {
+        "recommendation_runs": [
+            {
+                "id": "discover-pos",
+                "created_at": "2026-10-01T00:00:00Z",
+                "metadata": json.dumps({"status": "recommended"}),
+            },
+            {
+                "id": "discover-all-neg",
+                "created_at": "2026-10-02T00:00:00Z",
+                "metadata": json.dumps({"status": "recommended"}),
+            },
+            {
+                "id": "historical-decisions",
+                "created_at": "2026-10-03T00:00:00Z",
+                "metadata": json.dumps({"status": "decisions"}),
+            },
+            {
+                "id": "historical-saved",
+                "created_at": "2026-10-04T00:00:00Z",
+                "metadata": json.dumps({"status": "saved"}),
+            },
+        ],
+        "recommendation_impressions": [
+            {"id": 1, "run_id": "discover-pos", "candidate_id": 1, "rank": 1, "score": 95.0, "propensity": 1.0},
+            {"id": 2, "run_id": "discover-all-neg", "candidate_id": 2, "rank": 1, "score": 94.0, "propensity": 1.0},
+            {"id": 3, "run_id": "historical-decisions", "candidate_id": 3, "rank": 1, "score": 60.0, "propensity": 1.0},
+            {"id": 4, "run_id": "historical-saved", "candidate_id": 4, "rank": 1, "score": 88.0, "propensity": 1.0},
+        ],
+        "recommendation_outcomes": [
+            {"impression_id": 1, "label": 1.0, "label_kind": "explicit_feedback", "confidence": 1.0},
+            {"impression_id": 2, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
+            {"impression_id": 3, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
+            {"impression_id": 4, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
+        ],
+    }
+    loaded = load_rows(dataset)
+    assert {item["run_id"] for item in loaded} == {"discover-pos", "discover-all-neg"}
+    assert ips_ndcg_at_k(loaded, 20) == pytest.approx(0.5)
+
