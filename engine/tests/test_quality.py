@@ -1311,6 +1311,190 @@ def test_reaudit_keeps_accepted_status_when_apple_books_has_transient_outage(dat
         assert json.loads(q_row["flags_json"]) == []
 
 
+@respx.mock
+def test_reaudit_keeps_accepted_status_on_weak_primary_match_plus_apple_503(database):
+    from afterword_engine.main import recommendation_list
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+
+    unrelated_author_id = add_candidate(
+        "Weak Primary Match Book",
+        "Clara Vance",
+        status="recommended",
+    )
+    surname_only_id = add_candidate(
+        "Shared Surname Echoes",
+        "Clara Vance",
+        status="recommended",
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET score=93,description='Verified Apple synopsis.',"
+            "genres='[\"Literary Fiction\"]' WHERE id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.96,"
+            "provider='apple_books',provider_id='777888999',work_id='777888999',"
+            "title_match=1.0,author_match=1.0,flags_json=?,audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            ('["catalog_primary_unavailable"]', QUALITY_VERSION, unrelated_author_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.92,"
+            "provider='apple_books',provider_id='888999000',work_id='',"
+            "title_match=0.96,author_match=1.0,flags_json='[]',audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, surname_only_id),
+        )
+
+    def ol_weak_primary(request):
+        title = request.url.params.get("title", "")
+        if "Weak Primary Match Book" in title:
+            # Non-accepted primary match: exact title, completely different author (quality_score=0.65 < 0.82).
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLWEAK1W",
+                            "title": "Weak Primary Match Book",
+                            "author_name": ["Unrelated Author"],
+                            "isbn": ["0306406152"],
+                            "description": "Wrong book synopsis that must not overwrite candidate.",
+                            "subject": ["Cooking"],
+                        }
+                    ]
+                },
+            )
+        # Non-accepted primary match with surname-only author overlap (title_match=1.0, author_match=0.55 < 0.65,
+        # quality_score=0.8425 >= 0.82): still non-accepted and must not quarantine on Apple 503.
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLWEAK2W",
+                        "title": "Shared Surname Echoes",
+                        "author_name": ["Robert Vance"],
+                        "isbn": ["0306406152"],
+                        "description": "Wrong surname-only synopsis.",
+                        "subject": ["Gardening"],
+                    }
+                ]
+            },
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_weak_primary)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
+
+    reaudit_503 = asyncio.run(audit_candidates(only_pending=True))
+    assert len(ol_route.calls) == 2
+    assert len(apple_route.calls) == 4  # ebook + audiobook for both candidates
+    assert reaudit_503["audited"] == 2
+    assert reaudit_503["accepted"] == 2
+    assert reaudit_503["quarantine"] == 0
+
+    first_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (unrelated_author_id,))
+    assert first_q["quality_status"] == "accepted"
+    assert first_q["quality_score"] == pytest.approx(0.96)
+    assert first_q["provider"] == "apple_books"
+    assert first_q["provider_id"] == "777888999"
+    assert first_q["work_id"] == "777888999"
+    assert first_q["isbn13"] == ""
+    assert set(json.loads(first_q["flags_json"])) == {
+        "catalog_primary_unavailable",
+        "catalog_provider_unavailable",
+    }
+
+    second_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (surname_only_id,))
+    assert second_q["quality_status"] == "accepted"
+    assert second_q["quality_score"] == pytest.approx(0.92)
+    assert second_q["provider"] == "apple_books"
+    assert second_q["provider_id"] == "888999000"
+    assert second_q["work_id"] == ""
+    assert second_q["isbn13"] == ""
+    assert json.loads(second_q["flags_json"]) == ["catalog_provider_unavailable"]
+
+    for cid in (unrelated_author_id, surname_only_id):
+        cand = row("SELECT description,genres FROM candidates WHERE id=?", (cid,))
+        assert cand["description"] == "Verified Apple synopsis."
+        assert json.loads(cand["genres"]) == ["Literary Fiction"]
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert {unrelated_author_id, surname_only_id} <= visible_ids
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+    # Also verify weak primary match + Apple 429 keeps accepted status, and recovery promotes/backfills cleanly.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+    apple_route.mock(return_value=httpx.Response(429))
+
+    reaudit_429 = asyncio.run(audit_candidates(only_pending=True))
+    assert reaudit_429["accepted"] == 2
+    assert reaudit_429["quarantine"] == 0
+    for cid in (unrelated_author_id, surname_only_id):
+        q_row = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert "catalog_provider_rate_limited" in json.loads(q_row["flags_json"])
+
+    # When Apple recovers with an accepted match (even if its score is slightly lower than the surname-only
+    # non-accepted primary match's 0.8425), resolve_catalog_match chooses the verified accepted record.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+
+    def apple_recovered(request):
+        term = request.url.params.get("term", "")
+        if "Weak Primary Match Book" in term:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 777888999,
+                            "trackName": "Weak Primary Match Book",
+                            "artistName": "Clara Vance",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 888999000,
+                        "trackName": "Shared Surname Echoes: A Novel",
+                        "artistName": "C. Vance",
+                    }
+                ]
+            },
+        )
+
+    apple_route.mock(side_effect=apple_recovered)
+    recovered = asyncio.run(audit_candidates(only_pending=True))
+    assert recovered["accepted"] == 2
+    assert recovered["quarantine"] == 0
+    for cid, expected_work_id in (
+        (unrelated_author_id, "777888999"),
+        (surname_only_id, "888999000"),
+    ):
+        q_row = row("SELECT quality_status,provider,work_id,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert q_row["provider"] == "apple_books"
+        assert q_row["work_id"] == expected_work_id
+        assert json.loads(q_row["flags_json"]) == []
+
+
 def test_dedupe_and_hide_reject_candidates_handles_apple_work_keys_and_preserves_winner(database):
     from afterword_engine.main import recommendation_list
 

@@ -882,7 +882,9 @@ async def resolve_catalog_match(
                 by_record[record_key] = match
         records = list(by_record.values())
         verified_records = [record for record in records if accepted(record)]
-        identity_record = max(records, key=lambda record: record["quality_score"])
+        identity_record = max(
+            verified_records or records, key=lambda record: record["quality_score"]
+        )
         metadata_records = verified_records or []
         if not metadata_records:
             identity_record = dict(identity_record)
@@ -1076,10 +1078,44 @@ async def _audit_one(
         existing_fields_complete=_candidate_fields_complete(candidate),
         rate_limited_providers=rate_limited_providers,
     )
-    if not match or match.get("provider_lookup_unavailable"):
-        unavailable = bool(match and match.get("provider_lookup_unavailable"))
+    fetch_trace = (
+        match.get("metadata_provenance", {}).get("fetch_trace", [])
+        if isinstance(match, Mapping)
+        and isinstance(match.get("metadata_provenance"), Mapping)
+        else []
+    )
+    provider_failed_transiently = bool(
+        match
+        and (
+            match.get("provider_lookup_unavailable")
+            or any(
+                isinstance(trace, Mapping)
+                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+                for trace in fetch_trace
+            )
+        )
+    )
+    provider_rate_limited = bool(
+        match
+        and (
+            match.get("provider_rate_limited")
+            or any(
+                isinstance(trace, Mapping) and trace.get("status") == "rate_limited"
+                for trace in fetch_trace
+            )
+        )
+    )
+    accepted = bool(
+        match
+        and not match.get("provider_lookup_unavailable")
+        and match.get("quality_score", 0) >= 0.82
+        and match.get("title_match", 0) >= 0.82
+        and match.get("author_match", 0) >= 0.65
+    )
+    if not accepted and (not match or provider_failed_transiently):
+        unavailable = provider_failed_transiently
         failure_flags = ["catalog_provider_unavailable"]
-        if match and match.get("provider_rate_limited"):
+        if provider_rate_limited:
             failure_flags.append("catalog_provider_rate_limited")
         existing_status = str(
             candidate.get("_existing_quality_status")
@@ -1096,11 +1132,20 @@ async def _audit_one(
             or candidate.get("provider")
             or ""
         ).strip()
+        existing_audited_at = str(
+            candidate.get("_existing_audited_at")
+            or candidate.get("audited_at")
+            or ""
+        ).strip()
         if (
             unavailable
             and existing_status == "accepted"
             and existing_version != "legacy-pending-audit-v1"
-            and (existing_provider or existing_version == "builtin-curated-v1")
+            and (
+                existing_provider
+                or existing_audited_at
+                or existing_version == "builtin-curated-v1"
+            )
         ):
             raw_existing_flags = candidate.get("_existing_flags_json")
             if raw_existing_flags is None:
@@ -1163,7 +1208,6 @@ async def _audit_one(
             **({"metadata_provenance": match.get("metadata_provenance", {})} if unavailable else {}),
             **source_identifiers,
         }
-    accepted = match["quality_score"] >= 0.82 and match["title_match"] >= 0.82 and match["author_match"] >= 0.65
     extra_flags = []
     if not accepted:
         extra_flags.append("catalog_match_ambiguous")
@@ -1329,6 +1373,7 @@ _AUDIT_CANDIDATE_SELECT = (
     "q.title_match AS _existing_title_match,"
     "q.author_match AS _existing_author_match,"
     "q.audit_version AS _existing_audit_version,"
+    "q.audited_at AS _existing_audited_at,"
     "q.metadata_provider AS _metadata_provider,"
     "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
     "LEFT JOIN sources s ON s.id=c.source_id "

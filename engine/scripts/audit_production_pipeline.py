@@ -373,6 +373,7 @@ def _score_eligible_candidates(connection: sqlite3.Connection) -> list[dict[str,
     query = """
         SELECT c.*, s.name source_name, s.weight source_weight,
                q.work_id quality_work_id, q.provider quality_provider,
+               q.provider_id AS quality_provider_id,
                q.isbn13 quality_isbn13, q.isbn10 quality_isbn10,
                CASE WHEN q.quality_score>0 THEN q.quality_score
                     WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END
