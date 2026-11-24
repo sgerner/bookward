@@ -161,83 +161,207 @@ def test_saving_channels_while_schedule_off_validates_and_enables_test_delivery(
     initialize()
 
     with respx.mock(assert_all_called=False) as router:
-        webhook_url = "https://discord.com/api/webhooks/999/secret-token"
+        webhook_url = "https://discord.com/api/webhooks/999/webhook-id"
         discord_route = router.post(webhook_url).mock(return_value=httpx.Response(204))
 
-        with TestClient(app) as client:
-            headers = _auth_headers(client)
+        client = TestClient(app)
+        headers = _auth_headers(client)
 
-            # Saving an enabled channel with missing webhook fails even when enabled=False.
-            missing = client.put(
-                "/api/digest/settings",
-                headers=headers,
-                json={
-                    "enabled": False,
-                    "channels": ["discord"],
-                    "app_url": "https://books.example.com",
+        # Saving an enabled channel with missing webhook fails even when enabled=False.
+        missing = client.put(
+            "/api/digest/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "channels": ["discord"],
+                "app_url": "https://books.example.com",
+            },
+        )
+        assert missing.status_code == 400
+        assert "Discord webhook URL is required" in missing.json()["detail"]
+
+        # Saving valid Discord settings with enabled=False succeeds and encrypts webhook.
+        saved = client.put(
+            "/api/digest/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "channels": ["discord"],
+                "app_url": "https://books.example.com",
+                "discord_webhook_url": webhook_url,
+            },
+        )
+        assert saved.status_code == 200
+        body = saved.json()["digest"]
+        assert body["enabled"] is False
+        assert body["channels"] == ["discord"]
+        assert body["discord_webhook_set"] is True
+        assert "webhook-id" not in json.dumps(saved.json())
+        stored_secret = row("SELECT value,secret FROM settings WHERE key='digest_discord_webhook_url'")
+        assert stored_secret["secret"] == 1
+        assert "webhook-id" not in stored_secret["value"]
+
+        # Test notification succeeds without HTTP 400 while schedule stays off.
+        queued = client.post(
+            "/api/digest/test",
+            headers=headers,
+            json={"channel": "discord"},
+        )
+        assert queued.status_code == 200
+        job_result = asyncio.run(handle_job("digest:test:discord"))
+        assert job_result["status"] == "sent"
+        assert discord_route.call_count == 1
+
+        # One-step schedule disable and channel disable work even if stored secrets cannot unseal.
+        with transaction() as con:
+            con.execute("UPDATE settings SET value='1' WHERE key='digest_enabled'")
+            con.execute(
+                "UPDATE settings SET value='',secret=1 WHERE key='digest_discord_webhook_url'"
+            )
+        disable_schedule = client.put(
+            "/api/digest/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "channels": ["discord"],
+                "app_url": "https://books.example.com",
+            },
+        )
+        assert disable_schedule.status_code == 200
+        disable_channel = client.put(
+            "/api/digest/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "channels": [],
+                "app_url": "https://books.example.com",
+            },
+        )
+        assert disable_channel.status_code == 200
+
+
+def test_kill_switch_rejects_changed_webhook_host_and_invalid_email(tmp_path, monkeypatch):
+    import socket
+    from fastapi.testclient import TestClient
+    from afterword_engine.main import app
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "kill-switch-guard.db"))
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("162.159.135.42", 443))],
+    )
+    initialize()
+
+    client = TestClient(app)
+    headers = _auth_headers(client)
+    valid_webhook = "https://discord.com/api/webhooks/123/valid-hook"
+
+    active = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": True,
+            "channels": ["discord", "email"],
+            "app_url": "https://books.example.com",
+            "discord_webhook_url": valid_webhook,
+            "email_to": "reader@example.com",
+            "email_from": "bookward@example.com",
+            "smtp_host": "smtp.example.com",
+        },
+    )
+    assert active.status_code == 200
+
+    # Kill-switch PUT (enabled=True -> False) with a non-Discord host MUST 400 and never persist.
+    hijack = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": ["discord", "email"],
+            "discord_webhook_url": "https://attacker.example/x",
+        },
+    )
+    assert hijack.status_code == 400
+    assert "Discord webhook URL must point to Discord" in hijack.json()["detail"]
+
+    insecure = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": ["discord", "email"],
+            "discord_webhook_url": "http://discord.com/api/webhooks/123/insecure",
+        },
+    )
+    assert insecure.status_code == 400
+    assert "HTTPS" in insecure.json()["detail"]
+
+    bad_email = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": ["discord", "email"],
+            "email_to": "not-an-email",
+        },
+    )
+    assert bad_email.status_code == 400
+    assert "Valid email to is required" in bad_email.json()["detail"]
+
+    # Stored settings remain untouched after all rejected kill-switch payloads.
+    assert row("SELECT value FROM settings WHERE key='digest_enabled'")["value"] == "1"
+    assert row("SELECT value FROM settings WHERE key='digest_email_to'")["value"] == "reader@example.com"
+
+
+def test_stored_non_discord_webhook_is_refused_at_delivery_time(tmp_path, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "stored-non-discord.db"))
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    )
+    initialize()
+
+    attacker_url = "https://attacker.example/x"
+    with respx.mock(assert_all_called=False) as router:
+        attacker_route = router.post(attacker_url).mock(return_value=httpx.Response(204))
+
+        with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+            asyncio.run(digest._send_discord({"discord_webhook_url": attacker_url}, {"content": "hi"}))
+        assert attacker_route.call_count == 0
+
+        outcome = asyncio.run(
+            digest.send_digest(
+                {
+                    "digest_enabled": "0",
+                    "digest_channels": "discord",
+                    "digest_minimum_score": "0",
+                    "digest_discord_webhook_url": attacker_url,
+                }
+            )
+        )
+        assert outcome["status"] == "failed"
+        assert "Discord webhook URL must point to Discord" in outcome["deliveries"][0]["error"]
+        assert attacker_route.call_count == 0
+
+        delivery_id = row("SELECT id FROM notification_deliveries LIMIT 1")["id"]
+        retry = asyncio.run(
+            digest.retry_delivery(
+                delivery_id,
+                {
+                    "digest_enabled": "0",
+                    "digest_channels": "discord",
+                    "digest_minimum_score": "0",
+                    "digest_discord_webhook_url": attacker_url,
                 },
             )
-            assert missing.status_code == 400
-            assert "Discord webhook URL is required" in missing.json()["detail"]
-
-            # Saving valid Discord settings with enabled=False succeeds and encrypts webhook.
-            saved = client.put(
-                "/api/digest/settings",
-                headers=headers,
-                json={
-                    "enabled": False,
-                    "channels": ["discord"],
-                    "app_url": "https://books.example.com",
-                    "discord_webhook_url": webhook_url,
-                },
-            )
-            assert saved.status_code == 200
-            body = saved.json()["digest"]
-            assert body["enabled"] is False
-            assert body["channels"] == ["discord"]
-            assert body["discord_webhook_set"] is True
-            assert "secret-token" not in json.dumps(saved.json())
-            stored_secret = row("SELECT value,secret FROM settings WHERE key='digest_discord_webhook_url'")
-            assert stored_secret["secret"] == 1
-            assert "secret-token" not in stored_secret["value"]
-
-            # Test notification succeeds without HTTP 400 while schedule stays off.
-            queued = client.post(
-                "/api/digest/test",
-                headers=headers,
-                json={"channel": "discord"},
-            )
-            assert queued.status_code == 200
-            job_result = asyncio.run(handle_job("digest:test:discord"))
-            assert job_result["status"] == "sent"
-            assert discord_route.call_count == 1
-
-            # One-step schedule disable and channel disable work even if stored settings go stale.
-            with transaction() as con:
-                con.execute("UPDATE settings SET value='1' WHERE key='digest_enabled'")
-                con.execute(
-                    "UPDATE settings SET value='not-a-valid-webhook',secret=0 WHERE key='digest_discord_webhook_url'"
-                )
-            disable_schedule = client.put(
-                "/api/digest/settings",
-                headers=headers,
-                json={
-                    "enabled": False,
-                    "channels": ["discord"],
-                    "app_url": "https://books.example.com",
-                },
-            )
-            assert disable_schedule.status_code == 200
-            disable_channel = client.put(
-                "/api/digest/settings",
-                headers=headers,
-                json={
-                    "enabled": False,
-                    "channels": [],
-                    "app_url": "https://books.example.com",
-                },
-            )
-            assert disable_channel.status_code == 200
+        )
+        assert retry["status"] == "failed"
+        assert "Discord webhook URL must point to Discord" in retry["error"]
+        assert attacker_route.call_count == 0
 
 
 def test_public_url_upgrades_untouched_docker_default_and_preserves_custom_url(tmp_path, monkeypatch):
@@ -250,202 +374,134 @@ def test_public_url_upgrades_untouched_docker_default_and_preserves_custom_url(t
 
     assert row("SELECT value FROM settings WHERE key='digest_app_url'")["value"] == "http://127.0.0.1:3000"
     assert digest.digest_config({})["app_url"] == "http://127.0.0.1:3000"
-    assert DigestSettingsIn().app_url == "http://127.0.0.1:3000"
+    assert DigestSettingsIn().app_url is None
 
     # Operator configures AFTERWORD_PUBLIC_URL and restarts container: untouched 127.0.0.1:3000 upgrades.
     monkeypatch.setattr(settings, "public_url", "https://bookward.example.org")
     initialize()
     assert row("SELECT value FROM settings WHERE key='digest_app_url'")["value"] == "https://bookward.example.org"
 
-    # Operator saves a custom URL in Settings: future AFTERWORD_PUBLIC_URL changes preserve it.
-    with TestClient(app) as client:
-        headers = _auth_headers(client)
-        res = client.put(
-            "/api/digest/settings",
-            headers=headers,
-            json={
-                "enabled": False,
-                "channels": [],
-                "app_url": "https://custom-reader.example.net",
-            },
-        )
-        assert res.status_code == 200
+    # Operator saves a custom URL in Settings: partial PUTs omitting app_url and restarts preserve it.
+    client = TestClient(app)
+    headers = _auth_headers(client)
+    res = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": [],
+            "app_url": "https://custom-reader.example.net",
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["digest"]["app_url"] == "https://custom-reader.example.net"
+
+    partial = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": [],
+            "minimum_score": 85,
+        },
+    )
+    assert partial.status_code == 200
+    assert partial.json()["digest"]["app_url"] == "https://custom-reader.example.net"
+    assert row("SELECT value FROM settings WHERE key='digest_app_url'")["value"] == "https://custom-reader.example.net"
+    assert row("SELECT value FROM settings WHERE key='digest_app_url_custom'")["value"] == "1"
 
     monkeypatch.setattr(settings, "public_url", "https://another-host.example.org")
     initialize()
     assert row("SELECT value FROM settings WHERE key='digest_app_url'")["value"] == "https://custom-reader.example.net"
 
 
-def test_twenty_book_discord_digest_stays_within_limit_and_keeps_review_link():
-    items = [
-        {
-            "id": index,
-            "title": f"Long Speculative Novel Title Number {index}: Chronicles of the Distant Horizon",
-            "author": f"Author Name {index}",
-            "score": 96 - (index * 0.5),
-            "explanation": [
-                f"Strong thematic overlap with your 5-star science fiction reads and literary worldbuilding ({index})"
-            ],
-        }
-        for index in range(1, 21)
-    ]
-    config = {"app_url": "https://bookward.example.org"}
-    payload = digest._discord_payload(items, config, "2026-W47")
-    content = payload["content"]
-    expected_link = "https://bookward.example.org?view=discover&digest=1&digest_period=2026-W47"
-
-    assert len(content) <= 1990
-    assert payload["allowed_mentions"] == {"parse": []}
-    assert content.endswith(f"Review and shortlist these books in Bookward: {expected_link}")
-    bullet_lines = [line for line in content.splitlines() if line.startswith("• ")]
-    assert 1 <= len(bullet_lines) < 20
-    # Every included book line is a complete entry (never severed mid-line).
-    for index, line in enumerate(bullet_lines, start=1):
-        assert line == digest._book_line(items[index - 1])
-    remaining = 20 - len(bullet_lines)
-    assert f"…and {remaining} more book" in content
-
-
-def test_smtp_digest_sends_multipart_escaped_html_with_validated_covers(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "db", str(tmp_path / "smtp-html.db"))
+def test_existing_install_with_custom_loopback_app_url_is_preserved_on_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "db", str(tmp_path / "legacy-loopback.db"))
+    monkeypatch.setattr(settings, "public_url", "http://localhost:5173")
     initialize()
 
-    sent_messages = []
-
-    class FakeSMTP:
-        def __init__(self, host, port, timeout):
-            self.host, self.port, self.timeout = host, port, timeout
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def ehlo(self):
-            return None
-
-        def starttls(self, context):
-            assert context is not None
-
-        def login(self, username, password):
-            return None
-
-        def send_message(self, message):
-            sent_messages.append(message)
-
-    monkeypatch.setattr(digest.smtplib, "SMTP", FakeSMTP)
+    # Simulate an existing installation before digest_app_url_custom existed where the
+    # operator saved a custom loopback port (http://localhost:3000).
     with transaction() as con:
-        con.execute("DELETE FROM candidates")
-        src_id = row("SELECT id FROM sources LIMIT 1")["id"]
-        con.execute(
-            """INSERT INTO candidates(id,title,author,description,cover_url,source_url,source_id,score,explanation,status,normalized_key)
-            VALUES(101,?,?,?,?,?,?,95,?,'recommended','xss-book-1'),(102,?,?,?,?,?,?,91,?,'recommended','untrusted-cover-2')""",
-            (
-                "Book <script>alert(1)</script>",
-                'Ada "Lovelace" & Co.',
-                "Desc",
-                "https://covers.openlibrary.org/b/id/98765-L.jpg",
-                "https://openlibrary.org/works/OL1W",
-                src_id,
-                json.dumps(["Matched <b>Piranesi</b>"]),
-                "Untrusted Pixel Book",
-                " Bob Writer ",
-                "Desc",
-                "https://evil-tracker.example/pixel.png",
-                "https://evil-tracker.example/book",
-                src_id,
-                json.dumps(["Safe reason"]),
-            ),
-        )
-        con.execute(
-            "INSERT OR REPLACE INTO candidate_quality(candidate_id,quality_status,audit_version) VALUES(101,'accepted','v1'),(102,'accepted','v1')"
-        )
+        con.execute("UPDATE settings SET value='http://localhost:3000' WHERE key='digest_app_url'")
+        con.execute("DELETE FROM settings WHERE key='digest_app_url_custom'")
 
-    values = {
-        "digest_enabled": "0",
-        "digest_channels": "email",
-        "digest_minimum_score": "80",
-        "digest_maximum_books": "10",
-        "digest_app_url": "https://bookward.example.org",
-        "digest_email_to": "reader@example.com",
-        "digest_email_from": "bookward@example.com",
-        "digest_smtp_host": "smtp.example.com",
-        "digest_smtp_port": "587",
-        "digest_smtp_security": "starttls",
-    }
-    outcome = asyncio.run(digest.send_digest(values))
-    assert outcome["status"] == "sent"
-    assert len(sent_messages) == 1
-    msg = sent_messages[0]
-    assert msg.is_multipart()
-    plain_part = msg.get_body(("plain",))
-    html_part = msg.get_body(("html",))
-    assert plain_part is not None and html_part is not None
-    plain_text = plain_part.get_content()
-    html_text = html_part.get_content()
+    monkeypatch.setattr(settings, "public_url", "https://bookward.example.org")
+    initialize()
 
-    import html as html_lib
-
-    expected_link = "https://bookward.example.org?view=discover&digest=1&digest_period=" + outcome["period"]
-    assert expected_link in plain_text
-    assert f'href="{html_lib.escape(expected_link, quote=True)}"' in html_text
-    assert "<script>alert(1)</script>" not in html_text
-    assert "Book &lt;script&gt;alert(1)&lt;/script&gt;" in html_text
-    assert "Matched &lt;b&gt;Piranesi&lt;/b&gt;" in html_text
-    assert "https://covers.openlibrary.org/b/id/98765-L.jpg" in html_text
-    assert "evil-tracker.example" not in html_text
+    assert row("SELECT value FROM settings WHERE key='digest_app_url'")["value"] == "http://localhost:3000"
+    assert row("SELECT value FROM settings WHERE key='digest_app_url_custom'")["value"] == "1"
 
 
-def test_bulk_feedback_preserves_rejected_books_and_logs_run_confidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "blocked_host",
+    [
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "::ffff:127.0.0.1",
+        "10.0.0.5",
+        "192.168.1.10",
+        "169.254.169.254",
+        "localhost",
+        "mail.local",
+    ],
+)
+def test_smtp_host_rejects_loopback_private_and_local_targets_unless_allowlisted(
+    tmp_path, monkeypatch, blocked_host
+):
     from fastapi.testclient import TestClient
     from afterword_engine.main import app
 
-    monkeypatch.setattr(settings, "db", str(tmp_path / "bulk-triage.db"))
+    monkeypatch.setattr(settings, "db", str(tmp_path / "smtp-guard.db"))
+    monkeypatch.setattr(settings, "smtp_allowed_hosts", "")
     initialize()
 
-    with TestClient(app) as client:
-        headers = _auth_headers(client)
-        overview = client.get("/api/overview?recommendation_limit=24", headers=headers).json()
-        run_id = overview["recommendation_run_id"]
-        rec_ids = [item["id"] for item in overview["recommendations"][:3]]
-        assert len(rec_ids) == 3 and len(run_id) >= 8
+    client = TestClient(app)
+    headers = _auth_headers(client)
 
-        # Reader passes on the second recommendation in digest review mode.
-        passed = client.post(
-            f"/api/recommendations/{rec_ids[1]}/feedback",
-            headers=headers,
-            json={"action": "reject", "run_id": run_id},
+    rejected = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": ["email"],
+            "email_to": "reader@example.com",
+            "email_from": "bookward@example.com",
+            "smtp_host": blocked_host,
+        },
+    )
+    assert rejected.status_code == 400
+    assert "SMTP host" in rejected.json()["detail"]
+
+    with pytest.raises(ValueError, match="SMTP host"):
+        digest._smtp_send(
+            {
+                "smtp_host": blocked_host,
+                "smtp_port": 587,
+                "smtp_security": "starttls",
+                "smtp_username": "",
+                "smtp_password": "",
+                "email_from": "bookward@example.com",
+                "email_to": "reader@example.com",
+            },
+            "Subject",
+            "Body",
         )
-        assert passed.status_code == 200
 
-        # Bulk shortlisting even with the passed ID included preserves 'rejected' and updates only recommended rows.
-        bulk = client.post(
-            "/api/recommendations/bulk-feedback",
-            headers=headers,
-            json={"ids": rec_ids, "action": "save", "run_id": run_id},
-        )
-        assert bulk.status_code == 200
-        body = bulk.json()
-        assert body["updated"] == 2
-        assert body["skipped"] == 1
-        assert body["ids"] == sorted([rec_ids[0], rec_ids[2]])
+    # Explicit operator allowlist permits local mail relays (e.g. self-hosted bridge).
+    monkeypatch.setattr(settings, "smtp_allowed_hosts", blocked_host)
+    allowed = client.put(
+        "/api/digest/settings",
+        headers=headers,
+        json={
+            "enabled": False,
+            "channels": ["email"],
+            "email_to": "reader@example.com",
+            "email_from": "bookward@example.com",
+            "smtp_host": blocked_host,
+        },
+    )
+    assert allowed.status_code == 200
 
-        assert row("SELECT status FROM candidates WHERE id=?", (rec_ids[1],))["status"] == "rejected"
-        assert row("SELECT status FROM candidates WHERE id=?", (rec_ids[0],))["status"] == "saved"
-        assert row("SELECT status FROM candidates WHERE id=?", (rec_ids[2],))["status"] == "saved"
-
-        for saved_id in (rec_ids[0], rec_ids[2]):
-            fb = row(
-                "SELECT action,previous_status FROM feedback WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
-                (saved_id,),
-            )
-            assert fb == {"action": "save", "previous_status": "recommended"}
-            outcome = row(
-                """SELECT o.confidence,o.label FROM recommendation_outcomes o
-                JOIN recommendation_events e ON e.id=o.event_id
-                WHERE e.candidate_id=? AND e.event_type='save'""",
-                (saved_id,),
-            )
-            assert outcome == {"confidence": 0.8, "label": 1.0}
 

@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
     backup_scheduler_loop,
@@ -1180,7 +1180,7 @@ class DigestSettingsIn(BaseModel):
     minimum_score: float = Field(default=80, ge=0, le=100)
     maximum_books: int = Field(default=5, ge=1, le=20)
     only_new: bool = True
-    app_url: str = Field(default_factory=lambda: settings.public_url)
+    app_url: str | None = None
     # Optional secrets preserve the existing value when omitted and clear it
     # when explicitly sent as an empty string.
     discord_webhook_url: str | None = None
@@ -2196,33 +2196,15 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     with transaction() as con:
         placeholders = ",".join("?" for _ in ids)
-        rows_by_id = {
-            int(item["id"]): str(item["status"])
-            for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
-            ).fetchall()
+        found = {
+            int(item["id"])
+            for item in con.execute(f"SELECT id FROM candidates WHERE id IN ({placeholders})", ids).fetchall()
         }
-        eligible_ids = [
-            candidate_id
-            for candidate_id in ids
-            if candidate_id in rows_by_id
-            and (
-                rows_by_id[candidate_id] == "recommended"
-                if payload.action == "save"
-                else rows_by_id[candidate_id] in {"saved", "rejected", "maybe_later"}
-                if payload.action == "restore"
-                else rows_by_id[candidate_id] == "recommended"
-            )
-        ]
-        for candidate_id in eligible_ids:
-            previous_status = rows_by_id[candidate_id]
-            con.execute(
-                "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (status, candidate_id),
-            )
+        for candidate_id in found:
+            con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
             feedback_id = con.execute(
-                "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
-                (candidate_id, payload.action, previous_status),
+                "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                (candidate_id, payload.action),
             ).lastrowid
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
@@ -2239,12 +2221,7 @@ def bulk_feedback(payload: BulkFeedbackIn):
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-    return {
-        "updated": len(eligible_ids),
-        "skipped": len(ids) - len(eligible_ids),
-        "status": status,
-        "ids": sorted(eligible_ids),
-    }
+    return {"updated": len(found), "skipped": len(ids) - len(found), "status": status, "ids": sorted(found)}
 
 
 def telemetry_events(payload: TelemetryBatchIn):
@@ -2762,15 +2739,17 @@ def _save_digest_settings(updates: dict):
         validate_digest_config(merged, previous=existing)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    next_app_url = str(merged["app_url"] or "").rstrip("/")
-    prev_app_url = str(existing["app_url"] or "").rstrip("/")
-    default_public_url = str(settings.public_url or "").rstrip("/")
-    prev_custom = str(current.get("digest_app_url_custom") or "0") == "1"
-    app_url_custom = (
-        next_app_url != default_public_url
-        if "app_url" in updates and next_app_url != prev_app_url
-        else (prev_custom or (next_app_url != prev_app_url))
-    )
+    next_app_url = str(merged["app_url"] or "").strip().rstrip("/")
+    prev_app_url = str(existing["app_url"] or "").strip().rstrip("/")
+    default_public_url = str(settings.public_url or "").strip().rstrip("/")
+    if "digest_app_url_custom" in current:
+        prev_custom = str(current["digest_app_url_custom"]) == "1"
+    else:
+        prev_custom = bool(prev_app_url and prev_app_url not in DEFAULT_DIGEST_APP_URLS)
+    if "app_url" in updates and next_app_url != prev_app_url:
+        app_url_custom = next_app_url != default_public_url
+    else:
+        app_url_custom = prev_custom
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -2780,7 +2759,7 @@ def _save_digest_settings(updates: dict):
         "digest_minimum_score": str(merged["minimum_score"]),
         "digest_maximum_books": str(merged["maximum_books"]),
         "digest_only_new": "1" if merged["only_new"] else "0",
-        "digest_app_url": merged["app_url"],
+        "digest_app_url": next_app_url,
         "digest_app_url_custom": "1" if app_url_custom else "0",
         "digest_discord_webhook_url": merged["discord_webhook_url"],
         "digest_email_to": merged["email_to"],

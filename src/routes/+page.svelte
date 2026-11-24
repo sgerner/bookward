@@ -52,10 +52,6 @@
     canRunDigestNow,
     canTestDigestChannel,
     hasUnsavedDigestChanges,
-    isBoundedDigestReview,
-    pruneDigestSelection,
-    resolveDigestBulkRunId,
-    shouldPaginateDiscover,
     shouldShowDigestTestButton,
   } from "#lib/digest-ui.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
@@ -543,20 +539,9 @@
     digestMode &&
       (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
   );
-  const boundedDigestReview = $derived(
-    isBoundedDigestReview(digestVisible, data.digestReview.requested),
-  );
-  const selectedDigestRunId = $derived(
-    resolveDigestBulkRunId(selectedDigestIds, allBooks, data.recommendation_run_id),
-  );
   const hasMoreDiscoverBooks = $derived(
-    shouldPaginateDiscover({
-      isDiscoverView: activeView === "discover",
-      boundedDigestReview,
-      visibleCount: visibleBooks.length,
-      totalFilteredCount: filteredBooks.length,
-      discoverHasMore,
-    }),
+    activeView === "discover" &&
+      (visibleBooks.length < filteredBooks.length || discoverHasMore),
   );
   const activeSourceCount = $derived(
     data.sources.filter(sourceEnabled).length + (defaultSourceEnabled ? 1 : 0),
@@ -920,11 +905,6 @@
     const book = [...data.books, ...data.decisions, ...additionalDiscoverBooks, ...additionalDecisionBooks].find((item) => item.id === id);
     if (!book) return;
     const previous = bookStatusOverrides[id];
-    if (status !== "recommended" && selectedDigestIds.has(id)) {
-      const nextSelected = new Set(selectedDigestIds);
-      nextSelected.delete(id);
-      selectedDigestIds = nextSelected;
-    }
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
@@ -1213,7 +1193,7 @@
   }
 
   async function loadMoreDiscover() {
-    if (discoverLoading || boundedDigestReview) return;
+    if (discoverLoading) return;
     if (discoverVisibleCount < filteredBooks.length) {
       discoverVisibleCount = Math.min(
         discoverVisibleCount + DISCOVER_PAGE_SIZE,
@@ -1297,9 +1277,7 @@
   function toggleDigestBook(id: number) {
     const next = new Set(selectedDigestIds);
     if (next.has(id)) next.delete(id);
-    else if (allBooks.some((book) => book.id === id && book.status === "recommended")) {
-      next.add(id);
-    }
+    else next.add(id);
     selectedDigestIds = next;
   }
 
@@ -1548,14 +1526,6 @@
       !data.digestReview.requested
     ) {
       digestMode = false;
-    }
-  });
-
-  $effect(() => {
-    if (selectedDigestIds.size === 0) return;
-    const pruned = pruneDigestSelection(selectedDigestIds, allBooks);
-    if (pruned.size !== selectedDigestIds.size) {
-      selectedDigestIds = pruned;
     }
   });
 
@@ -2052,8 +2022,8 @@
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
 
         {@const viewBooks = view === "discover" ? (digestVisible ? (data.digestReview.requested ? discoverBooks.filter((book) => data.digestReview.ids.includes(book.id)) : discoverBooks.filter((book) => book.score >= digestSettings.minimum_score)) : discoverBooks) : view === "saved" ? shortlistBooks : decisionBooks}
-        {@const viewVisibleBooks = view === "discover" ? (boundedDigestReview ? viewBooks : viewBooks.slice(0, discoverVisibleCount)) : viewBooks}
-        {@const viewHasMoreDiscoverBooks = shouldPaginateDiscover({ isDiscoverView: view === "discover", boundedDigestReview, visibleCount: viewVisibleBooks.length, totalFilteredCount: viewBooks.length, discoverHasMore })}
+        {@const viewVisibleBooks = view === "discover" ? viewBooks.slice(0, discoverVisibleCount) : viewBooks}
+        {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || discoverHasMore)}
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
@@ -2120,7 +2090,6 @@
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
                   <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist

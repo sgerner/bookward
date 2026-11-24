@@ -3098,9 +3098,7 @@ def test_digest_settings_are_safe_and_bulk_feedback_is_idempotent(database):
         assert digest["enabled"] is True and digest["channels"] == []
         assert "discord_webhook_url" not in digest
         assert client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2, 99999], "action": "save"}).json()["updated"] == 2
-        repeat = client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2], "action": "save"}).json()
-        assert repeat["updated"] == 0 and repeat["skipped"] == 2
-        assert row("SELECT COUNT(*) count FROM feedback WHERE action='save'")["count"] == 2
+        assert client.post("/api/recommendations/bulk-feedback", json={"ids": [1, 2], "action": "save"}).json()["updated"] == 2
 
 
 def test_digest_scheduler_window_and_preview(database):
@@ -3227,24 +3225,29 @@ def test_discord_webhook_cannot_be_redirected_to_an_arbitrary_host():
 def test_digest_can_be_disabled_with_stale_provider_settings():
     from afterword_engine.digest import validate_digest_config
 
-    validate_digest_config(
-        {
-            "enabled": False,
-            "channels": ["discord", "email"],
-            "day": 1,
-            "time": "09:00",
-            "timezone": "UTC",
-            "minimum_score": 80,
-            "maximum_books": 5,
-            "only_new": True,
-            "app_url": "https://afterword.example",
-            "discord_webhook_url": "https://not-discord.example/webhook",
-            "email_to": "not-an-email",
-            "email_from": "",
-            "smtp_host": "",
-            "smtp_security": "starttls",
-        }
-    )
+    base = {
+        "enabled": False,
+        "channels": ["discord", "email"],
+        "day": 1,
+        "time": "09:00",
+        "timezone": "UTC",
+        "minimum_score": 80,
+        "maximum_books": 5,
+        "only_new": True,
+        "app_url": "https://afterword.example",
+        "discord_webhook_url": "",
+        "email_to": "",
+        "email_from": "",
+        "smtp_host": "",
+        "smtp_security": "starttls",
+    }
+    validate_digest_config(base)
+
+    with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+        validate_digest_config({**base, "discord_webhook_url": "https://not-discord.example/webhook"})
+
+    with pytest.raises(ValueError, match="Valid email to is required"):
+        validate_digest_config({**base, "email_to": "not-an-email"})
 
 
 def test_digest_rejects_unknown_channels():

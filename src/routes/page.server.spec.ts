@@ -1003,7 +1003,6 @@ describe("page actions", () => {
     const body = new FormData();
     body.append("ids", "7");
     body.append("ids", "8");
-    body.set("run_id", "run-digest-1234");
     const result = await actions.shortlistBulk!({
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
@@ -1011,7 +1010,6 @@ describe("page actions", () => {
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
       ids: [7, 8],
       action: "save",
-      run_id: "run-digest-1234",
     });
   });
 

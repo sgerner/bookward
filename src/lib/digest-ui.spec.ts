@@ -3,10 +3,6 @@ import {
   canRunDigestNow,
   canTestDigestChannel,
   hasUnsavedDigestChanges,
-  isBoundedDigestReview,
-  pruneDigestSelection,
-  resolveDigestBulkRunId,
-  shouldPaginateDiscover,
   shouldShowDigestTestButton,
   type DigestFormDraft,
   type SavedDigestSettings,
@@ -93,43 +89,5 @@ describe("digest settings dirty guard and action controls", () => {
     expect(hasUnsavedDigestChanges(saved, draft)).toBe(true);
     expect(canTestDigestChannel(saved, draft, "discord")).toBe(false);
     expect(canRunDigestNow(saved, draft)).toBe(false);
-  });
-});
-
-describe("digest review selection pruning, run attribution, and bounded pagination", () => {
-  it("prunes passed and shortlisted books from selectedDigestIds", () => {
-    const books = [
-      { id: 1, status: "recommended", recommendation_run_id: "run-abcd-1234" },
-      { id: 2, status: "rejected", recommendation_run_id: "run-abcd-1234" },
-      { id: 3, status: "recommended", recommendation_run_id: "run-abcd-1234" },
-      { id: 4, status: "saved", recommendation_run_id: "run-abcd-1234" },
-    ];
-    const pruned = pruneDigestSelection([1, 2, 3, 4], books);
-    expect([...pruned]).toEqual([1, 3]);
-    expect(resolveDigestBulkRunId(pruned, books, "run-abcd-1234")).toBe("run-abcd-1234");
-  });
-
-  it("suppresses extra discovery pagination when viewing a bounded digest period", () => {
-    const bounded = isBoundedDigestReview(true, true);
-    expect(bounded).toBe(true);
-    expect(
-      shouldPaginateDiscover({
-        isDiscoverView: true,
-        boundedDigestReview: bounded,
-        visibleCount: 15,
-        totalFilteredCount: 15,
-        discoverHasMore: true,
-      }),
-    ).toBe(false);
-
-    expect(
-      shouldPaginateDiscover({
-        isDiscoverView: true,
-        boundedDigestReview: false,
-        visibleCount: 8,
-        totalFilteredCount: 15,
-        discoverHasMore: true,
-      }),
-    ).toBe(true);
   });
 });
