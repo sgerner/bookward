@@ -23,7 +23,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(ENGINE))
 
 import evaluate_ordinal_interests as ordinal
-from afterword_engine.identity import book_identity
+from afterword_engine.identity import book_author_identity_key
 from evaluate_historical_ratings import whole_day_cuts
 from evaluate_ranking import load_corpus, prepare
 
@@ -261,7 +261,9 @@ def paired_cluster_bootstrap(
 def author_clusters(items: list[dict], indexes: np.ndarray) -> list[np.ndarray]:
     groups: dict[str, list[int]] = defaultdict(list)
     for local_index, corpus_index in enumerate(indexes):
-        key = book_identity("", items[int(corpus_index)].get("author", ""))
+        key = book_author_identity_key(items[int(corpus_index)].get("author", ""))
+        if not key or key == "unknown author":
+            key = f"__missing_author_{int(corpus_index)}"
         groups[key].append(local_index)
     return [np.asarray(group, dtype=np.int64) for group in groups.values()]
 
@@ -474,13 +476,16 @@ def safe_author_slices(
 ) -> dict:
     seen = []
     for index in indexes:
-        author = book_identity("", items[int(index)].get("author", ""))
+        author = book_author_identity_key(items[int(index)].get("author", ""))
         current_day = records[int(index)][0].date()
-        seen.append(any(
-            records[j][0].date() < current_day
-            and book_identity("", items[j].get("author", "")) == author
-            for j in range(int(index))
-        ))
+        seen.append(
+            bool(author and author != "unknown author")
+            and any(
+                records[j][0].date() < current_day
+                and book_author_identity_key(items[j].get("author", "")) == author
+                for j in range(int(index))
+            )
+        )
     seen = np.asarray(seen, dtype=bool)
     return {
         "author_seen": safe_compare_slice(
