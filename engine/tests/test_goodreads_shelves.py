@@ -608,7 +608,11 @@ def test_discovery_and_digest_exclude_shelves_across_editions_while_shortlist_an
 
         saved_res = client.get("/api/recommendations", params={"status": "saved"})
         assert saved_res.status_code == 200
-        assert [item["id"] for item in saved_res.json()] == [104]
+        assert [item["id"] for item in saved_res.json()] == [104, 105]
+
+        imported_res = client.get("/api/recommendations", params={"status": "imported"})
+        assert imported_res.status_code == 200
+        assert [item["id"] for item in imported_res.json()] == [105]
 
         overview_res = client.get("/api/overview")
         assert overview_res.status_code == 200
