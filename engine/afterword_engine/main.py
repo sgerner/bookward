@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -79,6 +79,7 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    validate_candidate_run_id,
     _impression_precedes,
     _read_label,
     _read_time,
@@ -2142,6 +2143,7 @@ def recommendation_list(
     include_imported: bool = False,
     format_urls: bool = True,
 ):
+    effective_include_imported = include_imported or status in {"saved", "imported", "all"}
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     if recommended_limit is not None and status is None and offset == 0:
@@ -2157,13 +2159,15 @@ def recommendation_list(
                 statuses=("saved", "imported", "new"),
                 limit=None,
                 identity_context=identity_context,
-                include_imported=include_imported,
+                include_imported=effective_include_imported,
             )
         )
     else:
         statuses = (
             ("rejected", "maybe_later")
             if status == "decisions"
+            else ("saved", "imported")
+            if status == "saved" and effective_include_imported
             else None if not status or status == "all" else (status,)
         )
         result = _recommendation_rows(
@@ -2172,7 +2176,7 @@ def recommendation_list(
             limit=limit,
             offset=offset,
             identity_context=identity_context,
-            include_imported=include_imported,
+            include_imported=effective_include_imported,
         )
     for item in result:
         item["genres"] = json.loads(item["genres"] or "[]")
@@ -2184,7 +2188,7 @@ def recommendation_list(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -2195,6 +2199,7 @@ def recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            include_imported=status in {"saved", "imported", "all"},
         )
     for item in values:
         item["recommendation_run_id"] = run_id
@@ -2390,7 +2395,8 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         (f"feedback:{decision_id}",),
     )
     compensation = (
-        "save" if previous_status in {"saved", "imported"}
+        "librarr_import" if previous_status == "imported"
+        else "save" if previous_status == "saved"
         else "reject" if previous_status == "rejected"
         else "maybe_later" if previous_status == "maybe_later"
         else "restore"
@@ -2542,13 +2548,56 @@ def telemetry_events(payload: TelemetryBatchIn):
 def post_telemetry_events(payload: TelemetryBatchIn):
     return telemetry_events(payload)
 
+class LibrarrImportIn(BaseModel):
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+def _record_librarr_import_in_connection(con, candidate_id: int, *, run_id: str | None = None):
+    next_seq = int(
+        con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM recommendation_events").fetchone()[0]
+    )
+    return record_event_in_connection(
+        con,
+        event_key=f"librarr-import:{int(candidate_id)}:{next_seq:08d}",
+        candidate_id=int(candidate_id),
+        event_type="librarr_import",
+        run_id=run_id,
+        source="librarr",
+        label=1.0,
+        label_kind="librarr_import",
+        confidence=0.7,
+    )
+
+
 @app.post("/api/recommendations/{candidate_id}/import")
-async def import_librarr(candidate_id: int):
-    candidate = row("SELECT * FROM candidates WHERE id=?", (candidate_id,))
-    if not candidate: raise HTTPException(404, "Recommendation not found")
+async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    run_id = payload.run_id if payload else None
+    with connect() as con:
+        candidate_row = con.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "Recommendation not found")
+        candidate = dict(candidate_row)
+        try:
+            validate_candidate_run_id(con, candidate_id, run_id)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     key = hashlib.sha256(f"{candidate_id}:{candidate['normalized_key']}".encode()).hexdigest()
     existing = row("SELECT * FROM librarr_imports WHERE idempotency_key=? AND status='complete'", (key,))
-    if existing: return {"id":candidate_id,"status":"imported","remote_id":existing["remote_id"],"duplicate":True}
+    if existing:
+        if candidate["status"] not in {"saved", "imported", "read"}:
+            raise HTTPException(409, "Shortlist this book before importing it")
+        with transaction() as con:
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else str(candidate["status"])
+            if current_status != "read":
+                if current_status != "imported":
+                    con.execute(
+                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                        (candidate_id,),
+                    )
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": existing["remote_id"], "duplicate": True}
     if candidate["status"] != "saved": raise HTTPException(409, "Shortlist this book before importing it")
     config = private_settings()
     if not config.get("librarr_url") or not config.get("librarr_api_key"): raise HTTPException(409, "Connect Librarr first")
@@ -2566,10 +2615,16 @@ async def import_librarr(candidate_id: int):
             response.raise_for_status()
             try: data = response.json()
             except ValueError: data = {}
+        remote_id = str(data.get("id", "imported"))
         with transaction() as con:
-            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id,key,str(data.get("id","imported"))))
-            con.execute("UPDATE candidates SET status='imported' WHERE id=?",(candidate_id,))
-        return {"id":candidate_id,"status":"imported","remote_id":str(data.get("id","imported"))}
+            con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
+            current = con.execute("SELECT status FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            current_status = str(current["status"]) if current else "imported"
+            if current_status != "read":
+                con.execute("UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'", (candidate_id,))
+                current_status = "imported"
+                _record_librarr_import_in_connection(con, candidate_id, run_id=run_id)
+        return {"id": candidate_id, "status": current_status, "remote_id": remote_id}
     except (httpx.HTTPError, ValueError) as exc:
         message = safe_error_message(exc, limit=1000)
         with transaction() as con: con.execute("UPDATE librarr_imports SET status='failed',error=?,updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",(message,key))
@@ -2631,50 +2686,44 @@ class LibrarrDownloadIn(BaseModel):
     media_type: str = "audiobook"
     result: dict[str, Any]
     candidate_id: int | None = Field(default=None, gt=0)
+    run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 @app.post("/api/librarr/download")
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
-        candidate = row("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)) if payload.candidate_id else None
-        if payload.candidate_id and not candidate:
-            raise HTTPException(404, "Recommendation not found")
+        with connect() as con:
+            candidate_row = (
+                con.execute("SELECT id,status FROM candidates WHERE id=?", (payload.candidate_id,)).fetchone()
+                if payload.candidate_id
+                else None
+            )
+            if payload.candidate_id and not candidate_row:
+                raise HTTPException(404, "Recommendation not found")
+            candidate = dict(candidate_row) if candidate_row else None
+            validate_candidate_run_id(con, int(candidate["id"]) if candidate else None, payload.run_id)
         encoded = json.dumps(payload.result, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{media}:{encoded}".encode()).hexdigest()
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         result = await librarr_download(config, payload.result, media, key)
         response: dict[str, Any] = {"ok": True, "media_type": media, "result": result}
         if candidate:
-            status = candidate["status"]
-            if status == "saved":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
+            with transaction() as con:
+                current = con.execute(
+                    "SELECT status FROM candidates WHERE id=?", (candidate["id"],)
+                ).fetchone()
+                status = str(current["status"]) if current else str(candidate["status"])
+                if status != "read":
+                    if status != "imported":
+                        con.execute(
+                            "UPDATE candidates SET status='imported',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='read'",
+                            (candidate["id"],),
+                        )
+                    status = "imported"
+                    _record_librarr_import_in_connection(
+                        con, int(candidate["id"]), run_id=payload.run_id
                     )
-                status = "imported"
-            elif status != "imported":
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE candidates SET status='saved',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (candidate["id"],),
-                    )
-                    feedback_id = con.execute(
-                        "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
-                        (candidate["id"], "save"),
-                    ).lastrowid
-                    record_event_in_connection(
-                        con,
-                        event_key=f"feedback:{feedback_id}",
-                        candidate_id=int(candidate["id"]),
-                        event_type="save",
-                        source="librarr",
-                        label=1.0,
-                        label_kind="explicit_feedback",
-                        confidence=0.9,
-                    )
-                status = "saved"
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
     except ValueError as exc:
@@ -3846,7 +3895,7 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
+    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ):
@@ -3879,8 +3928,8 @@ def api_telemetry_events(payload: TelemetryBatchIn):
 
 
 @api_v1.post("/recommendations/{candidate_id}/import")
-async def api_import_librarr(candidate_id: int):
-    return await import_librarr(candidate_id)
+async def api_import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
+    return await import_librarr(candidate_id, payload)
 
 
 @api_v1.get("/sources")
