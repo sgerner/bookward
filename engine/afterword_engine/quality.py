@@ -1392,12 +1392,46 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         metadata_provider_id = str(candidate.get("_metadata_provider_id") or "")
 
     audited_at = _utc_audit_timestamp()
+    quarantine_retry_status = ""
+    if status == "quarantine" and any(
+        flag in flags
+        for flag in ("catalog_provider_unavailable", "catalog_provider_rate_limited")
+    ):
+        provenance = result.get("metadata_provenance")
+        traces = (
+            provenance.get("fetch_trace", [])
+            if isinstance(provenance, dict)
+            else []
+        )
+        if isinstance(traces, list):
+            for trace in traces:
+                if not isinstance(trace, dict) or trace.get("provider") != "google_books":
+                    continue
+                trace_status = trace.get("status")
+                http_status = trace.get("http_status")
+                if trace_status in {
+                    "rate_limited",
+                    "server_error",
+                    "request_error",
+                    "timeout",
+                    "provider_unavailable",
+                } or (
+                    isinstance(http_status, int)
+                    and (http_status in {408, 429} or http_status >= 500)
+                ):
+                    quarantine_retry_status = "google_books_transient"
+                    break
+                if trace_status == "credential_error" or (
+                    isinstance(http_status, int) and http_status in {400, 401, 403}
+                ):
+                    quarantine_retry_status = "google_books_error"
+
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
             work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
-            metadata_provider_id,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+            metadata_provider_id,metadata_retry_status,audited_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -1412,6 +1446,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             audit_version=excluded.audit_version,
             metadata_provider=CASE WHEN excluded.metadata_provider!='' THEN excluded.metadata_provider ELSE metadata_provider END,
             metadata_provider_id=CASE WHEN excluded.metadata_provider_id!='' THEN excluded.metadata_provider_id ELSE metadata_provider_id END,
+            metadata_retry_status=CASE WHEN excluded.quality_status='accepted' THEN metadata_retry_status ELSE excluded.metadata_retry_status END,
             audited_at=excluded.audited_at,
             updated_at=CURRENT_TIMESTAMP""",
         (
@@ -1429,6 +1464,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             QUALITY_VERSION,
             metadata_provider,
             metadata_provider_id,
+            quarantine_retry_status,
             audited_at,
         ),
     )
