@@ -23,60 +23,51 @@ html:has([data-sticky-shell]) {
 	scroll-margin-block: 4rem;
 }
 
-.header-reflow {
-	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
+@layer components {
+	.header-reflow {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+	}
+
+	.modal-scroll-shell {
+		display: flex;
+		flex-direction: column;
+		max-height: min(44rem, calc(100vh - 2rem));
+		max-height: min(44rem, calc(100dvh - 2rem));
+		overflow: hidden;
+	}
+
+	.modal-scroll-body {
+		min-height: 0;
+		flex: 1 1 auto;
+		overflow-y: auto;
+	}
+
+	.text-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: normal;
+	}
+
+	.url-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
 }
 
-.modal-scroll-shell {
-	display: flex;
-	flex-direction: column;
-	max-height: min(44rem, calc(100vh - 2rem));
-	max-height: min(44rem, calc(100dvh - 2rem));
-	overflow: hidden;
-}
-
-.modal-scroll-body {
-	min-height: 0;
-	flex: 1 1 auto;
-	overflow-y: auto;
-}
-
-.text-reflow {
-	min-width: 0;
-	white-space: normal;
-	overflow-wrap: anywhere;
-	word-break: normal;
-}
-
-.url-reflow {
-	min-width: 0;
-	white-space: normal;
-	overflow-wrap: anywhere;
-	word-break: break-word;
-}
-
-.btn:not(.btn-icon) {
+@utility btn-reflow {
 	max-width: 100%;
 	height: auto;
 	white-space: normal;
 	overflow-wrap: break-word;
 	text-align: center;
 	line-height: 1.25;
-}
 
-.badge:not(.badge-icon):not(.badge-dot) {
-	max-width: 100%;
-	height: auto;
-	white-space: normal;
-	overflow-wrap: break-word;
-	text-align: center;
-	line-height: 1.25;
-}
-
-.btn > :where(svg),
-.btn-icon > :where(svg),
-.badge > :where(svg) {
-	flex-shrink: 0;
+	& > :where(svg) {
+		flex-shrink: 0;
+	}
 }

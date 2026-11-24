@@ -26,9 +26,29 @@
 	let theme = $state<SkeletonThemeName>(DEFAULT_THEME);
 	let mode = $state<ThemeMode>(DEFAULT_MODE);
 	let appearanceOpen = $state(false);
+	let compactStyle = $state('');
 	let pickerRoot = $state<HTMLDivElement | null>(null);
 	let appearanceButton = $state<HTMLButtonElement | null>(null);
 	let closeButton = $state<HTMLButtonElement | null>(null);
+
+	function updateCompactBounds() {
+		if (!compact || !pickerRoot || typeof window === 'undefined') {
+			compactStyle = '';
+			return;
+		}
+		const headerEl = pickerRoot.closest('header');
+		if (!headerEl) {
+			compactStyle = '';
+			return;
+		}
+		const headerRect = headerEl.getBoundingClientRect();
+		const topOffset = Math.max(80, Math.ceil(headerRect.height + 12));
+		const availableHeight = Math.max(
+			160,
+			Math.floor(window.innerHeight - Math.max(0, headerRect.top) - topOffset - 16),
+		);
+		compactStyle = `top: ${topOffset}px; max-height: min(42rem, ${availableHeight}px);`;
+	}
 
 	async function chooseTheme(nextTheme: SkeletonThemeName) {
 		try {
@@ -49,12 +69,15 @@
 
 	function closeAppearance(restoreFocus = true) {
 		appearanceOpen = false;
+		compactStyle = '';
 		if (restoreFocus) appearanceButton?.focus();
 	}
 
 	async function openAppearance() {
 		appearanceOpen = true;
+		updateCompactBounds();
 		await tick();
+		updateCompactBounds();
 		closeButton?.focus();
 	}
 
@@ -87,9 +110,23 @@
 			const target = event.target;
 			if (appearanceOpen && pickerRoot && target instanceof Node && !pickerRoot.contains(target)) closeAppearance(false);
 		};
+		const onResize = () => {
+			if (appearanceOpen && compact) updateCompactBounds();
+		};
+		const headerEl = pickerRoot?.closest('header');
+		const headerObserver =
+			typeof ResizeObserver !== 'undefined' && headerEl
+				? new ResizeObserver(() => {
+						if (appearanceOpen && compact) updateCompactBounds();
+					})
+				: null;
+		if (headerEl) headerObserver?.observe(headerEl);
+		window.addEventListener('resize', onResize);
 		window.addEventListener('keydown', onKeydown, true);
 		document.addEventListener('pointerdown', onPointerDown);
 		return () => {
+			headerObserver?.disconnect();
+			window.removeEventListener('resize', onResize);
 			window.removeEventListener('storage', sync);
 			window.removeEventListener('keydown', onKeydown, true);
 			document.removeEventListener('pointerdown', onPointerDown);
@@ -120,7 +157,8 @@
 			aria-label="Appearance"
 			in:fly={{ y: -10, duration: motionDuration(260) }}
 			out:fade={{ duration: motionDuration(180) }}
-			class={`modal-scroll-shell ${compact ? 'fixed right-4 top-4' : 'absolute right-0 top-[calc(100%+0.75rem)]'} z-50 w-[min(24rem,calc(100vw-2rem))] preset-filled-surface-50-950 shadow-xl`}
+			class={`modal-scroll-shell ${compact ? 'fixed right-4 top-20 max-h-[min(42rem,calc(100vh-6rem))] max-h-[min(42rem,calc(100dvh-6rem))]' : 'absolute right-0 top-[calc(100%+0.75rem)] max-h-[min(42rem,calc(100vh-2rem))] max-h-[min(42rem,calc(100dvh-2rem))]'} z-50 w-[min(24rem,calc(100vw-2rem))] preset-filled-surface-50-950 shadow-xl`}
+			style={compact ? compactStyle : undefined}
 		>
 			<div class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-300-700/40 p-4 pb-3 sm:p-5 sm:pb-4">
 				<div class="min-w-0">
