@@ -146,6 +146,19 @@ describe('Librarr modal state helpers', () => {
       candidate_id: 42,
       result: unlabelledResult,
     });
+    expect(
+      buildLibrarrDownloadPayload(searchedMediaType, unlabelledResult, 42, '  run_abcd1234  '),
+    ).toEqual({
+      media_type: 'audiobook',
+      candidate_id: 42,
+      run_id: 'run_abcd1234',
+      result: unlabelledResult,
+    });
+    expect(buildLibrarrDownloadPayload(searchedMediaType, unlabelledResult, 42, 'short')).toEqual({
+      media_type: 'audiobook',
+      candidate_id: 42,
+      result: unlabelledResult,
+    });
   });
 
   it('triggers a search on format switches for valid queries and resets short queries to idle', () => {
