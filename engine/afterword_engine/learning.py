@@ -46,7 +46,7 @@ EVENT_TYPES = {
     "restore",
     "read",
 }
-HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv"})
+HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv", "storygraph_csv"})
 EVENT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 MAX_METADATA_BYTES = 4096
@@ -196,6 +196,17 @@ def _run_impression(con, run_id: str, candidate_id: int):
     ).fetchone()
 
 
+def validate_candidate_run_id(con, candidate_id: int | None, run_id: str | None) -> str | None:
+    if run_id is None:
+        return None
+    _validate_identifier(run_id, "recommendation run")
+    if candidate_id is None or int(candidate_id) <= 0 or not _candidate_exists(con, int(candidate_id)):
+        raise ValueError("Recommendation not found")
+    if _run_impression(con, run_id, int(candidate_id)) is None:
+        raise ValueError("Recommendation run does not contain this candidate")
+    return run_id
+
+
 def _existing_event_matches(
     existing,
     *,
@@ -315,6 +326,17 @@ def record_event_in_connection(
         (event_key,),
     ).fetchone()
     read_value_changed = False
+    active_import = None
+    if not existing and event_type == "librarr_import":
+        latest_lifecycle = con.execute(
+            "SELECT id,event_key,run_id,event_type FROM recommendation_events "
+            "WHERE candidate_id=? AND event_type IN "
+            "('save','reject','maybe_later','restore','read','librarr_import') "
+            "ORDER BY datetime(occurred_at) DESC, id DESC LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        if latest_lifecycle and latest_lifecycle["event_type"] == "librarr_import":
+            active_import = latest_lifecycle
     if existing:
         if not _existing_event_matches(
             existing,
@@ -333,6 +355,17 @@ def record_event_in_connection(
                 (value, timestamp, event_id),
             )
             read_value_changed = True
+    elif active_import is not None:
+        event_id = int(active_import["id"])
+        event_key = str(active_import["event_key"])
+        if active_import["run_id"] is None and run_id is not None:
+            con.execute(
+                "UPDATE recommendation_events SET run_id=? WHERE id=?",
+                (run_id, event_id),
+            )
+        else:
+            run_id = active_import["run_id"] or run_id
+        duplicate = True
     else:
         cursor = con.execute(
             "INSERT INTO recommendation_events(event_key,run_id,candidate_id,event_type,value,source,occurred_at,metadata) "
@@ -373,18 +406,35 @@ def record_event_in_connection(
         confidence = 0.5 if confidence is None else float(confidence)
         if not 0 <= confidence <= 1:
             raise ValueError("Outcome confidence must be between 0 and 1")
-        impression = _find_latest_impression(con, candidate_id, run_id)
-        outcome_at = utc_now()
-        outcome_status = _record_outcome(
-            con,
-            impression_id=int(impression["id"]) if impression else None,
-            event_id=event_id,
-            read_id=read_id,
-            label=float(label),
-            label_kind=label_kind or event_type,
-            confidence=confidence,
-            attributed_at=outcome_at,
-        )
+        if (
+            active_import is not None
+            and con.execute(
+                "SELECT 1 FROM recommendation_outcomes WHERE event_id=? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            is not None
+        ):
+            impression = None
+            outcome_status = "unchanged"
+        else:
+            impression = _find_latest_impression(con, candidate_id, run_id)
+            outcome_at = utc_now()
+            outcome_status = _record_outcome(
+                con,
+                impression_id=int(impression["id"]) if impression else None,
+                event_id=event_id,
+                read_id=read_id,
+                label=float(label),
+                label_kind=label_kind or event_type,
+                confidence=confidence,
+                attributed_at=outcome_at,
+            )
+            if archived_revision is None and active_import is not None and outcome_status in {"created", "updated"}:
+                rev_row = con.execute(
+                    "SELECT MAX(id) id FROM recommendation_evidence_events WHERE event_key=?",
+                    (event_key,),
+                ).fetchone()
+                archived_revision = int(rev_row["id"]) if rev_row and rev_row["id"] is not None else None
         if (
             archived_revision is not None
             and impression is not None
