@@ -1966,7 +1966,7 @@ def _recommendation_rows(
         " ORDER BY COALESCE(unixepoch(active_decision_at,'subsec'),0) DESC,"
         "active_decision_at DESC,active_decision_id DESC,c.score DESC,c.id DESC"
         if is_decision_archive
-        else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+        else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC, c.id DESC"
     )
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
