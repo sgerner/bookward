@@ -22,7 +22,12 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .config import settings
-from .identity import book_author_identity_key, book_catalog_title_identity_key, canonical_part
+from .identity import (
+    book_author_identity_key,
+    book_catalog_title_identity_key,
+    book_openlibrary_work_id,
+    canonical_part,
+)
 from .isbn import canonical_isbn, isbn_parts
 from .security import safe_error_message
 from .subjects import normalize_subjects
@@ -50,6 +55,8 @@ KNOWN_COVER_HOSTS = frozenset(
         "placehold.co",
     }
 )
+_KNOWN_COVER_HOST_SUFFIXES = tuple(f".{suffix}" for suffix in KNOWN_COVER_HOSTS)
+_HTTPX_URL_TYPE = httpx.URL
 
 METADATA_USER_AGENT = "Bookward/0.1 (+self-hosted book recommender)"
 METADATA_NORMALIZATION_VERSION = "catalog-metadata-v1"
@@ -235,17 +242,53 @@ def metadata_client() -> httpx.AsyncClient:
     )
 
 
+def _parse_cover_url(value: object) -> httpx.URL | None:
+    if isinstance(value, _HTTPX_URL_TYPE):
+        return value
+    if not value:
+        return None
+    try:
+        return httpx.URL(str(value))
+    except Exception:
+        return None
+
+
+def _is_weak_parsed_cover_url(parsed: httpx.URL | None) -> bool:
+    if parsed is None:
+        return False
+    host = (parsed.host or "").casefold().rstrip(".")
+    return (
+        host == "covers.openlibrary.org"
+        and parsed.path.casefold().startswith("/b/isbn/")
+    ) or host == "placehold.co"
+
+
 def is_weak_cover_url(value: object) -> bool:
     """Identify known placeholder cover URLs that should be retried."""
 
-    try:
-        parsed = httpx.URL(str(value))
-    except Exception:
-        return False
-    return (
-        parsed.host == "covers.openlibrary.org"
-        and parsed.path.casefold().startswith("/b/isbn/")
-    ) or parsed.host == "placehold.co"
+    return _is_weak_parsed_cover_url(_parse_cover_url(value))
+
+
+def _safe_parsed_cover_url(parsed: httpx.URL | None, source_url: str = "") -> str:
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or not parsed.host
+        or parsed.username
+        or parsed.password
+    ):
+        return ""
+    host = parsed.host.casefold().rstrip(".")
+    known = host in KNOWN_COVER_HOSTS or host.endswith(_KNOWN_COVER_HOST_SUFFIXES)
+    if not known:
+        source = _parse_cover_url(source_url)
+        source_host = (source.host or "").casefold().rstrip(".") if source else ""
+        if host != source_host:
+            return ""
+    # Fragments are never sent to the image server and can carry misleading
+    # state; remove them before serializing the URL returned to the browser.
+    serialized = str(parsed)
+    return str(parsed.copy_with(fragment=None)) if "#" in serialized else serialized
 
 
 def safe_cover_url(value: object, source_url: str = "") -> str:
@@ -257,21 +300,14 @@ def safe_cover_url(value: object, source_url: str = "") -> str:
     parameters are allowed because Google Books uses them for image variants.
     """
 
-    try:
-        parsed = httpx.URL(str(value))
-        source = httpx.URL(source_url) if source_url else None
-    except Exception:
+    return _safe_parsed_cover_url(_parse_cover_url(value), source_url)
+
+
+def _usable_cover_url(supplied: object, source_url: str = "") -> str:
+    parsed = _parse_cover_url(supplied)
+    if parsed is None or _is_weak_parsed_cover_url(parsed):
         return ""
-    if parsed.scheme != "https" or not parsed.host or parsed.username or parsed.password:
-        return ""
-    host = parsed.host.casefold().rstrip(".")
-    source_host = (source.host or "").casefold().rstrip(".") if source else ""
-    known = host in KNOWN_COVER_HOSTS or any(host.endswith(f".{suffix}") for suffix in KNOWN_COVER_HOSTS)
-    if not known and host != source_host:
-        return ""
-    # Fragments are never sent to the image server and can carry misleading
-    # state; remove them before serializing the URL returned to the browser.
-    return str(parsed.copy_with(fragment=None))
+    return _safe_parsed_cover_url(parsed, source_url)
 
 
 def placeholder_cover_url(title: str, author: str) -> str:
@@ -297,18 +333,25 @@ def cover_url_from_open_library(cover_id: object) -> str:
     return f"https://covers.openlibrary.org/b/id/{identifier}-L.jpg"
 
 
-def canonical_book_source_url(title: str, author: str, source_url: object = "") -> str:
+def canonical_book_source_url(
+    title: str,
+    author: str,
+    source_url: object = "",
+    item: object = None,
+) -> str:
     """Return a durable public book link for recommendation cards.
 
     Open Library's ISBN route is only resolvable when that exact ISBN exists in
     its catalog. Upcoming-book feeds frequently publish provisional ISBNs, so
     those links become dead 404s even though the title is searchable. Reader
-    list pages identify a recommendation source but not the individual book.
-    Use the public search route for both cases; it remains useful if metadata
-    is eventually added and never requires a network lookup during rendering.
+    list pages identify a recommendation source but not the individual book;
+    promote them to a verified Open Library work page when available, or fall
+    back to the public search route.
     """
 
     value = str(source_url or "").strip()
+    if not value:
+        return ""
     try:
         parsed = urlparse(value)
     except ValueError:
@@ -321,6 +364,10 @@ def canonical_book_source_url(title: str, author: str, source_url: object = "") 
     )
     path = parsed.path.casefold() if parsed else ""
     is_list_page = path.startswith("/people/") and "/lists/" in path
+    if is_openlibrary and is_list_page and item is not None:
+        work_url = book_openlibrary_work_id(item)
+        if work_url:
+            return f"{OPEN_LIBRARY_WEB}{work_url}"
     if is_openlibrary and (path.startswith("/isbn/") or is_list_page):
         params = urlencode({"title": title[:300], "author": author[:200]})
         return f"{OPEN_LIBRARY_WEB}/search?{params}"
@@ -818,7 +865,7 @@ async def resolve_book_metadata(
     the same ISBN and the title and author also match.
     """
 
-    supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
+    supplied_url = _usable_cover_url(supplied, source_url)
     source_isbn13, source_isbn10 = isbn_parts(isbn13, isbn10)
     source_genres = _catalog_genres(genres, limit=METADATA_GENRE_LIMIT)
     result: dict[str, object] = {
@@ -1257,8 +1304,7 @@ async def resolve_openlibrary_work_metadata(
 def fallback_cover_url(title: str, author: str, supplied: object = "", source_url: str = "") -> str:
     """Synchronous, network-free fallback for API responses and bootstrapping."""
 
-    supplied_url = "" if is_weak_cover_url(supplied) else safe_cover_url(supplied, source_url)
-    return supplied_url or placeholder_cover_url(title, author)
+    return _usable_cover_url(supplied, source_url) or placeholder_cover_url(title, author)
 
 
 async def validate_google_books_api_key(
@@ -1315,4 +1361,3 @@ async def validate_google_books_api_key(
         raise ValueError(
             "Google Books returned an unexpected response while validating the API key."
         )
-
