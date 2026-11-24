@@ -51,3 +51,25 @@ When modifying `engine/pyproject.toml` or updating Python dependencies:
 ## Hygiene and security
 
 - Never commit `.env` files, SQLite database files (`*.db*`, `*.sqlite*`), API keys, webhook URLs, credentials, or `secret.key` files.
+
+## Offline engine test harness and background loops
+
+### `AFTERWORD_ENABLE_BACKGROUND_LOOPS` (`settings.enable_background_loops`)
+
+- `Settings.enable_background_loops` in `engine/afterword_engine/config.py` defaults to `True` (`AFTERWORD_ENABLE_BACKGROUND_LOOPS=true`) so production deployments, Docker containers, and `scripts/community_smoke.py` start `worker_loop`, periodic schedulers (`source_scheduler_loop`, `digest_scheduler_loop`, `goodreads_rss_scheduler_loop`, `backup_scheduler_loop`), and startup catalog backfill jobs automatically.
+- Synchronous startup initialization in `afterword_engine.main:lifespan` — auth registry setup, interrupted restore recovery, legacy and per-profile SQLite initialization, and legacy API token migration — always runs regardless of `enable_background_loops`.
+- When `settings.enable_background_loops` is `False`, `lifespan` skips creating worker/scheduler tasks, skips queuing startup backfill jobs, and skips awaiting background tasks on shutdown.
+
+### Default fixtures in `engine/tests/conftest.py`
+
+Every engine test runs with three autouse fixtures applied before test bodies:
+
+1. `disable_background_loops`: sets `settings.enable_background_loops = False` so `TestClient(app)` initializes schemas without spawning background catalog workers.
+2. `no_real_rate_limit_wait`: stubs `covers._openlibrary_rate_sleep` as a no-op so catalog tests never sleep on the 1-request/sec Open Library rate budget.
+3. `block_non_loopback_sockets`: blocks non-loopback TCP/UDP socket connections (`socket`, `asyncio`, `anyio`, `httpcore`) and raises `ExternalSocketBlockedError` immediately on unmocked external traffic. Loopback addresses (`127.0.0.1`, `::1`, `localhost`), Unix domain sockets (`AF_UNIX`), FastAPI `TestClient` ASGI transports, `httpx.MockTransport`, and `respx` mocks are allowed.
+
+### Per-test overrides
+
+- **Enable background loops**: set `monkeypatch.setattr(settings, "enable_background_loops", True)` before entering `TestClient(app)`, and mock any outbound HTTP calls or worker handlers.
+- **Test rate-limit timing**: override `monkeypatch.setattr(covers, "_openlibrary_rate_sleep", fake_sleep)` and `covers._openlibrary_rate_clock` inside the test body.
+- **Mock external catalogs**: decorate tests with `@respx.mock` or pass `httpx.MockTransport`. When testing `audit_candidates(only_pending=False)` without mocked catalog routes, clear or skip seeded demo rows (`initialize(seed_demo=False)` or `DELETE FROM candidates`) so curated demo entries do not trigger catalog lookups.
