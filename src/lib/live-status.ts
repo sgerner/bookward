@@ -180,7 +180,7 @@ export function formatReadingHistoryStatus({
   if (matchedCount === 0) {
     return hasActiveFilter
       ? "No read books match these filters. Change the search, rating, or source filter to see more books."
-      : "No read books yet. Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here.";
+      : "No read books yet. Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here.";
   }
   return `Showing ${visibleCount} of ${matchedCount} ${matchedCount === 1 ? "book" : "books"}.`;
 }

@@ -59,6 +59,7 @@
     formatReadingHistoryStatus,
     formatRecommendationStatus,
   } from "#lib/live-status.js";
+  import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
     buildLibrarrDownloadPayload,
@@ -760,12 +761,7 @@
     expandedRecommendationDetails = next;
   }
   function readingSourceLabel(source: string) {
-    return ({
-      goodreads_csv: "Goodreads CSV export",
-      goodreads_rss: "Goodreads read shelf RSS",
-      manual: "Added in Bookward",
-      demo: "Demo data",
-    } as Record<string, string>)[source] ?? (source || "Unknown source");
+    return formatReadingSourceLabel(source);
   }
   function formatHistoryDate(value: string | null) {
     if (!value) return "Not provided";
@@ -874,6 +870,7 @@
             (key.startsWith("read-") ||
               key.startsWith("shortlist-read-") ||
               key === "goodreads-rss" ||
+              key === "csv-import" ||
               key === "goodreads-csv")
           ) {
             readingHistory = [];
@@ -1641,6 +1638,9 @@
     librarrSearchError = "";
     librarrSearchMessage = "";
     try {
+      const runId = librarrSearchBook
+        ? String(allBooks.find((book) => book.id === librarrSearchBook?.id)?.recommendation_run_id || "").trim()
+        : "";
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
@@ -1649,6 +1649,7 @@
             librarrSearchedMediaType,
             result,
             librarrSearchBook?.id,
+            runId,
           ),
         ),
       });
@@ -1657,7 +1658,6 @@
       };
       if (!response.ok)
         throw new Error(payload.message || "Librarr could not add that book.");
-      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -2247,14 +2247,16 @@
                         ><BookOpen size={14} /> Mark Read</button>
                       </div>{/if}
                     </div>
-                  {:else if book.status === "saved"}
+                  {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
                       <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
-                      </form>
-                    {:else}
+                      {#if book.status === "saved"}
+                        <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
+                          <ProfileField profileId={data.user?.profile_id} />
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                        </form>
+                      {/if}
+                    {:else if book.status === "saved"}
                       <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
@@ -2264,20 +2266,10 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    {#if book.status === "saved"}
-                      <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
-                      </form>
-                    {/if}
-                  {:else if book.status === "imported"}
-                    <button
-                      in:fly={{ y: 8, duration: motionDuration(180) }}
-                      type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
-                      aria-label={`Mark Read: ${book.title} by ${book.author}`}
-                      onclick={() => openMarkRead(book)}
-                    ><Check size={15} /> Mark Read</button>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
+                    </form>
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -2454,7 +2446,7 @@
                 <span class="grid size-12 place-items-center rounded-full preset-tonal-primary"><BookOpen size={22} /></span>
                 <div>
                   <h2 class="font-semibold text-surface-950-50">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "No read books match these filters" : "No read books yet"}</h2>
-                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads CSV or read-shelf feed in Settings to see your reading history here."}</p>
+                  <p class="mt-1 max-w-md text-sm leading-6 text-surface-700-300">{filter || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all" ? "Change the search, rating, or source filter to see more books." : "Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here."}</p>
                 </div>
               </div>
             {/if}
@@ -3048,9 +3040,9 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
-                action="?/importGoodreadsCsv"
+                action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("goodreads-csv")}
+                use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex items-center justify-between gap-4">
@@ -3062,7 +3054,7 @@
                     <h2
                       class="truncate text-lg font-semibold text-surface-950-50"
                     >
-                      Goodreads export
+                      CSV library export
                     </h2>
                   </div>
                   <span class="badge shrink-0 preset-tonal-surface"
@@ -3070,11 +3062,11 @@
                   >
                 </div>
                 <p class="mt-1 text-sm leading-6 text-surface-700-300">
-                  Import the books on your Goodreads read shelf, with their ratings and read dates.
+                  Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
                   class="mt-5 block text-sm font-medium text-surface-800-200"
-                  >Goodreads CSV<input
+                  >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
                     type="file"
@@ -3084,9 +3076,9 @@
                 ><button
                   class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
-                  disabled={isPending("goodreads-csv")}
-                  aria-busy={isPending("goodreads-csv")}
-                  >{#if isPending("goodreads-csv")}<RefreshCw
+                  disabled={isPending("csv-import")}
+                  aria-busy={isPending("csv-import")}
+                  >{#if isPending("csv-import")}<RefreshCw
                       size={16}
                       class="animate-spin"
                     />{:else}<Upload size={16} />{/if} Import CSV</button

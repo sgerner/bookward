@@ -197,6 +197,17 @@ describe("status message formatters", () => {
     ).toBe(
       "No read books match these filters. Change the search, rating, or source filter to see more books.",
     );
+
+    expect(
+      formatReadingHistoryStatus({
+        state: "ready",
+        visibleCount: 0,
+        matchedCount: 0,
+        hasActiveFilter: false,
+      }),
+    ).toBe(
+      "No read books yet. Import a Goodreads or StoryGraph CSV, or a Goodreads read-shelf feed, in Settings to see your reading history here.",
+    );
   });
 
   it("formats models.dev catalog loads and provider/model filter counts", () => {
