@@ -101,7 +101,7 @@
 							<span id="password-help" class="text-sm font-normal leading-6 text-surface-700-300">Use at least 12 characters.</span>
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="login-submit btn group min-h-12 w-full justify-between preset-filled-primary-500" type="submit" disabled={submitting} aria-busy={submitting}>
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
 							<span>{submitting ? 'Creating administrator…' : 'Create administrator'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
@@ -123,7 +123,7 @@
 							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="current-password" required />
 						</label>
 						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
-						<button class="login-submit btn group min-h-12 w-full justify-between preset-filled-primary-500" type="submit" disabled={submitting} aria-busy={submitting}>
+						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
 							<span>{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
@@ -144,19 +144,11 @@
 
 <style>
 	.login-page {
-		background-color: var(--color-surface-50-950);
-	}
-
-	.login-page::before {
-		content: '';
-		position: absolute;
-		inset: 0;
-		z-index: -1;
-		pointer-events: none;
 		background:
 			radial-gradient(ellipse at 12% 4%, color-mix(in oklab, var(--color-primary-500) 30%, transparent), transparent 35%),
 			radial-gradient(ellipse at 88% 8%, color-mix(in oklab, var(--color-secondary-500) 26%, transparent), transparent 33%),
-			radial-gradient(ellipse at 52% 100%, color-mix(in oklab, var(--color-tertiary-500) 23%, transparent), transparent 43%);
+			radial-gradient(ellipse at 52% 100%, color-mix(in oklab, var(--color-tertiary-500) 23%, transparent), transparent 43%),
+			var(--color-surface-50-950);
 	}
 
 	.login-card {
@@ -172,6 +164,8 @@
 
 	.login-submit {
 		border: 1px solid color-mix(in oklab, var(--color-primary-500) 70%, transparent);
+		background: linear-gradient(110deg, var(--color-primary-500), var(--color-secondary-500) 58%, var(--color-tertiary-500));
+		color: var(--color-primary-contrast-500);
 		box-shadow: 0 10px 28px color-mix(in oklab, var(--color-primary-500) 28%, transparent);
 		transition: filter 160ms ease, box-shadow 160ms ease, transform 160ms ease;
 	}

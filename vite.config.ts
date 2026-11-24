@@ -1,11 +1,19 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig, type Plugin } from 'vitest/config';
 import tailwindcss from '@tailwindcss/vite';
 import adapter from '@sveltejs/adapter-node';
 import { sveltekit } from '@sveltejs/kit/vite';
+// Pure Node/TS calibration math (zero `$app`/`$env` runtime imports); housed under
+// `src/lib/server/` so SvelteKit's compiler boundary blocks client-bundle imports.
 import { calibrateThemeStylesheet } from './src/lib/server/theme-contrast.js';
 
+const CONFIG_DIR = dirname(fileURLToPath(import.meta.url));
+const SKELETON_THEMES_DIR = join(
+	CONFIG_DIR,
+	'node_modules/@skeletonlabs/skeleton/src/themes',
+);
 const SKELETON_THEME_SPECIFIER_RE = /^@skeletonlabs\/skeleton\/themes\/([a-z0-9-]+)\?raw$/;
 const SKELETON_RAW_THEME_PATH_RE =
 	/[/\\]@skeletonlabs[/\\]skeleton[/\\]src[/\\]themes[/\\]([a-z0-9-]+)\.css\?raw(?:&.*)?$/;
@@ -28,11 +36,7 @@ function calibratedSkeletonThemes(): Plugin {
 			const theme = id.slice(VIRTUAL_THEME_PREFIX.length);
 			const cached = cache.get(theme);
 			if (cached) return cached;
-			const filePath = join(
-				process.cwd(),
-				'node_modules/@skeletonlabs/skeleton/src/themes',
-				`${theme}.css`,
-			);
+			const filePath = join(SKELETON_THEMES_DIR, `${theme}.css`);
 			this.addWatchFile(filePath);
 			const rawCss = readFileSync(filePath, 'utf8');
 			const calibratedCss = calibrateThemeStylesheet(theme, rawCss);

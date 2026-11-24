@@ -893,9 +893,11 @@ export function calibrateThemeTokens(
 		roleFilled.tertiary.dark.c500,
 	);
 
-	// `--color-surface-contrast-50` is dark foreground text paired with `--color-surface-50`
-	// across both modes (including `preset-filled-surface-950-50` in dark mode), while
-	// `--color-surface-contrast-950` is light foreground text paired with `--color-surface-950`.
+	// `--color-surface-contrast-50` is dark foreground text paired with mode-invariant
+	// `--color-surface-50`, so it is emitted once in `light` (`:root` / `:root[data-theme="<id>"]`)
+	// and intentionally inherited in `.dark` (`dark['--color-surface-contrast-50']` is unset).
+	// Mode-switching foregrounds use `--color-surface-contrast-50-950` and
+	// `--color-surface-contrast-950-50`, which `.dark` overrides explicitly below.
 	const surfaceContrast50 = calibrateAgainstCoreAndExtended(
 		colorOf('--color-surface-contrast-50'),
 		finalLightEnvelope.core,

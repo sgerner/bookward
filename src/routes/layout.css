@@ -6,6 +6,19 @@
 @import '@skeletonlabs/skeleton';
 
 @import '@skeletonlabs/skeleton/themes/cerberus';
+/*
+ * Token ownership boundary:
+ * 1. `./theme-calibration.css` (and Vite-calibrated per-theme stylesheets) owns base
+ *    Skeleton palette/typography tokens (`--color-root-bg-*`, `--color-surface-*`,
+ *    `--color-{primary,secondary,tertiary,success,warning,error}-*`, `--typo-*`) and
+ *    `.preset-tonal-*` descendant inheritance (`--bookward-tonal-fg`) for WCAG 2.2
+ *    SC 1.4.3 (>= 4.5:1) text/tonal/filled contrast (`@layer base` `:root` fallback +
+ *    unlayered `:root[data-theme="<id>"]` overrides).
+ * 2. The unlayered `:root, [data-theme]` block below owns derived semantic control,
+ *    focus-ring, switch, and star-rating tokens (`--control-*`, `--focus-ring-*`,
+ *    `--switch-*`, `--star-*`) for SC 1.4.11 (>= 3:1) and SC 2.4.7, computed from the
+ *    calibrated `--color-*` palette primitives above without colliding on property names.
+ */
 @import './theme-calibration.css';
 
 /* Clear the sticky top header (65px) and mobile bottom nav (65px + safe-area) on keyboard focus (WCAG 2.2 C43). */

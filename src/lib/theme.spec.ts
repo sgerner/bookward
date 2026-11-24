@@ -128,6 +128,10 @@ describe('theme preferences', () => {
 		expect(themeModuleSource).not.toContain('theme-contrast');
 		expect(themeModuleSource).not.toContain('calibrateThemeStylesheet');
 
+		const viteConfigSource = readFileSync(join(process.cwd(), 'vite.config.ts'), 'utf8');
+		expect(viteConfigSource).toContain('fileURLToPath(import.meta.url)');
+		expect(viteConfigSource).not.toContain('process.cwd()');
+
 		const stylesheetPath = join(process.cwd(), 'src/routes/layout.css');
 		const stylesheet = readFileSync(stylesheetPath, 'utf8');
 		const appHtml = readFileSync(join(process.cwd(), 'src/app.html'), 'utf8');
@@ -179,7 +183,7 @@ describe('theme preferences', () => {
 		expect(compiled).not.toContain('[data-scope=');
 	});
 
-	it('calibrates every Skeleton palette and :root fallback to WCAG 2.2 G18 4.5:1 across solid and translucent mixes (10%-30%)', () => {
+	it('calibrates every Skeleton palette and :root fallback to WCAG 2.2 G18 4.5:1 across solid and translucent mixes (5%-30%)', () => {
 		const palettes = [
 			{ id: 'root', raw: DEFAULT_SKELETON_ROOT_TOKENS },
 			...THEMES.map((theme) => ({
@@ -222,8 +226,15 @@ describe('theme preferences', () => {
 				const secondary500 = parseCssColor(active['--color-secondary-500']);
 				const tertiary500 = parseCssColor(active['--color-tertiary-500']);
 
-				// Assert single-shade and dual-shade surface contrast tokens in both light and dark modes
-				// (specifically guarding dark-mode `--color-surface-contrast-50` inheritance).
+				// Note: `--color-surface-contrast-50` is set only in the base/light rule block
+				// (`calibrated.light`) and never set in `.dark` (`calibrated.dark['--color-surface-contrast-50']`
+				// is undefined), so the dark assertion below verifies the inherited light value against
+				// mode-invariant `--color-surface-50` (while `--color-surface-contrast-50-950` and
+				// `--color-surface-contrast-950-50` switch in `.dark`).
+				expect(calibrated.dark['--color-surface-contrast-50']).toBeUndefined();
+				expect(active['--color-surface-contrast-50']).toBe(
+					calibrated.light['--color-surface-contrast-50'],
+				);
 				expect(
 					contrastRatio(parseCssColor(active['--color-surface-contrast-50']), surface50),
 					`${palette.id}/${mode} --color-surface-contrast-50 on surface-50`,
@@ -244,10 +255,17 @@ describe('theme preferences', () => {
 					`${palette.id}/${mode} --color-surface-contrast-950-50 on surface-950-50`,
 				).toBeGreaterThanOrEqual(4.5);
 
-				// Solid surfaces + real translucent card/modal/callout/login mixes beyond 5-8%:
+				// Solid surfaces + 5%-8% envelope + real translucent card/modal/callout/login mixes (10%-30%):
 				const backgroundMixes: Array<[string, ReturnType<typeof parseCssColor>]> = [
 					['surface-50-950', surfaceBg],
 					['root-bg', rootBg],
+					['color-mix (5% opposite surface oklab)', mixOklab(surfaceBg, oppositeSurfaceBg, 0.05)],
+					['bg-surface-950-50/5 (srgb)', mixSrgbAlpha(surfaceBg, oppositeSurfaceBg, 0.05)],
+					['bg-primary-500/5', mixSrgbAlpha(surfaceBg, primary500, 0.05)],
+					['bg-secondary-500/5', mixSrgbAlpha(surfaceBg, secondary500, 0.05)],
+					['bg-tertiary-500/5', mixSrgbAlpha(surfaceBg, tertiary500, 0.05)],
+					['bg-surface-950-50/8 (srgb)', mixSrgbAlpha(surfaceBg, oppositeSurfaceBg, 0.08)],
+					['bg-primary-500/8', mixSrgbAlpha(surfaceBg, primary500, 0.08)],
 					['preset-tonal (10% oklab)', mixOklab(surfaceBg, oppositeSurfaceBg, 0.1)],
 					['bg-surface-950-50/10 (srgb)', mixSrgbAlpha(surfaceBg, oppositeSurfaceBg, 0.1)],
 					['bg-primary-500/15', mixSrgbAlpha(surfaceBg, primary500, 0.15)],
@@ -314,6 +332,8 @@ describe('theme preferences', () => {
 					const tonalFg = parseCssColor(active[`--color-${role}-950-50`]);
 					const tonalMixes: Array<[string, ReturnType<typeof parseCssColor>]> = [
 						['solid tonal', tonalBg],
+						['tonal + 5% primary-500', mixSrgbAlpha(tonalBg, primary500, 0.05)],
+						['tonal + 5% surface-950-50', mixSrgbAlpha(tonalBg, oppositeSurfaceBg, 0.05)],
 						['tonal + 15% primary-500', mixSrgbAlpha(tonalBg, primary500, 0.15)],
 						['tonal + 15% secondary-500', mixSrgbAlpha(tonalBg, secondary500, 0.15)],
 						['tonal + 10% surface-950-50', mixSrgbAlpha(tonalBg, oppositeSurfaceBg, 0.1)],
@@ -502,7 +522,10 @@ describe('theme preferences', () => {
 				themeColor: THEME_COLORS.sahara.light,
 				themeCss: expect.stringContaining(':root[data-theme="sahara"].dark {'),
 			});
-			const saharaDarkVars = parseEmittedThemeStylesheetVars(saharaResult.themeCss!, 'dark');
+			if (!saharaResult || typeof saharaResult.themeCss !== 'string') {
+				throw new Error('Expected calibrated Sahara SSR CSS');
+			}
+			const saharaDarkVars = parseEmittedThemeStylesheetVars(saharaResult.themeCss, 'dark');
 			expect(oklchToHex(saharaDarkVars['--color-root-bg-dark'])).toBe(THEME_COLORS.sahara.dark);
 
 			const invalidCookieResult = await loadRootLayout({

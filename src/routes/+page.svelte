@@ -2682,8 +2682,8 @@
             <div class="flex items-start gap-3">
               <span class="grid size-10 shrink-0 place-items-center preset-filled-secondary-500"><Bell size={18} /></span>
               <div>
-                <p class="font-semibold">Your weekly picks are ready</p>
-                <p class="mt-1 text-sm leading-6">Select the books you want to keep, then add them to your shortlist in one step.</p>
+                <p class="font-semibold text-surface-950-50">Your weekly picks are ready</p>
+                <p class="mt-1 text-sm leading-6 text-surface-700-300">Select the books you want to keep, then add them to your shortlist in one step.</p>
               </div>
             </div>
             <div class="flex flex-wrap gap-2 sm:shrink-0">
@@ -2747,7 +2747,7 @@
                 </button>
               </div>
               <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
-              <div class={`flex flex-wrap items-center gap-2 text-xs font-medium sm:text-sm ${view === "decisions" ? "" : "text-surface-600-400"}`}>
+              <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   {#if view === "discover" && digestVisible && book.status === "recommended"}
                     <label class="grid size-8 shrink-0 cursor-pointer place-items-center preset-filled-surface-50-950 opacity-90 shadow-lg sm:absolute sm:left-3 sm:top-3 sm:z-30" title={`Select ${book.title}`}>
                       <input
@@ -2776,11 +2776,11 @@
                     >{/if}
                 </div>
                 <div>
-                  <h2 class={`text-2xl font-semibold tracking-tight sm:text-3xl ${view === "decisions" ? "" : "text-surface-950-50"}`}>{book.title}</h2>
-                  <p class={`mt-1 text-base ${view === "decisions" ? "" : "text-surface-700-300"}`}>{book.author}</p>
+                  <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
                 <details
-                  class={`group/details text-base ${view === "decisions" ? "" : "text-surface-700-300"}`}
+                  class="group/details text-base text-surface-700-300"
                   open={expandedRecommendationDetails.has(book.id)}
                   ontoggle={(event) => {
                     const open = (event.currentTarget as HTMLDetailsElement).open;
@@ -2789,14 +2789,14 @@
                     if (open !== isExpanded) toggleRecommendationDetails(book.id);
                   }}
                 >
-                  <summary class={`flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium ${view === "decisions" ? "" : "text-primary-600-400"}`}>
+                  <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
                     <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
                   {#if expandedRecommendationDetails.has(book.id)}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
                       <p class="mt-2 leading-6">{book.reason}</p>
                       {#if book.synopsis}<div class="mt-4 border-l-2 border-secondary-500/50 pl-3">
-                          <p class={`text-xs font-semibold uppercase tracking-[0.16em] ${view === "decisions" ? "" : "text-secondary-600-400"}`}>Book summary</p>
-                          <p class={`mt-1 leading-6 ${view === "decisions" ? "" : "text-surface-800-200"}`}>{book.synopsis}</p>
+                          <p class="text-xs font-semibold uppercase tracking-[0.16em] text-secondary-600-400">Book summary</p>
+                          <p class="mt-1 leading-6 text-surface-800-200">{book.synopsis}</p>
                         </div>{/if}
                     </div>{/if}
                 </details>
@@ -2967,9 +2967,9 @@
                     <div class="flex items-start gap-3">
                       <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
                       <div class="min-w-0 flex-1">
-                        <h2 class="line-clamp-2 font-semibold leading-5">{item.title}</h2>
-                        <p class="mt-1 truncate text-sm">{item.author}</p>
-                        <p class="mt-2 text-xs">Bookward score <span class="font-semibold">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
+                        <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
+                        <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                        <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
                       <div class="flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
@@ -2990,7 +2990,7 @@
                       }}
                     >
                       <summary
-                        class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-left text-sm font-medium [&::-webkit-details-marker]:hidden"
+                        class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-left text-sm font-medium text-primary-600-400 [&::-webkit-details-marker]:hidden"
                         aria-label={`Reading details for ${item.title} by ${item.author}`}
                       >
                         <span>Reading details</span>
@@ -2998,28 +2998,28 @@
                       </summary>
                       <div class="pt-2">
                         <dl class="grid gap-2 text-xs">
-                          <div class="flex justify-between gap-3"><dt class="font-medium">Imported from</dt><dd class="text-right">{readingSourceLabel(item.source)}</dd></div>
-                          <div class="flex justify-between gap-3"><dt class="font-medium">Read date</dt><dd class="text-right">{formatHistoryDate(item.read_at)}</dd></div>
-                          <div class="flex justify-between gap-3"><dt class="font-medium">Added to Bookward</dt><dd class="text-right">{formatHistoryDate(item.created_at)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
                         </dl>
                         <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
                           {#if item.algorithm_score !== null}
-                            <p class="font-semibold">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
-                            <p class="mt-1">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
+                            <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
+                            <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
                             {#if item.algorithm_explanation.length}
-                              <ul class="mt-2 list-disc space-y-1 pl-4">
+                              <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
                                 {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
                               </ul>
                             {:else}
-                              <p class="mt-2">There are not yet other rated reads to compare with this title.</p>
+                              <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
                             {/if}
                           {:else}
-                            <p>Bookward could not calculate a current profile score. Try again later.</p>
+                            <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
                           {/if}
                           {#if item.rank_score !== null}
-                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
                           {:else}
-                            <p class="mt-3 border-t border-surface-300-700/40 pt-3">Bookward had not previously recommended this title.</p>
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
                           {/if}
                         </div>
                       </div>
@@ -3134,7 +3134,7 @@
                         }}
                       >
                         {option.label}
-                        <span class="ml-1 tabular-nums">{option.count}</span>
+                        <span class="ml-1 opacity-70">{option.count}</span>
                       </button>
                     {/each}
                   </div>
@@ -3597,7 +3597,7 @@
                   <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
                 {/if}
 
-                <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6">
+                <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
                   Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
                 </p>
 
@@ -3949,13 +3949,13 @@
                   <div class="flex w-full items-start gap-3">
                     <TriangleAlert
                       size={22}
-                      class="mt-0.5 shrink-0"
+                      class="mt-0.5 shrink-0 text-warning-600-400"
                     />
                     <div class="min-w-0 flex-1">
-                      <p class="text-base font-semibold">
+                      <p class="text-base font-semibold text-surface-950-50">
                         Changing providers usually requires a full rebuild
                       </p>
-                      <p class="mt-1 text-sm leading-6">
+                      <p class="mt-1 text-sm leading-6 text-surface-800-200">
                         Embeddings are not compatible between models. Rebuild
                         the entire database after changing providers or models
                         before scoring new books.
@@ -4816,7 +4816,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3" aria-live="polite">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
