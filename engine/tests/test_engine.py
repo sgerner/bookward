@@ -4088,17 +4088,48 @@ def test_switching_scanned_one_time_source_to_permanent_reenqueues_and_scans(
     database, monkeypatch
 ):
     monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    monkeypatch.setattr(
         main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=2)
     )
     with transaction() as con:
         source_id = con.execute(
-            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
-            "VALUES(?,?,1,'one_time','ok:2','2026-01-01T00:00:00+00:00')",
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at,last_attempted_at) "
+            "VALUES(?,?,1,'one_time','ok:2','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')",
             ("Promoted Feed", "https://books.example.test/promoted.xml"),
         ).lastrowid
 
     skipped = asyncio.run(handle_job(f"source:{source_id}"))
     assert skipped == {"skipped": "already_scanned", "source_id": source_id}
+
+    client = TestClient(app, headers=authenticated_headers())
+    noop_one_time = client.put(
+        f"/api/sources/{source_id}", json={"lifecycle": "one_time"}
+    )
+    assert noop_one_time.status_code == 200
+    assert noop_one_time.json()["job_id"] is None
+    same_url_rename = client.put(
+        f"/api/sources/{source_id}",
+        json={
+            "name": "Promoted Feed Renamed",
+            "url": "https://books.example.test/promoted.xml",
+        },
+    )
+    assert same_url_rename.status_code == 200
+    assert same_url_rename.json()["job_id"] is None
+    assert row(
+        "SELECT name,last_scanned_at,last_attempted_at FROM sources WHERE id=?",
+        (source_id,),
+    ) == {
+        "name": "Promoted Feed Renamed",
+        "last_scanned_at": "2026-01-01T00:00:00+00:00",
+        "last_attempted_at": "2026-01-01T00:00:00+00:00",
+    }
 
     scanned_urls: list[str] = []
 
@@ -4113,7 +4144,6 @@ def test_switching_scanned_one_time_source_to_permanent_reenqueues_and_scans(
 
     monkeypatch.setattr(main, "scan_source", fake_scan_source)
 
-    client = TestClient(app, headers=authenticated_headers())
     promoted = client.put(
         f"/api/sources/{source_id}", json={"lifecycle": "permanent"}
     )

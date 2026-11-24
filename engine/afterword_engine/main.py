@@ -3396,22 +3396,20 @@ def update_source(source_id: int, payload: SourceUpdateIn):
         if payload.filters is not None:
             updates.append("filters=?")
             values.append(json.dumps(payload.filters.model_dump()))
-        if payload.lifecycle is not None:
-            updates.append("lifecycle=?")
-            values.append(payload.lifecycle)
-
         effective_lifecycle = payload.lifecycle or source["lifecycle"]
         lifecycle_changed = (
             payload.lifecycle is not None
             and payload.lifecycle != source["lifecycle"]
         )
+        if lifecycle_changed:
+            updates.append("lifecycle=?")
+            values.append(payload.lifecycle)
         if url_changed:
             updates.append("last_scanned_at=NULL")
             updates.append("last_attempted_at=NULL")
             updates.append("last_status=NULL")
         elif effective_lifecycle == "one_time" and (
-            normalized_url is not None
-            or payload.filters is not None
+            payload.filters is not None
             or (lifecycle_changed and payload.lifecycle == "one_time")
         ):
             updates.append("last_scanned_at=NULL")
