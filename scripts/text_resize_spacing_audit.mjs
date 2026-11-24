@@ -8,10 +8,10 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,8 +30,27 @@ if (SCREENSHOTS_DIR) mkdirSync(SCREENSHOTS_DIR, { recursive: true });
 if (RESULTS_PATH) mkdirSync(dirname(RESULTS_PATH), { recursive: true });
 
 function findChromeBinary() {
+  const pwRoot = join(homedir(), ".cache/ms-playwright");
+  const pwHeadlessShell = existsSync(pwRoot)
+    ? readdirSync(pwRoot)
+        .filter((name) => name.startsWith("chromium_headless_shell-"))
+        .sort()
+        .reverse()
+        .map((name) =>
+          join(pwRoot, name, "chrome-headless-shell-linux64/chrome-headless-shell"),
+        )
+    : [];
+  const pwCandidates = existsSync(pwRoot)
+    ? readdirSync(pwRoot)
+        .filter((name) => name.startsWith("chromium-"))
+        .sort()
+        .reverse()
+        .map((name) => join(pwRoot, name, "chrome-linux64/chrome"))
+    : [];
   const candidates = [
     process.env.CHROME_BIN,
+    ...pwHeadlessShell,
+    ...pwCandidates,
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/chromium",
@@ -271,6 +290,10 @@ async function seedApplication(origin, mockSourcePort, ephemeralCredential) {
     }),
   });
 
+  await fetch(`${origin}/`, {
+    headers: { cookie, accept: "text/html" },
+  });
+
   return { cookie };
 }
 
@@ -396,7 +419,30 @@ const AUDIT_PAGE_EXPR = `(() => {
   };
 })()`;
 
-async function injectModeCss(cdp, cssText) {
+async function navigateTo(cdp, url) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const loaded = new Promise((resolveLoad) => {
+      const timer = setTimeout(resolveLoad, 5_000);
+      const list = cdp.listeners.get("Page.loadEventFired") ?? [];
+      const onceWrapper = () => {
+        const idx = list.indexOf(onceWrapper);
+        if (idx !== -1) list.splice(idx, 1);
+        clearTimeout(timer);
+        resolveLoad(undefined);
+      };
+      list.push(onceWrapper);
+      cdp.listeners.set("Page.loadEventFired", list);
+    });
+    await cdp.send("Page.navigate", { url });
+    await loaded;
+    await sleep(100);
+    const currentHref = await cdp.eval("location.href").catch(() => "");
+    if (currentHref === url) break;
+  }
+}
+
+async function injectModeCss(cdp, cssText, stepLabel = "") {
+  if (process.env.DEBUG_AUDIT) console.error(`[audit] ${stepLabel}`);
   await cdp.eval(`(() => {
     let tag = document.getElementById('__wcag_audit_style');
     if (!tag) {
@@ -406,7 +452,7 @@ async function injectModeCss(cdp, cssText) {
     }
     tag.textContent = ${JSON.stringify(cssText)};
   })()`);
-  await sleep(80);
+  await sleep(50);
 }
 
 async function captureScreenshot(cdp, filename) {
@@ -504,21 +550,17 @@ async function main() {
     await waitForHttp(`${origin}/login`);
     const { cookie } = await seedApplication(origin, mockPort, readerCredential);
 
-    children.push(
-      spawn(
-        chromeBinary,
-        [
-          "--headless=new",
-          "--no-sandbox",
-          "--disable-gpu",
-          "--disable-dev-shm-usage",
-          `--remote-debugging-port=${debugPort}`,
-          `--user-data-dir=${join(tempDir, "chrome-profile")}`,
-          "about:blank",
-        ],
-        { stdio: "ignore" },
-      ),
-    );
+    const chromeArgs = [
+      ...(chromeBinary.includes("chrome-headless-shell") ? [] : ["--headless=new"]),
+      "--no-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      "--enable-features=NetworkService,NetworkServiceInProcess",
+      `--remote-debugging-port=${debugPort}`,
+      `--user-data-dir=${join(tempDir, "chrome-profile")}`,
+      "about:blank",
+    ];
+    children.push(spawn(chromeBinary, chromeArgs, { stdio: "ignore" }));
 
     await waitForHttp(`http://127.0.0.1:${debugPort}/json/version`);
     const targets = await (
@@ -532,7 +574,12 @@ async function main() {
     await cdp.send("Runtime.enable");
     await cdp.send("Network.enable");
     await cdp.send("Network.setBlockedURLs", {
-      urls: ["*://*.openlibrary.org/*"],
+      urls: [
+        "*://*.openlibrary.org/*",
+        "*://*.google.com/*",
+        "*://*.googleapis.com/*",
+        "*://models.dev/*",
+      ],
     });
     await cdp.send("Emulation.setEmulatedMedia", {
       features: [{ name: "prefers-reduced-motion", value: "reduce" }],
@@ -564,6 +611,9 @@ async function main() {
       url: origin,
       httpOnly: true,
     });
+    await cdp.send("Network.setExtraHTTPHeaders", {
+      headers: { Cookie: cookie },
+    });
 
     const report = {
       generated_at: new Date().toISOString(),
@@ -576,7 +626,7 @@ async function main() {
         width: vp.width,
         height: vp.height,
         deviceScaleFactor: 2,
-        mobile: vp.width < 768,
+        mobile: false,
       });
 
       const activeModes =
@@ -587,9 +637,8 @@ async function main() {
       for (const [modeName, modeCss] of activeModes) {
         const minViewportForZeroOverflow = vp.width >= 320;
 
-        await cdp.send("Page.navigate", { url: `${origin}/` });
-        await sleep(450);
-        await injectModeCss(cdp, modeCss);
+        await navigateTo(cdp, `${origin}/`);
+        await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} discover`);
 
         const discoverRes = await cdp.eval(AUDIT_PAGE_EXPR);
         const singleRowExpectedAt320 =
@@ -635,8 +684,8 @@ async function main() {
           })()`);
 
           if (openedLibrarr) {
-            await sleep(420);
-            await injectModeCss(cdp, modeCss);
+            await sleep(240);
+            await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} librarr`);
             const librarrCheck = await cdp.eval(`(() => {
               const dialog = document.querySelector('dialog[aria-labelledby="librarr-search-title"]');
               const body = dialog?.querySelector('.modal-scroll-body');
@@ -722,7 +771,7 @@ async function main() {
               mrBtn?.click();
             })()`);
             await sleep(200);
-            await injectModeCss(cdp, modeCss);
+            await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} mark_read`);
             const markReadCheck = await cdp.eval(`(() => {
               const dialog = document.querySelector('[aria-labelledby="mark-read-title"]');
               if (!dialog) return { missing: true };
@@ -772,25 +821,29 @@ async function main() {
 
         // Open Profile menu + compact ThemePicker and verify top-20 clears header trigger
         await cdp.eval(`(() => {
-          document.querySelector('button[aria-label="Open profile menu"]')?.click();
+          const btn = document.querySelector('button[aria-label="Open profile menu"]');
+          if (btn && btn.getAttribute('aria-expanded') !== 'true') btn.click();
+        })()`);
+        await sleep(120);
+        await cdp.eval(`(() => {
+          const btn = document.querySelector('button[aria-label="Choose appearance"]');
+          if (btn && btn.getAttribute('aria-expanded') !== 'true') btn.click();
         })()`);
         await sleep(160);
-        await cdp.eval(`(() => {
-          document.querySelector('button[aria-label="Choose appearance"]')?.click();
-        })()`);
-        await sleep(220);
-        await injectModeCss(cdp, modeCss);
+        await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} theme_picker`);
 
         const themeCheck = await cdp.eval(`(() => {
-          const panel = document.getElementById('appearance-panel');
+          const appearanceTrigger = document.querySelector('button[aria-label="Choose appearance"]');
+          const panelId = appearanceTrigger?.getAttribute('aria-controls') || '';
+          const panel = panelId ? document.getElementById(panelId) : null;
           const profileTrigger = document.querySelector('button[aria-label="Open profile menu"]');
-          if (!panel || !profileTrigger) return { missing: true };
+          if (!panel || panel.hasAttribute('hidden') || !profileTrigger) return { missing: true };
           const pr = panel.getBoundingClientRect();
           const tr = profileTrigger.getBoundingClientRect();
           const xOverlap = Math.max(0, Math.min(pr.right, tr.right) - Math.max(pr.left, tr.left));
           const yOverlap = Math.max(0, Math.min(pr.bottom, tr.bottom) - Math.max(pr.top, tr.top));
           const overlapsHeaderTrigger = xOverlap > 1 && yOverlap > 1;
-          const themeGroup = panel.querySelector('[aria-label="Skeleton theme"]');
+          const themeGroup = panel.querySelector('[aria-labelledby="appearance-theme-legend"], [aria-label="Skeleton theme"]');
           const buttons = themeGroup ? Array.from(themeGroup.querySelectorAll('button')) : [];
           const clippedLabels = buttons.filter((btn) => {
             const span = btn.querySelector('.text-reflow');
@@ -842,20 +895,20 @@ async function main() {
         }
 
         await sendEscape(cdp);
+        await sendEscape(cdp);
 
         if (modeName !== "baseline_100" && vp.width >= 375) {
           // Reading History view
-          await cdp.send("Page.navigate", { url: `${origin}/?view=decisions` });
-          await sleep(380);
-          await injectModeCss(cdp, modeCss);
+          await navigateTo(cdp, `${origin}/?view=decisions`);
+          await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} decisions`);
           await cdp.eval(`(() => {
             const readBtn = Array.from(document.querySelectorAll('button')).find(
               (b) => (b.textContent || '').trim().startsWith('Read (')
             );
             readBtn?.click();
           })()`);
-          await sleep(420);
-          await injectModeCss(cdp, modeCss);
+          await sleep(240);
+          await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} history_read`);
           const historyRes = await cdp.eval(AUDIT_PAGE_EXPR);
           report.checks.push({
             viewport: `${vp.width}x${vp.height}`,
@@ -877,9 +930,8 @@ async function main() {
           }
 
           // Sources view
-          await cdp.send("Page.navigate", { url: `${origin}/?view=sources` });
-          await sleep(420);
-          await injectModeCss(cdp, modeCss);
+          await navigateTo(cdp, `${origin}/?view=sources`);
+          await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} sources`);
           const sourcesRes = await cdp.eval(AUDIT_PAGE_EXPR);
           report.checks.push({
             viewport: `${vp.width}x${vp.height}`,
@@ -901,9 +953,8 @@ async function main() {
           }
 
           // Settings view
-          await cdp.send("Page.navigate", { url: `${origin}/?view=settings` });
-          await sleep(420);
-          await injectModeCss(cdp, modeCss);
+          await navigateTo(cdp, `${origin}/?view=settings`);
+          await injectModeCss(cdp, modeCss, `${vp.width}x${vp.height} ${modeName} settings`);
           const settingsRes = await cdp.eval(AUDIT_PAGE_EXPR);
           report.checks.push({
             viewport: `${vp.width}x${vp.height}`,

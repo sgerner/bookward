@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "@tailwindcss/node";
@@ -18,8 +18,27 @@ function readSource(relativePath: string): string {
 }
 
 function findChromeBinary(): string | null {
+  const pwRoot = join(homedir(), ".cache/ms-playwright");
+  const pwHeadlessShell = existsSync(pwRoot)
+    ? readdirSync(pwRoot)
+        .filter((name) => name.startsWith("chromium_headless_shell-"))
+        .sort()
+        .reverse()
+        .map((name) =>
+          join(pwRoot, name, "chrome-headless-shell-linux64/chrome-headless-shell"),
+        )
+    : [];
+  const pwCandidates = existsSync(pwRoot)
+    ? readdirSync(pwRoot)
+        .filter((name) => name.startsWith("chromium-"))
+        .sort()
+        .reverse()
+        .map((name) => join(pwRoot, name, "chrome-linux64/chrome"))
+    : [];
   const candidates = [
     process.env.CHROME_BIN,
+    ...pwHeadlessShell,
+    ...pwCandidates,
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/chromium",
@@ -146,10 +165,11 @@ async function withHeadlessChrome<T>(
     proc = spawn(
       binary,
       [
-        "--headless=new",
+        ...(binary.includes("chrome-headless-shell") ? [] : ["--headless=new"]),
         "--no-sandbox",
         "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
         `--remote-debugging-port=${debugPort}`,
         `--user-data-dir=${tempDir}`,
         "about:blank",
@@ -229,8 +249,9 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
   it("renders ThemePicker SSR triggers for both compact and standalone variants and commits the Chrome audit script", () => {
     const compactRender = render(ThemePicker, { props: { compact: true } });
     expect(compactRender.body).toContain('aria-label="Choose appearance"');
-    expect(compactRender.body).toContain('aria-controls="appearance-panel"');
+    expect(compactRender.body).toMatch(/aria-controls="[^"]+"/);
     expect(compactRender.body).toContain('aria-haspopup="dialog"');
+    expect(compactRender.body).toContain("fixed right-4 top-20");
     expect(compactRender.body).toContain(">Appearance</span>");
 
     const standaloneRender = render(ThemePicker, { props: { compact: false } });
@@ -360,11 +381,11 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
     </div>
 
     <nav class="sticky inset-x-0 bottom-0 z-40 mt-auto flex flex-wrap border-t preset-filled-surface-50-950 md:hidden" aria-label="Mobile navigation">
-      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1.5 py-1.5 text-xs"><span class="flex items-center gap-1">Discover</span></button>
-      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1.5 py-1.5 text-xs"><span class="flex items-center gap-1">Saved<span class="badge badge-sm preset-tonal-secondary">3</span></span></button>
-      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1.5 py-1.5 text-xs"><span class="flex items-center gap-1">History</span></button>
-      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1.5 py-1.5 text-xs"><span class="flex items-center gap-1">Sources</span></button>
-      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1.5 py-1.5 text-xs"><span class="flex items-center gap-1">Settings</span></button>
+      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5"><span class="flex items-center gap-0.5">Discover</span></button>
+      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5"><span class="flex items-center gap-0.5">Shortlist<span class="badge badge-sm px-1 preset-tonal-secondary">3</span></span></button>
+      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5"><span class="flex items-center gap-0.5">History</span></button>
+      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5"><span class="flex items-center gap-0.5">Sources</span></button>
+      <button type="button" class="relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5"><span class="flex items-center gap-0.5">Settings</span></button>
     </nav>
   </div>
 
@@ -391,7 +412,7 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
           width: 375,
           height: 812,
           deviceScaleFactor: 2,
-          mobile: true,
+          mobile: false,
         });
         await cdp.send("Page.navigate", { url: "about:blank" });
         const { frameTree } = await cdp.send<{
@@ -478,7 +499,7 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
           width: 320,
           height: 568,
           deviceScaleFactor: 2,
-          mobile: true,
+          mobile: false,
         });
         await cdp.eval(`document.getElementById('mode-override').textContent = ''`);
         const nav320Baseline = await cdp.eval<{
