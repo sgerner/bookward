@@ -4,8 +4,6 @@
  * `app.html` and the hydrated picker share the same storage contract.
  */
 
-import { calibrateThemeStylesheet } from './theme-contrast.js';
-
 export const THEME_STORAGE_KEY = 'bookward-theme';
 export const MODE_STORAGE_KEY = 'bookward-color-mode';
 const LEGACY_THEME_STORAGE_KEY = 'afterword-theme';
@@ -54,6 +52,42 @@ export type ThemeSwatch = {
 	tertiary: string;
 };
 
+export type ThemeColors = {
+	light: string;
+	dark: string;
+};
+
+/**
+ * Calibrated light/dark root background sRGB hex pairs (`--color-root-bg-light`
+ * and `--color-root-bg-dark`) for `<meta name="theme-color">` and SSR bootstrap.
+ */
+export const THEME_COLORS: Record<SkeletonThemeName, ThemeColors> = {
+	catppuccin: { light: '#ffffff', dark: '#131322' },
+	cerberus: { light: '#fcfcfc', dark: '#121212' },
+	concord: { light: '#ffffff', dark: '#17171c' },
+	crimson: { light: '#ffffff', dark: '#0c0e17' },
+	dracula: { light: '#f5f8ff', dark: '#12141e' },
+	fennec: { light: '#eef6f1', dark: '#141519' },
+	hamlindigo: { light: '#ffffff', dark: '#0d1427' },
+	legacy: { light: '#ffffff', dark: '#0d1329' },
+	mint: { light: '#e1f6ed', dark: '#001d17' },
+	modern: { light: '#f2f2ff', dark: '#101229' },
+	mona: { light: '#ffffff', dark: '#0c1522' },
+	nosh: { light: '#f7f7f7', dark: '#030303' },
+	nouveau: { light: '#fbf7fe', dark: '#070010' },
+	pine: { light: '#f2f5ed', dark: '#12170d' },
+	reign: { light: '#f0f0f0', dark: '#171717' },
+	rocket: { light: '#ffffff', dark: '#0c1522' },
+	rose: { light: '#f7f2f9', dark: '#161419' },
+	rosepine: { light: '#f9f4ee', dark: '#181625' },
+	sahara: { light: '#ffeff2', dark: '#260b0f' },
+	seafoam: { light: '#e1f9fd', dark: '#001725' },
+	terminus: { light: '#fcfcfc', dark: '#131313' },
+	vintage: { light: '#f3f3f3', dark: '#181410' },
+	vox: { light: '#f4f1ff', dark: '#190f26' },
+	wintry: { light: '#ffffff', dark: '#091224' },
+};
+
 /**
  * Small preview tokens for the picker. These are intentionally separate from
  * the deferred theme styles: the picker can show every palette without
@@ -87,8 +121,9 @@ export const THEME_SWATCHES: Record<SkeletonThemeName, ThemeSwatch> = {
 };
 /**
  * Keep the default palette in the critical stylesheet. Alternate palettes are
- * loaded only when a user selects one, so the initial page does not download
- * every available theme.
+ * pre-calibrated at Vite build time (`vite.config.ts`) and loaded lazily only
+ * when selected (or during SSR for the active palette), so the client neither
+ * downloads unused palettes nor runs contrast calibration at runtime.
  */
 export const THEME_LOADERS: Record<SkeletonThemeName, () => Promise<unknown>> = {
 	catppuccin: () => import('@skeletonlabs/skeleton/themes/catppuccin?raw'),
@@ -121,23 +156,50 @@ const themeLoads = new Map<SkeletonThemeName, Promise<void>>([
 	[DEFAULT_THEME, Promise.resolve()],
 ]);
 
+function extractStylesheet(theme: SkeletonThemeName, module: unknown): string | null {
+	const stylesheet = typeof module === 'string'
+		? module
+		: (module as { default?: unknown } | null | undefined)?.default;
+	if (typeof stylesheet !== 'string' || !stylesheet) return null;
+	if (stylesheet.includes(`:root[data-theme="${theme}"], [data-theme="${theme}"]`)) {
+		return stylesheet;
+	}
+	return stylesheet.replace(
+		`[data-theme="${theme}"]`,
+		`:root[data-theme="${theme}"], [data-theme="${theme}"]`,
+	);
+}
+
+/** Resolve pre-calibrated CSS text for non-default themes during SSR and client loading. */
+export async function loadThemeCss(theme: SkeletonThemeName): Promise<string | null> {
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	if (nextTheme === DEFAULT_THEME) return null;
+	return extractStylesheet(nextTheme, await THEME_LOADERS[nextTheme]());
+}
+
 /** Load a palette stylesheet once before applying its data-theme attribute. */
 export function loadTheme(theme: SkeletonThemeName): Promise<void> {
 	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	if (nextTheme === DEFAULT_THEME || typeof document === 'undefined') {
+		return Promise.resolve();
+	}
+	if (
+		typeof document.head?.querySelector === 'function' &&
+		document.head.querySelector(`style[data-bookward-theme="${nextTheme}"]`)
+	) {
+		return Promise.resolve();
+	}
 	const existing = themeLoads.get(nextTheme);
 	if (existing) return existing;
 
-	const pending = THEME_LOADERS[nextTheme]().then(
-		(module) => {
-			if (nextTheme === DEFAULT_THEME || typeof document === 'undefined') return;
+	const pending = loadThemeCss(nextTheme).then(
+		(stylesheet) => {
+			if (typeof document === 'undefined') return;
 			if (document.head.querySelector(`style[data-bookward-theme="${nextTheme}"]`)) return;
-			const stylesheet = typeof module === 'string'
-				? module
-				: (module as { default?: unknown }).default;
 			if (typeof stylesheet !== 'string') throw new Error(`Theme stylesheet for ${nextTheme} was unavailable`);
 			const style = document.createElement('style');
 			style.dataset.bookwardTheme = nextTheme;
-			style.textContent = calibrateThemeStylesheet(nextTheme, stylesheet);
+			style.textContent = stylesheet;
 			document.head.append(style);
 		},
 		(error) => {
@@ -155,6 +217,12 @@ export function isThemeName(value: unknown): value is SkeletonThemeName {
 
 export function isThemeMode(value: unknown): value is ThemeMode {
 	return value === 'light' || value === 'dark' || value === 'system';
+}
+
+export function getThemeColor(theme: SkeletonThemeName, resolvedMode: Exclude<ThemeMode, 'system'>): string {
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	const palette = THEME_COLORS[nextTheme];
+	return resolvedMode === 'light' ? palette.light : palette.dark;
 }
 
 export function getSystemMode(): Exclude<ThemeMode, 'system'> {

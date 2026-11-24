@@ -1,6 +1,9 @@
 /**
- * OKLCH color parsing, WCAG 2.2 Technique G18 relative luminance, and
- * contrast calibration for Skeleton v5.0.4 theme stylesheets.
+ * Server/build-time OKLCH color parsing, WCAG 2.2 Technique G18 relative luminance,
+ * and contrast calibration for Skeleton theme stylesheets.
+ *
+ * Lives under `src/lib/server/` so SvelteKit guarantees calibration logic and
+ * test/build helpers never enter the client JavaScript bundle.
  *
  * References:
  * - WCAG 2.2 SC 1.4.3 Contrast (Minimum): https://www.w3.org/TR/WCAG22/#contrast-minimum
@@ -163,6 +166,15 @@ export function oklchToLinearSrgb(color: OklchColor): [number, number, number] {
 	];
 }
 
+/** Convert an `OklchColor` or CSS color string to 8-bit sRGB `#rrggbb` hex. */
+export function oklchToHex(input: string | OklchColor): string {
+	const color = typeof input === 'string' ? parseCssColor(input) : input;
+	const linear = oklchToLinearSrgb(color);
+	return `#${linear
+		.map((channel) => Math.round(linearChannelToSrgb(channel) * 255).toString(16).padStart(2, '0'))
+		.join('')}`;
+}
+
 function isInSrgbGamut(color: OklchColor): boolean {
 	const [r, g, b] = oklchToLinearSrgb(color);
 	const eps = 1e-6;
@@ -263,7 +275,8 @@ function minContrastAgainstAll(foreground: OklchColor, backgrounds: readonly Okl
 	return min;
 }
 
-function mixOklab(base: OklchColor, overlay: OklchColor, weight: number): OklchColor {
+/** Mix `overlay` onto `base` in Oklab space (`color-mix(in oklab, overlay <weight>, base)`). */
+export function mixOklab(base: OklchColor, overlay: OklchColor, weight: number): OklchColor {
 	const baseRad = (base.H * Math.PI) / 180;
 	const overRad = (overlay.H * Math.PI) / 180;
 	const L = base.L * (1 - weight) + overlay.L * weight;
@@ -275,6 +288,22 @@ function mixOklab(base: OklchColor, overlay: OklchColor, weight: number): OklchC
 	if (C < 0.0005) return clampOklchToSrgbGamut({ L, C: 0, H: 0, hueNone: true });
 	const H = ((Math.atan2(b, a) * 180) / Math.PI + 360) % 360;
 	return clampOklchToSrgbGamut({ L, C, H, hueNone: false });
+}
+
+/** Composite `overlay` at `alpha` over `base` in standard sRGB alpha blending (`bg-*-500/<alpha>`). */
+export function mixSrgbAlpha(base: OklchColor, overlay: OklchColor, alpha: number): OklchColor {
+	const [br, bg, bb] = oklchToLinearSrgb(base);
+	const [or, og, ob] = oklchToLinearSrgb(overlay);
+	const rSrgb = linearChannelToSrgb(or) * alpha + linearChannelToSrgb(br) * (1 - alpha);
+	const gSrgb = linearChannelToSrgb(og) * alpha + linearChannelToSrgb(bg) * (1 - alpha);
+	const bSrgb = linearChannelToSrgb(ob) * alpha + linearChannelToSrgb(bb) * (1 - alpha);
+	return clampOklchToSrgbGamut(
+		linearRgbToOklch(
+			srgbChannelToLinear(rSrgb),
+			srgbChannelToLinear(gSrgb),
+			srgbChannelToLinear(bSrgb),
+		),
+	);
 }
 
 /**
@@ -289,7 +318,6 @@ export function calibrateLightnessForContrast(
 ): OklchColor {
 	const initial = clampOklchToSrgbGamut(color);
 	if (minContrastAgainstAll(initial, backgrounds) >= minRatio) {
-		// Round-trip through formatted precision to verify rounded output also passes.
 		const formattedInitial = parseCssColor(formatOklch(initial));
 		if (minContrastAgainstAll(formattedInitial, backgrounds) >= minRatio) {
 			return formattedInitial;
@@ -349,16 +377,44 @@ function resolveTokenValue(
 export type CalibratedModeTokens = Record<string, string>;
 
 export type CalibratedThemeResult = {
-	/** Tokens set on `:root[data-theme="<id>"]` (light mode + shared base scale). */
+	/**
+	 * Base tokens emitted on `:root[data-theme="<id>"]` (applies to light mode and
+	 * provides shared scale tokens such as `--color-surface-contrast-50` / `-950`
+	 * inherited by dark mode unless overridden in `dark`).
+	 */
 	light: CalibratedModeTokens;
-	/** Mode-specific overrides set on `:root[data-theme="<id>"].dark`. */
+	/** Mode-specific overrides emitted on `:root[data-theme="<id>"].dark`. */
 	dark: CalibratedModeTokens;
 };
 
-const TEXT_TARGET_RATIO = 4.9;
+const CORE_TEXT_TARGET_RATIO = 4.9;
+const EXTENDED_MIX_TEXT_TARGET_RATIO = 4.65;
 const FILLED_TARGET_RATIO = 4.7;
 const TONAL_TARGET_RATIO = 5.0;
+const TONAL_MIX_TARGET_RATIO = 4.65;
 const SWITCH_TARGET_RATIO = 3.1;
+
+function calibrateAgainstCoreAndExtended(
+	initial: OklchColor,
+	coreBackgrounds: readonly OklchColor[],
+	extendedBackgrounds: readonly OklchColor[],
+	coreRatio: number,
+	extendedRatio: number,
+	direction: 'darker' | 'lighter',
+): OklchColor {
+	const coreAdjusted = calibrateLightnessForContrast(
+		initial,
+		coreBackgrounds,
+		coreRatio,
+		direction,
+	);
+	return calibrateLightnessForContrast(
+		coreAdjusted,
+		extendedBackgrounds,
+		extendedRatio,
+		direction,
+	);
+}
 
 function calibrateFilledPairForMode(
 	orig500: OklchColor,
@@ -433,8 +489,6 @@ function calibrateFilledPairForMode(
 		};
 	}
 
-	// `c500` sits in the narrow mid-luminance deadband (~0.175..0.205). Shift `c500.L` minimally
-	// in the direction that preserves `surfaceBg` >= 3.1:1 switch boundary contrast.
 	if (mode === 'light') {
 		const adjusted500 = calibrateLightnessForContrast(
 			c500,
@@ -451,6 +505,52 @@ function calibrateFilledPairForMode(
 		'lighter',
 	);
 	return { c500: adjusted500, contrast500: darkEndpoint };
+}
+
+function buildTranslucentBackgroundEnvelope(
+	surfaceBase: OklchColor,
+	rootBase: OklchColor,
+	oppositeSurface: OklchColor,
+	primary500: OklchColor,
+	secondary500: OklchColor,
+	tertiary500: OklchColor,
+): { core: OklchColor[]; extended: OklchColor[] } {
+	const core: OklchColor[] = [
+		surfaceBase,
+		rootBase,
+		// 10% opposite surface (`preset-tonal` in Oklab + `bg-surface-950-50/10` in sRGB)
+		mixOklab(surfaceBase, oppositeSurface, 0.1),
+		mixSrgbAlpha(surfaceBase, oppositeSurface, 0.1),
+		mixSrgbAlpha(surfaceBase, primary500, 0.08),
+		mixSrgbAlpha(surfaceBase, secondary500, 0.08),
+	];
+
+	const extended: OklchColor[] = [
+		...core,
+		// Modal and callout 15%-20% role-500 tints (`bg-primary-500/15`, `bg-secondary-500/10`, `bg-primary-500/20`)
+		mixSrgbAlpha(surfaceBase, primary500, 0.15),
+		mixSrgbAlpha(surfaceBase, secondary500, 0.15),
+		mixSrgbAlpha(surfaceBase, tertiary500, 0.15),
+		mixSrgbAlpha(surfaceBase, primary500, 0.2),
+		mixSrgbAlpha(surfaceBase, secondary500, 0.2),
+		mixSrgbAlpha(surfaceBase, tertiary500, 0.2),
+		mixOklab(surfaceBase, primary500, 0.2),
+		mixOklab(surfaceBase, secondary500, 0.2),
+		mixOklab(surfaceBase, tertiary500, 0.2),
+		mixSrgbAlpha(rootBase, primary500, 0.2),
+		// Stacked book card + mobile cover overlay (`from-primary-500/8` + `to-secondary-500/15`, etc.)
+		mixSrgbAlpha(mixSrgbAlpha(surfaceBase, primary500, 0.08), secondary500, 0.15),
+		mixSrgbAlpha(mixSrgbAlpha(surfaceBase, secondary500, 0.08), primary500, 0.15),
+		// Login page ambient radial glows (`30%` primary-500, `26%` secondary-500, `23%` tertiary-500)
+		mixOklab(surfaceBase, primary500, 0.3),
+		mixSrgbAlpha(surfaceBase, primary500, 0.3),
+		mixOklab(surfaceBase, secondary500, 0.26),
+		mixSrgbAlpha(surfaceBase, secondary500, 0.26),
+		mixOklab(surfaceBase, tertiary500, 0.23),
+		mixSrgbAlpha(surfaceBase, tertiary500, 0.23),
+	];
+
+	return { core, extended };
 }
 
 /**
@@ -491,7 +591,8 @@ export function calibrateThemeTokens(
 	surface50 = parseCssColor(formatOklch(surface50));
 	surface950 = parseCssColor(formatOklch(surface950));
 
-	// Normalize root backgrounds so pages using `html` background remain genuinely light/dark.
+	// Normalize root backgrounds so pages using `html` background and `<meta name="theme-color">`
+	// remain genuinely light/dark and deterministic across themes.
 	const rawRootLightRef = rawVars['--color-root-bg-light'] ?? 'var(--color-surface-50)';
 	const rawRootDarkRef = rawVars['--color-root-bg-dark'] ?? 'var(--color-surface-950)';
 	let rootBgLight =
@@ -517,27 +618,7 @@ export function calibrateThemeTokens(
 	rootBgLight = parseCssColor(formatOklch(rootBgLight));
 	rootBgDark = parseCssColor(formatOklch(rootBgDark));
 
-	// Include subtle card/modal tint mixes (5-8%) in the surface background envelope so translucent
-	// card gradients (`from-primary-500/8`, `bg-surface-950/5`) never push text below 4.5:1.
-	const rawPrimary500 = colorOf('--color-primary-500');
-	const rawSecondary500 = colorOf('--color-secondary-500');
-	const lightBackgrounds: OklchColor[] = [
-		surface50,
-		rootBgLight,
-		mixOklab(surface50, surface950, 0.06),
-		mixOklab(surface50, rawPrimary500, 0.08),
-		mixOklab(surface50, rawSecondary500, 0.08),
-	];
-	const darkBackgrounds: OklchColor[] = [
-		surface950,
-		rootBgDark,
-		mixOklab(surface950, surface50, 0.05),
-		mixOklab(surface950, rawPrimary500, 0.08),
-		mixOklab(surface950, rawSecondary500, 0.08),
-	];
-
-	// Build a strictly monotonic, contrast-calibrated 11-step surface scale.
-	// Check if upstream surface scale is inverted or compressed.
+	// Build a strictly monotonic initial 11-step surface scale.
 	let surfaceInverted = false;
 	for (let i = 0; i < rawSurfaceScale.length - 1; i += 1) {
 		if (rawSurfaceScale[i].L <= rawSurfaceScale[i + 1].L) {
@@ -589,160 +670,17 @@ export function calibrateThemeTokens(
 		}
 	}
 
-	const origSurfaceContrast500 = colorOf('--color-surface-contrast-500');
-	const initialLightSurfaceFilled = calibrateFilledPairForMode(
-		calibratedSurface['500'],
-		origSurfaceContrast500,
-		surface50,
-		surface950,
-		surface50,
-		'light',
-		true,
-	);
-	const initialDarkSurfaceFilled = calibrateFilledPairForMode(
-		calibratedSurface['500'],
-		origSurfaceContrast500,
-		surface50,
-		surface950,
-		surface950,
-		'dark',
-		true,
-	);
-
-	// Calibrate light-mode surface text shades (600, 700, 800, 900, 950) with clear hierarchy.
-	calibratedSurface['600'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['600'],
-			L: Math.min(calibratedSurface['600'].L, initialLightSurfaceFilled.c500.L - 0.02),
-		},
-		lightBackgrounds,
-		TEXT_TARGET_RATIO,
-		'darker',
-	);
-	calibratedSurface['700'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['700'],
-			L: Math.min(calibratedSurface['700'].L, calibratedSurface['600'].L - 0.03),
-		},
-		lightBackgrounds,
-		5.6,
-		'darker',
-	);
-	calibratedSurface['800'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['800'],
-			L: Math.min(calibratedSurface['800'].L, calibratedSurface['700'].L - 0.04),
-		},
-		lightBackgrounds,
-		7.0,
-		'darker',
-	);
-	calibratedSurface['900'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['900'],
-			L: Math.min(calibratedSurface['900'].L, calibratedSurface['800'].L - 0.04),
-		},
-		lightBackgrounds,
-		8.5,
-		'darker',
-	);
-	calibratedSurface['950'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['950'],
-			L: Math.min(calibratedSurface['950'].L, calibratedSurface['900'].L - 0.02),
-		},
-		lightBackgrounds,
-		10.0,
-		'darker',
-	);
-	surface950 = calibratedSurface['950'];
-
-	// Calibrate dark-mode surface text shades (400, 300, 200, 100, 50) with clear hierarchy.
-	const maxSurface500L = Math.max(initialLightSurfaceFilled.c500.L, initialDarkSurfaceFilled.c500.L);
-	calibratedSurface['400'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['400'],
-			L: Math.max(calibratedSurface['400'].L, maxSurface500L + 0.02),
-		},
-		darkBackgrounds,
-		TEXT_TARGET_RATIO,
-		'lighter',
-	);
-	calibratedSurface['300'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['300'],
-			L: Math.max(calibratedSurface['300'].L, calibratedSurface['400'].L + 0.04),
-		},
-		darkBackgrounds,
-		5.8,
-		'lighter',
-	);
-	calibratedSurface['200'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['200'],
-			L: Math.max(calibratedSurface['200'].L, calibratedSurface['300'].L + 0.05),
-		},
-		darkBackgrounds,
-		7.5,
-		'lighter',
-	);
-	calibratedSurface['100'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['100'],
-			L: Math.max(calibratedSurface['100'].L, calibratedSurface['200'].L + 0.05),
-		},
-		darkBackgrounds,
-		9.5,
-		'lighter',
-	);
-	calibratedSurface['50'] = calibrateLightnessForContrast(
-		{
-			...calibratedSurface['50'],
-			L: Math.max(calibratedSurface['50'].L, calibratedSurface['100'].L + 0.02),
-		},
-		darkBackgrounds,
-		11.5,
-		'lighter',
-	);
-	surface50 = calibratedSurface['50'];
-
-	const surfaceContrast50 = calibrateLightnessForContrast(
-		colorOf('--color-surface-contrast-50'),
-		lightBackgrounds,
-		9.0,
-		'darker',
-	);
-	const surfaceContrast950 = calibrateLightnessForContrast(
-		colorOf('--color-surface-contrast-950'),
-		darkBackgrounds,
-		9.0,
-		'lighter',
-	);
-
-	const light: CalibratedModeTokens = {
-		'--color-root-bg-light': formatOklch(rootBgLight),
-		'--color-root-bg-dark': formatOklch(rootBgDark),
-	};
-	const dark: CalibratedModeTokens = {};
-
-	for (const shade of THEME_SHADES) {
-		if (shade === '500') continue;
-		light[`--color-surface-${shade}`] = formatOklch(calibratedSurface[shade]);
-	}
-	light['--color-surface-contrast-50'] = formatOklch(surfaceContrast50);
-	light['--color-surface-contrast-950'] = formatOklch(surfaceContrast950);
-	light['--color-surface-contrast-50-950'] = formatOklch(surfaceContrast50);
-	dark['--color-surface-contrast-50-950'] = formatOklch(surfaceContrast950);
-
-	light['--color-surface-700-300'] = formatOklch(calibratedSurface['700']);
-	dark['--color-surface-700-300'] = formatOklch(calibratedSurface['300']);
-	light['--color-surface-800-200'] = formatOklch(calibratedSurface['800']);
-	dark['--color-surface-800-200'] = formatOklch(calibratedSurface['200']);
-	light['--color-surface-900-100'] = formatOklch(calibratedSurface['900']);
-	dark['--color-surface-900-100'] = formatOklch(calibratedSurface['100']);
-
-	// 2. Calibrate all 7 roles: tonal (50/950), link/muted (600/400), and filled (500/contrast-500).
+	// 2. Pre-calibrate tonal endpoints and filled 500 pairs for all roles so translucent
+	// card/modal/login background envelopes use each mode's actual emitted `--color-*-500`.
 	const switchRoles = new Set<ThemeColorRole>(['primary', 'secondary', 'tertiary', 'surface']);
+	const roleTonalEndpoints = {} as Record<ThemeColorRole, { c50: OklchColor; c950: OklchColor }>;
+	const roleFilled = {} as Record<
+		ThemeColorRole,
+		{
+			light: { c500: OklchColor; contrast500: OklchColor };
+			dark: { c500: OklchColor; contrast500: OklchColor };
+		}
+	>;
 
 	for (const role of THEME_COLOR_ROLES) {
 		let c50 = role === 'surface' ? surface50 : colorOf(`--color-${role}-50`);
@@ -767,8 +705,288 @@ export function calibrateThemeTokens(
 			}
 			c50 = parseCssColor(formatOklch(c50));
 			c950 = calibrateLightnessForContrast(c950, [c50], TONAL_TARGET_RATIO, 'darker');
-			// Also ensure dark-mode tonal fg (c50) reaches >= 5.0:1 on c950.
 			c50 = calibrateLightnessForContrast(c50, [c950], TONAL_TARGET_RATIO, 'lighter');
+		}
+		roleTonalEndpoints[role] = { c50, c950 };
+
+		const orig500 = role === 'surface' ? calibratedSurface['500'] : colorOf(`--color-${role}-500`);
+		const origContrast500 = colorOf(`--color-${role}-contrast-500`);
+		const needsSwitchContrast = switchRoles.has(role);
+
+		roleFilled[role] = {
+			light: calibrateFilledPairForMode(
+				orig500,
+				origContrast500,
+				c50,
+				c950,
+				surface50,
+				'light',
+				needsSwitchContrast,
+			),
+			dark: calibrateFilledPairForMode(
+				orig500,
+				origContrast500,
+				c50,
+				c950,
+				surface950,
+				'dark',
+				needsSwitchContrast,
+			),
+		};
+	}
+
+	// 3. Build core + extended translucent background envelopes (10%-30%) using calibrated 500s.
+	const lightEnvelope = buildTranslucentBackgroundEnvelope(
+		surface50,
+		rootBgLight,
+		surface950,
+		roleFilled.primary.light.c500,
+		roleFilled.secondary.light.c500,
+		roleFilled.tertiary.light.c500,
+	);
+	const darkEnvelope = buildTranslucentBackgroundEnvelope(
+		surface950,
+		rootBgDark,
+		surface50,
+		roleFilled.primary.dark.c500,
+		roleFilled.secondary.dark.c500,
+		roleFilled.tertiary.dark.c500,
+	);
+
+	// 4. Calibrate light-mode surface text shades (600, 700, 800, 900, 950) with strict monotonicity.
+	calibratedSurface['600'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['600'],
+			L: Math.min(calibratedSurface['600'].L, roleFilled.surface.light.c500.L - 0.02),
+		},
+		lightEnvelope.core,
+		lightEnvelope.extended,
+		CORE_TEXT_TARGET_RATIO,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	calibratedSurface['700'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['700'],
+			L: Math.min(calibratedSurface['700'].L, calibratedSurface['600'].L - 0.025),
+		},
+		lightEnvelope.core,
+		lightEnvelope.extended,
+		5.6,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	calibratedSurface['800'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['800'],
+			L: Math.min(calibratedSurface['800'].L, calibratedSurface['700'].L - 0.03),
+		},
+		lightEnvelope.core,
+		lightEnvelope.extended,
+		7.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	calibratedSurface['900'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['900'],
+			L: Math.min(calibratedSurface['900'].L, calibratedSurface['800'].L - 0.03),
+		},
+		lightEnvelope.core,
+		lightEnvelope.extended,
+		8.5,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	calibratedSurface['950'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['950'],
+			L: Math.min(calibratedSurface['950'].L, calibratedSurface['900'].L - 0.02),
+		},
+		lightEnvelope.core,
+		lightEnvelope.extended,
+		10.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	surface950 = calibratedSurface['950'];
+
+	// Calibrate dark-mode surface text shades (400, 300, 200, 100, 50) with strict monotonicity.
+	const maxSurface500L = Math.max(
+		roleFilled.surface.light.c500.L,
+		roleFilled.surface.dark.c500.L,
+	);
+	calibratedSurface['400'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['400'],
+			L: Math.max(calibratedSurface['400'].L, maxSurface500L + 0.02),
+		},
+		darkEnvelope.core,
+		darkEnvelope.extended,
+		CORE_TEXT_TARGET_RATIO,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+	calibratedSurface['300'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['300'],
+			L: Math.max(calibratedSurface['300'].L, calibratedSurface['400'].L + 0.03),
+		},
+		darkEnvelope.core,
+		darkEnvelope.extended,
+		5.8,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+	calibratedSurface['200'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['200'],
+			L: Math.max(calibratedSurface['200'].L, calibratedSurface['300'].L + 0.04),
+		},
+		darkEnvelope.core,
+		darkEnvelope.extended,
+		7.5,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+	calibratedSurface['100'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['100'],
+			L: Math.max(calibratedSurface['100'].L, calibratedSurface['200'].L + 0.04),
+		},
+		darkEnvelope.core,
+		darkEnvelope.extended,
+		9.5,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+	calibratedSurface['50'] = calibrateAgainstCoreAndExtended(
+		{
+			...calibratedSurface['50'],
+			L: Math.max(calibratedSurface['50'].L, calibratedSurface['100'].L + 0.02),
+		},
+		darkEnvelope.core,
+		darkEnvelope.extended,
+		11.5,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+	surface50 = calibratedSurface['50'];
+	roleTonalEndpoints.surface = { c50: surface50, c950: surface950 };
+
+	// Rebuild envelopes with final `surface50` / `surface950` so all remaining shades and
+	// contrast pairs are guaranteed against the exact emitted surface endpoints.
+	const finalLightEnvelope = buildTranslucentBackgroundEnvelope(
+		surface50,
+		rootBgLight,
+		surface950,
+		roleFilled.primary.light.c500,
+		roleFilled.secondary.light.c500,
+		roleFilled.tertiary.light.c500,
+	);
+	const finalDarkEnvelope = buildTranslucentBackgroundEnvelope(
+		surface950,
+		rootBgDark,
+		surface50,
+		roleFilled.primary.dark.c500,
+		roleFilled.secondary.dark.c500,
+		roleFilled.tertiary.dark.c500,
+	);
+
+	// `--color-surface-contrast-50` is dark foreground text paired with `--color-surface-50`
+	// across both modes (including `preset-filled-surface-950-50` in dark mode), while
+	// `--color-surface-contrast-950` is light foreground text paired with `--color-surface-950`.
+	const surfaceContrast50 = calibrateAgainstCoreAndExtended(
+		colorOf('--color-surface-contrast-50'),
+		finalLightEnvelope.core,
+		finalLightEnvelope.extended,
+		9.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'darker',
+	);
+	const surfaceContrast950 = calibrateAgainstCoreAndExtended(
+		colorOf('--color-surface-contrast-950'),
+		finalDarkEnvelope.core,
+		finalDarkEnvelope.extended,
+		9.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
+		'lighter',
+	);
+
+	const light: CalibratedModeTokens = {
+		'--color-root-bg-light': formatOklch(rootBgLight),
+		'--color-root-bg-dark': formatOklch(rootBgDark),
+	};
+	const dark: CalibratedModeTokens = {};
+
+	for (const shade of THEME_SHADES) {
+		if (shade === '500') continue;
+		light[`--color-surface-${shade}`] = formatOklch(calibratedSurface[shade]);
+	}
+	light['--color-surface-contrast-50'] = formatOklch(surfaceContrast50);
+	light['--color-surface-contrast-950'] = formatOklch(surfaceContrast950);
+	light['--color-surface-contrast-50-950'] = formatOklch(surfaceContrast50);
+	dark['--color-surface-contrast-50-950'] = formatOklch(surfaceContrast950);
+	light['--color-surface-contrast-950-50'] = formatOklch(surfaceContrast950);
+	dark['--color-surface-contrast-950-50'] = formatOklch(surfaceContrast50);
+
+	light['--color-surface-700-300'] = formatOklch(calibratedSurface['700']);
+	dark['--color-surface-700-300'] = formatOklch(calibratedSurface['300']);
+	light['--color-surface-800-200'] = formatOklch(calibratedSurface['800']);
+	dark['--color-surface-800-200'] = formatOklch(calibratedSurface['200']);
+	light['--color-surface-900-100'] = formatOklch(calibratedSurface['900']);
+	dark['--color-surface-900-100'] = formatOklch(calibratedSurface['100']);
+
+	// 5. Finalize all 7 roles: tonal (50/950 + card/code overlays), link/muted (600/400), and filled (500/contrast-500).
+	for (const role of THEME_COLOR_ROLES) {
+		let { c50, c950 } = roleTonalEndpoints[role];
+
+		if (role !== 'surface') {
+			const lightTonalMixes = [
+				c50,
+				mixSrgbAlpha(c50, roleFilled.primary.light.c500, 0.15),
+				mixSrgbAlpha(c50, roleFilled.secondary.light.c500, 0.15),
+				mixSrgbAlpha(c50, surface950, 0.1),
+			];
+			c950 = calibrateAgainstCoreAndExtended(
+				c950,
+				[c50],
+				lightTonalMixes,
+				TONAL_TARGET_RATIO,
+				TONAL_MIX_TARGET_RATIO,
+				'darker',
+			);
+
+			const darkTonalMixes = [
+				c950,
+				mixSrgbAlpha(c950, roleFilled.primary.dark.c500, 0.15),
+				mixSrgbAlpha(c950, roleFilled.secondary.dark.c500, 0.15),
+				mixSrgbAlpha(c950, surface50, 0.1),
+			];
+			c50 = calibrateAgainstCoreAndExtended(
+				c50,
+				[c950],
+				darkTonalMixes,
+				TONAL_TARGET_RATIO,
+				TONAL_MIX_TARGET_RATIO,
+				'lighter',
+			);
+
+			// Re-verify light tonal fg if c50 shifted slightly lighter.
+			const updatedLightTonalMixes = [
+				c50,
+				mixSrgbAlpha(c50, roleFilled.primary.light.c500, 0.15),
+				mixSrgbAlpha(c50, roleFilled.secondary.light.c500, 0.15),
+				mixSrgbAlpha(c50, surface950, 0.1),
+			];
+			c950 = calibrateAgainstCoreAndExtended(
+				c950,
+				[c50],
+				updatedLightTonalMixes,
+				TONAL_TARGET_RATIO,
+				TONAL_MIX_TARGET_RATIO,
+				'darker',
+			);
 
 			light[`--color-${role}-50`] = formatOklch(c50);
 			light[`--color-${role}-950`] = formatOklch(c950);
@@ -782,19 +1000,23 @@ export function calibrateThemeTokens(
 		const c600 =
 			role === 'surface'
 				? calibratedSurface['600']
-				: calibrateLightnessForContrast(
+				: calibrateAgainstCoreAndExtended(
 						colorOf(`--color-${role}-600`),
-						lightBackgrounds,
-						TEXT_TARGET_RATIO,
+						finalLightEnvelope.core,
+						finalLightEnvelope.extended,
+						CORE_TEXT_TARGET_RATIO,
+						EXTENDED_MIX_TEXT_TARGET_RATIO,
 						'darker',
 					);
 		const c400 =
 			role === 'surface'
 				? calibratedSurface['400']
-				: calibrateLightnessForContrast(
+				: calibrateAgainstCoreAndExtended(
 						colorOf(`--color-${role}-400`),
-						darkBackgrounds,
-						TEXT_TARGET_RATIO,
+						finalDarkEnvelope.core,
+						finalDarkEnvelope.extended,
+						CORE_TEXT_TARGET_RATIO,
+						EXTENDED_MIX_TEXT_TARGET_RATIO,
 						'lighter',
 					);
 
@@ -805,28 +1027,8 @@ export function calibrateThemeTokens(
 		light[`--color-${role}-600-400`] = formatOklch(c600);
 		dark[`--color-${role}-600-400`] = formatOklch(c400);
 
-		const orig500 = role === 'surface' ? calibratedSurface['500'] : colorOf(`--color-${role}-500`);
-		const origContrast500 = colorOf(`--color-${role}-contrast-500`);
-		const needsSwitchContrast = switchRoles.has(role);
-
-		const lightFilled = calibrateFilledPairForMode(
-			orig500,
-			origContrast500,
-			c50,
-			c950,
-			surface50,
-			'light',
-			needsSwitchContrast,
-		);
-		const darkFilled = calibrateFilledPairForMode(
-			orig500,
-			origContrast500,
-			c50,
-			c950,
-			surface950,
-			'dark',
-			needsSwitchContrast,
-		);
+		const lightFilled = roleFilled[role].light;
+		const darkFilled = roleFilled[role].dark;
 
 		light[`--color-${role}-500`] = formatOklch(lightFilled.c500);
 		light[`--color-${role}-contrast-500`] = formatOklch(lightFilled.contrast500);
@@ -841,17 +1043,21 @@ export function calibrateThemeTokens(
 		}
 	}
 
-	// 3. Calibrate base, heading, and anchor typography tokens against surface & root backgrounds.
-	const typoBaseLight = calibrateLightnessForContrast(
+	// 6. Calibrate base, heading, and anchor typography tokens against core + extended envelopes.
+	const typoBaseLight = calibrateAgainstCoreAndExtended(
 		colorOf('--typo-base--color-light'),
-		lightBackgrounds,
+		finalLightEnvelope.core,
+		finalLightEnvelope.extended,
 		9.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
 		'darker',
 	);
-	const typoBaseDark = calibrateLightnessForContrast(
+	const typoBaseDark = calibrateAgainstCoreAndExtended(
 		colorOf('--typo-base--color-dark'),
-		darkBackgrounds,
+		finalDarkEnvelope.core,
+		finalDarkEnvelope.extended,
 		9.0,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
 		'lighter',
 	);
 	light['--typo-base--color-light'] = formatOklch(typoBaseLight);
@@ -860,10 +1066,12 @@ export function calibrateThemeTokens(
 	const rawHeadingLight = resolveTokenValue('--typo-heading--color-light', rawVars);
 	if (rawHeadingLight && rawHeadingLight !== 'inherit') {
 		light['--typo-heading--color-light'] = formatOklch(
-			calibrateLightnessForContrast(
+			calibrateAgainstCoreAndExtended(
 				parseCssColor(rawHeadingLight),
-				lightBackgrounds,
-				TEXT_TARGET_RATIO,
+				finalLightEnvelope.core,
+				finalLightEnvelope.extended,
+				CORE_TEXT_TARGET_RATIO,
+				EXTENDED_MIX_TEXT_TARGET_RATIO,
 				'darker',
 			),
 		);
@@ -871,31 +1079,85 @@ export function calibrateThemeTokens(
 	const rawHeadingDark = resolveTokenValue('--typo-heading--color-dark', rawVars);
 	if (rawHeadingDark && rawHeadingDark !== 'inherit') {
 		light['--typo-heading--color-dark'] = formatOklch(
-			calibrateLightnessForContrast(
+			calibrateAgainstCoreAndExtended(
 				parseCssColor(rawHeadingDark),
-				darkBackgrounds,
-				TEXT_TARGET_RATIO,
+				finalDarkEnvelope.core,
+				finalDarkEnvelope.extended,
+				CORE_TEXT_TARGET_RATIO,
+				EXTENDED_MIX_TEXT_TARGET_RATIO,
 				'lighter',
 			),
 		);
 	}
 
-	const typoAnchorLight = calibrateLightnessForContrast(
+	const typoAnchorLight = calibrateAgainstCoreAndExtended(
 		colorOf('--typo-anchor--color-light'),
-		lightBackgrounds,
-		TEXT_TARGET_RATIO,
+		finalLightEnvelope.core,
+		finalLightEnvelope.extended,
+		CORE_TEXT_TARGET_RATIO,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
 		'darker',
 	);
-	const typoAnchorDark = calibrateLightnessForContrast(
+	const typoAnchorDark = calibrateAgainstCoreAndExtended(
 		colorOf('--typo-anchor--color-dark'),
-		darkBackgrounds,
-		TEXT_TARGET_RATIO,
+		finalDarkEnvelope.core,
+		finalDarkEnvelope.extended,
+		CORE_TEXT_TARGET_RATIO,
+		EXTENDED_MIX_TEXT_TARGET_RATIO,
 		'lighter',
 	);
 	light['--typo-anchor--color-light'] = formatOklch(typoAnchorLight);
 	light['--typo-anchor--color-dark'] = formatOklch(typoAnchorDark);
 
 	return { light, dark };
+}
+
+/**
+ * Resolve the complete mode-specific custom property map for a Skeleton theme
+ * (merging default root fallbacks, raw theme tokens, and calibrated light/dark overrides).
+ * Suitable for downstream token/contrast test suites (e.g., `contrast.spec.ts`).
+ */
+export function resolveCalibratedThemeTokens(
+	rawVars: Readonly<Record<string, string>>,
+	mode: 'light' | 'dark',
+): Record<string, string> {
+	const calibrated = calibrateThemeTokens(rawVars);
+	return mode === 'dark'
+		? { ...DEFAULT_SKELETON_ROOT_TOKENS, ...rawVars, ...calibrated.light, ...calibrated.dark }
+		: { ...DEFAULT_SKELETON_ROOT_TOKENS, ...rawVars, ...calibrated.light };
+}
+
+/**
+ * Resolve the complete mode-specific custom property map from a raw Skeleton theme CSS file.
+ */
+export function resolveCalibratedThemeStylesheetVars(
+	rawStylesheet: string,
+	mode: 'light' | 'dark',
+): Record<string, string> {
+	return resolveCalibratedThemeTokens(extractCssVariables(rawStylesheet), mode);
+}
+
+/**
+ * Parse an emitted calibrated theme stylesheet (such as `await loadThemeCss(theme)`)
+ * into effective custom properties for `light` or `dark` mode, applying `.dark`
+ * rule blocks only when `mode === 'dark'`.
+ */
+export function parseEmittedThemeStylesheetVars(
+	emittedStylesheet: string,
+	mode: 'light' | 'dark',
+): Record<string, string> {
+	const vars: Record<string, string> = { ...DEFAULT_SKELETON_ROOT_TOKENS };
+	const blockRe = /([^{}]+)\{([^{}]*)\}/g;
+	for (const match of emittedStylesheet.matchAll(blockRe)) {
+		const selector = match[1].trim();
+		const isDarkSelector = /\.dark\b/.test(selector);
+		if (isDarkSelector && mode !== 'dark') continue;
+		const body = match[2];
+		for (const decl of body.matchAll(/(--[a-zA-Z0-9-]+)\s*:\s*([^;{}]+);/g)) {
+			vars[decl[1].trim()] = decl[2].trim();
+		}
+	}
+	return vars;
 }
 
 function serializeRuleBlock(selector: string, declarations: CalibratedModeTokens, indent = ''): string {
@@ -922,10 +1184,19 @@ export function getCalibratedThemeOverrides(theme: string, stylesheet: string): 
 	return buildCalibratedThemeOverrideCss(theme, rawVars);
 }
 
-/** Append calibrated `:root[data-theme="<theme>"]` overrides to a raw Skeleton theme stylesheet. */
+/**
+ * Elevate `[data-theme="<theme>"]` selector specificity to beat unlayered `:root` rules
+ * during SSR `<svelte:head>` rendering and append calibrated light/dark overrides.
+ */
 export function calibrateThemeStylesheet(theme: string, stylesheet: string): string {
+	const elevated = stylesheet.includes(`:root[data-theme="${theme}"], [data-theme="${theme}"]`)
+		? stylesheet
+		: stylesheet.replace(
+				`[data-theme="${theme}"]`,
+				`:root[data-theme="${theme}"], [data-theme="${theme}"]`,
+			);
 	const overrides = getCalibratedThemeOverrides(theme, stylesheet);
-	return `${stylesheet}\n\n${overrides}\n`;
+	return `${elevated}\n\n${overrides}\n`;
 }
 
 export const SHARED_TONAL_DESCENDANT_CSS = `/* Shared tonal foreground inheritance to prevent WCAG 2.2 Failure F24. */
