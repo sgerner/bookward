@@ -786,16 +786,24 @@ export const actions: Actions = {
     }
   },
   importLibrar: async ({ request }) => {
-    const id = idSchema.safeParse((await request.formData()).get("id"));
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const runId = z
+      .string()
+      .trim()
+      .max(128)
+      .or(z.literal(""))
+      .catch("")
+      .parse(data.get("run_id"));
     if (!id.success) return fail(400, { message: "Invalid book." });
     try {
       await engine(`/api/recommendations/${id.data}/import`, {
         method: "POST",
-        body: "{}",
+        body: JSON.stringify(runId ? { run_id: runId } : {}),
       });
       return { message: "Book added to the Librarr wishlist." };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   configureEmbeddings: async ({ request }) => {

@@ -1092,6 +1092,59 @@ describe("page actions", () => {
     });
   });
 
+  it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "12");
+    body.set("status", "recommended");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Returned to Discover.",
+      undo_id: 77,
+      id: 12,
+      undo_label: "restoring this book",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      action: "restore",
+      run_id: "run-shortlist-1",
+    });
+  });
+
+  it("forwards run_id when importing a shortlisted book to the Librarr wishlist", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 12, status: "imported", remote_id: "remote-12" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "12");
+    body.set("run_id", "run-shortlist-1");
+    const result = await actions.importLibrar!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Book added to the Librarr wishlist." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/12/import",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ run_id: "run-shortlist-1" }),
+      }),
+    );
+  });
+
   it("forwards a shared run_id and returns batch undo tokens for shortlistBulk", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
