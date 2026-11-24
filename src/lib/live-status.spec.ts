@@ -67,6 +67,59 @@ describe("live status controller", () => {
     controller.destroy();
   });
 
+  it("resets baseline silently when contextKey changes across views", () => {
+    const onAnnounce = vi.fn();
+    const controller = createLiveStatusController({ onAnnounce });
+
+    controller.update("Showing 8 of more recommendations.", {
+      contextKey: "discover",
+    });
+    controller.update("Showing 16 of more recommendations.", {
+      contextKey: "discover",
+      immediate: true,
+    });
+    expect(onAnnounce).toHaveBeenCalledTimes(1);
+
+    onAnnounce.mockClear();
+    controller.update("3 books on your shortlist.", {
+      contextKey: "saved",
+      immediate: true,
+    });
+    vi.advanceTimersByTime(LIVE_STATUS_DEBOUNCE_MS * 2);
+    // Clears previous view's live-region text to "" without announcing the new view's baseline count
+    expect(onAnnounce).toHaveBeenCalledTimes(1);
+    expect(onAnnounce).toHaveBeenCalledWith("");
+
+    onAnnounce.mockClear();
+    controller.update("1 of 3 shortlist books match.", {
+      contextKey: "saved",
+    });
+    vi.advanceTimersByTime(LIVE_STATUS_DEBOUNCE_MS);
+    expect(onAnnounce).toHaveBeenCalledTimes(1);
+    expect(onAnnounce).toHaveBeenCalledWith("1 of 3 shortlist books match.");
+    controller.destroy();
+  });
+
+  it("suppresses reactive updates and cancels pending timers while paused during view transitions", () => {
+    const onAnnounce = vi.fn();
+    const controller = createLiveStatusController({ onAnnounce });
+
+    controller.update("Showing 8 recommendations.", { contextKey: "discover" });
+    controller.update("4 recommendations match these filters.", {
+      contextKey: "discover",
+    });
+    vi.advanceTimersByTime(100);
+
+    controller.update("No books match these filters.", {
+      contextKey: "discover",
+      paused: true,
+      immediate: true,
+    });
+    vi.advanceTimersByTime(LIVE_STATUS_DEBOUNCE_MS * 2);
+    expect(onAnnounce).not.toHaveBeenCalled();
+    controller.destroy();
+  });
+
   it("announces initial mount asynchronously when announceOnMount is enabled for modal dialogs", () => {
     const onAnnounce = vi.fn();
     const controller = createLiveStatusController({
@@ -110,7 +163,67 @@ describe("live status controller", () => {
 });
 
 describe("status message formatters", () => {
-  it("formats Discover, Shortlist, and Past Decisions counts and empty states", () => {
+  it("formats Discover, Shortlist, and Past Decisions counts, loading, error, and empty states", () => {
+    expect(
+      formatRecommendationStatus({
+        view: "discover",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 0,
+        hasActiveFilter: true,
+        decisionFilter: "all",
+        digestVisible: false,
+        discoverHasMore: false,
+        loading: true,
+      }),
+    ).toBe("Searching recommendations…");
+
+    expect(
+      formatRecommendationStatus({
+        view: "decisions",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 0,
+        hasActiveFilter: true,
+        decisionFilter: "all",
+        digestVisible: false,
+        discoverHasMore: false,
+        loading: true,
+      }),
+    ).toBe("Loading past decisions…");
+
+    expect(
+      formatRecommendationStatus({
+        view: "discover",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 0,
+        hasActiveFilter: true,
+        decisionFilter: "all",
+        digestVisible: false,
+        discoverHasMore: false,
+        hasError: true,
+      }),
+    ).toBe("");
+
+    expect(
+      formatRecommendationStatus({
+        view: "discover",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 0,
+        hasActiveFilter: false,
+        decisionFilter: "all",
+        digestVisible: false,
+        digestRequested: true,
+        discoverHasMore: false,
+      }),
+    ).toBe("No unread digest picks left.");
+
     expect(
       formatRecommendationStatus({
         view: "discover",
@@ -166,9 +279,37 @@ describe("status message formatters", () => {
         discoverHasMore: false,
       }),
     ).toBe("Showing 2 of 5 past decisions.");
+
+    expect(
+      formatRecommendationStatus({
+        view: "decisions",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 4,
+        hasActiveFilter: false,
+        decisionFilter: "maybe_later",
+        digestVisible: false,
+        discoverHasMore: false,
+      }),
+    ).toBe("No deferred books.");
+
+    expect(
+      formatRecommendationStatus({
+        view: "decisions",
+        visibleCount: 0,
+        matchedCount: 0,
+        shortlistTotalCount: 0,
+        totalDecisionCount: 4,
+        hasActiveFilter: false,
+        decisionFilter: "rejected",
+        digestVisible: false,
+        discoverHasMore: false,
+      }),
+    ).toBe("No passed books.");
   });
 
-  it("formats Reading History counts and filtered zero-match states", () => {
+  it("formats Reading History loading, counts, and filtered zero-match states", () => {
     expect(
       formatReadingHistoryStatus({
         state: "loading",
@@ -176,7 +317,7 @@ describe("status message formatters", () => {
         matchedCount: 0,
         hasActiveFilter: false,
       }),
-    ).toBe("");
+    ).toBe("Loading your read books…");
 
     expect(
       formatReadingHistoryStatus({

@@ -2,6 +2,8 @@ export const LIVE_STATUS_DEBOUNCE_MS = 300;
 
 export type LiveStatusUpdateOptions = {
   immediate?: boolean;
+  contextKey?: string;
+  paused?: boolean;
 };
 
 export type LiveStatusControllerOptions = {
@@ -26,6 +28,7 @@ export function createLiveStatusController({
   let initialized = false;
   let lastInput = "";
   let lastAnnounced = "";
+  let lastContextKey: string | undefined = undefined;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   function clearTimer() {
@@ -46,15 +49,40 @@ export function createLiveStatusController({
     update(rawMessage, options) {
       const message = (rawMessage ?? "").trim();
       const immediate = Boolean(options?.immediate);
+      const contextKey = options?.contextKey;
+      const paused = Boolean(options?.paused);
 
       if (!initialized) {
         initialized = true;
         lastInput = message;
+        lastContextKey = contextKey;
+        if (!paused && announceOnMount && message) {
+          timer = setTimeout(() => {
+            timer = null;
+            deliver(message);
+          }, 0);
+        }
+        return;
+      }
+
+      if (paused) {
+        clearTimer();
+        lastInput = message;
+        lastContextKey = contextKey;
+        return;
+      }
+
+      if (contextKey !== lastContextKey) {
+        lastContextKey = contextKey;
+        lastInput = message;
+        clearTimer();
         if (announceOnMount && message) {
           timer = setTimeout(() => {
             timer = null;
             deliver(message);
           }, 0);
+        } else {
+          deliver("");
         }
         return;
       }
@@ -91,6 +119,67 @@ export function createLiveStatusController({
   };
 }
 
+export type LiveStatusActionParams = {
+  message?: string | null;
+  immediate?: boolean;
+  announceOnMount?: boolean;
+  debounceMs?: number;
+  contextKey?: string;
+  paused?: boolean;
+};
+
+export function liveStatus(
+  node: { textContent: string | null },
+  initialParams: LiveStatusActionParams = {},
+) {
+  let currentConfig = {
+    debounceMs: initialParams.debounceMs ?? LIVE_STATUS_DEBOUNCE_MS,
+    announceOnMount: Boolean(initialParams.announceOnMount),
+  };
+  let controller = createLiveStatusController({
+    ...currentConfig,
+    onAnnounce: (nextMessage) => {
+      node.textContent = nextMessage;
+    },
+  });
+  controller.update(initialParams.message, {
+    immediate: initialParams.immediate,
+    contextKey: initialParams.contextKey,
+    paused: initialParams.paused,
+  });
+
+  return {
+    update(nextParams: LiveStatusActionParams = {}) {
+      const nextDebounceMs = nextParams.debounceMs ?? LIVE_STATUS_DEBOUNCE_MS;
+      const nextAnnounceOnMount = Boolean(nextParams.announceOnMount);
+      if (
+        nextDebounceMs !== currentConfig.debounceMs ||
+        nextAnnounceOnMount !== currentConfig.announceOnMount
+      ) {
+        controller.destroy();
+        currentConfig = {
+          debounceMs: nextDebounceMs,
+          announceOnMount: nextAnnounceOnMount,
+        };
+        controller = createLiveStatusController({
+          ...currentConfig,
+          onAnnounce: (nextMessage) => {
+            node.textContent = nextMessage;
+          },
+        });
+      }
+      controller.update(nextParams.message, {
+        immediate: nextParams.immediate,
+        contextKey: nextParams.contextKey,
+        paused: nextParams.paused,
+      });
+    },
+    destroy() {
+      controller.destroy();
+    },
+  };
+}
+
 export type RecommendationStatusInput = {
   view: "discover" | "saved" | "decisions";
   visibleCount: number;
@@ -100,7 +189,10 @@ export type RecommendationStatusInput = {
   hasActiveFilter: boolean;
   decisionFilter: "all" | "maybe_later" | "rejected" | "read";
   digestVisible: boolean;
+  digestRequested?: boolean;
   discoverHasMore: boolean;
+  loading?: boolean;
+  hasError?: boolean;
 };
 
 export function formatRecommendationStatus({
@@ -112,8 +204,18 @@ export function formatRecommendationStatus({
   hasActiveFilter,
   decisionFilter,
   digestVisible,
+  digestRequested = false,
   discoverHasMore,
+  loading = false,
+  hasError = false,
 }: RecommendationStatusInput): string {
+  if (hasError) return "";
+  if (loading) {
+    return view === "decisions"
+      ? "Loading past decisions…"
+      : "Searching recommendations…";
+  }
+
   if (matchedCount === 0) {
     if (view === "saved" && shortlistTotalCount === 0) {
       return "Your shortlist is empty.";
@@ -124,7 +226,12 @@ export function formatRecommendationStatus({
         : "No books match these filters.";
     }
     if (view === "decisions") {
+      if (decisionFilter === "maybe_later") return "No deferred books.";
+      if (decisionFilter === "rejected") return "No passed books.";
       return "No past decisions.";
+    }
+    if (digestRequested) {
+      return "No unread digest picks left.";
     }
     if (digestVisible) {
       return "No digest picks yet.";
@@ -143,7 +250,7 @@ export function formatRecommendationStatus({
   }
 
   if (view === "decisions") {
-    if (hasActiveFilter || decisionFilter !== "all") {
+    if ((hasActiveFilter || decisionFilter !== "all") && totalDecisionCount >= matchedCount) {
       return `Showing ${matchedCount} of ${totalDecisionCount} past ${totalDecisionCount === 1 ? "decision" : "decisions"}.`;
     }
     return `Showing ${matchedCount} past ${matchedCount === 1 ? "decision" : "decisions"}.`;
@@ -152,6 +259,9 @@ export function formatRecommendationStatus({
   if (hasActiveFilter) {
     if (visibleCount < matchedCount) {
       return `Showing ${visibleCount} of ${matchedCount} matching recommendations.`;
+    }
+    if (discoverHasMore) {
+      return `Showing ${visibleCount} matching ${visibleCount === 1 ? "recommendation" : "recommendations"}.`;
     }
     return `${matchedCount} ${matchedCount === 1 ? "recommendation matches" : "recommendations match"} these filters.`;
   }
@@ -176,6 +286,7 @@ export function formatReadingHistoryStatus({
   matchedCount,
   hasActiveFilter,
 }: ReadingHistoryStatusInput): string {
+  if (state === "loading") return "Loading your read books…";
   if (state !== "ready") return "";
   if (matchedCount === 0) {
     return hasActiveFilter
