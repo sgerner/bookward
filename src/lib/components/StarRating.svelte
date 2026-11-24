@@ -37,6 +37,8 @@
 	let radioGroup = $state<{ focusFirst: () => void } | null>(null);
 	let lastRadioTrigger: HTMLElement | null = null;
 
+	const uid = $props.id();
+	const effectiveLabelledBy = $derived(labelledBy ?? `${uid}-label`);
 	const ratings = $derived(Array.from({ length: max }, (_, index) => index + 1));
 	const normalizedValue = $derived(
 		typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max
@@ -66,12 +68,14 @@
 	aria-busy={busy}
 	data-rating-group={groupKey}
 >
+	{#if !labelledBy}
+		<span id={effectiveLabelledBy} class="sr-only">{label}</span>
+	{/if}
 	<RadioGroup
 		bind:this={radioGroup}
 		items={ratings}
 		value={normalizedValue}
-		{labelledBy}
-		ariaLabel={labelledBy ? undefined : label}
+		labelledBy={effectiveLabelledBy}
 		columns={1}
 		{selectOnMove}
 		clearable

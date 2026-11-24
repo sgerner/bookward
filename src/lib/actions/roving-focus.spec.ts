@@ -66,48 +66,105 @@ describe('nextRovingIndex', () => {
 		expect(nextRovingIndex(0, 0, 'ArrowRight', 1)).toBeNull();
 	});
 
-	it('navigates 2D grids across rows and columns with wrapping', () => {
-		expect(nextRovingIndex(0, 6, 'ArrowDown', 2)).toBe(2);
-		expect(nextRovingIndex(5, 6, 'ArrowDown', 2)).toBe(1);
-		expect(nextRovingIndex(0, 6, 'ArrowUp', 2)).toBe(4);
-		expect(nextRovingIndex(1, 6, 'ArrowRight', 2)).toBe(2);
-		expect(nextRovingIndex(0, 6, 'ArrowLeft', 2)).toBe(5);
+	it('treats single-row multi-column groups such as 3 color modes consistently', () => {
+		expect(nextRovingIndex(0, 3, 'ArrowRight', 3)).toBe(1);
+		expect(nextRovingIndex(0, 3, 'ArrowDown', 3)).toBe(1);
+		expect(nextRovingIndex(2, 3, 'ArrowRight', 3)).toBe(0);
+		expect(nextRovingIndex(0, 3, 'ArrowLeft', 3)).toBe(2);
+		expect(nextRovingIndex(0, 3, 'ArrowUp', 3)).toBe(2);
+	});
+
+	it('navigates 2D palette grids across rows and columns with wrapping', () => {
+		// 24 palettes across 2 columns
+		expect(nextRovingIndex(0, 24, 'ArrowDown', 2)).toBe(2);
+		expect(nextRovingIndex(1, 24, 'ArrowDown', 2)).toBe(3);
+		expect(nextRovingIndex(22, 24, 'ArrowDown', 2)).toBe(0);
+		expect(nextRovingIndex(23, 24, 'ArrowDown', 2)).toBe(1);
+
+		expect(nextRovingIndex(2, 24, 'ArrowUp', 2)).toBe(0);
+		expect(nextRovingIndex(0, 24, 'ArrowUp', 2)).toBe(22);
+		expect(nextRovingIndex(1, 24, 'ArrowUp', 2)).toBe(23);
+
+		expect(nextRovingIndex(1, 24, 'ArrowRight', 2)).toBe(2);
+		expect(nextRovingIndex(23, 24, 'ArrowRight', 2)).toBe(0);
+		expect(nextRovingIndex(0, 24, 'ArrowLeft', 2)).toBe(23);
+		expect(nextRovingIndex(10, 24, 'Home', 2)).toBe(0);
+		expect(nextRovingIndex(10, 24, 'End', 2)).toBe(23);
+	});
+
+	it('handles uneven final rows in 2D grids without out-of-bounds indices', () => {
+		// 5 items in 2 columns: [0, 1], [2, 3], [4]
+		expect(nextRovingIndex(3, 5, 'ArrowDown', 2)).toBe(1);
+		expect(nextRovingIndex(4, 5, 'ArrowDown', 2)).toBe(0);
+		expect(nextRovingIndex(0, 5, 'ArrowUp', 2)).toBe(4);
+		expect(nextRovingIndex(1, 5, 'ArrowUp', 2)).toBe(3);
 	});
 });
 
 describe('rovingFocus action', () => {
-	it('maintains a single tabindex=0 stop and moves focus across radios', () => {
-		const radios = Array.from({ length: 5 }, (_, idx) => createFakeRadio(idx === 1));
+	it('maintains a single tabindex=0 stop and moves focus in 2D without auto-selecting', () => {
+		const radios = Array.from({ length: 6 }, (_, idx) => createFakeRadio(idx === 1));
 		const { node, dispatch, listenerCount } = createFakeContainer(radios);
 		const onMove = vi.fn();
 		const onActiveIndexChange = vi.fn();
 
 		const handle = rovingFocus(node, {
-			columns: 1,
+			columns: 2,
 			selectedIndex: 1,
 			onMove,
 			onActiveIndexChange,
 		});
 
-		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual(['-1', '0', '-1', '-1', '-1']);
+		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual([
+			'-1',
+			'0',
+			'-1',
+			'-1',
+			'-1',
+			'-1',
+		]);
 
 		const preventDefault = vi.fn();
-		dispatch('keydown', { key: 'ArrowRight', target: radios[1], preventDefault });
+		dispatch('keydown', { key: 'ArrowDown', target: radios[1], preventDefault });
 
 		expect(preventDefault).toHaveBeenCalledTimes(1);
-		expect(radios[2].focus).toHaveBeenCalledTimes(1);
-		expect(radios[2].scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
-		expect(onMove).toHaveBeenCalledWith(2);
-		expect(onActiveIndexChange).toHaveBeenCalledWith(2);
-		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual(['-1', '-1', '0', '-1', '-1']);
+		expect(radios[3].focus).toHaveBeenCalledTimes(1);
+		expect(radios[3].scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+		expect(onMove).toHaveBeenCalledWith(3);
+		expect(onActiveIndexChange).toHaveBeenCalledWith(3);
+		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual([
+			'-1',
+			'-1',
+			'-1',
+			'0',
+			'-1',
+			'-1',
+		]);
 
+		// Re-running update with unchanged selectedIndex preserves roving position at index 3
 		handle.update({
-			columns: 1,
+			columns: 2,
+			selectedIndex: 1,
+			onMove,
+			onActiveIndexChange,
+		});
+		expect(radios[3].getAttribute('tabindex')).toBe('0');
+
+		// Updating selectedIndex when an option is chosen syncs tabindex=0 to the new selection
+		handle.update({
+			columns: 2,
 			selectedIndex: 4,
 			onMove,
 			onActiveIndexChange,
 		});
-		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual(['-1', '-1', '-1', '-1', '0']);
+		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual([
+			'-1',
+			'-1',
+			'-1',
+			'-1',
+			'0',
+			'-1',
+		]);
 
 		handle.destroy();
 		expect(listenerCount('keydown')).toBe(0);
@@ -125,6 +182,7 @@ describe('rovingFocus action', () => {
 			onClear,
 		});
 
+		// Unselected optional group starts with index 0 as the single Tab stop
 		expect(radios.map((r) => r.getAttribute('tabindex'))).toEqual(['0', '-1', '-1', '-1', '-1']);
 
 		dispatch('focusin', { target: radios[2] });

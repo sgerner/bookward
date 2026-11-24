@@ -15,7 +15,6 @@
 		value = null,
 		getValue = (entry: Item) => entry as unknown as string | number,
 		labelledBy,
-		ariaLabel,
 		columns = 1,
 		selectOnMove = false,
 		clearable = false,
@@ -27,8 +26,7 @@
 		items: readonly Item[];
 		value?: string | number | null;
 		getValue?: (entry: Item) => string | number;
-		labelledBy?: string;
-		ariaLabel?: string;
+		labelledBy: string;
 		columns?: number;
 		selectOnMove?: boolean;
 		clearable?: boolean;
@@ -93,7 +91,6 @@
 	bind:this={root}
 	role="radiogroup"
 	aria-labelledby={labelledBy}
-	aria-label={labelledBy ? undefined : ariaLabel}
 	class={className}
 	use:rovingFocus={{
 		columns,

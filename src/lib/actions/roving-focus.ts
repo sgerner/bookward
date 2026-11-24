@@ -96,8 +96,7 @@ export function rovingFocus(node: HTMLElement, initialOptions: RovingFocusOption
 	const findTargetIndex = (items: HTMLElement[], target: EventTarget | null): number => {
 		if (!target) return -1;
 		return items.findIndex(
-			(item) =>
-				item === target || (typeof item.contains === 'function' && item.contains(target as Node)),
+			(item) => item === target || (typeof item.contains === 'function' && item.contains(target as Node)),
 		);
 	};
 

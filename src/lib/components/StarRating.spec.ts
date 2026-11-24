@@ -13,7 +13,8 @@ describe('shared StarRating component', () => {
 		});
 
 		expect(body).toContain('role="radiogroup"');
-		expect(body).toContain('aria-label="Rating for Station Eleven"');
+		expect(body).toContain('aria-labelledby="');
+		expect(body).toContain('>Rating for Station Eleven</span>');
 		expect(body).not.toContain('aria-pressed');
 		expect(body.match(/role="radio"/g)).toHaveLength(5);
 		expect(body.match(/aria-checked="true"/g)).toBeNull();
