@@ -32,6 +32,7 @@ from .backups import (
 )
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url
+from . import ingestion
 from .ingestion import (
     import_goodreads_csv,
     import_goodreads_rss,
@@ -2430,8 +2431,18 @@ async def goodreads_csv(file: UploadFile = File(...)):
 
 async def _sync_goodreads_rss(url: str):
     try:
-        count = await import_goodreads_rss(url)
-        shelves = await import_goodreads_shelves(url)
+        async with ingestion._source_client() as client:
+            read_result, shelf_results = await asyncio.gather(
+                import_goodreads_rss(url, client=client),
+                ingestion._fetch_goodreads_shelves(url, client=client),
+                return_exceptions=True,
+            )
+        if isinstance(read_result, BaseException):
+            raise read_result
+        if isinstance(shelf_results, BaseException):
+            raise shelf_results
+        count = read_result
+        shelves = ingestion._apply_goodreads_shelves(shelf_results)
     except Exception as exc:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         message = safe_error_message(exc, limit=300)
