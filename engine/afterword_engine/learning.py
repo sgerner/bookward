@@ -671,12 +671,6 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         if read_time is None and source not in HISTORICAL_READ_SOURCES:
             read_time, day_precision = _read_time(read.get("created_at"))
 
-        # Preserve earlier attributed labels when a later import omits dates or
-        # the current catalog has no matching row; only an explicit read_time
-        # that precedes exposures is evidence against attribution.
-        if not matched_by_id or read_time is None:
-            continue
-
         existing_events = existing_read_events_by_read_id.get(read_id, [])
         metadata = {
             "read_source": str(read.get("source") or "unknown")[:32],
@@ -684,6 +678,30 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         }
         read_value = float(read["rating"]) if read.get("rating") is not None else None
         occurred_at = read.get("read_at") or read.get("created_at") or utc_now()
+
+        # Candidate foreign keys cascade on delete, so any surviving read event
+        # points to a live catalog candidate that this read no longer matches.
+        if not matched_by_id:
+            for existing_event in existing_events:
+                record_event_in_connection(
+                    con,
+                    event_key=str(existing_event["event_key"]),
+                    candidate_id=int(existing_event["candidate_id"]),
+                    event_type="read",
+                    run_id=None,
+                    value=read_value,
+                    source="read_import",
+                    metadata=metadata,
+                    occurred_at=occurred_at,
+                    clear_read_outcome=True,
+                )
+            continue
+
+        # Preserve earlier attributed labels when a later import omits dates for
+        # a still-matching book; only an explicit read_time that precedes
+        # exposures (or a lost identity match above) clears attribution.
+        if read_time is None:
+            continue
 
         exact_identity = book_identity(read["title"], read["author"])
         read_isbn_keys = _isbn_match_keys(read)
@@ -792,8 +810,10 @@ def attribute_read_outcomes(connection=None) -> dict[str, int]:
     event and outcome keys are stable across Goodreads re-imports. Historical
     imports need an explicit completion date; their creation time is import
     time, not evidence of when the book was read. If a later import omits a
-    completion date or does not match a current catalog row, previously
-    attributed outcomes are preserved rather than wiped.
+    completion date for a still-matching book, previously attributed outcomes
+    are preserved; if a read stops matching any catalog candidate or its
+    explicit completion date moves before all exposures, prior read outcomes
+    are cleared.
     """
 
     if connection is not None:

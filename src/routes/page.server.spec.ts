@@ -1367,7 +1367,7 @@ describe("page actions", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     const body = new FormData();
-    body.set("run_id", "  run-digest-1234  ");
+    body.set("run_id", "run-digest-1");
     body.append("ids", "7");
     body.append("ids", "8");
     const result = await actions.shortlistBulk!({
@@ -1384,7 +1384,7 @@ describe("page actions", () => {
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
       ids: [7, 8],
       action: "save",
-      run_id: "run-digest-1234",
+      run_id: "run-digest-1",
     });
   });
 

@@ -1079,9 +1079,18 @@ def archive_recommendation_event(
     source: str,
     occurred_at: str,
 ) -> int | None:
-    """Append a run-linked event revision without mutable-catalog references."""
+    """Append a run-linked or superseding unlinked event revision without mutable-catalog references.
+
+    Unlinked (``run_id=None``) revisions are only appended when ``event_key``
+    already has archived evidence so superseded or retracted outcomes can still
+    be hidden during replay even after a run reaches ``MAX_ARCHIVED_EVENTS_PER_RUN``.
+    Those unlinked revisions intentionally bypass the per-run event cap and are
+    bounded by the global ``MAX_STORED_EVIDENCE_BYTES`` storage quota.
+    """
 
     if not run_id:
+        # Unlinked retraction/superseding revisions are not tied to one run_id;
+        # they bypass MAX_ARCHIVED_EVENTS_PER_RUN and rely on _budget_allows below.
         has_prior_evidence = (
             connection.execute(
                 "SELECT 1 FROM recommendation_evidence_events WHERE event_key=? LIMIT 1",
@@ -1319,8 +1328,12 @@ def purge_recommendation_evidence(
                     "SELECT event_key FROM recommendation_events "
                     "WHERE event_key LIKE ? OR event_key LIKE ? UNION "
                     "SELECT event_key FROM recommendation_evidence_events "
+                    "WHERE event_key LIKE ? OR event_key LIKE ? UNION "
+                    "SELECT event_key FROM recommendation_evidence_outcomes "
                     "WHERE event_key LIKE ? OR event_key LIKE ?",
                     (
+                        f"read:{read_id:08d}:%",
+                        f"manual-read:%:{read_id:08d}",
                         f"read:{read_id:08d}:%",
                         f"manual-read:%:{read_id:08d}",
                         f"read:{read_id:08d}:%",
@@ -1337,8 +1350,10 @@ def purge_recommendation_evidence(
             "SELECT run_id FROM recommendation_events "
             f"WHERE event_key IN ({event_marks}) UNION "
             "SELECT run_id FROM recommendation_evidence_events "
+            f"WHERE event_key IN ({event_marks}) UNION "
+            "SELECT run_id FROM recommendation_evidence_outcomes "
             f"WHERE event_key IN ({event_marks})",
-            (*reads, *read_event_keys, *read_event_keys),
+            (*reads, *read_event_keys, *read_event_keys, *read_event_keys),
         ).fetchall()
         selected_runs.update(str(row["run_id"]) for row in rows if row["run_id"])
 
@@ -1412,6 +1427,17 @@ def purge_recommendation_evidence(
     removed_runs = 0
     if run_list:
         run_marks = ",".join("?" for _ in run_list)
+        purged_run_event_keys = sorted(
+            {
+                str(row["event_key"])
+                for row in connection.execute(
+                    f"SELECT DISTINCT event_key FROM recommendation_evidence_events WHERE run_id IN ({run_marks}) "
+                    f"UNION SELECT DISTINCT event_key FROM recommendation_evidence_outcomes WHERE run_id IN ({run_marks})",
+                    (*run_list, *run_list),
+                ).fetchall()
+                if row["event_key"]
+            }
+        )
         removed_runs = int(
             connection.execute(
                 f"SELECT COUNT(*) count FROM recommendation_runs WHERE id IN ({run_marks})",
@@ -1428,13 +1454,21 @@ def purge_recommendation_evidence(
             f"DELETE FROM recommendation_runs WHERE id IN ({run_marks})",
             run_list,
         )
-        connection.execute(
-            "DELETE FROM recommendation_evidence_events "
-            "WHERE run_id IS NULL AND NOT EXISTS ("
-            "SELECT 1 FROM recommendation_evidence_events e2 "
-            "WHERE e2.event_key=recommendation_evidence_events.event_key "
-            "AND e2.run_id IS NOT NULL)"
-        )
+        for start in range(0, len(purged_run_event_keys), 400):
+            key_batch = purged_run_event_keys[start : start + 400]
+            key_marks = ",".join("?" for _ in key_batch)
+            connection.execute(
+                "DELETE FROM recommendation_evidence_events "
+                f"WHERE run_id IS NULL AND event_key IN ({key_marks}) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM recommendation_evidence_events e2 "
+                "WHERE e2.event_key=recommendation_evidence_events.event_key "
+                "AND e2.run_id IS NOT NULL) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM recommendation_evidence_outcomes o2 "
+                "WHERE o2.event_key=recommendation_evidence_events.event_key)",
+                key_batch,
+            )
     if candidates:
         connection.execute(
             f"DELETE FROM recommendation_events WHERE candidate_id IN ({marks})",
@@ -1468,6 +1502,10 @@ def purge_recommendation_evidence(
         )
         connection.execute(
             f"DELETE FROM recommendation_evidence_events WHERE event_key IN ({event_marks})",
+            read_event_keys,
+        )
+        connection.execute(
+            f"DELETE FROM recommendation_evidence_outcomes WHERE event_key IN ({event_marks})",
             read_event_keys,
         )
     if clear_all_evidence:

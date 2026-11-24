@@ -1705,6 +1705,36 @@ def test_three_part_read_event_key_cleans_up_on_rematch_and_pre_exposure_date(da
         replayed = load_decision_evidence(con, run_id)["outcomes"]
         assert [int(item["candidate_id"]) for item in replayed] == [cand_a]
 
+    # Re-match Candidate B, then stop matching any candidate -> 3-part key is cleaned up,
+    # and a later re-match to Candidate A does not double-count.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Beta',author='Writer Two' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] == run_id
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Unmatched Catalog Title',author='Nobody' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 0
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Alpha',author='Writer One' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 1
+    with connect() as con:
+        assert [int(item["candidate_id"]) for item in load_decision_evidence(con, run_id)["outcomes"]] == [cand_a]
+
     # Re-match Candidate B then move read_at before all exposures -> 3-part key is cleared too.
     with transaction() as con:
         con.execute(
@@ -1720,8 +1750,28 @@ def test_three_part_read_event_key_cleans_up_on_rematch_and_pre_exposure_date(da
     with connect() as con:
         assert load_decision_evidence(con, run_id)["outcomes"] == []
 
+    from afterword_engine.decision_evidence import purge_recommendation_evidence
 
-def test_undated_or_unmatched_reads_and_unlabelled_duplicate_reads_preserve_outcomes(database):
+    with transaction() as con:
+        purged = purge_recommendation_evidence(con, read_ids=[read_id])
+        assert purged["runs_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key IN (?,?)",
+                (default_key, three_part_key),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key IN (?,?)",
+                (default_key, three_part_key),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
+def test_undated_reads_and_unlabelled_duplicate_reads_preserve_outcomes_while_unmatched_reads_clean_up(database):
     recommendations, run_id = tracked_recommendations()
     candidate = recommendations[0]
     _set_candidate_exposure_time(candidate["id"], run_id, "2025-05-01T10:00:00+00:00")
@@ -1738,7 +1788,7 @@ def test_undated_or_unmatched_reads_and_unlabelled_duplicate_reads_preserve_outc
     event = row("SELECT id,run_id FROM recommendation_events WHERE event_key=?", (event_key,))
     assert event["run_id"] == run_id
 
-    # Dropping read_at on a historical source must NOT wipe earlier attributed outcomes.
+    # Dropping read_at on a historical source for a still-matching book must NOT wipe earlier attributed outcomes.
     with transaction() as con:
         con.execute("UPDATE reads SET read_at=NULL WHERE id=?", (read_id,))
     attribute_read_outcomes()
@@ -1746,16 +1796,6 @@ def test_undated_or_unmatched_reads_and_unlabelled_duplicate_reads_preserve_outc
     assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?", (event["id"],))["count"] == 1
     with connect() as con:
         assert len(load_decision_evidence(con, run_id)["outcomes"]) == 1
-
-    # Becoming unmatched in the current catalog must also preserve earlier attributed outcomes.
-    with transaction() as con:
-        con.execute(
-            "UPDATE reads SET title='Unmatched Export Title',read_at='2025-05-05' WHERE id=?",
-            (read_id,),
-        )
-    attribute_read_outcomes()
-    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (event_key,))["run_id"] == run_id
-    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?", (event["id"],))["count"] == 1
 
     # Recording a duplicate read without a label must preserve all existing outcomes regardless of label_kind.
     with transaction() as con:
@@ -1788,29 +1828,27 @@ def test_undated_or_unmatched_reads_and_unlabelled_duplicate_reads_preserve_outc
             == 2
         )
 
-        # Even explicit clear_read_outcome=True only removes READ_OUTCOME_LABEL_KINDS.
-        record_event_in_connection(
-            con,
-            event_key=event_key,
-            candidate_id=candidate["id"],
-            event_type="read",
-            run_id=None,
-            value=5.0,
-            source="read_import",
-            metadata={"read_source": "goodreads_csv", "time_precision": "day"},
-            clear_read_outcome=True,
+    # Becoming unmatched in the catalog cleans up read-derived outcomes while preserving non-read label_kinds.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Unmatched Export Title',read_at='2025-05-05' WHERE id=?",
+            (read_id,),
         )
-        remaining = [
-            dict(r)
-            for r in con.execute(
-                "SELECT label_kind FROM recommendation_outcomes WHERE event_id=?",
-                (event["id"],),
-            ).fetchall()
-        ]
-        assert remaining == [{"label_kind": "explicit_feedback"}]
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (event_key,))["run_id"] is None
+    remaining = [
+        dict(r)
+        for r in __import__("afterword_engine.database", fromlist=["rows"]).rows(
+            "SELECT label_kind FROM recommendation_outcomes WHERE event_id=?",
+            (event["id"],),
+        )
+    ]
+    assert remaining == [{"label_kind": "explicit_feedback"}]
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
 
 
-def test_retracted_explicit_outcomes_are_deleted_and_unmask_read_outcomes(database):
+def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_outcomes(database):
     from afterword_engine.evaluation import load_rows
 
     recommendations, run_id = tracked_recommendations()
