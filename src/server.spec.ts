@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import process from 'node:process';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { handle } from './hooks.server';
-import { prepareRuntimeEnv, startServer, wrapAdapterHandler } from '../server.js';
+import { prepareRuntimeEnv, startServer } from '../server.js';
 
 type AdapterResponder = (request: Request) => Promise<Response>;
 
@@ -391,20 +391,5 @@ describe('Node runtime origin wrapper', () => {
 			forwardedHost: 'books.example.com',
 			forwardedFor: null
 		});
-
-		const fallbackRes: { statusCode?: number; ended?: boolean } = {};
-		const wrapped = wrapAdapterHandler((_req, _res, next) => next(), prepareRuntimeEnv({}));
-		wrapped(
-			{ headers: { 'x-forwarded-proto': 'http' } } as never,
-			{
-				set statusCode(code: number) {
-					fallbackRes.statusCode = code;
-				},
-				end: () => {
-					fallbackRes.ended = true;
-				}
-			} as never
-		);
-		expect(fallbackRes).toEqual({ statusCode: 404, ended: true });
 	});
 });

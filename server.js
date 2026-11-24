@@ -3,14 +3,6 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 /**
- * @typedef {(
- *   req: import('node:http').IncomingMessage,
- *   res: import('node:http').ServerResponse,
- *   next: () => void
- * ) => unknown} AdapterHandler
- */
-
-/**
  * @typedef {{
  *   origin: string | undefined;
  *   protocolHeader: string | undefined;
@@ -97,43 +89,14 @@ function trustedForwardedHeaders(config) {
  * Strips untrusted `X-Forwarded-*` and `Forwarded` headers from `headers`.
  *
  * @param {import('node:http').IncomingHttpHeaders} headers
- * @param {RuntimeOriginConfig} config
+ * @param {ReadonlySet<string>} trusted
  */
-export function sanitizeForwardedHeaders(headers, config) {
-	const trusted = trustedForwardedHeaders(config);
+function stripUntrustedForwardedHeaders(headers, trusted) {
 	for (const header of FORWARDED_HEADERS) {
 		if (!trusted.has(header)) {
 			delete headers[header];
 		}
 	}
-}
-
-/**
- * Wraps `@sveltejs/adapter-node`'s `build/handler.js` middleware to strip
- * untrusted forwarded headers before origin and client-address resolution.
- *
- * @param {AdapterHandler} handler
- * @param {RuntimeOriginConfig} config
- * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, next?: () => void) => unknown}
- */
-export function wrapAdapterHandler(handler, config) {
-	const trusted = trustedForwardedHeaders(config);
-	return (req, res, next) => {
-		for (const header of FORWARDED_HEADERS) {
-			if (!trusted.has(header)) {
-				delete req.headers[header];
-			}
-		}
-		return handler(
-			req,
-			res,
-			next ??
-				(() => {
-					res.statusCode = 404;
-					res.end();
-				})
-		);
-	};
 }
 
 /**
@@ -152,11 +115,7 @@ export function attachOriginGuard(server, config) {
 		'request',
 		/** @param {import('node:http').IncomingMessage} req */
 		(req) => {
-			for (const header of FORWARDED_HEADERS) {
-				if (!trusted.has(header)) {
-					delete req.headers[header];
-				}
-			}
+			stripUntrustedForwardedHeaders(req.headers, trusted);
 		}
 	);
 	return server;

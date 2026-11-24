@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
 import { currentSessionToken } from '#lib/server/request-context.js';
 import { actions as loginActions } from './routes/login/+page.server';
-import { prepareRuntimeEnv, wrapAdapterHandler } from '../server.js';
+import { attachOriginGuard, prepareRuntimeEnv } from '../server.js';
 
 type AdapterResponder = (request: Request) => Promise<Response>;
 
@@ -224,7 +224,11 @@ describe('authentication boundary', () => {
 			import.meta.url
 		).href}?hooksSpecRun=${adapterRunId}`;
 		const { handler } = (await import(/* @vite-ignore */ adapterHandlerUrl)) as {
-			handler: Parameters<typeof wrapAdapterHandler>[0];
+			handler: (
+				req: http.IncomingMessage,
+				res: http.ServerResponse,
+				next: () => void
+			) => unknown;
 		};
 
 		vi.stubGlobal(
@@ -303,7 +307,15 @@ describe('authentication boundary', () => {
 			return new Response(response.body, { status: response.status, headers });
 		});
 
-		const server = http.createServer(wrapAdapterHandler(handler, originConfig));
+		const server = attachOriginGuard(
+			http.createServer((req, res) =>
+				handler(req, res, () => {
+					res.statusCode = 404;
+					res.end();
+				})
+			),
+			originConfig
+		);
 		onTestFinished(async () => {
 			server.closeAllConnections?.();
 			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
