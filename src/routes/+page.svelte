@@ -2679,6 +2679,9 @@
                                         required
                                       />
                                     </label>
+                                    <p class="text-xs leading-5 text-surface-600-400">
+                                      Previously discovered books kept from earlier scans stay attributed to this source after a URL change.
+                                    </p>
                                     {#if formState?.error && formState?.editSource?.id === source.id && formState?.message}
                                       <p class="border-l-2 border-error-500 preset-tonal-error p-2.5 text-xs leading-5 text-surface-900-100" role="alert">
                                         {formState.message}

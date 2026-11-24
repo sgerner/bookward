@@ -528,7 +528,7 @@ export const actions: Actions = {
           include_genres: [],
           exclude_genres: [],
         };
-        const preview = await engine<{ count: number }>(
+        const preview = await engine<{ count: number; url?: string }>(
           "/api/sources/preview",
           {
             method: "POST",
@@ -543,14 +543,33 @@ export const actions: Actions = {
                 : "No recognizable books were found at that URL.",
             editSource: editState,
           });
+        const resolvedUrl =
+          typeof preview.url === "string" && preview.url.trim()
+            ? preview.url.trim()
+            : url.data;
+        const resolvedComparable = comparableSourceUrl(resolvedUrl);
+        if (
+          sources.some(
+            (item) =>
+              item.id !== id.data &&
+              comparableSourceUrl(item.url) === resolvedComparable,
+          )
+        )
+          return fail(409, {
+            message: "A source with that URL already exists.",
+            editSource: editState,
+          });
         await engine(`/api/sources/${id.data}`, {
           method: "PUT",
-          body: JSON.stringify({ name: label.data, url: url.data }),
+          body: JSON.stringify({ name: label.data, url: resolvedUrl }),
         });
+        const resolvedUrlChanged =
+          resolvedComparable !== comparableSourceUrl(current.url);
         return {
-          message: current.enabled
-            ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`
-            : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`,
+          message:
+            current.enabled && resolvedUrlChanged
+              ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`
+              : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`,
         };
       }
       await engine(`/api/sources/${id.data}`, {

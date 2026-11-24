@@ -1131,6 +1131,122 @@ describe("page actions", () => {
     });
   });
 
+  it("forwards canonical preview.url when editing a custom source to a homepage and rejects canonical collisions", async () => {
+    const sourcesPayload = [
+      {
+        id: 14,
+        name: "Old Feed",
+        url: "https://books.example/old.xml",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: "ok:2",
+        last_scanned_at: "2026-03-01T00:00:00Z",
+      },
+      {
+        id: 15,
+        name: "Existing Atom Feed",
+        url: "https://feeds.existing.example/books.atom",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: "ok:5",
+        last_scanned_at: "2026-03-01T00:00:00Z",
+      },
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 4,
+            url: "https://feeds.bookdispatches.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 14,
+            name: "Book Dispatches",
+            url: "https://feeds.bookdispatches.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 5,
+            url: "https://feeds.existing.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "14");
+    body.set("label", "Book Dispatches");
+    body.set("url", "https://www.bookdispatches.example");
+    const updated = await actions.editSource!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(updated).toEqual({
+      message: "Source updated; a fresh scan is queued (4 books detected).",
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe("http://127.0.0.1:8000/api/sources/14");
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body)),
+    ).toEqual({
+      name: "Book Dispatches",
+      url: "https://feeds.bookdispatches.example/books.atom",
+    });
+
+    const conflictBody = new FormData();
+    conflictBody.set("id", "14");
+    conflictBody.set("label", "Duplicate Homepage");
+    conflictBody.set("url", "https://www.existing.example");
+    const conflict = await actions.editSource!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: conflictBody,
+      }),
+    } as never);
+    expect(conflict).toMatchObject({
+      status: 409,
+      data: {
+        error: true,
+        message: "A source with that URL already exists.",
+        editSource: {
+          id: 14,
+          label: "Duplicate Homepage",
+          url: "https://www.existing.example",
+        },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
   it("preserves user input when custom source validation, conflict, or preview fails", async () => {
     const invalidBody = new FormData();
     invalidBody.set("id", "14");

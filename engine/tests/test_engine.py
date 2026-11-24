@@ -3456,6 +3456,234 @@ def test_update_custom_source_persists_name_and_url_and_returns_409_on_duplicate
     assert result["collected"] == 2
     assert scanned_urls == ["https://books.example.test/moved-feed.xml"]
 
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind='score'")
+    renamed_only = client.put(
+        f"/api/sources/{first_id}",
+        json={"name": "Sci-Fi Weekly Digest"},
+    )
+    assert renamed_only.status_code == 200
+    assert renamed_only.json()["name"] == "Sci-Fi Weekly Digest"
+    assert renamed_only.json()["job_id"] is None
+    renamed_same_url = client.put(
+        f"/api/sources/{first_id}",
+        json={
+            "name": "Sci-Fi Weekly Archive",
+            "url": "https://books.example.test/moved-feed.xml",
+        },
+    )
+    assert renamed_same_url.status_code == 200
+    assert renamed_same_url.json()["name"] == "Sci-Fi Weekly Archive"
+    assert renamed_same_url.json()["job_id"] is None
+    assert row("SELECT 1 FROM jobs WHERE kind='score' LIMIT 1") is None
+
+
+def test_update_or_refresh_during_running_source_scan_reenqueues_and_scans_one_time_source(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    monkeypatch.setattr(
+        main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=1)
+    )
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'one_time')",
+            ("Initial Feed", "https://books.example.test/initial-one-time.xml"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,?, 'running')",
+            ("running-initial-job", f"source:{source_id}"),
+        )
+
+    client = TestClient(app, headers=authenticated_headers())
+    scanned_urls: list[str] = []
+    mid_run_edit_response: dict[str, object] = {}
+
+    async def scan_with_mid_run_url_edit(source):
+        scanned_urls.append(source["url"])
+        if len(scanned_urls) == 1:
+            resp = client.put(
+                f"/api/sources/{source['id']}",
+                json={
+                    "name": "Edited Mid-Scan",
+                    "url": "https://books.example.test/edited-mid-scan.xml",
+                },
+            )
+            assert resp.status_code == 200
+            mid_run_edit_response.update(resp.json())
+        status = "ok:1" if len(scanned_urls) == 1 else "ok:3"
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status=? WHERE id=?",
+                (status, source["id"]),
+            )
+        return 1 if len(scanned_urls) == 1 else 3
+
+    monkeypatch.setattr(main, "scan_source", scan_with_mid_run_url_edit)
+
+    first_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert first_run["collected"] == 1
+    followup_job_id = mid_run_edit_response["job_id"]
+    assert followup_job_id and followup_job_id != "running-initial-job"
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (followup_job_id,)) == {
+        "kind": f"source:{source_id}",
+        "status": "queued",
+    }
+    assert row(
+        "SELECT name,url,last_scanned_at,last_status FROM sources WHERE id=?",
+        (source_id,),
+    ) == {
+        "name": "Edited Mid-Scan",
+        "url": "https://books.example.test/edited-mid-scan.xml",
+        "last_scanned_at": None,
+        "last_status": None,
+    }
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='complete' WHERE id='running-initial-job'"
+        )
+        con.execute(
+            "UPDATE jobs SET status='running' WHERE id=?",
+            (followup_job_id,),
+        )
+
+    second_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert "skipped" not in second_run
+    assert second_run["collected"] == 3
+    assert scanned_urls == [
+        "https://books.example.test/initial-one-time.xml",
+        "https://books.example.test/edited-mid-scan.xml",
+    ]
+    after_second = row(
+        "SELECT last_scanned_at,last_status FROM sources WHERE id=?",
+        (source_id,),
+    )
+    assert after_second["last_scanned_at"] is not None
+    assert after_second["last_status"] == "ok:3"
+
+    # Now verify a manual refresh landing while a one-time scan is running.
+    with transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='complete' WHERE id=?",
+            (followup_job_id,),
+        )
+        con.execute(
+            "UPDATE sources SET last_scanned_at=NULL WHERE id=?",
+            (source_id,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,?, 'running')",
+            ("running-refresh-job", f"source:{source_id}"),
+        )
+
+    refresh_scans: list[str] = []
+    mid_run_refresh_response: dict[str, object] = {}
+
+    async def scan_with_mid_run_refresh(source):
+        refresh_scans.append(source["url"])
+        if len(refresh_scans) == 1:
+            resp = client.post(f"/api/sources/{source['id']}/refresh")
+            assert resp.status_code == 200
+            mid_run_refresh_response.update(resp.json())
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status='ok:2' WHERE id=?",
+                (source["id"],),
+            )
+        return 2
+
+    monkeypatch.setattr(main, "scan_source", scan_with_mid_run_refresh)
+
+    asyncio.run(handle_job(f"source:{source_id}"))
+    refresh_followup_id = mid_run_refresh_response["job_id"]
+    assert refresh_followup_id and refresh_followup_id != "running-refresh-job"
+    assert row(
+        "SELECT kind,status FROM jobs WHERE id=?", (refresh_followup_id,)
+    ) == {
+        "kind": f"source:{source_id}",
+        "status": "queued",
+    }
+    assert (
+        row("SELECT last_scanned_at FROM sources WHERE id=?", (source_id,))[
+            "last_scanned_at"
+        ]
+        is None
+    )
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE jobs SET status='complete' WHERE id='running-refresh-job'"
+        )
+        con.execute(
+            "UPDATE jobs SET status='running' WHERE id=?",
+            (refresh_followup_id,),
+        )
+
+    followup_refresh_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert "skipped" not in followup_refresh_run
+    assert followup_refresh_run["collected"] == 2
+    assert len(refresh_scans) == 2
+    assert (
+        row("SELECT last_scanned_at FROM sources WHERE id=?", (source_id,))[
+            "last_scanned_at"
+        ]
+        is not None
+    )
+
+
+def test_switching_scanned_one_time_source_to_permanent_reenqueues_and_scans(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=2)
+    )
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES(?,?,1,'one_time','ok:2','2026-01-01T00:00:00+00:00')",
+            ("Promoted Feed", "https://books.example.test/promoted.xml"),
+        ).lastrowid
+
+    skipped = asyncio.run(handle_job(f"source:{source_id}"))
+    assert skipped == {"skipped": "already_scanned", "source_id": source_id}
+
+    scanned_urls: list[str] = []
+
+    async def fake_scan_source(source):
+        scanned_urls.append(source["url"])
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status='ok:2' WHERE id=?",
+                (source["id"],),
+            )
+        return 2
+
+    monkeypatch.setattr(main, "scan_source", fake_scan_source)
+
+    client = TestClient(app, headers=authenticated_headers())
+    promoted = client.put(
+        f"/api/sources/{source_id}", json={"lifecycle": "permanent"}
+    )
+    assert promoted.status_code == 200
+    body = promoted.json()
+    assert body["lifecycle"] == "permanent"
+    assert body["job_id"]
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (body["job_id"],)) == {
+        "kind": f"source:{source_id}",
+        "status": "queued",
+    }
+
+    result = asyncio.run(handle_job(f"source:{source_id}"))
+    assert result["collected"] == 2
+    assert scanned_urls == ["https://books.example.test/promoted.xml"]
+
 
 def test_update_source_url_rejects_unsafe_addresses_and_inline_nyt_keys(
     database, monkeypatch

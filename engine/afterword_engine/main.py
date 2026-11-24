@@ -111,7 +111,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_scope
+from .tenancy import current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -260,6 +260,22 @@ def active_job(kind: str):
         "SELECT 1 FROM jobs WHERE kind=? AND status IN ('queued','running') LIMIT 1",
         (kind,),
     )
+
+
+_SOURCE_SCAN_GENERATIONS: dict[tuple[str, int], int] = {}
+
+
+def _source_scan_generation_key(source_id: int) -> tuple[str, int]:
+    return (str(profile_database_path()), int(source_id))
+
+
+def _source_scan_generation(source_id: int) -> int:
+    return _SOURCE_SCAN_GENERATIONS.get(_source_scan_generation_key(source_id), 0)
+
+
+def _bump_source_scan_generation(source_id: int) -> None:
+    key = _source_scan_generation_key(source_id)
+    _SOURCE_SCAN_GENERATIONS[key] = _SOURCE_SCAN_GENERATIONS.get(key, 0) + 1
 
 
 def enqueue_followup_job(kind: str):
@@ -579,18 +595,93 @@ async def handle_job(kind: str):
             return {"skipped": "disabled", "source_id": source_id}
         if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
             return {"skipped": "already_scanned", "source_id": source_id}
+        started_url = source["url"]
+        started_lifecycle = source["lifecycle"]
+        started_filters = normalize_source_filters(source.get("filters"))
+        started_last_scanned_at = source["last_scanned_at"]
+        started_generation = _source_scan_generation(source_id)
+        queued_before = {
+            item["id"]
+            for item in rows(
+                "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                (kind,),
+            )
+        }
+
+        def _concurrent_source_state():
+            current = row("SELECT * FROM sources WHERE id=?", (source_id,))
+            if not current:
+                return None, False, False
+            queued_after = {
+                item["id"]
+                for item in rows(
+                    "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                    (kind,),
+                )
+            }
+            url_changed = current["url"] != started_url
+            lifecycle_changed = current["lifecycle"] != started_lifecycle
+            filters_changed = (
+                normalize_source_filters(current.get("filters")) != started_filters
+            )
+            reset_during_run = (
+                (
+                    started_last_scanned_at is not None
+                    and current["last_scanned_at"] is None
+                )
+                or bool(queued_after - queued_before)
+                or _source_scan_generation(source_id) != started_generation
+            )
+            return (
+                current,
+                url_changed,
+                url_changed
+                or lifecycle_changed
+                or filters_changed
+                or reset_during_run,
+            )
+
         try:
             collected = await scan_source(source)
         except Exception as exc:
             message = safe_error_message(exc)
+            current, url_changed, needs_rescan = _concurrent_source_state()
             with transaction() as con:
-                con.execute(
-                    "UPDATE sources SET last_status=?, "
-                    "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                    "WHERE id=?",
-                    (f"error:{message}", source_id),
-                )
+                if not url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_status=?, "
+                        "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
+                        "WHERE id=?",
+                        (f"error:{message}", source_id),
+                    )
+                    if needs_rescan and current and current["lifecycle"] == "one_time":
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL WHERE id=?",
+                            (source_id,),
+                        )
+            if (
+                needs_rescan
+                and current
+                and current["enabled"]
+                and current["kind"] not in {"builtin", "association"}
+            ):
+                enqueue_followup_job(kind)
             raise
+        current, url_changed, needs_rescan = _concurrent_source_state()
+        if needs_rescan and current:
+            with transaction() as con:
+                if url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_status=NULL WHERE id=?",
+                        (source_id,),
+                    )
+                elif current["lifecycle"] == "one_time":
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL WHERE id=?",
+                        (source_id,),
+                    )
+            if current["enabled"] and current["kind"] not in {"builtin", "association"}:
+                enqueue_followup_job(kind)
         metadata = await refresh_missing_candidate_metadata()
         if candidate_metadata_refresh_remaining():
             enqueue_job("metadata", dedupe=True)
@@ -2536,11 +2627,11 @@ def toggle_source(source_id:int):
                 "WHERE source_id=? AND status='recommended'",
                 (source_id,),
             )
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if became_enabled and source["kind"] not in {"builtin", "association"}
-        else None
-    )
+    if became_enabled and source["kind"] not in {"builtin", "association"}:
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
+    else:
+        job_id = None
     return {"id":source_id, "job_id":job_id}
 
 
@@ -2774,14 +2865,12 @@ def update_source(source_id: int, payload: SourceUpdateIn):
 
         updates: list[str] = []
         values: list[object] = []
-        name_changed = False
         url_changed = False
         existing_filters = normalize_source_filters(source["filters"])
 
         if cleaned_name is not None:
             updates.append("name=?")
             values.append(cleaned_name)
-            name_changed = cleaned_name != source["name"]
         if normalized_url is not None:
             updates.append("url=?")
             values.append(normalized_url)
@@ -2830,11 +2919,13 @@ def update_source(source_id: int, payload: SourceUpdateIn):
         or payload.lifecycle is not None
     )
     job_id = None
-    if source["enabled"] and source["kind"] not in {"builtin", "association"}:
-        if needs_source_scan:
-            job_id = enqueue_job(f"source:{source_id}", dedupe=True)
-        elif name_changed:
-            job_id = enqueue_job("score", dedupe=True)
+    if (
+        needs_source_scan
+        and source["enabled"]
+        and source["kind"] not in {"builtin", "association"}
+    ):
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
     return {
         "id": source_id,
         "name": cleaned_name if cleaned_name is not None else source["name"],
@@ -2863,7 +2954,8 @@ def refresh_source(source_id: int):
                 "UPDATE sources SET last_scanned_at=NULL WHERE id=?",
                 (source_id,),
             )
-    job_id = enqueue_job(f"source:{source_id}", dedupe=True)
+    _bump_source_scan_generation(source_id)
+    job_id = enqueue_followup_job(f"source:{source_id}")
     return {"id": source_id, "job_id": job_id}
 
 
