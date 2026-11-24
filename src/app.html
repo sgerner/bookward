@@ -4,9 +4,37 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="color-scheme" content="light dark" />
+		%sveltekit.head%
 		<script>
 			(() => {
-				const themes = ['catppuccin', 'cerberus', 'concord', 'crimson', 'dracula', 'fennec', 'hamlindigo', 'legacy', 'mint', 'modern', 'mona', 'nosh', 'nouveau', 'pine', 'reign', 'rocket', 'rose', 'rosepine', 'sahara', 'seafoam', 'terminus', 'vintage', 'vox', 'wintry'];
+				const themeColors = {
+					catppuccin: { light: '#ffffff', dark: '#131322' },
+					cerberus: { light: '#fcfcfc', dark: '#121212' },
+					concord: { light: '#ffffff', dark: '#17171c' },
+					crimson: { light: '#ffffff', dark: '#0c0e17' },
+					dracula: { light: '#f5f8ff', dark: '#12141e' },
+					fennec: { light: '#eef6f1', dark: '#141519' },
+					hamlindigo: { light: '#ffffff', dark: '#0d1427' },
+					legacy: { light: '#ffffff', dark: '#0d1329' },
+					mint: { light: '#e1f6ed', dark: '#001d17' },
+					modern: { light: '#f2f2ff', dark: '#101229' },
+					mona: { light: '#ffffff', dark: '#0c1522' },
+					nosh: { light: '#f7f7f7', dark: '#030303' },
+					nouveau: { light: '#fbf7fe', dark: '#070010' },
+					pine: { light: '#f2f5ed', dark: '#12170d' },
+					reign: { light: '#f0f0f0', dark: '#171717' },
+					rocket: { light: '#ffffff', dark: '#0c1522' },
+					rose: { light: '#f7f2f9', dark: '#161419' },
+					rosepine: { light: '#f9f4ee', dark: '#181625' },
+					sahara: { light: '#ffeff2', dark: '#260b0f' },
+					seafoam: { light: '#e1f9fd', dark: '#001725' },
+					terminus: { light: '#fcfcfc', dark: '#131313' },
+					vintage: { light: '#f3f3f3', dark: '#181410' },
+					vox: { light: '#f4f1ff', dark: '#190f26' },
+					wintry: { light: '#ffffff', dark: '#091224' }
+				};
+				const hasTheme = (value) => typeof value === 'string' && Object.prototype.hasOwnProperty.call(themeColors, value);
+				const hasMode = (value) => value === 'light' || value === 'dark' || value === 'system';
 				const root = document.documentElement;
 				const systemDark = () => {
 					try {
@@ -15,30 +43,110 @@
 						return false;
 					}
 				};
+				const readCookie = (name) => {
+					try {
+						const raw = document.cookie;
+						if (typeof raw !== 'string' || !raw) return null;
+						for (const part of raw.split(';')) {
+							const trimmed = part.trim();
+							const eq = trimmed.indexOf('=');
+							if (eq < 0) continue;
+							if (trimmed.slice(0, eq) === name) {
+								const value = trimmed.slice(eq + 1);
+								try {
+									return decodeURIComponent(value);
+								} catch {
+									return value;
+								}
+							}
+						}
+					} catch {
+						return null;
+					}
+					return null;
+				};
+				const writeCookie = (name, value) => {
+					try {
+						const secure = window.location?.protocol === 'https:' ? '; Secure' : '';
+						document.cookie = `${name}=${value}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
+					} catch {
+						// Ignore restricted cookie contexts.
+					}
+				};
+				const setMetaThemeColor = (theme, resolvedMode) => {
+					try {
+						const meta =
+							typeof document.querySelector === 'function'
+								? document.querySelector('meta[name="theme-color"]')
+								: typeof document.head?.querySelector === 'function'
+									? document.head.querySelector('meta[name="theme-color"]')
+									: null;
+						if (!meta) return;
+						const palette = themeColors[theme] || themeColors.cerberus;
+						const color = resolvedMode === 'light' ? palette.light : palette.dark;
+						if ('content' in meta) meta.content = color;
+						if (typeof meta.setAttribute === 'function') meta.setAttribute('content', color);
+					} catch {
+						// Ignore missing or read-only head metadata.
+					}
+				};
+				const hasThemeCss = (theme) => {
+					if (theme === 'cerberus') return true;
+					try {
+						const selector = `style[data-bookward-theme="${theme}"]`;
+						if (typeof document.head?.querySelector === 'function') {
+							return Boolean(document.head.querySelector(selector));
+						}
+						if (typeof document.querySelector === 'function') {
+							return Boolean(document.querySelector(selector));
+						}
+					} catch {
+						return false;
+					}
+					return false;
+				};
 				try {
 					const storedTheme = window.localStorage.getItem('bookward-theme');
 					const legacyTheme = window.localStorage.getItem('afterword-theme');
-					const theme = themes.includes(storedTheme ?? '') ? storedTheme : legacyTheme;
+					const localTheme = hasTheme(storedTheme) ? storedTheme : hasTheme(legacyTheme) ? legacyTheme : null;
 					const storedMode = window.localStorage.getItem('bookward-color-mode');
 					const legacyMode = window.localStorage.getItem('afterword-color-mode');
-					const mode = storedMode === 'light' || storedMode === 'dark' || storedMode === 'system' ? storedMode : legacyMode;
-					const selectedTheme = themes.includes(theme ?? '') ? theme : 'cerberus';
-					const selectedMode = mode === 'light' || mode === 'dark' || mode === 'system' ? mode : 'dark';
+					const localMode = hasMode(storedMode) ? storedMode : hasMode(legacyMode) ? legacyMode : null;
+
+					if (localTheme) writeCookie('bookward-theme', localTheme);
+					if (localMode) writeCookie('bookward-color-mode', localMode);
+
+					const cookieTheme = storedTheme === null && legacyTheme === null ? readCookie('bookward-theme') : null;
+					const cookieMode = storedMode === null && legacyMode === null ? readCookie('bookward-color-mode') : null;
+
+					const selectedTheme = localTheme ?? (hasTheme(cookieTheme) ? cookieTheme : 'cerberus');
+					const selectedMode = localMode ?? (hasMode(cookieMode) ? cookieMode : 'dark');
+					const activeTheme = hasThemeCss(selectedTheme) ? selectedTheme : 'cerberus';
 					const resolvedMode = selectedMode === 'system' ? (systemDark() ? 'dark' : 'light') : selectedMode;
-					root.dataset.theme = selectedTheme;
+
+					root.dataset.theme = activeTheme;
 					root.dataset.mode = selectedMode;
 					root.dataset.colorScheme = resolvedMode;
 					root.classList.toggle('dark', resolvedMode === 'dark');
 					root.style.colorScheme = resolvedMode;
+					setMetaThemeColor(activeTheme, resolvedMode);
 				} catch {
-					root.dataset.mode = 'dark';
-					root.dataset.colorScheme = 'dark';
-					root.classList.toggle('dark', true);
-					root.style.colorScheme = 'dark';
+					const cookieTheme = readCookie('bookward-theme');
+					const cookieMode = readCookie('bookward-color-mode');
+					const selectedTheme = hasTheme(cookieTheme) ? cookieTheme : 'cerberus';
+					const selectedMode = hasMode(cookieMode) ? cookieMode : 'dark';
+					const activeTheme = hasThemeCss(selectedTheme) ? selectedTheme : 'cerberus';
+					const resolvedMode = selectedMode === 'system' ? (systemDark() ? 'dark' : 'light') : selectedMode;
+
+					root.dataset.theme = activeTheme;
+					root.dataset.mode = selectedMode;
+					root.dataset.colorScheme = resolvedMode;
+					root.classList.toggle('dark', resolvedMode === 'dark');
+					root.style.colorScheme = resolvedMode;
+					setMetaThemeColor(activeTheme, resolvedMode);
 				}
 			})();
 		</script>
-		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
 		<div style="display: contents">%sveltekit.body%</div>

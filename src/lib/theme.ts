@@ -57,6 +57,8 @@ export type ThemeColors = {
 	dark: string;
 };
 
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+
 /**
  * Calibrated light/dark root background sRGB hex pairs (`--color-root-bg-light`
  * and `--color-root-bg-dark`) for `<meta name="theme-color">` and SSR bootstrap.
@@ -225,6 +227,23 @@ export function getThemeColor(theme: SkeletonThemeName, resolvedMode: Exclude<Th
 	return resolvedMode === 'light' ? palette.light : palette.dark;
 }
 
+export function readCookie(cookieHeader: string | undefined, name: string): string | null {
+	if (!cookieHeader) return null;
+	for (const part of cookieHeader.split(';')) {
+		const trimmed = part.trim();
+		const eq = trimmed.indexOf('=');
+		if (eq < 0) continue;
+		if (trimmed.slice(0, eq) === name) {
+			const value = trimmed.slice(eq + 1);
+			try {
+				return decodeURIComponent(value);
+			} catch {
+				return value;
+			}
+		}
+	}
+	return null;
+}
 export function getSystemMode(): Exclude<ThemeMode, 'system'> {
 	try {
 		return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia(SYSTEM_MEDIA_QUERY).matches
@@ -247,9 +266,12 @@ export function getStoredPreferences(): { theme: SkeletonThemeName; mode: ThemeM
 		const legacyTheme = window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY);
 		const storedMode = window.localStorage.getItem(MODE_STORAGE_KEY);
 		const legacyMode = window.localStorage.getItem(LEGACY_MODE_STORAGE_KEY);
+		const rawCookies = typeof document !== 'undefined' && typeof document.cookie === 'string' ? document.cookie : undefined;
+		const cookieTheme = storedTheme === null && legacyTheme === null ? readCookie(rawCookies, THEME_STORAGE_KEY) : null;
+		const cookieMode = storedMode === null && legacyMode === null ? readCookie(rawCookies, MODE_STORAGE_KEY) : null;
 		return {
-			theme: isThemeName(storedTheme) ? storedTheme : isThemeName(legacyTheme) ? legacyTheme : DEFAULT_THEME,
-			mode: isThemeMode(storedMode) ? storedMode : isThemeMode(legacyMode) ? legacyMode : DEFAULT_MODE,
+			theme: isThemeName(storedTheme) ? storedTheme : isThemeName(legacyTheme) ? legacyTheme : isThemeName(cookieTheme) ? cookieTheme : DEFAULT_THEME,
+			mode: isThemeMode(storedMode) ? storedMode : isThemeMode(legacyMode) ? legacyMode : isThemeMode(cookieMode) ? cookieMode : DEFAULT_MODE,
 		};
 	} catch {
 		// Private browsing and embedded webviews can deny localStorage access.
@@ -274,16 +296,40 @@ export function applyTheme(theme: SkeletonThemeName, mode: ThemeMode): Exclude<T
 	root.dataset.colorScheme = resolved;
 	root.classList.toggle('dark', resolved === 'dark');
 	root.style.colorScheme = resolved;
+
+	const meta =
+		typeof document.querySelector === 'function'
+			? document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+			: typeof document.head?.querySelector === 'function'
+				? document.head.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+				: null;
+	if (meta) {
+		const color = getThemeColor(nextTheme, resolved);
+		if ('content' in meta) meta.content = color;
+		if (typeof meta.setAttribute === 'function') meta.setAttribute('content', color);
+	}
 	return resolved;
 }
 
 export function persistPreferences(theme: SkeletonThemeName, mode: ThemeMode): void {
+	if (typeof window === 'undefined') return;
+	const nextTheme = isThemeName(theme) ? theme : DEFAULT_THEME;
+	const nextMode = isThemeMode(mode) ? mode : DEFAULT_MODE;
 	try {
-		if (typeof window === 'undefined') return;
-		window.localStorage.setItem(THEME_STORAGE_KEY, isThemeName(theme) ? theme : DEFAULT_THEME);
-		window.localStorage.setItem(MODE_STORAGE_KEY, isThemeMode(mode) ? mode : DEFAULT_MODE);
+		window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+		window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
 	} catch {
-		// Applying the current preference remains useful even when it cannot persist.
+		// Applying the current preference remains useful even when localStorage cannot persist.
+	}
+	try {
+		if (typeof document !== 'undefined') {
+			const secure = window.location?.protocol === 'https:' ? '; Secure' : '';
+			const suffix = `; Path=/; Max-Age=${COOKIE_MAX_AGE}; SameSite=Lax${secure}`;
+			document.cookie = `${THEME_STORAGE_KEY}=${nextTheme}${suffix}`;
+			document.cookie = `${MODE_STORAGE_KEY}=${nextMode}${suffix}`;
+		}
+	} catch {
+		// Sandboxed contexts can also block cookie writes.
 	}
 }
 
