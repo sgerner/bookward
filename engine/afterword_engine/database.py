@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import threading
 import weakref
@@ -18,6 +19,7 @@ from .secrets import unseal
 from .tenancy import profile_database_path
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
+SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -995,10 +997,22 @@ MIGRATIONS = [
     (
         27,
         """
+        ALTER TABLE sources ADD COLUMN last_attempted_at TEXT;
+        UPDATE sources SET last_attempted_at=last_scanned_at
+            WHERE last_attempted_at IS NULL AND last_scanned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_sources_lifecycle_enabled_attempt
+            ON sources(lifecycle, enabled, last_attempted_at);
+        ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
+        """,
+    ),
+    (
+        28,
+        """
+        -- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD
         CREATE TABLE goodreads_shelf_items_v2 (
             id INTEGER PRIMARY KEY,
             shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
-            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
             title TEXT NOT NULL,
             author TEXT NOT NULL,
             isbn TEXT,
@@ -1012,22 +1026,7 @@ MIGRATIONS = [
         )
         SELECT
             shelf,
-            CASE
-                WHEN EXISTS (
-                    SELECT 1 FROM settings
-                    WHERE key IN (
-                        'goodreads_rss_url',
-                        'goodreads_rss_last_sync_at',
-                        'goodreads_rss_last_attempt_at',
-                        'goodreads_rss_last_scheduled_date'
-                    )
-                    AND TRIM(value) != ''
-                )
-                OR EXISTS (SELECT 1 FROM jobs WHERE kind = 'goodreads_rss')
-                OR EXISTS (SELECT 1 FROM reads WHERE source = 'goodreads_rss')
-                THEN 'goodreads_rss'
-                ELSE 'goodreads_csv'
-            END,
+            'legacy',
             title,
             author,
             isbn,
@@ -1047,12 +1046,6 @@ MIGRATIONS = [
             openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id),
             added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
             updated_at=excluded.updated_at;
-        DELETE FROM goodreads_shelf_items_v2
-        WHERE source = 'goodreads_rss'
-          AND EXISTS (
-              SELECT 1 FROM settings
-              WHERE key = 'goodreads_rss_url' AND TRIM(value) = ''
-          );
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
         DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
         DROP TABLE goodreads_shelf_items;
@@ -1094,6 +1087,11 @@ MIGRATIONS = [
 # other installation settings. The API exposes a safe, typed projection while
 # this map documents the defaults and lets existing installations upgrade
 # without a separate config file.
+DEFAULT_DIGEST_APP_URLS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+)
+
 DIGEST_SETTING_DEFAULTS = {
     "digest_enabled": "0",
     "digest_channels": "",
@@ -1103,7 +1101,7 @@ DIGEST_SETTING_DEFAULTS = {
     "digest_minimum_score": "80",
     "digest_maximum_books": "5",
     "digest_only_new": "1",
-    "digest_app_url": settings.public_url,
+    "digest_app_url": "http://localhost:5173",
     "digest_discord_webhook_url": "",
     "digest_email_to": "",
     "digest_email_from": "",
@@ -1429,9 +1427,198 @@ def persist_metadata_field_provenance(
     return written
 
 
+_SQLITE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_sqlite_ident(name: str) -> str:
+    if not _SQLITE_IDENT_RE.fullmatch(name):
+        raise sqlite3.DatabaseError(f"Unsafe SQLite identifier in schema migration: {name!r}")
+    return f'"{name}"'
+
+
+def _rebuild_goodreads_shelf_items_migration(con: sqlite3.Connection) -> None:
+    """Rebuild goodreads_shelf_items with neutral 'legacy' provenance while preserving extra columns."""
+
+    table_info = con.execute("PRAGMA table_info(goodreads_shelf_items)").fetchall()
+    existing_names = {str(col[1]) for col in table_info}
+    core_columns = {
+        "id",
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+    }
+    extra_cols = [col for col in table_info if str(col[1]) not in core_columns]
+    extra_ddls = []
+    extra_quoted = []
+    extra_conflict_updates = []
+    for col in extra_cols:
+        col_name = str(col[1])
+        col_type = str(col[2] or "").strip()
+        notnull = bool(col[3])
+        dflt_value = col[4]
+        qname = _quote_sqlite_ident(col_name)
+        parts = [qname]
+        if col_type:
+            parts.append(col_type)
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            parts.append(f"DEFAULT {dflt_value}")
+        extra_ddls.append(" ".join(parts))
+        extra_quoted.append(qname)
+        extra_conflict_updates.append(
+            f"{qname}=COALESCE(NULLIF(excluded.{qname}, ''), goodreads_shelf_items_v2.{qname}, excluded.{qname})"
+        )
+
+    canonical_index_names = {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_source_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    extra_index_sqls = [
+        str(idx_row[1])
+        for idx_row in con.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='goodreads_shelf_items' AND sql IS NOT NULL"
+        ).fetchall()
+        if str(idx_row[0]) not in canonical_index_names
+    ]
+
+    extra_ddl_clause = (
+        ",\n            " + ",\n            ".join(extra_ddls) if extra_ddls else ""
+    )
+    con.execute(
+        f"""
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP{extra_ddl_clause},
+            UNIQUE(source, title, author)
+        )
+        """
+    )
+
+    has_source = "source" in existing_names
+    inner_cols = ["shelf"]
+    if has_source:
+        inner_cols.append("source")
+    inner_cols.extend(
+        ["title", "author", "isbn", "openlibrary_work_id", "added_at", "updated_at", *extra_quoted]
+    )
+    outer_select_cols = [
+        "shelf",
+        (
+            "CASE WHEN source IN ('goodreads_csv', 'goodreads_rss', 'legacy') THEN source ELSE 'legacy' END"
+            if has_source
+            else "'legacy'"
+        ),
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    target_cols = [
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    conflict_updates = [
+        "shelf=excluded.shelf",
+        "isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn)",
+        "openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id)",
+        "added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at)",
+        "updated_at=excluded.updated_at",
+        *extra_conflict_updates,
+    ]
+    con.execute(
+        f"""
+        INSERT INTO goodreads_shelf_items_v2({", ".join(target_cols)})
+        SELECT {", ".join(outer_select_cols)}
+        FROM (
+            SELECT {", ".join(inner_cols)}
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+            LIMIT -1
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            {", ".join(conflict_updates)}
+        """
+    )
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+    con.execute("DROP TABLE goodreads_shelf_items")
+    con.execute("ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items")
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_shelf "
+        "ON goodreads_shelf_items(shelf, updated_at DESC)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_source_shelf "
+        "ON goodreads_shelf_items(source, shelf)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_title_author "
+        "ON goodreads_shelf_items(title, author)"
+    )
+    for index_sql in extra_index_sqls:
+        con.execute(index_sql)
+    con.execute(
+        """
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          )
+        """
+    )
+
+
 def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
     """Execute complete SQL statements on the caller's active transaction."""
 
+    if "-- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD" in script:
+        _rebuild_goodreads_shelf_items_migration(con)
+        return
     start = 0
     for index, character in enumerate(script):
         if character == ";" and sqlite3.complete_statement(script[start : index + 1]):
@@ -1486,10 +1673,18 @@ def initialize(*, seed_demo: bool = True):
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
         )
-        for key, value in DIGEST_SETTING_DEFAULTS.items():
+        existing_digest_app_url_row = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url'"
+        ).fetchone()
+        for key, default_value in DIGEST_SETTING_DEFAULTS.items():
             # Credential-shaped values are marked secret even when empty so a
             # later update never accidentally returns or logs them in plain
             # text. Blank secrets are preserved by the settings endpoint.
+            value = (
+                (settings.public_url or default_value).rstrip("/")
+                if key == "digest_app_url"
+                else default_value
+            )
             secret = 1 if key in {
                 "digest_discord_webhook_url",
                 "digest_smtp_username",
@@ -1502,13 +1697,41 @@ def initialize(*, seed_demo: bool = True):
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES('nyt_api_key','',1)"
         )
-        # Upgrade an older install's placeholder link when the deployment now
-        # advertises a different public origin, without overwriting a URL the
-        # user explicitly chose in Settings.
-        if settings.public_url and settings.public_url != "http://localhost:5173":
+        # Seed digest_app_url_custom for existing rows that predate the flag so
+        # an operator-configured URL (including custom loopback ports such as
+        # http://localhost:3000) is preserved across restarts.
+        configured_public_url = (settings.public_url or "").rstrip("/")
+        custom_flag = con.execute(
+            "SELECT value FROM settings WHERE key='digest_app_url_custom'"
+        ).fetchone()
+        if custom_flag is None:
+            if existing_digest_app_url_row is None:
+                custom_value = "0"
+            else:
+                existing_app_url = (
+                    str(existing_digest_app_url_row[0] or "").strip().rstrip("/")
+                )
+                custom_value = (
+                    "1"
+                    if existing_app_url and existing_app_url not in DEFAULT_DIGEST_APP_URLS
+                    else "0"
+                )
             con.execute(
-                "UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP WHERE key='digest_app_url' AND value='http://localhost:5173'",
-                (settings.public_url,),
+                "INSERT INTO settings(key,value,secret) VALUES('digest_app_url_custom',?,0)",
+                (custom_value,),
+            )
+        else:
+            custom_value = str(custom_flag[0] or "0")
+        # Upgrade an untouched loopback default (http://localhost:5173 or
+        # Docker's http://127.0.0.1:3000) when the deployment advertises a
+        # different public origin, without overwriting a custom URL.
+        if configured_public_url and custom_value != "1":
+            placeholders = ",".join("?" for _ in DEFAULT_DIGEST_APP_URLS)
+            con.execute(
+                f"UPDATE settings SET value=?,updated_at=CURRENT_TIMESTAMP "
+                f"WHERE key='digest_app_url' AND RTRIM(value,'/') IN ({placeholders}) "
+                f"AND RTRIM(value,'/')!=?",
+                (configured_public_url, *DEFAULT_DIGEST_APP_URLS, configured_public_url),
             )
         con.execute("INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,?)", ("Bookward demo upcoming books", "builtin://upcoming", "builtin", 1, 1))
         con.execute(
@@ -1516,10 +1739,41 @@ def initialize(*, seed_demo: bool = True):
             ("Bookward demo upcoming books",),
         )
         builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        # Track default URLs once seeded so a user's custom source that shares
+        # a default source's display name never blocks seeding that default URL,
+        # while editing an already-seeded starter URL will not re-insert the
+        # original URL on subsequent startups.
+        seeded_row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (SEEDED_DEFAULT_SOURCES_KEY,),
+        ).fetchone()
+        try:
+            parsed_seeded = json.loads(seeded_row["value"]) if seeded_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_seeded = []
+        seeded_urls = {
+            str(item)
+            for item in (parsed_seeded if isinstance(parsed_seeded, list) else [])
+            if item
+        }
+        seeded_changed = False
         for name, url, enabled in DEFAULT_SOURCES:
+            if url in seeded_urls:
+                continue
             con.execute(
                 "INSERT OR IGNORE INTO sources(name,url,kind,enabled,is_default) VALUES(?,?,?,?,0)",
                 (name, url, "web", enabled),
+            )
+            seeded_urls.add(url)
+            seeded_changed = True
+        if seeded_changed:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (
+                    SEEDED_DEFAULT_SOURCES_KEY,
+                    json.dumps(sorted(seeded_urls), separators=(",", ":")),
+                ),
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []

@@ -141,7 +141,7 @@ def load_shelf_intent_priors(connection=None) -> list[dict[str, Any]]:
     try:
         shelf_rows = fetch(
             "SELECT id,shelf,source,title,author,isbn,openlibrary_work_id,added_at,updated_at "
-            "FROM goodreads_shelf_items WHERE shelf='to-read' "
+            "FROM goodreads_shelf_items "
             "ORDER BY updated_at DESC,id DESC LIMIT 2000"
         )
     except sqlite3.OperationalError as exc:
@@ -183,6 +183,8 @@ def load_shelf_intent_priors(connection=None) -> list[dict[str, Any]]:
         if identity == "\x1f" or identity in seen_identities:
             continue
         seen_identities.add(identity)
+        if str(item.get("shelf") or "").strip().casefold() != "to-read":
+            continue
         matched_genres: object = item.get("genres") or "[]"
         if matched_genres in ("", "[]", []):
             for match_key in book_row_identity_match_keys(item):
