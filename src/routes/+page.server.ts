@@ -455,7 +455,10 @@ export const actions: Actions = {
     const data = await request.formData();
     const url = urlSchema.safeParse(data.get("url"));
     const label = z.preprocess(
-      (value) => typeof value === "string" && !value.trim() ? undefined : value,
+      (value) =>
+        value === null || (typeof value === "string" && !value.trim())
+          ? undefined
+          : value,
       z.string().trim().min(2).max(100).optional(),
     ).safeParse(data.get("label"));
     const lifecycle = z
@@ -467,7 +470,7 @@ export const actions: Actions = {
       return fail(400, { message: "Add a valid name and public URL." });
     const name = label.data ?? new URL(url.data).hostname.replace(/^www\./i, "");
     try {
-      const preview = await engine<{ count: number }>("/api/sources/preview", {
+      const preview = await engine<{ count: number; url?: string }>("/api/sources/preview", {
         method: "POST",
         body: JSON.stringify({ url: url.data, filters }),
       });
@@ -477,11 +480,15 @@ export const actions: Actions = {
             ? "No books matched these filters."
             : "No recognizable books were found at that URL.",
         });
+      const resolvedUrl =
+        typeof preview.url === "string" && preview.url.trim()
+          ? preview.url.trim()
+          : url.data;
       await engine("/api/sources", {
         method: "POST",
         body: JSON.stringify({
           name,
-          url: url.data,
+          url: resolvedUrl,
           lifecycle,
           filters,
         }),
