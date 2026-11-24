@@ -334,11 +334,15 @@ uv run --project engine python -m compileall -q engine/afterword_engine
 # First-run web/engine integration, with isolated temporary data (requires the web build)
 uv run --project engine python scripts/community_smoke.py
 
-# Container smoke build
-docker compose build
+# Optional container validation and disposable container smoke check
+docker compose --profile ollama -f compose.yaml config --quiet
+docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
+ORIGIN=http://127.0.0.1:3000 docker compose -p bookward-smoke up --build -d
+BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
+docker compose -p bookward-smoke down -v
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
 
 ## Contributing
 
