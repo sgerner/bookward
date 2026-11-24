@@ -58,6 +58,8 @@ function basePageData(overrides: Record<string, unknown> = {}) {
     engineOnline: true,
     recommendation_run_id: "run-abc",
     books: [sampleBook()],
+    recommendations_has_more: false,
+    recommendation_genres: ["Science fiction", "Speculative"],
     decisions: [
       sampleBook({
         id: 202,
@@ -72,7 +74,25 @@ function basePageData(overrides: Record<string, unknown> = {}) {
         status: "maybe_later",
       }),
     ],
+    decisions_has_more: false,
     decisionsHasMore: false,
+    decision_genres: ["Science fiction", "Speculative"],
+    history: [],
+    readCount: 24,
+    backupStatus: {
+      enabled: false,
+      interval_hours: 0,
+      retention_count: 0,
+      last_success_at: null,
+      last_error: null,
+      next_backup_at: null,
+      backups: [],
+    },
+    digestReview: {
+      requested: false,
+      ids: [],
+      books: [],
+    },
     sources: [],
     stats: {
       reads: 24,
@@ -110,15 +130,18 @@ function basePageData(overrides: Record<string, unknown> = {}) {
         only_new: true,
         app_url: "",
         discord_webhook_url_set: false,
+        discord_webhook_set: false,
         email_to: "",
         email_from: "",
         smtp_host: "",
         smtp_port: 587,
         smtp_username: "",
+        smtp_username_set: false,
         smtp_password_set: false,
         smtp_security: "starttls",
         last_sent_at: "",
         last_period: "",
+        last_delivery: null,
         deliveries: [],
       },
     },
@@ -130,10 +153,23 @@ describe("recommendation card presentation", () => {
   it("renders inline clamped synopsis, Read full summary toggle, one-decimal Rank badge, and clean explanation list in Discover", () => {
     mockedView = "discover";
     const { body } = render(Page, {
-      props: { data: basePageData() as never, form: null },
+      props: {
+        data: basePageData({
+          books: [
+            sampleBook({ score: 81.24 }),
+            sampleBook({
+              id: 102,
+              title: "The Dispossessed",
+              score: 81.25,
+            }),
+          ],
+        }) as never,
+        form: null,
+      },
     });
 
     expect(body).toContain("Rank 81.2");
+    expect(body).toContain("Rank 81.3");
     expect(body).toContain("A lone human emissary is sent to Winter");
     expect(body).toContain("line-clamp-3");
     expect(body).toContain("Read full summary");

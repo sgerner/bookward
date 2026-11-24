@@ -91,7 +91,7 @@
 				<h2 id={headingId} class="text-lg font-semibold">Appearance</h2>
 				<p class="mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
 			</div>
-			<button type="button" class="btn-icon btn-icon-sm preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
+			<button type="button" class="btn-icon btn-icon-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
 		</div>
 
 		<fieldset class="min-w-0 space-y-2 border-0 p-0">
@@ -102,7 +102,7 @@
 				getValue={(entry) => entry.id}
 				labelledBy="appearance-color-mode-legend"
 				columns={3}
-				class="grid grid-cols-3 gap-1 rounded-container preset-tonal-surface p-1"
+				class="grid grid-cols-3 gap-1.5 rounded-container border border-[var(--control-border)] preset-tonal-surface p-1.5"
 				onSelect={(entry) => chooseMode(entry.id)}
 			>
 				{#snippet item(entry, radio)}
@@ -111,7 +111,8 @@
 						role="radio"
 						aria-checked={radio.checked}
 						tabindex={radio.tabIndex}
-						class={`btn min-h-11 flex-col gap-1 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
+						data-active={radio.checked ? 'true' : 'false'}
+						class={`theme-picker-option btn min-h-11 flex-col gap-1 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
 						title={entry.description}
 						onclick={radio.select}
 					>
@@ -133,7 +134,7 @@
 				getValue={(entry) => entry.id}
 				labelledBy="appearance-theme-legend"
 				columns={2}
-				class="grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto pr-1"
+				class="-mx-1.5 grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto p-1.5"
 				onSelect={(entry) => void chooseTheme(entry.id)}
 			>
 				{#snippet item(entry, radio)}
@@ -142,11 +143,12 @@
 						role="radio"
 						aria-checked={radio.checked}
 						tabindex={radio.tabIndex}
-						class={`flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
+						data-active={radio.checked ? 'true' : 'false'}
+						class={`theme-picker-option flex min-h-11 min-w-0 items-center gap-2 rounded-container p-2 text-left text-sm transition-colors ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface hover:preset-tonal-primary'}`}
 						aria-label={`Use ${entry.label} theme`}
 						onclick={radio.select}
 					>
-						<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-surface-300-700" aria-hidden="true">
+						<span class="grid shrink-0 grid-cols-3 overflow-hidden rounded-container ring-1 ring-[var(--control-border)]" aria-hidden="true">
 							<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].primary}`}></span>
 							<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].secondary}`}></span>
 							<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].tertiary}`}></span>
@@ -159,3 +161,40 @@
 		</fieldset>
 	{/snippet}
 </PopoverDialog>
+
+<style>
+	.theme-picker-option {
+		border: 1px solid var(--control-border);
+	}
+
+	.theme-picker-option[data-active='true'] {
+		border-color: var(--control-border-strong);
+	}
+
+	.theme-picker-option:focus-visible {
+		position: relative;
+		z-index: 1;
+		outline: 2px solid var(--focus-ring-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-ring-inner),
+			0 0 0 4px var(--focus-ring-outer);
+	}
+
+	.theme-picker-option[data-active='true']:focus-visible {
+		box-shadow:
+			0 0 0 2px var(--focus-ring-swatch-inner),
+			0 0 0 4px var(--focus-ring-outer);
+	}
+
+	@media (forced-colors: active) {
+		.theme-picker-option[data-active='true'] {
+			border: 2px solid Highlight;
+		}
+
+		.theme-picker-option:focus-visible {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+		}
+	}
+</style>

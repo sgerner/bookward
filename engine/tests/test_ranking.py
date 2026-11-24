@@ -392,3 +392,27 @@ def test_normalize_explanation_items_preserves_author_particles_and_prefixes_wit
     ]
     assert "De La Cruz" not in unmatched[0]
     assert "Mcdonald" not in unmatched[0]
+
+
+def test_format_recommendation_item_normalizes_legacy_explanations():
+    from afterword_engine.main import _format_recommendation_item
+
+    formatted = _format_recommendation_item(
+        {
+            "id": 91,
+            "title": "River of Gods",
+            "author": "Ian McDonald",
+            "genres": '["Sci-Fi & Fantasy"]',
+            "release_date": "2004-03-01",
+            "explanation": '["Raised using books you saved, imported, or positively rated (author ian mcdonald, subject sci fi fantasy)", "Lowered slightly after appearing on several recent days without a decision"]',
+            "cover_url": "",
+            "source_url": "",
+        },
+        format_urls=False,
+    )
+    assert formatted["genres"] == ["Sci-Fi & Fantasy"]
+    assert formatted["explanation"] == [
+        "Raised using books you shortlisted, added to Librarr, or rated highly (author Ian McDonald, subject Sci-Fi & Fantasy)",
+        "Lowered after appearing on several recent days without a decision",
+    ]
+
