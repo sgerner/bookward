@@ -448,6 +448,7 @@ def test_generic_source_parser_handles_semantic_cards_and_publisher_heading_pair
             "description": "A collection of fantastic stories.",
             "cover_url": "",
             "source_url": "https://publisher.example/books/call-and-response",
+            "isbn13": "9781966503149",
             "release_date": None,
             "date_kind": "",
             "genres": [],
@@ -1181,11 +1182,13 @@ def test_failed_discord_delivery_does_not_persist_webhook_secret(database, monke
 
 
 def test_failed_permanent_source_retries_after_error_retry_floor(database, monkeypatch):
+    good_scan_at = "2026-04-10T12:00:00+00:00"
     with transaction() as con:
         con.execute("UPDATE sources SET enabled=0")
         cursor = con.execute(
-            "INSERT INTO sources(name,url,enabled,lifecycle) VALUES(?,?,1,'permanent')",
-            ("Retry permanent", "https://example.com/retry-permanent"),
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_scanned_at,last_attempted_at) "
+            "VALUES(?,?,1,'permanent',?,?)",
+            ("Retry permanent", "https://example.com/retry-permanent", good_scan_at, good_scan_at),
         )
 
     async def fail(_source):
@@ -1196,6 +1199,8 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     source = row("SELECT * FROM sources WHERE id=?", (cursor.lastrowid,))
     assert len(result["errors"]) == 1
     assert source["last_status"].startswith("error:")
+    assert source["last_scanned_at"] == good_scan_at
+    assert source["last_attempted_at"] != good_scan_at
     assert source_sync_is_due() is False
 
     retry_at = datetime.now(timezone.utc) - timedelta(
@@ -1203,7 +1208,7 @@ def test_failed_permanent_source_retries_after_error_retry_floor(database, monke
     )
     with transaction() as con:
         con.execute(
-            "UPDATE sources SET last_scanned_at=? WHERE id=?",
+            "UPDATE sources SET last_attempted_at=? WHERE id=?",
             (retry_at.isoformat(), cursor.lastrowid),
         )
     assert source_sync_is_due() is True
@@ -3327,10 +3332,10 @@ def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(
     assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
 
 
-def test_initialize_upgrades_v26_database_to_add_additional_authors(tmp_path):
+def test_initialize_upgrades_v27_database_to_add_additional_authors(tmp_path):
     from afterword_engine.identity import ReadIdentityIndex, read_metadata_identity_hash
 
-    settings.db = str(tmp_path / "v26.db")
+    settings.db = str(tmp_path / "v27.db")
     import sqlite3
 
     with sqlite3.connect(settings.db) as con:
@@ -3339,11 +3344,11 @@ def test_initialize_upgrades_v26_database_to_add_additional_authors(tmp_path):
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version > 26:
+            if version > 27:
                 break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
-        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 27))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 28))
         assert "additional_authors" not in {
             item["name"] for item in con.execute("PRAGMA table_info(reads)")
         }
@@ -3378,7 +3383,7 @@ def test_initialize_upgrades_v26_database_to_add_additional_authors(tmp_path):
 
     initialize(seed_demo=False)
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
-    assert row("SELECT 1 FROM schema_migrations WHERE version=27") is not None
+    assert row("SELECT 1 FROM schema_migrations WHERE version=28") is not None
 
     for table_name in ("reads", "goodreads_shelf_items"):
         col_info = {item["name"]: item for item in rows(f"PRAGMA table_info({table_name})")}
@@ -3755,24 +3760,29 @@ def test_discord_webhook_cannot_be_redirected_to_an_arbitrary_host():
 def test_digest_can_be_disabled_with_stale_provider_settings():
     from afterword_engine.digest import validate_digest_config
 
-    validate_digest_config(
-        {
-            "enabled": False,
-            "channels": ["discord", "email"],
-            "day": 1,
-            "time": "09:00",
-            "timezone": "UTC",
-            "minimum_score": 80,
-            "maximum_books": 5,
-            "only_new": True,
-            "app_url": "https://afterword.example",
-            "discord_webhook_url": "https://not-discord.example/webhook",
-            "email_to": "not-an-email",
-            "email_from": "",
-            "smtp_host": "",
-            "smtp_security": "starttls",
-        }
-    )
+    base = {
+        "enabled": False,
+        "channels": ["discord", "email"],
+        "day": 1,
+        "time": "09:00",
+        "timezone": "UTC",
+        "minimum_score": 80,
+        "maximum_books": 5,
+        "only_new": True,
+        "app_url": "https://afterword.example",
+        "discord_webhook_url": "",
+        "email_to": "",
+        "email_from": "",
+        "smtp_host": "",
+        "smtp_security": "starttls",
+    }
+    validate_digest_config(base)
+
+    with pytest.raises(ValueError, match="Discord webhook URL must point to Discord"):
+        validate_digest_config({**base, "discord_webhook_url": "https://not-discord.example/webhook"})
+
+    with pytest.raises(ValueError, match="Valid email to is required"):
+        validate_digest_config({**base, "email_to": "not-an-email"})
 
 
 def test_digest_rejects_unknown_channels():

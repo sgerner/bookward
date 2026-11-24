@@ -470,14 +470,22 @@ def _author_title_keys_for_row(
     title_keys: set[str],
     author: object,
     additional_authors: object = "",
+    *,
+    include_individual_contributors: bool = True,
 ) -> set[tuple[str, str]]:
     if not title_keys:
         return set()
     author_keys = book_author_identity_keys(author, additional_authors)
     if author_keys:
+        full_author_key = f"set:{'&'.join(sorted(author_keys))}"
+        emitted_authors = (
+            set(author_keys) | {full_author_key}
+            if include_individual_contributors
+            else {full_author_key}
+        )
         return {
             (author_key, title_key)
-            for author_key in author_keys
+            for author_key in emitted_authors
             for title_key in title_keys
         }
     raw_primary = canonical_part(author)
@@ -492,10 +500,12 @@ def book_row_exact_and_prefix_match_keys(
 ) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
     """Return ``(exact_keys, prefix_keys)`` for a read, shelf, or candidate row.
 
-    ``exact_keys`` include exact/genre-edition title variants, validated ISBNs,
-    and provider-scoped work IDs. ``prefix_keys`` hold heuristic omitted-subtitle
-    prefixes so bare titles match subtitled editions without matching two
-    distinct subtitle sequels against each other.
+    ``exact_keys`` include exact/genre-edition title variants (paired with both
+    individual contributors and the full contributor set), validated ISBNs, and
+    provider-scoped work IDs. ``prefix_keys`` hold heuristic omitted-subtitle
+    prefixes paired only with the full normalized contributor set so bare titles
+    match subtitled editions without matching two distinct subtitle sequels or
+    partial co-author adaptations against each other.
     """
 
     title = _row_value(item, "title")
@@ -503,12 +513,24 @@ def book_row_exact_and_prefix_match_keys(
     additional_authors = _row_value(item, "additional_authors")
     exact_titles, prefix_titles = _split_title_match_keys(title)
     exact_keys: set[tuple[str, ...]] = set(
-        _author_title_keys_for_row(exact_titles, author, additional_authors)
+        _author_title_keys_for_row(
+            exact_titles,
+            author,
+            additional_authors,
+            include_individual_contributors=True,
+        )
     )
     exact_keys.update(_isbn_match_keys(item))
     exact_keys.update(_work_match_keys(item))
     prefix_keys: set[tuple[str, ...]] = (
-        set(_author_title_keys_for_row(prefix_titles, author, additional_authors))
+        set(
+            _author_title_keys_for_row(
+                prefix_titles,
+                author,
+                additional_authors,
+                include_individual_contributors=False,
+            )
+        )
         - exact_keys
     )
     return exact_keys, prefix_keys
@@ -562,10 +584,17 @@ def book_identity_match_keys(
 ) -> set[tuple[str, str]]:
     """Return indexed keys used by the conservative same-work matcher."""
 
+    exact_titles, prefix_titles = _split_title_match_keys(title)
     return _author_title_keys_for_row(
-        _title_match_keys(title),
+        exact_titles,
         author,
         additional_authors,
+        include_individual_contributors=True,
+    ) | _author_title_keys_for_row(
+        prefix_titles,
+        author,
+        additional_authors,
+        include_individual_contributors=False,
     )
 
 
@@ -685,8 +714,8 @@ def book_identity_matches(
         return False
     left_exact, left_prefix = _split_title_match_keys(left_title)
     right_exact, right_prefix = _split_title_match_keys(right_title)
-    return bool(
-        (left_exact & right_exact)
-        or (left_exact & right_prefix)
-        or (left_prefix & right_exact)
-    )
+    if left_exact & right_exact:
+        return True
+    if left_authors == right_authors:
+        return bool((left_exact & right_prefix) or (left_prefix & right_exact))
+    return False

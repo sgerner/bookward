@@ -801,6 +801,78 @@ def test_coauthor_matching_is_asymmetric_without_candidate_additional_authors():
     assert book_identity_matches("Dune", "Frank Herbert & Brian Herbert", "Dune", "Brian Herbert")
     assert not book_identity_matches("Dune", "Frank Herbert", "Dune", "Brian Herbert")
 
+    # Partial co-author overlap requires exact/genre-edition title keys in both
+    # directions so subtitled co-authored adaptations do not match solo-author
+    # classics, while identical contributor sets continue to match omitted subtitles.
+    austen_index = ReadIdentityIndex.from_reads([
+        {"title": "Pride and Prejudice", "author": "Jane Austen"}
+    ])
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice: Dawn of the Dreadfuls",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice and Zombies",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    mashup_read_index = ReadIdentityIndex.from_reads([
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Jane Austen",
+            "additional_authors": "Seth Grahame-Smith",
+        }
+    ])
+    assert not mashup_read_index.matches({"title": "Pride and Prejudice", "author": "Jane Austen"})
+    solo_mashup_read_index = ReadIdentityIndex.from_reads([
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Seth Grahame-Smith",
+        }
+    ])
+    assert not solo_mashup_read_index.matches(
+        {"title": "Pride and Prejudice", "author": "Jane Austen & Seth Grahame-Smith"}
+    )
+    assert not book_identity_matches(
+        "Pride and Prejudice",
+        "Jane Austen",
+        "Pride and Prejudice: The Complete Novel, with Zombies",
+        "Jane Austen & Seth Grahame-Smith",
+    )
+    time_war_team = ReadIdentityIndex.from_reads([
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar",
+            "additional_authors": "Max Gladstone",
+        }
+    ])
+    assert time_war_team.matches(
+        {
+            "title": "This Is How You Lose the Time War: The Letters of Red and Blue",
+            "author": "Max Gladstone & Amal El-Mohtar",
+        }
+    )
+    assert book_identity_matches(
+        "This Is How You Lose the Time War",
+        "Amal El-Mohtar & Max Gladstone",
+        "This Is How You Lose the Time War: The Letters of Red and Blue",
+        "Max Gladstone & Amal El-Mohtar",
+    )
+    # Exact-title shared-contributor rows intentionally match.
+    dune_solo = ReadIdentityIndex.from_reads([
+        {"title": "Dune", "author": "Frank Herbert"}
+    ])
+    assert dune_solo.matches({"title": "Dune", "author": "Frank Herbert & Brian Herbert"})
+
 
 def test_article_led_subtitle_sequels_do_not_match_each_other(database):
     from afterword_engine.quality import _dedupe_and_hide

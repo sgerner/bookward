@@ -170,7 +170,7 @@ describe('ThemePicker and +page.svelte ARIA wiring', () => {
 		expect(pageSource).toContain('<ChipToggle');
 		expect(pageSource).toContain('id="mark-read-rating-label"');
 		expect(pageSource).toContain('labelledBy="mark-read-rating-label"');
-		expect(pageSource.match(/<SwitchControl/g)).toHaveLength(4);
+		expect(pageSource.match(/<SwitchControl/g)).toHaveLength(6);
 		expect(pageSource).not.toMatch(/<input[^>]*role="switch"/);
 	});
 });
