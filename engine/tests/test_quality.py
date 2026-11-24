@@ -976,3 +976,51 @@ def test_full_sweep_skips_curated_demo_rows_and_already_audited_sweep_rows(datab
         audit_candidates(only_pending=False, limit=10, audited_before=sweep_started_at)
     )
     assert third_pass["audited"] == 0
+
+
+@respx.mock
+def test_audit_runs_dedupe_and_hide_once_after_subbatch_loop(database, monkeypatch):
+    from afterword_engine import quality as quality_module
+
+    candidate_ids = [
+        add_candidate(f"Batch Dedupe Book {index}", f"Author {index}")
+        for index in range(35)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+
+    dedupe_calls = 0
+    real_dedupe = quality_module._dedupe_and_hide
+
+    def counted_dedupe(con):
+        nonlocal dedupe_calls
+        dedupe_calls += 1
+        return real_dedupe(con)
+
+    monkeypatch.setattr(quality_module, "_dedupe_and_hide", counted_dedupe)
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{req.url.params.get('title', '').replace(' ', '_')}",
+                        "title": req.url.params.get("title", ""),
+                        "author_name": [req.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True, limit=50))
+    assert result["audited"] == 35
+    assert result["accepted"] == 35
+    assert dedupe_calls == 1

@@ -1125,61 +1125,27 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
     return predicate, (QUALITY_VERSION, QUALITY_VERSION, retry_before)
 
 
-def _select_incremental_audit_candidate_ids(
-    limit: int | None,
-    *,
-    now: datetime | None = None,
-    audited_before: str | None = None,
-) -> list[int]:
-    predicate, params = candidate_quality_audit_eligibility(now)
-    if audited_before:
-        predicate = f"({predicate}) AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
-        params = (*params, audited_before)
-    page_size = max(100, min(limit or QUALITY_AUDIT_BATCH_SIZE, QUALITY_AUDIT_BATCH_SIZE) * 4)
-    selected_ids: list[int] = []
-    offset = 0
-    while limit is None or len(selected_ids) < limit:
-        page = rows(
-            "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
-            "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
-            "q.quality_status,q.audit_version,q.flags_json "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
-            "ORDER BY c.id LIMIT ? OFFSET ?",
-            (*params, page_size, offset),
+def _incremental_candidate_matches_python_gate(candidate: dict[str, Any]) -> bool:
+    status = str(candidate.get("quality_status") or "pending")
+    legacy_pending = candidate.get("audit_version") == "legacy-pending-audit-v1"
+    try:
+        flags = json.loads(candidate.get("flags_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        flags = []
+    expired_provider_outage = bool(
+        status == "quarantine"
+        and candidate.get("audit_version") == QUALITY_VERSION
+        and isinstance(flags, list)
+        and "catalog_provider_unavailable" in flags
+    )
+    if status == "pending" or legacy_pending or expired_provider_outage:
+        return True
+    return any(
+        isbn_parts_from_source(
+            [candidate.get("eligibility_isbn13"), candidate.get("eligibility_isbn10")],
+            candidate.get("source_url", ""),
         )
-        if not page:
-            break
-        for candidate in page:
-            status = str(candidate.get("quality_status") or "pending")
-            legacy_pending = candidate.get("audit_version") == "legacy-pending-audit-v1"
-            try:
-                flags = json.loads(candidate.get("flags_json") or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                flags = []
-            expired_provider_outage = bool(
-                status == "quarantine"
-                and candidate.get("audit_version") == QUALITY_VERSION
-                and isinstance(flags, list)
-                and "catalog_provider_unavailable" in flags
-            )
-            if status == "pending" or legacy_pending or expired_provider_outage:
-                selected_ids.append(int(candidate["id"]))
-            elif any(
-                isbn_parts_from_source(
-                    [candidate.get("eligibility_isbn13"), candidate.get("eligibility_isbn10")],
-                    candidate.get("source_url", ""),
-                )
-            ):
-                selected_ids.append(int(candidate["id"]))
-            if limit is not None and len(selected_ids) >= limit:
-                break
-        offset += len(page)
-        if len(page) < page_size:
-            break
-    return selected_ids
+    )
 
 
 def candidate_quality_audit_candidates(
@@ -1191,9 +1157,35 @@ def candidate_quality_audit_candidates(
     """Select a bounded batch due for quality audit, validating old ISBN rows."""
 
     batch_limit = max(1, min(int(limit), QUALITY_AUDIT_BATCH_SIZE))
-    selected_ids = _select_incremental_audit_candidate_ids(
-        batch_limit, now=now, audited_before=audited_before
-    )
+    predicate, params = candidate_quality_audit_eligibility(now)
+    if audited_before:
+        predicate = f"({predicate}) AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+        params = (*params, audited_before)
+    page_size = max(100, batch_limit * 4)
+    selected_ids: list[int] = []
+    last_id = 0
+    while len(selected_ids) < batch_limit:
+        page = rows(
+            "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
+            "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
+            "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
+            "q.quality_status,q.audit_version,q.flags_json "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            f"WHERE c.id>? AND c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
+            "ORDER BY c.id LIMIT ?",
+            (last_id, *params, page_size),
+        )
+        if not page:
+            break
+        for candidate in page:
+            if _incremental_candidate_matches_python_gate(candidate):
+                selected_ids.append(int(candidate["id"]))
+            if len(selected_ids) >= batch_limit:
+                break
+        last_id = int(page[-1]["id"])
+        if len(page) < page_size:
+            break
     if not selected_ids:
         return []
     placeholders = ",".join("?" for _ in selected_ids)
@@ -1243,31 +1235,72 @@ def candidate_quality_audit_remaining(
     mode: str = "incremental",
     audited_before: str | None = None,
     now: datetime | None = None,
+    con=None,
 ) -> int:
     """Count remaining candidates eligible in the given sweep mode."""
 
+    def _one(sql: str, params: tuple[object, ...] = ()) -> dict[str, Any] | None:
+        if con is not None:
+            found = con.execute(sql, params).fetchone()
+            return dict(found) if found else None
+        return row(sql, params)
+
+    def _many(sql: str, params: tuple[object, ...] = ()) -> list[dict[str, Any]]:
+        if con is not None:
+            return [dict(item) for item in con.execute(sql, params).fetchall()]
+        return rows(sql, params)
+
+    base_where = (
+        "c.status!='rejected' "
+        "AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) "
+        "AND COALESCE(q.audit_version,'')!='builtin-curated-v1'"
+    )
+    base_params: tuple[object, ...] = ()
+    if audited_before:
+        base_where += " AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
+        base_params = (audited_before,)
+
     if mode == "full":
-        where = (
-            "c.status!='rejected' "
-            "AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) "
-            "AND COALESCE(q.audit_version,'')!='builtin-curated-v1'"
-        )
-        params: tuple[object, ...] = ()
-        if audited_before:
-            where += " AND (q.audited_at IS NULL OR julianday(q.audited_at)<julianday(?))"
-            params = (audited_before,)
-        found = row(
+        found = _one(
             "SELECT COUNT(*) AS count FROM candidates c "
             "LEFT JOIN sources s ON s.id=c.source_id "
             "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            f"WHERE {where}",
-            params,
+            f"WHERE {base_where}",
+            base_params,
         )
         return int((found or {}).get("count") or 0)
-    return len(
-        _select_incremental_audit_candidate_ids(
-            None, now=now, audited_before=audited_before
-        )
+
+    _, eligibility_params = candidate_quality_audit_eligibility(now)
+    direct_count_row = _one(
+        "SELECT COUNT(*) AS count FROM candidates c "
+        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        f"WHERE {base_where} "
+        "AND (COALESCE(q.quality_status,'pending')='pending' "
+        "OR q.audit_version='legacy-pending-audit-v1')",
+        base_params,
+    )
+    direct_count = int((direct_count_row or {}).get("count") or 0)
+    gated_rows = _many(
+        "SELECT c.id,c.source_url,"
+        "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
+        "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
+        "q.quality_status,q.audit_version,q.flags_json "
+        "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+        "LEFT JOIN sources s ON s.id=c.source_id "
+        f"WHERE {base_where} "
+        "AND COALESCE(q.quality_status,'pending')!='pending' "
+        "AND COALESCE(q.audit_version,'')!='legacy-pending-audit-v1' "
+        "AND ((q.quality_status IN ('accepted','quarantine') "
+        "AND COALESCE(q.audit_version,'')!=? "
+        "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
+        "OR (q.quality_status='quarantine' AND q.audit_version=? "
+        "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
+        "AND datetime(q.audited_at)<=datetime(?)))",
+        (*base_params, *eligibility_params),
+    )
+    return direct_count + sum(
+        1 for candidate in gated_rows if _incremental_candidate_matches_python_gate(candidate)
     )
 
 
@@ -1597,9 +1630,6 @@ async def audit_candidates(
                         status_changed += 1
                     if _store_result(con, candidate, result):
                         enriched += 1
-                sub_deduped = _dedupe_and_hide(con)
-                deduped += sub_deduped
-                status_changed += sub_deduped
                 audited_count += len(subbatch)
                 update_job_progress(
                     audited_count / total_candidates, job_id=job_id, con=con
@@ -1607,6 +1637,11 @@ async def audit_candidates(
             if audited_count < total_candidates and current_job_stop_requested(stop):
                 stopped = True
                 break
+
+    if audited_count > 0:
+        with transaction() as con:
+            deduped = _dedupe_and_hide(con)
+            status_changed += deduped
 
     report: dict[str, Any] = {
         "audited": audited_count,
@@ -1710,16 +1745,28 @@ def configure_candidate_quality_sweep(
                     )
             job_id = str(existing["id"])
         else:
+            preserve_unfinished_full = (
+                not retry
+                and stored_active
+                and bool(stored_started_at)
+                and stored_mode == "full"
+                and mode != "full"
+                and candidate_quality_audit_remaining(
+                    mode="full", audited_before=stored_started_at, con=con
+                )
+                > 0
+            )
             if (
                 retry
                 and stored_active
                 and stored_started_at
                 and requested_mode == stored_mode
-            ):
+            ) or preserve_unfinished_full:
+                effective_mode = stored_mode
                 effective_started_at = stored_started_at
             else:
+                effective_mode = requested_mode
                 effective_started_at = _utc_audit_timestamp()
-            effective_mode = requested_mode
             _save_sweep_settings(
                 con,
                 {

@@ -578,7 +578,7 @@ async def handle_job(kind: str):
         )
         is_final_batch = remaining == 0 and not stopped
         score_job_id = (
-            enqueue_job("score", dedupe=True)
+            enqueue_followup_job("score")
             if (changed or is_final_batch)
             else None
         )
