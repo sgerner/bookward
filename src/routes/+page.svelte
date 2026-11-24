@@ -1013,8 +1013,9 @@
     return task;
   }
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
-    recommendationsImmediate = false;
-    readingHistoryImmediate = false;
+    const inDecisionsView = activeView === "decisions";
+    recommendationsImmediate = inDecisionsView;
+    readingHistoryImmediate = inDecisionsView;
     decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
     decisionsLoadError = "";
@@ -3254,6 +3255,15 @@
                   </div>
                 </div>
                 <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
+                  <StatusRegion
+                    message={formState?.sourcePreview
+                      ? formState.sourcePreview.count === 0
+                        ? `Preview matched 0 of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.`
+                        : `Preview matched ${formState.sourcePreview.count} of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}.`
+                      : ""}
+                    immediate
+                    paused={activeView !== "sources"}
+                  />
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -3456,7 +3466,6 @@
                                 {#if formState?.sourcePreview?.id === source.id}
                                   <div
                                     class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
-                                    role="status"
                                   >
                                     {#if formState.sourcePreview.count === 0}
                                       Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
@@ -3707,8 +3716,13 @@
                   </div>
                 </div>
 
+                <StatusRegion
+                  message={data.backupStatus.last_error ?? ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if data.backupStatus.last_error}
-                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
+                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm">{data.backupStatus.last_error}</p>
                 {/if}
 
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
@@ -4227,6 +4241,7 @@
                   <StatusRegion
                     message={llmCatalogStatusMessage}
                     immediate={llmCatalogImmediate}
+                    paused={activeView !== "settings"}
                   />
                   <InlineAlert message={llmCatalogError} size="sm" />
                   {#if llmCatalogProviders.length > 0}
@@ -4425,6 +4440,7 @@
                 <StatusRegion
                   message={apiTokenCopyStatus && !apiTokenCopyStatus.error ? apiTokenCopyStatus.message : ""}
                   immediate
+                  paused={activeView !== "settings"}
                   class={apiTokenCopyStatus && !apiTokenCopyStatus.error ? "mb-3 text-xs text-surface-700-300" : "sr-only"}
                 />
                 {#if apiTokenCopyStatus?.error}
@@ -4601,9 +4617,13 @@
                     </div>
                     <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
+                  <StatusRegion
+                    message={digestDirty ? "Save digest settings to apply your edits before sending a test or running the digest." : ""}
+                    paused={activeView !== "settings"}
+                  />
                   <div class="mt-6 flex flex-col gap-3 border-t border-surface-300-700/40 pt-5 sm:flex-row sm:items-center sm:justify-between">
                     {#if digestDirty}
-                      <p class="text-sm font-medium text-warning-700-300" role="status">Save digest settings to apply your edits before sending a test or running the digest.</p>
+                      <p class="text-sm font-medium text-warning-700-300">Save digest settings to apply your edits before sending a test or running the digest.</p>
                     {:else if digestEnabled}
                       <p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>
                     {:else}
@@ -4625,9 +4645,16 @@
                     <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
+                <StatusRegion
+                  message={digestSettings.last_delivery
+                    ? `Last ${digestSettings.last_delivery.channel} delivery: ${digestSettings.last_delivery.status}${digestSettings.last_delivery.error ? `. ${digestSettings.last_delivery.error}` : ""}`
+                    : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if digestSettings.last_delivery}
                   {@const delivery = digestSettings.last_delivery}
-                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`} role="status">
+                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`}>
                     {#if delivery.status === "sent"}<Check size={16} class="shrink-0" />{:else if delivery.status === "failed"}<TriangleAlert size={16} class="shrink-0" />{:else}<RefreshCw size={16} class="shrink-0 animate-spin" />{/if}
                     <span class="min-w-0 flex-1">Last {delivery.channel} delivery: <strong>{delivery.status}</strong>{#if delivery.sent_at} · {formatDeliveryDate(delivery.sent_at)}{:else if delivery.updated_at} · {formatDeliveryDate(delivery.updated_at)}{/if}{#if delivery.error}<span class="mt-1 block text-xs">{delivery.error}</span>{/if}</span>
                     {#if delivery.status === "failed"}<form method="POST" action="?/retryDigest" use:enhance={setPending("digest-retry")}>

@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { createRawSnippet } from "svelte";
+import { compile } from "svelte/compiler";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import InlineAlert from "./InlineAlert.svelte";
@@ -41,20 +45,55 @@ describe("InlineAlert component", () => {
     expect(classes).not.toContain("text-sm");
   });
 
-  it("supports warning tone styling", () => {
-    const { body } = render(InlineAlert, {
+  it("supports warning tone styling and custom children snippets", () => {
+    const warning = render(InlineAlert, {
       props: { message: "Rate limit approaching.", tone: "warning" },
     });
 
-    expect(extractClassTokens(body)).toContain("preset-tonal-warning");
-    expect(extractClassTokens(body)).not.toContain("preset-tonal-error");
+    expect(extractClassTokens(warning.body)).toContain("preset-tonal-warning");
+    expect(extractClassTokens(warning.body)).not.toContain("preset-tonal-error");
+
+    const children = createRawSnippet(() => ({
+      render: () => "<span>Structured alert detail</span>",
+    }));
+    const rich = render(InlineAlert, {
+      props: { size: "sm", tone: "warning", children },
+    });
+    const richClasses = extractClassTokens(rich.body);
+    expect(rich.body).toContain('<div class="');
+    expect(rich.body).toContain('role="alert"');
+    expect(rich.body).toContain("<span>Structured alert detail</span>");
+    expect(richClasses).toContain("p-3");
+    expect(richClasses).toContain("text-xs");
+    expect(richClasses).toContain("preset-tonal-warning");
+    expect(richClasses).not.toContain("p-4");
+    expect(richClasses).not.toContain("text-sm");
   });
 
-  it("does not render an empty alert region when message is blank", () => {
-    const { body } = render(InlineAlert, {
-      props: { message: "   " },
+  it("does not render an empty alert region when message is blank or null", () => {
+    expect(render(InlineAlert, { props: { message: "   " } }).body).not.toContain(
+      'role="alert"',
+    );
+    expect(render(InlineAlert, { props: { message: null } }).body).not.toContain(
+      'role="alert"',
+    );
+  });
+
+  it("compiles cleanly in client runes mode with reactive tone, size, and trimmed message branches", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./InlineAlert.svelte", import.meta.url)),
+      "utf8",
+    );
+    const compiled = compile(source, {
+      filename: "InlineAlert.svelte",
+      generate: "client",
+      runes: true,
     });
 
-    expect(body).not.toContain('role="alert"');
+    expect(compiled.warnings).toEqual([]);
+    expect(compiled.js.code).toContain("preset-tonal-warning");
+    expect(compiled.js.code).toContain("preset-tonal-error");
+    expect(compiled.js.code).toContain("p-3 text-xs");
+    expect(compiled.js.code).toContain("p-4 text-sm");
   });
 });

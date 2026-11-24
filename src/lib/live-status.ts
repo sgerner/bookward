@@ -4,6 +4,8 @@ export type LiveStatusUpdateOptions = {
   immediate?: boolean;
   contextKey?: string;
   paused?: boolean;
+  debounceMs?: number;
+  announceOnMount?: boolean;
 };
 
 export type LiveStatusControllerOptions = {
@@ -21,10 +23,12 @@ export type LiveStatusController = {
 };
 
 export function createLiveStatusController({
-  debounceMs = LIVE_STATUS_DEBOUNCE_MS,
-  announceOnMount = false,
+  debounceMs: initialDebounceMs = LIVE_STATUS_DEBOUNCE_MS,
+  announceOnMount: initialAnnounceOnMount = false,
   onAnnounce,
 }: LiveStatusControllerOptions): LiveStatusController {
+  let debounceMs = initialDebounceMs;
+  let announceOnMount = initialAnnounceOnMount;
   let initialized = false;
   let lastInput = "";
   let lastAnnounced = "";
@@ -47,6 +51,12 @@ export function createLiveStatusController({
 
   return {
     update(rawMessage, options) {
+      if (options?.debounceMs !== undefined) {
+        debounceMs = options.debounceMs;
+      }
+      if (options?.announceOnMount !== undefined) {
+        announceOnMount = options.announceOnMount;
+      }
       const message = (rawMessage ?? "").trim();
       const immediate = Boolean(options?.immediate);
       const contextKey = options?.contextKey;
@@ -132,12 +142,9 @@ export function liveStatus(
   node: { textContent: string | null },
   initialParams: LiveStatusActionParams = {},
 ) {
-  let currentConfig = {
+  const controller = createLiveStatusController({
     debounceMs: initialParams.debounceMs ?? LIVE_STATUS_DEBOUNCE_MS,
     announceOnMount: Boolean(initialParams.announceOnMount),
-  };
-  let controller = createLiveStatusController({
-    ...currentConfig,
     onAnnounce: (nextMessage) => {
       node.textContent = nextMessage;
     },
@@ -150,28 +157,12 @@ export function liveStatus(
 
   return {
     update(nextParams: LiveStatusActionParams = {}) {
-      const nextDebounceMs = nextParams.debounceMs ?? LIVE_STATUS_DEBOUNCE_MS;
-      const nextAnnounceOnMount = Boolean(nextParams.announceOnMount);
-      if (
-        nextDebounceMs !== currentConfig.debounceMs ||
-        nextAnnounceOnMount !== currentConfig.announceOnMount
-      ) {
-        controller.destroy();
-        currentConfig = {
-          debounceMs: nextDebounceMs,
-          announceOnMount: nextAnnounceOnMount,
-        };
-        controller = createLiveStatusController({
-          ...currentConfig,
-          onAnnounce: (nextMessage) => {
-            node.textContent = nextMessage;
-          },
-        });
-      }
       controller.update(nextParams.message, {
         immediate: nextParams.immediate,
         contextKey: nextParams.contextKey,
         paused: nextParams.paused,
+        debounceMs: nextParams.debounceMs ?? LIVE_STATUS_DEBOUNCE_MS,
+        announceOnMount: Boolean(nextParams.announceOnMount),
       });
     },
     destroy() {

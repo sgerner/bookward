@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parse } from "svelte/compiler";
+import { compile, parse } from "svelte/compiler";
 import { render } from "svelte/server";
 import { LIVE_STATUS_DEBOUNCE_MS, liveStatus } from "../live-status";
 import StatusRegion from "./StatusRegion.svelte";
@@ -179,6 +179,15 @@ describe("StatusRegion liveStatus DOM action", () => {
     });
     expect(node.textContent).toBe("Found 2 audiobook results.");
 
+    // Dynamic debounceMs reconfiguration preserves live updates cleanly
+    action.update({
+      message: "Updated with custom debounce.",
+      debounceMs: 120,
+      announceOnMount: false,
+    });
+    vi.advanceTimersByTime(120);
+    expect(node.textContent).toBe("Updated with custom debounce.");
+
     action.destroy();
   });
 });
@@ -317,5 +326,72 @@ describe("+page.svelte live region and alert wiring", () => {
       expect(classAttr).not.toMatch(/\bp-\d+\b/);
       expect(classAttr).not.toMatch(/\btext-(xs|sm|base|lg)\b/);
     }
+  });
+
+  it("compiles StatusRegion cleanly in client runes mode and leaves zero raw static role=status elements in +page.svelte", () => {
+    const componentSource = readFileSync(
+      fileURLToPath(new URL("./StatusRegion.svelte", import.meta.url)),
+      "utf8",
+    );
+    const compiled = compile(componentSource, {
+      filename: "StatusRegion.svelte",
+      generate: "client",
+      runes: true,
+    });
+    expect(compiled.warnings).toEqual([]);
+    expect(compiled.js.code).toContain("liveStatus");
+    expect(compiled.js.code).toContain("contextKey");
+    expect(compiled.js.code).toContain("paused");
+
+    const { source, fragment } = readPageAst();
+    const allStatusRegions = collectNodes(
+      fragment,
+      (node) => node.type === "Component" && node.name === "StatusRegion",
+    );
+    expect(allStatusRegions.length).toBeGreaterThanOrEqual(9);
+    for (const { ancestors } of allStatusRegions) {
+      expect(
+        ancestors.some(
+          (ancestor) => ancestor.type === "RegularElement" && ancestor.name === "details",
+        ),
+      ).toBe(false);
+    }
+
+    const sourcePreviewRegions = allStatusRegions.filter(({ node }) =>
+      getAttrRaw(source, node, "message").includes("sourcePreview"),
+    );
+    expect(sourcePreviewRegions).toHaveLength(1);
+    expect(getAttrRaw(source, sourcePreviewRegions[0].node, "paused")).toContain(
+      'activeView !== "sources"',
+    );
+    expect(
+      sourcePreviewRegions[0].ancestors.some((ancestor) => ancestor.type === "KeyBlock"),
+    ).toBe(false);
+
+    const toastLiveNodes = collectNodes(
+      fragment,
+      (node) =>
+        node.type === "RegularElement" &&
+        getAttrRaw(source, node, "role").includes("formIsError"),
+    );
+    expect(toastLiveNodes).toHaveLength(1);
+    expect(
+      toastLiveNodes[0].ancestors.some((ancestor) => ancestor.type === "IfBlock"),
+    ).toBe(false);
+
+    const rawStatusElements = collectNodes(
+      fragment,
+      (node) => {
+        if (node.type !== "RegularElement") return false;
+        const roleAttr = getAttrRaw(source, node, "role");
+        const ariaLiveAttr = getAttrRaw(source, node, "aria-live");
+        // Only the intentional pre-mounted toast notification uses dynamic `formIsError` role/aria-live.
+        if (roleAttr.includes("formIsError") || ariaLiveAttr.includes("formIsError")) {
+          return false;
+        }
+        return roleAttr.includes("status") || Boolean(ariaLiveAttr);
+      },
+    );
+    expect(rawStatusElements).toHaveLength(0);
   });
 });
