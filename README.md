@@ -337,7 +337,7 @@ uv run --project engine python scripts/community_smoke.py
 # Optional container validation and disposable container smoke check
 docker compose --profile ollama -f compose.yaml config --quiet
 docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
-docker compose -p bookward-smoke up --build -d
+ORIGIN=http://127.0.0.1:3000 docker compose -p bookward-smoke up --build -d
 BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
 docker compose -p bookward-smoke down -v
 ~~~
