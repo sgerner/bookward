@@ -3845,10 +3845,27 @@ def test_update_custom_source_persists_name_and_url_and_returns_409_on_duplicate
         },
     )
     assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "A source with that URL already exists"
     assert row("SELECT name,url FROM sources WHERE id=?", (first_id,)) == {
         "name": "Sci-Fi Weekly",
         "url": "https://books.example.test/moved-feed.xml",
     }
+
+    with transaction() as con:
+        con.execute("CREATE UNIQUE INDEX idx_test_unique_source_name ON sources(name)")
+    try:
+        name_conflict = client.put(
+            f"/api/sources/{second_id}",
+            json={"name": "Sci-Fi Weekly"},
+        )
+        assert name_conflict.status_code == 409
+        assert (
+            name_conflict.json()["detail"]
+            == "A source with that name already exists"
+        )
+    finally:
+        with transaction() as con:
+            con.execute("DROP INDEX idx_test_unique_source_name")
 
     token = client.post(
         "/api/settings/api-tokens", json={"name": "Source update v1"}
@@ -4102,6 +4119,168 @@ def test_switching_scanned_one_time_source_to_permanent_reenqueues_and_scans(
     result = asyncio.run(handle_job(f"source:{source_id}"))
     assert result["collected"] == 2
     assert scanned_urls == ["https://books.example.test/promoted.xml"]
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs WHERE kind=?", (f"source:{source_id}",))
+    noop_permanent = client.put(
+        f"/api/sources/{source_id}", json={"lifecycle": "permanent"}
+    )
+    assert noop_permanent.status_code == 200
+    assert noop_permanent.json()["job_id"] is None
+    assert (
+        row(
+            "SELECT 1 FROM jobs WHERE kind=? AND status='queued' LIMIT 1",
+            (f"source:{source_id}",),
+        )
+        is None
+    )
+
+
+def test_permanent_source_mid_run_url_edit_and_error_path_reenqueue_cleanly(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    monkeypatch.setattr(
+        main, "score_all", lambda *_args, **_kwargs: asyncio.sleep(0, result=2)
+    )
+    with transaction() as con:
+        source_id = con.execute(
+            "INSERT INTO sources(name,url,enabled,lifecycle,last_status,last_scanned_at) "
+            "VALUES(?,?,1,'permanent','ok:1','2026-01-01T00:00:00+00:00')",
+            ("Permanent Feed", "https://books.example.test/perm-initial.xml"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,?, 'running')",
+            ("running-perm-job", f"source:{source_id}"),
+        )
+
+    client = TestClient(app, headers=authenticated_headers())
+    perm_scanned_urls: list[str] = []
+    mid_run_perm_edit: dict[str, object] = {}
+
+    async def scan_perm_with_mid_run_edit(source):
+        perm_scanned_urls.append(source["url"])
+        if len(perm_scanned_urls) == 1:
+            resp = client.put(
+                f"/api/sources/{source['id']}",
+                json={
+                    "name": "Permanent Moved",
+                    "url": "https://books.example.test/perm-updated.xml",
+                },
+            )
+            assert resp.status_code == 200
+            mid_run_perm_edit.update(resp.json())
+        status = "ok:1" if len(perm_scanned_urls) == 1 else "ok:4"
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status=? WHERE id=?",
+                (status, source["id"]),
+            )
+        return 1 if len(perm_scanned_urls) == 1 else 4
+
+    monkeypatch.setattr(main, "scan_source", scan_perm_with_mid_run_edit)
+
+    first_perm_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert first_perm_run["collected"] == 1
+    perm_followup_id = mid_run_perm_edit["job_id"]
+    assert perm_followup_id and perm_followup_id != "running-perm-job"
+    assert row(
+        "SELECT COUNT(*) count FROM jobs WHERE kind=? AND status='queued'",
+        (f"source:{source_id}",),
+    ) == {"count": 1}
+    assert row(
+        "SELECT name,url,last_scanned_at,last_status FROM sources WHERE id=?",
+        (source_id,),
+    ) == {
+        "name": "Permanent Moved",
+        "url": "https://books.example.test/perm-updated.xml",
+        "last_scanned_at": None,
+        "last_status": None,
+    }
+
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='complete' WHERE id='running-perm-job'")
+        con.execute("UPDATE jobs SET status='running' WHERE id=?", (perm_followup_id,))
+
+    second_perm_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert second_perm_run["collected"] == 4
+    assert perm_scanned_urls == [
+        "https://books.example.test/perm-initial.xml",
+        "https://books.example.test/perm-updated.xml",
+    ]
+    assert (
+        row("SELECT last_status FROM sources WHERE id=?", (source_id,))["last_status"]
+        == "ok:4"
+    )
+
+    # Error-path mid-run case: old scan raises after a mid-run URL edit.
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='complete' WHERE id=?", (perm_followup_id,))
+        con.execute(
+            "INSERT INTO jobs(id,kind,status) VALUES(?,?, 'running')",
+            ("running-error-job", f"source:{source_id}"),
+        )
+
+    error_path_scans: list[str] = []
+    mid_error_edit: dict[str, object] = {}
+
+    async def failing_scan_after_mid_run_edit(source):
+        error_path_scans.append(source["url"])
+        if len(error_path_scans) == 1:
+            resp = client.put(
+                f"/api/sources/{source['id']}",
+                json={"url": "https://books.example.test/perm-recovered.xml"},
+            )
+            assert resp.status_code == 200
+            mid_error_edit.update(resp.json())
+            raise RuntimeError("old feed upstream 502")
+        with transaction() as con:
+            con.execute(
+                "UPDATE sources SET last_scanned_at=CURRENT_TIMESTAMP, last_status='ok:5' WHERE id=?",
+                (source["id"],),
+            )
+        return 5
+
+    monkeypatch.setattr(main, "scan_source", failing_scan_after_mid_run_edit)
+
+    with pytest.raises(RuntimeError, match="old feed upstream 502"):
+        asyncio.run(handle_job(f"source:{source_id}"))
+
+    error_followup_id = mid_error_edit["job_id"]
+    assert error_followup_id and error_followup_id != "running-error-job"
+    assert row(
+        "SELECT url,last_scanned_at,last_status FROM sources WHERE id=?",
+        (source_id,),
+    ) == {
+        "url": "https://books.example.test/perm-recovered.xml",
+        "last_scanned_at": None,
+        "last_status": None,
+    }
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (error_followup_id,)) == {
+        "kind": f"source:{source_id}",
+        "status": "queued",
+    }
+
+    with transaction() as con:
+        con.execute("UPDATE jobs SET status='failed' WHERE id='running-error-job'")
+        con.execute("UPDATE jobs SET status='running' WHERE id=?", (error_followup_id,))
+
+    recovered_run = asyncio.run(handle_job(f"source:{source_id}"))
+    assert recovered_run["collected"] == 5
+    assert error_path_scans == [
+        "https://books.example.test/perm-updated.xml",
+        "https://books.example.test/perm-recovered.xml",
+    ]
+    assert (
+        row("SELECT last_status FROM sources WHERE id=?", (source_id,))["last_status"]
+        == "ok:5"
+    )
 
 
 def test_update_source_url_rejects_unsafe_addresses_and_inline_nyt_keys(

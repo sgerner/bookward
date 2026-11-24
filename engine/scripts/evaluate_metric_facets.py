@@ -47,9 +47,7 @@ from afterword_engine.covers import METADATA_GENRE_LIMIT
 from afterword_engine.identity import book_identity, read_metadata_identity_hash
 from afterword_engine.subjects import normalize_subjects
 from evaluate_next_five import development_folds as frozen_development_folds
-from evaluate_ranking import load_corpus, prepare
-from evaluate_next_five import development_folds as frozen_development_folds
-from evaluate_ranking import load_corpus, prepare
+from evaluate_ranking import load_corpus, prepare, tail_metrics_at_k
 
 
 METRIC_COMPONENTS = (4, 8)
@@ -694,8 +692,8 @@ def _metrics(ratings: Sequence[float], scores: Sequence[float]) -> dict[str, Any
     high, low = ratings >= 4, ratings <= 2
     high_auc = _auc(high, scores)
     low_auc = _auc(low, -scores)
-    top = np.argsort(-scores, kind="stable")[:min(20, len(scores))]
-    bottom = np.argsort(scores, kind="stable")[:min(20, len(scores))]
+    _, top20_high_precision = tail_metrics_at_k(scores, high, k=20, lowest=False)
+    _, bottom20_low_precision = tail_metrics_at_k(scores, low, k=20, lowest=True)
     tails = high | low
     high_low_auc = _auc(high[tails], scores[tails]) if tails.any() else None
     return {
@@ -706,8 +704,8 @@ def _metrics(ratings: Sequence[float], scores: Sequence[float]) -> dict[str, Any
         "low_reversed_auc": low_auc,
         "balanced_auc": None if high_auc is None or low_auc is None else (high_auc + low_auc) / 2,
         "high_vs_low_auc": high_low_auc,
-        "top20_high_precision": float(high[top].mean()),
-        "bottom20_low_precision": float(low[bottom].mean()),
+        "top20_high_precision": top20_high_precision,
+        "bottom20_low_precision": bottom20_low_precision,
     }
 
 

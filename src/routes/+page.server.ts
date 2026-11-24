@@ -44,8 +44,11 @@ type Overview = {
     status: string;
     source_name: string | null;
   }>;
+  recommendations_has_more?: boolean;
+  recommendation_genres?: string[];
   decisions?: Overview["recommendations"];
   decisions_has_more?: boolean;
+  decision_genres?: string[];
   history: Array<{
     id: number;
     title: string;
@@ -132,6 +135,19 @@ type DigestSettings = {
   } | null;
 };
 
+const distinctGenres = (items: Array<{ genres: string[] }>) => {
+  const seen = new Map<string, string>();
+  for (const item of items) {
+    for (const raw of item.genres ?? []) {
+      const cleaned = String(raw ?? "").trim();
+      if (cleaned && !seen.has(cleaned.toLowerCase())) {
+        seen.set(cleaned.toLowerCase(), cleaned);
+      }
+    }
+  }
+  return [...seen.values()].sort((left, right) => left.localeCompare(right));
+};
+
 export const load: PageServerLoad = async ({ url, locals }) => {
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
@@ -148,6 +164,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
     () => fallbackBackupStatus,
   );
+  let digestPeriod = url.searchParams.get("digest_period");
+  const digestReviewRequest = digestPeriod
+    ? engine<{
+        ids?: unknown[];
+        items?: Overview["recommendations"];
+        found?: boolean;
+      }>(`/api/digest/review?period=${encodeURIComponent(digestPeriod)}`).catch(
+        () => null,
+      )
+    : Promise.resolve(null);
   let overview: Overview;
   try {
     overview = await overviewRequest;
@@ -159,41 +185,63 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   }
   const backupStatus = await backupStatusRequest;
   const builtIn = overview.sources.find((source) => source.is_default);
-  let digestPeriod = url.searchParams.get("digest_period");
+  const runId = overview.recommendation_run_id ?? "";
+  const books = overview.recommendations.map((book) =>
+    toPageBook({
+      ...book,
+      recommendation_run_id: runId,
+    }),
+  );
+  const overviewBooksById = new Map(books.map((book) => [book.id, book]));
+  const decisions = (overview.decisions ?? []).map((book) =>
+    toPageBook({ ...book, recommendation_run_id: "" }),
+  );
   let digestReviewIds: number[] = [];
+  let digestReviewBooks: typeof books = [];
   if (digestPeriod) {
-    try {
-      const review = await engine<{ ids?: unknown[]; found?: boolean }>(
-        `/api/digest/review?period=${encodeURIComponent(digestPeriod)}`,
-      );
+    const review = await digestReviewRequest;
+    if (review) {
       digestReviewIds = Array.isArray(review.ids)
         ? review.ids.filter((value): value is number => Number.isInteger(value))
         : [];
       if (review.found === false) {
         digestPeriod = null;
+        digestReviewIds = [];
+      } else if (Array.isArray(review.items)) {
+        digestReviewBooks = review.items.map((item) => {
+          const existing = overviewBooksById.get(item.id);
+          return existing ?? toPageBook({ ...item, recommendation_run_id: "" });
+        });
+      } else {
+        digestReviewBooks = digestReviewIds
+          .map((id) => overviewBooksById.get(id))
+          .filter((item): item is (typeof books)[number] => Boolean(item && item.status === "recommended"));
       }
-    } catch {
-      // A stale digest link should still open the normal Discover view.
-      digestReviewIds = [];
     }
   }
+  const recommendationGenres = Array.isArray(overview.recommendation_genres)
+    ? distinctGenres([{ genres: overview.recommendation_genres }])
+    : distinctGenres(books.filter((book) => book.status === "recommended"));
+  const decisionGenres = Array.isArray(overview.decision_genres)
+    ? distinctGenres([{ genres: overview.decision_genres }])
+    : distinctGenres(decisions);
   return {
     user: locals.user,
-    recommendation_run_id: overview.recommendation_run_id ?? "",
-    books: overview.recommendations.map((book) =>
-      toPageBook({
-        ...book,
-        recommendation_run_id: overview.recommendation_run_id ?? "",
-      }),
-    ),
-    decisions: (overview.decisions ?? []).map((book) =>
-      toPageBook({ ...book, recommendation_run_id: "" }),
-    ),
+    recommendation_run_id: runId,
+    books,
+    recommendations_has_more: overview.recommendations_has_more === true,
+    recommendation_genres: recommendationGenres,
+    decisions,
     decisions_has_more: overview.decisions_has_more === true,
+    decision_genres: decisionGenres,
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
-    digestReview: { requested: Boolean(digestPeriod), ids: digestReviewIds },
+    digestReview: {
+      requested: Boolean(digestPeriod),
+      ids: digestReviewIds,
+      books: digestReviewBooks,
+    },
     sources: overview.sources
       .filter((source) => !source.is_default)
       .map((source) => ({
@@ -621,11 +669,14 @@ export const actions: Actions = {
         });
         const resolvedUrlChanged =
           resolvedComparable !== comparableSourceUrl(current.url);
+        const provenanceNote = resolvedUrlChanged
+          ? " Earlier books stay attributed to this source."
+          : "";
         return {
           message:
             current.enabled && resolvedUrlChanged
-              ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`
-              : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).`,
+              ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`
+              : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`,
         };
       }
       await engine(`/api/sources/${id.data}`, {
