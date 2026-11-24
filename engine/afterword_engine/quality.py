@@ -61,7 +61,7 @@ from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 
 
 LOGGER = logging.getLogger(__name__)
-QUALITY_VERSION = "candidate-quality-v6"
+QUALITY_VERSION = "candidate-quality-v5"
 _NON_CATALOG_PROVIDERS = frozenset({"source", "penguinrandomhouse"})
 _POLLUTION_FLAGS = frozenset(
     {
@@ -2405,9 +2405,16 @@ def _google_books_outage_retry_status(
     return retry_status
 
 
-def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> bool:
+def _store_result(
+    con,
+    candidate: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    plan: dict[str, Any] | None = None,
+) -> bool:
     candidate_id = int(candidate["id"])
-    plan = _plan_store_result(con, candidate, result)
+    if plan is None:
+        plan = _plan_store_result(con, candidate, result)
     flags = plan["flags"]
     audited_at = _utc_audit_timestamp()
 
@@ -2562,6 +2569,7 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
         metadata_provider = existing_provider
         metadata_provider_id = existing_provider_id
 
+    is_transient_outage = int(bool(plan["transient_outage"]))
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
@@ -2575,8 +2583,8 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             provider=excluded.provider,
             provider_id=excluded.provider_id,
             work_id=excluded.work_id,
-            isbn13=excluded.isbn13,
-            isbn10=excluded.isbn10,
+            isbn13=CASE WHEN excluded.isbn13!='' OR ?=0 THEN excluded.isbn13 ELSE candidate_quality.isbn13 END,
+            isbn10=CASE WHEN excluded.isbn10!='' OR ?=0 THEN excluded.isbn10 ELSE candidate_quality.isbn10 END,
             title_match=excluded.title_match,
             author_match=excluded.author_match,
             audit_version=excluded.audit_version,
@@ -2602,6 +2610,8 @@ def _store_result(con, candidate: dict[str, Any], result: dict[str, Any]) -> boo
             metadata_provider_id,
             "",
             audited_at,
+            is_transient_outage,
+            is_transient_outage,
         ),
     )
 
@@ -2788,10 +2798,16 @@ async def audit_candidates(
 ) -> dict[str, Any]:
     """Audit and enrich candidates, returning a deterministic quality report."""
 
+    effective_quarantine_before = (
+        quarantine_before
+        if quarantine_before is not None
+        else (_utc_audit_timestamp() if retry_quarantined else None)
+    )
+
     if count_only:
         due_total, breakdown = _due_candidate_quality_breakdown(
             include_quarantined=retry_quarantined,
-            quarantine_before=quarantine_before,
+            quarantine_before=effective_quarantine_before,
             audited_before=audited_before,
         )
         if only_pending:
@@ -2828,7 +2844,7 @@ async def audit_candidates(
         candidates = candidate_quality_audit_candidates(
             limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE,
             include_quarantined=retry_quarantined,
-            quarantine_before=quarantine_before,
+            quarantine_before=effective_quarantine_before,
             audited_before=audited_before,
         )
     else:
@@ -2943,7 +2959,7 @@ async def audit_candidates(
                         plan = _plan_store_result(con, candidate, result)
                         eff_status = plan["effective_status"]
                         counts[eff_status] = counts.get(eff_status, 0) + 1
-                        if _store_result(con, candidate, result):
+                        if _store_result(con, candidate, result, plan=plan):
                             enriched += 1
                 _update_running_audit_job_progress(audited_count / max(1, total_selected))
 
@@ -2976,7 +2992,7 @@ async def audit_candidates(
         due_total = (
             count_candidate_quality_audit_candidates(
                 include_quarantined=retry_quarantined,
-                quarantine_before=quarantine_before,
+                quarantine_before=effective_quarantine_before,
                 audited_before=audited_before,
             )
             if (only_pending or retry_quarantined)
@@ -3001,7 +3017,7 @@ async def audit_candidates(
     remaining = (
         count_candidate_quality_audit_candidates(
             include_quarantined=retry_quarantined,
-            quarantine_before=quarantine_before,
+            quarantine_before=effective_quarantine_before,
             audited_before=audited_before,
         )
         if (only_pending or retry_quarantined)

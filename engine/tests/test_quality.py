@@ -219,12 +219,12 @@ def test_provider_unavailable_quarantine_retries_after_backoff(database):
 
 
 def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
-    assert QUALITY_VERSION == "candidate-quality-v6"
+    assert QUALITY_VERSION == "candidate-quality-v5"
     old_accepted = add_candidate("Old Accepted ISBN", "A Writer", isbn13="9780307474278")
     old_quarantine = add_candidate("Old Quarantine ISBN", "A Writer", isbn10="0307474275")
     quality_isbn_accepted = add_candidate("Old Accepted Quality ISBN", "A Writer")
     quality_isbn_quarantine = add_candidate("Old Quarantine Quality ISBN", "A Writer")
-    v5_catalog_accepted = add_candidate("V5 Catalog Accepted Without ISBN", "A Writer")
+    other_stamp_catalog_accepted = add_candidate("Other Stamp Catalog Accepted Without ISBN", "A Writer")
     v4_no_isbn_catalog_accepted = add_candidate("V4 Catalog Accepted Without ISBN", "A Writer")
     v4_no_isbn_unattributed = add_candidate("V4 Unattributed Accepted Without ISBN", "A Writer")
     v4_no_isbn_quarantine = add_candidate("V4 Quarantine Without ISBN", "A Writer")
@@ -248,7 +248,7 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
             (old_quarantine, "quarantine", "candidate-quality-v2"),
             (quality_isbn_accepted, "accepted", "candidate-quality-v3"),
             (quality_isbn_quarantine, "quarantine", "candidate-quality-v2"),
-            (v5_catalog_accepted, "accepted", "candidate-quality-v5"),
+            (other_stamp_catalog_accepted, "accepted", "candidate-quality-v6"),
             (v4_no_isbn_catalog_accepted, "accepted", "candidate-quality-v4"),
             (v4_no_isbn_unattributed, "accepted", "candidate-quality-v4"),
             (v4_no_isbn_quarantine, "quarantine", "candidate-quality-v4"),
@@ -270,7 +270,7 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
                 (status, version, candidate_id),
             )
         for cat_cid, work_id in (
-            (v5_catalog_accepted, "/works/OLV5W"),
+            (other_stamp_catalog_accepted, "/works/OLV6W"),
             (v4_no_isbn_catalog_accepted, "/works/OLV4W"),
         ):
             con.execute(
@@ -330,7 +330,7 @@ def test_bounded_quality_recovery_selects_due_rows_and_skips_curated(database):
         old_quarantine,
         quality_isbn_accepted,
         quality_isbn_quarantine,
-        v5_catalog_accepted,
+        other_stamp_catalog_accepted,
         v4_no_isbn_catalog_accepted,
         expired_v4_no_isbn_quarantine,
         expired_current_quarantine,
@@ -1849,7 +1849,7 @@ def test_partial_outage_non_empty_surviving_description_preserves_existing_descr
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
             "provider='openlibrary',provider_id='/works/OLHOME1W',work_id='/works/OLHOME1W',"
-            "metadata_provider='openlibrary',metadata_provider_id='/works/OLHOME1W' WHERE candidate_id=?",
+            "isbn10='0312428545',metadata_provider='openlibrary',metadata_provider_id='/works/OLHOME1W' WHERE candidate_id=?",
             (existing_cid,),
         )
         for field in ("description", "cover_url", "release_date", "genres"):
@@ -1915,6 +1915,7 @@ def test_partial_outage_non_empty_surviving_description_preserves_existing_descr
     assert preserved_cand["description"] == "Rich existing Open Library synopsis that must survive partial outage."
     assert preserved_cand["cover_url"] == "https://covers.openlibrary.org/b/id/901-L.jpg"
     assert preserved_cand["release_date"] == "2008-09-02"
+    assert preserved_qual["isbn10"] == "0312428545"
     assert preserved_qual["metadata_provider"] == "openlibrary"
     desc_prov = row(
         "SELECT provider,provider_id FROM metadata_field_provenance "
@@ -2010,9 +2011,22 @@ def test_quarantined_false_negative_recovers_after_cooldown_or_manual_retry(data
     respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
     respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
 
-    # Manual retry=True re-audits quarantined rows immediately without looping infinitely if still unmatched.
+    # Direct audit_candidates(retry_quarantined=True) uses a single start cutoff so still-quarantined rows report remaining == 0.
+    direct_retry = asyncio.run(audit_candidates(retry_quarantined=True))
+    assert direct_retry["audited"] == 2
+    assert direct_retry["quarantine"] == 2
+    assert direct_retry["remaining"] == 0
+
+    # Manual retry=True via endpoint resets stale idle chain_started_at and re-audits quarantined rows without looping infinitely.
+    engine_main._set_quality_recovery_settings(
+        **{engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "1.000000"}
+    )
     queued = asyncio.run(engine_main.candidate_audit(payload=None, retry=True))
     assert queued["retry_quarantined"] is True
+    assert row(
+        "SELECT value FROM settings WHERE key=?",
+        (engine_main.QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY,),
+    )["value"] == ""
     with transaction() as con:
         con.execute("UPDATE jobs SET status='running' WHERE id=?", (queued["job_id"],))
     outcome_still_missing = asyncio.run(engine_main.handle_job("candidate_quality_recovery"))

@@ -345,7 +345,7 @@ def _has_due_quality_recovery() -> bool:
 
 
 def _enqueue_candidate_quality_followup():
-    if _has_due_quality_recovery():
+    if not _is_quality_recovery_deferred() and _has_due_quality_recovery():
         return enqueue_followup_job("candidate_quality_recovery")
     return None
 
@@ -3601,12 +3601,13 @@ async def candidate_audit(
         )
     if effective_retry:
         cutoff = _utc_audit_timestamp()
-        _set_quality_recovery_settings(
-            **{
-                QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
-                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-            }
-        )
+        settings_updates = {
+            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+        }
+        if not active_job("candidate_quality_recovery"):
+            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**settings_updates)
         return {
             "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
             "retry_quarantined": True,
