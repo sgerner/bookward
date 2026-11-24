@@ -27,9 +27,13 @@ const optionsSnippet = ((renderer: SsrOptionRenderer) => {
 }) as unknown as Snippet;
 
 type SelectComponentNode = {
+  start: number;
+  end: number;
   attributes: Array<{
     type: string;
     name?: string;
+    start?: number;
+    end?: number;
     expression?: { type?: string; name?: string };
     value?: true | Array<{ type?: string; data?: string }>;
   }>;
@@ -41,6 +45,8 @@ function collectLabeledSelects(node: unknown): SelectComponentNode[] {
   const found: SelectComponentNode[] = [];
   if (record.type === "Component" && record.name === "LabeledSelect") {
     found.push({
+      start: record.start as number,
+      end: record.end as number,
       attributes: (record.attributes as SelectComponentNode["attributes"]) ?? [],
     });
   }
@@ -176,12 +182,17 @@ describe("LabeledSelect component and +page.svelte wiring", () => {
         : "";
       return {
         label,
-        boundState: bindAttr?.expression?.name ?? "",
+        boundState:
+          bindAttr?.expression?.name ??
+          pageSource.slice(bindAttr?.start ?? 0, bindAttr?.end ?? 0),
       };
     });
 
     expect(wiredBindings).toEqual([
-      { label: "Genre", boundState: "genreFilter" },
+      {
+        label: "Genre",
+        boundState: "bind:value={() => viewGenre, (next) => setGenreForView(view, next)}",
+      },
       { label: "Sort by", boundState: "shortlistSort" },
       { label: "Rating", boundState: "readingHistoryRatingFilter" },
       { label: "Source", boundState: "readingHistorySourceFilter" },
