@@ -32,7 +32,110 @@ export type ReadingHistoryScorePatch = {
   metadata_confidence: number | null;
 };
 
+export type ReadingHistoryScoreBatchResponse = {
+  ok: boolean;
+  status: number;
+  scores?: ReadingHistoryScorePatch[];
+  message?: string;
+};
+
+export type ReadingHistoryScoreBatchOutcome =
+  | { status: "stale" }
+  | {
+      status: "ready";
+      nextOffset: number;
+      buffered: Map<number, ReadingHistoryScorePatch>;
+    }
+  | {
+      status: "error";
+      message: string;
+      nextOffset: number;
+      buffered: Map<number, ReadingHistoryScorePatch>;
+    };
+
 export const READING_HISTORY_SCORE_BATCH_SIZE = 200;
+const LEGACY_READING_HISTORY_SCORE_BATCH_SIZE = 20;
+
+export async function runReadingHistoryScoreBatches(params: {
+  total: number;
+  startOffset: number;
+  initialBuffer: ReadonlyMap<number, ReadingHistoryScorePatch>;
+  batchSize?: number;
+  isCurrent?: () => boolean;
+  fetchBatch: (
+    offset: number,
+    limit: number,
+  ) => Promise<ReadingHistoryScoreBatchResponse>;
+  onBatch?: (progress: {
+    nextOffset: number;
+    buffered: Map<number, ReadingHistoryScorePatch>;
+  }) => void;
+}): Promise<ReadingHistoryScoreBatchOutcome> {
+  let currentOffset = params.startOffset;
+  let activeBatchSize = params.batchSize ?? READING_HISTORY_SCORE_BATCH_SIZE;
+  let buffered = new Map(params.initialBuffer);
+
+  while (currentOffset < params.total) {
+    let response: ReadingHistoryScoreBatchResponse;
+    try {
+      response = await params.fetchBatch(currentOffset, activeBatchSize);
+    } catch (error) {
+      if (params.isCurrent && !params.isCurrent()) {
+        return { status: "stale" };
+      }
+      return {
+        status: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Reading history scores could not be loaded.",
+        nextOffset: currentOffset,
+        buffered,
+      };
+    }
+
+    if (params.isCurrent && !params.isCurrent()) {
+      return { status: "stale" };
+    }
+
+    if (
+      !response.ok &&
+      response.status === 400 &&
+      activeBatchSize > LEGACY_READING_HISTORY_SCORE_BATCH_SIZE
+    ) {
+      activeBatchSize = LEGACY_READING_HISTORY_SCORE_BATCH_SIZE;
+      continue;
+    }
+
+    if (!response.ok || !Array.isArray(response.scores)) {
+      return {
+        status: "error",
+        message:
+          response.message || "Reading history scores could not be loaded.",
+        nextOffset: currentOffset,
+        buffered,
+      };
+    }
+
+    const nextBuffer = new Map(buffered);
+    for (const score of response.scores) {
+      nextBuffer.set(score.id, score);
+    }
+    buffered = nextBuffer;
+    currentOffset += activeBatchSize;
+    params.onBatch?.({ nextOffset: currentOffset, buffered });
+  }
+
+  if (params.isCurrent && !params.isCurrent()) {
+    return { status: "stale" };
+  }
+
+  return {
+    status: "ready",
+    nextOffset: currentOffset,
+    buffered,
+  };
+}
 
 const VALID_VIEWS = new Set<View>([
   "discover",

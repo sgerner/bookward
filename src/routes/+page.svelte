@@ -63,6 +63,7 @@
     readUrlViewState,
     reconcileBookMutation,
     reconcilePagedBooks,
+    runReadingHistoryScoreBatches,
     sortReadingHistory,
     type DecisionFilter,
     type ReadingHistoryScorePatch,
@@ -699,30 +700,45 @@
     let task: Promise<void> | null = null;
     const run = async () => {
       try {
-        for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
-          const response = await fetch(
-            `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
-            { headers: profileHeaders },
-          );
-          const payload = (await response.json().catch(() => ({}))) as {
-            scores?: ReadingHistoryScorePatch[];
-            message?: string;
-          };
-          if (generation !== readingHistoryGeneration) return;
-          if (!response.ok || !Array.isArray(payload.scores)) {
-            throw new Error(payload.message || "Reading history scores could not be loaded.");
-          }
-          const nextBuffer = new Map(bufferedReadingHistoryScores);
-          for (const score of payload.scores) {
-            nextBuffer.set(score.id, score);
-          }
-          bufferedReadingHistoryScores = nextBuffer;
-          readingHistoryScoreOffset = offset + batchSize;
+        const outcome = await runReadingHistoryScoreBatches({
+          total,
+          startOffset: readingHistoryScoreOffset,
+          initialBuffer: bufferedReadingHistoryScores,
+          batchSize,
+          isCurrent: () => generation === readingHistoryGeneration,
+          fetchBatch: async (offset, limit) => {
+            const response = await fetch(
+              `/api/reading-history/scores?offset=${offset}&limit=${limit}`,
+              { headers: profileHeaders },
+            );
+            const payload = (await response.json().catch(() => ({}))) as {
+              scores?: ReadingHistoryScorePatch[];
+              message?: string;
+            };
+            return {
+              ok: response.ok,
+              status: response.status,
+              scores: payload.scores,
+              message: payload.message,
+            };
+          },
+          onBatch: ({ nextOffset, buffered }) => {
+            bufferedReadingHistoryScores = buffered;
+            readingHistoryScoreOffset = nextOffset;
+          },
+        });
+        if (outcome.status === "stale") return;
+        if (outcome.status === "error") {
+          readingHistoryScoreOffset = outcome.nextOffset;
+          bufferedReadingHistoryScores = outcome.buffered;
+          readingHistoryScoreError = outcome.message;
+          readingHistoryScoreState = "error";
+          return;
         }
-        if (generation !== readingHistoryGeneration) return;
+        readingHistoryScoreOffset = outcome.nextOffset;
         readingHistory = applyReadingHistoryScores(
           readingHistory,
-          bufferedReadingHistoryScores,
+          outcome.buffered,
         );
         bufferedReadingHistoryScores = new Map();
         readingHistoryScoreState = "ready";

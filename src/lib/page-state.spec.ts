@@ -8,6 +8,7 @@ import {
   readUrlViewState,
   reconcileBookMutation,
   reconcilePagedBooks,
+  runReadingHistoryScoreBatches,
   sortReadingHistory,
   type ReadingHistoryScorePatch,
 } from "./page-state";
@@ -341,5 +342,134 @@ describe("batched reading-history score buffering and sorting", () => {
     expect(
       sortReadingHistory(scored, "score_low", false).map((item) => item.id),
     ).toEqual([1, 3, 2]);
+  });
+
+  it("preserves readingHistoryScoreOffset and buffered scores on partial batch failure, then retries from the failed offset", async () => {
+    const requestedRanges: Array<[number, number]> = [];
+    let failSecondBatchOnce = true;
+
+    const makePatch = (id: number): ReadingHistoryScorePatch => ({
+      id,
+      algorithm_score: 50 + (id % 40),
+      algorithm_explanation: [`Score for ${id}`],
+      metadata_confidence: 1,
+    });
+
+    let readingHistoryScoreOffset = 0;
+    let bufferedReadingHistoryScores = new Map<
+      number,
+      ReadingHistoryScorePatch
+    >();
+
+    const firstAttempt = await runReadingHistoryScoreBatches({
+      total: 430,
+      startOffset: readingHistoryScoreOffset,
+      initialBuffer: bufferedReadingHistoryScores,
+      fetchBatch: async (offset, limit) => {
+        requestedRanges.push([offset, limit]);
+        if (offset === 200 && failSecondBatchOnce) {
+          failSecondBatchOnce = false;
+          return {
+            ok: false,
+            status: 502,
+            message: "Second batch timed out.",
+          };
+        }
+        const count = Math.min(limit, 430 - offset);
+        return {
+          ok: true,
+          status: 200,
+          scores: Array.from({ length: count }, (_, idx) =>
+            makePatch(offset + idx + 1),
+          ),
+        };
+      },
+      onBatch: ({ nextOffset, buffered }) => {
+        readingHistoryScoreOffset = nextOffset;
+        bufferedReadingHistoryScores = buffered;
+      },
+    });
+
+    expect(firstAttempt.status).toBe("error");
+    if (firstAttempt.status !== "error") throw new Error("Expected error");
+    expect(firstAttempt.message).toBe("Second batch timed out.");
+    expect(readingHistoryScoreOffset).toBe(200);
+    expect(bufferedReadingHistoryScores.size).toBe(200);
+    expect(requestedRanges).toEqual([
+      [0, 200],
+      [200, 200],
+    ]);
+
+    // Retrying resumes from readingHistoryScoreOffset (200) without re-fetching offset 0.
+    const retryAttempt = await runReadingHistoryScoreBatches({
+      total: 430,
+      startOffset: readingHistoryScoreOffset,
+      initialBuffer: bufferedReadingHistoryScores,
+      fetchBatch: async (offset, limit) => {
+        requestedRanges.push([offset, limit]);
+        const count = Math.min(limit, 430 - offset);
+        return {
+          ok: true,
+          status: 200,
+          scores: Array.from({ length: count }, (_, idx) =>
+            makePatch(offset + idx + 1),
+          ),
+        };
+      },
+      onBatch: ({ nextOffset, buffered }) => {
+        readingHistoryScoreOffset = nextOffset;
+        bufferedReadingHistoryScores = buffered;
+      },
+    });
+
+    expect(retryAttempt.status).toBe("ready");
+    if (retryAttempt.status !== "ready") throw new Error("Expected ready");
+    expect(readingHistoryScoreOffset).toBe(600);
+    expect(retryAttempt.buffered.size).toBe(430);
+    expect(requestedRanges).toEqual([
+      [0, 200],
+      [200, 200],
+      [200, 200],
+      [400, 200],
+    ]);
+  });
+
+  it("steps down from 200-row batches to 20-row batches if the server enforces the legacy 20-row limit", async () => {
+    const requestedRanges: Array<[number, number]> = [];
+    const outcome = await runReadingHistoryScoreBatches({
+      total: 35,
+      startOffset: 0,
+      initialBuffer: new Map(),
+      fetchBatch: async (offset, limit) => {
+        requestedRanges.push([offset, limit]);
+        if (limit > 20) {
+          return {
+            ok: false,
+            status: 400,
+            message: "Invalid reading history score range.",
+          };
+        }
+        const count = Math.min(limit, 35 - offset);
+        return {
+          ok: true,
+          status: 200,
+          scores: Array.from({ length: count }, (_, idx) => ({
+            id: offset + idx + 1,
+            algorithm_score: 75,
+            algorithm_explanation: [],
+            metadata_confidence: 1,
+          })),
+        };
+      },
+    });
+
+    expect(outcome.status).toBe("ready");
+    if (outcome.status !== "ready") throw new Error("Expected ready");
+    expect(outcome.buffered.size).toBe(35);
+    expect(requestedRanges).toEqual([
+      [0, 200],
+      [0, 20],
+      [20, 20],
+    ]);
   });
 });
