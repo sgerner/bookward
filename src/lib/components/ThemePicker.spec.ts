@@ -1,38 +1,17 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import { THEMES } from '#lib/theme.js';
 import ThemePicker from './ThemePicker.svelte';
 
 describe('ThemePicker', () => {
-	it('renders compact and icon triggers with dialog ARIA attributes when closed', () => {
-		const iconPicker = render(ThemePicker, { props: { compact: false } });
-		expect(iconPicker.body).toContain('aria-controls="appearance-panel"');
-		expect(iconPicker.body).toContain('aria-haspopup="dialog"');
-		expect(iconPicker.body).toContain('aria-expanded="false"');
-		expect(iconPicker.body).not.toContain('<span>Appearance</span>');
-		expect(iconPicker.body).not.toContain('<dialog');
+	it('keeps standard mode as an anchored absolute popover and compact mode as a single-scroller top-layer panel', () => {
+		const standard = render(ThemePicker, { props: { compact: false } });
+		expect(standard.body).toContain('aria-label="Choose appearance"');
+		expect(standard.body).toContain('absolute right-0 top-[calc(100%+0.75rem)] z-50');
+		expect(standard.body).not.toContain('<dialog');
 
-		const compactPicker = render(ThemePicker, { props: { compact: true } });
-		expect(compactPicker.body).toContain('<span>Appearance</span>');
-		expect(compactPicker.body).toContain('aria-expanded="false"');
-	});
-
-	it('renders #appearance-panel as a single-scroll ModalDialog with all 24 themes including Wintry', () => {
-		const opened = render(ThemePicker, { props: { compact: true, open: true } });
-
-		expect(opened.body).toContain('<dialog');
-		expect(opened.body).toContain('id="appearance-panel"');
-		expect(opened.body).toContain('m-auto');
-		expect(opened.body).toContain('max-h-[calc(100dvh-2rem)]');
-		expect(opened.body).toContain('overflow-y-auto');
-		expect(opened.body).not.toContain('45vh');
-		expect(opened.body).toContain('data-modal-initial-focus');
-		expect(opened.body).toContain('aria-label="Close appearance picker"');
-
-		expect(THEMES).toHaveLength(24);
-		for (const theme of THEMES) {
-			expect(opened.body).toContain(`aria-label="Use ${theme.label} theme"`);
-		}
-		expect(opened.body).toContain('aria-label="Use Wintry theme"');
+		const compact = render(ThemePicker, { props: { compact: true } });
+		expect(compact.body).toContain('Appearance');
+		expect(compact.body).toContain('fixed right-4 top-4 left-auto bottom-auto z-[55]');
+		expect(compact.body).not.toContain('max-h-[min(22rem,45vh)]');
 	});
 });

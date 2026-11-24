@@ -169,6 +169,7 @@ describe("cover proportions, intrinsic image sizes, and modal viewports", () => 
     expect(markReadDialog).toBeDefined();
     const markReadClass = staticAttribute(markReadDialog, "class") ?? "";
     expect(markReadClass).toContain("max-h-[min(42rem,calc(100dvh-2rem))]");
+    expect(markReadClass).toContain("overflow-y-auto");
 
     const librarrDialog = collectNodes(
       ast,
@@ -178,8 +179,9 @@ describe("cover proportions, intrinsic image sizes, and modal viewports", () => 
         staticAttribute(node, "ariaLabelledby") === "librarr-search-title",
     )[0];
     expect(librarrDialog).toBeDefined();
-    const librarrClass = staticAttribute(librarrDialog, "class") ?? "";
-    expect(librarrClass).toContain("max-h-[min(44rem,calc(100dvh-2rem))]");
+    const librarrSnippet = source.slice(librarrDialog.start, librarrDialog.end);
+    expect(librarrSnippet).toContain("max-h-[min(44rem,calc(100dvh-2rem))]");
+    expect(librarrSnippet).toContain("max-h-[calc(100dvh-11rem)]");
 
     for (const dialogNode of [markReadDialog, librarrDialog]) {
       const modalImages = collectNodes(
