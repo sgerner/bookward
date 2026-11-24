@@ -548,12 +548,9 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  toggleDefault: async ({ request }) => {
+  toggleDefault: async () => {
     try {
-      const overview = await engine<Overview>("/api/overview");
-      const source = overview.sources.find((item) => item.is_default);
-      if (!source) return fail(404, { message: "Default source not found." });
-      await engine(`/api/sources/${source.id}/toggle`, {
+      await engine("/api/sources/default/toggle", {
         method: "PUT",
         body: "{}",
       });
@@ -659,18 +656,9 @@ export const actions: Actions = {
         message: "Enter a valid Librarr URL, API key, and media type.",
       });
     try {
-      const overview = await engine<Overview>("/api/overview");
-      if (!key.data && !overview.settings.librarr_api_key_set)
-        return fail(400, {
-          message: "Enter a Librarr API key for the first connection.",
-        });
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
-          embedding_backend: overview.settings.embedding_backend,
-          embedding_model: overview.settings.embedding_model,
-          embedding_url: overview.settings.embedding_url,
-          embedding_api_key: "",
           librarr_url: url.data,
           librarr_api_key: key.data,
           librarr_media_type: mediaType.data,
@@ -705,7 +693,6 @@ export const actions: Actions = {
     if (!backend.success || !model.success)
       return fail(400, { message: "Choose an embedding backend and model." });
     try {
-      const overview = await engine<Overview>("/api/overview");
       await engine("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -713,9 +700,6 @@ export const actions: Actions = {
           embedding_model: model.data,
           embedding_url: String(data.get("url") || ""),
           embedding_api_key: String(data.get("apiKey") || ""),
-          librarr_url: overview.settings.librarr_url,
-          librarr_api_key: "",
-          librarr_media_type: overview.settings.librarr_media_type,
         }),
       });
       return { message: "Embedding provider saved and checked." };
