@@ -21,14 +21,6 @@ from afterword_engine.isbn import isbn_parts_from_source
 from afterword_engine.quality import _audit_one, resolve_catalog_match
 
 
-@pytest.fixture(autouse=True)
-def no_real_rate_limit_wait(monkeypatch):
-    async def advance_without_wait(delay):
-        return None
-
-    monkeypatch.setattr(covers, "_openlibrary_rate_sleep", advance_without_wait)
-
-
 def _provider_client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
