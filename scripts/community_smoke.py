@@ -114,11 +114,11 @@ def run_smoke_checks(
     ready_attempts: int = 100,
     ready_interval: float = 0.1,
 ):
-    scheme = urlsplit(origin).scheme or "http"
+    is_https = urlsplit(origin).scheme == "https"
     with httpx.Client(
         base_url=base_url,
         timeout=15,
-        headers={"accept": "text/html", "x-forwarded-proto": scheme},
+        headers={"accept": "text/html"},
     ) as client:
         for _ in range(ready_attempts):
             exited = [
@@ -139,12 +139,29 @@ def run_smoke_checks(
         else:
             raise RuntimeError("Smoke-test services did not become ready")
         assert client.get("/").status_code == 303
+        blocked = client.post(
+            "/login?/setup",
+            data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+            headers={"origin": "https://attacker.example", "accept": "application/json"},
+        )
+        assert blocked.status_code == 403, (blocked.status_code, blocked.text[:200])
+        assert blocked.json().get("message")
+        setup_headers = {"origin": origin}
+        if not is_https:
+            setup_headers["x-forwarded-proto"] = "https"
+            setup_headers["x-forwarded-host"] = "evil.example"
         response = client.post(
             "/login?/setup",
             data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
-            headers={"origin": origin},
+            headers=setup_headers,
         )
         assert response.status_code == 303, (response.status_code, response.text[:200])
+        set_cookie = response.headers.get("set-cookie", "")
+        assert "bookward_session=" in set_cookie, set_cookie
+        if is_https:
+            assert "Secure" in set_cookie, set_cookie
+        else:
+            assert "Secure" not in set_cookie, set_cookie
         assert "bookward_session" in client.cookies
         profile_id = None
         for path in ["/", "/?view=sources", "/?view=settings", "/account", "/admin"]:
@@ -164,10 +181,18 @@ def run_smoke_checks(
         )
         assert client.get("/api/v1/recommendations").status_code == 401
         assert profile_id
-        assert (
-            client.post("/auth/logout", data={"__profile_id": profile_id}, headers={"origin": origin}).status_code
-            == 303
+        logout_response = client.post(
+            "/auth/logout",
+            data={"__profile_id": profile_id},
+            headers={"origin": origin},
         )
+        assert logout_response.status_code == 303
+        logout_cookie = logout_response.headers.get("set-cookie", "")
+        assert "bookward_session=" in logout_cookie, logout_cookie
+        if is_https:
+            assert "Secure" in logout_cookie, logout_cookie
+        else:
+            assert "Secure" not in logout_cookie, logout_cookie
         assert client.get("/").status_code == 303
         response = client.post(
             "/login?/login",
@@ -304,9 +329,10 @@ def main(
             PORT=str(web_port),
             OIDC_AUTO_LOGIN="false",
             BODY_SIZE_LIMIT="12M",
-            PROTOCOL_HEADER="x-forwarded-proto",
             PYTHONUNBUFFERED="1",
         )
+        env.pop("PROTOCOL_HEADER", None)
+        env.pop("HOST_HEADER", None)
         default_engine_cmd = [
             str(root / "engine/.venv/bin/python"),
             "-m",
@@ -321,7 +347,7 @@ def main(
         ]
         service_specs = (
             ("engine", engine_cmd, default_engine_cmd),
-            ("web", web_cmd, ["node", str(root / "build")]),
+            ("web", web_cmd, ["node", str(root / "server.js")]),
         )
         services: list[_ServiceRun] = []
         open_files = []
