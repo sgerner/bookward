@@ -38,16 +38,26 @@
     Upload,
     X,
   } from "@lucide/svelte";
-  import ThemePicker from "#lib/components/ThemePicker.svelte";
+  import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
   import RadioGroup from "#lib/components/RadioGroup.svelte";
   import SwitchControl from "#lib/components/SwitchControl.svelte";
+  import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import ThemePicker from "#lib/components/ThemePicker.svelte";
   import { copyApiTokenText } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
-  import { readLibrarrSearchStream } from "#lib/librarr-stream.js";
+  import {
+    buildLibrarrDownloadPayload,
+    canRetryLibrarrSearch,
+    finalizeLibrarrStreamState,
+    librarrFormatChangeAction,
+    readLibrarrSearchStream,
+    resolveLibrarrResultFormat,
+    shouldShowLibrarrEmptyBanner,
+  } from "#lib/librarr-stream.js";
   import { modalFocus } from "#lib/actions/modal-focus.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
@@ -98,8 +108,6 @@
   let genreFilter = $state("");
   let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
-  let profileMenuRoot = $state<HTMLDivElement | null>(null);
-  let profileMenuButton = $state<HTMLButtonElement | null>(null);
   let expandedRecommendationDetails = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
@@ -144,6 +152,7 @@
   } | null>(null);
   let librarrQuery = $state("");
   let librarrMediaType = $state<MediaType>("audiobook");
+  let librarrSearchedMediaType = $state<MediaType>("audiobook");
   let librarrResults = $state<LibrarrResult[]>([]);
   let librarrSearchState = $state<"idle" | "searching" | "ready" | "error">(
     "idle",
@@ -1251,11 +1260,7 @@
     );
   }
   function resultFormat(result: LibrarrResult) {
-    return resultText(
-      result,
-      ["media_type", "format", "type"],
-      librarrMediaType,
-    );
+    return resolveLibrarrResultFormat(result, librarrSearchedMediaType);
   }
   function resultScore(result: LibrarrResult) {
     const value = result.score;
@@ -1287,7 +1292,9 @@
     librarrSearchBook = book;
     librarrQuery = `${book.title} ${book.author}`.trim().slice(0, 200);
     librarrMediaType = configuredLibrarrMediaType;
+    librarrSearchedMediaType = configuredLibrarrMediaType;
     librarrResults = [];
+    librarrSearchState = "idle";
     librarrSearchError = "";
     librarrSearchMessage = "";
     librarrAdded = new Set();
@@ -1429,6 +1436,26 @@
     observer.observe(sentinel);
     return () => observer.disconnect();
   });
+  function handleLibrarrMediaTypeChange(event: Event) {
+    const nextMediaType: MediaType =
+      (event.currentTarget as HTMLSelectElement).value === "ebook"
+        ? "ebook"
+        : "audiobook";
+    librarrMediaType = nextMediaType;
+    librarrSearchAbortController?.abort();
+    librarrSearchAbortController = null;
+    const action = librarrFormatChangeAction(librarrQuery, nextMediaType);
+    if (action.shouldSearch) {
+      void searchLibrarr();
+      return;
+    }
+    librarrSearchedMediaType = action.searchedMediaType;
+    librarrResults = [];
+    librarrAdded = new Set();
+    librarrSearchState = action.state;
+    librarrSearchError = "";
+    librarrSearchMessage = "";
+  }
   async function searchLibrarr() {
     const query = librarrQuery.trim();
     librarrSearchAbortController?.abort();
@@ -1438,6 +1465,8 @@
       librarrSearchError = "Enter at least two characters.";
       return;
     }
+    const searchedMediaType = librarrMediaType;
+    librarrSearchedMediaType = searchedMediaType;
     const controller = new AbortController();
     librarrSearchAbortController = controller;
     librarrResults = [];
@@ -1448,7 +1477,7 @@
     try {
       const params = new URLSearchParams({
         q: query,
-        media_type: librarrMediaType,
+        media_type: searchedMediaType,
       });
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_search", { query });
       let response = await fetch(`/api/librarr/search/stream?${params.toString()}`, {
@@ -1480,6 +1509,9 @@
               Boolean(item && typeof item === "object" && !Array.isArray(item)),
             )
           : [];
+        if (librarrSearchAbortController === controller) {
+          librarrSearchState = "ready";
+        }
       } else {
         if (!response.ok) {
           const payload = (await response.json().catch(() => ({}))) as {
@@ -1492,12 +1524,12 @@
           if (librarrSearchAbortController === controller) librarrResults = results;
         });
         if (librarrSearchAbortController !== controller) return;
-        if (!progress.completed) {
-          librarrSearchError = "Librarr ended the stream before search finished. Showing any results received.";
-        }
-      }
-      if (librarrSearchAbortController === controller) {
-        librarrSearchState = "ready";
+        const outcome = finalizeLibrarrStreamState(
+          progress.completed,
+          librarrResults.length,
+        );
+        librarrSearchState = outcome.state;
+        librarrSearchError = outcome.error;
       }
     } catch (error) {
       if (controller.signal.aborted || librarrSearchAbortController !== controller) return;
@@ -1521,7 +1553,13 @@
       const response = await fetch("/api/librarr/download", {
         method: "POST",
         headers: { "content-type": "application/json", ...profileHeaders },
-        body: JSON.stringify({ media_type: librarrMediaType, candidate_id: librarrSearchBook?.id, result }),
+        body: JSON.stringify(
+          buildLibrarrDownloadPayload(
+            librarrSearchedMediaType,
+            result,
+            librarrSearchBook?.id,
+          ),
+        ),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
@@ -1590,21 +1628,9 @@
         openReadMenuId = null;
         document.querySelector<HTMLButtonElement>(`[data-read-menu-trigger="${menuId}"]`)?.focus();
       }
-      if (event.key === "Escape" && profileMenuOpen) {
-        profileMenuOpen = false;
-        profileMenuButton?.focus();
-      }
     };
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target;
-      if (
-        profileMenuOpen &&
-        profileMenuRoot &&
-        target instanceof Node &&
-        !profileMenuRoot.contains(target)
-      ) {
-        profileMenuOpen = false;
-      }
       if (openReadMenuId !== null && target instanceof Node) {
         const menuRoot = document.querySelector<HTMLElement>(`[data-read-menu-root="${openReadMenuId}"]`);
         if (menuRoot && !menuRoot.contains(target)) openReadMenuId = null;
@@ -1709,6 +1735,7 @@
 >
 
 <div
+  data-sticky-shell
   class="relative isolate min-h-screen overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
 >
   <header
@@ -1759,38 +1786,33 @@
               /></button
             >
           </form>{/if}
-        <div bind:this={profileMenuRoot} class="relative">
-          <button
-            bind:this={profileMenuButton}
-            type="button"
-            class="btn btn-icon min-h-11 min-w-11 preset-tonal-surface"
-            aria-label="Open profile menu"
-            title="Profile"
-            aria-expanded={profileMenuOpen}
-            aria-controls="profile-menu-panel"
-            onclick={() => (profileMenuOpen = !profileMenuOpen)}
-          ><CircleUserRound size={19} strokeWidth={1.8} /></button>
-          {#if profileMenuOpen}
-            <div
-              id="profile-menu-panel"
-              class="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
-            >
-              <div class="border-b border-surface-300-700/40 px-2 pb-3">
-                <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
-                {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
-              </div>
-              <div class="grid gap-1 py-2">
-                <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} />Account settings</a>
-                {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} />Manage accounts</a>{/if}
-                <ThemePicker compact />
-              </div>
-              <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
-                <ProfileField profileId={data.user?.profile_id} />
-                <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} />Sign out</button>
-              </form>
+        <PopoverDialog
+          bind:open={profileMenuOpen}
+          panelId="profile-menu-panel"
+          triggerLabel="Open profile menu"
+          triggerTitle="Profile"
+          dialogLabel="Profile"
+          panelClass="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
+        >
+          {#snippet trigger()}
+            <CircleUserRound size={19} strokeWidth={1.8} aria-hidden="true" />
+          {/snippet}
+          {#snippet children()}
+            <div class="border-b border-surface-300-700/40 px-2 pb-3">
+              <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+              {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
-          {/if}
-        </div>
+            <div class="grid gap-1 py-2">
+              <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} aria-hidden="true" />Account settings</a>
+              {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
+              <ThemePicker compact />
+            </div>
+            <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
+              <ProfileField profileId={data.user?.profile_id} />
+              <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} aria-hidden="true" />Sign out</button>
+            </form>
+          {/snippet}
+        </PopoverDialog>
       </div>
     </div>
   </header>
@@ -2239,53 +2261,56 @@
                       <div class="flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
-                          <span class="badge preset-tonal-secondary" aria-label={`Your rating: ${item.rating} ${item.rating === 1 ? "star" : "stars"}`}>{item.rating} ★</span>
+                          <StarRatingBadge rating={item.rating} />
                         {:else}
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
                     </div>
-                    <div class="mt-3 border-t border-surface-300-700/40 pt-2">
-                      <button
-                        type="button"
-                        class="flex min-h-9 w-full items-center gap-2 text-left text-sm font-medium text-primary-600-400"
-                        aria-label={`Show reading details for ${item.title} by ${item.author}`}
-                        aria-expanded={expandedReadingDetails.includes(item.id)}
-                        aria-controls={`reading-details-${item.id}`}
-                        onclick={() => toggleReadingDetails(item.id)}
+                    <details
+                      class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
+                      open={expandedReadingDetails.includes(item.id)}
+                      ontoggle={(event) => {
+                        const open = (event.currentTarget as HTMLDetailsElement).open;
+                        const isExpanded = expandedReadingDetails.includes(item.id);
+                        if (open !== isExpanded) toggleReadingDetails(item.id);
+                      }}
+                    >
+                      <summary
+                        class="flex min-h-9 cursor-pointer list-none items-center gap-2 text-left text-sm font-medium text-primary-600-400 [&::-webkit-details-marker]:hidden"
+                        aria-label={`Reading details for ${item.title} by ${item.author}`}
                       >
-                        Reading details <ChevronDown size={15} class={`ml-auto transition ${expandedReadingDetails.includes(item.id) ? "rotate-180" : ""}`} />
-                      </button>
-                      {#if expandedReadingDetails.includes(item.id)}
-                        <div id={`reading-details-${item.id}`} class="pt-2" transition:slide={{ duration: motionDuration(220) }}>
-                          <dl class="grid gap-2 text-xs">
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
-                            <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
-                          </dl>
-                          <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
-                            {#if item.algorithm_score !== null}
-                              <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
-                              <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
-                              {#if item.algorithm_explanation.length}
-                                <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
-                                  {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
-                                </ul>
-                              {:else}
-                                <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
-                              {/if}
+                        <span>Reading details</span>
+                        <ChevronDown size={15} aria-hidden="true" class="ml-auto transition group-open/details:rotate-180" />
+                      </summary>
+                      <div class="pt-2">
+                        <dl class="grid gap-2 text-xs">
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Imported from</dt><dd class="text-right text-surface-800-200">{readingSourceLabel(item.source)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Read date</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.read_at)}</dd></div>
+                          <div class="flex justify-between gap-3"><dt class="text-surface-600-400">Added to Bookward</dt><dd class="text-right text-surface-800-200">{formatHistoryDate(item.created_at)}</dd></div>
+                        </dl>
+                        <div class="mt-3 border-t border-surface-300-700/40 pt-3 text-xs leading-5">
+                          {#if item.algorithm_score !== null}
+                            <p class="font-semibold text-surface-950-50">Current profile score: {item.algorithm_score.toFixed(1)} / 100</p>
+                            <p class="mt-1 text-surface-700-300">This relative score compares the book with your other rated reads, excluding this title to avoid a self-match. It is not a probability or star rating.</p>
+                            {#if item.algorithm_explanation.length}
+                              <ul class="mt-2 list-disc space-y-1 pl-4 text-surface-700-300">
+                                {#each item.algorithm_explanation as reason (reason)}<li>{reason}</li>{/each}
+                              </ul>
                             {:else}
-                              <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
+                              <p class="mt-2 text-surface-700-300">There are not yet other rated reads to compare with this title.</p>
                             {/if}
-                            {#if item.rank_score !== null}
-                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
-                            {:else}
-                              <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
-                            {/if}
-                          </div>
+                          {:else}
+                            <p class="text-surface-700-300">Bookward could not calculate a current profile score. Try again later.</p>
+                          {/if}
+                          {#if item.rank_score !== null}
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 font-semibold text-surface-950-50">Score when Bookward last recommended it: {item.rank_score.toFixed(1)} / 100</p>
+                          {:else}
+                            <p class="mt-3 border-t border-surface-300-700/40 pt-3 text-surface-700-300">Bookward had not previously recommended this title.</p>
+                          {/if}
                         </div>
-                      {/if}
-                    </div>
+                      </div>
+                    </details>
                   </article>
                 {/each}
               </div>
@@ -2943,7 +2968,7 @@
                   duration: motionDuration(300),
                   delay: motionDelay(2),
                 }}
-                class="card scroll-mt-24 preset-tonal-surface p-5 sm:p-6"
+                class="card scroll-mt-4 preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/configureLibrar"
                 use:enhance={setPending("librarr", optimisticLibrarr)}
@@ -3709,11 +3734,10 @@
                             >{item.author}</small
                           >
                         </div>
-                        {#if item.rating}<span
-                            in:scale={{ duration: motionDuration(150) }}
+                        {#if item.rating}<StarRatingBadge
+                            rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
-                            >{item.rating} ★</span
-                          >{/if}
+                          />{/if}
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
@@ -3938,6 +3962,7 @@
               id="librarr-media-type"
               class="select min-h-12 sm:mx-1 sm:w-40"
               bind:value={librarrMediaType}
+              onchange={handleLibrarrMediaTypeChange}
               ><option value="audiobook">Audiobook</option><option value="ebook"
                 >Ebook</option
               ></select
@@ -3962,11 +3987,22 @@
             </div>{/if}
           {#if librarrSearchError}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
-              class="mt-4 flex items-start gap-2 preset-tonal-error p-3 text-sm"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3 preset-tonal-error p-3 text-sm"
               role="alert"
             >
-              <CircleHelp size={16} class="mt-0.5 shrink-0" />
-              <span>{librarrSearchError}</span>
+              <div class="flex min-w-0 flex-1 items-start gap-2">
+                <CircleHelp size={16} class="mt-0.5 shrink-0" />
+                <span>{librarrSearchError}</span>
+              </div>
+              {#if canRetryLibrarrSearch(librarrSearchState, librarrQuery)}
+                <button
+                  type="button"
+                  class="btn btn-sm min-h-9 shrink-0 preset-tonal-surface"
+                  onclick={() => void searchLibrarr()}
+                >
+                  <RefreshCw size={14} /> Retry
+                </button>
+              {/if}
             </div>{/if}
           {#if librarrSearchState === "searching" && librarrResults.length === 0}
             <div
@@ -3986,14 +4022,14 @@
               Searching Librarr… {librarrResults.length} matches so far
             </div>
           {/if}
-          {#if librarrSearchState === "ready" && librarrResults.length === 0}
+          {#if shouldShowLibrarrEmptyBanner(librarrSearchState, librarrResults.length, librarrSearchError)}
             <div
               in:fade={{ duration: motionDuration(160) }}
               class="grid min-h-48 place-items-center text-center text-sm text-surface-700-300"
             >
               <div>
                 <BookOpen size={24} class="mx-auto mb-3 text-primary-500" />
-                <p>No {librarrMediaType} results found.</p>
+                <p>No {librarrSearchedMediaType} results found.</p>
                 <p class="mt-1">Try a title, author, or a shorter search.</p>
               </div>
             </div>

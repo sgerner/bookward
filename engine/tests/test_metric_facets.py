@@ -294,7 +294,7 @@ def test_metadata_field_provenance_requires_matching_identity_value_and_provider
     description = "Set in the 19th century, a detective solves a case."
     digest = evaluator.hashlib.sha256(description.encode()).hexdigest()
     read = {"id": 31}
-    monkeypatch.setattr(evaluator, "_read_metadata_identity_hash", lambda value: "identity-ok")
+    monkeypatch.setattr(evaluator, "read_metadata_identity_hash", lambda value: "identity-ok")
     original = {"read_id": 31, "identity_hash": "identity-ok", "description": description,
                 "description_kind": "synopsis"}
     supplemented = {
@@ -328,7 +328,7 @@ def test_genre_provenance_hash_uses_production_twelve_subject_limit(monkeypatch,
         normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
     read = {"id": 401}
-    monkeypatch.setattr(evaluator, "_read_metadata_identity_hash", lambda value: "identity-ok")
+    monkeypatch.setattr(evaluator, "read_metadata_identity_hash", lambda value: "identity-ok")
     original = {
         "read_id": 401,
         "identity_hash": "identity-ok",
@@ -368,7 +368,7 @@ def test_genre_provenance_rejects_a_tampered_twelfth_subject(monkeypatch):
         normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
     read = {"id": 402}
-    monkeypatch.setattr(evaluator, "_read_metadata_identity_hash", lambda value: "identity-ok")
+    monkeypatch.setattr(evaluator, "read_metadata_identity_hash", lambda value: "identity-ok")
     original = {"read_id": 402, "identity_hash": "identity-ok", "genres": genres}
     source = {"provider": "catalog", "provider_id": "work:402"}
     supplemented = {
@@ -396,7 +396,7 @@ def test_grounded_records_verify_twelve_genres_but_keep_eight_as_features(tmp_pa
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
     read = {"id": 403}
-    monkeypatch.setattr(evaluator, "_read_metadata_identity_hash", lambda value: "identity-ok")
+    monkeypatch.setattr(evaluator, "read_metadata_identity_hash", lambda value: "identity-ok")
     original = {
         "read_id": 403,
         "identity_hash": "identity-ok",
