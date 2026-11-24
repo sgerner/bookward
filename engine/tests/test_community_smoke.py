@@ -52,10 +52,10 @@ class SmokeHandler(BaseHTTPRequestHandler):
         cookie = self.headers.get("Cookie", "")
         return SESSION_COOKIE in cookie
 
-    def _send(self, status, body="", headers=None):
+    def _send(self, status, body="", headers=None, content_type="text/html; charset=utf-8"):
         payload = body.encode("utf-8")
         extra_headers = dict(headers or {})
-        content_type = extra_headers.pop("Content-Type", "text/html; charset=utf-8")
+        content_type = extra_headers.pop("Content-Type", content_type)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -74,6 +74,12 @@ class SmokeHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/v1/recommendations":
             self._send(401, "Unauthorized")
+            return
+        if self.path == "/api/recommendations" or self.path.startswith("/api/recommendations?"):
+            if not self._has_session():
+                self._send(401, '{"detail":"Unauthorized"}', content_type="application/json")
+                return
+            self._send(200, '{"items":[]}', content_type="application/json")
             return
         if self.path in {"/", "/?view=sources", "/?view=settings", "/account", "/admin"}:
             if not self._has_session():

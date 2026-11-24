@@ -30,15 +30,18 @@ from afterword_engine.covers import (
 from afterword_engine.ingestion import (
     _nyt_request_url,
     _source_client,
+    discover_feed_urls,
     enrich_book_metadata,
     enrich_goodreads_blog_items,
     fetch_bytes,
     filter_source_items,
+    import_csv,
     import_goodreads_csv,
     import_goodreads_rss,
     normalize_source_filters,
     normalize_stored_candidate_subjects,
     parse_book_items,
+    preview_source,
     refresh_missing_candidate_metadata,
     scan_source,
 )
@@ -601,6 +604,296 @@ def test_source_fetch_follows_and_repins_public_redirects(monkeypatch):
     content, content_type = asyncio.run(fetch_bytes("https://books.example.test/list"))
     assert content == b"books" and content_type == "text/plain"
     assert final.calls[0].request.headers["host"] == "redirect.example.test"
+
+
+def test_discover_feed_urls_rejects_non_default_ports():
+    html_doc = b"""
+    <html><head>
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:8443/feed.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test:443/default.xml" />
+      <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/plain.xml" />
+    </head></html>
+    """
+    assert discover_feed_urls(html_doc, "https://newsletter.example.test/archive/") == [
+        "https://newsletter.example.test/default.xml",
+        "https://newsletter.example.test/plain.xml",
+    ]
+
+
+def test_discover_feed_urls_resolves_relative_links_deduplicates_and_deprioritizes_comments():
+    html_doc = b"""
+    <html>
+      <head>
+        <link rel="stylesheet" href="/site.css" />
+        <link rel="alternate" type="text/xml+oembed" href="/oembed.xml" />
+        <link rel="alternate" type="application/rss+xml" title="Comments Feed" href="/comments/feed.xml#latest" />
+        <link rel="alternate" type="application/rss+xml" href="http://newsletter.example.test/insecure.xml" />
+        <link rel="alternate" type="application/rss+xml" href="https://localhost/local.xml" />
+        <link rel="alternate" type="application/rss+xml" href="https://127.0.0.1/loopback.xml" />
+        <link rel="alternate" type="application/rss+xml" href="/archive/index.html#self" />
+        <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/#root" />
+        <link rel="alternate" type="application/rss+xml; charset=utf-8" title="Main RSS" href="feed.xml#top" />
+        <link rel="alternate" type="application/rss+xml" href="https://newsletter.example.test/archive/feed.xml" />
+        <link rel="ALTERNATE" type="APPLICATION/ATOM+XML" title="Atom Feed" href="../feeds/books.atom#entries" />
+      </head>
+    </html>
+    """
+    discovered = discover_feed_urls(
+        html_doc,
+        "https://newsletter.example.test/archive/index.html",
+        original_url="https://newsletter.example.test",
+    )
+    assert discovered == [
+        "https://newsletter.example.test/archive/feed.xml",
+        "https://newsletter.example.test/feeds/books.atom",
+        "https://newsletter.example.test/comments/feed.xml",
+    ]
+
+
+@respx.mock
+def test_preview_source_autodiscovers_atom_after_redirect_and_prioritizes_populated_feed(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    respx.get("https://93.184.216.34/").mock(
+        return_value=httpx.Response(
+            302,
+            headers={"location": "https://www.newsletter.example.test/blog/"},
+        )
+    )
+    respx.get("https://93.184.216.34/blog/").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html>
+              <head>
+                <link rel="alternate" type="application/rss+xml" title="Post Comments" href="/blog/comments/feed.xml" />
+                <link rel="alternate" type="application/rss+xml" title="Empty RSS" href="rss.xml" />
+                <link rel="alternate" type="application/atom+xml" title="Books Atom" href="../atom.xml#feed" />
+                <link rel="alternate" type="application/rss+xml" title="Backup RSS" href="/backup.xml" />
+              </head>
+              <body><h1>Newsletter Home</h1><p>Weekly dispatches for readers.</p></body>
+            </html>
+            """,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+    )
+    empty_rss = respx.get("https://93.184.216.34/blog/rss.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+    atom_feed = respx.get("https://93.184.216.34/atom.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>Book Dispatches</title>
+              <entry>
+                <title>The Left Hand of Darkness</title>
+                <author><name>Ursula K. Le Guin</name></author>
+                <link rel="alternate" href="/posts/left-hand" />
+                <summary>A classic science fiction novel.</summary>
+              </entry>
+            </feed>
+            """,
+            headers={"content-type": "application/atom"},
+        )
+    )
+    backup_rss = respx.get("https://93.184.216.34/backup.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    comments_rss = respx.get("https://93.184.216.34/blog/comments/feed.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+
+    _, _, redirected_url = asyncio.run(
+        fetch_bytes("https://newsletter.example.test/", return_url=True)
+    )
+    assert redirected_url == "https://www.newsletter.example.test/blog/"
+
+    preview = asyncio.run(preview_source("https://newsletter.example.test/"))
+    assert preview["url"] == "https://www.newsletter.example.test/atom.xml"
+    assert preview["content_type"] == "application/atom"
+    assert preview["count"] == 1
+    assert preview["sample"][0]["title"] == "The Left Hand of Darkness"
+    assert preview["sample"][0]["author"] == "Ursula K. Le Guin"
+    assert (
+        preview["sample"][0]["source_url"]
+        == "https://www.newsletter.example.test/posts/left-hand"
+    )
+    assert empty_rss.called and atom_feed.called
+    assert not backup_rss.called
+    assert not comments_rss.called
+
+
+@respx.mock
+def test_autodiscovery_enforces_ssrf_caps_fetches_and_keeps_direct_html_single_fetch(
+    monkeypatch,
+):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        ip = "127.0.0.1" if host == "private.example.test" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    private_route = respx.get("https://127.0.0.1/internal.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    respx.get("https://93.184.216.34/empty-home").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html><head>
+              <link rel="alternate" type="application/rss+xml" href="http://books.example.test/http-only.xml" />
+              <link rel="alternate" type="application/rss+xml" href="https://private.example.test/internal.xml" />
+              <link rel="alternate" type="application/rss+xml" href="/nested-html" />
+              <link rel="alternate" type="application/rss+xml" href="/redirect-private" />
+              <link rel="alternate" type="application/rss+xml" href="/empty-3.xml" />
+              <link rel="alternate" type="application/rss+xml" href="/fourth.xml" />
+            </head><body><p>No books directly on homepage.</p></body></html>
+            """,
+            headers={"content-type": "text/html"},
+        )
+    )
+    nested_html = respx.get("https://93.184.216.34/nested-html").mock(
+        return_value=httpx.Response(
+            200,
+            text='<html><head><link rel="alternate" type="application/rss+xml" href="/nested.xml" /></head></html>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    nested_feed = respx.get("https://93.184.216.34/nested.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    redirect_private = respx.get("https://93.184.216.34/redirect-private").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://private.example.test/internal.xml"}
+        )
+    )
+    empty_three = respx.get("https://93.184.216.34/empty-3.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+    fourth_feed = respx.get("https://93.184.216.34/fourth.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text='<?xml version="1.0"?><rss version="2.0"><channel><item><title>Unreached Book</title></item></channel></rss>',
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+
+    empty_preview = asyncio.run(preview_source("https://books.example.test/empty-home"))
+    assert empty_preview["count"] == 0
+    assert empty_preview["url"] == "https://books.example.test/empty-home"
+    assert not private_route.called
+    assert nested_html.called and redirect_private.called and empty_three.called
+    assert not nested_feed.called
+    assert not fourth_feed.called
+
+    respx.get("https://93.184.216.34/direct-books").mock(
+        return_value=httpx.Response(
+            200,
+            text="""
+            <html>
+              <head>
+                <link rel="alternate" type="application/rss+xml" href="/unused-feed.xml" />
+                <script type="application/ld+json">
+                  {"@type": "Book", "name": "Direct JSON-LD Book", "author": "A Writer"}
+                </script>
+              </head>
+              <body></body>
+            </html>
+            """,
+            headers={"content-type": "text/html"},
+        )
+    )
+    unused_feed = respx.get("https://93.184.216.34/unused-feed.xml").mock(
+        return_value=httpx.Response(200, text="<rss/>", headers={"content-type": "application/rss+xml"})
+    )
+    direct_preview = asyncio.run(preview_source("https://books.example.test/direct-books"))
+    assert direct_preview["count"] == 1
+    assert direct_preview["url"] == "https://books.example.test/direct-books"
+    assert not unused_feed.called
+
+
+@respx.mock
+def test_source_endpoints_persist_resolved_feed_url_and_reject_duplicate_canonical_feed(
+    database, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    for path in ("/", "/about"):
+        respx.get(f"https://93.184.216.34{path}").mock(
+            return_value=httpx.Response(
+                200,
+                text='<html><head><link rel="alternate" type="application/rss+xml" href="/feed.xml" /></head></html>',
+                headers={"content-type": "text/html"},
+            )
+        )
+    respx.get("https://93.184.216.34/feed.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text="""<?xml version="1.0"?>
+            <rss version="2.0"><channel>
+              <item><title>Orbital</title><author>Samantha Harvey</author></item>
+            </channel></rss>""",
+            headers={"content-type": "application/rss+xml"},
+        )
+    )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        first_preview = client.post(
+            "/api/sources/preview", json={"url": "https://newsletter.example.test/"}
+        )
+        assert first_preview.status_code == 200
+        assert first_preview.json()["url"] == "https://newsletter.example.test/feed.xml"
+        assert first_preview.json()["count"] == 1
+
+        created = client.post(
+            "/api/sources",
+            json={
+                "name": "newsletter.example.test",
+                "url": first_preview.json()["url"],
+                "enabled": False,
+            },
+        )
+        assert created.status_code == 200
+        stored = row("SELECT name, url FROM sources WHERE id=?", (created.json()["id"],))
+        assert stored["name"] == "newsletter.example.test"
+        assert stored["url"] == "https://newsletter.example.test/feed.xml"
+
+        second_preview = client.post(
+            "/api/sources/preview", json={"url": "https://newsletter.example.test/about"}
+        )
+        assert second_preview.status_code == 200
+        assert second_preview.json()["url"] == "https://newsletter.example.test/feed.xml"
+
+        duplicate = client.post(
+            "/api/sources",
+            json={
+                "name": "Duplicate feed",
+                "url": second_preview.json()["url"],
+                "enabled": False,
+            },
+        )
+        assert duplicate.status_code == 409
+        assert "already exists" in duplicate.json()["detail"]
 
 @respx.mock
 def test_scan_source_persists_provider_metadata(database, monkeypatch):
@@ -1515,6 +1808,132 @@ def test_settings_encrypt_and_preserve_api_keys(database):
     assert row("SELECT value FROM settings WHERE key='librarr_media_type'")["value"] == "ebook"
 
 
+def test_partial_settings_updates_preserve_sibling_fields_and_require_initial_librarr_key(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        missing_key = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert missing_key.status_code == 400
+        assert missing_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        omitted_key = client.put(
+            "/api/settings",
+            json={"librarr_url": "http://librarr:5050"},
+        )
+        assert omitted_key.status_code == 400
+        assert omitted_key.json()["detail"] == "Enter a Librarr API key for the first connection."
+
+        saved_librarr = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "librarr-initial-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert saved_librarr.status_code == 200
+
+        saved_embeddings = client.put(
+            "/api/settings",
+            json={
+                "embedding_backend": "local",
+                "embedding_model": "hashing-768",
+                "embedding_url": "",
+                "embedding_api_key": "embedding-initial-secret",
+            },
+        )
+        assert saved_embeddings.status_code == 200
+
+        def reject_embedding_check(*_args, **_kwargs):
+            raise AssertionError("unchanged embedding settings should not be checked")
+
+        monkeypatch.setattr(main_module, "get_embedder", reject_embedding_check)
+        updated_format = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://librarr:5050",
+                "librarr_api_key": "",
+                "librarr_media_type": "audiobook",
+            },
+        )
+        assert updated_format.status_code == 200
+        assert updated_format.json()["embedding"]["checked"] is False
+
+    private = main_module.private_settings()
+    assert private["librarr_url"] == "http://librarr:5050"
+    assert private["librarr_api_key"] == "librarr-initial-secret"
+    assert private["librarr_media_type"] == "audiobook"
+    assert private["embedding_api_key"] == "embedding-initial-secret"
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+
+
+def test_settings_reject_private_librarr_host_even_with_a_key(database):
+    import afterword_engine.main as main_module
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        rejected = client.put(
+            "/api/settings",
+            json={
+                "librarr_url": "http://10.0.0.1:5050",
+                "librarr_api_key": "librarr-secret",
+                "librarr_media_type": "ebook",
+            },
+        )
+        assert rejected.status_code == 400
+    private = main_module.private_settings()
+    assert private.get("librarr_url", "") == ""
+    assert private.get("librarr_api_key", "") == ""
+
+
+def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
+    default_source = row("SELECT id, enabled FROM sources WHERE is_default=1")
+    assert default_source["enabled"] == 1
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        disabled = client.put("/api/sources/default/toggle")
+        assert disabled.status_code == 200
+        assert disabled.json() == {
+            "id": default_source["id"],
+            "enabled": 0,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 0
+        assert (
+            row(
+                "SELECT COUNT(*) count FROM candidates WHERE source_id=? AND status='recommended'",
+                (default_source["id"],),
+            )["count"]
+            == 0
+        )
+
+        reenabled = client.put("/api/sources/default/toggle")
+        assert reenabled.status_code == 200
+        assert reenabled.json() == {
+            "id": default_source["id"],
+            "enabled": 1,
+            "job_id": None,
+        }
+        assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 1
+
+        with transaction() as con:
+            con.execute("UPDATE sources SET is_default=0 WHERE is_default=1")
+
+        missing = client.put("/api/sources/default/toggle")
+        assert missing.status_code == 404
+        assert missing.json()["detail"] == "Default source not found."
+
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
+
+
 def test_nyt_books_key_is_encrypted_and_only_added_to_outgoing_requests(database):
     with TestClient(app, headers=authenticated_headers()) as client:
         assert client.get("/api/settings/nyt").json() == {"api_key_set": False}
@@ -1757,6 +2176,319 @@ def test_cover_urls_are_https_and_source_or_provider_scoped():
     assert safe_cover_url("https://books.example/cover.jpg", "https://books.example/list")
     assert safe_cover_url("https://tracking.example/cover.jpg", "https://books.example/list") == ""
     assert fallback_cover_url("A Book", "An Author").startswith("https://placehold.co/")
+
+
+def test_cover_and_source_url_helpers_deduplicate_parses_and_preserve_edge_cases(monkeypatch):
+    import afterword_engine.covers as covers_module
+
+    # Credentials, uppercase/trailing-dot hosts, subdomains, and fragment stripping
+    assert safe_cover_url("https://user:pass@covers.openlibrary.org/b/id/42-L.jpg") == ""
+    assert (
+        safe_cover_url("https://COVERS.OPENLIBRARY.ORG./b/id/42-L.jpg#preview")
+        == "https://covers.openlibrary.org./b/id/42-L.jpg"
+    )
+    assert (
+        safe_cover_url("https://is1-ssl.MZSTATIC.com/image/thumb/cover.jpg#")
+        == "https://is1-ssl.mzstatic.com/image/thumb/cover.jpg"
+    )
+    assert (
+        safe_cover_url(
+            "https://BOOKS.EXAMPLE./art/cover.jpg#top",
+            "https://books.example/list",
+        )
+        == "https://books.example./art/cover.jpg"
+    )
+
+    # Weak covers fall back to placeholder_cover_url
+    expected_placeholder = covers_module.placeholder_cover_url("A Book", "An Author")
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/isbn/9780000000000-L.jpg",
+            "https://openlibrary.org/works/OL1W",
+        )
+        == expected_placeholder
+    )
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://placehold.co/640x960?text=Old",
+            "https://books.example/list",
+        )
+        == expected_placeholder
+    )
+
+    # Known CDN cover without '#' parses supplied once and skips source_url + copy_with
+    httpx_calls = []
+    real_httpx_url = covers_module.httpx.URL
+
+    def counting_httpx_url(value, *args, **kwargs):
+        httpx_calls.append(value)
+        return real_httpx_url(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", counting_httpx_url)
+    assert (
+        fallback_cover_url(
+            "A Book",
+            "An Author",
+            "https://covers.openlibrary.org/b/id/42-L.jpg",
+            "https://books.example/list",
+        )
+        == "https://covers.openlibrary.org/b/id/42-L.jpg"
+    )
+    assert httpx_calls == ["https://covers.openlibrary.org/b/id/42-L.jpg"]
+
+    # canonical_book_source_url parses source_url once and promotes Open Library list links when work ID exists
+    urlparse_calls = []
+    real_urlparse = covers_module.urlparse
+
+    def counting_urlparse(value, *args, **kwargs):
+        urlparse_calls.append(value)
+        return real_urlparse(value, *args, **kwargs)
+
+    monkeypatch.setattr(covers_module, "urlparse", counting_urlparse)
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://www.openlibrary.org./people/reader/lists/OL2L",
+            item={"quality_work_id": "/works/OL99W", "quality_provider": "openlibrary"},
+        )
+        == "https://openlibrary.org/works/OL99W"
+    )
+    assert (
+        canonical_book_source_url(
+            "A Book",
+            "A Writer",
+            "https://openlibrary.org/people/reader/lists/OL2L",
+            item={"quality_work_id": "", "quality_provider": ""},
+        )
+        == "https://openlibrary.org/search?title=A+Book&author=A+Writer"
+    )
+    assert len(urlparse_calls) == 2
+
+
+def test_tracked_recommendations_defers_url_formatting_until_after_pagination(database, monkeypatch):
+    import afterword_engine.covers as covers_module
+    import afterword_engine.main as main_module
+    from afterword_engine.decision_evidence import load_decision_evidence
+
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+        con.execute("DELETE FROM candidate_quality")
+        source_id = con.execute("SELECT id FROM sources WHERE enabled=1 LIMIT 1").fetchone()["id"]
+        special_cases = [
+            (
+                "Top Promoted List Book",
+                "Writer One",
+                "https://covers.openlibrary.org/b/id/501-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL10L",
+                "recommended",
+                99.0,
+                "/works/OL501W",
+            ),
+            (
+                "Top Unpromoted List Book",
+                "Writer Two",
+                "https://covers.openlibrary.org/b/isbn/9780000000002-L.jpg",
+                "https://openlibrary.org/people/reader/lists/OL11L",
+                "recommended",
+                98.0,
+                "",
+            ),
+            (
+                "Top Fragment Publisher Book",
+                "Writer Three",
+                "https://BOOKS.EXAMPLE./covers/three.jpg#hero",
+                "https://books.example/list/three",
+                "recommended",
+                97.0,
+                "",
+            ),
+            (
+                "Top ISBN Search Book",
+                "Writer Four",
+                "https://placehold.co/600x900",
+                "https://openlibrary.org/isbn/9780000000004",
+                "recommended",
+                96.0,
+                "",
+            ),
+        ]
+        for idx in range(196):
+            special_cases.append(
+                (
+                    f"Pool Tail Book {idx}",
+                    f"Tail Author {idx}",
+                    f"https://covers.openlibrary.org/b/id/{1000 + idx}-L.jpg",
+                    f"https://openlibrary.org/people/reader/lists/OL{1000 + idx}L",
+                    "recommended",
+                    round(90.0 - idx * 0.1, 3),
+                    "",
+                )
+            )
+        special_cases.extend(
+            [
+                (
+                    "Saved Weak Cover Book",
+                    "Saved Author",
+                    "https://covers.openlibrary.org/b/isbn/9780000000099-L.jpg",
+                    "https://openlibrary.org/isbn/9780000000099",
+                    "saved",
+                    85.0,
+                    "",
+                ),
+                (
+                    "Rejected List Book",
+                    "Rejected Author",
+                    "https://covers.openlibrary.org/b/id/900-L.jpg#frag",
+                    "https://openlibrary.org/people/reader/lists/OL900L",
+                    "rejected",
+                    40.0,
+                    "/works/OL900W",
+                ),
+            ]
+        )
+        for title, author, cover_url, source_url, status, score_val, work_id in special_cases:
+            cur = con.execute(
+                """INSERT INTO candidates(
+                    title,author,description,cover_url,source_url,source_id,
+                    release_date,date_kind,genres,score,explanation,status,normalized_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    title,
+                    author,
+                    f"Summary for {title}",
+                    cover_url,
+                    source_url,
+                    source_id,
+                    "2026-02-01",
+                    "day",
+                    json.dumps(["Fiction"]),
+                    score_val,
+                    json.dumps(["Matched"]),
+                    status,
+                    normalize_key(title, author),
+                ),
+            )
+            con.execute(
+                """INSERT OR REPLACE INTO candidate_quality(
+                    candidate_id,quality_status,quality_score,audit_version,metadata_version,work_id,provider
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    cur.lastrowid,
+                    "accepted",
+                    1.0,
+                    "builtin-curated-v1",
+                    "catalog-metadata-v1",
+                    work_id,
+                    "openlibrary" if work_id else "",
+                ),
+            )
+            if status == "rejected":
+                con.execute(
+                    "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+                    (cur.lastrowid, "reject"),
+                )
+
+    unformatted = recommendation_list(status="recommended", limit=4, format_urls=False)
+    assert unformatted[0]["genres"] == ["Fiction"]
+    assert unformatted[0]["explanation"] == ["Matched"]
+    assert unformatted[0]["source_url"] == "https://openlibrary.org/people/reader/lists/OL10L"
+
+    httpx_calls = 0
+    urlparse_calls = 0
+    real_httpx_url = covers_module.httpx.URL
+    real_covers_urlparse = covers_module.urlparse
+    real_main_urlparse = main_module.urlparse
+
+    def count_httpx_url(*args, **kwargs):
+        nonlocal httpx_calls
+        httpx_calls += 1
+        return real_httpx_url(*args, **kwargs)
+
+    def count_covers_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_covers_urlparse(*args, **kwargs)
+
+    def count_main_urlparse(*args, **kwargs):
+        nonlocal urlparse_calls
+        urlparse_calls += 1
+        return real_main_urlparse(*args, **kwargs)
+
+    monkeypatch.setattr(covers_module.httpx, "URL", count_httpx_url)
+    monkeypatch.setattr(covers_module, "urlparse", count_covers_urlparse)
+    monkeypatch.setattr(main_module, "urlparse", count_main_urlparse)
+
+    served, run_id = main_module.tracked_recommendations(status="recommended", limit=8, offset=0)
+    assert len(served) == 8
+    # Only the 8 served recommendations are URL-formatted (8 source URLs; 8 covers + 1 source-host check)
+    assert urlparse_calls == 8
+    assert httpx_calls == 9
+
+    assert served[0]["cover_url"] == "https://covers.openlibrary.org/b/id/501-L.jpg"
+    assert served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert served[1]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[1]["source_url"]
+        == "https://openlibrary.org/search?title=Top+Unpromoted+List+Book&author=Writer+Two"
+    )
+    assert served[2]["cover_url"] == "https://books.example./covers/three.jpg"
+    assert served[2]["source_url"] == "https://books.example/list/three"
+    assert served[3]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        served[3]["source_url"]
+        == "https://openlibrary.org/search?title=Top+ISBN+Search+Book&author=Writer+Four"
+    )
+
+    with main_module.connect() as con:
+        evidence = load_decision_evidence(con, run_id)
+    assert evidence is not None and evidence["capture_status"] == "complete"
+    assert len(evidence["decision"]["pools"]["base"]) == 200
+    assert len(evidence["decision"]["pools"]["final"]) == 200
+    assert "cover_url" not in evidence["decision"]["pools"]["final"][0]
+    assert "source_url" not in evidence["decision"]["pools"]["final"][0]
+    assert len(evidence["served_exposures"]) == 8
+    exposure_snapshot = json.loads(evidence["served_exposures"][0]["candidate_snapshot_json"])
+    assert "cover_url" not in exposure_snapshot
+    assert "source_url" not in exposure_snapshot
+
+    # Non-personalized path (can_personalize is False) still formats URLs for the returned slice
+    saved_items, _ = main_module.tracked_recommendations(status="saved", limit=8, offset=0)
+    assert len(saved_items) == 1
+    assert saved_items[0]["cover_url"].startswith("https://placehold.co/")
+    assert (
+        saved_items[0]["source_url"]
+        == "https://openlibrary.org/search?title=Saved+Weak+Cover+Book&author=Saved+Author"
+    )
+
+    decisions = recommendation_list(status="decisions", limit=8)
+    assert len(decisions) == 1
+    assert decisions[0]["cover_url"] == "https://covers.openlibrary.org/b/id/900-L.jpg"
+    assert decisions[0]["source_url"] == "https://openlibrary.org/works/OL900W"
+
+    # Overview path (status=None, recommended_limit=4) formats only 4 recommended + 1 saved
+    httpx_calls = 0
+    urlparse_calls = 0
+    overview_slice, _ = main_module.tracked_recommendations(limit=24, recommended_limit=4)
+    assert len(overview_slice) == 5
+    assert urlparse_calls == 5
+
+    # Personalization failure fallback still formats URLs for the returned slice
+    def broken_personalize(*_args, **_kwargs):
+        raise RuntimeError("simulated personalization failure")
+
+    monkeypatch.setattr(main_module, "personalize_recommendations", broken_personalize)
+    httpx_calls = 0
+    urlparse_calls = 0
+    fallback_served, _ = main_module.tracked_recommendations(status="recommended", limit=4, offset=0)
+    assert len(fallback_served) == 4
+    assert urlparse_calls == 4
+    assert fallback_served[0]["source_url"] == "https://openlibrary.org/works/OL501W"
+    assert fallback_served[2]["cover_url"] == "https://books.example./covers/three.jpg"
 
 @respx.mock
 def test_book_metadata_lookup_supplies_summary_and_year():
@@ -3035,3 +3767,112 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def test_storygraph_csv_imports_completed_books_fractional_ratings_dates_and_isbns(database):
+    payload = (
+        "Title,Authors,Contributors,ISBN/UID,Format,Read Status,Date Added,Last Date Read,Dates Read,Star Rating\n"
+        '"This Is How You Lose the Time War","Amal El-Mohtar, Max Gladstone",,9781534431003,hardcover,read,2024/01/01,2024/01/18,2024/01/05-2024/01/18,4.75\n'
+        '"A Canticle for Leibowitz","Walter M. Miller, Jr.",,0553273817,paperback,read,2023/06/01,,2021/03/01-2021/03/10; 2023/06/02-2023/06/19,4.25\n'
+        '"Indie Digital Book",Solo Writer,,B08FHBV4ZX,digital,read,2024/02/01,,2024/02/10-,3.5\n'
+        '"UUID Edition",Another Writer,,a1b2c3d4-e5f6-4789-abcd-ef0123456789,audio,read,2024/03/01,2024-03-15,,\n'
+    ).encode("utf-8")
+
+    result = import_csv(payload)
+    assert result == {"imported": 4, "source": "storygraph_csv"}
+
+    imported_rows = rows(
+        "SELECT title, author, rating, read_at, isbn, source "
+        "FROM reads WHERE source='storygraph_csv' ORDER BY title"
+    )
+    assert imported_rows == [
+        {
+            "title": "A Canticle for Leibowitz",
+            "author": "Walter M. Miller, Jr.",
+            "rating": 4.25,
+            "read_at": "2023/06/19",
+            "isbn": "9780553273816",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "Indie Digital Book",
+            "author": "Solo Writer",
+            "rating": 3.5,
+            "read_at": None,
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar, Max Gladstone".split(",")[0],
+            "rating": 4.75,
+            "read_at": "2024/01/18",
+            "isbn": "9781534431003",
+            "source": "storygraph_csv",
+        },
+        {
+            "title": "UUID Edition",
+            "author": "Another Writer",
+            "rating": None,
+            "read_at": "2024-03-15",
+            "isbn": None,
+            "source": "storygraph_csv",
+        },
+    ]
+
+
+def test_invalid_storygraph_rating_rolls_back_all_rows(database):
+    payload = (
+        "Title,Authors,Read Status,Star Rating\n"
+        "First Book,Writer One,read,4.5\n"
+        "Out Of Range,Writer Two,read,5.25\n"
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="CSV row 3.*Out Of Range.*No books were imported"):
+        import_csv(payload)
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='storygraph_csv'")["count"] == 0
+
+
+def test_unsupported_csv_headers_name_supported_formats(database):
+    payload = b"Heading,Writer,Rating\nSome Book,Someone,4\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(payload)
+    calibre_like = b"Title,Authors,Publisher\nSome Book,Someone,Press\n"
+    with pytest.raises(ValueError, match="Goodreads.*StoryGraph"):
+        import_csv(calibre_like)
+
+
+def test_csv_upload_routes_handle_storygraph_and_goodreads(database):
+    storygraph_csv = (
+        "Title,Authors,ISBN/UID,Read Status,Last Date Read,Star Rating\n"
+        "Piranesi,Susanna Clarke,9781635575637,read,2025/08/12,4.75\n"
+    ).encode("utf-8")
+    goodreads_csv_bytes = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Dune,Frank Herbert,5,2025/07/01,read\n"
+    ).encode("utf-8")
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        sg_res = client.post(
+            "/api/import/csv",
+            files={"file": ("storygraph.csv", storygraph_csv, "text/csv")},
+        )
+        assert sg_res.status_code == 200
+        assert sg_res.json()["imported"] == 1
+        assert sg_res.json()["source"] == "storygraph_csv"
+        assert sg_res.json()["job_id"]
+
+        gr_res = client.post(
+            "/api/import/goodreads/csv",
+            files={"file": ("goodreads.csv", goodreads_csv_bytes, "text/csv")},
+        )
+        assert gr_res.status_code == 200
+        assert gr_res.json()["imported"] == 1
+        assert gr_res.json()["source"] == "goodreads_csv"
+
+        bad_res = client.post(
+            "/api/import/csv",
+            files={"file": ("other.csv", b"Name,Price\nTea,5\n", "text/csv")},
+        )
+        assert bad_res.status_code == 400
+        assert "StoryGraph" in bad_res.json()["detail"]
+
