@@ -15,6 +15,8 @@ const querySchema = z.object({
   ]).default("recommended"),
   limit: z.coerce.number().int().min(1).max(24).default(8),
   offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+  search: z.string().trim().max(200).optional(),
+  genre: z.string().trim().max(100).optional(),
 });
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Recommendations could not be loaded.";
@@ -28,6 +30,8 @@ export const GET: RequestHandler = async ({ url }) => {
     limit: String(parsed.data.limit + 1),
     offset: String(parsed.data.offset),
   });
+  if (parsed.data.search) params.set("search", parsed.data.search);
+  if (parsed.data.genre) params.set("genre", parsed.data.genre);
   try {
     const items = await engine<Recommendation[]>(`/api/recommendations?${params.toString()}`);
     return Response.json({
