@@ -27,10 +27,12 @@ from .database import (
     bind_request_restore_epoch,
     connect,
     database_lock,
+    demote_orphaned_recommended_candidates,
     fenced_async,
     initialize,
     normalize_key,
     private_setting,
+    recompute_candidate_sources,
     row,
     rows,
     scheduler_fenced,
@@ -126,9 +128,14 @@ from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     CATALOG_QUARANTINE_RETRY_DAYS,
     QUALITY_AUDIT_BATCH_SIZE,
+    QUALITY_SWEEP_ACTIVE_KEY,
     _utc_audit_timestamp,
     audit_candidates,
+    configure_candidate_quality_sweep,
+    finish_candidate_quality_batch,
+    get_candidate_quality_sweep_status,
     has_candidate_quality_audit_candidates,
+    prepare_candidate_quality_batch,
     quality_summary,
 )
 from . import llm_reranker
@@ -192,6 +199,16 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class CandidateAuditIn(BaseModel):
+    mode: Literal["incremental", "full"] | None = None
+    dry_run: bool = False
+    count_only: bool = False
+    only_pending: bool | None = None
+    retry: bool = False
+    retry_quarantined: bool = False
+    limit: int | None = Field(default=None, ge=1, le=500)
 
 
 def _ensure_profile_database(profile_id: str):
@@ -379,7 +396,8 @@ def _queue_due_enrichment_retries():
     queued = {}
     now_ts = _recovery_clock()
     if (
-        not active_job("candidate_quality_recovery")
+        not active_job("candidate_quality")
+        and not active_job("candidate_quality_recovery")
         and not _is_quality_recovery_deferred(now_ts)
         and _has_due_quality_recovery()
     ):
@@ -659,15 +677,43 @@ async def handle_job(kind: str):
             enqueue_followup_job("metadata")
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        quality = await audit_candidates(only_pending=False)
-        enqueue_job("read_work_identities", dedupe=True)
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
+        mode, started_at = prepare_candidate_quality_batch()
+        quality = await audit_candidates(
+            only_pending=(mode != "full"),
+            limit=QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=started_at,
         )
-        return {**quality, "scored": scored}
+        stopped = bool(quality.get("stopped"))
+        remaining = finish_candidate_quality_batch(
+            mode=mode,
+            started_at=started_at,
+            stopped=stopped,
+        )
+        changed = bool(
+            quality.get("status_changed")
+            or quality.get("deduped")
+            or quality.get("enriched")
+        )
+        is_final_batch = remaining == 0 and not stopped
+        score_job_id = (
+            enqueue_followup_job("score")
+            if (changed or is_final_batch)
+            else None
+        )
+        followup_job_id = (
+            enqueue_followup_job("candidate_quality")
+            if remaining > 0
+            else None
+        )
+        if quality.get("audited") or is_final_batch:
+            enqueue_job("read_work_identities", dedupe=True)
+        return {
+            **quality,
+            "mode": mode,
+            "remaining": remaining,
+            "followup_job_id": followup_job_id,
+            "score_job_id": score_job_id,
+        }
     if kind == "candidate_quality_recovery":
         profile_key = current_profile_id()
         now_ts = _recovery_clock()
@@ -843,7 +889,11 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if not _is_quality_recovery_deferred() and _has_due_quality_recovery():
+                if (
+                    not active_job("candidate_quality")
+                    and not _is_quality_recovery_deferred()
+                    and _has_due_quality_recovery()
+                ):
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -3571,13 +3621,9 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
         "WHERE id=?",
         (source_id,),
     )
+    recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE source_id=? AND status='recommended'",
-            (source_id,),
-        )
+        demote_orphaned_recommended_candidates(con, source_id=source_id)
     return became_enabled
 
 
@@ -4111,12 +4157,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND COALESCE(s.enabled,1)=1",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }
@@ -4176,19 +4222,19 @@ async def sync():
 async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
-class CandidateAuditIn(BaseModel):
-    dry_run: bool = False
-    count_only: bool = False
-    only_pending: bool = True
-    retry: bool = False
-    retry_quarantined: bool = False
-    limit: int | None = Field(default=None, ge=1, le=500)
+def _has_resumable_manual_sweep() -> bool:
+    if private_setting(QUALITY_SWEEP_ACTIVE_KEY, "") == "1":
+        return True
+    if active_job("candidate_quality"):
+        return True
+    return bool(get_candidate_quality_sweep_status().get("can_retry"))
 
 
 @app.post("/api/candidates/audit")
 @fenced_async
 async def candidate_audit(
     payload: Annotated[CandidateAuditIn | None, Body()] = None,
+    mode: Annotated[Literal["incremental", "full"] | None, Query()] = None,
     dry_run: Annotated[bool, Query()] = False,
     count_only: Annotated[bool, Query()] = False,
     only_pending: Annotated[bool | None, Query()] = None,
@@ -4196,32 +4242,40 @@ async def candidate_audit(
     retry_quarantined: Annotated[bool, Query()] = False,
     limit: Annotated[int | None, Query(ge=1, le=500)] = None,
 ):
-    """Queue a catalog audit, retry quarantined rows, or preview scope via count_only/dry_run."""
+    """Queue a bounded incremental/full catalog audit, retry quarantined rows, or preview scope."""
 
-    effective_dry_run = bool(dry_run or (payload and payload.dry_run))
-    effective_count_only = bool(count_only or (payload and payload.count_only))
-    effective_retry = bool(
-        retry
-        or retry_quarantined
-        or (payload and (payload.retry or payload.retry_quarantined))
+    has_payload = isinstance(payload, CandidateAuditIn)
+    effective_mode = mode if mode is not None else (payload.mode if has_payload else None)
+    effective_dry_run = bool(dry_run or (has_payload and payload.dry_run))
+    effective_count_only = bool(count_only or (has_payload and payload.count_only))
+    effective_retry = bool(retry or (has_payload and payload.retry))
+    effective_retry_quarantined = bool(
+        retry_quarantined or (has_payload and payload.retry_quarantined)
     )
     if effective_dry_run or effective_count_only:
+        payload_only_pending = payload.only_pending if has_payload else None
         effective_only_pending = (
             only_pending
             if only_pending is not None
-            else (payload.only_pending if payload is not None else True)
+            else (
+                payload_only_pending
+                if payload_only_pending is not None
+                else (effective_mode != "full")
+            )
         )
         effective_limit = (
-            limit if limit is not None else (payload.limit if payload is not None else None)
+            limit if limit is not None else (payload.limit if has_payload else None)
         )
         return await audit_candidates(
             only_pending=effective_only_pending,
             limit=effective_limit,
             dry_run=effective_dry_run,
             count_only=effective_count_only,
-            retry_quarantined=effective_retry,
+            retry_quarantined=bool(effective_retry or effective_retry_quarantined),
         )
-    if effective_retry:
+    if effective_retry_quarantined or (
+        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
+    ):
         cutoff = _utc_audit_timestamp()
         settings_updates = {
             QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
@@ -4232,10 +4286,11 @@ async def candidate_audit(
         _set_quality_recovery_settings(**settings_updates)
         return {
             "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "mode": "incremental",
             "retry_quarantined": True,
             "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
         }
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
