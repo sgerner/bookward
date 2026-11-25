@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from .config import settings
+from .http_bounds import read_bounded_json_sync
 from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
 from .security import safe_error_message, validate_public_url
 from .tenancy import current_profile_id, profile_database_path
@@ -922,22 +923,35 @@ def rerank_with_llm_sync(
         validate_public_url(url)
         current_url = url
         with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            response = None
+            payload: Any = None
             for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-                response = client.post(current_url, headers=headers, json=request_body)
-                if 300 <= response.status_code < 400:
-                    current_url = _validate_redirect_target(
-                        url,
-                        response.status_code,
-                        response.headers.get("location", "").strip(),
+                request = client.build_request(
+                    "POST",
+                    current_url,
+                    headers=headers,
+                    json=request_body,
+                )
+                response = client.send(request, stream=True)
+                try:
+                    if 300 <= response.status_code < 400:
+                        current_url = _validate_redirect_target(
+                            url,
+                            response.status_code,
+                            response.headers.get("location", "").strip(),
+                        )
+                        continue
+                    response.raise_for_status()
+                    payload = read_bounded_json_sync(
+                        response,
+                        max_bytes=settings.llm_rerank_max_bytes,
+                        size_error="LLM reranker response is too large",
                     )
-                    continue
-                break
+                    break
+                finally:
+                    response.close()
             else:
                 raise ValueError("Too many redirects from LLM endpoint")
-            assert response is not None
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+            content = payload["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             kind, payload_items = _extract_response_payload(parsed)
             reranked, diag = _apply_parsed_payload(
