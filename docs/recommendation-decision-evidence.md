@@ -103,11 +103,18 @@ shortlist/dismissed curation is also being cleared) in the same transaction. A
 read/history reset must also clear
 or recompute materialized candidate scores and explanation strings derived
 from the deleted reads before those candidates are served again; purging the
-archive alone does not remove those live derived values. The current app has
-no per-candidate delete or library/history reset endpoint. Removing a profile
-database removes its evidence too. Backups contain the evidence and restoring
-one restores it, so a privacy deletion that includes backup copies must also
-expire or replace those backups under the deployment's retention policy.
+archive alone does not remove those live derived values. The current app exposes profile history reset via `POST /auth/account/reset-history`
+(under **Account → Reset reading history**), which calls
+`purge_recommendation_evidence(connection, clear_all_evidence=True)`, deletes
+read/import/embedding/association history, and zeroes materialized candidate
+scores and explanations while preserving the profile's backup snapshots as
+restore points. It still has no per-candidate delete endpoint. Deleting an
+account via `DELETE /auth/account` or `DELETE /admin/accounts/{account_id}`
+removes the profile database, its decision evidence, and its per-profile backup
+snapshots, scrubs the erased account from retained `auth-registry/` snapshots,
+and writes a durable tombstone marker so restarts never recreate deleted profile
+files; disabled profiles also have expired snapshots pruned on the scheduled
+backup window.
 
 Routine source refresh is not an intentional privacy deletion and leaves the
 run-linked evidence in place. This distinction keeps audit history available
