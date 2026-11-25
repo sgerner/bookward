@@ -634,22 +634,41 @@ async def _apple_books_match(
     for item in payload.get("results", []) if isinstance(payload, dict) else []:
         if not isinstance(item, dict):
             continue
-        track_id = str(item.get("trackId") or "").strip()
-        catalog_title = str(item.get("trackName") or "").strip()
+        raw_provider_id = item.get("trackId")
+        if raw_provider_id is None or not str(raw_provider_id).strip():
+            raw_provider_id = item.get("collectionId")
+        provider_id = str(raw_provider_id or "").strip()
+        catalog_title = str(item.get("trackName") or item.get("collectionName") or "").strip()
         catalog_author = str(item.get("artistName") or "").strip()
-        if not track_id or not catalog_title:
+        if not provider_id or not catalog_title:
             continue
         description = _clean_metadata_text(item.get("description"))
         description_kind = "synopsis" if description else ""
         release_date, release_date_kind = _publication_date(item.get("releaseDate"))
         raw_cover = str(item.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
         cover = safe_cover_url(raw_cover)
+        raw_genres = item.get("genres")
+        if isinstance(raw_genres, str):
+            raw_genres = [raw_genres]
+        elif isinstance(raw_genres, (list, tuple)):
+            raw_genres = list(raw_genres)
+        else:
+            raw_genres = []
+        filtered_genres = [
+            g for g in raw_genres if str(g).strip().casefold() not in {"books", "audiobooks"}
+        ]
+        if not filtered_genres and item.get("primaryGenreName"):
+            filtered_genres = [
+                g
+                for g in [item.get("primaryGenreName")]
+                if str(g).strip().casefold() not in {"books", "audiobooks"}
+            ]
         genres = _catalog_genres(
-            [g for g in (item.get("genres") or []) if str(g).casefold() != "books"],
+            filtered_genres,
             limit=METADATA_GENRE_LIMIT,
         )
         source_payload = {
-            "trackId": item.get("trackId"),
+            "trackId": item.get("trackId") if item.get("trackId") is not None else item.get("collectionId"),
             "trackName": _clean_metadata_text(catalog_title, 500),
             "artistName": _clean_metadata_text(catalog_author, 300),
             "description": description,
@@ -658,10 +677,16 @@ async def _apple_books_match(
             "artworkUrl100": raw_cover,
             "media": media,
         }
+        if item.get("collectionId") is not None and item.get("trackId") is None:
+            source_payload["collectionId"] = item.get("collectionId")
+        if item.get("collectionName") and not item.get("trackName"):
+            source_payload["collectionName"] = _clean_metadata_text(item.get("collectionName"), 500)
+        if item.get("primaryGenreName") and not item.get("genres"):
+            source_payload["primaryGenreName"] = _clean_metadata_text(item.get("primaryGenreName"), 80)
         match = _provider_match(
             provider="apple_books",
-            provider_id=track_id,
-            work_id="",
+            provider_id=provider_id,
+            work_id=provider_id,
             title=title,
             author=author,
             catalog_title=catalog_title,
@@ -805,30 +830,46 @@ async def resolve_catalog_match(
             and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
             for trace in fetch_trace
         )
-        if (
-            not any(accepted(value) for value in matches)
-            and (not query_isbn or primary_unavailable)
-            and (rate_limited_providers is None or "apple_books" not in rate_limited_providers)
+        if not any(accepted(value) for value in matches) and (
+            not query_isbn or primary_unavailable
         ):
-            apple_match = await _apple_books_match(
-                title, author, client, media="ebook", trace=fetch_trace
-            )
-            _record_rate_limits()
-            if apple_match:
-                matches.append(apple_match)
-            if not accepted(apple_match) and (
-                rate_limited_providers is None or "apple_books" not in rate_limited_providers
-            ):
-                audio_match = await _apple_books_match(
-                    title, author, client, media="audiobook", trace=fetch_trace
+            if rate_limited_providers is not None and "apple_books" in rate_limited_providers:
+                fetch_trace.append(
+                    {
+                        "provider": "apple_books",
+                        "fetched_at": _utc_now(),
+                        "query_kind": "title_author_ebook",
+                        "status": "rate_limited",
+                        "http_status": 429,
+                        "skipped": True,
+                    }
+                )
+            else:
+                apple_match = await _apple_books_match(
+                    title, author, client, media="ebook", trace=fetch_trace
                 )
                 _record_rate_limits()
-                if audio_match:
-                    matches.append(audio_match)
+                if apple_match:
+                    matches.append(apple_match)
+                apple_rate_limited = any(
+                    trace.get("provider") == "apple_books" and trace.get("status") == "rate_limited"
+                    for trace in fetch_trace
+                )
+                if (
+                    not accepted(apple_match)
+                    and not apple_rate_limited
+                    and (rate_limited_providers is None or "apple_books" not in rate_limited_providers)
+                ):
+                    audio_match = await _apple_books_match(
+                        title, author, client, media="audiobook", trace=fetch_trace
+                    )
+                    _record_rate_limits()
+                    if audio_match:
+                        matches.append(audio_match)
 
         if not matches:
             unavailable = any(
-                trace.get("provider") in {"openlibrary", "google_books"}
+                trace.get("provider") in {"openlibrary", "google_books", "apple_books"}
                 and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
                 for trace in fetch_trace
             )
@@ -877,7 +918,9 @@ async def resolve_catalog_match(
                 by_record[record_key] = match
         records = list(by_record.values())
         verified_records = [record for record in records if accepted(record)]
-        identity_record = max(records, key=lambda record: record["quality_score"])
+        identity_record = max(
+            verified_records or records, key=lambda record: record["quality_score"]
+        )
         metadata_records = verified_records or []
         if not metadata_records:
             identity_record = dict(identity_record)
@@ -933,6 +976,8 @@ async def resolve_catalog_match(
         )
 
         result = dict(identity_record)
+        if primary_unavailable and result.get("provider") == "apple_books":
+            result["primary_provider_unavailable"] = True
         result.update({
             "description": description,
             "description_kind": description_record.get("description_kind", "") if description_record else "",
@@ -1069,11 +1114,128 @@ async def _audit_one(
         existing_fields_complete=_candidate_fields_complete(candidate),
         rate_limited_providers=rate_limited_providers,
     )
-    if not match or match.get("provider_lookup_unavailable"):
-        unavailable = bool(match and match.get("provider_lookup_unavailable"))
+    fetch_trace = (
+        match.get("metadata_provenance", {}).get("fetch_trace", [])
+        if isinstance(match, Mapping)
+        and isinstance(match.get("metadata_provenance"), Mapping)
+        else []
+    )
+    provider_failed_transiently = bool(
+        match
+        and (
+            match.get("provider_lookup_unavailable")
+            or any(
+                isinstance(trace, Mapping)
+                and trace.get("status") in _CATALOG_PROVIDER_FAILURE_STATUSES
+                for trace in fetch_trace
+            )
+        )
+    )
+    provider_rate_limited = bool(
+        match
+        and (
+            match.get("provider_rate_limited")
+            or any(
+                isinstance(trace, Mapping) and trace.get("status") == "rate_limited"
+                for trace in fetch_trace
+            )
+        )
+    )
+    accepted = bool(
+        match
+        and not match.get("provider_lookup_unavailable")
+        and match.get("quality_score", 0) >= 0.82
+        and match.get("title_match", 0) >= 0.82
+        and match.get("author_match", 0) >= 0.65
+    )
+    if not accepted and (not match or provider_failed_transiently):
+        unavailable = provider_failed_transiently
         failure_flags = ["catalog_provider_unavailable"]
-        if match and match.get("provider_rate_limited"):
+        if provider_rate_limited:
             failure_flags.append("catalog_provider_rate_limited")
+        existing_status = str(
+            candidate.get("_existing_quality_status")
+            or candidate.get("quality_status")
+            or ""
+        )
+        existing_version = str(
+            candidate.get("_existing_audit_version")
+            or candidate.get("audit_version")
+            or ""
+        )
+        existing_provider = str(
+            candidate.get("_existing_provider")
+            or candidate.get("provider")
+            or ""
+        ).strip()
+        existing_audited_at = str(
+            candidate.get("_existing_audited_at")
+            or candidate.get("audited_at")
+            or ""
+        ).strip()
+        if (
+            unavailable
+            and existing_status == "accepted"
+            and existing_version != "legacy-pending-audit-v1"
+            and (
+                existing_provider
+                or existing_audited_at
+                or existing_version == "builtin-curated-v1"
+            )
+        ):
+            raw_existing_flags = candidate.get("_existing_flags_json")
+            if raw_existing_flags is None:
+                raw_existing_flags = candidate.get("flags_json")
+            if raw_existing_flags is None:
+                raw_existing_flags = candidate.get("flags")
+            existing_flags: list[str] = []
+            if isinstance(raw_existing_flags, str):
+                try:
+                    parsed_flags = json.loads(raw_existing_flags)
+                    if isinstance(parsed_flags, list):
+                        existing_flags = [str(item) for item in parsed_flags if item]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_flags = []
+            elif isinstance(raw_existing_flags, list):
+                existing_flags = [str(item) for item in raw_existing_flags if item]
+            preserved_flags = [
+                item
+                for item in existing_flags
+                if item not in {"catalog_provider_unavailable", "catalog_provider_rate_limited"}
+            ]
+            existing_score = candidate.get("_existing_quality_score")
+            if existing_score is None:
+                existing_score = candidate.get("quality_score")
+            existing_title_match = candidate.get("_existing_title_match")
+            if existing_title_match is None:
+                existing_title_match = candidate.get("title_match")
+            existing_author_match = candidate.get("_existing_author_match")
+            if existing_author_match is None:
+                existing_author_match = candidate.get("author_match")
+            return {
+                "candidate_id": int(candidate["id"]),
+                "quality_status": "accepted",
+                "quality_score": float(existing_score or 0.0),
+                "flags": sorted(set(flags + preserved_flags + failure_flags)),
+                "provider": existing_provider,
+                "provider_id": str(
+                    candidate.get("_existing_provider_id")
+                    or candidate.get("provider_id")
+                    or ""
+                ).strip(),
+                "work_id": str(
+                    candidate.get("_existing_work_id")
+                    or candidate.get("work_id")
+                    or ""
+                ).strip(),
+                "isbn13": source_isbn13
+                or str(candidate.get("_existing_quality_isbn13") or "").strip(),
+                "isbn10": source_isbn10
+                or str(candidate.get("_existing_quality_isbn10") or "").strip(),
+                "title_match": float(existing_title_match or 0.0),
+                "author_match": float(existing_author_match or 0.0),
+                "metadata_provenance": match.get("metadata_provenance", {}),
+            }
         return {
             "candidate_id": int(candidate["id"]),
             "quality_status": "quarantine",
@@ -1082,12 +1244,16 @@ async def _audit_one(
             **({"metadata_provenance": match.get("metadata_provenance", {})} if unavailable else {}),
             **source_identifiers,
         }
-    accepted = match["quality_score"] >= 0.82 and match["title_match"] >= 0.82 and match["author_match"] >= 0.65
+    extra_flags = []
+    if not accepted:
+        extra_flags.append("catalog_match_ambiguous")
+    elif match.get("provider") == "apple_books" and match.get("primary_provider_unavailable"):
+        extra_flags.append("catalog_primary_unavailable")
     return {
         "candidate_id": int(candidate["id"]),
         "quality_status": "accepted" if accepted else "quarantine",
         "quality_score": match["quality_score"],
-        "flags": sorted(set(flags + ([] if accepted else ["catalog_match_ambiguous"]))),
+        "flags": sorted(set(flags + extra_flags)),
         **match,
         "isbn13": source_isbn13 or match.get("isbn13", ""),
         "isbn10": source_isbn10 or match.get("isbn10", ""),
@@ -1129,11 +1295,24 @@ def candidate_quality_audit_eligibility(now: datetime | None = None) -> tuple[st
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND COALESCE(q.audit_version,'')!=? "
         "AND (c.isbn13!='' OR c.isbn10!='' OR q.isbn13!='' OR q.isbn10!='')) "
-        "OR (q.quality_status='quarantine' AND q.audit_version=? "
+        "OR (q.quality_status IN ('accepted','quarantine') AND q.audit_version=? "
         "AND q.flags_json LIKE '%catalog_provider_unavailable%' "
-        "AND datetime(q.audited_at)<=datetime(?)))"
+        "AND datetime(q.audited_at)<=datetime(?)) "
+        "OR (q.quality_status='accepted' AND q.audit_version=? "
+        "AND q.flags_json LIKE '%catalog_primary_unavailable%' "
+        "AND datetime(q.audited_at)<=datetime(?)) "
+        "OR (q.quality_status='accepted' AND q.provider='apple_books' "
+        "AND q.work_id='' AND q.provider_id!='' "
+        "AND (q.audited_at IS NULL OR datetime(q.audited_at)<=datetime(?))))"
     )
-    return predicate, (QUALITY_VERSION, QUALITY_VERSION, retry_before)
+    return predicate, (
+        QUALITY_VERSION,
+        QUALITY_VERSION,
+        retry_before,
+        QUALITY_VERSION,
+        retry_before,
+        retry_before,
+    )
 
 
 def candidate_quality_audit_candidates(
@@ -1153,7 +1332,8 @@ def candidate_quality_audit_candidates(
             "SELECT c.id,c.isbn13,c.isbn10,c.source_url,"
             "COALESCE(NULLIF(c.isbn13,''),q.isbn13) AS eligibility_isbn13,"
             "COALESCE(NULLIF(c.isbn10,''),q.isbn10) AS eligibility_isbn10,"
-            "q.quality_status,q.audit_version,q.flags_json "
+            "q.quality_status,q.audit_version,q.flags_json,"
+            "q.provider,q.provider_id,q.work_id "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "LEFT JOIN sources s ON s.id=c.source_id "
             f"WHERE c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
@@ -1170,12 +1350,30 @@ def candidate_quality_audit_candidates(
             except (TypeError, ValueError, json.JSONDecodeError):
                 flags = []
             expired_provider_outage = bool(
-                status == "quarantine"
+                status in {"quarantine", "accepted"}
                 and candidate.get("audit_version") == QUALITY_VERSION
                 and isinstance(flags, list)
                 and "catalog_provider_unavailable" in flags
             )
-            if status == "pending" or legacy_pending or expired_provider_outage:
+            expired_primary_outage = bool(
+                status == "accepted"
+                and candidate.get("audit_version") == QUALITY_VERSION
+                and isinstance(flags, list)
+                and "catalog_primary_unavailable" in flags
+            )
+            legacy_apple_without_work_id = bool(
+                status == "accepted"
+                and candidate.get("provider") == "apple_books"
+                and not str(candidate.get("work_id") or "").strip()
+                and bool(str(candidate.get("provider_id") or "").strip())
+            )
+            if (
+                status == "pending"
+                or legacy_pending
+                or expired_provider_outage
+                or expired_primary_outage
+                or legacy_apple_without_work_id
+            ):
                 selected_ids.append(int(candidate["id"]))
             elif any(
                 isbn_parts_from_source(
@@ -1193,13 +1391,30 @@ def candidate_quality_audit_candidates(
         return []
     placeholders = ",".join("?" for _ in selected_ids)
     return rows(
-        "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
-        "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
-        "LEFT JOIN sources s ON s.id=c.source_id "
-        "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-        f"WHERE c.id IN ({placeholders}) ORDER BY c.id",
+        f"{_AUDIT_CANDIDATE_SELECT} WHERE c.id IN ({placeholders}) ORDER BY c.id",
         tuple(selected_ids),
     )
+
+
+_AUDIT_CANDIDATE_SELECT = (
+    "SELECT c.*,s.url AS source_root,"
+    "q.quality_status AS _existing_quality_status,"
+    "q.quality_score AS _existing_quality_score,"
+    "q.flags_json AS _existing_flags_json,"
+    "q.provider AS _existing_provider,"
+    "q.provider_id AS _existing_provider_id,"
+    "q.work_id AS _existing_work_id,"
+    "q.isbn13 AS _existing_quality_isbn13,"
+    "q.isbn10 AS _existing_quality_isbn10,"
+    "q.title_match AS _existing_title_match,"
+    "q.author_match AS _existing_author_match,"
+    "q.audit_version AS _existing_audit_version,"
+    "q.audited_at AS _existing_audited_at,"
+    "q.metadata_provider AS _metadata_provider,"
+    "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
+    "LEFT JOIN sources s ON s.id=c.source_id "
+    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
+)
 
 
 def has_candidate_quality_audit_candidates(*, now: datetime | None = None) -> bool:
@@ -1422,6 +1637,7 @@ def _dedupe_and_hide(con) -> int:
     active = con.execute(
         """SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,
         q.work_id AS quality_work_id,q.provider AS quality_provider,
+        q.provider_id AS quality_provider_id,
         q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
         FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
@@ -1442,6 +1658,7 @@ def _dedupe_and_hide(con) -> int:
         con.execute(
             """SELECT c.title,c.author,c.isbn13,c.isbn10,
             q.work_id AS quality_work_id,q.provider AS quality_provider,
+            q.provider_id AS quality_provider_id,
             q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
             FROM candidates c
             LEFT JOIN candidate_quality q ON q.candidate_id=c.id
@@ -1458,8 +1675,8 @@ def _dedupe_and_hide(con) -> int:
     accepted = con.execute(
         """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
         c.isbn13,c.isbn10,q.quality_score,q.work_id AS quality_work_id,
-        q.provider AS quality_provider,q.isbn13 AS quality_isbn13,
-        q.isbn10 AS quality_isbn10
+        q.provider AS quality_provider,q.provider_id AS quality_provider_id,
+        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
         FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'"""
     ).fetchall()
@@ -1493,13 +1710,7 @@ async def audit_candidates(*, only_pending: bool = False, limit: int | None = No
             limit=limit if limit is not None else QUALITY_AUDIT_BATCH_SIZE
         )
     else:
-        query = (
-            "SELECT c.*,s.url AS source_root,q.metadata_provider AS _metadata_provider,"
-            "q.metadata_provider_id AS _metadata_provider_id FROM candidates c "
-            "LEFT JOIN sources s ON s.id=c.source_id "
-            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            "WHERE c.status!='rejected' ORDER BY c.id"
-        )
+        query = f"{_AUDIT_CANDIDATE_SELECT} WHERE c.status!='rejected' ORDER BY c.id"
         params: tuple[object, ...] = ()
         if limit is not None:
             query += " LIMIT ?"

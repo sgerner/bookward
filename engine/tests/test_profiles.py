@@ -18,10 +18,19 @@ from fastapi.testclient import TestClient
 from afterword_engine import backups, database, profiles
 from afterword_engine.api_tokens import generate_api_token, legacy_hash_api_token
 from afterword_engine.config import settings
-from afterword_engine.database import MIGRATIONS, connect, database_lock, initialize, transaction
+from afterword_engine.database import (
+    MIGRATIONS,
+    RestoreEpochError,
+    bind_restore_epoch,
+    connect,
+    current_restore_epoch,
+    database_lock,
+    initialize,
+    transaction,
+)
 import afterword_engine.jobs as jobs
 from afterword_engine.jobs import enqueue_job, worker_loop
-from afterword_engine.main import app
+from afterword_engine.main import app, queue_goodreads_rss_if_due
 from afterword_engine.secrets import installation_key, installation_key_path, seal, unseal
 from afterword_engine.tenancy import current_profile_id, profile_database_path, profile_scope
 
@@ -951,6 +960,476 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
             executor.shutdown(wait=True)
         assert lock_acquired.wait(timeout=2)
         restore.result(timeout=2)
+
+
+def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_restore(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        snapshot = backups.create_backup()
+        first_job_id = enqueue_job("disappearing_lease")
+
+    init_calls: list[str] = []
+    original_initialize = database.initialize
+
+    def spy_initialize(*, seed_demo=True):
+        init_calls.append(current_profile_id() or "legacy")
+        return original_initialize(seed_demo=seed_demo)
+
+    monkeypatch.setattr(database, "initialize", spy_initialize)
+
+    stop = asyncio.Event()
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    never_complete = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def handler(kind):
+        if kind == "disappearing_lease":
+            first_started.set()
+            try:
+                await never_complete.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+        if kind == "after_restore":
+            second_done.set()
+            stop.set()
+            return {"after_restore": True}
+        return {}
+
+    async def run():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            assert init_calls == ["legacy"]
+            with profile_scope("legacy"), transaction() as con:
+                con.execute("DELETE FROM jobs WHERE id=?", (first_job_id,))
+            await asyncio.wait_for(first_cancelled.wait(), timeout=2)
+
+            with profile_scope("legacy"):
+                await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+                second_job_id = enqueue_job("after_restore")
+
+            await asyncio.wait_for(second_done.wait(), timeout=2)
+            await asyncio.wait_for(worker, timeout=2)
+            return second_job_id
+        finally:
+            stop.set()
+            never_complete.set()
+
+    second_job_id = asyncio.run(run())
+
+    with profile_scope("legacy"), connect() as con:
+        second_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (second_job_id,)
+        ).fetchone()
+    assert first_cancelled.is_set()
+    assert init_calls.count("legacy") >= 2
+    assert second_job["status"] == "complete"
+    assert second_job["result"] == '{"after_restore": true}'
+
+
+def test_heartbeat_defers_lease_renewal_while_profile_database_lock_is_held(
+    identity_store, monkeypatch, caplog
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("deferred_heartbeat")
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2026-01-01T00:00:00+00:00',"
+                "heartbeat_at='2026-01-01T00:00:00+00:00',lease_token='lease-1',attempts=1 "
+                "WHERE id=?",
+                (job_id,),
+            )
+        legacy_path = profile_database_path()
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(legacy_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_exclusive_lock)
+    assert lock_held.wait(timeout=2)
+
+    stop = Event()
+    lost_lease = Event()
+    caplog.set_level("INFO", logger=jobs.LOGGER.name)
+    hb_thread = Thread(
+        target=jobs._heartbeat,
+        args=("legacy", job_id, "lease-1", stop, lost_lease.set, 0),
+        daemon=True,
+    )
+    try:
+        hb_thread.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if any(
+                "Deferred lease renewal for job" in record.getMessage()
+                for record in caplog.records
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            "Deferred lease renewal for job" in record.getMessage()
+            for record in caplog.records
+        )
+        assert not lost_lease.is_set()
+
+        # Once the exclusive lock releases, heartbeat renews heartbeat_at cleanly.
+        release_lock.set()
+        future.result(timeout=2)
+        deadline = time.monotonic() + 1.0
+        renewed = None
+        while time.monotonic() < deadline:
+            with profile_scope("legacy"), connect() as con:
+                renewed = con.execute(
+                    "SELECT heartbeat_at FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()[0]
+            if renewed and renewed != "2026-01-01T00:00:00+00:00":
+                break
+            time.sleep(0.01)
+        assert renewed is not None and renewed != "2026-01-01T00:00:00+00:00"
+        assert not lost_lease.is_set()
+    finally:
+        stop.set()
+        release_lock.set()
+        hb_thread.join(timeout=2)
+        holder.shutdown(wait=True)
+
+
+def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants(
+    identity_store,
+):
+    from datetime import datetime, timezone
+
+    alice = profiles.create_account("tenant-alice", "tenant-alice-password-long")
+    bob = profiles.create_account("tenant-bob", "tenant-bob-password-long")
+    sync_time = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+
+    for account, rss_url in (
+        (alice, "https://www.goodreads.com/review/list_rss/alice"),
+        (bob, "https://www.goodreads.com/review/list_rss/bob"),
+    ):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            with transaction() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,0)",
+                    (rss_url,),
+                )
+
+    with profile_scope(alice["profile_id"]):
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice snapshot read','Alice','test')"
+            )
+            con.execute(
+                "INSERT INTO jobs(id,kind,status) VALUES('alice-snapshot-queued','alice_snapshot','queued')"
+            )
+        alice_backup = backups.create_backup()
+        with transaction() as con:
+            con.execute("DELETE FROM jobs WHERE id='alice-snapshot-queued'")
+        alice_live_job = enqueue_job("alice_active")
+
+    with profile_scope(bob["profile_id"]):
+        bob_live_job = enqueue_job("bob_active")
+
+    alice_started = asyncio.Event()
+    alice_cancelled = asyncio.Event()
+    alice_snapshot_done = asyncio.Event()
+    alice_hold = asyncio.Event()
+    bob_started = asyncio.Event()
+    bob_release = asyncio.Event()
+    alice_stop = asyncio.Event()
+    bob_stop = asyncio.Event()
+
+    async def alice_handler(kind):
+        if current_profile_id() != alice["profile_id"]:
+            await asyncio.sleep(0.05)
+            return {}
+        if kind == "alice_snapshot":
+            alice_snapshot_done.set()
+            return {"restored_pending": True}
+        assert kind == "alice_active"
+        alice_started.set()
+        try:
+            await alice_hold.wait()
+        except asyncio.CancelledError:
+            alice_cancelled.set()
+            raise
+        return {"owner": "alice"}
+
+    async def bob_handler(kind):
+        assert current_profile_id() == bob["profile_id"]
+        assert kind == "bob_active"
+        bob_started.set()
+        await bob_release.wait()
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Bob concurrent read','Bob','test')"
+            )
+        bob_stop.set()
+        return {"owner": "bob"}
+
+    async def run():
+        # Run dedicated profile-filtered workers concurrently so Alice's active job
+        # and Bob's active job are both in flight when Alice restores.
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        try:
+            alice_worker = asyncio.create_task(worker_loop(alice_handler, alice_stop))
+            await asyncio.wait_for(alice_started.wait(), timeout=2)
+
+            profiles.profile_ids = lambda: [bob["profile_id"]]
+            bob_worker = asyncio.create_task(worker_loop(bob_handler, bob_stop))
+            await asyncio.wait_for(bob_started.wait(), timeout=2)
+            profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+
+            # While Alice's quiescence barrier is active, Alice's scheduler pauses
+            # while Bob's scheduler still queues work normally.
+            with profile_scope(alice["profile_id"]):
+                alice_lock = database_lock()
+            with alice_lock.quiesce():
+                await asyncio.wait_for(alice_cancelled.wait(), timeout=2)
+                with profile_scope(alice["profile_id"]):
+                    assert queue_goodreads_rss_if_due(sync_time) is None
+                with profile_scope(bob["profile_id"]):
+                    bob_scheduled = queue_goodreads_rss_if_due(sync_time)
+                    assert bob_scheduled is not None
+
+            # Capture a pre-restore epoch fence for Alice before swapping Alice's DB.
+            with profile_scope(alice["profile_id"]):
+                pre_restore_epoch = current_restore_epoch()
+                assert pre_restore_epoch == 0
+                await asyncio.to_thread(backups.restore_backup, alice_backup["id"])
+                with bind_restore_epoch(pre_restore_epoch):
+                    with pytest.raises(RestoreEpochError):
+                        with transaction() as con:
+                            con.execute(
+                                "INSERT INTO reads(title,author,source) VALUES('Late Alice write','Alice','test')"
+                            )
+
+            # Bob's active job was never canceled or fenced by Alice's restore,
+            # and Alice's pending queued job from the snapshot executes cleanly.
+            await asyncio.wait_for(alice_snapshot_done.wait(), timeout=2)
+            bob_release.set()
+            await asyncio.wait_for(bob_worker, timeout=2)
+            alice_stop.set()
+            await asyncio.wait_for(alice_worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            alice_stop.set()
+            bob_stop.set()
+            alice_hold.set()
+            bob_release.set()
+
+    asyncio.run(run())
+
+    with profile_scope(alice["profile_id"]), connect() as con:
+        alice_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        alice_jobs = con.execute(
+            "SELECT id,status FROM jobs WHERE status IN ('queued','running')"
+        ).fetchall()
+        restored_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id='alice-snapshot-queued'"
+        ).fetchone()
+        alice_epoch = current_restore_epoch()
+    assert alice_reads == {"Alice snapshot read"}
+    assert alice_jobs == []
+    assert restored_job["status"] == "complete"
+    assert restored_job["result"] == '{"restored_pending": true}'
+    assert alice_epoch == 1
+    assert alice_live_job is not None
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        bob_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (bob_live_job,)
+        ).fetchone()
+        bob_epoch = current_restore_epoch()
+    assert "Bob concurrent read" in bob_reads
+    assert bob_job["status"] == "complete"
+    assert bob_job["result"] == '{"owner": "bob"}'
+    assert bob_epoch == 0
+
+
+def test_worker_loop_does_not_block_event_loop_when_profile_lock_is_held(identity_store):
+    alice = profiles.create_account("locked-alice", "locked-alice-password-with-length")
+    bob = profiles.create_account("unlocked-bob", "unlocked-bob-password-with-length")
+    for account in (alice, bob):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+
+    with profile_scope(alice["profile_id"]):
+        enqueue_job("alice_blocked")
+        alice_path = profile_database_path()
+    with profile_scope(bob["profile_id"]):
+        bob_job_id = enqueue_job("bob_unblocked")
+
+    writer_held = Event()
+    release_writer = Event()
+
+    def hold_alice_writer():
+        with database_lock(alice_path):
+            writer_held.set()
+            release_writer.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_alice_writer)
+    assert writer_held.wait(timeout=2)
+
+    bob_done = asyncio.Event()
+    stop = asyncio.Event()
+    max_tick_gap = 0.0
+
+    async def monitor_loop():
+        nonlocal max_tick_gap
+        last = time.monotonic()
+        while not stop.is_set():
+            await asyncio.sleep(0.02)
+            now_mono = time.monotonic()
+            max_tick_gap = max(max_tick_gap, now_mono - last)
+            last = now_mono
+
+    async def handler(kind):
+        if kind == "bob_unblocked":
+            bob_done.set()
+            return {"bob": True}
+        stop.set()
+        return {"alice": True}
+
+    async def run():
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        monitor = asyncio.create_task(monitor_loop())
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Event loop remained responsive while Alice's exclusive writer lock was held.
+            assert max_tick_gap < 0.25
+            release_writer.set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            release_writer.set()
+            stop.set()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release_writer.set()
+        future.result(timeout=2)
+        holder.shutdown(wait=True)
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        assert (
+            con.execute("SELECT status FROM jobs WHERE id=?", (bob_job_id,)).fetchone()[0]
+            == "complete"
+        )
+
+
+def test_lifespan_legacy_recovery_failure_is_guarded_and_old_schema_safety_snapshot_recovers(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "legacy-startup.db"
+    monkeypatch.setattr(settings, "db", str(database_path))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin(
+        "startup-admin", "startup-admin-password-with-length"
+    )
+    alice = profiles.create_account(
+        "startup-alice", "startup-alice-password-with-length"
+    )
+    alice_session, _ = profiles.create_session(alice["id"])
+    admin_session, _ = profiles.create_session(admin["id"])
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Legacy safety read','Author','manual')"
+            )
+        legacy_safety = backups.create_backup()
+        broken_journal = backups._restore_journal_path()
+        broken_journal.write_text('{"safety_backup":"bookward-20260101T000000Z-missing0","selected_backup":"bookward-20260101T000000Z-missing0"}')
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice healthy read','Alice','manual')"
+            )
+
+    # 1. Broken legacy restore journal logs an error during lifespan startup without
+    #    crashing /api/health or healthy secondary tenant profiles.
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        alice_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": alice_session}
+        )
+        assert alice_overview.status_code == 200
+        assert {item["title"] for item in alice_overview.json()["history"]} == {
+            "Alice healthy read"
+        }
+
+    # 2. Old-schema safety snapshot (missing newer tables and missing jobs / settings.updated_at)
+    #    recovers cleanly during lifespan startup and migrates to the latest schema.
+    with profile_scope("legacy"):
+        safety_file = backups.backup_directory() / f"{legacy_safety['id']}.sqlite3"
+        with sqlite3.connect(safety_file) as con:
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+            con.execute("DROP TABLE IF EXISTS goodreads_shelf_items")
+            con.execute("DROP INDEX IF EXISTS idx_jobs_status_heartbeat")
+            con.execute("DROP TABLE IF EXISTS jobs")
+            existing_settings = con.execute(
+                "SELECT key,value,secret FROM settings"
+            ).fetchall()
+            con.execute("DROP TABLE settings")
+            con.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0)"
+            )
+            con.executemany(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?)",
+                existing_settings,
+            )
+            con.execute("DELETE FROM schema_migrations WHERE version >= 21")
+            con.commit()
+        backups._write_restore_journal(safety_file, safety_file)
+
+    with TestClient(app) as client:
+        legacy_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": admin_session}
+        )
+        assert legacy_overview.status_code == 200
+        assert "Legacy safety read" in {
+            item["title"] for item in legacy_overview.json()["history"]
+        }
+
+    with profile_scope("legacy"), connect() as con:
+        assert not backups._restore_journal_path().exists()
+        assert (
+            con.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            == MIGRATIONS[-1][0]
+        )
+        assert current_restore_epoch() >= 1
 
 
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):

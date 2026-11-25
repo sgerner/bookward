@@ -107,10 +107,29 @@ class OpenAICompatibleEmbedder(Embedder):
             )
             return _ordered_openai_embeddings(payload, len(texts))
 
+EMBEDDING_DEFAULT_MODELS = {
+    "local": "hashing-768",
+    "fastembed": "BAAI/bge-small-en-v1.5",
+    "sentence-transformers": "sentence-transformers/all-MiniLM-L6-v2",
+    "ollama": "qwen3-embedding:0.6b",
+}
+
+
+def resolve_embedding_target(backend=None, model=None) -> tuple[str, str]:
+    resolved_backend = str(backend or settings.embedding_backend).strip() or "local"
+    raw_model = str(model or "").strip()
+    if resolved_backend == "local":
+        return "local", "hashing-768"
+    resolved_model = (
+        EMBEDDING_DEFAULT_MODELS.get(resolved_backend, "")
+        if not raw_model or raw_model == "hashing-768"
+        else raw_model
+    )
+    return resolved_backend, resolved_model
+
+
 def get_embedder(backend=None, model=None, url=None, api_key=None):
-    backend = backend or settings.embedding_backend
-    defaults = {"local":"hashing-768","fastembed":"BAAI/bge-small-en-v1.5","sentence-transformers":"sentence-transformers/all-MiniLM-L6-v2","ollama":"qwen3-embedding:0.6b"}
-    model = defaults.get(backend, "") if not model or model == "hashing-768" and backend != "local" else model
+    backend, model = resolve_embedding_target(backend, model)
     if backend == "local": return LocalHashingEmbedder()
     if backend == "fastembed": return FastEmbedder(model or "BAAI/bge-small-en-v1.5")
     if backend == "sentence-transformers": return SentenceTransformerEmbedder(model or "sentence-transformers/all-MiniLM-L6-v2")
