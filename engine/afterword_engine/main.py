@@ -28,12 +28,15 @@ from .backups import (
     backup_scheduler_loop,
     backup_status,
     clear_interrupted_restore_journal,
+    compact_database,
     create_backup,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
 )
+from .decision_evidence import set_evidence_rotation_enabled
+from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
@@ -1216,6 +1219,40 @@ def make_backup():
     return {"backup": created, "status": backup_status()}
 
 
+class StorageRetentionIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/backups/compact")
+def compact_database_storage():
+    try:
+        return compact_database()
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/backups/retention")
+def update_storage_retention(payload: StorageRetentionIn):
+    set_storage_retention_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "retention_enabled": bool(status.get("retention_enabled", payload.enabled)),
+        "status": status,
+    }
+
+
+@app.post("/api/backups/evidence-rotation")
+def update_evidence_rotation(payload: StorageRetentionIn):
+    set_evidence_rotation_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "evidence_rotation_enabled": bool(
+            status.get("evidence_rotation_enabled", payload.enabled)
+        ),
+        "status": status,
+    }
+
+
 @app.post("/api/backups/{backup_id}/restore")
 def restore_database_backup(backup_id: str):
     try:
@@ -1634,7 +1671,7 @@ def _exploration_rng(scope: str, exploration_seed: str) -> random.Random:
     return random.Random(int.from_bytes(digest, "big"))
 
 
-def tracked_recommendations_page(
+def tracked_recommendations(
     *,
     status: str | None = None,
     limit: int | None = 100,
@@ -1650,7 +1687,13 @@ def tracked_recommendations_page(
     track_impressions: bool = True,
     session_id: str = "",
     seed_run_id: str | None = None,
-) -> tuple[list[dict[str, Any]], str, bool]:
+    _return_has_more: bool = False,
+):
+    def _result(items: list[dict[str, Any]], active_run_id: str, more: bool):
+        if _return_has_more:
+            return items, active_run_id, more
+        return items, active_run_id
+
     if isinstance(status, str):
         status = status.strip()
     effective_session_id = session_id or (current_session_id() or "")
@@ -1673,9 +1716,9 @@ def tracked_recommendations_page(
             format_urls=False,
         )
         if limit is None:
-            return _format_recommendation_urls(batch), "", False
+            return _result(_format_recommendation_urls(batch), "", False)
         cap = max(0, int(limit))
-        return _format_recommendation_urls(batch[:cap]), "", len(batch) > cap
+        return _result(_format_recommendation_urls(batch[:cap]), "", len(batch) > cap)
 
     ranking_at = datetime.now(timezone.utc)
     planned_run_id = str(uuid.uuid4())
@@ -1917,7 +1960,7 @@ def tracked_recommendations_page(
         )
 
     if not discovery_slice or not track_impressions:
-        return recommendations, "", has_more
+        return _result(recommendations, "", has_more)
 
     if is_filtered:
         decision_evidence = {
@@ -1967,10 +2010,10 @@ def tracked_recommendations_page(
         ranking_metadata=learning_metadata,
         discovery_slate_metadata=discovery_metadata,
     )
-    return recommendations, run_id, has_more
+    return _result(recommendations, run_id, has_more)
 
 
-def tracked_recommendations(
+def tracked_recommendations_page(
     *,
     status: str | None = None,
     limit: int | None = 100,
@@ -1986,8 +2029,8 @@ def tracked_recommendations(
     track_impressions: bool = True,
     session_id: str = "",
     seed_run_id: str | None = None,
-):
-    recommendations, run_id, _has_more = tracked_recommendations_page(
+) -> tuple[list[dict[str, Any]], str, bool]:
+    recommendations, run_id, has_more = tracked_recommendations(
         status=status,
         limit=limit,
         offset=offset,
@@ -2002,8 +2045,9 @@ def tracked_recommendations(
         track_impressions=track_impressions,
         session_id=session_id,
         seed_run_id=seed_run_id,
+        _return_has_more=True,
     )
-    return recommendations, run_id
+    return recommendations, run_id, has_more
 
 
 def overview_payload(
@@ -2198,6 +2242,7 @@ async def reading_history_scores(
                 embedder,
                 "read_candidate",
                 virtual_candidates,
+                persist=False,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
@@ -2243,6 +2288,7 @@ def _recommendation_identity_context(connection=None):
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlist_rows = fetch(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
@@ -2309,7 +2355,8 @@ def _recommendation_rows(
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
-        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
         f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -3670,7 +3717,8 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                 for item in connection.execute(
                     "SELECT c.*,s.name source_name,q.metadata_confidence,"
                     "q.work_id quality_work_id,"
-                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+                    "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
                     "LEFT JOIN sources s ON s.id=c.source_id "

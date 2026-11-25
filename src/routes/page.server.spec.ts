@@ -1909,6 +1909,156 @@ describe("page actions", () => {
     );
   });
 
+  it("exposes database storage and evidence quota metrics and compacts storage online", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const backupStatus = {
+      enabled: true,
+      interval_hours: 24,
+      retention_count: 7,
+      last_success_at: "2026-11-21T00:00:00+00:00",
+      last_error: null,
+      next_backup_at: "2026-11-22T00:00:00+00:00",
+      backups: [],
+      live_size_bytes: 12 * 1024 * 1024,
+      reclaimable_bytes: 2 * 1024 * 1024,
+      auto_vacuum_mode: "incremental",
+      evidence_used_bytes: 64 * 1024 * 1024,
+      evidence_quota_bytes: 512 * 1024 * 1024,
+      evidence_status: "healthy",
+    };
+    let compactCalls = 0;
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (String(input).includes("/api/backups/compact")) {
+        compactCalls += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              compactCalls === 1
+                ? {
+                    reclaimed_bytes: 2 * 1024 * 1024,
+                    after_bytes: 10 * 1024 * 1024,
+                  }
+                : {
+                    reclaimed_bytes: 0,
+                    after_bytes: 10 * 1024 * 1024,
+                  },
+            ),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups/evidence-rotation")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ evidence_rotation_enabled: true, status: backupStatus }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups/retention")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ retention_enabled: false, status: backupStatus }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(backupStatus), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      backupStatus: typeof backupStatus & {
+        retention_enabled?: boolean;
+        evidence_rotation_enabled?: boolean;
+      };
+    };
+    expect(loaded.backupStatus.retention_enabled).toBe(false);
+    expect(loaded.backupStatus.evidence_rotation_enabled).toBe(false);
+    expect(loaded.backupStatus.live_size_bytes).toBe(12 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_used_bytes).toBe(64 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_status).toBe("healthy");
+
+    const compactResult = await actions.compactStorage!({} as never);
+    expect(compactResult).toEqual({
+      message: "Storage compacted; reclaimed 2.0 MB. Live database: 10.0 MB.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/compact",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    const alreadyCompact = await actions.compactStorage!({} as never);
+    expect(alreadyCompact).toEqual({
+      message: "Database already compact. Live database: 10.0 MB.",
+    });
+
+    const pauseForm = new FormData();
+    pauseForm.set("enabled", "0");
+    const paused = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: pauseForm }),
+    } as never);
+    expect(paused).toEqual({ message: "Automatic storage retention paused." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/retention",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: false }),
+      }),
+    );
+
+    const resumeForm = new FormData();
+    resumeForm.set("enabled", "1");
+    const resumed = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: resumeForm }),
+    } as never);
+    expect(resumed).toEqual({ message: "Automatic storage retention enabled." });
+
+    const rotationForm = new FormData();
+    rotationForm.set("enabled", "1");
+    const rotationEnabled = await actions.setEvidenceRotation!({
+      request: new Request("http://afterword.test", { method: "POST", body: rotationForm }),
+    } as never);
+    expect(rotationEnabled).toEqual({ message: "Replay evidence rotation enabled." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/evidence-rotation",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: true }),
+      }),
+    );
+  });
+
   it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {
