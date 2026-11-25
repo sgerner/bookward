@@ -1438,6 +1438,416 @@ describe("page actions", () => {
     });
   });
 
+  it("renames a custom source without running preview when its URL is unchanged", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify([
+            {
+              id: 14,
+              name: "goodreads.com",
+              url: "https://books.example/feed.xml",
+              enabled: 1,
+              kind: "web",
+              is_default: 0,
+              is_custom: true,
+              lifecycle: "permanent",
+              filters: { include_genres: ["Sci-Fi"], exclude_genres: [] },
+              last_status: "ok:4",
+              last_scanned_at: "2026-10-01T00:00:00Z",
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 14,
+            name: "Sci-Fi Shelf",
+            url: "https://books.example/feed.xml",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "14");
+    body.set("label", "Sci-Fi Shelf");
+    body.set("url", "https://books.example/feed.xml");
+    const result = await actions.editSource!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({ message: "Source updated." });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/api/sources");
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:8000/api/sources/14");
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({
+      name: "Sci-Fi Shelf",
+    });
+  });
+
+  it("previews a changed custom source URL before saving it", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify([
+            {
+              id: 14,
+              name: "goodreads.com",
+              url: "https://books.example/old.xml",
+              enabled: 1,
+              kind: "web",
+              is_default: 0,
+              is_custom: true,
+              lifecycle: "permanent",
+              filters: { include_genres: ["Fantasy"], exclude_genres: ["Horror"] },
+              last_status: "error:404",
+              last_scanned_at: null,
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 3 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 14,
+            name: "Moved Fantasy Feed",
+            url: "https://books.example/new.xml",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "14");
+    body.set("label", "Moved Fantasy Feed");
+    body.set("url", "https://books.example/new.xml");
+    const result = await actions.editSource!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message:
+        "Source updated; a fresh scan is queued (3 books detected). Earlier books stay attributed to this source.",
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/preview",
+    );
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({
+      url: "https://books.example/new.xml",
+      filters: { include_genres: ["Fantasy"], exclude_genres: ["Horror"] },
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe("http://127.0.0.1:8000/api/sources/14");
+    expect(JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body))).toEqual({
+      name: "Moved Fantasy Feed",
+      url: "https://books.example/new.xml",
+    });
+  });
+
+  it("forwards canonical preview.url when editing a custom source to a homepage and rejects canonical collisions", async () => {
+    const sourcesPayload = [
+      {
+        id: 14,
+        name: "Old Feed",
+        url: "https://books.example/old.xml",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: "ok:2",
+        last_scanned_at: "2026-03-01T00:00:00Z",
+      },
+      {
+        id: 15,
+        name: "Existing Atom Feed",
+        url: "https://feeds.existing.example/books.atom",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: "ok:5",
+        last_scanned_at: "2026-03-01T00:00:00Z",
+      },
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 4,
+            url: "https://feeds.bookdispatches.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 14,
+            name: "Book Dispatches",
+            url: "https://feeds.bookdispatches.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            count: 5,
+            url: "https://feeds.existing.example/books.atom",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "14");
+    body.set("label", "Book Dispatches");
+    body.set("url", "https://www.bookdispatches.example");
+    const updated = await actions.editSource!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(updated).toEqual({
+      message:
+        "Source updated; a fresh scan is queued (4 books detected). Earlier books stay attributed to this source.",
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe("http://127.0.0.1:8000/api/sources/14");
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body)),
+    ).toEqual({
+      name: "Book Dispatches",
+      url: "https://feeds.bookdispatches.example/books.atom",
+    });
+
+    const conflictBody = new FormData();
+    conflictBody.set("id", "14");
+    conflictBody.set("label", "Duplicate Homepage");
+    conflictBody.set("url", "https://www.existing.example");
+    const conflict = await actions.editSource!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: conflictBody,
+      }),
+    } as never);
+    expect(conflict).toMatchObject({
+      status: 409,
+      data: {
+        error: true,
+        message: "A source with that URL already exists.",
+        editSource: {
+          id: 14,
+          label: "Duplicate Homepage",
+          url: "https://www.existing.example",
+        },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("preserves user input when custom source validation, conflict, or preview fails", async () => {
+    const invalidBody = new FormData();
+    invalidBody.set("id", "14");
+    invalidBody.set("label", "A");
+    invalidBody.set("url", "not-a-url");
+    const invalidResult = await actions.editSource!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: invalidBody,
+      }),
+    } as never);
+    expect(invalidResult).toMatchObject({
+      status: 400,
+      data: {
+        error: true,
+        message: "Add a valid name and public URL.",
+        editSource: { id: 14, label: "A", url: "not-a-url" },
+      },
+    });
+
+    const sourcesPayload = [
+      {
+        id: 14,
+        name: "Feed A",
+        url: "https://books.example/a.xml",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: null,
+        last_scanned_at: null,
+      },
+      {
+        id: 15,
+        name: "Feed B",
+        url: "https://books.example/b.xml",
+        enabled: 1,
+        kind: "web",
+        is_default: 0,
+        is_custom: true,
+        lifecycle: "permanent",
+        filters: { include_genres: [], exclude_genres: [] },
+        last_status: null,
+        last_scanned_at: null,
+      },
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(sourcesPayload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ count: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const duplicateBody = new FormData();
+    duplicateBody.set("id", "14");
+    duplicateBody.set("label", "Feed A Renamed");
+    duplicateBody.set("url", "https://books.example/b.xml");
+    const duplicateResult = await actions.editSource!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: duplicateBody,
+      }),
+    } as never);
+    expect(duplicateResult).toMatchObject({
+      status: 409,
+      data: {
+        error: true,
+        message: "A source with that URL already exists.",
+        editSource: {
+          id: 14,
+          label: "Feed A Renamed",
+          url: "https://books.example/b.xml",
+        },
+      },
+    });
+
+    const emptyPreviewBody = new FormData();
+    emptyPreviewBody.set("id", "14");
+    emptyPreviewBody.set("label", "Feed A Empty");
+    emptyPreviewBody.set("url", "https://books.example/empty.xml");
+    const emptyPreviewResult = await actions.editSource!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: emptyPreviewBody,
+      }),
+    } as never);
+    expect(emptyPreviewResult).toMatchObject({
+      status: 400,
+      data: {
+        error: true,
+        message: "No recognizable books were found at that URL.",
+        editSource: {
+          id: 14,
+          label: "Feed A Empty",
+          url: "https://books.example/empty.xml",
+        },
+      },
+    });
+  });
+
+  it("switches source lifecycle in both directions and queues single-source refreshes", async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ id: 14, job_id: "job-source-14" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const toOneTime = new FormData();
+    toOneTime.set("id", "14");
+    toOneTime.set("lifecycle", "one_time");
+    await expect(
+      actions.switchSourceLifecycle!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: toOneTime,
+        }),
+      } as never),
+    ).resolves.toEqual({ message: "Source changed to a one-time import." });
+
+    const toPermanent = new FormData();
+    toPermanent.set("id", "14");
+    toPermanent.set("lifecycle", "permanent");
+    await expect(
+      actions.switchSourceLifecycle!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: toPermanent,
+        }),
+      } as never),
+    ).resolves.toEqual({ message: "Source restored to a permanent feed." });
+
+    const refresh = new FormData();
+    refresh.set("id", "14");
+    await expect(
+      actions.refreshSource!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: refresh,
+        }),
+      } as never),
+    ).resolves.toEqual({ message: "Source refresh queued." });
+
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      lifecycle: "one_time",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({
+      lifecycle: "permanent",
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "http://127.0.0.1:8000/api/sources/14/refresh",
+    );
+  });
+
   it("hydrates full Digest Review picks beyond the initial 24 Discover page and exposes full-pool genres", async () => {
     const overview = {
       recommendation_run_id: "run-9999",

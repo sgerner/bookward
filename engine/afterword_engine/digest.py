@@ -25,6 +25,7 @@ import httpx
 
 from .config import settings
 from .database import RestoreEpochError, fenced_async, row, rows, transaction
+from .http_bounds import stream_bytes_async
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
 from .ingestion import read_identity_rows_with_current_verified_work_ids
 from .security import BLOCKED_HOSTS, safe_error_message, validate_public_url
@@ -475,13 +476,19 @@ async def _send_discord(config: dict, payload: dict) -> str:
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             # Enforce this at delivery too, including retries of old payloads.
-            response = await client.post(webhook_url, json={
-                **payload, "allowed_mentions": {"parse": []},
-            })
-            response.raise_for_status()
+            await stream_bytes_async(
+                client,
+                "POST",
+                webhook_url,
+                json={
+                    **payload, "allowed_mentions": {"parse": []},
+                },
+                max_bytes=settings.discord_max_bytes,
+                size_error="Discord webhook response is too large",
+            )
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(f"Discord webhook returned HTTP {exc.response.status_code}") from exc
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         raise RuntimeError("Discord webhook request failed") from exc
     return "discord webhook"
 
