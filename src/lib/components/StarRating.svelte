@@ -146,7 +146,7 @@
 			type="button"
 			{disabled}
 			data-rating-clear={groupKey}
-			class={`star-rating-clear btn btn-sm ml-1 preset-tonal-surface ${
+			class={`star-rating-clear btn btn-sm btn-reflow ml-1 preset-tonal-surface ${
 				resolvedSize === 'sm' ? 'min-h-9 text-xs' : 'min-h-10'
 			}`}
 			onclick={(event) => clearFromButton(event.currentTarget)}

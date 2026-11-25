@@ -1913,6 +1913,278 @@ def test_internal_settings_and_sources_endpoints_enforce_auth_and_mask_secrets(
     assert sources_res.json() == overview_res.json()["sources"]
 
 
+def test_read_attribution_matches_subtitles_coauthors_isbns_and_verified_work_ids(database):
+    from afterword_engine.identity import read_metadata_identity_hash
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
+        cand_subtitle = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Piranesi','Susanna Clarke',95,'recommended',?,'piranesi-base')",
+            (source_id,),
+        ).lastrowid
+        cand_coauthor = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Good Omens','Terry Pratchett & Neil Gaiman',94,'recommended',?,'good-omens-co')",
+            (source_id,),
+        ).lastrowid
+        cand_isbn = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
+            "VALUES('Hospitality Edition','Catalog Author',93,'recommended',?,'9780593418574','hosp-isbn')",
+            (source_id,),
+        ).lastrowid
+        cand_work = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('The Golden Compass','Philip Pullman',92,'recommended',?,'golden-compass-work')",
+            (source_id,),
+        ).lastrowid
+        cand_quarantined = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Quarantined Guess','Wrong Author',50,'new',?,'quarantined-guess')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='openlibrary',"
+            "work_id='/works/OL777W' WHERE candidate_id=?",
+            (cand_work,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='quarantine',provider='openlibrary',"
+            "work_id='/works/OL888W' WHERE candidate_id=?",
+            (cand_quarantined,),
+        )
+
+    run_id = create_recommendation_run(
+        [
+            {"id": cand_subtitle, "score": 95},
+            {"id": cand_coauthor, "score": 94},
+            {"id": cand_isbn, "score": 93},
+            {"id": cand_work, "score": 92},
+            {"id": cand_quarantined, "score": 50},
+        ]
+    )
+    for cid in (cand_subtitle, cand_coauthor, cand_isbn, cand_work, cand_quarantined):
+        _set_candidate_exposure_time(cid, run_id, "2026-01-05T12:00:00+00:00")
+
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Piranesi: A Novel", "Susanna Clarke", 5, "2026-01-10", "goodreads_csv"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,additional_authors,rating,read_at,source) "
+            "VALUES(?,?,?,?,?,?)",
+            ("Good Omens", "Neil Gaiman", "Terry Pratchett", 4, "2026-01-10", "goodreads_csv"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,isbn,rating,read_at,source) VALUES(?,?,?,?,?,?)",
+            ("Unreasonable Hospitality", "Will Guidara", "0593418573", 5, "2026-01-10", "goodreads_csv"),
+        )
+        work_read_id = con.execute(
+            "INSERT INTO reads(title,author,isbn,rating,read_at,source) VALUES(?,?,?,?,?,?)",
+            ("Northern Lights", "Philip Pullman", "9781407130221", 5, "2026-01-10", "goodreads_csv"),
+        ).lastrowid
+        work_read = dict(con.execute("SELECT * FROM reads WHERE id=?", (work_read_id,)).fetchone())
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+            "identity_provider_id,identity_hash) VALUES(?,?,?,?,?)",
+            (
+                work_read_id,
+                "/works/OL777W",
+                "openlibrary",
+                "/works/OL777W",
+                read_metadata_identity_hash(work_read),
+            ),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,openlibrary_work_id,rating,read_at,source) "
+            "VALUES(?,?,?,?,?,?)",
+            ("Other Work", "Other Author", "/works/OL888W", 5, "2026-01-10", "goodreads_csv"),
+        )
+        con.execute(
+            "INSERT INTO goodreads_shelf_items(shelf,title,author,added_at) VALUES(?,?,?,?)",
+            ("to-read", "Piranesi", "Susanna Clarke", "2026-01-10"),
+        )
+
+    summary = attribute_read_outcomes()
+    assert summary["outcomes_created"] == 4
+    assert summary["reads_attributed"] == 4
+    attributed_cids = {
+        item["candidate_id"]
+        for item in rows(
+            "SELECT candidate_id FROM recommendation_events WHERE event_key LIKE 'read:%'"
+        )
+    }
+    assert attributed_cids == {cand_subtitle, cand_coauthor, cand_isbn, cand_work}
+
+
+def test_read_attribution_preserves_exposed_dune_with_duplicate_and_credits_latest_exposure(
+    database, monkeypatch
+):
+    from contextlib import contextmanager
+    import afterword_engine.learning as learning_mod
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
+        exposed_dune = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Dune','Frank Herbert',95,'recommended',?,'dune-primary')",
+            (source_id,),
+        ).lastrowid
+        rejected_audio = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Dune (Unabridged)','Frank Herbert',80,'rejected',?,'dune-audio-dup')",
+            (source_id,),
+        ).lastrowid
+        deluxe_dune = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Dune: Deluxe Edition','Frank Herbert',96,'recommended',?,'dune-deluxe')",
+            (source_id,),
+        ).lastrowid
+        post_read_dune = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Dune (Dune Chronicles, Book One)','Frank Herbert',97,'recommended',?,'dune-post')",
+            (source_id,),
+        ).lastrowid
+        piranesi_base = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Piranesi','Susanna Clarke',92,'recommended',?,'piranesi-early')",
+            (source_id,),
+        ).lastrowid
+        piranesi_illus = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Piranesi (Illustrated Edition)','Susanna Clarke',92,'recommended',?,'piranesi-late')",
+            (source_id,),
+        ).lastrowid
+        drawing_sequel = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('The Dark Tower: The Drawing of the Three','Stephen King',90,'recommended',?,'dark-tower-2')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='rejected' WHERE candidate_id=?",
+            (rejected_audio,),
+        )
+
+    early_dune_run = create_recommendation_run([{"id": exposed_dune, "score": 95}])
+    _set_candidate_exposure_time(exposed_dune, early_dune_run, "2026-02-01T10:00:00+00:00")
+    later_dune_run = create_recommendation_run([{"id": deluxe_dune, "score": 96}])
+    _set_candidate_exposure_time(deluxe_dune, later_dune_run, "2026-02-05T10:00:00+00:00")
+    after_read_run = create_recommendation_run([{"id": post_read_dune, "score": 97}])
+    _set_candidate_exposure_time(post_read_dune, after_read_run, "2026-02-15T10:00:00+00:00")
+    early_piranesi_run = create_recommendation_run([{"id": piranesi_base, "score": 92}])
+    _set_candidate_exposure_time(piranesi_base, early_piranesi_run, "2026-02-02T10:00:00+00:00")
+    later_piranesi_run = create_recommendation_run([{"id": piranesi_illus, "score": 92}])
+    _set_candidate_exposure_time(piranesi_illus, later_piranesi_run, "2026-02-06T10:00:00+00:00")
+    sequel_run = create_recommendation_run([{"id": drawing_sequel, "score": 90}])
+    _set_candidate_exposure_time(drawing_sequel, sequel_run, "2026-02-03T10:00:00+00:00")
+
+    with transaction() as con:
+        dune_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Dune", "Frank Herbert", None, "2026-02-10", "goodreads_csv"),
+        ).lastrowid
+        piranesi_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Piranesi: A Novel", "Susanna Clarke", None, "2026-02-10", "goodreads_csv"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("The Dark Tower: The Gunslinger", "Stephen King", 5, "2026-02-10", "goodreads_csv"),
+        )
+
+    sql_statements: list[str] = []
+    real_transaction = learning_mod.transaction
+
+    @contextmanager
+    def traced_transaction():
+        with real_transaction() as con:
+            con.set_trace_callback(sql_statements.append)
+            try:
+                yield con
+            finally:
+                con.set_trace_callback(None)
+
+    monkeypatch.setattr(learning_mod, "transaction", traced_transaction)
+
+    # Impressions are fetched in a single batched query, exact-identity 'Dune'
+    # beats subtitle variants while remaining unaffected by unexposed 'Dune (Unabridged)',
+    # equal-tier subtitle variants ('Piranesi') tie-break by latest prior exposure,
+    # and 'The Dark Tower: The Gunslinger' does not falsely attribute to 'The Drawing of the Three'.
+    first = attribute_read_outcomes()
+    assert first["outcomes_created"] == 2
+    assert first["reads_attributed"] == 2
+    batch_impression_queries = [
+        stmt
+        for stmt in sql_statements
+        if "FROM recommendation_impressions WHERE candidate_id IN" in stmt
+    ]
+    per_candidate_queries = [
+        stmt
+        for stmt in sql_statements
+        if "FROM recommendation_impressions WHERE candidate_id=?" in stmt
+    ]
+    assert len(batch_impression_queries) == 1
+    assert per_candidate_queries == []
+
+    dune_event = row(
+        "SELECT id,run_id,candidate_id,value FROM recommendation_events WHERE event_key=?",
+        (f"read:{dune_read_id:08d}",),
+    )
+    assert (dune_event["run_id"], dune_event["candidate_id"], dune_event["value"]) == (
+        early_dune_run,
+        exposed_dune,
+        None,
+    )
+    piranesi_event = row(
+        "SELECT id,run_id,candidate_id,value FROM recommendation_events WHERE event_key=?",
+        (f"read:{piranesi_read_id:08d}",),
+    )
+    assert (piranesi_event["run_id"], piranesi_event["candidate_id"], piranesi_event["value"]) == (
+        later_piranesi_run,
+        piranesi_illus,
+        None,
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_events WHERE candidate_id=?",
+            (drawing_sequel,),
+        )["count"]
+        == 0
+    )
+
+    # Updating the read's rating updates the existing event/outcome in place without deleting rows.
+    with real_transaction() as con:
+        con.execute("UPDATE reads SET rating=5 WHERE id=?", (piranesi_read_id,))
+
+    second = attribute_read_outcomes()
+    assert second["outcomes_updated"] == 1
+    updated_event = row(
+        "SELECT id,run_id,candidate_id,value FROM recommendation_events WHERE event_key=?",
+        (f"read:{piranesi_read_id:08d}",),
+    )
+    assert (
+        updated_event["run_id"],
+        updated_event["candidate_id"],
+        updated_event["value"],
+    ) == (later_piranesi_run, piranesi_illus, 5.0)
+    outcomes = rows(
+        "SELECT impression_id,read_id,label_kind FROM recommendation_outcomes WHERE event_id=?",
+        (updated_event["id"],),
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0]["read_id"] == piranesi_read_id
+    assert outcomes[0]["label_kind"] == "rating_positive"
+
+
 def _expected_evidence_budget(con) -> int:
     return int(
         con.execute(
@@ -3037,4 +3309,3 @@ def test_authenticated_http_discovery_isolates_exploration_seed_per_session(
     assert meta_a1["exploration_seed"] == run_a0
     assert meta_b1["exploration_seed"] == run_b0
     assert meta_v1["exploration_seed"] == run_v1
-

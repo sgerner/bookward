@@ -32,6 +32,7 @@ afterEach(() => vi.clearAllMocks());
 const PAGE_BOOK_KEYS = [
   "author",
   "cover_url",
+  "explanation",
   "genres",
   "id",
   "metadata_confidence",
@@ -113,6 +114,7 @@ describe("recommendations endpoint", () => {
           score: 91,
           metadata_confidence: null,
           synopsis: "A description",
+          explanation: ["A good match"],
           reason: "A good match",
           status: "recommended",
         },
@@ -168,6 +170,7 @@ describe("recommendations endpoint", () => {
       score: 77,
       metadata_confidence: 0.52,
       synopsis: "Summary text",
+      explanation: ["Similar to a 5-star read", "Trusted source"],
       reason: "Similar to a 5-star read · Trusted source",
       status: "recommended",
     });

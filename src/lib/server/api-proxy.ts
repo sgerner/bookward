@@ -1,5 +1,7 @@
 const env = process.env;
 import type { RequestEvent } from "@sveltejs/kit";
+import { validateClientIpConfig } from "#lib/server/engine.js";
+import { currentClientIp, resolveClientAddress } from "#lib/server/request-context.js";
 
 const engineBase = (env.ENGINE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 const forwardedHeaders = [
@@ -54,12 +56,15 @@ export async function proxyApi(event: RequestEvent) {
     return new Response(null, { status: 204, headers: corsHeaders(event.request, methods) });
   }
 
+  validateClientIpConfig(env);
   const headers = new Headers();
   for (const name of forwardedHeaders) {
     const value = event.request.headers.get(name);
     if (value) headers.set(name, value);
   }
-  if (env.ENGINE_SERVICE_SECRET) headers.set("x-bookward-service", env.ENGINE_SERVICE_SECRET);
+  if (env.ENGINE_SERVICE_SECRET?.trim()) headers.set("x-bookward-service", env.ENGINE_SERVICE_SECRET);
+  const clientIp = currentClientIp() ?? resolveClientAddress(event);
+  if (clientIp) headers.set("x-bookward-client-ip", clientIp);
 
   let upstream: Response;
   try {
@@ -88,6 +93,7 @@ export async function proxyApi(event: RequestEvent) {
     "content-type",
     "etag",
     "location",
+    "retry-after",
     "www-authenticate",
     "x-bookward-has-more",
     "x-bookward-recommendation-run",

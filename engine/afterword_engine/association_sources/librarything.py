@@ -24,6 +24,7 @@ from ..associations import (
     RateLimiter,
     select_seed_reads,
 )
+from ..config import settings
 from ..database import rows
 from ..identity import ReadIdentityIndex, book_identity
 from ..isbn import normalize_isbn_identifier
@@ -135,7 +136,7 @@ class LibraryThingClient:
             source_label="LibraryThing",
             params={**query, "apiKey": self.api_key},
             timeout_seconds=self.timeout_seconds,
-            max_bytes=2_000_000,
+            max_bytes=settings.source_max_bytes,
             user_agent=LIBRARYTHING_USER_AGENT,
             require_mapping=True,
         )

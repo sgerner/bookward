@@ -1,17 +1,23 @@
-import type { Handle } from '@sveltejs/kit/hooks';
+import type { Handle, ServerInit } from '@sveltejs/kit/hooks';
 import { error as httpError, redirect } from '@sveltejs/kit';
 import {
 	EngineError,
 	GOODREADS_CSV_LIMIT_MESSAGE,
 	engine,
-	isPayloadTooLarge
+	isPayloadTooLarge,
+	validateClientIpConfig
 } from '#lib/server/engine.js';
 import {
 	SESSION_COOKIE,
 	sessionCookieDeleteOptions,
 	sessionRefreshCookieOptions
 } from '#lib/server/cookies.js';
-import { requestFormData, withSessionToken } from '#lib/server/request-context.js';
+import {
+	requestFormData,
+	resolveClientAddress,
+	withRequestContext,
+	withSessionToken
+} from '#lib/server/request-context.js';
 
 function jsonError(status: number, detail: string) {
 	return withSecurityHeaders(new Response(JSON.stringify({ detail, message: detail }), {
@@ -95,81 +101,90 @@ async function submittedProfile(request: Request): Promise<string> {
 	return '';
 }
 
+export const init: ServerInit = () => {
+	validateClientIpConfig(process.env, { warn: console.warn });
+};
+
 export const handle: Handle = async ({ event, resolve }) => {
 	const path = event.url.pathname;
-	const session = event.cookies.get(SESSION_COOKIE);
+	if (isAsset(path)) return withSecurityHeaders(await resolve(event));
 
-	if (isPublicApiPath(path) || isAsset(path)) return withSecurityHeaders(await resolve(event));
-	const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(event.request.method);
-	if (mutation) {
-		const origin = event.request.headers.get('origin');
-		const referrer = event.request.headers.get('referer');
-		const fetchSite = event.request.headers.get('sec-fetch-site');
-		let sameOriginReferrer = false;
-		try { sameOriginReferrer = Boolean(referrer) && new URL(referrer!).origin === event.url.origin; } catch { /* Reject malformed referrers. */ }
-		if ((origin && origin !== event.url.origin) ||
-			(!origin && !sameOriginReferrer && fetchSite !== 'same-origin')) {
-			return jsonError(403, 'Request origin could not be verified');
-		}
-	}
-	if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
-		const origin = event.request.headers.get('origin');
-		const fetchSite = event.request.headers.get('sec-fetch-site');
-		if ((origin && origin !== event.url.origin) || (!origin && fetchSite !== 'same-origin')) {
-			return withSecurityHeaders(new Response('Request origin could not be verified', { status: 403 }));
-		}
-	}
+	const clientIp = resolveClientAddress(event);
+	return withRequestContext({ clientIp }, async () => {
+		const session = event.cookies.get(SESSION_COOKIE);
 
-	if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'login') {
-		return withSecurityHeaders(await resolve(event));
-	}
-
-	const callback = path === '/auth/oidc/callback';
-	if (path === '/login' && session) {
-		const user = await sessionUser(session);
-		if (user) throw redirect(303, '/');
-		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
-		return withSecurityHeaders(await resolve(event));
-	}
-
-	if (!session && path !== '/login' && !callback) {
-		if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
-		const next = `${event.url.pathname}${event.url.search}`;
-		throw redirect(303, `/login?next=${encodeURIComponent(next)}`);
-	}
-
-	if (!session) return withSecurityHeaders(await resolve(event));
-
-	const user = await sessionUser(session);
-	if (!user) {
-		event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
-		if (callback) return withSecurityHeaders(await resolve(event));
-		if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
-		throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
-	}
-	const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
-		(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
-	if (boundProfile) {
-		let expected = '';
-		try {
-			expected = await submittedProfile(event.request);
-		} catch (cause) {
-			if (isPayloadTooLarge(cause)) {
-				if (prefersHtmlError(event.request, path)) {
-					throw httpError(413, GOODREADS_CSV_LIMIT_MESSAGE);
-				}
-				return jsonError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+		if (isPublicApiPath(path)) return withSecurityHeaders(await resolve(event));
+		const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(event.request.method);
+		if (mutation) {
+			const origin = event.request.headers.get('origin');
+			const referrer = event.request.headers.get('referer');
+			const fetchSite = event.request.headers.get('sec-fetch-site');
+			let sameOriginReferrer = false;
+			try { sameOriginReferrer = Boolean(referrer) && new URL(referrer!).origin === event.url.origin; } catch { /* Reject malformed referrers. */ }
+			if ((origin && origin !== event.url.origin) ||
+				(!origin && !sameOriginReferrer && fetchSite !== 'same-origin')) {
+				return jsonError(403, 'Request origin could not be verified');
 			}
-			throw cause;
 		}
-		if (!expected || expected !== user.profile_id) {
-			return jsonError(409, 'This page belongs to a different profile. Reload before continuing.');
+		if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
+			const origin = event.request.headers.get('origin');
+			const fetchSite = event.request.headers.get('sec-fetch-site');
+			if ((origin && origin !== event.url.origin) || (!origin && fetchSite !== 'same-origin')) {
+				return withSecurityHeaders(new Response('Request origin could not be verified', { status: 403 }));
+			}
 		}
-	}
-	event.locals.user = user;
-	if (user.must_change_password && path !== '/account' && !path.startsWith('/auth/')) throw redirect(303, '/account?force_password_change=1');
-	event.cookies.set(SESSION_COOKIE, session, sessionRefreshCookieOptions(event.url));
-	const response = await withSessionToken(session, () => resolve(event));
-	response.headers.set('cache-control', 'private, no-store');
-	return withSecurityHeaders(response);
+
+		if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'login') {
+			return withSecurityHeaders(await resolve(event));
+		}
+
+		const callback = path === '/auth/oidc/callback';
+		if (path === '/login' && session) {
+			const user = await sessionUser(session);
+			if (user) throw redirect(303, '/');
+			event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
+			return withSecurityHeaders(await resolve(event));
+		}
+
+		if (!session && path !== '/login' && !callback) {
+			if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
+			const next = `${event.url.pathname}${event.url.search}`;
+			throw redirect(303, `/login?next=${encodeURIComponent(next)}`);
+		}
+
+		if (!session) return withSecurityHeaders(await resolve(event));
+
+		const user = await sessionUser(session);
+		if (!user) {
+			event.cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(event.url));
+			if (callback) return withSecurityHeaders(await resolve(event));
+			if (path.startsWith('/api/')) return withSecurityHeaders(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
+			throw redirect(303, `/login?next=${encodeURIComponent(`${event.url.pathname}${event.url.search}`)}`);
+		}
+		const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
+			(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
+		if (boundProfile) {
+			let expected = '';
+			try {
+				expected = await submittedProfile(event.request);
+			} catch (cause) {
+				if (isPayloadTooLarge(cause)) {
+					if (prefersHtmlError(event.request, path)) {
+						throw httpError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+					}
+					return jsonError(413, GOODREADS_CSV_LIMIT_MESSAGE);
+				}
+				throw cause;
+			}
+			if (!expected || expected !== user.profile_id) {
+				return jsonError(409, 'This page belongs to a different profile. Reload before continuing.');
+			}
+		}
+		event.locals.user = user;
+		if (user.must_change_password && path !== '/account' && !path.startsWith('/auth/')) throw redirect(303, '/account?force_password_change=1');
+		event.cookies.set(SESSION_COOKIE, session, sessionRefreshCookieOptions(event.url));
+		const response = await withSessionToken(session, () => resolve(event), clientIp);
+		response.headers.set('cache-control', 'private, no-store');
+		return withSecurityHeaders(response);
+	});
 };
