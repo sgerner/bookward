@@ -494,20 +494,43 @@ def _publication_date(value: object) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
-def _openlibrary_publication_date(record: object) -> tuple[str | None, str | None, str]:
-    """Return the parsed date and the exact Open Library field that supplied it."""
+_MIN_WORK_PUBLICATION_YEAR = 1000
+
+
+def _max_work_publication_year(today: date | None = None) -> int:
+    current_year = (today or datetime.now(timezone.utc).date()).year
+    return current_year + 1
+
+
+def _openlibrary_publication_date(
+    record: object,
+    *,
+    today: date | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Return a bounded Open Library work publication date and its source field.
+
+    Open Library ``first_publish_date`` and ``first_publish_year`` describe the
+    work's original publication rather than a modern edition reissue. Year-only
+    work dates normalize to ``YYYY-01-01`` with ``date_kind="year"`` (and
+    month-only dates to ``YYYY-MM-01`` with ``date_kind="month"``). Years
+    outside ``[1000, current_utc_year + 1]`` are rejected so polluted future
+    work years cannot outrank valid edition dates.
+    """
 
     if not isinstance(record, dict):
         return None, None, ""
-    source_field = (
-        "first_publish_date" if record.get("first_publish_date")
-        else "first_publish_year" if record.get("first_publish_year")
-        else ""
-    )
-    if not source_field:
-        return None, None, ""
-    release_date, date_kind = _publication_date(record.get(source_field))
-    return release_date, date_kind, source_field
+    max_year = _max_work_publication_year(today)
+    for source_field in ("first_publish_date", "first_publish_year"):
+        raw_value = record.get(source_field)
+        if not raw_value or isinstance(raw_value, bool):
+            continue
+        release_date, date_kind = _publication_date(raw_value)
+        if not release_date or not date_kind:
+            continue
+        year = int(release_date[:4])
+        if _MIN_WORK_PUBLICATION_YEAR <= year <= max_year:
+            return release_date, date_kind, source_field
+    return None, None, ""
 
 
 async def _lookup_open_library_record(
@@ -596,7 +619,7 @@ async def _lookup_open_library_record(
                 "opening_sentence": opening_sentence,
                 "genres": genres,
                 "identifiers": identifiers,
-                "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+                "publication_date": _clean_metadata_text(doc.get(release_date_source_field), 40) if release_date else "",
                 "publication_date_source_field": release_date_source_field if release_date else "",
                 "cover_id": str(doc.get("cover_i") or "")[:40],
             }),
@@ -1070,10 +1093,23 @@ async def resolve_book_metadata(
             result["cover_provider"] = cover_record.get("provider", "")
             result["cover_provider_id"] = cover_record.get("provider_id", "")
 
+    # Intentional precedence reversal over pure precision ranking: bounded Open
+    # Library work dates (first_publish_date / first_publish_year, where
+    # year-only values normalize to YYYY-01-01 with date_kind="year") rank
+    # ahead of day-precision storefront edition dates (Google publishedDate,
+    # Apple releaseDate), with day > month > year breaking ties within each
+    # tier. For undated candidates, storing the original work date and its
+    # provenance supplies first_publication_year to batch era ranking
+    # (scoring.py -> ranking.py) and era buckets via release_date in
+    # interaction_personalization._book_features.
     date_rank = {"day": 3, "month": 2, "year": 1}
     date_record = max(
         (record for record in records if record.get("release_date")),
-        key=lambda record: date_rank.get(str(record.get("date_kind") or ""), 0),
+        key=lambda record: (
+            record.get("provider") == "openlibrary"
+            and record.get("release_date_source_field") in {"first_publish_date", "first_publish_year"},
+            date_rank.get(str(record.get("date_kind") or ""), 0),
+        ),
         default=None,
     )
     if needs_release_date and date_record:
@@ -1300,7 +1336,7 @@ async def resolve_openlibrary_work_metadata(
                     "description": synopsis,
                     "opening_sentence": opening_sentence,
                     "genres": genres,
-                    "publication_date": _clean_metadata_text(payload.get("first_publish_date") or payload.get("first_publish_year"), 40),
+                    "publication_date": _clean_metadata_text(payload.get(release_date_source_field), 40) if release_date else "",
                     "publication_date_source_field": release_date_source_field if release_date else "",
                     "cover_ids": [str(value)[:40] for value in raw_covers[:8]] if isinstance(raw_covers, list) else [],
                 }),
