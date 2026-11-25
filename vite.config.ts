@@ -67,9 +67,10 @@ export default defineConfig({
 				test: {
 					name: 'server',
 					environment: 'node',
-					// Real-Chromium specs launch a browser in beforeAll, which can exceed the
-					// 10s default on a loaded CI runner.
+					// Real-Chromium specs launch a browser in beforeAll and drive it over CDP,
+					// which can exceed the 10s hook / 5s test defaults on a loaded CI runner.
 					hookTimeout: 60_000,
+					testTimeout: 30_000,
 					include: ['src/**/*.{test,spec}.{js,ts}'],
 					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}']
 				}
