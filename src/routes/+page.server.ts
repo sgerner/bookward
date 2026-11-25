@@ -41,6 +41,34 @@ type BackupStatus = {
   evidence_incomplete_runs?: number;
 };
 
+type CatalogAuditStatus = {
+  status: "idle" | "queued" | "running" | "failed" | "paused" | "complete";
+  active: boolean;
+  mode: "incremental" | "full";
+  last_mode: "incremental" | "full" | null;
+  batch_size: number;
+  subbatch_size: number;
+  remaining: number;
+  progress: number;
+  started_at: string | null;
+  completed_at: string | null;
+  job_id: string | null;
+  last_error: string | null;
+  can_retry: boolean;
+};
+
+type CatalogQuality = {
+  statuses: Array<{ quality_status: string; count: number }>;
+  identifiers: {
+    total: number;
+    with_isbn13: number;
+    with_catalog_match: number;
+  };
+  flags: Record<string, number>;
+  version: string;
+  audit: CatalogAuditStatus;
+};
+
 type Overview = {
   counts?: { reads?: number };
   recommendation_run_id?: string;
@@ -79,6 +107,7 @@ type Overview = {
     enabled: number;
     kind: string;
     is_default: number;
+    is_custom?: boolean;
     lifecycle: "permanent" | "one_time";
     filters: SourceFilters;
     last_status: string | null;
@@ -196,6 +225,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const backupStatusRequest = engine<BackupStatus>("/api/backups")
     .then((status) => ({ ...fallbackBackupStatus, ...status }))
     .catch(() => fallbackBackupStatus);
+  const catalogQualityRequest = engine<unknown>("/api/candidates/quality").catch(
+    () => null,
+  );
   let digestPeriod = url.searchParams.get("digest_period");
   const digestReviewRequest = digestPeriod
     ? engine<{
@@ -215,7 +247,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       `Bookward's recommendation engine is unavailable. ${message(cause)}`,
     );
   }
-  const backupStatus = await backupStatusRequest;
+  const [backupStatus, rawCatalogQuality] = await Promise.all([
+    backupStatusRequest,
+    catalogQualityRequest,
+  ]);
+  const catalogQuality = normalizeCatalogQuality(rawCatalogQuality);
   const builtIn = overview.sources.find((source) => source.is_default);
   const runId = overview.recommendation_run_id ?? "";
   const books = overview.recommendations.map((book) =>
@@ -269,6 +305,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
+    catalogQuality,
     digestReview: {
       requested: Boolean(digestPeriod),
       ids: digestReviewIds,
@@ -276,7 +313,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     },
     sources: overview.sources
       .filter((source) => !source.is_default)
-      .map((source) => ({ ...source, label: source.name })),
+      .map((source) => ({
+        ...source,
+        label: source.name,
+        is_custom: source.is_custom ?? source.kind === "web",
+      })),
     profile: {
       goodreads_url: overview.settings.goodreads_rss_url ?? "",
       goodreads_rss_last_sync_at: overview.settings.goodreads_rss_last_sync_at ?? "",
@@ -302,6 +343,13 @@ const idSchema = z.coerce.number().int().positive();
 const urlSchema = z.url();
 const fail = <T extends { message: string }>(statusCode: number, data: T) =>
   kitFail(statusCode, { ...data, error: true as const });
+const comparableSourceUrl = (value: string) => {
+  try {
+    return new URL(value).href;
+  } catch {
+    return value.trim();
+  }
+};
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -327,6 +375,29 @@ const sourceFiltersFromForm = (data: FormData): SourceFilters => ({
 const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
+};
+const updateSourceLifecycle = async (
+  rawId: FormDataEntryValue | null,
+  rawLifecycle: FormDataEntryValue | null,
+) => {
+  const id = idSchema.safeParse(rawId);
+  const lifecycle = z.enum(["permanent", "one_time"]).safeParse(rawLifecycle);
+  if (!id.success || !lifecycle.success)
+    return fail(400, { message: "Invalid source." });
+  try {
+    await engine(`/api/sources/${id.data}`, {
+      method: "PUT",
+      body: JSON.stringify({ lifecycle: lifecycle.data }),
+    });
+    return {
+      message:
+        lifecycle.data === "one_time"
+          ? "Source changed to a one-time import."
+          : "Source restored to a permanent feed.",
+    };
+  } catch (error) {
+    return fail(engineStatus(error), { message: message(error) });
+  }
 };
 async function handleCsvImport(request: Request) {
   let incoming: FormData;
@@ -649,6 +720,114 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
+  editSource: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const rawLabel = String(data.get("label") ?? "");
+    const rawUrl = String(data.get("url") ?? "");
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    const editState = { id: id.data, label: rawLabel, url: rawUrl };
+    const label = z.string().trim().min(2).max(100).safeParse(rawLabel);
+    const url = urlSchema.safeParse(rawUrl.trim());
+    if (!label.success || !url.success)
+      return fail(400, {
+        message: "Add a valid name and public URL.",
+        editSource: editState,
+      });
+    try {
+      const sources = await engine<Overview["sources"]>("/api/sources");
+      const current = sources.find((item) => item.id === id.data);
+      if (!current)
+        return fail(404, {
+          message: "Source not found.",
+          editSource: editState,
+        });
+      if (
+        current.kind !== "web" ||
+        current.is_default ||
+        current.is_custom === false
+      )
+        return fail(400, {
+          message: "Only custom sources can be edited.",
+          editSource: editState,
+        });
+      const nextComparable = comparableSourceUrl(url.data);
+      const urlChanged = nextComparable !== comparableSourceUrl(current.url);
+      if (urlChanged) {
+        if (
+          sources.some(
+            (item) =>
+              item.id !== id.data &&
+              comparableSourceUrl(item.url) === nextComparable,
+          )
+        )
+          return fail(409, {
+            message: "A source with that URL already exists.",
+            editSource: editState,
+          });
+        const filters = current.filters ?? {
+          include_genres: [],
+          exclude_genres: [],
+        };
+        const preview = await engine<{ count: number; url?: string }>(
+          "/api/sources/preview",
+          {
+            method: "POST",
+            body: JSON.stringify({ url: url.data, filters }),
+          },
+        );
+        if (preview.count === 0)
+          return fail(400, {
+            message:
+              filters.include_genres.length || filters.exclude_genres.length
+                ? "No books matched these filters."
+                : "No recognizable books were found at that URL.",
+            editSource: editState,
+          });
+        const resolvedUrl =
+          typeof preview.url === "string" && preview.url.trim()
+            ? preview.url.trim()
+            : url.data;
+        const resolvedComparable = comparableSourceUrl(resolvedUrl);
+        if (
+          sources.some(
+            (item) =>
+              item.id !== id.data &&
+              comparableSourceUrl(item.url) === resolvedComparable,
+          )
+        )
+          return fail(409, {
+            message: "A source with that URL already exists.",
+            editSource: editState,
+          });
+        await engine(`/api/sources/${id.data}`, {
+          method: "PUT",
+          body: JSON.stringify({ name: label.data, url: resolvedUrl }),
+        });
+        const resolvedUrlChanged =
+          resolvedComparable !== comparableSourceUrl(current.url);
+        const provenanceNote = resolvedUrlChanged
+          ? " Earlier books stay attributed to this source."
+          : "";
+        return {
+          message:
+            current.enabled && resolvedUrlChanged
+              ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`
+              : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`,
+        };
+      }
+      await engine(`/api/sources/${id.data}`, {
+        method: "PUT",
+        body: JSON.stringify({ name: label.data }),
+      });
+      return { message: "Source updated." };
+    } catch (error) {
+      return fail(engineStatus(error), {
+        message: message(error),
+        editSource: editState,
+      });
+    }
+  },
   configureSourceFilters: async ({ request }) => {
     const data = await request.formData();
     const id = idSchema.safeParse(data.get("id"));
@@ -803,15 +982,21 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  switchSourceToOneTime: async ({ request }) => {
+  switchSourceLifecycle: async ({ request }) => {
+    const data = await request.formData();
+    return updateSourceLifecycle(data.get("id"), data.get("lifecycle"));
+  },
+  switchSourceToOneTime: async ({ request }) =>
+    updateSourceLifecycle((await request.formData()).get("id"), "one_time"),
+  refreshSource: async ({ request }) => {
     const id = idSchema.safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
     try {
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify({ lifecycle: "one_time" }),
+      await engine(`/api/sources/${id.data}/refresh`, {
+        method: "POST",
+        body: "{}",
       });
-      return { message: "Source changed to a one-time import." };
+      return { message: "Source refresh queued." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -1144,6 +1329,82 @@ export const actions: Actions = {
       return fail(502, { message: message(error) });
     }
   },
+  auditCatalog: async ({ request }) => {
+    const data = await request.formData();
+    const rawMode = formText(data, "mode") || "incremental";
+    const parsedMode = z.enum(["incremental", "full"]).safeParse(rawMode);
+    if (!parsedMode.success)
+      return fail(400, { message: "Choose a valid catalog audit mode." });
+    const mode = parsedMode.data;
+    const modeLabel =
+      mode === "full" ? "Full catalog audit" : "Incremental catalog audit";
+    try {
+      const queued = await engine<{
+        job_id: string;
+        mode?: string;
+        remaining?: number;
+      }>("/api/candidates/audit", {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      const job = await waitForJob(queued.job_id, 2, 250);
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || `${modeLabel} failed.`,
+        });
+      if (job.status === "complete") {
+        const remaining = parseAuditRemaining(job.result);
+        if (remaining !== null && remaining > 0)
+          return {
+            message: `${modeLabel} batch finished; ${remaining} book${remaining === 1 ? "" : "s"} remaining in the background.`,
+          };
+        return {
+          message: `${modeLabel} complete and recommendations queued for refresh.`,
+        };
+      }
+      const remainingSuffix =
+        typeof queued.remaining === "number" && queued.remaining > 0
+          ? ` (${queued.remaining} book${queued.remaining === 1 ? "" : "s"} remaining)`
+          : "";
+      return {
+        message: `${modeLabel} queued in bounded 50-book batches${remainingSuffix}.`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  retryCatalogAudit: async () => {
+    try {
+      const queued = await engine<{
+        job_id: string;
+        mode?: string;
+        remaining?: number;
+      }>("/api/candidates/audit", {
+        method: "POST",
+        body: JSON.stringify({ retry: true }),
+      });
+      const job = await waitForJob(queued.job_id, 2, 250);
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Catalog audit retry failed.",
+        });
+      if (job.status === "complete") {
+        const remaining = parseAuditRemaining(job.result);
+        if (remaining !== null && remaining > 0)
+          return {
+            message: `Catalog audit retry batch finished; ${remaining} book${remaining === 1 ? "" : "s"} remaining in the background.`,
+          };
+        return {
+          message: "Catalog audit complete and recommendations queued for refresh.",
+        };
+      }
+      return {
+        message: `Catalog audit retry queued (${queued.job_id.slice(0, 8)}).`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
   configureDigest: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
@@ -1350,9 +1611,9 @@ export const actions: Actions = {
   },
 };
 
-async function waitForJob(jobId: string, maxAttempts = 30) {
+async function waitForJob(jobId: string, maxAttempts = 30, delayMs = 500) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
     const job = await engine<{
       status: string;
       error: string | null;
@@ -1426,4 +1687,134 @@ function digestJobFailure(result: string | null) {
     return "Digest delivery reached the automatic retry limit.";
   }
   return "The digest channel could not deliver the message.";
+}
+
+function parseAuditRemaining(result: string | null): number | null {
+  if (!result) return null;
+  try {
+    const parsed = JSON.parse(result) as { remaining?: unknown };
+    return typeof parsed.remaining === "number" &&
+      Number.isFinite(parsed.remaining) &&
+      parsed.remaining >= 0
+      ? Math.floor(parsed.remaining)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCatalogQuality(raw: unknown): CatalogQuality {
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const auditRaw =
+    record.audit && typeof record.audit === "object"
+      ? (record.audit as Record<string, unknown>)
+      : {};
+  const validStatuses = new Set([
+    "idle",
+    "queued",
+    "running",
+    "failed",
+    "paused",
+    "complete",
+  ]);
+  const status = validStatuses.has(String(auditRaw.status ?? ""))
+    ? (String(auditRaw.status) as CatalogAuditStatus["status"])
+    : "idle";
+  const mode = auditRaw.mode === "full" ? "full" : "incremental";
+  const lastMode =
+    auditRaw.last_mode === "full" || auditRaw.last_mode === "incremental"
+      ? auditRaw.last_mode
+      : null;
+  const remaining =
+    typeof auditRaw.remaining === "number" &&
+    Number.isFinite(auditRaw.remaining) &&
+    auditRaw.remaining >= 0
+      ? Math.floor(auditRaw.remaining)
+      : 0;
+  const progress =
+    typeof auditRaw.progress === "number" && Number.isFinite(auditRaw.progress)
+      ? Math.max(0, Math.min(1, auditRaw.progress))
+      : 0;
+  const batchSize =
+    typeof auditRaw.batch_size === "number" &&
+    Number.isInteger(auditRaw.batch_size) &&
+    auditRaw.batch_size > 0
+      ? auditRaw.batch_size
+      : 50;
+  const subbatchSize =
+    typeof auditRaw.subbatch_size === "number" &&
+    Number.isInteger(auditRaw.subbatch_size) &&
+    auditRaw.subbatch_size > 0
+      ? auditRaw.subbatch_size
+      : 10;
+  const statuses = Array.isArray(record.statuses)
+    ? record.statuses
+        .filter(
+          (item): item is { quality_status: string; count: number } =>
+            Boolean(item && typeof item === "object") &&
+            typeof (item as Record<string, unknown>).quality_status === "string" &&
+            typeof (item as Record<string, unknown>).count === "number",
+        )
+        .map((item) => ({
+          quality_status: item.quality_status,
+          count: item.count,
+        }))
+    : [];
+  const identifiersRaw =
+    record.identifiers && typeof record.identifiers === "object"
+      ? (record.identifiers as Record<string, unknown>)
+      : {};
+  const flagsRaw =
+    record.flags && typeof record.flags === "object" && !Array.isArray(record.flags)
+      ? (record.flags as Record<string, unknown>)
+      : {};
+  const flags: Record<string, number> = {};
+  for (const [key, value] of Object.entries(flagsRaw)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      flags[key] = value;
+    }
+  }
+  return {
+    statuses,
+    identifiers: {
+      total: typeof identifiersRaw.total === "number" ? identifiersRaw.total : 0,
+      with_isbn13:
+        typeof identifiersRaw.with_isbn13 === "number"
+          ? identifiersRaw.with_isbn13
+          : 0,
+      with_catalog_match:
+        typeof identifiersRaw.with_catalog_match === "number"
+          ? identifiersRaw.with_catalog_match
+          : 0,
+    },
+    flags,
+    version: typeof record.version === "string" ? record.version : "",
+    audit: {
+      status,
+      active: Boolean(auditRaw.active),
+      mode,
+      last_mode: lastMode,
+      batch_size: batchSize,
+      subbatch_size: subbatchSize,
+      remaining,
+      progress,
+      started_at:
+        typeof auditRaw.started_at === "string" && auditRaw.started_at
+          ? auditRaw.started_at
+          : null,
+      completed_at:
+        typeof auditRaw.completed_at === "string" && auditRaw.completed_at
+          ? auditRaw.completed_at
+          : null,
+      job_id:
+        typeof auditRaw.job_id === "string" && auditRaw.job_id
+          ? auditRaw.job_id
+          : null,
+      last_error:
+        typeof auditRaw.last_error === "string" && auditRaw.last_error
+          ? auditRaw.last_error
+          : null,
+      can_retry: Boolean(auditRaw.can_retry || status === "failed"),
+    },
+  };
 }

@@ -22,18 +22,64 @@ export const load: PageServerLoad = async ({ url }) => {
 	return { ...config, next, auto_sso: autoSso, manual_login: manualLogin, error };
 };
 
+const formFail = (
+	status: number,
+	formId: 'login' | 'setup',
+	message: string,
+	fieldErrors: Record<string, string> = {},
+	values?: Record<string, string>
+) =>
+	fail(status, {
+		formId,
+		error: true as const,
+		message,
+		fieldErrors,
+		...(values ? { values } : {})
+	});
+
+const hasControlCharacters = (value: string) =>
+	[...value].some((character) => character.charCodeAt(0) < 32);
+
 export const actions: Actions = {
 	login: async ({ request, cookies, url }) => {
 		const form = await request.formData();
 		const username = String(form.get('username') || '');
+		const cleanUsername = username.trim();
 		const password = String(form.get('password') || '');
-		if (!username || !password) return fail(400, { message: 'Enter your username and password.' });
+		const fieldErrors: Record<string, string> = {};
+		if (!cleanUsername) fieldErrors.username = 'Enter your username.';
+		if (!password) fieldErrors.password = 'Enter your password.';
+		if (Object.keys(fieldErrors).length > 0) {
+			const summary =
+				!cleanUsername && !password
+					? 'Enter your username and password.'
+					: (fieldErrors.username ?? fieldErrors.password!);
+			return formFail(400, 'login', summary, fieldErrors, { username: cleanUsername });
+		}
 		let result: SessionResult;
 		try {
-			result = await engine<SessionResult>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+			result = await engine<SessionResult>('/auth/login', {
+				method: 'POST',
+				body: JSON.stringify({ username, password })
+			});
 		} catch (error) {
-			if (error instanceof EngineError && error.status === 401) return fail(401, { message: 'Username or password is incorrect.' });
-			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Sign-in is unavailable.' });
+			if (error instanceof EngineError && error.status === 401) {
+				return fail(401, {
+					formId: 'login' as const,
+					error: true as const,
+					credentialError: true as const,
+					message: 'Username or password is incorrect.',
+					fieldErrors: {} as Record<string, string>,
+					values: { username: cleanUsername }
+				});
+			}
+			return formFail(
+				error instanceof EngineError ? error.status : 503,
+				'login',
+				error instanceof Error ? error.message : 'Sign-in is unavailable.',
+				{},
+				{ username: cleanUsername }
+			);
 		}
 		cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 		throw redirect(303, safeNext(form.get('next')));
@@ -41,13 +87,44 @@ export const actions: Actions = {
 	setup: async ({ request, cookies, url }) => {
 		const form = await request.formData();
 		const username = String(form.get('username') || '');
+		const cleanUsername = username.trim();
 		const password = String(form.get('password') || '');
-		if (!username || !password) return fail(400, { message: 'Enter a username and password.' });
+		const fieldErrors: Record<string, string> = {};
+		if (!cleanUsername) {
+			fieldErrors.username = 'Enter a username.';
+		} else if (cleanUsername.length > 160 || hasControlCharacters(cleanUsername)) {
+			fieldErrors.username = 'Enter a valid username.';
+		}
+		if (!password) {
+			fieldErrors.password = 'Enter a password.';
+		} else if (password.length < 12 || password.length > 1024) {
+			fieldErrors.password = 'Use a password between 12 and 1024 characters.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			const summary =
+				!cleanUsername && !password
+					? 'Enter a username and password.'
+					: (fieldErrors.username ?? fieldErrors.password!);
+			return formFail(400, 'setup', summary, fieldErrors, { username: cleanUsername });
+		}
 		let result: SessionResult;
 		try {
-			result = await engine<SessionResult>('/auth/setup', { method: 'POST', body: JSON.stringify({ username, password }) });
+			result = await engine<SessionResult>('/auth/setup', {
+				method: 'POST',
+				body: JSON.stringify({ username, password })
+			});
 		} catch (error) {
-			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Account setup is unavailable.' });
+			const status = error instanceof EngineError ? error.status : 503;
+			const msg = error instanceof Error ? error.message : 'Account setup is unavailable.';
+			const mappedFieldErrors: Record<string, string> =
+				status === 400
+					? /username/i.test(msg)
+						? { username: msg }
+						: /password/i.test(msg)
+							? { password: msg }
+							: {}
+					: {};
+			return formFail(status, 'setup', msg, mappedFieldErrors, { username: cleanUsername });
 		}
 		cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
 		throw redirect(303, '/');

@@ -783,12 +783,12 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
 
     class _FakeLLMResponse:
         status_code = 200
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {"content-type": "application/json"}
 
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict:
+        def iter_bytes(self):
             if rerank_mode == "adjustments":
                 body = {
                     "adjustments": [
@@ -805,7 +805,12 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
                         {"id": second["id"], "reason": "Solid runner-up"},
                     ]
                 }
-            return {"choices": [{"message": {"content": json.dumps(body)}}]}
+            yield json.dumps({"choices": [{"message": {"content": json.dumps(body)}}]}).encode(
+                "utf-8"
+            )
+
+        def close(self) -> None:
+            return None
 
     class _ServingClient:
         def __init__(self, *args, **kwargs):
@@ -817,9 +822,14 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
         def __exit__(self, *args):
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
             nonlocal llm_calls
+            assert stream is True
             llm_calls += 1
+            headers = request.get("headers") or {}
             assert "Bearer sk-live-super-secret-bearer-777" == headers["Authorization"]
             return _FakeLLMResponse()
 
@@ -1200,18 +1210,23 @@ def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
 
     class _FakeLLMResponse:
         status_code = 200
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {"content-type": "application/json"}
 
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict:
+        def iter_bytes(self):
             body = {
                 "adjustments": [
                     {"id": a3["id"], "delta": 1.0, "reason": "Strong reader match"},
                 ]
             }
-            return {"choices": [{"message": {"content": json.dumps(body)}}]}
+            yield json.dumps({"choices": [{"message": {"content": json.dumps(body)}}]}).encode(
+                "utf-8"
+            )
+
+        def close(self) -> None:
+            return None
 
     class _ServingClient:
         def __init__(self, *args, **kwargs):
@@ -1223,7 +1238,11 @@ def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
         def __exit__(self, *args):
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
             return _FakeLLMResponse()
 
     monkeypatch.setattr(httpx, "Client", _ServingClient)
@@ -1252,3 +1271,235 @@ def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
     assert [item["id"] for item in replayed["pools"]["served"]] == [
         item["id"] for item in served
     ]
+
+
+def test_purge_read_ids_expands_two_part_three_part_and_manual_read_keys(database):
+    vec = np.asarray([0.5, 0.25, -0.5], dtype=np.float32)
+    with transaction() as con:
+        cand_a = _candidate(con, "Purge Read Alpha", "A. Writer")
+        cand_b = _candidate(con, "Purge Read Beta", "B. Writer")
+        cand_c = _candidate(con, "Purge Read Gamma", "C. Writer")
+        cand_keep = _candidate(con, "Purge Read Keep", "D. Writer")
+        all_cands = [cand_a, cand_b, cand_c, cand_keep]
+        vec_map = {item["id"]: vec for item in all_cands}
+        _set_embeddings(con, all_cands, vec_map)
+        ev_a = _build(con, [cand_a], [], {cand_a["id"]: vec})
+        ev_b = _build(con, [cand_b], [], {cand_b["id"]: vec})
+        ev_c = _build(con, [cand_c], [], {cand_c["id"]: vec})
+        ev_keep = _build(con, [cand_keep], [], {cand_keep["id"]: vec})
+        read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Purge Read Alpha','A. Writer',5,'2025-06-01','goodreads_csv')"
+            ).lastrowid
+        )
+        other_read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Purge Read Keep','D. Writer',4,'2025-06-01','goodreads_csv')"
+            ).lastrowid
+        )
+
+    run_a = create_recommendation_run([cand_a], decision_evidence=ev_a)
+    run_b = create_recommendation_run([cand_b], decision_evidence=ev_b)
+    run_c = create_recommendation_run([cand_c], decision_evidence=ev_c)
+    run_keep = create_recommendation_run([cand_keep], decision_evidence=ev_keep)
+
+    two_part_key = f"read:{read_id:08d}"
+    three_part_key = f"read:{read_id:08d}:{cand_b['id']}"
+    manual_key = f"manual-read:{cand_c['id']}:{read_id:08d}"
+    keep_key = f"read:{other_read_id:08d}"
+
+    with transaction() as con:
+        for key, cand, run, rid in (
+            (two_part_key, cand_a, run_a, read_id),
+            (three_part_key, cand_b, run_b, read_id),
+            (manual_key, cand_c, run_c, read_id),
+            (keep_key, cand_keep, run_keep, other_read_id),
+        ):
+            record_event_in_connection(
+                con,
+                event_key=key,
+                candidate_id=cand["id"],
+                event_type="read",
+                run_id=run,
+                value=5.0,
+                source="read_import",
+                label=1.0,
+                label_kind="rating_positive",
+                confidence=1.0,
+                read_id=rid,
+            )
+
+        removed = purge_recommendation_evidence(con, read_ids=[read_id])
+        assert removed["runs_removed"] == 3
+        for purged_run in (run_a, run_b, run_c):
+            assert (
+                con.execute(
+                    "SELECT 1 FROM recommendation_runs WHERE id=?", (purged_run,)
+                ).fetchone()
+                is None
+            )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (run_keep,)
+            ).fetchone()
+            is not None
+        )
+        for table in (
+            "recommendation_events",
+            "recommendation_evidence_events",
+            "recommendation_evidence_outcomes",
+        ):
+            assert (
+                con.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE event_key IN (?,?,?)",
+                    (two_part_key, three_part_key, manual_key),
+                ).fetchone()[0]
+                == 0
+            )
+            assert (
+                con.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE event_key=?",
+                    (keep_key,),
+                ).fetchone()[0]
+                == 1
+            )
+
+
+def test_purge_orphan_sweep_is_scoped_to_purged_runs(database):
+    vec = np.asarray([0.3, -0.4, 0.8], dtype=np.float32)
+    with transaction() as con:
+        first = _candidate(con, "Scoped Purge First", "E. Writer")
+        second = _candidate(con, "Scoped Purge Second", "F. Writer")
+        unrelated = _candidate(con, "Scoped Purge Unrelated", "G. Writer")
+        _set_embeddings(
+            con,
+            [first, second, unrelated],
+            {first["id"]: vec, second["id"]: vec, unrelated["id"]: vec},
+        )
+        ev_first = _build(con, [first, second], [], {first["id"]: vec, second["id"]: vec})
+        ev_second = _build(con, [second], [], {second["id"]: vec})
+
+    run_first = create_recommendation_run([first, second], decision_evidence=ev_first)
+    run_second = create_recommendation_run([second], decision_evidence=ev_second)
+
+    key_purged = "scoped-read:00000001"
+    key_shared = "scoped-read:00000002"
+    key_unrelated_orphan = "unrelated-orphan:00000099"
+
+    with transaction() as con:
+        # key_purged belongs only to run_first, then gets an unlinked retraction revision.
+        record_event_in_connection(
+            con,
+            event_key=key_purged,
+            candidate_id=first["id"],
+            event_type="read",
+            run_id=run_first,
+            value=5.0,
+            source="read_import",
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+        )
+        record_event_in_connection(
+            con,
+            event_key=key_purged,
+            candidate_id=first["id"],
+            event_type="read",
+            run_id=None,
+            value=5.0,
+            source="read_import",
+            clear_read_outcome=True,
+        )
+
+        # key_shared spans run_first and run_second, then gets an unlinked retraction revision.
+        record_event_in_connection(
+            con,
+            event_key=key_shared,
+            candidate_id=second["id"],
+            event_type="read",
+            run_id=run_first,
+            value=4.0,
+            source="read_import",
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+        )
+        record_event_in_connection(
+            con,
+            event_key=key_shared,
+            candidate_id=second["id"],
+            event_type="read",
+            run_id=run_second,
+            value=5.0,
+            source="read_import",
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+        )
+        record_event_in_connection(
+            con,
+            event_key=key_shared,
+            candidate_id=second["id"],
+            event_type="read",
+            run_id=None,
+            value=5.0,
+            source="read_import",
+            clear_read_outcome=True,
+        )
+
+        # Unrelated run-less evidence event with no run_id IS NOT NULL sibling anywhere.
+        con.execute(
+            "INSERT INTO recommendation_evidence_events("
+            "event_key,revision,run_id,candidate_id,event_type,value,source,occurred_at) "
+            "VALUES(?,1,NULL,?,'restore',NULL,'ui_undo','2025-06-02T00:00:00+00:00')",
+            (key_unrelated_orphan, unrelated["id"]),
+        )
+
+        removed = purge_recommendation_evidence(con, run_ids=[run_first])
+        assert removed["runs_removed"] == 1
+
+        # key_purged's unlinked revision is cleaned up with run_first.
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_events WHERE event_key=?",
+                (key_purged,),
+            ).fetchone()[0]
+            == 0
+        )
+        # key_shared still has run_second, so both its run_second revision and unlinked retraction remain.
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_events WHERE event_key=?",
+                (key_shared,),
+            ).fetchone()[0]
+            == 2
+        )
+        assert load_decision_evidence(con, run_second)["outcomes"] == []
+        # Unrelated run-less evidence row is untouched because the sweep is scoped to run_first's keys.
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_events WHERE event_key=?",
+                (key_unrelated_orphan,),
+            ).fetchone()[0]
+            == 1
+        )
+
+        # Purging run_second now cleans up key_shared's unlinked revision while still preserving key_unrelated_orphan.
+        removed_second = purge_recommendation_evidence(con, run_ids=[run_second])
+        assert removed_second["runs_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_events WHERE event_key=?",
+                (key_shared,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_events WHERE event_key=?",
+                (key_unrelated_orphan,),
+            ).fetchone()[0]
+            == 1
+        )

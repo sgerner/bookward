@@ -19,17 +19,20 @@ from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
 from .config import settings
 from .database import (
     DEFAULT_DIGEST_APP_URLS,
+    DEFAULT_SOURCE_URLS,
     RestoreEpochError,
     bind_request_restore_epoch,
     connect,
     database_lock,
+    demote_orphaned_recommended_candidates,
     fenced_async,
     initialize,
     normalize_key,
+    recompute_candidate_sources,
     row,
     rows,
     scheduler_fenced,
@@ -69,6 +72,14 @@ from .ingestion import (
     refresh_missing_candidate_metadata,
     scan_source,
 )
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    ResponseBoundsError,
+    ResponseTooLargeError,
+    iter_bounded_bytes_async,
+    stream_bytes_async,
+    stream_json_async,
+)
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
@@ -95,16 +106,19 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    sync_read_rating_in_connection,
     validate_candidate_run_id,
     _impression_precedes,
     _read_label,
     _read_time,
+    _validate_identifier,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -122,7 +136,10 @@ from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
     audit_candidates,
+    configure_candidate_quality_sweep,
+    finish_candidate_quality_batch,
     has_candidate_quality_audit_candidates,
+    prepare_candidate_quality_batch,
     quality_summary,
 )
 from . import llm_reranker
@@ -144,7 +161,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_scope
+from .tenancy import current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -181,6 +198,11 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class CandidateAuditIn(BaseModel):
+    mode: Literal["incremental", "full"] | None = None
+    retry: bool = False
 
 
 def _ensure_profile_database(profile_id: str):
@@ -297,6 +319,22 @@ def active_job(kind: str):
     )
 
 
+_SOURCE_SCAN_GENERATIONS: dict[tuple[str, int], int] = {}
+
+
+def _source_scan_generation_key(source_id: int) -> tuple[str, int]:
+    return (str(profile_database_path()), int(source_id))
+
+
+def _source_scan_generation(source_id: int) -> int:
+    return _SOURCE_SCAN_GENERATIONS.get(_source_scan_generation_key(source_id), 0)
+
+
+def _bump_source_scan_generation(source_id: int) -> None:
+    key = _source_scan_generation_key(source_id)
+    _SOURCE_SCAN_GENERATIONS[key] = _SOURCE_SCAN_GENERATIONS.get(key, 0) + 1
+
+
 def enqueue_followup_job(kind: str):
     """Keep at most one queued continuation while the current job is running."""
 
@@ -326,7 +364,11 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+    if (
+        not active_job("candidate_quality")
+        and not active_job("candidate_quality_recovery")
+        and has_candidate_quality_audit_candidates()
+    ):
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -596,15 +638,43 @@ async def handle_job(kind: str):
             enqueue_followup_job("metadata")
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        quality = await audit_candidates(only_pending=False)
-        enqueue_job("read_work_identities", dedupe=True)
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
+        mode, started_at = prepare_candidate_quality_batch()
+        quality = await audit_candidates(
+            only_pending=(mode != "full"),
+            limit=QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=started_at,
         )
-        return {**quality, "scored": scored}
+        stopped = bool(quality.get("stopped"))
+        remaining = finish_candidate_quality_batch(
+            mode=mode,
+            started_at=started_at,
+            stopped=stopped,
+        )
+        changed = bool(
+            quality.get("status_changed")
+            or quality.get("deduped")
+            or quality.get("enriched")
+        )
+        is_final_batch = remaining == 0 and not stopped
+        score_job_id = (
+            enqueue_followup_job("score")
+            if (changed or is_final_batch)
+            else None
+        )
+        followup_job_id = (
+            enqueue_followup_job("candidate_quality")
+            if remaining > 0
+            else None
+        )
+        if quality.get("audited") or is_final_batch:
+            enqueue_job("read_work_identities", dedupe=True)
+        return {
+            **quality,
+            "mode": mode,
+            "remaining": remaining,
+            "followup_job_id": followup_job_id,
+            "score_job_id": score_job_id,
+        }
     if kind == "candidate_quality_recovery":
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
         _enqueue_candidate_quality_followup()
@@ -630,18 +700,103 @@ async def handle_job(kind: str):
             return {"skipped": "disabled", "source_id": source_id}
         if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
+        started_url = source["url"]
+        started_lifecycle = source["lifecycle"]
+        started_filters = normalize_source_filters(source.get("filters"))
+        started_last_scanned_at = source["last_scanned_at"]
+        started_last_attempted_at = source.get("last_attempted_at")
+        started_generation = _source_scan_generation(source_id)
+        queued_before = {
+            item["id"]
+            for item in rows(
+                "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                (kind,),
+            )
+        }
+
+        def _concurrent_source_state():
+            current = row("SELECT * FROM sources WHERE id=?", (source_id,))
+            if not current:
+                return None, False, False
+            queued_after = {
+                item["id"]
+                for item in rows(
+                    "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                    (kind,),
+                )
+            }
+            url_changed = current["url"] != started_url
+            lifecycle_changed = current["lifecycle"] != started_lifecycle
+            filters_changed = (
+                normalize_source_filters(current.get("filters")) != started_filters
+            )
+            reset_during_run = (
+                (
+                    started_last_scanned_at is not None
+                    and current["last_scanned_at"] is None
+                )
+                or (
+                    started_last_attempted_at is not None
+                    and current.get("last_attempted_at") is None
+                )
+                or bool(queued_after - queued_before)
+                or _source_scan_generation(source_id) != started_generation
+            )
+            return (
+                current,
+                url_changed,
+                url_changed
+                or lifecycle_changed
+                or filters_changed
+                or reset_during_run,
+            )
+
         try:
             collected = await scan_source(source)
         except RestoreEpochError:
             raise
         except Exception as exc:
             message = safe_error_message(exc)
+            current, url_changed, needs_rescan = _concurrent_source_state()
             with transaction() as con:
-                con.execute(
-                    "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (f"error:{message}", source_id),
-                )
+                if not url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (f"error:{message}", source_id),
+                    )
+                    if needs_rescan and current and current["lifecycle"] == "one_time":
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                else:
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                        (source_id,),
+                    )
+            if (
+                needs_rescan
+                and current
+                and current["enabled"]
+                and current["kind"] not in {"builtin", "association"}
+            ):
+                enqueue_followup_job(kind)
             raise
+        current, url_changed, needs_rescan = _concurrent_source_state()
+        if needs_rescan and current:
+            with transaction() as con:
+                if url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                        (source_id,),
+                    )
+                elif current["lifecycle"] == "one_time":
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                        (source_id,),
+                    )
+            if current["enabled"] and current["kind"] not in {"builtin", "association"}:
+                enqueue_followup_job(kind)
         metadata = await refresh_missing_candidate_metadata()
         if candidate_metadata_refresh_remaining():
             enqueue_job("metadata", dedupe=True)
@@ -734,7 +889,7 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if has_candidate_quality_audit_candidates():
+                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -1389,9 +1544,28 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
-    url: HttpUrl | None = None
+    name: str | None = None
+    url: str | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
+
+
+_HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
+
+
+def _is_custom_source(source: dict[str, Any] | sqlite3.Row) -> bool:
+    return bool(
+        source["kind"] == "web"
+        and not source["is_default"]
+        and source["url"] not in DEFAULT_SOURCE_URLS
+    )
+
+
+def _serialize_source(source: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    item = dict(source)
+    item["filters"] = normalize_source_filters(item.get("filters"))
+    item["is_custom"] = _is_custom_source(item)
+    return item
 
 
 class SourceScheduleIn(BaseModel):
@@ -1451,6 +1625,33 @@ class MarkReadIn(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
     )
+
+
+class ReadingHistoryRatingIn(BaseModel):
+    rating: int | None
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def validate_whole_star_rating(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, int):
+            if 1 <= value <= 5:
+                return value
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "":
+                raise HTTPException(
+                    400,
+                    "Rating must be a whole number between 1 and 5, or null for unrated",
+                )
+            if trimmed in {"1", "2", "3", "4", "5"}:
+                return int(trimmed)
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
 
 
 class TelemetryEventIn(BaseModel):
@@ -2170,11 +2371,6 @@ def overview_payload(
     recommendation_limit: int | None = None,
     decision_limit: int = 24,
 ):
-    def source_payload(source):
-        item = dict(source)
-        item["filters"] = normalize_source_filters(item.get("filters"))
-        return item
-
     deferred_prepared = None
     recommendations = None
     run_id = None
@@ -2214,7 +2410,7 @@ def overview_payload(
             for item in all_decision_rows[:decision_limit]
         ]
         sources_list = [
-            source_payload(item)
+            _serialize_source(item)
             for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()
@@ -2306,6 +2502,51 @@ def reading_history():
         item["algorithm_explanation"] = []
         item["metadata_confidence"] = None
     return items
+
+
+@app.put("/api/reading-history/{read_id}")
+def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    """Set, change, or clear a whole-star rating on an existing read entry."""
+    if read_id <= 0:
+        raise HTTPException(404, "Read entry not found")
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?",
+            (read_id,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        con.execute(
+            "UPDATE reads SET rating=? WHERE id=?",
+            (payload.rating, read_id),
+        )
+        updated = dict(
+            con.execute(
+                "SELECT * FROM reads WHERE id=?",
+                (read_id,),
+            ).fetchone()
+        )
+        try:
+            sync_read_rating_in_connection(con, updated)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    job_id = enqueue_followup_job("score")
+    raw_rating = updated.get("rating")
+    normalized_rating = (
+        int(raw_rating)
+        if raw_rating is not None and float(raw_rating).is_integer()
+        else raw_rating
+    )
+    return {
+        "id": int(updated["id"]),
+        "title": updated["title"],
+        "author": updated["author"],
+        "rating": normalized_rating,
+        "read_at": updated.get("read_at"),
+        "source": updated.get("source") or "",
+        "created_at": updated.get("created_at"),
+        "job_id": job_id,
+    }
 
 
 @app.get("/api/reading-history/scores")
@@ -2716,10 +2957,30 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "read_source": str(read["source"] or "unknown")[:32],
         "time_precision": "day" if day_precision else "timestamp",
     }
+    read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
+    existing_read_event = con.execute(
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?) ORDER BY id",
+        (read_event_key, candidate_read_event_key),
+    ).fetchall()
+    matched_existing_key = next(
+        (
+            str(item["event_key"])
+            for item in existing_read_event
+            if int(item["candidate_id"]) == int(candidate["id"])
+        ),
+        None,
+    )
+    event_key = (
+        matched_existing_key
+        if matched_existing_key is not None
+        else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+    )
     try:
         record_event_in_connection(
             con,
-            event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
+            event_key=event_key,
             candidate_id=int(candidate["id"]),
             event_type="read",
             value=saved_rating,
@@ -2735,6 +2996,47 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return read, existing is not None
+
+
+def _clear_explicit_feedback_outcomes(
+    con,
+    candidate_id: int,
+    *,
+    event_type: str,
+    source: str = "ui",
+    event_key: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if event_key is not None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes "
+            "WHERE label_kind='explicit_feedback' AND event_id=("
+            "SELECT id FROM recommendation_events WHERE event_key=?)",
+            (event_key,),
+        )
+        retract_recommendation_outcome_evidence(
+            con,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            source=source,
+            occurred_at=now,
+            event_key=event_key,
+        )
+        return
+    con.execute(
+        "DELETE FROM recommendation_outcomes "
+        "WHERE label_kind='explicit_feedback' AND ("
+        "event_id IN (SELECT id FROM recommendation_events WHERE candidate_id=?) "
+        "OR impression_id IN (SELECT id FROM recommendation_impressions WHERE candidate_id=?))",
+        (candidate_id, candidate_id),
+    )
+    retract_recommendation_outcome_evidence(
+        con,
+        candidate_id=candidate_id,
+        event_type=event_type,
+        source=source,
+        occurred_at=now,
+    )
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2757,6 +3059,13 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
             (candidate_id, payload.action, previous_status),
         ).lastrowid
+        if payload.action in {"restore", "maybe_later"}:
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=payload.action,
+                source="ui",
+            )
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
             record_event_in_connection(
@@ -2830,11 +3139,6 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
         (decision_id,),
     )
-    con.execute(
-        "DELETE FROM recommendation_outcomes WHERE event_id=("
-        "SELECT id FROM recommendation_events WHERE event_key=?)",
-        (f"feedback:{decision_id}",),
-    )
     compensation = (
         "librarr_import" if previous_status == "imported"
         else "save" if previous_status == "saved"
@@ -2842,6 +3146,20 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         else "maybe_later" if previous_status == "maybe_later"
         else "restore"
     )
+    _clear_explicit_feedback_outcomes(
+        con,
+        candidate_id,
+        event_type=compensation,
+        source="ui_undo",
+        event_key=f"feedback:{decision_id}",
+    )
+    if compensation in {"restore", "maybe_later"}:
+        _clear_explicit_feedback_outcomes(
+            con,
+            candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
     try:
         record_event_in_connection(
             con,
@@ -2911,22 +3229,51 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     decisions = []
     with transaction() as con:
+        if payload.run_id is not None:
+            try:
+                _validate_identifier(payload.run_id, "recommendation run")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         placeholders = ",".join("?" for _ in ids)
-        found = {
+        candidate_rows = {
             int(item["id"]): str(item["status"])
             for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})",
+                ids,
             ).fetchall()
         }
-        for candidate_id in ids:
-            if candidate_id not in found:
-                continue
-            previous_status = found[candidate_id]
-            con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
+        found = [candidate_id for candidate_id in ids if candidate_id in candidate_rows]
+        run_candidate_ids: set[int] = set()
+        if payload.run_id is not None and found:
+            run_placeholders = ",".join("?" for _ in found)
+            run_candidate_ids = {
+                int(item["candidate_id"])
+                for item in con.execute(
+                    f"SELECT candidate_id FROM recommendation_impressions "
+                    f"WHERE run_id=? AND candidate_id IN ({run_placeholders})",
+                    (payload.run_id, *found),
+                ).fetchall()
+            }
+        for candidate_id in found:
+            previous_status = candidate_rows[candidate_id]
+            con.execute(
+                "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, candidate_id),
+            )
             feedback_id = con.execute(
                 "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
                 (candidate_id, payload.action, previous_status),
             ).lastrowid
+            if payload.action == "restore":
+                _clear_explicit_feedback_outcomes(
+                    con,
+                    candidate_id,
+                    event_type="restore",
+                    source="ui",
+                )
+            candidate_run_id = (
+                payload.run_id if candidate_id in run_candidate_ids else None
+            )
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
                 record_event_in_connection(
@@ -2934,11 +3281,11 @@ def bulk_feedback(payload: BulkFeedbackIn):
                     event_key=f"feedback:{feedback_id}",
                     candidate_id=candidate_id,
                     event_type=payload.action,
-                    run_id=payload.run_id,
+                    run_id=candidate_run_id,
                     source="ui",
                     label=label,
                     label_kind="explicit_feedback" if label is not None else None,
-                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                    confidence=0.8 if candidate_run_id and label is not None else 0.5,
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -3053,10 +3400,23 @@ async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Bo
         validate_service_url(config["librarr_url"], allowed)
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             media_type = normalize_media_type(config.get("librarr_media_type"))
-            response = await client.post(f"{config['librarr_url'].rstrip('/')}/api/wishlist", headers={"X-Api-Key":config["librarr_api_key"],"Idempotency-Key":key}, json={"title":candidate["title"],"author":candidate["author"],"media_type":media_type})
-            response.raise_for_status()
-            try: data = response.json()
-            except ValueError: data = {}
+            _response, body = await stream_bytes_async(
+                client,
+                "POST",
+                f"{config['librarr_url'].rstrip('/')}/api/wishlist",
+                headers={"X-Api-Key": config["librarr_api_key"], "Idempotency-Key": key},
+                json={"title": candidate["title"], "author": candidate["author"], "media_type": media_type},
+                max_bytes=settings.librarr_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Librarr returned an unsupported wishlist content type",
+                size_error="Librarr wishlist response is too large",
+            )
+            try:
+                parsed_body = json.loads(body) if body.strip() else {}
+                data = parsed_body if isinstance(parsed_body, dict) else {}
+            except ValueError:
+                data = {}
         remote_id = str(data.get("id", "imported"))
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
@@ -3079,10 +3439,10 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         media = normalize_media_type(media_type)
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 @app.get("/api/librarr/search/stream")
@@ -3098,18 +3458,30 @@ async def stream_librarr_search(
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
     assert client is not None and upstream is not None
 
     async def stream_bytes():
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
+            async for chunk in iter_bounded_bytes_async(
+                upstream,
+                max_bytes=settings.librarr_stream_max_bytes,
+                size_error="Librarr search stream is too large",
+            ):
+                yield chunk
+        except ResponseTooLargeError:
+            LOGGER.warning(
+                "Aborted Librarr SSE stream after exceeding %d bytes",
+                settings.librarr_stream_max_bytes,
+            )
+            error_payload = json.dumps(
+                {"message": "Librarr search stream exceeded the maximum response size."}
+            )
+            yield f"\n\nevent: error\ndata: {error_payload}\n\n".encode("utf-8")
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -3169,10 +3541,10 @@ async def download_librarr(payload: LibrarrDownloadIn):
                     )
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @fenced_async
 async def _import_csv_upload(file: UploadFile):
@@ -3287,6 +3659,14 @@ def _reject_inline_nyt_key(url: str):
             "Store NYT credentials in encrypted NYT API settings instead of the source URL.",
         )
 
+@app.get("/api/sources")
+def list_sources():
+    return [
+        _serialize_source(source)
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    ]
+
+
 @app.post("/api/sources")
 def add_source(payload: SourceIn):
     _reject_inline_nyt_key(str(payload.url))
@@ -3308,13 +3688,9 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
         "WHERE id=?",
         (source_id,),
     )
+    recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE source_id=? AND status='recommended'",
-            (source_id,),
-        )
+        demote_orphaned_recommended_candidates(con, source_id=source_id)
     return became_enabled
 
 
@@ -3342,11 +3718,11 @@ def toggle_source(source_id:int):
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
         became_enabled = _toggle_source_row(con, source_id, source)
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if became_enabled and source["kind"] not in {"builtin", "association"}
-        else None
-    )
+    if became_enabled and source["kind"] not in {"builtin", "association"}:
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
+    else:
+        job_id = None
     return {"id":source_id, "job_id":job_id}
 
 
@@ -3632,101 +4008,211 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
+    """Return the cached models.dev provider catalog for the Settings picker.
+
+    Refreshes connect directly with ``follow_redirects=False`` and
+    ``trust_env=False`` (matching public source and catalog fetches so ambient
+    ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` and ``SSL_CERT_*`` variables
+    are ignored). Deployments that require an outbound HTTP proxy receive HTTP
+    502 here and should configure the LLM reranker endpoint URL and model ID
+    directly in Settings.
+    """
+
     now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get("https://models.dev/api.json")
-            resp.raise_for_status()
-            providers = _normalize_models_dev_catalog(resp.json())
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _resp, raw_catalog = await stream_json_async(
+                client,
+                "GET",
+                "https://models.dev/api.json",
+                max_bytes=settings.models_dev_max_bytes,
+                size_error="models.dev catalog response is too large",
+            )
+        if not isinstance(raw_catalog, dict):
+            raise ValueError("models.dev catalog must be a JSON object")
+        providers = _normalize_models_dev_catalog(raw_catalog)
         _MODELS_DEV_CACHE["providers"] = providers
         _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
         return {"providers": providers, "cached": False}
     except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
+
+
+def _validate_source_update_guardrails(source: dict[str, Any] | sqlite3.Row, payload: SourceUpdateIn):
+    if source["kind"] in {"builtin", "association"} or source["is_default"]:
+        if payload.name is not None:
+            raise HTTPException(400, "This source name cannot be changed")
+        if payload.url is not None:
+            raise HTTPException(400, "This source URL cannot be changed")
+        if payload.filters is not None:
+            raise HTTPException(
+                400,
+                "The built-in source cannot be filtered"
+                if source["kind"] == "builtin"
+                else "This source cannot be filtered",
+            )
+        if payload.lifecycle is not None:
+            raise HTTPException(400, "This source lifecycle cannot be changed")
+    if payload.url is not None and source["url"] in DEFAULT_SOURCE_URLS:
+        raise HTTPException(400, "Default source URLs cannot be changed")
+
+
+def _source_integrity_conflict_detail(exc: sqlite3.IntegrityError) -> str:
+    detail = str(exc).lower()
+    if "sources.name" in detail or detail.endswith(".name") or "(name)" in detail:
+        return "A source with that name already exists"
+    if "sources.url" in detail or detail.endswith(".url") or "(url)" in detail:
+        return "A source with that URL already exists"
+    return "Source already exists"
 
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
-    next_url: str | None = None
+    initial = row(
+        "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+        "FROM sources WHERE id=?",
+        (source_id,),
+    )
+    if not initial:
+        raise HTTPException(404, "Source not found")
+    _validate_source_update_guardrails(initial, payload)
+
+    cleaned_name: str | None = None
+    if payload.name is not None:
+        cleaned_name = payload.name.strip()
+        if len(cleaned_name) < 2 or len(cleaned_name) > 100:
+            raise HTTPException(400, "Source name must be between 2 and 100 characters")
+
+    normalized_url: str | None = None
     if payload.url is not None:
-        next_url = str(payload.url)
-        _reject_inline_nyt_key(next_url)
+        raw_url = payload.url.strip()
+        if not raw_url or len(raw_url) > 2048:
+            raise HTTPException(400, "Invalid public URL")
+        _reject_inline_nyt_key(raw_url)
         try:
-            validate_public_url(next_url)
+            validate_public_url(raw_url)
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
-    updates = []
-    values = []
+        try:
+            normalized_url = str(_HTTP_URL_ADAPTER.validate_python(raw_url))
+        except ValidationError as exc:
+            raise HTTPException(400, "Invalid public URL") from exc
+
     with transaction() as con:
         source = con.execute(
-            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+            "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
             "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
         if not source:
             raise HTTPException(404, "Source not found")
-        if next_url is not None:
-            if source["is_default"] or source["kind"] in {"builtin", "association"}:
-                raise HTTPException(400, "This source URL cannot be changed")
+        _validate_source_update_guardrails(source, payload)
+
+        updates: list[str] = []
+        values: list[object] = []
+        url_changed = False
+        existing_filters = normalize_source_filters(source["filters"])
+
+        if cleaned_name is not None:
+            updates.append("name=?")
+            values.append(cleaned_name)
+        if normalized_url is not None:
             updates.append("url=?")
-            values.append(next_url)
+            values.append(normalized_url)
+            url_changed = normalized_url != source["url"]
         if payload.filters is not None:
-            if source["kind"] == "builtin":
-                raise HTTPException(400, "The built-in source cannot be filtered")
             updates.append("filters=?")
             values.append(json.dumps(payload.filters.model_dump()))
-        if payload.lifecycle is not None:
-            if source["kind"] in {"builtin", "association"}:
-                raise HTTPException(400, "This source lifecycle cannot be changed")
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        lifecycle_changed = (
+            payload.lifecycle is not None
+            and payload.lifecycle != source["lifecycle"]
+        )
+        if lifecycle_changed:
             updates.append("lifecycle=?")
             values.append(payload.lifecycle)
-        effective_lifecycle = payload.lifecycle or source["lifecycle"]
-        if effective_lifecycle == "one_time" and (
-            next_url is not None or payload.filters is not None
+        if url_changed:
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_attempted_at=NULL")
+            updates.append("last_status=NULL")
+        elif effective_lifecycle == "one_time" and (
+            payload.filters is not None
+            or (lifecycle_changed and payload.lifecycle == "one_time")
         ):
             updates.append("last_scanned_at=NULL")
             updates.append("last_attempted_at=NULL")
+
         if updates:
+            values.append(source_id)
             try:
                 con.execute(
-                    f"UPDATE sources SET {','.join(updates)} WHERE id=?",
-                    (*values, source_id),
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
                 )
             except sqlite3.IntegrityError as exc:
-                raise HTTPException(409, "Source already exists") from exc
+                raise HTTPException(
+                    409, _source_integrity_conflict_detail(exc)
+                ) from exc
+
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
-        else normalize_source_filters(source["filters"])
+        else existing_filters
     )
-    should_queue = bool(
-        updates
+    needs_source_scan = (
+        url_changed
+        or payload.filters is not None
+        or lifecycle_changed
+    )
+    job_id = None
+    if (
+        needs_source_scan
         and source["enabled"]
         and source["kind"] not in {"builtin", "association"}
-        and not (
-            effective_lifecycle == "one_time"
-            and next_url is None
-            and payload.filters is None
-            and _one_time_source_completed(source)
-        )
-    )
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if should_queue
-        else None
-    )
+    ):
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
     return {
         "id": source_id,
-        "url": next_url or source["url"],
+        "name": cleaned_name if cleaned_name is not None else source["name"],
+        "url": normalized_url if normalized_url is not None else source["url"],
         "filters": filters,
         "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
+
+
+@app.post("/api/sources/{source_id}/refresh")
+def refresh_source(source_id: int):
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,is_default,lifecycle FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if source["kind"] in {"builtin", "association"} or source["is_default"]:
+            raise HTTPException(400, "Only web sources can be refreshed")
+        if not source["enabled"]:
+            raise HTTPException(400, "Enable this source before refreshing it")
+        if source["lifecycle"] == "one_time":
+            con.execute(
+                "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                (source_id,),
+            )
+    _bump_source_scan_generation(source_id)
+    job_id = enqueue_followup_job(f"source:{source_id}")
+    return {"id": source_id, "job_id": job_id}
 
 
 def _save_digest_settings(updates: dict):
@@ -3848,12 +4334,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND COALESCE(s.enabled,1)=1",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }
@@ -3914,10 +4400,12 @@ async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/candidates/audit")
-async def candidate_audit():
-    """Queue a full catalog identity and quality audit."""
+async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
+    """Queue a bounded incremental or full catalog identity and quality audit."""
 
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
+    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
+    return configure_candidate_quality_sweep(mode=mode, retry=retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
@@ -4036,7 +4524,7 @@ async def preview_google_book_associations():
     try:
         associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+        raise HTTPException(502, f"Google Books preview failed: {safe_error_message(exc)}") from exc
     return {
         "provider": provider.provider,
         "count": len(associations),
@@ -4334,6 +4822,8 @@ def api_root():
         "documentation": "GET /openapi.json or /docs on the engine",
         "endpoints": {
             "overview": "GET /api/v1/overview",
+            "reading_history": "GET /api/v1/reading-history",
+            "reading_history_rating": "PUT /api/v1/reading-history/{id}",
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
@@ -4357,6 +4847,16 @@ def api_me(request: Request):
 @api_v1.get("/overview")
 def api_overview():
     return overview_payload(include_api_tokens=False)
+
+
+@api_v1.get("/reading-history")
+def api_reading_history():
+    return reading_history()
+
+
+@api_v1.put("/reading-history/{read_id}")
+def api_update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    return update_reading_history_rating(read_id, payload)
 
 
 @api_v1.get("/settings")
@@ -4408,10 +4908,7 @@ async def api_import_librarr(candidate_id: int, payload: LibrarrImportIn | None 
 
 @api_v1.get("/sources")
 def api_sources():
-    return [
-        {**source, "filters": normalize_source_filters(source.get("filters"))}
-        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
-    ]
+    return list_sources()
 
 
 @api_v1.post("/sources/preview")
@@ -4437,6 +4934,11 @@ def api_update_source_schedule(payload: SourceScheduleIn):
 @api_v1.put("/sources/{source_id}")
 def api_update_source(source_id: int, payload: SourceUpdateIn):
     return update_source(source_id, payload)
+
+
+@api_v1.post("/sources/{source_id}/refresh")
+def api_refresh_source(source_id: int):
+    return refresh_source(source_id)
 
 
 @api_v1.post("/import/goodreads/rss")
