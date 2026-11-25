@@ -51,7 +51,7 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
-from .decision_evidence import set_evidence_rotation_enabled
+from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
@@ -1918,9 +1918,17 @@ def _prepare_tracked_recommendations(
     recommendations = None
     interaction_events: list[dict[str, Any]] = []
     cached_vectors: dict[int, Any] = {}
+    visible_day_counts: dict[int, int] = {}
+    fatigue_settings = {
+        "enabled": bool(settings.impression_fatigue_enabled),
+        "window_days": int(settings.impression_fatigue_window_days),
+        "grace_days": int(settings.impression_fatigue_grace_days),
+        "penalty_per_day": float(settings.impression_fatigue_penalty_per_day),
+        "max_penalty": float(settings.impression_fatigue_max_penalty),
+    }
     read_rows: list[dict[str, Any]] = []
     llm_events: list[dict[str, Any]] = []
-    llm_cfg = {"enabled": False, "provider": "", "api_url": "", "api_key": "", "model": ""}
+    llm_cfg: dict[str, Any] = {}
     llm_active = False
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata: dict[str, Any] = {
@@ -1995,8 +2003,12 @@ def _prepare_tracked_recommendations(
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
             if not is_filtered and has_recommended:
                 try:
-                    llm_cfg = effective_llm_rerank_settings(connection, private)
-                    llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
+                    llm_cfg = {
+                        **effective_llm_rerank_settings(connection, private),
+                        "top_k": settings.llm_rerank_top_k,
+                        "max_delta": settings.llm_rerank_max_delta,
+                    }
+                    llm_active = bool(llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip())
                     if llm_active:
                         read_rows, llm_events = _load_llm_rerank_inputs(
                             connection, interaction_events
@@ -2014,6 +2026,9 @@ def _prepare_tracked_recommendations(
             fallback_triggered = True
             base_pool = personalized_pool = None
             ranked = None
+            visible_day_counts = {}
+            llm_cfg = {}
+            llm_active = False
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2081,6 +2096,8 @@ def _prepare_tracked_recommendations(
         "recommendations": recommendations,
         "interaction_events": interaction_events,
         "cached_vectors": cached_vectors,
+        "visible_day_counts": visible_day_counts,
+        "fatigue_settings": fatigue_settings,
         "learning_metadata": learning_metadata,
         "discovery_metadata": discovery_metadata,
         "llm_active": llm_active,
@@ -2112,8 +2129,12 @@ def _complete_tracked_recommendations(
     recommendations = prepared["recommendations"]
     interaction_events = prepared["interaction_events"]
     cached_vectors = prepared["cached_vectors"]
+    visible_day_counts = prepared["visible_day_counts"]
+    fatigue_settings = prepared["fatigue_settings"]
     learning_metadata = prepared["learning_metadata"]
     discovery_metadata = prepared["discovery_metadata"]
+    llm_cfg = prepared["llm_cfg"]
+    llm_rerank_output: dict[str, Any] | None = None
     final_pool = None
 
     if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
@@ -2147,7 +2168,12 @@ def _complete_tracked_recommendations(
                         )
                         recommended = unreranked_recommended
                         llm_diag = {"applied": False, "reason": "fallback"}
-                    learning_metadata["llm_rerank"] = llm_diag
+                    llm_rerank_output = llm_diag
+                    learning_metadata["llm_rerank"] = {
+                        key: value
+                        for key, value in llm_diag.items()
+                        if key not in {"adjustments", "rankings"}
+                    }
                 # Apply bounded anti-redundancy swaps after LLM score adjustments.
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
@@ -2195,6 +2221,7 @@ def _complete_tracked_recommendations(
                 "Post-personalization slate assembly failed; serving base ranking"
             )
             base_pool = personalized_pool = final_pool = None
+            llm_rerank_output = None
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2245,7 +2272,7 @@ def _complete_tracked_recommendations(
         )
     if is_filtered:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "filtered_query",
             "captured_at": ranking_at.isoformat(),
@@ -2270,10 +2297,14 @@ def _complete_tracked_recommendations(
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
             },
+            visible_day_counts=visible_day_counts,
+            impression_fatigue_settings=fatigue_settings,
+            llm_rerank_settings=llm_cfg,
+            llm_rerank_output=llm_rerank_output,
         )
     else:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
@@ -2356,27 +2387,20 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        llm_cfg = effective_llm_rerank_settings(connection, private)
-        llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
-        if llm_active:
-            deferred_prepared = _prepare_tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
-            )
+        prepared = _prepare_tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            identity_context=identity_context,
+            include_imported=True,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        if prepared["llm_active"]:
+            deferred_prepared = prepared
         else:
-            recommendations, run_id = tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
+            recommendations, run_id = _complete_tracked_recommendations(
+                prepared, connection=connection
             )
         all_decision_rows = _recommendation_rows(
             connection,
