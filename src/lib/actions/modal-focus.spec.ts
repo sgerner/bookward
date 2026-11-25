@@ -1,6 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
@@ -235,6 +238,8 @@ function findChromeBinary(): string | null {
 class CdpPipeSession {
   private proc: ChildProcess;
   private toBrowser: Writable;
+  private fromBrowser: Readable;
+  private userDataDir: string;
   private nextId = 1;
   private pending = new Map<
     number,
@@ -242,13 +247,32 @@ class CdpPipeSession {
   >();
   private sessionId = "";
   private buffer = "";
+  private stderrTail = "";
+  private closing = false;
+  private closedError: Error | null = null;
 
-  private constructor(proc: ChildProcess) {
+  private constructor(proc: ChildProcess, userDataDir: string) {
     this.proc = proc;
+    this.userDataDir = userDataDir;
     this.toBrowser = proc.stdio[3] as Writable;
-    const fromBrowser = proc.stdio[4] as Readable;
-    fromBrowser.setEncoding("utf8");
-    fromBrowser.on("data", (chunk: string) => {
+    this.fromBrowser = proc.stdio[4] as Readable;
+
+    if (proc.stderr) {
+      proc.stderr.setEncoding("utf8");
+      proc.stderr.on("data", (chunk: string) => {
+        this.stderrTail = `${this.stderrTail}${chunk}`.slice(-4096);
+      });
+      proc.stderr.on("error", () => {});
+    }
+
+    this.toBrowser.on("error", (error) => {
+      this.failPending(
+        new Error(`CDP pipe write failed: ${error.message}`),
+      );
+    });
+
+    this.fromBrowser.setEncoding("utf8");
+    this.fromBrowser.on("data", (chunk: string) => {
       this.buffer += chunk;
       let nulIndex = this.buffer.indexOf("\0");
       while (nulIndex !== -1) {
@@ -275,9 +299,67 @@ class CdpPipeSession {
         nulIndex = this.buffer.indexOf("\0");
       }
     });
+
+    this.fromBrowser.on("error", (error) => {
+      this.failPending(
+        new Error(`CDP pipe read failed: ${error.message}`),
+      );
+    });
+
+    this.fromBrowser.on("close", () => {
+      this.failPending(
+        new Error(
+          `CDP pipe closed unexpectedly${this.formatStderrSuffix()}`,
+        ),
+      );
+    });
+
+    proc.on("error", (error) => {
+      this.failPending(
+        new Error(`Failed to spawn Chromium: ${error.message}`),
+      );
+    });
+
+    proc.on("exit", (code, signal) => {
+      this.failPending(
+        new Error(
+          `Chromium exited unexpectedly (code=${String(code)}, signal=${String(signal)})${this.formatStderrSuffix()}`,
+        ),
+      );
+    });
   }
 
-  static async launch(chromeBinary: string): Promise<CdpPipeSession> {
+  private formatStderrSuffix(): string {
+    const trimmed = this.stderrTail.trim();
+    return trimmed ? `\n${trimmed}` : "";
+  }
+
+  private failPending(error: Error): void {
+    if (this.closing) return;
+    if (!this.closedError) {
+      this.closedError = error;
+    }
+    for (const waiter of this.pending.values()) {
+      waiter.reject(this.closedError);
+    }
+    this.pending.clear();
+  }
+
+  private static async launchOnce(
+    chromeBinary: string,
+    attemptTimeoutMs: number,
+  ): Promise<CdpPipeSession> {
+    const userDataDir = mkdtempSync(
+      join(tmpdir(), "bookward-modal-focus-chrome-"),
+    );
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      DBUS_SESSION_BUS_ADDRESS: "/dev/null",
+      DBUS_SYSTEM_BUS_ADDRESS: "/dev/null",
+    };
+    delete childEnv.DISPLAY;
+    delete childEnv.WAYLAND_DISPLAY;
+
     const proc = spawn(
       chromeBinary,
       [
@@ -287,30 +369,97 @@ class CdpPipeSession {
         "--disable-dev-shm-usage",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-service-autorun",
+        "--no-pings",
+        "--mute-audio",
+        "--metrics-recording-only",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--disable-background-networking",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-field-trial-config",
+        "--disable-hang-monitor",
+        "--disable-ipc-flooding-protection",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-renderer-backgrounding",
+        "--disable-sync",
+        "--disable-translate",
+        `--user-data-dir=${userDataDir}`,
         "--remote-debugging-pipe",
         "about:blank",
       ],
-      { stdio: ["ignore", "ignore", "pipe", "pipe", "pipe"] },
+      {
+        detached: process.platform !== "win32",
+        env: childEnv,
+        stdio: ["ignore", "ignore", "pipe", "pipe", "pipe"],
+      },
     );
-    const client = new CdpPipeSession(proc);
-    const targets = (await client.sendRoot("Target.getTargets")) as {
-      targetInfos: Array<{ targetId: string; type: string }>;
-    };
-    let pageTarget = targets.targetInfos.find((info) => info.type === "page");
-    if (!pageTarget) {
-      const created = (await client.sendRoot("Target.createTarget", {
-        url: "about:blank",
-      })) as { targetId: string };
-      pageTarget = { targetId: created.targetId, type: "page" };
+    const client = new CdpPipeSession(proc, userDataDir);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          const targets = (await client.sendRoot("Target.getTargets")) as {
+            targetInfos: Array<{ targetId: string; type: string }>;
+          };
+          let pageTarget = targets.targetInfos.find(
+            (info) => info.type === "page",
+          );
+          if (!pageTarget) {
+            const created = (await client.sendRoot("Target.createTarget", {
+              url: "about:blank",
+            })) as { targetId: string };
+            pageTarget = { targetId: created.targetId, type: "page" };
+          }
+          const attached = (await client.sendRoot("Target.attachToTarget", {
+            targetId: pageTarget.targetId,
+            flatten: true,
+          })) as { sessionId: string };
+          client.sessionId = attached.sessionId;
+          await client.send("Page.enable");
+          await client.send("Runtime.enable");
+        })(),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(
+              new Error(
+                `Timed out launching headless Chromium after ${attemptTimeoutMs}ms${client.formatStderrSuffix()}`,
+              ),
+            );
+          }, attemptTimeoutMs);
+          timeoutHandle.unref?.();
+        }),
+      ]);
+      return client;
+    } catch (error) {
+      await client.close();
+      throw error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
-    const attached = (await client.sendRoot("Target.attachToTarget", {
-      targetId: pageTarget.targetId,
-      flatten: true,
-    })) as { sessionId: string };
-    client.sessionId = attached.sessionId;
-    await client.send("Page.enable");
-    await client.send("Runtime.enable");
-    return client;
+  }
+
+  static async launch(
+    chromeBinary: string,
+    options: { attempts?: number; attemptTimeoutMs?: number } = {},
+  ): Promise<CdpPipeSession> {
+    const attempts = Math.max(1, options.attempts ?? 3);
+    const attemptTimeoutMs = options.attemptTimeoutMs ?? 8_000;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await CdpPipeSession.launchOnce(chromeBinary, attemptTimeoutMs);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Failed to launch headless Chromium");
   }
 
   private sendRoot(
@@ -325,6 +474,9 @@ class CdpPipeSession {
   }
 
   private sendMessage(payload: Record<string, unknown>): Promise<unknown> {
+    if (this.closedError) {
+      return Promise.reject(this.closedError);
+    }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -382,20 +534,55 @@ class CdpPipeSession {
     return response.result.value as T;
   }
 
+  private signalProcessGroup(signal: NodeJS.Signals): void {
+    const pid = this.proc.pid;
+    if (pid && process.platform !== "win32") {
+      try {
+        process.kill(-pid, signal);
+        return;
+      } catch {
+        // Fall through to direct child signal if the group already exited.
+      }
+    }
+    try {
+      this.proc.kill(signal);
+    } catch {
+      // Process already exited.
+    }
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
+    this.closedError = new Error("CDP session closed");
     for (const waiter of this.pending.values()) {
-      waiter.reject(new Error("CDP session closed"));
+      waiter.reject(this.closedError);
     }
     this.pending.clear();
-    if (this.proc.exitCode === null) {
-      this.proc.kill("SIGTERM");
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      this.signalProcessGroup("SIGTERM");
       await new Promise<void>((resolve) => {
-        this.proc.once("exit", () => resolve());
-        setTimeout(() => {
-          if (this.proc.exitCode === null) this.proc.kill("SIGKILL");
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        const done = () => {
+          if (killTimer) clearTimeout(killTimer);
           resolve();
+        };
+        this.proc.once("exit", done);
+        killTimer = setTimeout(() => {
+          if (this.proc.exitCode === null && this.proc.signalCode === null) {
+            this.signalProcessGroup("SIGKILL");
+          }
+          done();
         }, 1000);
+        killTimer.unref?.();
       });
+    }
+    this.toBrowser.destroy();
+    this.fromBrowser.destroy();
+    this.proc.stderr?.destroy();
+    try {
+      rmSync(this.userDataDir, { recursive: true, force: true });
+    } catch {
+      // Ignore transient cleanup races from exiting utility processes.
     }
   }
 }
@@ -427,11 +614,11 @@ describe.skipIf(!chromeBinary)("modalFocus in real headless Chromium DOM", () =>
   beforeAll(async () => {
     bundleScript = buildBrowserBundle();
     browser = await CdpPipeSession.launch(chromeBinary!);
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await browser?.close();
-  });
+  }, 15_000);
 
   it("uses real layout client rects and keyboard Tab/Shift+Tab wrapping (including from body) while cleaning up listeners on destroy", async () => {
     await browser.setHtml(
@@ -692,5 +879,50 @@ describe.skipIf(!chromeBinary)("modalFocus in real headless Chromium DOM", () =>
     })()`);
     expect(afterInertOutro.activeId).toBe("next-action");
     expect(afterInertOutro.overflow).toBe("auto");
+  });
+
+  it("launches cleanly without hanging even when DBUS_SESSION_BUS_ADDRESS points to a stalled socket", async () => {
+    const socketPath = join(
+      tmpdir(),
+      `bookward-stalled-dbus-${process.pid}-${Date.now()}.sock`,
+    );
+    const openSockets = new Set<import("node:net").Socket>();
+    const stalledBus = createServer((socket) => {
+      openSockets.add(socket);
+      socket.on("close", () => openSockets.delete(socket));
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => stalledBus.listen(socketPath, resolve));
+
+    const previousSessionBus = process.env.DBUS_SESSION_BUS_ADDRESS;
+    const previousSystemBus = process.env.DBUS_SYSTEM_BUS_ADDRESS;
+    process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${socketPath}`;
+    process.env.DBUS_SYSTEM_BUS_ADDRESS = `unix:path=${socketPath}`;
+
+    let isolatedSession: CdpPipeSession | undefined;
+    try {
+      isolatedSession = await CdpPipeSession.launch(chromeBinary!, {
+        attempts: 1,
+        attemptTimeoutMs: 5_000,
+      });
+      expect(await isolatedSession.evaluate<string>("document.readyState")).toBe(
+        "complete",
+      );
+    } finally {
+      if (previousSessionBus === undefined) {
+        delete process.env.DBUS_SESSION_BUS_ADDRESS;
+      } else {
+        process.env.DBUS_SESSION_BUS_ADDRESS = previousSessionBus;
+      }
+      if (previousSystemBus === undefined) {
+        delete process.env.DBUS_SYSTEM_BUS_ADDRESS;
+      } else {
+        process.env.DBUS_SYSTEM_BUS_ADDRESS = previousSystemBus;
+      }
+      await isolatedSession?.close();
+      for (const socket of openSockets) socket.destroy();
+      await new Promise<void>((resolve) => stalledBus.close(() => resolve()));
+      rmSync(socketPath, { force: true });
+    }
   });
 });
