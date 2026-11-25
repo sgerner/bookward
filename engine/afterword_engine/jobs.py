@@ -1,10 +1,12 @@
 import json
 import uuid
 import asyncio
+from contextvars import ContextVar
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread, get_ident
 import time
+from typing import Any
 
 from .database import (
     RestoreEpochError,
@@ -16,6 +18,7 @@ from .database import (
     transaction,
 )
 from .security import safe_error_message
+from .tenancy import ProfileDeletedError
 
 LOGGER = logging.getLogger(__name__)
 JOB_LEASE_SECONDS = 300
@@ -24,8 +27,61 @@ JOB_REAPER_SECONDS = 30
 JOB_MAX_ATTEMPTS = 3
 PROFILE_RETRY_SECONDS = 60
 QUALITY_RECOVERY_COOLDOWN_SECONDS = 60
+_ACTIVE_JOB_CONTEXT: ContextVar[tuple[str, str, Any] | None] = ContextVar(
+    "afterword_active_job", default=None
+)
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def current_job_context() -> tuple[str, str, Any] | None:
+    """Return the active (job_id, lease_token, stop_event) in this worker task."""
+
+    return _ACTIVE_JOB_CONTEXT.get()
+
+
+def current_job_stop_requested(stop: Any = None) -> bool:
+    """Return whether the caller's or worker's stop signal is set."""
+
+    if stop is not None:
+        return bool(stop.is_set())
+    context = _ACTIVE_JOB_CONTEXT.get()
+    return bool(context and context[2] is not None and context[2].is_set())
+
+
+def update_job_progress(
+    progress: float,
+    *,
+    job_id: str | None = None,
+    con=None,
+) -> int:
+    """Persist fractional job progress, reusing an open transaction when given."""
+
+    bounded = max(0.0, min(1.0, float(progress)))
+    context = _ACTIVE_JOB_CONTEXT.get()
+
+    def _apply(connection) -> int:
+        if job_id is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running'",
+                (bounded, job_id),
+            ).rowcount
+        if context is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running' AND lease_token=?",
+                (bounded, context[0], context[1]),
+            ).rowcount
+        return connection.execute(
+            "UPDATE jobs SET progress=? WHERE id=("
+            "SELECT id FROM jobs WHERE kind IN ('candidate_quality','candidate_quality_recovery') "
+            "AND status='running' ORDER BY rowid DESC LIMIT 1)",
+            (bounded,),
+        ).rowcount
+
+    if con is not None:
+        return _apply(con)
+    with transaction() as managed:
+        return _apply(managed)
 
 
 def _reap_abandoned_jobs() -> int:
@@ -280,6 +336,8 @@ async def worker_loop(handler, stop):
             try:
                 with profile_scope(profile_id):
                     lock = database_lock()
+                    if lock.is_deleted:
+                        raise ProfileDeletedError("Profile has been deleted")
                     if lock.is_locked():
                         continue
                     generation = profile_restore_generation()
@@ -313,6 +371,7 @@ async def worker_loop(handler, stop):
                 with profile_scope(profile_id), bind_restore_epoch(epoch):
                     heartbeat_stop = Event()
                     job_aborted = Event()
+                    job_token = _ACTIVE_JOB_CONTEXT.set((job["id"], lease_token, stop))
                     handler_task = asyncio.create_task(handler(job["kind"]))
 
                     def cancel_handler() -> None:
@@ -325,85 +384,99 @@ async def worker_loop(handler, stop):
                         except RuntimeError:
                             pass
 
-                    with lock.track_worker_job(cancel_handler, loop_thread_id):
-                        heartbeat = Thread(
-                            target=_heartbeat,
-                            args=(
-                                profile_id,
-                                job["id"],
-                                lease_token,
-                                heartbeat_stop,
-                                cancel_handler,
-                                epoch,
-                            ),
-                            name=f"job-heartbeat-{job['id'][:8]}",
-                            daemon=True,
-                        )
-                        heartbeat.start()
-                        should_record_recovery_cooldown = False
-                        try:
-                            result = await handler_task
-                            await asyncio.to_thread(
-                                _complete_claimed_job,
-                                profile_id,
-                                job["id"],
-                                lease_token,
-                                epoch,
-                                result,
+                    try:
+                        with lock.track_worker_job(cancel_handler, loop_thread_id):
+                            heartbeat = Thread(
+                                target=_heartbeat,
+                                args=(
+                                    profile_id,
+                                    job["id"],
+                                    lease_token,
+                                    heartbeat_stop,
+                                    cancel_handler,
+                                    epoch,
+                                ),
+                                name=f"job-heartbeat-{job['id'][:8]}",
+                                daemon=True,
                             )
-                            if job_aborted.is_set():
-                                reset_profile_ready(profile_id)
-                            else:
-                                should_record_recovery_cooldown = True
-                        except asyncio.CancelledError:
-                            outer = asyncio.current_task()
-                            if not job_aborted.is_set() or (
-                                outer is not None and outer.cancelling()
-                            ):
-                                handler_task.cancel()
-                                await asyncio.gather(handler_task, return_exceptions=True)
-                                raise
-                            reset_profile_ready(profile_id)
+                            heartbeat.start()
+                            should_record_recovery_cooldown = False
                             try:
+                                result = await handler_task
                                 await asyncio.to_thread(
-                                    _requeue_aborted_job,
+                                    _complete_claimed_job,
                                     profile_id,
                                     job["id"],
                                     lease_token,
                                     epoch,
+                                    result,
                                 )
-                            except RestoreEpochError:
-                                pass
-                        except RestoreEpochError:
-                            reset_profile_ready(profile_id)
-                        except Exception as exc:
-                            if job_aborted.is_set():
-                                reset_profile_ready(profile_id)
-                            else:
-                                should_record_recovery_cooldown = True
-                            try:
-                                await asyncio.to_thread(
-                                    _fail_claimed_job,
-                                    profile_id,
-                                    job["id"],
-                                    lease_token,
-                                    epoch,
-                                    safe_error_message(exc, limit=2000),
-                                )
-                            except RestoreEpochError:
-                                reset_profile_ready(profile_id)
-                        finally:
-                            if (
-                                should_record_recovery_cooldown
-                                and job["kind"] == "candidate_quality_recovery"
-                            ):
-                                last_quality_recovery_at = time.monotonic()
-                            heartbeat_stop.set()
-                            try:
-                                await asyncio.to_thread(heartbeat.join)
+                                if job_aborted.is_set():
+                                    reset_profile_ready(profile_id)
+                                else:
+                                    should_record_recovery_cooldown = True
                             except asyncio.CancelledError:
-                                heartbeat.join(timeout=1.0)
+                                outer = asyncio.current_task()
+                                if not job_aborted.is_set() or (
+                                    outer is not None and outer.cancelling()
+                                ):
+                                    handler_task.cancel()
+                                    await asyncio.gather(handler_task, return_exceptions=True)
+                                    raise
+                                reset_profile_ready(profile_id)
+                                try:
+                                    await asyncio.to_thread(
+                                        _requeue_aborted_job,
+                                        profile_id,
+                                        job["id"],
+                                        lease_token,
+                                        epoch,
+                                    )
+                                except ProfileDeletedError:
+                                    raise
+                                except RestoreEpochError:
+                                    pass
+                            except ProfileDeletedError:
                                 raise
+                            except RestoreEpochError:
+                                reset_profile_ready(profile_id)
+                            except Exception as exc:
+                                if job_aborted.is_set():
+                                    reset_profile_ready(profile_id)
+                                else:
+                                    should_record_recovery_cooldown = True
+                                try:
+                                    await asyncio.to_thread(
+                                        _fail_claimed_job,
+                                        profile_id,
+                                        job["id"],
+                                        lease_token,
+                                        epoch,
+                                        safe_error_message(exc, limit=2000),
+                                    )
+                                except ProfileDeletedError:
+                                    raise
+                                except RestoreEpochError:
+                                    reset_profile_ready(profile_id)
+                            finally:
+                                if (
+                                    should_record_recovery_cooldown
+                                    and job["kind"] == "candidate_quality_recovery"
+                                ):
+                                    last_quality_recovery_at = time.monotonic()
+                                heartbeat_stop.set()
+                                try:
+                                    await asyncio.to_thread(heartbeat.join)
+                                except asyncio.CancelledError:
+                                    heartbeat.join(timeout=1.0)
+                                    raise
+                    finally:
+                        _ACTIVE_JOB_CONTEXT.reset(job_token)
+            except ProfileDeletedError:
+                reset_profile_ready(profile_id)
+                seen_restore_generations.pop(profile_id, None)
+                fenced_profiles.discard(profile_id)
+                profile_retry_after.pop(profile_id, None)
             except RestoreEpochError:
                 reset_profile_ready(profile_id)
             except Exception:
@@ -444,7 +517,7 @@ def _heartbeat(
                         "WHERE id=? AND status='running' AND lease_token=?",
                         (now(), job_id, lease_token),
                     ).rowcount
-        except RestoreEpochError:
+        except (ProfileDeletedError, RestoreEpochError):
             if on_lost_lease is not None:
                 on_lost_lease()
             return

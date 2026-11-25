@@ -939,6 +939,7 @@ def test_migration_28_has_no_startup_deletes_and_maintenance_batches_orphan_clea
     database, monkeypatch
 ):
     assert MIGRATIONS[-1][0] >= 28
+    assert 28 in dict(MIGRATIONS)
     migration_28_sql = dict(MIGRATIONS)[28]
     sql_without_triggers = re.sub(
         r"CREATE\s+TRIGGER\b.*?END\s*;",

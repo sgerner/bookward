@@ -1,6 +1,9 @@
 from pathlib import Path
 import asyncio
+import hashlib
+import logging
 import sqlite3
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Thread
 
@@ -34,6 +37,9 @@ from afterword_engine.main import app, queue_goodreads_rss_if_due
 from afterword_engine.secrets import installation_key, installation_key_path, seal, unseal
 from afterword_engine.tenancy import current_profile_id, profile_database_path, profile_scope
 
+OWNER_PASSWORD = f"owner-fixture-{uuid.uuid4().hex}"  # ggignore
+WRONG_PASSWORD = f"wrong-fixture-{uuid.uuid4().hex}"  # ggignore
+
 
 @pytest.fixture()
 def identity_store(tmp_path: Path, monkeypatch):
@@ -42,9 +48,7 @@ def identity_store(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     profiles.initialize_auth()
     if profiles.account_count() == 0:
-        admin = profiles.create_first_admin(
-            "owner", "owner-password-with-enough-length"
-        )
+        admin = profiles.create_first_admin("owner", OWNER_PASSWORD)
     else:
         with profiles.auth_connect() as con:
             admin_row = con.execute(
@@ -272,6 +276,510 @@ def test_password_reset_and_change_revoke_old_sessions(identity_store):
     assert changed_login["must_change_password"] is False
 
 
+def test_multi_ip_login_isolation_429_retry_after_single_warning_and_argon_skip(
+    identity_store, monkeypatch, caplog
+):
+    from datetime import timedelta
+    from afterword_engine import auth_admin
+
+    proxy_secret = f"svc-{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "service_secret", proxy_secret)
+
+    real_hasher = profiles.PASSWORD_HASHER
+
+    class CountingPasswordHasher:
+        def __init__(self):
+            self.verify_calls = 0
+
+        def verify(self, encoded, password):
+            self.verify_calls += 1
+            return real_hasher.verify(encoded, password)
+
+        def __getattr__(self, name):
+            return getattr(real_hasher, name)
+
+    counting_hasher = CountingPasswordHasher()
+    monkeypatch.setattr(profiles, "PASSWORD_HASHER", counting_hasher)
+
+    # Seed an expired failure (>24h ago) to verify pruning during checks.
+    with profiles.auth_connect() as con:
+        con.execute(
+            "INSERT INTO login_attempts(normalized_username,remote_address,succeeded,attempted_at) "
+            "VALUES(?,?,0,?)",
+            ("owner", "192.0.2.55", profiles.iso(profiles.utc_now() - timedelta(days=2))),
+        )
+
+    service_headers = {"x-bookward-service": proxy_secret}
+    client = TestClient(app)
+
+    # 10 failed logins spread across 203.0.113.1 .. 203.0.113.10 never lock out another IP.
+    for octet in range(1, 11):
+        failed = client.post(
+            "/auth/login",
+            json={"username": "owner", "password": WRONG_PASSWORD},
+            headers={**service_headers, "x-bookward-client-ip": f"203.0.113.{octet}"},
+        )
+        assert failed.status_code == 401
+
+    allowed = client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={**service_headers, "x-bookward-client-ip": "198.51.100.42"},
+    )
+    assert allowed.status_code == 200
+
+    with profiles.auth_connect() as con:
+        expired = con.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE remote_address='192.0.2.55'"
+        ).fetchone()[0]
+    assert expired == 0
+
+    # Trigger a 10-failure lockout on 203.0.113.1 (already has 1 failed attempt -> 9 more).
+    caplog.clear()
+    for _ in range(9):
+        failed = client.post(
+            "/auth/login",
+            json={"username": "owner", "password": WRONG_PASSWORD},
+            headers={**service_headers, "x-bookward-client-ip": "203.0.113.1"},
+        )
+        assert failed.status_code == 401
+
+    calls_before_lockout = counting_hasher.verify_calls
+    eleventh = client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={**service_headers, "x-bookward-client-ip": "203.0.113.1"},
+    )
+    twelfth = client.post(
+        "/auth/login",
+        json={"username": "owner", "password": WRONG_PASSWORD},
+        headers={**service_headers, "x-bookward-client-ip": "203.0.113.1"},
+    )
+
+    assert eleventh.status_code == 429
+    assert twelfth.status_code == 429
+    assert int(eleventh.headers["retry-after"]) > 0
+    assert "Wait" in eleventh.json()["detail"]
+    # Argon2id verification is skipped while locked out.
+    assert counting_hasher.verify_calls == calls_before_lockout
+    # Exactly one warning log is emitted for the lockout window, with the client IP truncated to /24.
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "203.0.113.0/24" in warnings[0]
+    assert "203.0.113.1" not in warnings[0]
+
+    # IPv6 lockouts truncate the logged address to /48 instead of logging the full host address.
+    caplog.clear()
+    for _ in range(10):
+        assert client.post(
+            "/auth/login",
+            json={"username": "owner", "password": WRONG_PASSWORD},
+            headers={**service_headers, "x-bookward-client-ip": "2001:db8:abcd:0012::42"},
+        ).status_code == 401
+    ipv6_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(ipv6_warnings) == 1
+    assert "2001:db8:abcd::/48" in ipv6_warnings[0]
+    assert "2001:db8:abcd:12::42" not in ipv6_warnings[0]
+
+    # Legitimate sign-in from 198.51.100.42 still succeeds while 203.0.113.1 is locked out.
+    trusted_ok = client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={**service_headers, "x-bookward-client-ip": "198.51.100.42"},
+    )
+    assert trusted_ok.status_code == 200
+
+    # CLI unlock clears the lockout without revoking active sessions and logs at WARNING without level forcing.
+    caplog.clear()
+    auth_admin.main(["unlock", "owner", "--ip", "203.0.113.1"])
+    ip_unlock_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(ip_unlock_logs) == 1
+    assert f"admin_id=cli target_account_id={identity_store['id']} cleared_attempts=10" in ip_unlock_logs[0]
+    assert profiles.resolve_session(trusted_ok.json()["session_token"]) is not None
+    recovered = client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={**service_headers, "x-bookward-client-ip": "203.0.113.1"},
+    )
+    assert recovered.status_code == 200
+
+    # Newlines in attacker-supplied usernames are stripped from rate-limit warning logs.
+    caplog.clear()
+    for _ in range(10):
+        assert client.post(
+            "/auth/login",
+            json={"username": "spoof\r\nadmin", "password": WRONG_PASSWORD},
+            headers={**service_headers, "x-bookward-client-ip": "203.0.113.55"},
+        ).status_code == 401
+    injected_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(injected_warnings) == 1
+    assert "spoofadmin" in injected_warnings[0]
+    assert "\n" not in injected_warnings[0]
+    assert "\r" not in injected_warnings[0]
+    assert "\\n" not in injected_warnings[0]
+    assert "\\r" not in injected_warnings[0]
+
+
+def test_untrusted_callers_cannot_spoof_forwarded_client_ip_and_share_peer_bucket_without_secret(
+    identity_store, monkeypatch, caplog
+):
+    from afterword_engine.main import _warn_if_shared_rate_limit_bucket
+
+    monkeypatch.setattr(settings, "service_secret", "")
+
+    caplog.clear()
+    _warn_if_shared_rate_limit_bucket()
+    startup_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.main" and record.levelname == "WARNING"
+    ]
+    assert len(startup_warnings) == 1
+    assert "AFTERWORD_SERVICE_SECRET is not set" in startup_warnings[0]
+
+    # Without a service secret, non-loopback callers share one peer-IP bucket even if x-bookward-client-ip rotates.
+    untrusted_client = TestClient(app, client=("203.0.113.77", 50000))
+    for index in range(10):
+        resp = untrusted_client.post(
+            "/auth/login",
+            json={"username": "owner", "password": WRONG_PASSWORD},
+            headers={"x-bookward-client-ip": f"198.51.100.{index + 1}"},
+        )
+        assert resp.status_code == 401
+    blocked = untrusted_client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={"x-bookward-client-ip": "198.51.100.250"},
+    )
+    assert blocked.status_code == 429
+
+    # Fail closed on loopback too: without service_secret, loopback processes cannot spoof x-bookward-client-ip
+    # and all attempts from 127.0.0.1 share the single 127.0.0.1 bucket.
+    loopback_client = TestClient(app, client=("127.0.0.1", 50000))
+    for index in range(10):
+        resp = loopback_client.post(
+            "/auth/login",
+            json={"username": "owner", "password": WRONG_PASSWORD},
+            headers={"x-bookward-client-ip": f"192.0.2.{index + 1}"},
+        )
+        assert resp.status_code == 401
+    loopback_blocked = loopback_client.post(
+        "/auth/login",
+        json={"username": "owner", "password": OWNER_PASSWORD},
+        headers={"x-bookward-client-ip": "198.51.100.88"},
+    )
+    assert loopback_blocked.status_code == 429
+
+
+def test_forced_password_change_uses_isolated_session_bucket_and_admin_unlock_recovers(
+    identity_store, monkeypatch, capsys, caplog
+):
+    import uvicorn.config
+    from afterword_engine import auth_admin
+
+    proxy_secret = f"svc-{uuid.uuid4().hex}"
+    temp_password = f"temp-{uuid.uuid4().hex}"  # ggignore
+    personal_password = f"personal-{uuid.uuid4().hex}"  # ggignore
+    reset_password_val = f"reset-{uuid.uuid4().hex}"  # ggignore
+    next_password = f"next-{uuid.uuid4().hex}"  # ggignore
+
+    monkeypatch.setattr(settings, "service_secret", proxy_secret)
+    headers = {"x-bookward-service": proxy_secret, "x-bookward-client-ip": "203.0.113.20"}
+    admin_session, _ = profiles.create_session(identity_store["id"])
+
+    # Confirm plain uvicorn leaves unconfigured application loggers inheriting the root WARNING threshold.
+    assert "afterword_engine" not in uvicorn.config.LOGGING_CONFIG["loggers"]
+    assert logging.getLogger("afterword_engine.profiles").getEffectiveLevel() == logging.WARNING
+
+    client = TestClient(app)
+    created = client.post(
+        "/admin/accounts",
+        json={
+            "username": "first-login-reader",
+            "password": temp_password,
+            "display_name": "First Login Reader",
+            "role": "user",
+        },
+        headers={**headers, "x-bookward-session": admin_session},
+    )
+    assert created.status_code == 200
+    reader_id = created.json()["id"]
+
+    # Reader signs in before external noise saturates their IP bucket.
+    reader_login = client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": temp_password},
+        headers=headers,
+    )
+    assert reader_login.status_code == 200
+    assert reader_login.json()["account"]["must_change_password"] is True
+    reader_session = reader_login.json()["session_token"]
+
+    # External noise locks out public /auth/login for first-login-reader on the same IP.
+    for _ in range(10):
+        assert client.post(
+            "/auth/login",
+            json={"username": "first-login-reader", "password": WRONG_PASSWORD},
+            headers=headers,
+        ).status_code == 401
+    assert client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": temp_password},
+        headers=headers,
+    ).status_code == 429
+
+    # Active session still updates the mandatory temporary password via its session bucket.
+    changed = client.post(
+        "/auth/password/change",
+        json={
+            "current_password": temp_password,
+            "new_password": personal_password,
+        },
+        headers={**headers, "x-bookward-session": reader_session},
+    )
+    assert changed.status_code == 200
+    new_reader_session = changed.json()["session_token"]
+
+    # Non-admin cannot call admin unlock, and unknown target returns 404 without an audit log.
+    assert client.post(
+        f"/admin/accounts/{reader_id}/unlock",
+        headers={**headers, "x-bookward-session": new_reader_session},
+    ).status_code == 403
+    caplog.clear()
+    missing_unlock = client.post(
+        "/admin/accounts/nonexistent-account-id/unlock",
+        headers={**headers, "x-bookward-session": admin_session},
+    )
+    assert missing_unlock.status_code == 404
+    assert [
+        record for record in caplog.records
+        if record.name == "afterword_engine.profiles"
+    ] == []
+
+    # Admin sees lockout metadata in /admin/accounts, unlocks the account, and emits a WARNING audit log
+    # under the default logger threshold (without caplog.at_level forcing).
+    accounts = client.get(
+        "/admin/accounts",
+        headers={**headers, "x-bookward-session": admin_session},
+    ).json()["accounts"]
+    reader_entry = next(item for item in accounts if item["id"] == reader_id)
+    assert reader_entry["locked_bucket_count"] == 1
+    assert reader_entry["lockout_retry_after_seconds"] > 0
+
+    caplog.clear()
+    unlocked = client.post(
+        f"/admin/accounts/{reader_id}/unlock",
+        headers={**headers, "x-bookward-session": admin_session},
+    )
+    assert unlocked.status_code == 200
+    assert unlocked.json()["cleared_attempts"] == 10
+    unlock_audit_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(unlock_audit_logs) == 1
+    assert f"admin_id={identity_store['id']}" in unlock_audit_logs[0]
+    assert f"target_account_id={reader_id}" in unlock_audit_logs[0]
+    assert "cleared_attempts=10" in unlock_audit_logs[0]
+
+    relogin = client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": personal_password},
+        headers=headers,
+    )
+    assert relogin.status_code == 200
+
+    # Lock again, then verify password reset also clears failed login attempts.
+    for _ in range(10):
+        assert client.post(
+            "/auth/login",
+            json={"username": "first-login-reader", "password": WRONG_PASSWORD},
+            headers=headers,
+        ).status_code == 401
+    assert client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": personal_password},
+        headers=headers,
+    ).status_code == 429
+
+    reset_resp = client.post(
+        f"/admin/accounts/{reader_id}/password",
+        json={"password": reset_password_val},
+        headers={**headers, "x-bookward-session": admin_session},
+    )
+    assert reset_resp.status_code == 200
+    after_reset = client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": reset_password_val},
+        headers=headers,
+    )
+    assert after_reset.status_code == 200
+
+    # Independent session password-change bucket rate-limits after 10 bad current passwords.
+    fresh_session = after_reset.json()["session_token"]
+    fresh_session_hash = hashlib.sha256(fresh_session.encode()).hexdigest()
+    caplog.clear()
+    for _ in range(10):
+        bad_change = client.post(
+            "/auth/password/change",
+            json={"current_password": WRONG_PASSWORD, "new_password": next_password},
+            headers={**headers, "x-bookward-session": fresh_session},
+        )
+        assert bad_change.status_code == 401
+    session_locked = client.post(
+        "/auth/password/change",
+        json={"current_password": reset_password_val, "new_password": next_password},
+        headers={**headers, "x-bookward-session": fresh_session},
+    )
+    assert session_locked.status_code == 429
+    assert int(session_locked.headers["retry-after"]) > 0
+    session_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(session_warnings) == 1
+    assert "authenticated-session" in session_warnings[0]
+    assert fresh_session_hash not in session_warnings[0]
+
+    # Public login remains unaffected by session-bucket failures, and CLI --all clears remaining buckets
+    # while emitting a WARNING audit log without caplog.at_level forcing.
+    assert client.post(
+        "/auth/login",
+        json={"username": "first-login-reader", "password": reset_password_val},
+        headers=headers,
+    ).status_code == 200
+    caplog.clear()
+    auth_admin.main(["unlock", "--all"])
+    assert "Cleared" in capsys.readouterr().out
+    cli_audit_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(cli_audit_logs) == 1
+    assert "admin_id=cli target_account_id=all cleared_attempts=20" in cli_audit_logs[0]
+
+
+def test_password_change_enforces_ip_bucket_across_multiple_sessions(
+    identity_store, monkeypatch, caplog
+):
+    proxy_secret = f"svc-{uuid.uuid4().hex}"
+    current_password = f"curr-{uuid.uuid4().hex}"  # ggignore
+    updated_password = f"updated-{uuid.uuid4().hex}"  # ggignore
+
+    monkeypatch.setattr(settings, "service_secret", proxy_secret)
+    reader = profiles.create_account("multi-session-reader", current_password)
+    session_a, _ = profiles.create_session(reader["id"])
+    session_b, _ = profiles.create_session(reader["id"])
+    session_c, _ = profiles.create_session(reader["id"])
+
+    same_ip_headers = {"x-bookward-service": proxy_secret, "x-bookward-client-ip": "198.51.100.91"}
+    other_ip_headers = {"x-bookward-service": proxy_secret, "x-bookward-client-ip": "198.51.100.92"}
+
+    client = TestClient(app)
+    caplog.clear()
+    for active_session in (session_a, session_b):
+        for _ in range(5):
+            assert client.post(
+                "/auth/password/change",
+                json={"current_password": WRONG_PASSWORD, "new_password": updated_password},
+                headers={**same_ip_headers, "x-bookward-session": active_session},
+            ).status_code == 401
+
+    ip_locked = client.post(
+        "/auth/password/change",
+        json={"current_password": current_password, "new_password": updated_password},
+        headers={**same_ip_headers, "x-bookward-session": session_c},
+    )
+    assert ip_locked.status_code == 429
+    pwchange_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(pwchange_warnings) == 1
+    assert "pwchange:198.51.100.0/24" in pwchange_warnings[0]
+    assert "198.51.100.91" not in pwchange_warnings[0]
+
+    # Another client IP using session_c is not blocked by 198.51.100.91's password-change IP bucket.
+    other_ip_ok = client.post(
+        "/auth/password/change",
+        json={"current_password": current_password, "new_password": updated_password},
+        headers={**other_ip_headers, "x-bookward-session": session_c},
+    )
+    assert other_ip_ok.status_code == 200
+
+
+def test_concurrent_login_failures_enforce_exact_limit_without_db_lock_errors(
+    identity_store, monkeypatch, caplog
+):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from argon2 import PasswordHasher
+
+    # Use lightweight Argon2 parameters so 16 threads race simultaneously onto Phase 3.
+    fast_hasher = PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1)
+    monkeypatch.setattr(profiles, "PASSWORD_HASHER", fast_hasher)
+    monkeypatch.setattr(profiles, "DUMMY_PASSWORD_HASH", fast_hasher.hash(f"dummy-{uuid.uuid4().hex}"))
+    concurrent_user = profiles.create_account("race-reader", f"race-{uuid.uuid4().hex}")
+
+    worker_count = 16
+    barrier = threading.Barrier(worker_count)
+
+    def attempt_bad_login():
+        barrier.wait(timeout=5)
+        try:
+            result = profiles.authenticate_local(
+                concurrent_user["username"],
+                WRONG_PASSWORD,
+                "203.0.113.200",
+            )
+            return ("none" if result is None else "ok")
+        except profiles.LoginRateLimitError:
+            return "rate_limited"
+
+    caplog.clear()
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        outcomes = list(pool.map(lambda _: attempt_bad_login(), range(worker_count)))
+
+    assert outcomes.count("none") == profiles.LOGIN_FAILURE_LIMIT
+    assert outcomes.count("rate_limited") == worker_count - profiles.LOGIN_FAILURE_LIMIT
+
+    with profiles.auth_connect() as con:
+        stored_failures = con.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE normalized_username=? AND remote_address='203.0.113.200' AND succeeded=0",
+            (concurrent_user["username"],),
+        ).fetchone()[0]
+    assert stored_failures == profiles.LOGIN_FAILURE_LIMIT
+
+    race_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "afterword_engine.profiles" and record.levelname == "WARNING"
+    ]
+    assert len(race_warnings) == 1
+    assert "203.0.113.0/24" in race_warnings[0]
+    assert "203.0.113.200" not in race_warnings[0]
+
+
 def test_background_worker_processes_each_profiles_jobs_in_its_own_scope(identity_store):
     alice = profiles.create_account("job-alice", "job-alice-password-long")
     bob = profiles.create_account("job-bob", "job-bob-password-long")
@@ -458,6 +966,198 @@ def test_worker_fails_jobs_after_the_retry_limit(identity_store):
     assert job["lease_token"] is None
 
 
+def test_multi_profile_worker_interleaves_second_profile_score_after_first_50_row_audit_batch(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    alice = profiles.create_account("audit-alice", "audit-alice-password-long")
+    bob = profiles.create_account("score-bob", "score-bob-password-long")
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(300):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Alice Sweep Book {index}",
+                        "Alice Author",
+                        "https://example.com/alice",
+                        source_id,
+                        f"alice sweep book {index}",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        quality_module.configure_candidate_quality_sweep(mode="full")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        bob_score_job_id = enqueue_job("score", dedupe=True)
+
+    monkeypatch.setattr(
+        profiles,
+        "profile_ids",
+        lambda: [alice["profile_id"], bob["profile_id"]],
+    )
+
+    audited_per_turn: list[int] = []
+    execution_order: list[tuple[str, str]] = []
+    stop = asyncio.Event()
+
+    async def fake_audit_one(candidate, *_args, **_kwargs):
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "accepted",
+            "quality_score": 0.9,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{candidate['id']}",
+            "work_id": f"/works/OL{candidate['id']}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    async def fake_score_all(*_args, **_kwargs):
+        return 1
+
+    monkeypatch.setattr(quality_module, "_audit_one", fake_audit_one)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+
+    async def tracked_handler(kind: str):
+        pid = current_profile_id()
+        execution_order.append((pid, kind))
+        result = await engine_main.handle_job(kind)
+        if pid == alice["profile_id"] and kind == "candidate_quality":
+            audited_per_turn.append(int(result["audited"]))
+        if len(execution_order) >= 3:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(tracked_handler, stop))
+
+    # Alice runs one 50-row batch, then Bob immediately runs its score job before Alice's next batch.
+    assert execution_order[0] == (alice["profile_id"], "candidate_quality")
+    assert execution_order[1] == (bob["profile_id"], "score")
+    assert audited_per_turn[0] == quality_module.QUALITY_AUDIT_BATCH_SIZE
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_status = con.execute(
+            "SELECT status FROM jobs WHERE id=?", (bob_score_job_id,)
+        ).fetchone()["status"]
+    assert bob_status == "complete"
+
+
+def test_worker_recovers_interrupted_audit_job_and_skips_committed_subbatches(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    reader = profiles.create_account("recover-reader", "recover-reader-password-long")
+    candidate_ids: list[int] = []
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(65):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Recoverable Sweep {index}",
+                        "Sweep Writer",
+                        "https://example.com/recover",
+                        source_id,
+                        f"recoverable sweep {index}",
+                    ),
+                ).lastrowid
+                candidate_ids.append(cid)
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        sweep = quality_module.configure_candidate_quality_sweep(mode="full")
+        initial_job_id = sweep["job_id"]
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2000-01-01T00:00:00+00:00',"
+                "heartbeat_at='2000-01-01T00:00:00+00:00',lease_token='crashed-worker',attempts=1 "
+                "WHERE id=?",
+                (initial_job_id,),
+            )
+
+    monkeypatch.setattr(profiles, "profile_ids", lambda: [reader["profile_id"]])
+    monkeypatch.setattr(engine_main, "score_all", lambda *_a, **_k: asyncio.sleep(0, result=0))
+
+    seen_candidates: list[int] = []
+    crashed_once = False
+
+    async def crashing_then_healthy_audit_one(candidate, *_args, **_kwargs):
+        nonlocal crashed_once
+        cid = int(candidate["id"])
+        # Crash at candidate index 20 (row 21) on the first run after two 10-row sub-batches commit.
+        if not crashed_once and cid == candidate_ids[20]:
+            crashed_once = True
+            raise RuntimeError("Simulated mid-pass crash at row 21")
+        seen_candidates.append(cid)
+        return {
+            "candidate_id": cid,
+            "quality_status": "accepted",
+            "quality_score": 0.92,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{cid}",
+            "work_id": f"/works/OL{cid}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    monkeypatch.setattr(quality_module, "_audit_one", crashing_then_healthy_audit_one)
+
+    # First attempt crashes at row 21 after committing 20 rows (two 10-row sub-batches).
+    with profile_scope(reader["profile_id"]):
+        with pytest.raises(RuntimeError, match="Simulated mid-pass crash at row 21"):
+            asyncio.run(engine_main.handle_job("candidate_quality"))
+        committed_after_crash = [
+            item["candidate_id"]
+            for item in database.rows(
+                "SELECT candidate_id FROM candidate_quality WHERE julianday(audited_at)>=julianday(?)",
+                (sweep["started_at"],),
+            )
+        ]
+        assert committed_after_crash == candidate_ids[:20]
+
+    # Worker reaps the expired lease and resumes from row 21 without repeating rows 1..20.
+    seen_candidates.clear()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        result = await engine_main.handle_job(kind)
+        if kind == "candidate_quality" and result["remaining"] == 0:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(handler, stop))
+
+    assert seen_candidates == candidate_ids[20:]
+    with profile_scope(reader["profile_id"]):
+        summary = quality_module.quality_summary()
+    assert summary["audit"]["status"] == "complete"
+    assert summary["audit"]["remaining"] == 0
+
+
 def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
     identity_store, monkeypatch
 ):
@@ -502,7 +1202,7 @@ def test_lifespan_boots_when_legacy_or_secondary_profile_has_unrecoverable_resto
     monkeypatch.setattr(settings, "backup_dir", "")
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     profiles.initialize_auth()
-    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    owner = profiles.create_first_admin("owner", OWNER_PASSWORD)
     alice = profiles.create_account("alice", "alice-password-with-enough-length")
 
     with profile_scope("legacy"):
@@ -587,7 +1287,7 @@ def test_transient_startup_lock_recovers_on_request_and_preserves_later_writes(
     monkeypatch.setattr(settings, "backup_dir", "")
     monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
     profiles.initialize_auth()
-    owner = profiles.create_first_admin("owner", "owner-password-with-enough-length")
+    owner = profiles.create_first_admin("owner", OWNER_PASSWORD)
     api_token = profiles.create_profile_api_token("legacy", "Recovery check")["token"]
 
     with profile_scope("legacy"):

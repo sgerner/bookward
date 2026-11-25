@@ -6,6 +6,30 @@
 @import '@skeletonlabs/skeleton';
 
 @import '@skeletonlabs/skeleton/themes/cerberus';
+/*
+ * Token ownership boundary:
+ * 1. `./theme-calibration.css` (and Vite-calibrated per-theme stylesheets) owns base
+ *    Skeleton palette/typography tokens (`--color-root-bg-*`, `--color-surface-*`,
+ *    `--color-{primary,secondary,tertiary,success,warning,error}-*`, `--typo-*`) and
+ *    `.preset-tonal-*` descendant inheritance (`--bookward-tonal-fg`) for WCAG 2.2
+ *    SC 1.4.3 (>= 4.5:1) text/tonal/filled contrast (`@layer base` `:root` fallback +
+ *    unlayered `:root[data-theme="<id>"]` overrides).
+ * 2. The unlayered `:root, [data-theme]` block below owns derived semantic control,
+ *    focus-ring, switch, and star-rating tokens (`--control-*`, `--focus-ring-*`,
+ *    `--switch-*`, `--star-*`) for SC 1.4.11 (>= 3:1) and SC 2.4.7, computed from the
+ *    calibrated `--color-*` palette primitives above without colliding on property names.
+ */
+@import './theme-calibration.css';
+
+@layer components {
+	.card,
+	.input,
+	.select,
+	input[type='file'] {
+		min-width: 0;
+		max-width: 100%;
+	}
+}
 
 /* Clear the sticky top header (65px) and mobile bottom nav (65px + safe-area) on keyboard focus (WCAG 2.2 C43). */
 html:has([data-sticky-shell]) {
@@ -21,6 +45,37 @@ html:has([data-sticky-shell]) {
 
 [data-sticky-shell] [role='switch'] {
 	scroll-margin-block: 4rem;
+}
+
+@media (max-width: 24rem) {
+	.btn:not(.btn-icon) {
+		max-width: 100%;
+		height: auto;
+		white-space: normal;
+		line-height: 1.25;
+		text-align: center;
+	}
+
+	.btn:not(.btn-icon) > :where(svg) {
+		flex-shrink: 0;
+	}
+}
+
+@media (max-height: 20rem) {
+	html:has([data-sticky-shell]) {
+		scroll-padding-top: 0;
+		scroll-padding-bottom: 0;
+	}
+
+	[data-sticky-shell] [role='switch'] {
+		scroll-margin-block: 0;
+	}
+
+	header.sticky,
+	nav.fixed,
+	.sticky {
+		position: static;
+	}
 }
 
 :root,
@@ -76,6 +131,45 @@ html:has([data-sticky-shell]) {
 		color-mix(in oklab, oklch(0.82 0.16 82) 18%, var(--color-surface-50)),
 		color-mix(in oklab, oklch(0.85 0.17 88) 14%, var(--color-surface-950))
 	);
+}
+
+@layer components {
+	.header-reflow {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+	}
+
+	.text-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: normal;
+	}
+
+	.url-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+}
+
+@utility btn-reflow {
+	max-width: 100%;
+	height: auto;
+	white-space: normal;
+	overflow-wrap: anywhere;
+	text-align: center;
+	line-height: 1.25;
+
+	& > :where(svg) {
+		flex-shrink: 0;
+	}
+
+	& > :where(:not(svg)) {
+		min-width: 0;
+	}
 }
 
 @utility checkbox-sm {

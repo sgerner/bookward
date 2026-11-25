@@ -29,6 +29,7 @@ export type PageBook = {
   score: number;
   metadata_confidence: number | null;
   synopsis: string;
+  explanation: string[];
   reason: string;
   status: string;
 };
@@ -56,6 +57,7 @@ export function toPageBook(book: Recommendation): PageBook {
     score: book.score,
     metadata_confidence: book.metadata_confidence ?? null,
     synopsis: book.description,
+    explanation: [...book.explanation],
     reason: book.explanation.join(" · "),
     status: book.status,
   };
