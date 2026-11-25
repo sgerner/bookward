@@ -25,6 +25,10 @@ _restore_fence_bypass: ContextVar[bool] = ContextVar("bookward_restore_fence_byp
 _PROFILE_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
+class ProfileDeletedError(RuntimeError):
+    """Raised when attempting to access storage or keys for a deleted profile."""
+
+
 def current_profile_id() -> str | None:
     return _profile_id.get()
 
