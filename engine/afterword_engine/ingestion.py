@@ -956,6 +956,9 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                     values,
                 )
                 continue
+            # Shelf-to-read promotion intentionally preserves prior scoring batches
+            # and serving runs so `attribute_read_outcomes()` can link this completed
+            # read to preceding impressions while the book remains in `reads`.
             con.executemany(
                 "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
                 ((item[0], item[1]) for item in values),
@@ -2327,12 +2330,29 @@ def _apply_goodreads_shelves(
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
     imported: dict[str, int] = {}
+    updated_shelves: list[str] = []
     for shelf in shelves:
-        shelf_rows = fetched_shelves.get(shelf)
-        if shelf_rows is None:
+        if fetched_shelves.get(shelf) is None:
             imported[shelf] = 0
-            continue
-        with transaction() as con:
+        else:
+            updated_shelves.append(shelf)
+    if not updated_shelves:
+        return imported
+
+    from .identity import book_row_identity_match_keys
+
+    with transaction() as con:
+        shelf_marks = ",".join("?" for _ in updated_shelves)
+        previous_rows = [
+            dict(row)
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                f"FROM goodreads_shelf_items WHERE shelf IN ({shelf_marks})",
+                updated_shelves,
+            ).fetchall()
+        ]
+        for shelf in updated_shelves:
+            shelf_rows = fetched_shelves[shelf] or []
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
             con.executemany(
                 "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
@@ -2344,6 +2364,38 @@ def _apply_goodreads_shelves(
                 shelf_rows,
             )
             imported[shelf] = len(shelf_rows)
+
+        if previous_rows:
+            remaining_keys: set[tuple[str, ...]] = set()
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                "FROM goodreads_shelf_items"
+            ).fetchall():
+                remaining_keys.update(book_row_identity_match_keys(dict(row)))
+            removed_rows = [
+                row
+                for row in previous_rows
+                if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
+            ]
+            if removed_rows:
+                read_keys: set[tuple[str, ...]] = set()
+                for row in con.execute(
+                    "SELECT title, author, isbn, openlibrary_work_id FROM reads"
+                ).fetchall():
+                    read_keys.update(book_row_identity_match_keys(dict(row)))
+                # Intentional: books promoted from shelves into `reads` remain part
+                # of the user's library and retain prior batches/runs so read-outcome
+                # attribution and score provenance stay intact (erased via `read_ids`
+                # if the read row itself is later purged).
+                deleted_shelf_rows = [
+                    row
+                    for row in removed_rows
+                    if not (set(book_row_identity_match_keys(row)) & read_keys)
+                ]
+                if deleted_shelf_rows:
+                    from .decision_evidence import purge_recommendation_evidence
+
+                    purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
     return imported
 
 
@@ -2381,6 +2433,9 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        # Shelf-to-read promotion intentionally preserves prior scoring batches and
+        # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
+        # exposures while the book remains in `reads`.
         con.executemany(
             "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
             ((item[0], item[1]) for item in read_rows),

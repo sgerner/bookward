@@ -1,9 +1,10 @@
 """Bounded anti-redundancy swaps for the first discovery recommendations.
 
 This layer leaves the ranker's scores intact. It only swaps a redundant item
-with a close-scoring candidate a few positions later, and every moved item
-stays within the configured displacement bound. Cached candidate vectors are
-used when available; the request path never generates embeddings.
+with a close-scoring candidate a few positions later, appends a plain-language
+variety note to promoted items, and keeps every moved item within the
+configured displacement bound. Cached candidate vectors are used when
+available; the request path never generates embeddings.
 """
 
 from __future__ import annotations
@@ -209,9 +210,11 @@ def diversify_discovery_slate(
         if best is None:
             continue
         _, candidate_position, candidate_redundancy = best
-        if current_redundancy[0] > candidate_redundancy[0]:
+        author_reduced = current_redundancy[0] > candidate_redundancy[0]
+        similarity_reduced = current_redundancy[1] > candidate_redundancy[1]
+        if author_reduced:
             author_swaps += 1
-        if current_redundancy[1] > candidate_redundancy[1]:
+        if similarity_reduced:
             similarity_swaps += 1
         items[position], items[candidate_position] = (
             items[candidate_position],
@@ -221,6 +224,18 @@ def diversify_discovery_slate(
             original_positions[candidate_position],
             original_positions[position],
         )
+        promoted = items[position]
+        existing_explanation = promoted.get("explanation")
+        explanation_list = (
+            list(existing_explanation) if isinstance(existing_explanation, list) else []
+        )
+        variety_reason = (
+            "Moved up for variety so one author does not crowd your top picks"
+            if author_reduced and not similarity_reduced
+            else "Moved up for variety alongside closely related books in your top picks"
+        )
+        if variety_reason not in explanation_list:
+            promoted["explanation"] = [*explanation_list, variety_reason]
 
     reordered = sum(
         original_positions[position] != position for position in range(slate_size)

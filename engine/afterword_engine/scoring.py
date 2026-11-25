@@ -284,8 +284,8 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         shelf_rows = con.execute(
             "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id FROM goodreads_shelf_items"
         ).fetchall()
-    to_read_keys: set[str] = set()
-    currently_reading_keys: set[str] = set()
+    to_read_keys: set[tuple[str, ...]] = set()
+    currently_reading_keys: set[tuple[str, ...]] = set()
     for srow in shelf_rows:
         target = currently_reading_keys if srow["shelf"] == "currently-reading" else to_read_keys
         target.update(book_row_identity_match_keys(dict(srow)))
@@ -296,6 +296,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     captured_at = datetime.now(timezone.utc).isoformat()
     with transaction() as con:
         written = []
+        to_read_written_ids: list[int] = []
         for candidate in ranked:
             cand_keys = set(book_row_identity_match_keys(candidate))
             if cand_keys & currently_reading_keys:
@@ -305,12 +306,17 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
                     (candidate["id"],),
                 )
                 continue
-            if cand_keys & to_read_keys:
-                candidate["score"] = round(min(100.0, float(candidate["score"]) + 10.0), 1)
+            base_score = float(candidate["score"])
+            on_to_read = bool(cand_keys & to_read_keys)
+            if on_to_read:
+                candidate["score"] = round(min(100.0, base_score + 10.0), 1)
                 explanation = list(candidate.get("explanation") or [])
                 if "On your Goodreads to-read shelf" not in explanation:
                     explanation.insert(0, "On your Goodreads to-read shelf")
                 candidate["explanation"] = explanation
+            candidate["base_score"] = base_score
+            candidate["shelf_boost"] = round(float(candidate["score"]) - base_score, 1)
+            candidate["on_goodreads_to_read"] = on_to_read
             cursor = con.execute(
                 "UPDATE candidates SET score=?, explanation=?, score_batch_id=NULL, "
                 "status=CASE WHEN status='new' THEN 'recommended' ELSE status END, "
@@ -324,6 +330,8 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
                 (candidate["metadata_confidence"], candidate["id"]),
             )
             written.append(candidate)
+            if on_to_read:
+                to_read_written_ids.append(int(candidate["id"]))
         if written:
             written_ids = {int(item["id"]) for item in written}
             written_inputs = [
@@ -354,6 +362,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
                     backend=embedder.name,
                     model=embedder.model,
                     scoring_batch_size=SCORING_BATCH_SIZE,
+                    to_read_candidate_ids=to_read_written_ids,
                 )
                 capture_status = persist_scoring_batch(
                     con, batch_id=batch_id, evidence=evidence
