@@ -80,7 +80,7 @@
 					{formErrorBanner(form, 'changePassword')}
 				</p>
 			{/if}
-			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
+			<button class="btn btn-reflow preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
 		</form>
 	</section>
 	<section class="mt-6 rounded-2xl border border-surface-300-700 p-6">
@@ -103,7 +103,7 @@
 								<ProfileField profileId={data.user?.profile_id} />
 								<input type="hidden" name="id" value={identity.id} />
 								<p class="text-xs text-surface-700-300">You will need another sign-in method to access this profile.</p>
-								<button class="btn btn-sm preset-filled-error-500" type="submit" aria-label={`Confirm disconnect: ${identity.email || identity.issuer}`}>Confirm disconnect</button>
+								<button class="btn btn-sm btn-reflow preset-filled-error-500" type="submit" aria-label={`Confirm disconnect: ${identity.email || identity.issuer}`}>Confirm disconnect</button>
 							</form>
 						</details>
 					</div>
@@ -111,9 +111,9 @@
 			</div>
 		{/if}
 		{#if data.oidcEnabled}
-			<a class="btn preset-tonal-primary mt-5" href="/auth/oidc/start?intent=link&amp;profile_id={encodeURIComponent(data.user.profile_id)}">Link SSO identity</a>
+			<a class="btn btn-reflow preset-tonal-primary mt-5" href="/auth/oidc/start?intent=link&amp;profile_id={encodeURIComponent(data.user.profile_id)}">Link SSO identity</a>
 			<p class="mt-2 text-xs text-surface-700-300">Linking requires a sign-in within the last 10 minutes. Sign out and back in if asked to confirm.</p>
 		{/if}
 	</section>
-	{#if data.user.role === 'admin'}<a class="btn preset-tonal-surface mt-6" href="/admin">Manage accounts</a>{/if}
+	{#if data.user.role === 'admin'}<a class="btn btn-reflow preset-tonal-surface mt-6" href="/admin">Manage accounts</a>{/if}
 </main>

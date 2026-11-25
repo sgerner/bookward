@@ -133,6 +133,45 @@ html:has([data-sticky-shell]) {
 	);
 }
 
+@layer components {
+	.header-reflow {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+	}
+
+	.text-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: normal;
+	}
+
+	.url-reflow {
+		min-width: 0;
+		white-space: normal;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+}
+
+@utility btn-reflow {
+	max-width: 100%;
+	height: auto;
+	white-space: normal;
+	overflow-wrap: anywhere;
+	text-align: center;
+	line-height: 1.25;
+
+	& > :where(svg) {
+		flex-shrink: 0;
+	}
+
+	& > :where(:not(svg)) {
+		min-width: 0;
+	}
+}
+
 @utility checkbox-sm {
 	height: --spacing(4);
 	width: --spacing(4);

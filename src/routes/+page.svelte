@@ -3087,13 +3087,13 @@
 
 <div
   data-sticky-shell
-  class="relative isolate min-h-screen overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
+  class="relative isolate flex min-h-screen flex-col overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
 >
   <header
     class="sticky top-0 z-40 border-b border-primary-500/15 preset-filled-surface-50-950 shadow-lg shadow-primary-500/5 backdrop-blur-xl"
   >
     <div
-      class="relative mx-auto flex min-h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:gap-6 lg:px-8"
+      class="header-reflow relative mx-auto flex min-h-16 max-w-7xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-6 lg:gap-x-6 lg:px-8"
     >
       <a
         href="/"
@@ -3107,7 +3107,7 @@
         ></a
       >
       <nav
-        class="hidden min-w-0 flex-1 items-center gap-1 md:flex"
+        class="hidden min-w-0 flex-1 basis-[15rem] flex-wrap items-center gap-1.5 py-1 md:flex"
         aria-label="Primary navigation"
       >
         {#each navItems as item}{@const Icon = item.icon}<button
@@ -3118,7 +3118,7 @@
             ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span>{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</button
       >{/each}
       </nav>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex shrink-0 items-center gap-2">
         {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
@@ -3152,7 +3152,7 @@
           {/snippet}
           {#snippet children()}
             <div class="border-b border-surface-300-700/40 px-2 pb-3">
-              <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+              <p class="text-reflow text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
               {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
             <div class="grid min-w-0 gap-1 py-2">
@@ -3171,7 +3171,7 @@
   </header>
 
   <div
-    class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
+    class="mx-auto flex w-full max-w-7xl flex-1 gap-10 px-4 pb-10 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
     <main id="main-content" tabindex="-1" class="min-w-0 flex-1">
       <div
@@ -3306,7 +3306,7 @@
         })}
         <section class="mb-8 flex min-w-0 flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
-            class="min-w-0 break-words text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
+            class="text-reflow text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex min-w-0 w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
               <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
@@ -3365,9 +3365,9 @@
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
+              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
           </section>
         {/if}
@@ -3386,19 +3386,19 @@
               </div>
             </div>
             <div class="flex flex-wrap gap-2 sm:shrink-0">
-              <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
+              <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
                   {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
-                  <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
+                  <button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
                   </button>
                 </form>
                 <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={clearDigestSelection}>Clear</button>
               {/if}
-              <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={exitDigestMode}>View all</button>
+              <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-surface" onclick={exitDigestMode}>View all</button>
             </div>
           </section>
         {/if}
@@ -3470,8 +3470,8 @@
                     >{/if}
                 </div>
                 <div class="min-w-0">
-                  <h2 class="break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
-                  <p class="mt-1 break-words text-base text-surface-700-300">{book.author}</p>
+                  <h2 class="text-reflow text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="text-reflow mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
                 {#if synopsisText}
                   <div class="space-y-1">
@@ -3520,10 +3520,10 @@
                 </details>
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -3551,7 +3551,7 @@
                         <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
                         <button
                           type="button"
-                          class="btn btn-sm mt-3 min-h-10 w-full preset-filled-primary-500"
+                          class="btn btn-sm btn-reflow mt-3 min-h-10 w-full preset-filled-primary-500"
                           aria-label={`Mark Read: ${book.title} by ${book.author}`}
                           onclick={() => openMarkRead(book)}
                         ><BookOpen size={14} /> Mark Read</button>
@@ -3559,20 +3559,20 @@
                     </div>
                   {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
-                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
+                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
                       {#if book.status === "saved"}
                         <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
                           <ProfileField profileId={data.user?.profile_id} />
-                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                         </form>
                       {/if}
                     {:else if book.status === "saved"}
-                      <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
+                      <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
                       in:fly={{ y: 8, duration: motionDuration(180) }}
                       type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
+                      class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500"
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
@@ -3583,7 +3583,7 @@
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
                   {/if}
                 </div>
@@ -3595,7 +3595,7 @@
               </div>
             {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
                 <InlineAlert message={viewFilterError} />
-                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
                 <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
@@ -3603,21 +3603,21 @@
                   <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : view === "saved" && viewHasFilter ? "No shortlist books match these filters" : viewHasFilter ? "No books match these filters" : view === "decisions" && decisionFilter === "maybe_later" ? "No deferred books" : view === "decisions" && decisionFilter === "rejected" ? "No passed books" : view === "decisions" ? "No past decisions" : digestRequested ? "No unread digest picks left" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
                   <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : view === "saved" && viewHasFilter ? "Change the shortlist search or genre filter to see your saved books." : viewHasFilter ? "Change the search or genre filter to see more books." : view === "decisions" && decisionFilter === "maybe_later" ? "Books you set aside with Maybe later will appear here." : view === "decisions" && decisionFilter === "rejected" ? "Books you pass on will appear here." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestRequested ? "You have already acted on the books from this digest, or open View all to browse Discover." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
                 </div>
-                {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
+                {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn btn-reflow preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
                 {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
+                  <button type="submit" class="btn btn-reflow preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                     {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
                   </button>
                 </form>{/if}
               </div>{/if}{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
               <InlineAlert message={discoverLoadError} />
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
+              <button type="button" class="btn btn-sm btn-reflow preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
               <InlineAlert message={decisionsLoadError} />
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
+              <button type="button" class="btn btn-sm btn-reflow preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
                 {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
               </button>
             </div>{/if}
@@ -3682,7 +3682,7 @@
                   size="sm"
                   message={`${readingHistoryScoreError} Scores loaded for ${scoredReadingHistoryCount} of ${readingHistory.length} books.`}
                 />
-                <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
             {#if readingHistoryState === "idle" || readingHistoryState === "loading"}
@@ -3690,21 +3690,21 @@
             {:else if readingHistoryState === "error"}
               <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
                 <InlineAlert message={readingHistoryError} />
-                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
               <p class="mb-3 text-xs text-surface-700-300">Showing {visibleReadingHistory.length} of {filteredReadingHistory.length} books</p>
               <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {#each visibleReadingHistory as item (item.id)}
                   <article class="card min-w-0 preset-tonal-success p-4">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
-                      <div class="min-w-0 flex-1">
-                        <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
-                        <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h2 class="text-reflow font-semibold leading-5 text-surface-950-50">{item.title}</h2>
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">{item.author}</p>
                         <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
-                      <div class="flex shrink-0 flex-col items-end gap-2">
+                      <div class="ml-auto flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
                           <StarRatingBadge rating={item.rating} />
@@ -3771,7 +3771,7 @@
                 {/each}
               </div>
               {#if visibleReadingHistory.length < filteredReadingHistory.length}
-                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
               {/if}
             {:else}
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
@@ -3825,7 +3825,7 @@
           >
             <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Choose your sources.
               </h1>
@@ -3853,7 +3853,7 @@
                     </p>
                   </div>
                   <div
-                    class="flex min-w-0 w-full items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
+                    class="flex min-w-0 w-full flex-wrap items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
                     role="tablist"
                     aria-label="Filter sources by lifecycle"
                   >
@@ -3865,7 +3865,7 @@
                         aria-controls="source-filter-panel"
                         aria-selected={sourceFilter === option.value}
                         tabindex={sourceFilter === option.value ? 0 : -1}
-                        class={`min-h-9 min-w-0 flex-1 break-words px-2 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
+                        class={`text-reflow min-h-9 min-w-0 flex-1 px-2 py-1.5 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
                         onclick={() => (sourceFilter = option.value)}
                         onkeydown={(event) => {
                           if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -3895,17 +3895,17 @@
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
-                      class="flex min-h-24 items-center gap-4 py-4"
+                      class="flex min-h-24 flex-wrap items-center gap-4 py-4"
                     >
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Sparkles size={18} /></span
                       >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-medium text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-medium text-surface-950-50">
                           Bookward demo books
                         </h3>
-                        <p class="mt-1 text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           A small offline sample to test a fresh installation.
                         </p>
                         <span class="mt-1 block text-xs text-surface-600-400"
@@ -3913,6 +3913,7 @@
                         >
                       </div>
                       <form
+                        class="ml-auto shrink-0"
                         method="POST"
                         action="?/toggleDefault"
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
@@ -3933,17 +3934,17 @@
                     <div in:fade={{ duration: motionDuration(160) }} out:fade={{ duration: motionDuration(100) }}>
                   {#each visibleSourceGroups as group}
                     <div
-                      class="flex min-w-0 items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
+                      class="flex min-w-0 flex-wrap items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
                     >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-semibold text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-semibold text-surface-950-50">
                           {group.label}
                         </h3>
-                        <p class="mt-1 break-words text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           {group.description}
                         </p>
                       </div>
-                      <span class="badge max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
+                      <span class="badge h-auto max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
                         >{group.active} active · {group.sources.length} total</span
                       >
                     </div>
@@ -3955,17 +3956,17 @@
                             delay: motionDelay(source.id % 5, 24),
                           }}
                           out:fade={{ duration: motionDuration(120) }}
-                          class="flex min-h-24 min-w-0 items-center gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:gap-4"
+                          class="flex min-h-24 min-w-0 flex-wrap items-start gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:items-center sm:gap-4"
                         >
                           <span
                             class={`grid size-10 shrink-0 place-items-center ${source.lifecycle === "one_time" ? "preset-tonal-tertiary" : "preset-tonal-secondary"}`}
                             ><Link2 size={18} /></span
                           >
-                          <div class="min-w-0 flex-1">
-                            <h3 class="truncate font-medium text-surface-950-50">
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <h3 class="text-reflow font-medium text-surface-950-50">
                               {source.label}
                             </h3>
-                            <p class="mt-1 truncate text-sm text-surface-700-300">
+                            <p class="url-reflow mt-1 text-sm text-surface-700-300">
                               {source.url}
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
@@ -4082,7 +4083,7 @@
                                       message={formState?.error && formState?.editSource?.id === source.id ? formState.message : ""}
                                     />
                                     <button
-                                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                                       type="submit"
                                       disabled={isPending(`edit-source-${source.id}`)}
                                       aria-busy={isPending(`edit-source-${source.id}`)}
@@ -4159,7 +4160,7 @@
                                           0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
                                         </p>
                                         <button
-                                          class="btn btn-sm min-h-9 preset-filled-warning-500"
+                                          class="btn btn-sm btn-reflow min-h-9 preset-filled-warning-500"
                                           type="submit"
                                           name="confirmZeroMatch"
                                           value="1"
@@ -4170,7 +4171,7 @@
                                     {/if}
                                     <div class="flex flex-wrap items-center gap-2">
                                       <button
-                                        class="btn btn-sm min-h-9 preset-tonal-surface"
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-surface"
                                         type="submit"
                                         name="intent"
                                         value="preview"
@@ -4178,7 +4179,7 @@
                                         aria-busy={isPending(`source-filters-${source.id}`)}
                                       ><Search size={14} /> Preview matches</button>
                                       <button
-                                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                                         type="submit"
                                         name="intent"
                                         value="save"
@@ -4191,7 +4192,7 @@
                               {/if}
                             </div>
                           </div>
-                          <div class="flex shrink-0 items-center gap-2">
+                          <div class="ml-auto flex shrink-0 items-center gap-2">
                             {#if source.kind === "web" && sourceEnabled(source)}
                               <form
                                 method="POST"
@@ -4292,7 +4293,7 @@
                     keeps scanning even when the browser is closed.
                   </p>
                   <button
-                    class="btn mt-4 min-h-11 w-full preset-filled-secondary-500"
+                    class="btn btn-reflow mt-4 min-h-11 w-full preset-filled-secondary-500"
                     type="submit"
                     disabled={isPending("source-schedule")}
                     aria-busy={isPending("source-schedule")}
@@ -4372,7 +4373,7 @@
                     </div>
                   </details
                   ><button
-                    class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
+                    class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-tertiary-500"
                     type="submit"
                     disabled={isPending("source")}
                     aria-busy={isPending("source")}
@@ -4392,9 +4393,9 @@
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
-            <section class="mb-6 max-w-2xl">
+            <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Settings.
               </h1>
@@ -4494,7 +4495,7 @@
                     <form method="POST" action="?/setEvidenceRotation" use:enhance={setPending("toggle-evidence-rotation")}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="enabled" value={data.backupStatus.evidence_rotation_enabled ? "0" : "1"} />
-                      <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
+                      <button class="btn btn-reflow min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
                         {data.backupStatus.evidence_rotation_enabled ? "Pause evidence rotation" : "Enable evidence rotation"}
                       </button>
                     </form>
@@ -4515,14 +4516,14 @@
                     <div class="grid min-w-0 gap-2">
                       <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
                           <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
                         </button>
                       </form>
                       <form method="POST" action="?/setStorageRetention" use:enhance={setPending("toggle-retention")}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="enabled" value={data.backupStatus.retention_enabled ? "0" : "1"} />
-                        <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
                           {data.backupStatus.retention_enabled ? "Pause automatic retention" : "Enable automatic retention"}
                         </button>
                       </form>
@@ -4534,7 +4535,7 @@
                   <div class="min-w-0">
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
+                      <button class="btn btn-reflow min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
                         {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
                       </button>
                     </form>
@@ -4564,7 +4565,7 @@
                           {/each}
                         </select></label>
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
-                        <button class="btn min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
                           {#if isPending("restore-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<RefreshCw size={16} />{/if} Restore selected backup
                         </button>
                       </form>
@@ -4586,14 +4587,14 @@
                 use:enhance={setPending("goodreads-rss")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Goodreads RSS
                     </h2>
@@ -4628,7 +4629,7 @@
                     required
                   /></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-secondary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-secondary-500"
                   type="submit"
                   disabled={isPending("goodreads-rss")}
                   aria-busy={isPending("goodreads-rss")}
@@ -4639,7 +4640,7 @@
                 >
                 {#if data.profile.goodreads_url}
                   <button
-                    class="btn mt-2 min-h-10 w-full preset-tonal-surface"
+                    class="btn btn-reflow mt-2 min-h-10 w-full preset-tonal-surface"
                     type="submit"
                     formaction="?/disconnectGoodreads"
                     formnovalidate
@@ -4660,14 +4661,14 @@
                 use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Upload size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       CSV library export
                     </h2>
@@ -4689,7 +4690,7 @@
                     required
                   /></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
                   disabled={isPending("csv-import")}
                   aria-busy={isPending("csv-import")}
@@ -4713,14 +4714,14 @@
                 use:enhance={setPending("librarr", optimisticLibrarr)}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><Library size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Librarr
                     </h2>
@@ -4772,7 +4773,7 @@
                     ></select
                   ></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-secondary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-secondary-500"
                   type="submit"
                   disabled={isPending("librarr")}
                   aria-busy={isPending("librarr")}
@@ -4790,14 +4791,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Settings2 size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Embedding provider
                     </h2>
@@ -4860,7 +4861,7 @@
                         : "Optional"}
                     /></label
                   ><button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                     type="submit"
                     disabled={isPending("embeddings")}
                     aria-busy={isPending("embeddings")}
@@ -4899,7 +4900,7 @@
                   >
                     <ProfileField profileId={data.user?.profile_id} />
                     <button
-                      class="btn min-h-11 w-full preset-filled-warning-500"
+                      class="btn btn-reflow min-h-11 w-full preset-filled-warning-500"
                       type="submit"
                       disabled={isPending("rebuild-embeddings")}
                       aria-busy={isPending("rebuild-embeddings")}
@@ -4919,14 +4920,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Google Books API
                     </h2>
@@ -4973,7 +4974,7 @@
                     >
                   {/if}
                   <button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                     type="submit"
                     disabled={isPending("google-books")}
                     aria-busy={isPending("google-books")}
@@ -4993,14 +4994,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><Database size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Catalog audit
                     </h2>
@@ -5129,7 +5130,7 @@
                     <ProfileField profileId={data.user?.profile_id} />
                     <input type="hidden" name="mode" value="incremental" />
                     <button
-                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                       type="submit"
                       disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
                       aria-busy={isPending("catalog-audit-incremental")}
@@ -5148,7 +5149,7 @@
                     <ProfileField profileId={data.user?.profile_id} />
                     <input type="hidden" name="mode" value="full" />
                     <button
-                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      class="btn btn-reflow min-h-11 w-full preset-tonal-secondary"
                       type="submit"
                       disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
                       aria-busy={isPending("catalog-audit-full")}
@@ -5169,14 +5170,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                       ><Sparkles size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       LLM reranker
                     </h2>
@@ -5204,7 +5205,7 @@
                     >
                     <button
                       type="button"
-                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                       onclick={() => void loadLlmCatalog()}
                       disabled={llmCatalogLoading}
                       aria-busy={llmCatalogLoading}
@@ -5357,7 +5358,7 @@
                     >
                   {/if}
                   <button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                     type="submit"
                     disabled={isPending("llm-rerank")}
                     aria-busy={isPending("llm-rerank")}
@@ -5381,7 +5382,7 @@
                     ><KeyRound size={19} /></span
                   >
                   <div class="min-w-0 flex-1">
-                    <h2 class="text-lg font-semibold text-surface-950-50">API access</h2>
+                    <h2 class="text-reflow text-lg font-semibold text-surface-950-50">API access</h2>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">
                       Connect automations and other apps to Bookward with a token. Tokens are shown only once when created.
                     </p>
@@ -5390,20 +5391,20 @@
 
                 <div class="mb-5 min-w-0 border border-surface-300-700/50 p-3 text-sm">
                   <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
-                  <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
+                  <code class="url-reflow mt-1 block text-surface-950-50">{page.url.origin}/api/v1</code>
                   <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code class="break-words wrap-anywhere">Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
                 {#if revealedApiToken}
                   <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <Check size={18} class="mt-0.5 shrink-0" aria-hidden="true" />
-                      <div class="min-w-0 flex-1">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
                         <div role="alert">
                           <p class="font-semibold">Copy this token now</p>
                           <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
                         </div>
-                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
+                        <code class="url-reflow mt-3 block rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
                         class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"
@@ -5431,7 +5432,7 @@
                     Token name
                     <input class="input mt-2" name="name" maxlength="100" placeholder="Home Assistant" required />
                   </label>
-                  <button class="btn min-h-11 preset-filled-primary-500" type="submit" disabled={isPending("create-api-token")} aria-busy={isPending("create-api-token")}>
+                  <button class="btn btn-reflow min-h-11 preset-filled-primary-500" type="submit" disabled={isPending("create-api-token")} aria-busy={isPending("create-api-token")}>
                     {#if isPending("create-api-token")}<RefreshCw size={16} class="animate-spin" />{:else}<KeyRound size={16} />{/if} Generate token
                   </button>
                 </form>
@@ -5442,8 +5443,8 @@
                     <ul class="mt-3 divide-y divide-surface-300-700/40 border border-surface-300-700/40">
                       {#each apiTokens as token (token.id)}
                         <li class="flex flex-wrap items-center gap-3 p-3">
-                          <div class="min-w-0 flex-1">
-                            <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <p class="text-reflow text-sm font-medium text-surface-950-50">{token.name}</p>
                             <p class="mt-1 text-xs text-surface-700-300"><code class="break-words wrap-anywhere">{token.token_prefix}…</code> · Created {token.created_at}</p>
                             {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
                           </div>
@@ -5451,12 +5452,12 @@
                             <span class="badge preset-tonal-error">Revoked</span>
                           {:else}
                             <details>
-                              <summary class="btn btn-sm min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
+                              <summary class="btn btn-sm btn-reflow min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
                               <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)} class="mt-2 grid max-w-xs justify-items-start gap-2">
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={token.id} />
                                 <p class="text-xs text-surface-700-300">Apps using this token will lose access to Bookward.</p>
-                                <button class="btn btn-sm min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
+                                <button class="btn btn-sm btn-reflow min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
                               </form>
                             </details>
                           {/if}
@@ -5615,7 +5616,7 @@
                     {:else}
                       <p in:fade={{ duration: motionDuration(180) }} class="text-sm text-surface-700-300">Weekly schedule is off. Save a channel below to test delivery before turning on automatic digests.</p>
                     {/if}
-                    <button class="btn min-h-11 w-full preset-filled-secondary-500 sm:w-auto" type="submit" disabled={isPending("digest-settings")} aria-busy={isPending("digest-settings")}>{#if isPending("digest-settings")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save digest settings</button>
+                    <button class="btn btn-reflow min-h-11 w-full preset-filled-secondary-500 sm:w-auto" type="submit" disabled={isPending("digest-settings")} aria-busy={isPending("digest-settings")}>{#if isPending("digest-settings")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save digest settings</button>
                   </div>
                 </form>
                 <div class="mt-5 flex flex-wrap items-center gap-2 border-t border-surface-300-700/40 pt-5">
@@ -5623,12 +5624,12 @@
                     {#if shouldShowDigestTestButton(digestSettings, digestDraft, channel)}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="channel" value={channel} />
-                      <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={!canTestDigestChannel(digestSettings, digestDraft, channel) || isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
+                      <button class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" type="submit" disabled={!canTestDigestChannel(digestSettings, digestDraft, channel) || isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
                     </form>{/if}
                   {/each}
                   <form method="POST" action="?/runDigest" use:enhance={setPending("digest-run")} class="ml-auto">
                     <ProfileField profileId={data.user?.profile_id} />
-                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
+                    <button class="btn btn-sm btn-reflow min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
                 <StatusRegion
@@ -5661,8 +5662,8 @@
                     class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                     ><BookOpen size={19} /></span
                   >
-                  <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
-                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => go("decisions", "read")}>View full history <ArrowRight size={14} /></button>
+                  <h2 class="text-reflow flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
+                  <button type="button" class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary" onclick={() => go("decisions", "read")}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if recentReads.length}<div
                     class="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3"
@@ -5677,12 +5678,12 @@
                         class="flex min-h-16 min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
-                        <div class="min-w-0 flex-1">
+                        <div class="min-w-0 flex-1 basis-[8rem]">
                           <span
-                            class="block truncate text-sm font-medium text-surface-950-50"
+                            class="text-reflow block text-sm font-medium text-surface-950-50"
                             >{item.title}</span
                           ><small
-                            class="block truncate text-xs text-surface-700-300"
+                            class="text-reflow mt-0.5 block text-xs text-surface-700-300"
                             >{item.author}</small
                           >
                         </div>
@@ -5717,18 +5718,18 @@
   </div>
 
   <nav
-    class="fixed inset-x-0 bottom-0 z-40 flex border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
+    class="sticky inset-x-0 bottom-0 z-40 mt-auto flex flex-wrap border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
     aria-label="Mobile navigation"
   >
     {#each navItems as item}{@const Icon = item.icon}<button
         type="button"
-        class={`relative flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 px-0.5 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
+        class={`relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5 ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
         aria-current={activeView === item.id ? "page" : undefined}
         onclick={() => go(item.id)}
         ><Icon
           size={19}
           strokeWidth={activeView === item.id ? 2.2 : 1.8}
-        /><span class="flex items-center gap-1">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
+        /><span class="flex items-center gap-0.5">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm px-1 preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
             in:scale={{ duration: motionDuration(150) }}
             out:fade={{ duration: motionDuration(90) }}
             class="absolute bottom-1 size-1 rounded-full preset-filled-primary-500"
@@ -5749,13 +5750,13 @@
           <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
         </div>
         <div class="flex items-start justify-between gap-4 border-b border-surface-200-800/70 p-4 sm:gap-5 sm:p-7">
-          <div class="flex min-w-0 items-center gap-3 sm:gap-4">
+          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-3 sm:gap-4">
             <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
               <BookOpen size={22} />
             </span>
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1 basis-[4.5rem]">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
+              <h2 id="mark-read-title" class="text-reflow mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -5773,7 +5774,7 @@
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
 
-            <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
+            <div class="flex flex-wrap items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
               <div class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
                 <BookOpen size={22} class="text-surface-600-400" aria-hidden="true" />
                 {#if markReadBook.cover_url}
@@ -5787,9 +5788,9 @@
                   />
                 {/if}
               </div>
-              <div class="min-w-0">
-                <p class="line-clamp-2 text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
-                <p class="mt-1 truncate text-sm text-surface-700-300">{markReadBook.author}</p>
+              <div class="min-w-0 flex-1 basis-[8rem]">
+                <p class="text-reflow text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
+                <p class="text-reflow mt-1 text-sm text-surface-700-300">{markReadBook.author}</p>
               </div>
               <span class="ml-auto hidden size-9 shrink-0 place-items-center rounded-full bg-secondary-500/10 text-secondary-600-400 sm:grid" aria-hidden="true"><Check size={17} /></span>
             </div>
@@ -5806,10 +5807,10 @@
           </div>
 
           <div class="flex flex-col-reverse gap-2 border-t border-surface-200-800/70 bg-surface-950/5 p-5 sm:flex-row sm:justify-end sm:p-6">
-            <button type="button" class="btn min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
+            <button type="button" class="btn btn-reflow min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
             <button
               type="submit"
-              class="btn min-h-11 preset-filled-primary-500"
+              class="btn btn-reflow min-h-11 preset-filled-primary-500"
               disabled={isPending(`shortlist-read-${markReadBook.id}`)}
               aria-busy={isPending(`shortlist-read-${markReadBook.id}`)}
             >
@@ -5835,11 +5836,11 @@
             </p>
             <h2
               id="librarr-search-title"
-              class="mt-1 truncate text-2xl font-semibold tracking-tight text-surface-950-50"
+              class="text-reflow mt-1 text-2xl font-semibold tracking-tight text-surface-950-50"
             >
               Find a book to add
             </h2>
-            <p class="mt-1 truncate text-sm text-surface-700-300">
+            <p class="text-reflow mt-1 text-sm text-surface-700-300">
               {librarrSearchBook?.title} · {librarrSearchBook?.author}
             </p>
           </div>
@@ -5880,7 +5881,7 @@
             >
             <button
               type="submit"
-              class="btn min-h-12 preset-filled-primary-500"
+              class="btn btn-reflow min-h-12 preset-filled-primary-500"
               aria-busy={librarrSearchState === "searching"}
               >{#if librarrSearchState === "searching"}<RefreshCw
                   size={16}
@@ -5952,7 +5953,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm btn-reflow min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -5962,7 +5963,7 @@
                     duration: motionDuration(220),
                     delay: motionDelay(index, 24),
                   }}
-                  class="flex min-w-0 items-center gap-4 preset-tonal-surface p-3 sm:p-4"
+                  class="flex min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3 sm:gap-4 sm:p-4"
                 >
                   <div
                     class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
@@ -5985,13 +5986,13 @@
                             true)}
                       />{/if}
                   </div>
-                  <div class="min-w-0 flex-1">
+                  <div class="min-w-0 flex-1 basis-[8rem]">
                     <h3
-                      class="line-clamp-2 text-base font-semibold text-surface-950-50 sm:text-lg"
+                      class="text-reflow text-base font-semibold text-surface-950-50 sm:text-lg"
                     >
                       {resultTitle(result)}
                     </h3>
-                    <p class="mt-1 truncate text-sm text-surface-700-300">
+                    <p class="text-reflow mt-1 text-sm text-surface-700-300">
                       {resultAuthor(result)}
                     </p>
                     <span
@@ -6002,7 +6003,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm ml-auto min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}
