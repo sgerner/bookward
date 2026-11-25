@@ -32,6 +32,6 @@ describe('ThemePicker focus and template invariants', () => {
 		expect(pageSource).not.toContain('role="switch"');
 		expect(pageSource).not.toContain('text-amber-300');
 		expect((pageSource.match(/<SwitchControl\b/g) ?? []).length).toBe(6);
-		expect((pageSource.match(/<StarRating\b/g) ?? []).length).toBe(1);
+		expect((pageSource.match(/<StarRating\b/g) ?? []).length).toBe(3);
 	});
 });
