@@ -722,6 +722,21 @@
   const catalogAuditPercent = $derived(
     Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
   );
+  // State changes only: the remaining count changes on every poll and would be
+  // re-announced every few seconds.
+  const catalogAuditStatusMessage = $derived(
+    catalogAudit.status === "failed"
+      ? "Catalog audit needs retry."
+      : catalogAudit.active
+        ? `${catalogAudit.mode === "full" ? "Full" : "Incremental"} catalog audit ${
+            catalogAudit.status === "queued" ? "queued" : "running"
+          }.`
+        : catalogAudit.status === "paused"
+          ? "Catalog audit paused."
+          : catalogAudit.remaining > 0
+            ? "Catalog audit has books due."
+            : "Catalog audit up to date.",
+  );
   $effect(() => {
     if (typeof window === "undefined") return;
     if (activeView !== "settings" || !catalogAudit.active) return;
@@ -4480,11 +4495,7 @@
                   Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
                 </p>
 
-                <div
-                  class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm"
-                  role="status"
-                  aria-live="polite"
-                >
+                <div class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm">
                   <div class="flex flex-wrap items-center justify-between gap-2">
                     <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
                       {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
@@ -4528,6 +4539,10 @@
                     </div>
                   {/if}
                 </div>
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  paused={activeView !== "settings"}
+                />
 
                 {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
                   <div
