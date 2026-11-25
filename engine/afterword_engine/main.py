@@ -27,9 +27,11 @@ from .database import (
     bind_request_restore_epoch,
     connect,
     database_lock,
+    demote_orphaned_recommended_candidates,
     fenced_async,
     initialize,
     normalize_key,
+    recompute_candidate_sources,
     row,
     rows,
     scheduler_fenced,
@@ -102,6 +104,7 @@ from .learning import (
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    sync_read_rating_in_connection,
     validate_candidate_run_id,
     _impression_precedes,
     _read_label,
@@ -124,7 +127,10 @@ from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
     audit_candidates,
+    configure_candidate_quality_sweep,
+    finish_candidate_quality_batch,
     has_candidate_quality_audit_candidates,
+    prepare_candidate_quality_batch,
     quality_summary,
 )
 from . import llm_reranker
@@ -183,6 +189,11 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class CandidateAuditIn(BaseModel):
+    mode: Literal["incremental", "full"] | None = None
+    retry: bool = False
 
 
 def _ensure_profile_database(profile_id: str):
@@ -328,7 +339,11 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+    if (
+        not active_job("candidate_quality")
+        and not active_job("candidate_quality_recovery")
+        and has_candidate_quality_audit_candidates()
+    ):
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -598,15 +613,43 @@ async def handle_job(kind: str):
             enqueue_followup_job("metadata")
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        quality = await audit_candidates(only_pending=False)
-        enqueue_job("read_work_identities", dedupe=True)
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
+        mode, started_at = prepare_candidate_quality_batch()
+        quality = await audit_candidates(
+            only_pending=(mode != "full"),
+            limit=QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=started_at,
         )
-        return {**quality, "scored": scored}
+        stopped = bool(quality.get("stopped"))
+        remaining = finish_candidate_quality_batch(
+            mode=mode,
+            started_at=started_at,
+            stopped=stopped,
+        )
+        changed = bool(
+            quality.get("status_changed")
+            or quality.get("deduped")
+            or quality.get("enriched")
+        )
+        is_final_batch = remaining == 0 and not stopped
+        score_job_id = (
+            enqueue_followup_job("score")
+            if (changed or is_final_batch)
+            else None
+        )
+        followup_job_id = (
+            enqueue_followup_job("candidate_quality")
+            if remaining > 0
+            else None
+        )
+        if quality.get("audited") or is_final_batch:
+            enqueue_job("read_work_identities", dedupe=True)
+        return {
+            **quality,
+            "mode": mode,
+            "remaining": remaining,
+            "followup_job_id": followup_job_id,
+            "score_job_id": score_job_id,
+        }
     if kind == "candidate_quality_recovery":
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
         _enqueue_candidate_quality_followup()
@@ -736,7 +779,7 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if has_candidate_quality_audit_candidates():
+                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -1453,6 +1496,33 @@ class MarkReadIn(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
     )
+
+
+class ReadingHistoryRatingIn(BaseModel):
+    rating: int | None
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def validate_whole_star_rating(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, int):
+            if 1 <= value <= 5:
+                return value
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "":
+                raise HTTPException(
+                    400,
+                    "Rating must be a whole number between 1 and 5, or null for unrated",
+                )
+            if trimmed in {"1", "2", "3", "4", "5"}:
+                return int(trimmed)
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
 
 
 class TelemetryEventIn(BaseModel):
@@ -2284,6 +2354,51 @@ def reading_history():
         item["algorithm_explanation"] = []
         item["metadata_confidence"] = None
     return items
+
+
+@app.put("/api/reading-history/{read_id}")
+def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    """Set, change, or clear a whole-star rating on an existing read entry."""
+    if read_id <= 0:
+        raise HTTPException(404, "Read entry not found")
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?",
+            (read_id,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        con.execute(
+            "UPDATE reads SET rating=? WHERE id=?",
+            (payload.rating, read_id),
+        )
+        updated = dict(
+            con.execute(
+                "SELECT * FROM reads WHERE id=?",
+                (read_id,),
+            ).fetchone()
+        )
+        try:
+            sync_read_rating_in_connection(con, updated)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    job_id = enqueue_followup_job("score")
+    raw_rating = updated.get("rating")
+    normalized_rating = (
+        int(raw_rating)
+        if raw_rating is not None and float(raw_rating).is_integer()
+        else raw_rating
+    )
+    return {
+        "id": int(updated["id"]),
+        "title": updated["title"],
+        "author": updated["author"],
+        "rating": normalized_rating,
+        "read_at": updated.get("read_at"),
+        "source": updated.get("source") or "",
+        "created_at": updated.get("created_at"),
+        "job_id": job_id,
+    }
 
 
 @app.get("/api/reading-history/scores")
@@ -3392,13 +3507,9 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
         "WHERE id=?",
         (source_id,),
     )
+    recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE source_id=? AND status='recommended'",
-            (source_id,),
-        )
+        demote_orphaned_recommended_candidates(con, source_id=source_id)
     return became_enabled
 
 
@@ -3932,12 +4043,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND COALESCE(s.enabled,1)=1",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }
@@ -3998,10 +4109,12 @@ async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/candidates/audit")
-async def candidate_audit():
-    """Queue a full catalog identity and quality audit."""
+async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
+    """Queue a bounded incremental or full catalog identity and quality audit."""
 
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
+    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
+    return configure_candidate_quality_sweep(mode=mode, retry=retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
@@ -4418,6 +4531,8 @@ def api_root():
         "documentation": "GET /openapi.json or /docs on the engine",
         "endpoints": {
             "overview": "GET /api/v1/overview",
+            "reading_history": "GET /api/v1/reading-history",
+            "reading_history_rating": "PUT /api/v1/reading-history/{id}",
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
@@ -4441,6 +4556,16 @@ def api_me(request: Request):
 @api_v1.get("/overview")
 def api_overview():
     return overview_payload(include_api_tokens=False)
+
+
+@api_v1.get("/reading-history")
+def api_reading_history():
+    return reading_history()
+
+
+@api_v1.put("/reading-history/{read_id}")
+def api_update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    return update_reading_history_rating(read_id, payload)
 
 
 @api_v1.get("/settings")
