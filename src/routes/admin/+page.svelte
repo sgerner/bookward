@@ -1,6 +1,15 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
+	import { tick } from 'svelte';
+	import FormField from '#lib/components/FormField.svelte';
 	import ProfileField from '#lib/components/ProfileField.svelte';
+	import {
+		fieldError,
+		focusFirstInvalidControl,
+		formErrorBanner,
+		formSuccessBanner,
+		formValue
+	} from '#lib/form-errors.js';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 	const backupTime = new Intl.DateTimeFormat('en', {
@@ -8,6 +17,27 @@
 		timeStyle: 'short',
 		timeZone: 'UTC'
 	});
+
+	const accountsSectionError = $derived.by(() => {
+		if (!form?.error || !form.formId || form.formId === 'create') return undefined;
+		const renderedInRow = data.accounts.some(
+			(account) =>
+				form.formId === `setStatus-${account.id}` ||
+				(account.id !== data.current_user_id && form.formId === `resetPassword-${account.id}`)
+		);
+		if (renderedInRow) return undefined;
+		return typeof form.message === 'string' && form.message.trim() ? form.message.trim() : undefined;
+	});
+
+	const enhanceForm: SubmitFunction = ({ formElement }) => {
+		return async ({ result, update }) => {
+			await update({ reset: result.type === 'success' });
+			if (result.type === 'failure') {
+				await tick();
+				focusFirstInvalidControl(formElement);
+			}
+		};
+	};
 </script>
 
 <svelte:head><title>Manage accounts · Bookward</title></svelte:head>
@@ -17,47 +47,156 @@
 	<a href="/" class="inline-flex min-h-11 items-center text-primary-600-400">← Bookward</a>
 	<h1 class="mt-6 text-3xl font-semibold">Manage accounts</h1>
 	<p class="mt-2 text-surface-700-300">Each account opens one private profile. Existing data stays with the original administrator profile.</p>
-	{#if form?.message && form.error}<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>{:else if form?.message}<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>{/if}
 	<section class="mt-8 rounded-2xl border border-surface-300-700 p-6">
 		<h2 class="text-xl font-semibold">Create an account</h2>
 		<p class="mt-1 text-sm text-surface-700-300">Share the temporary password privately. The new reader must set a personal password on first sign-in.</p>
-		<form method="POST" action="?/create" use:enhance class="mt-5 grid gap-4 sm:grid-cols-2">
+		{#if formSuccessBanner(form, 'create')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, 'create')}</p>
+		{/if}
+		<form method="POST" action="?/create" use:enhance={enhanceForm} class="mt-5 grid items-start gap-4 sm:grid-cols-2">
 			<ProfileField profileId={data.user?.profile_id} />
-			<label class="grid gap-2 text-sm font-medium">Username<input class="input" name="username" autocomplete="off" maxlength="160" required /></label>
-			<label class="grid gap-2 text-sm font-medium">Display name<input class="input" name="display_name" maxlength="160" /></label>
-			<label class="grid gap-2 text-sm font-medium">Temporary password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" /></label>
-			<label class="grid gap-2 text-sm font-medium">Role<select class="select" name="role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
-			<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Create profile</button>
+			<FormField
+				id="create-username"
+				label="Username"
+				error={fieldError(form, 'create', 'username')}
+			>
+				{#snippet children(field)}
+					<input
+						{...field}
+						class="input"
+						name="username"
+						value={formValue(form, 'create', 'username')}
+						autocomplete="off"
+						maxlength="160"
+						required
+					/>
+				{/snippet}
+			</FormField>
+			<FormField
+				id="create-display-name"
+				label="Display name"
+				error={fieldError(form, 'create', 'display_name')}
+			>
+				{#snippet children(field)}
+					<input
+						{...field}
+						class="input"
+						name="display_name"
+						value={formValue(form, 'create', 'display_name')}
+						maxlength="160"
+					/>
+				{/snippet}
+			</FormField>
+			<FormField
+				id="create-password"
+				label="Temporary password"
+				hint="Use at least 12 characters."
+				error={fieldError(form, 'create', 'password')}
+			>
+				{#snippet children(field)}
+					<input
+						{...field}
+						class="input"
+						type="password"
+						name="password"
+						minlength="12"
+						required
+						autocomplete="new-password"
+					/>
+				{/snippet}
+			</FormField>
+			<FormField
+				id="create-role"
+				label="Role"
+				error={fieldError(form, 'create', 'role')}
+			>
+				{#snippet children(field)}
+					<select {...field} class="select" name="role">
+						<option value="user" selected={formValue(form, 'create', 'role') !== 'admin'}>User</option>
+						<option value="admin" selected={formValue(form, 'create', 'role') === 'admin'}>Administrator</option>
+					</select>
+				{/snippet}
+			</FormField>
+			{#if formErrorBanner(form, 'create')}
+				<p class="rounded-xl p-3 text-sm preset-tonal-error sm:col-span-2" role="alert">{formErrorBanner(form, 'create')}</p>
+			{/if}
+			<button class="btn preset-filled-primary-500 justify-self-start sm:col-span-2" type="submit">Create profile</button>
 		</form>
 	</section>
 	<section class="mt-8 grid gap-4">
 		<h2 class="text-xl font-semibold">Accounts</h2>
+		{#if accountsSectionError}
+			<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">{accountsSectionError}</p>
+		{/if}
 		{#each data.accounts as account}
 			{@const hasLocalUsername = account.has_local_username ?? !account.username.trim().toLowerCase().startsWith('oidc:')}
 			{@const loginLabel = hasLocalUsername ? account.username : 'SSO-only'}
 			{@const headingLabel = account.display_name || loginLabel}
+			{@const statusFormId = `setStatus-${account.id}`}
+			{@const resetFormId = `resetPassword-${account.id}`}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
 					<div><h3 class="font-semibold">{headingLabel}</h3><p class="text-sm text-surface-700-300">{loginLabel} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}</p></div>
-					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
+					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
 						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${headingLabel}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
 				</div>
+				{#if formSuccessBanner(form, statusFormId)}
+					<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, statusFormId)}</p>
+				{/if}
+				{#if formErrorBanner(form, statusFormId)}
+					<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, statusFormId)}</p>
+				{/if}
 				{#if account.id !== data.current_user_id}
+					{#if formSuccessBanner(form, resetFormId)}
+						<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, resetFormId)}</p>
+					{/if}
 					{#if hasLocalUsername}
-						<form method="POST" action="?/resetPassword" use:enhance class="mt-4 flex flex-wrap items-end gap-3">
+						<form method="POST" action="?/resetPassword" use:enhance={enhanceForm} class="mt-4 flex flex-wrap items-start gap-3">
 							<ProfileField profileId={data.user?.profile_id} />
 							<input type="hidden" name="account_id" value={account.id} />
-							<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium">Set password<input class="input" type="password" name="password" minlength="12" required autocomplete="new-password" aria-label={`Set password for ${headingLabel}`} /></label>
-							<button class="btn btn-sm preset-tonal-surface" type="submit" aria-label={`Reset password for ${headingLabel}`}>Reset password</button>
+							<FormField
+								id={`reset-password-${account.id}`}
+								label="Set password"
+								srLabel={`for ${headingLabel}`}
+								hint="Use at least 12 characters."
+								error={fieldError(form, resetFormId, 'password')}
+								class="grid min-w-64 flex-1 gap-2"
+							>
+								{#snippet children(field)}
+									<input
+										{...field}
+										class="input"
+										type="password"
+										name="password"
+										minlength="12"
+										required
+										autocomplete="new-password"
+									/>
+								{/snippet}
+							</FormField>
+							<button class="btn btn-sm preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${headingLabel}`}>Reset password</button>
+							{#if formErrorBanner(form, resetFormId)}
+								<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
+							{/if}
 						</form>
 					{:else}
-						<div class="mt-4 flex flex-wrap items-end gap-3">
-							<label class="grid min-w-64 flex-1 gap-2 text-sm font-medium text-surface-700-300">
-								Set password
-								<input class="input" type="password" disabled aria-label={`Set password unavailable for SSO-only account ${headingLabel}`} aria-describedby={`sso-only-reset-hint-${account.id}`} />
-								<span id={`sso-only-reset-hint-${account.id}`} class="text-xs font-normal text-surface-700-300">SSO-only — local password reset is unavailable until this reader sets a username in Account settings.</span>
-							</label>
-							<button class="btn btn-sm preset-tonal-surface" type="button" disabled aria-label={`Reset password unavailable for ${headingLabel}`}>Reset password</button>
+						<div class="mt-4 flex flex-wrap items-start gap-3">
+							<FormField
+								id={`reset-password-${account.id}`}
+								label="Set password"
+								srLabel={`unavailable for SSO-only account ${headingLabel}`}
+								hint="SSO-only — local password reset is unavailable until this reader sets a username in Account settings."
+								class="grid min-w-64 flex-1 gap-2"
+								labelClass="block text-sm font-medium text-surface-700-300"
+							>
+								{#snippet children(field)}
+									<input {...field} class="input" type="password" disabled />
+								{/snippet}
+							</FormField>
+							<button class="btn btn-sm preset-tonal-surface sm:mt-7" type="button" disabled aria-label={`Reset password unavailable for ${headingLabel}`}>Reset password</button>
+							{#if formErrorBanner(form, resetFormId)}
+								<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
+							{/if}
 						</div>
 					{/if}
 				{/if}

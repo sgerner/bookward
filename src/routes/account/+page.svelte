@@ -1,6 +1,15 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
+	import { tick } from 'svelte';
+	import FormField from '#lib/components/FormField.svelte';
 	import ProfileField from '#lib/components/ProfileField.svelte';
+	import {
+		fieldError,
+		focusFirstInvalidControl,
+		formErrorBanner,
+		formSuccessBanner,
+		formValue
+	} from '#lib/form-errors.js';
 	import type { ActionData, PageData } from './$types';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -16,6 +25,16 @@
 	const localLoginReady = $derived(Boolean(data.methods.password_enabled && hasLocalUsername));
 	const enrollmentVerified = $derived(Boolean(data.enrollmentVerified ?? data.methods.enrollment_verified));
 	const canUnlinkSso = $derived(localLoginReady || data.methods.oidc_identities.length > 1);
+
+	const enhanceForm: SubmitFunction = ({ formElement }) => {
+		return async ({ result, update }) => {
+			await update({ reset: result.type === 'success' });
+			if (result.type === 'failure') {
+				await tick();
+				focusFirstInvalidControl(formElement);
+			}
+		};
+	};
 </script>
 
 <svelte:head><title>Account · Bookward</title></svelte:head>
@@ -26,11 +45,7 @@
 	<h1 class="mt-6 text-3xl font-semibold">Account</h1>
 	<p class="mt-2 text-surface-700-300">Signed in as <strong>{activeDisplayName}</strong>. Your recommendations and reading lists are private to this profile.</p>
 	{#if data.forcePasswordChange}<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">Set a personal password before continuing. Your administrator supplied a temporary password for this first sign-in.</p>{/if}
-	{#if form?.message && form.error}
-		<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>
-	{:else if form?.message}
-		<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>
-	{:else if data.reauthenticationRequired}
+	{#if data.reauthenticationRequired}
 		<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">For security, sign out and sign back in before linking single sign-on.</p>
 	{:else if data.linkError}
 		<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">The identity could not be linked. Check that the provider identity is not already linked to another account, then try again.</p>
@@ -52,33 +67,69 @@
 				Choose a username and password as another way to sign in.
 			{/if}
 		</p>
+		{#if formSuccessBanner(form, 'changePassword')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, 'changePassword')}</p>
+		{/if}
 		{#if localLoginReady || enrollmentVerified}
-			<form method="POST" action="?/changePassword" use:enhance class="mt-5 grid gap-4">
+			<form method="POST" action="?/changePassword" use:enhance={enhanceForm} class="mt-5 grid gap-4">
 				<ProfileField profileId={data.user?.profile_id} />
 				{#if !hasLocalUsername}
-					<label class="grid gap-2 text-sm font-medium">
-						Username
-						<input
-							class="input"
-							name="username"
-							autocomplete="username"
-							autocapitalize="none"
-							spellcheck="false"
-							maxlength="160"
-							required
-							aria-describedby="account-username-hint"
-						/>
-						<span id="account-username-hint" class="text-xs font-normal text-surface-700-300">Choose a unique username for local sign-in.</span>
-					</label>
+					<FormField
+						id="account-username"
+						label="Username"
+						hint="Choose a unique username for local sign-in."
+						error={fieldError(form, 'changePassword', 'username')}
+					>
+						{#snippet children(field)}
+							<input
+								{...field}
+								class="input"
+								name="username"
+								value={formValue(form, 'changePassword', 'username')}
+								autocomplete="username"
+								autocapitalize="none"
+								spellcheck="false"
+								maxlength="160"
+								required
+							/>
+						{/snippet}
+					</FormField>
 				{/if}
 				{#if localLoginReady}
-					<label class="grid gap-2 text-sm font-medium">Current password<input class="input" type="password" name="current_password" autocomplete="current-password" required /></label>
+					<FormField
+						id="account-current-password"
+						label="Current password"
+						error={fieldError(form, 'changePassword', 'current_password')}
+					>
+						{#snippet children(field)}
+							<input {...field} class="input" type="password" name="current_password" autocomplete="current-password" required />
+						{/snippet}
+					</FormField>
 				{/if}
-				<label class="grid gap-2 text-sm font-medium">New password<input class="input" type="password" name="new_password" autocomplete="new-password" minlength="12" maxlength="1024" required /></label>
+				<FormField
+					id="account-new-password"
+					label="New password"
+					hint="Use at least 12 characters."
+					error={fieldError(form, 'changePassword', 'new_password')}
+				>
+					{#snippet children(field)}
+						<input {...field} class="input" type="password" name="new_password" autocomplete="new-password" minlength="12" maxlength="1024" required />
+					{/snippet}
+				</FormField>
+				{#if formErrorBanner(form, 'changePassword')}
+					<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">
+						{formErrorBanner(form, 'changePassword')}
+					</p>
+				{/if}
 				<button class="btn preset-filled-primary-500 justify-self-start" type="submit">Update password</button>
 			</form>
 		{:else}
 			<div class="mt-4 grid justify-items-start gap-3">
+				{#if formErrorBanner(form, 'changePassword')}
+					<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">
+						{formErrorBanner(form, 'changePassword')}
+					</p>
+				{/if}
 				<p class="text-sm text-surface-700-300">Confirm your single sign-on identity in a fresh sign-in before adding local credentials.</p>
 				{#if data.oidcEnabled}
 					<a class="btn preset-filled-primary-500" href="/auth/oidc/start?intent=enroll&amp;profile_id={encodeURIComponent(data.user.profile_id)}">Confirm with SSO</a>
@@ -91,6 +142,12 @@
 	<section class="mt-6 rounded-2xl border border-surface-300-700 p-6">
 		<h2 class="text-xl font-semibold">Single sign-on</h2>
 		<p class="mt-1 text-sm text-surface-700-300">Link your provider once. Future SSO sign-ins open this profile automatically.</p>
+		{#if formSuccessBanner(form, 'unlink')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, 'unlink')}</p>
+		{/if}
+		{#if formErrorBanner(form, 'unlink')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, 'unlink')}</p>
+		{/if}
 		{#if data.methods.oidc_identities.length}
 			<div class="mt-4 grid gap-3">
 				{#each data.methods.oidc_identities as identity}
@@ -99,7 +156,7 @@
 						{#if canUnlinkSso}
 							<details>
 								<summary class="btn btn-sm cursor-pointer preset-tonal-error" aria-label={`Disconnect ${identity.email || identity.issuer} from this account`}>Disconnect</summary>
-								<form method="POST" action="?/unlink" use:enhance class="mt-2 grid max-w-xs justify-items-start gap-2">
+								<form method="POST" action="?/unlink" use:enhance={enhanceForm} class="mt-2 grid max-w-xs justify-items-start gap-2">
 									<ProfileField profileId={data.user?.profile_id} />
 									<input type="hidden" name="id" value={identity.id} />
 									<p class="text-xs text-surface-700-300">You will need another sign-in method to access this profile.</p>
