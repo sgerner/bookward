@@ -15,7 +15,7 @@ from .covers import (
     fallback_cover_url,
     is_weak_cover_url,
 )
-from .identity import book_identity, book_identity_matches, normalize_key
+from .identity import ReadIdentityIndex, book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
 from .tenancy import (
@@ -1237,6 +1237,293 @@ MIGRATIONS = [
         ALTER TABLE goodreads_shelf_items ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
         """,
     ),
+    (
+        31,
+        """
+        DROP TABLE IF EXISTS temp._m31_demo_reads;
+        CREATE TEMP TABLE _m31_demo_reads (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT NOT NULL,
+            openlibrary_work_id TEXT NOT NULL
+        );
+        INSERT INTO temp._m31_demo_reads(id, title, author, isbn, openlibrary_work_id)
+        SELECT id, title, author, COALESCE(isbn, ''), COALESCE(openlibrary_work_id, '')
+        FROM reads
+        WHERE source = 'demo'
+          AND (
+              EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
+              OR EXISTS (
+                  SELECT 1 FROM sources
+                  WHERE url = 'builtin://upcoming' AND enabled = 0
+              )
+          );
+
+        DROP TABLE IF EXISTS temp._m31_demo_events;
+        CREATE TEMP TABLE _m31_demo_events (
+            event_id INTEGER,
+            event_key TEXT NOT NULL,
+            run_id TEXT,
+            candidate_id INTEGER
+        );
+        INSERT INTO temp._m31_demo_events(event_id, event_key, run_id, candidate_id)
+        SELECT NULL, printf('read:%08d', id), NULL, NULL
+        FROM temp._m31_demo_reads;
+        INSERT INTO temp._m31_demo_events(event_id, event_key, run_id, candidate_id)
+        SELECT e.id, e.event_key, e.run_id, e.candidate_id
+        FROM recommendation_events e
+        WHERE EXISTS (
+            SELECT 1 FROM temp._m31_demo_reads r
+            WHERE e.event_key = printf('read:%08d', r.id)
+               OR e.event_key GLOB printf('read:%08d:*', r.id)
+               OR e.event_key GLOB printf('manual-read:*:%08d', r.id)
+               OR e.event_key GLOB printf('attribution:read:%08d:*', r.id)
+        )
+           OR (
+            e.event_type = 'read'
+            AND json_valid(e.metadata)
+            AND json_extract(e.metadata, '$.read_source') = 'demo'
+            AND (
+                EXISTS (SELECT 1 FROM reads WHERE source != 'demo')
+                OR EXISTS (
+                    SELECT 1 FROM sources
+                    WHERE url = 'builtin://upcoming' AND enabled = 0
+                )
+            )
+        );
+        INSERT INTO temp._m31_demo_events(event_id, event_key, run_id, candidate_id)
+        SELECT NULL, ee.event_key, ee.run_id, ee.candidate_id
+        FROM recommendation_evidence_events ee
+        WHERE EXISTS (
+            SELECT 1 FROM temp._m31_demo_reads r
+            WHERE ee.event_key = printf('read:%08d', r.id)
+               OR ee.event_key GLOB printf('read:%08d:*', r.id)
+               OR ee.event_key GLOB printf('manual-read:*:%08d', r.id)
+               OR ee.event_key GLOB printf('attribution:read:%08d:*', r.id)
+        )
+           OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events);
+        INSERT INTO temp._m31_demo_events(event_id, event_key, run_id, candidate_id)
+        SELECT NULL, eo.event_key, eo.run_id, eo.candidate_id
+        FROM recommendation_evidence_outcomes eo
+        WHERE EXISTS (
+            SELECT 1 FROM temp._m31_demo_reads r
+            WHERE eo.event_key = printf('read:%08d', r.id)
+               OR eo.event_key GLOB printf('read:%08d:*', r.id)
+               OR eo.event_key GLOB printf('manual-read:*:%08d', r.id)
+               OR eo.event_key GLOB printf('attribution:read:%08d:*', r.id)
+        )
+           OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events);
+
+        DROP TABLE IF EXISTS temp._m31_demo_batches;
+        CREATE TEMP TABLE _m31_demo_batches (batch_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m31_demo_batches(batch_id)
+        SELECT DISTINCT batch_id
+        FROM scoring_batch_reads
+        WHERE read_id IN (SELECT id FROM temp._m31_demo_reads);
+
+        DROP TABLE IF EXISTS temp._m31_demo_runs;
+        CREATE TEMP TABLE _m31_demo_runs (run_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m31_demo_runs(run_id)
+        SELECT i.run_id
+        FROM recommendation_outcomes o
+        JOIN recommendation_impressions i ON i.id = o.impression_id
+        WHERE o.read_id IN (SELECT id FROM temp._m31_demo_reads)
+          AND i.run_id IS NOT NULL AND i.run_id != '';
+        INSERT OR IGNORE INTO temp._m31_demo_runs(run_id)
+        SELECT run_id FROM temp._m31_demo_events
+        WHERE run_id IS NOT NULL AND run_id != '';
+        INSERT OR IGNORE INTO temp._m31_demo_runs(run_id)
+        SELECT run_id FROM recommendation_run_evidence_scoring_batches
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m31_demo_batches)
+          AND run_id IS NOT NULL AND run_id != '';
+
+        INSERT INTO jobs(id, kind, status)
+        SELECT 'migration-31-score-' || lower(hex(randomblob(8))), 'score', 'queued'
+        WHERE (
+            EXISTS (SELECT 1 FROM temp._m31_demo_reads)
+            OR EXISTS (SELECT 1 FROM temp._m31_demo_events WHERE event_id IS NOT NULL)
+            OR EXISTS (SELECT 1 FROM temp._m31_demo_batches)
+        )
+          AND NOT EXISTS (
+              SELECT 1 FROM jobs
+              WHERE kind = 'score' AND status IN ('queued', 'running')
+          );
+
+        UPDATE candidates
+        SET status = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM sources s
+                    WHERE s.id = candidates.source_id AND s.enabled = 1
+                ) AND EXISTS (
+                    SELECT 1 FROM candidate_quality q
+                    WHERE q.candidate_id = candidates.id AND q.quality_status = 'accepted'
+                ) THEN 'recommended'
+                ELSE 'new'
+            END,
+            score = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM sources s
+                    WHERE s.id = candidates.source_id AND s.enabled = 1
+                ) AND EXISTS (
+                    SELECT 1 FROM candidate_quality q
+                    WHERE q.candidate_id = candidates.id AND q.quality_status = 'accepted'
+                ) THEN score
+                ELSE 0
+            END,
+            explanation = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM sources s
+                    WHERE s.id = candidates.source_id AND s.enabled = 1
+                ) AND EXISTS (
+                    SELECT 1 FROM candidate_quality q
+                    WHERE q.candidate_id = candidates.id AND q.quality_status = 'accepted'
+                ) THEN explanation
+                ELSE '[]'
+            END,
+            score_batch_id = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'read'
+          AND (
+              id IN (
+                  SELECT candidate_id FROM temp._m31_demo_events
+                  WHERE candidate_id IS NOT NULL
+              )
+              OR EXISTS (
+                  SELECT 1 FROM temp._m31_demo_reads r
+                  WHERE (
+                      lower(trim(r.title)) = lower(trim(candidates.title))
+                      AND replace(replace(lower(trim(r.author)), '.', ''), ' ', '')
+                          = replace(replace(lower(trim(candidates.author)), '.', ''), ' ', '')
+                  )
+                     OR (
+                      r.isbn != ''
+                      AND (
+                          r.isbn = candidates.isbn13
+                          OR r.isbn = candidates.isbn10
+                          OR EXISTS (
+                              SELECT 1 FROM candidate_quality q
+                              WHERE q.candidate_id = candidates.id
+                                AND (r.isbn = q.isbn13 OR r.isbn = q.isbn10)
+                          )
+                      )
+                  )
+                     OR (
+                      r.openlibrary_work_id != ''
+                      AND EXISTS (
+                          SELECT 1 FROM candidate_quality q
+                          WHERE q.candidate_id = candidates.id
+                            AND q.work_id = r.openlibrary_work_id
+                      )
+                  )
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM reads keep
+              WHERE keep.source != 'demo'
+                AND (
+                    (
+                        lower(trim(keep.title)) = lower(trim(candidates.title))
+                        AND replace(replace(lower(trim(keep.author)), '.', ''), ' ', '')
+                            = replace(replace(lower(trim(candidates.author)), '.', ''), ' ', '')
+                    )
+                    OR (
+                        COALESCE(keep.isbn, '') != ''
+                        AND (
+                            keep.isbn = candidates.isbn13
+                            OR keep.isbn = candidates.isbn10
+                            OR EXISTS (
+                                SELECT 1 FROM candidate_quality q
+                                WHERE q.candidate_id = candidates.id
+                                  AND (keep.isbn = q.isbn13 OR keep.isbn = q.isbn10)
+                            )
+                        )
+                    )
+                    OR (
+                        COALESCE(keep.openlibrary_work_id, '') != ''
+                        AND EXISTS (
+                            SELECT 1 FROM candidate_quality q
+                            WHERE q.candidate_id = candidates.id
+                              AND q.work_id = keep.openlibrary_work_id
+                        )
+                    )
+                )
+          );
+
+        UPDATE candidates
+        SET score_batch_id = NULL
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m31_demo_batches);
+
+        DELETE FROM recommendation_run_evidence_scoring_batches
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m31_demo_batches)
+           OR run_id IN (SELECT run_id FROM temp._m31_demo_runs);
+        DELETE FROM scoring_batch_vectors
+        WHERE batch_id IN (SELECT batch_id FROM temp._m31_demo_batches);
+        DELETE FROM scoring_batch_candidates
+        WHERE batch_id IN (SELECT batch_id FROM temp._m31_demo_batches);
+        DELETE FROM scoring_batch_reads
+        WHERE batch_id IN (SELECT batch_id FROM temp._m31_demo_batches);
+        DELETE FROM scoring_batches
+        WHERE id IN (SELECT batch_id FROM temp._m31_demo_batches);
+
+        DELETE FROM recommendation_outcomes
+        WHERE read_id IN (SELECT id FROM temp._m31_demo_reads)
+           OR event_id IN (
+               SELECT event_id FROM temp._m31_demo_events WHERE event_id IS NOT NULL
+           )
+           OR event_id IN (
+               SELECT id FROM recommendation_events
+               WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events)
+           );
+        DELETE FROM recommendation_events
+        WHERE id IN (
+               SELECT event_id FROM temp._m31_demo_events WHERE event_id IS NOT NULL
+           )
+           OR event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events);
+        DELETE FROM recommendation_evidence_outcomes
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events);
+        DELETE FROM recommendation_evidence_events
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m31_demo_events);
+        DELETE FROM recommendation_run_evidence_vectors
+        WHERE run_id IN (SELECT run_id FROM temp._m31_demo_runs);
+        DELETE FROM recommendation_run_evidence_candidates
+        WHERE run_id IN (SELECT run_id FROM temp._m31_demo_runs);
+        DELETE FROM recommendation_run_evidence
+        WHERE run_id IN (SELECT run_id FROM temp._m31_demo_runs);
+
+        DELETE FROM recommendation_evidence_vectors
+        WHERE (
+            EXISTS (SELECT 1 FROM temp._m31_demo_batches)
+            OR EXISTS (SELECT 1 FROM temp._m31_demo_runs)
+        )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_run_evidence_vectors r
+              WHERE r.artifact_hash = recommendation_evidence_vectors.artifact_hash
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM scoring_batch_vectors s
+              WHERE s.artifact_hash = recommendation_evidence_vectors.artifact_hash
+          );
+
+        DELETE FROM embeddings
+        WHERE entity_type = 'read'
+          AND entity_id IN (SELECT id FROM temp._m31_demo_reads);
+        DELETE FROM association_evidence
+        WHERE seed_read_id IN (SELECT id FROM temp._m31_demo_reads);
+        DELETE FROM read_metadata
+        WHERE read_id IN (SELECT id FROM temp._m31_demo_reads);
+        DELETE FROM metadata_field_provenance
+        WHERE entity_type = 'read'
+          AND entity_id IN (SELECT id FROM temp._m31_demo_reads);
+        DELETE FROM reads
+        WHERE id IN (SELECT id FROM temp._m31_demo_reads);
+
+        DROP TABLE temp._m31_demo_runs;
+        DROP TABLE temp._m31_demo_batches;
+        DROP TABLE temp._m31_demo_events;
+        DROP TABLE temp._m31_demo_reads;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1904,6 +2191,184 @@ def persist_metadata_field_provenance(
     return written
 
 
+def purge_demo_reads(con: sqlite3.Connection) -> int:
+    """Purge synthetic cold-start demo reads, derived evidence, and stale candidate status."""
+
+    demo_rows = [
+        dict(item)
+        for item in con.execute(
+            "SELECT * FROM reads WHERE source='demo' ORDER BY id"
+        ).fetchall()
+    ]
+    orphan_demo_events = [
+        dict(item)
+        for item in con.execute(
+            "SELECT id, event_key, run_id, candidate_id FROM recommendation_events "
+            "WHERE event_type='read' AND json_valid(metadata) "
+            "AND json_extract(metadata, '$.read_source')='demo'"
+        ).fetchall()
+    ]
+    if not demo_rows and not orphan_demo_events:
+        return 0
+
+    from .decision_evidence import purge_recommendation_evidence
+    from .ingestion import read_identity_rows_with_current_verified_work_ids
+
+    demo_ids = [int(item["id"]) for item in demo_rows]
+    real_rows = [
+        dict(item)
+        for item in con.execute(
+            "SELECT * FROM reads WHERE source!='demo' ORDER BY id"
+        ).fetchall()
+    ]
+    try:
+        metadata_rows = [
+            dict(item)
+            for item in con.execute(
+                "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                "FROM read_metadata WHERE verified_work_id!=''"
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        metadata_rows = []
+
+    demo_id_set = set(demo_ids)
+    demo_meta = [item for item in metadata_rows if int(item["read_id"]) in demo_id_set]
+    real_meta = [item for item in metadata_rows if int(item["read_id"]) not in demo_id_set]
+    demo_index = ReadIdentityIndex.from_reads(
+        read_identity_rows_with_current_verified_work_ids(demo_rows, demo_meta)
+    )
+    real_index = ReadIdentityIndex.from_reads(
+        read_identity_rows_with_current_verified_work_ids(real_rows, real_meta)
+    )
+
+    demo_linked_candidate_ids = {
+        int(item["candidate_id"])
+        for item in orphan_demo_events
+        if item.get("candidate_id") is not None
+    }
+    demo_event_ids = {int(item["id"]) for item in orphan_demo_events}
+    for start in range(0, len(demo_ids), 100):
+        batch = demo_ids[start : start + 100]
+        clauses = " OR ".join(
+            "event_key = ? OR event_key GLOB ? OR event_key GLOB ? OR event_key GLOB ?"
+            for _ in batch
+        )
+        params: list[str] = []
+        for read_id in batch:
+            params.append(f"read:{read_id:08d}")
+            params.append(f"read:{read_id:08d}:*")
+            params.append(f"manual-read:*:{read_id:08d}")
+            params.append(f"attribution:read:{read_id:08d}:*")
+        for event_row in con.execute(
+            f"SELECT id, candidate_id FROM recommendation_events WHERE {clauses}",
+            params,
+        ).fetchall():
+            demo_event_ids.add(int(event_row["id"]))
+            if event_row["candidate_id"] is not None:
+                demo_linked_candidate_ids.add(int(event_row["candidate_id"]))
+
+    real_linked_candidate_ids = {
+        int(event_row["candidate_id"])
+        for event_row in con.execute(
+            "SELECT id, candidate_id FROM recommendation_events WHERE event_type='read'"
+        ).fetchall()
+        if int(event_row["id"]) not in demo_event_ids
+        and event_row["candidate_id"] is not None
+    }
+
+    read_candidates = [
+        dict(item)
+        for item in con.execute(
+            "SELECT c.*, q.work_id quality_work_id, q.provider quality_provider, "
+            "q.provider_id AS quality_provider_id, "
+            "q.isbn13 quality_isbn13, q.isbn10 quality_isbn10, "
+            "COALESCE(q.quality_status, 'pending') AS quality_status, "
+            "COALESCE(s.enabled, 0) AS source_enabled "
+            "FROM candidates c "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "WHERE c.status='read'"
+        ).fetchall()
+    ]
+    for cand in read_candidates:
+        cid = int(cand["id"])
+        matched_demo = cid in demo_linked_candidate_ids or demo_index.matches(cand)
+        matched_real = cid in real_linked_candidate_ids or real_index.matches(cand)
+        if matched_demo and not matched_real:
+            if int(cand["source_enabled"]) and str(cand["quality_status"]) == "accepted":
+                con.execute(
+                    "UPDATE candidates SET status='recommended', score_batch_id=NULL, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (cid,),
+                )
+            else:
+                con.execute(
+                    "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                    "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (cid,),
+                )
+
+    orphan_run_ids = sorted(
+        {str(item["run_id"]) for item in orphan_demo_events if item.get("run_id")}
+    )
+    if demo_ids or orphan_run_ids:
+        purge_recommendation_evidence(
+            con,
+            read_ids=demo_ids,
+            run_ids=orphan_run_ids,
+            preserve_runs=True,
+        )
+
+    orphan_event_keys = sorted(
+        {str(item["event_key"]) for item in orphan_demo_events if item.get("event_key")}
+    )
+    for start in range(0, len(orphan_event_keys), 400):
+        batch = orphan_event_keys[start : start + 400]
+        marks = ",".join("?" for _ in batch)
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE event_id IN ("
+            f"SELECT id FROM recommendation_events WHERE event_key IN ({marks}))",
+            batch,
+        )
+        con.execute(
+            f"DELETE FROM recommendation_evidence_outcomes WHERE event_key IN ({marks})",
+            batch,
+        )
+        con.execute(
+            f"DELETE FROM recommendation_events WHERE event_key IN ({marks})",
+            batch,
+        )
+        con.execute(
+            f"DELETE FROM recommendation_evidence_events WHERE event_key IN ({marks})",
+            batch,
+        )
+
+    for start in range(0, len(demo_ids), 400):
+        batch = demo_ids[start : start + 400]
+        marks = ",".join("?" for _ in batch)
+        con.execute(
+            f"DELETE FROM embeddings WHERE entity_type='read' AND entity_id IN ({marks})",
+            batch,
+        )
+        con.execute(
+            f"DELETE FROM association_evidence WHERE seed_read_id IN ({marks})",
+            batch,
+        )
+        try:
+            con.execute(f"DELETE FROM read_metadata WHERE read_id IN ({marks})", batch)
+            con.execute(
+                "DELETE FROM metadata_field_provenance "
+                f"WHERE entity_type='read' AND entity_id IN ({marks})",
+                batch,
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    deleted = max(0, int(con.execute("DELETE FROM reads WHERE source='demo'").rowcount))
+    return deleted or len(orphan_demo_events)
+
+
 def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
     """Execute complete SQL statements on the caller's active transaction."""
 
@@ -2020,7 +2485,8 @@ def initialize(*, seed_demo: bool = True):
             "UPDATE sources SET name=? WHERE url='builtin://upcoming' AND name='Afterword demo upcoming books'",
             ("Bookward demo upcoming books",),
         )
-        builtin_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        builtin = con.execute("SELECT id,enabled FROM sources WHERE url='builtin://upcoming'").fetchone()
+        builtin_id = builtin["id"]
         # Track default URLs once seeded so a user's custom source that shares
         # a default source's display name never blocks seeding that default URL,
         # while editing an already-seeded starter URL will not re-insert the
@@ -2059,7 +2525,12 @@ def initialize(*, seed_demo: bool = True):
             )
         seed = Path(__file__).with_name("seed.json")
         seed_items = json.loads(seed.read_text()) if seed_demo else []
-        if seed_demo and not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone():
+        if (
+            seed_demo
+            and builtin["enabled"]
+            and not con.execute("SELECT 1 FROM candidates LIMIT 1").fetchone()
+            and not con.execute("SELECT 1 FROM reads LIMIT 1").fetchone()
+        ):
             for item in seed_items:
                 release_date = (date.today() + timedelta(days=int(item.get("release_offset_days", 30)))).isoformat()
                 con.execute("""INSERT OR IGNORE INTO candidates(title,author,description,cover_url,source_url,source_id,release_date,date_kind,genres,score,explanation,status,normalized_key)
