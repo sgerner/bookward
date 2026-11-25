@@ -17,6 +17,9 @@
 	let submitting = $state(false);
 	const loginBanner = $derived(formErrorBanner(form, 'login'));
 	const loginCredentialError = $derived(Boolean(isCredentialError(form, 'login') && loginBanner));
+	const loginRateLimited = $derived(
+		Boolean(form && form.formId === 'login' && 'rateLimited' in form && form.rateLimited)
+	);
 	const trackSubmission: SubmitFunction = ({ formElement }) => {
 		submitting = true;
 		return async ({ result, update }) => {
@@ -161,13 +164,26 @@
 					<form class="mt-8 grid gap-5" method="POST" action="?/login" use:enhance={trackSubmission}>
 						<input type="hidden" name="next" value={data.next} />
 						{#if loginBanner}
-							<p
-								id="login-error-summary"
-								class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error"
-								role="alert"
-							>
-								{loginBanner}
-							</p>
+							{#if loginRateLimited}
+								<div
+									id="login-error-summary"
+									class="rounded-xl border border-warning-500/30 p-3.5 text-sm leading-6 preset-tonal-warning"
+									role="alert"
+								>
+									<p class="font-medium">{loginBanner}</p>
+									<p class="mt-1 text-xs opacity-90">
+										An administrator can also unlock this account in Manage accounts or with <code class="rounded bg-surface-950/10 px-1 py-0.5 font-mono">auth_admin unlock</code>.
+									</p>
+								</div>
+							{:else}
+								<p
+									id="login-error-summary"
+									class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error"
+									role="alert"
+								>
+									{loginBanner}
+								</p>
+							{/if}
 						{/if}
 						<FormField
 							id="login-username"
