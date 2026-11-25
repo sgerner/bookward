@@ -1,6 +1,13 @@
 import { error as httpError, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
+import { formatWaitDuration } from '#lib/lockout-ui.js';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resolveClientAddress,
+	withRequestContext
+} from '#lib/server/request-context.js';
 
 type Account = {
 	id: string;
@@ -47,17 +54,26 @@ export const load: PageServerLoad = async ({ locals }) => {
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
 	let result: { accounts: Account[] };
 	let identityBackup: IdentityBackupStatus | null;
+	let methods: { password_enabled: boolean };
 	try {
-		[result, identityBackup] = await Promise.all([
+		[result, identityBackup, methods] = await Promise.all([
 			engine<{ accounts: Account[] }>('/admin/accounts'),
-			engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
+			engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null),
+			engine<{ password_enabled: boolean }>('/auth/identities').catch(() => ({
+				password_enabled: true
+			}))
 		]);
 	} catch (error) {
 		if (error instanceof EngineError && error.status === 401) throw redirect(303, '/login');
 		if (error instanceof EngineError && error.status === 403) throw redirect(303, '/');
 		throw httpError(503, "Bookward's recommendation engine is unavailable.");
 	}
-	return { accounts: result.accounts, current_user_id: locals.user.id, identityBackup };
+	return {
+		accounts: result.accounts,
+		current_user_id: locals.user.id,
+		identityBackup,
+		password_enabled: methods.password_enabled
+	};
 };
 
 export const actions: Actions = {
@@ -185,6 +201,81 @@ export const actions: Actions = {
 			};
 		} catch (error) {
 			return failure(formId, error);
+		}
+	},
+	deleteAccount: async (event) => {
+		const { request, locals, setHeaders } = event;
+		const form = await request.formData();
+		const account_id = String(form.get('account_id') || '').trim();
+		const confirm_username = String(form.get('confirm_username') || '').trim();
+		const hasCurrentPassword = form.has('current_password');
+		const current_password = String(form.get('current_password') || '');
+		const formId = account_id ? `deleteAccount-${account_id}` : 'deleteAccount';
+		if (!account_id) {
+			return fail(400, {
+				formId,
+				message: 'Choose a valid account.',
+				error: true as const,
+				fieldErrors: {}
+			});
+		}
+		const fieldErrors: Record<string, string> = {};
+		if (account_id !== locals.user?.id && !confirm_username) {
+			fieldErrors.confirm_username = 'Type the username to confirm deleting this account.';
+		}
+		if (account_id !== locals.user?.id && hasCurrentPassword && !current_password) {
+			fieldErrors.current_password = 'Enter your current password.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			return fail(400, {
+				formId,
+				message: fieldErrors.confirm_username ?? fieldErrors.current_password!,
+				error: true as const,
+				fieldErrors
+			});
+		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
+		try {
+			const deleted = await withRequestContext(
+				{ sessionToken: currentSessionToken(), clientIp },
+				() =>
+					engine<{ username?: string }>(
+						`/admin/accounts/${encodeURIComponent(account_id)}`,
+						{
+							method: 'DELETE',
+							body: JSON.stringify({
+								confirm_username: confirm_username || undefined,
+								current_password
+							})
+						},
+						10 * 60_000
+					)
+			);
+			return {
+				formId: 'deleteAccount',
+				message: `Account ${deleted.username || confirm_username} deleted.`
+			};
+		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId,
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					error: true as const,
+					fieldErrors: {},
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
+			const status = error instanceof EngineError ? error.status : 503;
+			const msg = error instanceof Error ? error.message : 'Account operation failed.';
+			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)
+				? { current_password: msg }
+				: status === 400 && /confirm deleting this account/i.test(msg)
+					? { confirm_username: msg }
+					: {};
+			return failure(formId, error, mappedFieldErrors);
 		}
 	}
 };
