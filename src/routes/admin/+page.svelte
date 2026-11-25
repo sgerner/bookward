@@ -122,7 +122,7 @@
 			{#if formErrorBanner(form, 'create')}
 				<p class="rounded-xl p-3 text-sm preset-tonal-error sm:col-span-2" role="alert">{formErrorBanner(form, 'create')}</p>
 			{/if}
-			<button class="btn preset-filled-primary-500 justify-self-start sm:col-span-2" type="submit">Create profile</button>
+			<button class="btn btn-reflow preset-filled-primary-500 justify-self-start sm:col-span-2" type="submit">Create profile</button>
 		</form>
 	</section>
 	<section class="mt-8 grid gap-4">
@@ -206,7 +206,7 @@
 								/>
 							{/snippet}
 						</FormField>
-						<button class="btn btn-sm preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
+						<button class="btn btn-sm btn-reflow preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
 						{#if formErrorBanner(form, resetFormId)}
 							<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
 						{/if}

@@ -150,8 +150,8 @@
 							{/snippet}
 						</FormField>
 						{#if formErrorBanner(form, 'setup')}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{formErrorBanner(form, 'setup')}</p>{/if}
-						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
-							<span>{submitting ? 'Creating administrator…' : 'Create administrator'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
+						<button class="login-submit btn btn-reflow group min-h-12 w-full justify-between text-left" type="submit" disabled={submitting} aria-busy={submitting}>
+							<span class="min-w-0">{submitting ? 'Creating administrator…' : 'Create administrator'}</span>{#if submitting}<RefreshCw size={17} class="shrink-0 animate-spin" />{:else}<ArrowRight size={17} class="shrink-0 transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
 					<p class="mt-6 border-t border-surface-300-700/40 pt-5 text-sm leading-6 text-surface-700-300">
@@ -226,16 +226,16 @@
 								/>
 							{/snippet}
 						</FormField>
-						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
-							<span>{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
+						<button class="login-submit btn btn-reflow group min-h-12 w-full justify-between text-left" type="submit" disabled={submitting} aria-busy={submitting}>
+							<span class="min-w-0">{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="shrink-0 animate-spin" />{:else}<ArrowRight size={17} class="shrink-0 transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
 					</form>
 					{#if data.oidc_enabled}
 						<div class="my-6 flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.16em] text-surface-600-400">
 							<span class="h-px flex-1 bg-surface-300-700/50"></span><span>or</span><span class="h-px flex-1 bg-surface-300-700/50"></span>
 						</div>
-						<a class="btn min-h-12 w-full justify-between preset-tonal-surface" href={`/auth/oidc/start?intent=login&next=${encodeURIComponent(data.next)}`}>
-							<span class="inline-flex items-center gap-2"><KeyRound size={16} /> Continue with single sign-on</span><ArrowRight size={16} />
+						<a class="btn btn-reflow min-h-12 w-full justify-between preset-tonal-surface text-left" href={`/auth/oidc/start?intent=login&next=${encodeURIComponent(data.next)}`}>
+							<span class="inline-flex min-w-0 items-center gap-2"><KeyRound size={16} class="shrink-0" /> <span>Continue with single sign-on</span></span><ArrowRight size={16} class="shrink-0" />
 						</a>
 					{/if}
 				{/if}
