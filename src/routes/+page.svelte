@@ -39,13 +39,18 @@
     X,
   } from "@lucide/svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import InlineAlert from "#lib/components/InlineAlert.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import StatusRegion from "#lib/components/StatusRegion.svelte";
   import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
-  import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import {
+    copyApiTokenText,
+    type ApiTokenCopyStatus,
+  } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import {
@@ -54,6 +59,17 @@
     hasUnsavedDigestChanges,
     shouldShowDigestTestButton,
   } from "#lib/digest-ui.js";
+  import {
+    formatLibrarrSearchStatus,
+    formatLlmCatalogStatus,
+    formatReadingHistoryStatus,
+    formatRecommendationStatus,
+  } from "#lib/live-status.js";
+  import {
+    applyRatingOverrides,
+    createReadingHistoryRatingController,
+    formatRatingConfirmation,
+  } from "#lib/reading-history-ratings.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -127,7 +143,7 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
-  let markReadRating = $state(0);
+  let markReadRating = $state<number | null>(0);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -167,28 +183,34 @@
   let previousQueriedDecisionStatus = "decisions";
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
+  let recommendationsImmediate = $state(false);
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let readingHistoryImmediate = $state(false);
   let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -232,7 +254,7 @@
   let digestSmtpUsername = $state("");
   let digestSmtpPassword = $state("");
   let digestClearSmtpCredentials = $state(false);
-  let apiTokenCopyMessage = $state<string | null>(null);
+  let apiTokenCopyStatus = $state<ApiTokenCopyStatus | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
   let notificationPointerInside = false;
@@ -268,8 +290,11 @@
     models: Array<{ id: string; name: string }>;
   };
   let llmCatalogProviders = $state<LlmCatalogProvider[]>([]);
+  let llmCatalogLoaded = $state(false);
   let llmCatalogLoading = $state(false);
   let llmCatalogError = $state("");
+  let llmCatalogImmediate = $state(false);
+  let llmActiveFilter = $state<"none" | "provider" | "model">("none");
   let llmProviderSearch = $state("");
   let llmModelSearch = $state("");
   let llmEnabledOverride = $state<boolean | null>(null);
@@ -310,6 +335,11 @@
     return discoverSearch;
   }
   function setSearchForView(view: FilterableView, value: string) {
+    if (view === "decisions" && decisionFilter === "read") {
+      readingHistoryImmediate = false;
+    } else {
+      recommendationsImmediate = false;
+    }
     if (view === "saved") savedSearch = value;
     else if (view === "decisions") decisionsSearch = value;
     else discoverSearch = value;
@@ -320,6 +350,7 @@
     return discoverGenre;
   }
   function setGenreForView(view: FilterableView, value: string) {
+    recommendationsImmediate = false;
     if (view === "saved") savedGenre = value;
     else if (view === "decisions") decisionsGenre = value;
     else discoverGenre = value;
@@ -550,6 +581,12 @@
       rawGenre.trim()
     );
   }
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -568,7 +605,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -647,6 +684,67 @@
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const catalogQuality = $derived(
+    data.catalogQuality ?? {
+      statuses: [],
+      identifiers: { total: 0, with_isbn13: 0, with_catalog_match: 0 },
+      flags: {},
+      version: "",
+      audit: {
+        status: "idle" as const,
+        active: false,
+        mode: "incremental" as const,
+        last_mode: null,
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 0,
+        progress: 0,
+        started_at: null,
+        completed_at: null,
+        job_id: null,
+        last_error: null,
+        can_retry: false,
+      },
+    },
+  );
+  const catalogAudit = $derived(catalogQuality.audit);
+  const catalogStatusCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const item of catalogQuality.statuses) {
+      counts[item.quality_status] = item.count;
+    }
+    return {
+      accepted: counts.accepted ?? 0,
+      quarantine: counts.quarantine ?? 0,
+      pending: counts.pending ?? 0,
+    };
+  });
+  const catalogAuditPercent = $derived(
+    Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
+  );
+  // State changes only: the remaining count changes on every poll and would be
+  // re-announced every few seconds.
+  const catalogAuditStatusMessage = $derived(
+    catalogAudit.status === "failed"
+      ? "Catalog audit needs retry."
+      : catalogAudit.active
+        ? `${catalogAudit.mode === "full" ? "Full" : "Incremental"} catalog audit ${
+            catalogAudit.status === "queued" ? "queued" : "running"
+          }.`
+        : catalogAudit.status === "paused"
+          ? "Catalog audit paused."
+          : catalogAudit.remaining > 0
+            ? "Catalog audit has books due."
+            : "Catalog audit up to date.",
+  );
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    if (activeView !== "settings" || !catalogAudit.active) return;
+    const timer = window.setInterval(() => {
+      void invalidateAll();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  });
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -670,6 +768,22 @@
     );
   });
 
+  const llmCatalogStatusMessage = $derived(
+    formatLlmCatalogStatus({
+      loaded: llmCatalogLoaded,
+      loading: llmCatalogLoading,
+      hasError: Boolean(llmCatalogError),
+      totalProviders: llmCatalogProviders.length,
+      matchedProviders: filteredLlmProviders.length,
+      providerQuery: llmProviderSearch,
+      selectedProviderName: selectedCatalogProvider?.name ?? null,
+      totalModels: selectedCatalogProvider?.models.length ?? 0,
+      matchedModels: filteredLlmModels.length,
+      modelQuery: llmModelSearch,
+      activeFilter: llmActiveFilter,
+    }),
+  );
+
   async function loadLlmCatalog() {
     if (llmCatalogLoading) return;
     llmCatalogLoading = true;
@@ -682,6 +796,9 @@
         return;
       }
       llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
+      llmCatalogLoaded = true;
+      llmActiveFilter = "none";
+      llmCatalogImmediate = true;
     } catch (error) {
       llmCatalogError =
         error instanceof Error
@@ -695,6 +812,8 @@
   function handleLlmProviderChange(providerId: string) {
     llmProviderOverride = providerId;
     llmModelSearch = "";
+    llmActiveFilter = "none";
+    llmCatalogImmediate = true;
     const match = llmCatalogProviders.find((p) => p.id === providerId);
     if (!match) return;
     if (match.api) {
@@ -901,6 +1020,7 @@
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
     readingHistoryState = "loading";
+    readingHistoryImmediate = true;
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
@@ -915,6 +1035,7 @@
         throw new Error(payload.message || "Reading history could not be loaded.");
       }
       readingHistory = payload.items;
+      readingHistoryImmediate = true;
       readingHistoryState = "ready";
       void loadReadingHistoryScores(payload.items.length);
     } catch (error) {
@@ -967,7 +1088,66 @@
     readingHistoryScoreTask = task;
     return task;
   }
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
+  }
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
+      const response = await fetch(`/api/reading-history/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === id ? { ...entry, rating } : entry,
+      );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        void refreshReadingHistoryScores();
+      }
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+    const inDecisionsView = activeView === "decisions";
+    recommendationsImmediate = inDecisionsView;
+    readingHistoryImmediate = inDecisionsView;
     decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
     decisionsLoadError = "";
@@ -995,7 +1175,9 @@
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
   function go(view: View) {
-    revealedApiToken = tokenForView(view, revealedApiToken);
+    const nextToken = tokenForView(view, revealedApiToken);
+    if (!nextToken) apiTokenCopyStatus = null;
+    revealedApiToken = nextToken;
     activeView = view;
     if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
     if (typeof window !== "undefined") {
@@ -1510,6 +1692,7 @@
       filteredDiscoverLoadedKey = key;
       filteredDiscoverPending = false;
       discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
       discoverLoadError =
@@ -1531,6 +1714,7 @@
 
   function reloadFilteredDiscover() {
     if (!hasActiveDiscoverFilter) return;
+    recommendationsImmediate = true;
     filteredDiscoverPending = true;
     void fetchInitialFilteredDiscover(
       activeDiscoverFilterKey,
@@ -1542,6 +1726,7 @@
   async function loadMoreDiscover() {
     if (discoverLoading || filteredDiscoverPending || digestRequested) return;
     if (discoverVisibleCount < discoverViewBooks.length) {
+      recommendationsImmediate = true;
       discoverVisibleCount = Math.min(
         discoverVisibleCount + DISCOVER_PAGE_SIZE,
         discoverViewBooks.length,
@@ -1600,6 +1785,7 @@
         unfilteredDiscoverOffset = offset + payload.items.length;
         unfilteredDiscoverHasMore = payload.has_more === true;
       }
+      recommendationsImmediate = true;
       discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
@@ -1652,6 +1838,7 @@
       queriedDecisionsHasMore = payload.has_more === true;
       queriedDecisionLoadedKey = key;
       queriedDecisionPending = false;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError =
@@ -1673,6 +1860,7 @@
 
   function reloadQueriedDecisions() {
     if (!isQueriedDecisionMode) return;
+    recommendationsImmediate = true;
     queriedDecisionPending = true;
     void fetchInitialQueriedDecisions(
       activeDecisionQueryKey,
@@ -1735,6 +1923,7 @@
         unfilteredDecisionOffset = offset + payload.items.length;
         decisionsHasMoreOverride = payload.has_more === true;
       }
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError = error instanceof Error
@@ -1846,6 +2035,17 @@
       .map((result, index) => ({ result, index, score: resultScore(result) }))
       .filter((item): item is { result: LibrarrResult; index: number; score: number } => item.score !== null && item.score >= 90),
   );
+  const librarrStatusMessage = $derived(
+    formatLibrarrSearchStatus({
+      state: librarrSearchState,
+      resultCount: librarrResults.length,
+      mediaType: librarrSearchedMediaType,
+    }),
+  );
+  const librarrSearchImmediate = $derived(
+    librarrSearchState === "ready" ||
+      (librarrSearchState === "searching" && librarrResults.length === 0),
+  );
   function resultKey(result: LibrarrResult, index: number) {
     return `${resultIdentity(result)}-${index}`;
   }
@@ -1932,15 +2132,22 @@
   }
 
   async function copyApiToken() {
-    apiTokenCopyMessage = await copyApiTokenText(
+    apiTokenCopyStatus = null;
+    await tick();
+    apiTokenCopyStatus = await copyApiTokenText(
       revealedApiToken ?? "",
       navigator.clipboard,
     );
   }
 
   $effect(() => {
-    if (formState?.token) revealedApiToken = formState.token;
-    else if (formState) revealedApiToken = null;
+    if (formState?.token) {
+      revealedApiToken = formState.token;
+      apiTokenCopyStatus = null;
+    } else if (formState) {
+      revealedApiToken = null;
+      apiTokenCopyStatus = null;
+    }
   });
 
   $effect(() => {
@@ -1974,6 +2181,13 @@
     unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -2124,7 +2338,9 @@
       return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) void loadMoreDiscover();
+        if (!discoverLoadError && entries.some((entry) => entry.isIntersecting)) {
+          void loadMoreDiscover();
+        }
       },
       { rootMargin: "240px 0px" },
     );
@@ -2314,7 +2530,9 @@
       const nextView = readView(
         new URL(window.location.href).searchParams.get("view"),
       );
-      revealedApiToken = tokenForView(nextView, revealedApiToken);
+      const nextToken = tokenForView(nextView, revealedApiToken);
+      if (!nextToken) apiTokenCopyStatus = null;
+      revealedApiToken = nextToken;
       activeView = nextView;
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
@@ -2622,7 +2840,6 @@
       {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
-
         {@const viewSearch = searchForView(view)}
         {@const viewGenre = genreForView(view)}
         {@const viewGenres = genresForView(view)}
@@ -2632,6 +2849,28 @@
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || effectiveDiscoverHasMore)}
         {@const viewInitialLoading = (view === "discover" && hasActiveDiscoverFilter && (filteredDiscoverPending || (discoverLoading && filteredDiscoverLoadedKey !== activeDiscoverFilterKey))) || (view === "decisions" && isQueriedDecisionMode && (queriedDecisionPending || (decisionsLoading && queriedDecisionLoadedKey !== activeDecisionQueryKey)))}
         {@const viewFilterError = view === "discover" && hasActiveDiscoverFilter ? discoverLoadError : view === "decisions" && isQueriedDecisionMode ? decisionsLoadError : ""}
+        {@const totalDecisionBooks = unfilteredDecisionBooks.length}
+        {@const recommendationStatusMessage = formatRecommendationStatus({
+          view,
+          visibleCount: viewVisibleBooks.length,
+          matchedCount: viewBooks.length,
+          shortlistTotalCount,
+          totalDecisionCount: totalDecisionBooks,
+          hasActiveFilter: viewHasFilter,
+          decisionFilter,
+          digestVisible,
+          digestRequested,
+          discoverHasMore: effectiveDiscoverHasMore,
+          loading: viewInitialLoading,
+          hasError: Boolean(viewFilterError),
+        })}
+        {@const hasActiveReadingFilter = Boolean(decisionsSearch.trim() || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all")}
+        {@const readingHistoryStatusMessage = formatReadingHistoryStatus({
+          state: readingHistoryState,
+          visibleCount: visibleReadingHistory.length,
+          matchedCount: filteredReadingHistory.length,
+          hasActiveFilter: hasActiveReadingFilter,
+        })}
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
@@ -2676,7 +2915,19 @@
               {/if}
           </div>
         </section>
+        <StatusRegion
+          message={view === "decisions" && decisionFilter === "read" ? "" : recommendationStatusMessage}
+          immediate={recommendationsImmediate}
+          contextKey={view}
+          paused={activeView !== view}
+        />
         {#if view === "decisions"}
+          <StatusRegion
+            message={decisionFilter === "read" ? readingHistoryStatusMessage : ""}
+            immediate={readingHistoryImmediate}
+            contextKey="decisions-read"
+            paused={activeView !== "decisions"}
+          />
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
@@ -2719,7 +2970,6 @@
         {/if}
         <section
           class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
-          aria-live="polite"
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
@@ -2886,11 +3136,11 @@
               </div>
             </article>
           {:else}
-            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status">
+            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300">
                 <RefreshCw size={17} class="animate-spin" />{view === "decisions" ? "Loading past decisions…" : "Searching recommendations…"}
               </div>
-            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{viewFilterError}</p>
+            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={viewFilterError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
@@ -2908,11 +3158,11 @@
                 </form>{/if}
               </div>{/if}{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if discoverLoadError}<p class="text-sm text-error-600-400" role="alert">{discoverLoadError}</p>{/if}
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
+              <InlineAlert message={discoverLoadError} />
+              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if decisionsLoadError}<p class="text-sm text-error-600-400" role="alert">{decisionsLoadError}</p>{/if}
+              <InlineAlert message={decisionsLoadError} />
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
                 {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
               </button>
@@ -2928,7 +3178,7 @@
               <div class="mb-5 grid gap-3 sm:grid-cols-3" role="group" aria-label="Filter and sort read books">
                 <label class="block text-sm font-medium text-surface-800-200">
                   Rating
-                  <select bind:value={readingHistoryRatingFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
+                  <select bind:value={readingHistoryRatingFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
                     <option value="all">Any rating</option>
                     <option value="rated">Rated</option>
                     <option value="unrated">Unrated</option>
@@ -2936,7 +3186,7 @@
                 </label>
                 <label class="block text-sm font-medium text-surface-800-200">
                   Source
-                  <select bind:value={readingHistorySourceFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
+                  <select bind:value={readingHistorySourceFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
                     <option value="all">All sources</option>
                     {#each readingHistorySources as source (source)}
                       <option value={source}>{readingSourceLabel(source)}</option>
@@ -2957,20 +3207,24 @@
               </div>
             {/if}
             {#if readingHistoryScoreState === "loading"}
-              <p class="mb-4 text-sm text-surface-700-300" role="status" aria-live="polite">
+              <p class="mb-4 text-sm text-surface-700-300">
                 Calculating Bookward scores for {scoredReadingHistoryCount} of {readingHistory.length} read books…
               </p>
             {:else if readingHistoryScoreState === "error"}
-              <div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-surface-700-300" role="status">
-                <span>{readingHistoryScoreError} Scores loaded for {scoredReadingHistoryCount} of {readingHistory.length} books.</span>
-                <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+              <div class="mb-4 flex flex-wrap items-center gap-3">
+                <InlineAlert
+                  tone="warning"
+                  size="sm"
+                  message={`${readingHistoryScoreError} Scores loaded for ${scoredReadingHistoryCount} of ${readingHistory.length} books.`}
+                />
+                <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
             {#if readingHistoryState === "loading"}
-              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
-              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{readingHistoryError}</p>
+              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={readingHistoryError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
@@ -2993,6 +3247,16 @@
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
+                    </div>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-3">
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
                     </div>
                     <details
                       class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
@@ -3042,7 +3306,7 @@
                 {/each}
               </div>
               {#if visibleReadingHistory.length < filteredReadingHistory.length}
-                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => (readingHistoryVisibleCount += 30)}><ArrowRight size={14} /> Load more books</button></div>
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
               {/if}
             {:else}
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
@@ -3154,6 +3418,15 @@
                   </div>
                 </div>
                 <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
+                  <StatusRegion
+                    message={formState?.sourcePreview
+                      ? formState.sourcePreview.count === 0
+                        ? `Preview matched 0 of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.`
+                        : `Preview matched ${formState.sourcePreview.count} of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}.`
+                      : ""}
+                    immediate
+                    paused={activeView !== "sources"}
+                  />
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -3356,7 +3629,6 @@
                                 {#if formState?.sourcePreview?.id === source.id}
                                   <div
                                     class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
-                                    role="status"
                                   >
                                     {#if formState.sourcePreview.count === 0}
                                       Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
@@ -3607,8 +3879,13 @@
                   </div>
                 </div>
 
+                <StatusRegion
+                  message={data.backupStatus.last_error ?? ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if data.backupStatus.last_error}
-                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
+                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm">{data.backupStatus.last_error}</p>
                 {/if}
 
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
@@ -4170,6 +4447,183 @@
                 </form>
               </section>
               <section
+                id="catalog-audit-settings"
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><Database size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Catalog audit
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${
+                      catalogAudit.status === "failed"
+                        ? "preset-tonal-error"
+                        : catalogAudit.active
+                          ? "preset-tonal-secondary"
+                          : catalogAudit.remaining > 0
+                            ? "preset-tonal-warning"
+                            : "preset-tonal-success"
+                    }`}
+                  >
+                    {#if catalogAudit.status === "failed"}
+                      Needs retry
+                    {:else if catalogAudit.active}
+                      {catalogAudit.mode === "full" ? "Full sweep" : "Incremental"} · {catalogAudit.status === "queued" ? "Queued" : "Running"}
+                    {:else if catalogAudit.status === "paused"}
+                      Paused · {catalogAudit.remaining} left
+                    {:else if catalogAudit.remaining > 0}
+                      {catalogAudit.remaining} due
+                    {:else}
+                      Up to date
+                    {/if}
+                  </span>
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
+                </p>
+
+                <div class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
+                      {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
+                        ? "Active sweep mode"
+                        : "Default mode"}
+                    </span>
+                    <span class="font-medium text-surface-950-50">
+                      {catalogAudit.mode === "full"
+                        ? "Full catalog sweep"
+                        : "Incremental"}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-surface-700-300">Remaining to check</span>
+                    <strong class="text-surface-950-50">
+                      {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"}
+                    </strong>
+                  </div>
+                  <p class="text-xs text-surface-600-400">
+                    {catalogStatusCounts.accepted} accepted · {catalogStatusCounts.quarantine} quarantined{#if catalogStatusCounts.pending > 0} · {catalogStatusCounts.pending} pending{/if}
+                  </p>
+                  {#if catalogAudit.active}
+                    <div class="pt-1">
+                      <div class="mb-1 flex items-center justify-between text-xs text-surface-700-300">
+                        <span>Current {catalogAudit.batch_size}-book batch</span>
+                        <span>{catalogAuditPercent}%</span>
+                      </div>
+                      <div
+                        class="h-2 w-full overflow-hidden rounded-full bg-surface-300-700/50"
+                        role="progressbar"
+                        aria-label="Current catalog audit batch progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={catalogAuditPercent}
+                      >
+                        <div
+                          class="h-full rounded-full preset-filled-secondary-500 transition-all"
+                          style={`width: ${catalogAuditPercent}%`}
+                        ></div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  paused={activeView !== "settings"}
+                />
+
+                {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
+                  <div
+                    class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
+                    role="alert"
+                  >
+                    <TriangleAlert size={16} class="shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <strong>
+                        {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
+                      </strong>
+                      {#if catalogAudit.remaining > 0}
+                        · {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"} remaining
+                      {/if}
+                      {#if catalogAudit.last_error}
+                        <span class="mt-1 block text-xs">{catalogAudit.last_error}</span>
+                      {/if}
+                    </span>
+                    <form
+                      method="POST"
+                      action="?/retryCatalogAudit"
+                      use:enhance={setPending("catalog-audit-retry")}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button
+                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                        type="submit"
+                        disabled={isPending("catalog-audit-retry") || catalogAudit.active}
+                        aria-busy={isPending("catalog-audit-retry")}
+                      >
+                        {#if isPending("catalog-audit-retry")}<RefreshCw
+                            size={14}
+                            class="animate-spin"
+                          />{:else}<RefreshCw size={14} />{/if} Retry
+                      </button>
+                    </form>
+                  </div>
+                {/if}
+
+                <div class="mt-4 grid gap-2 sm:grid-cols-2">
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-incremental")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="incremental" />
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
+                      aria-busy={isPending("catalog-audit-incremental")}
+                    >
+                      {#if isPending("catalog-audit-incremental") || (catalogAudit.active && catalogAudit.mode === "incremental")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Search size={16} />{/if} Audit due books
+                    </button>
+                  </form>
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-full")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="full" />
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
+                      aria-busy={isPending("catalog-audit-full")}
+                    >
+                      {#if isPending("catalog-audit-full") || (catalogAudit.active && catalogAudit.mode === "full")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<RefreshCw size={16} />{/if} Re-check full catalog
+                    </button>
+                  </form>
+                </div>
+              </section>
+              <section
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
@@ -4215,6 +4669,7 @@
                       class="btn btn-sm min-h-9 preset-tonal-secondary"
                       onclick={() => void loadLlmCatalog()}
                       disabled={llmCatalogLoading}
+                      aria-busy={llmCatalogLoading}
                     >
                       {#if llmCatalogLoading}<RefreshCw
                           size={14}
@@ -4223,9 +4678,12 @@
                       {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
                     </button>
                   </div>
-                  {#if llmCatalogError}
-                    <p class="text-xs text-error-600-400" role="alert">{llmCatalogError}</p>
-                  {/if}
+                  <StatusRegion
+                    message={llmCatalogStatusMessage}
+                    immediate={llmCatalogImmediate}
+                    paused={activeView !== "settings"}
+                  />
+                  <InlineAlert message={llmCatalogError} size="sm" />
                   {#if llmCatalogProviders.length > 0}
                     <div class="grid gap-3 sm:grid-cols-2">
                       <div>
@@ -4234,6 +4692,10 @@
                             class="input mt-1"
                             type="search"
                             bind:value={llmProviderSearch}
+                            oninput={() => {
+                              llmActiveFilter = "provider";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search OpenAI, Google, Groq…"
                           /></label
                         >
@@ -4261,6 +4723,10 @@
                             class="input mt-1"
                             type="search"
                             bind:value={llmModelSearch}
+                            oninput={() => {
+                              llmActiveFilter = "model";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search model ID or name…"
                             disabled={!selectedCatalogProvider}
                           /></label
@@ -4391,12 +4857,14 @@
                 </div>
 
                 {#if revealedApiToken}
-                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
+                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4">
                     <div class="flex items-start gap-3">
-                      <Check size={18} class="mt-0.5 shrink-0" />
+                      <Check size={18} class="mt-0.5 shrink-0" aria-hidden="true" />
                       <div class="min-w-0 flex-1">
-                        <p class="font-semibold">Copy this token now</p>
-                        <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        <div role="alert">
+                          <p class="font-semibold">Copy this token now</p>
+                          <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        </div>
                         <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
@@ -4407,10 +4875,16 @@
                         onclick={() => void copyApiToken()}
                       ><Copy size={14} /> Copy</button>
                     </div>
-                    {#if apiTokenCopyMessage}
-                      <p class="mt-3 text-xs" role="status">{apiTokenCopyMessage}</p>
-                    {/if}
                   </div>
+                {/if}
+                <StatusRegion
+                  message={apiTokenCopyStatus && !apiTokenCopyStatus.error ? apiTokenCopyStatus.message : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                  class={apiTokenCopyStatus && !apiTokenCopyStatus.error ? "mb-3 text-xs text-surface-700-300" : "sr-only"}
+                />
+                {#if apiTokenCopyStatus?.error}
+                  <InlineAlert message={apiTokenCopyStatus.message} size="sm" class="mb-3" />
                 {/if}
 
                 <form method="POST" action="?/createApiToken" use:enhance={setPending("create-api-token")} class="flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -4583,9 +5057,13 @@
                     </div>
                     <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
+                  <StatusRegion
+                    message={digestDirty ? "Save digest settings to apply your edits before sending a test or running the digest." : ""}
+                    paused={activeView !== "settings"}
+                  />
                   <div class="mt-6 flex flex-col gap-3 border-t border-surface-300-700/40 pt-5 sm:flex-row sm:items-center sm:justify-between">
                     {#if digestDirty}
-                      <p class="text-sm font-medium text-warning-700-300" role="status">Save digest settings to apply your edits before sending a test or running the digest.</p>
+                      <p class="text-sm font-medium text-warning-700-300">Save digest settings to apply your edits before sending a test or running the digest.</p>
                     {:else if digestEnabled}
                       <p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>
                     {:else}
@@ -4607,9 +5085,16 @@
                     <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
+                <StatusRegion
+                  message={digestSettings.last_delivery
+                    ? `Last ${digestSettings.last_delivery.channel} delivery: ${digestSettings.last_delivery.status}${digestSettings.last_delivery.error ? `. ${digestSettings.last_delivery.error}` : ""}`
+                    : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if digestSettings.last_delivery}
                   {@const delivery = digestSettings.last_delivery}
-                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`} role="status">
+                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`}>
                     {#if delivery.status === "sent"}<Check size={16} class="shrink-0" />{:else if delivery.status === "failed"}<TriangleAlert size={16} class="shrink-0" />{:else}<RefreshCw size={16} class="shrink-0 animate-spin" />{/if}
                     <span class="min-w-0 flex-1">Last {delivery.channel} delivery: <strong>{delivery.status}</strong>{#if delivery.sent_at} · {formatDeliveryDate(delivery.sent_at)}{:else if delivery.updated_at} · {formatDeliveryDate(delivery.updated_at)}{/if}{#if delivery.error}<span class="mt-1 block text-xs">{delivery.error}</span>{/if}</span>
                     {#if delivery.status === "failed"}<form method="POST" action="?/retryDigest" use:enhance={setPending("digest-retry")}>
@@ -4633,17 +5118,17 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentReads.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -4659,6 +5144,16 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
@@ -4872,12 +5367,20 @@
                 />{:else}<Search size={16} />{/if} Search</button
             >
           </form>
+          <StatusRegion
+            message={librarrStatusMessage}
+            immediate={librarrSearchImmediate}
+            announceOnMount
+          />
+          <StatusRegion
+            message={librarrSearchMessage}
+            immediate
+          />
           {#if librarrSearchMessage}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
               class="mt-4 flex items-center gap-2 preset-tonal-success p-3 text-sm"
-              role="status"
             >
-              <Check size={16} />
+              <Check size={16} aria-hidden="true" />
               {librarrSearchMessage}
             </div>{/if}
           {#if librarrSearchError}<div
@@ -4910,8 +5413,6 @@
           {:else if librarrSearchState === "searching"}
             <div
               class="mt-4 flex items-center gap-2 text-sm text-surface-700-300"
-              role="status"
-              aria-live="polite"
             >
               <RefreshCw size={15} class="animate-spin text-primary-500" />
               Searching Librarr… {librarrResults.length} matches so far
@@ -4931,7 +5432,7 @@
           {/if}
           {#if librarrResults.length}
             {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
-            <div class="mt-5 space-y-3" aria-live="polite">
+            <div class="mt-5 space-y-3">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
                 <article
