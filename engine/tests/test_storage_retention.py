@@ -170,7 +170,7 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
 ):
     assert (
         '"base_ranker_fallback" if can_personalize else "non_ranking_request"'
-        in inspect.getsource(main_module.tracked_recommendations)
+        in inspect.getsource(main_module._complete_tracked_recommendations)
     )
     monkeypatch.setattr(main_module, "enqueue_job", lambda *_a, **_kw: "job-noop")
     with transaction() as con:
@@ -239,8 +239,9 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
                 """,
                 (rec_id,),
             ).fetchall()
+            # Restoring the saved book retracts its explicit save label; the later
+            # read rating is the only outcome left, still anchored to the Discover run.
             assert [(r["run_id"], float(r["label"]), r["label_kind"]) for r in outcomes] == [
-                (discover_run_id, 1.0, "explicit_feedback"),
                 (discover_run_id, 1.0, "rating_positive"),
             ]
 
