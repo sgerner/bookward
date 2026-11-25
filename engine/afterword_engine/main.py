@@ -37,6 +37,7 @@ from .database import (
     initialize,
     normalize_key,
     private_setting,
+    purge_demo_reads,
     recompute_candidate_sources,
     row,
     rows,
@@ -3227,7 +3228,10 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
-    saved_rating = rating if rating is not None else existing["rating"] if existing else None
+    already_present = existing is not None
+    existing_is_real = bool(existing and existing["source"] != "demo")
+    saved_rating = rating if rating is not None else existing["rating"] if existing_is_real else None
+    purge_demo_reads(con)
     read_at = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
@@ -3328,7 +3332,7 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return read, existing is not None
+    return read, already_present
 
 
 def _clear_explicit_feedback_outcomes(
@@ -4012,8 +4016,13 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
-def _toggle_source_row(con, source_id: int, source) -> bool:
+def _is_builtin_demo_source(source) -> bool:
+    return source["url"] == "builtin://upcoming" or source["kind"] == "builtin"
+
+
+def _toggle_source_row(con, source_id: int, source) -> tuple[bool, int]:
     became_enabled = not source["enabled"]
+    purged_demo = 0
     con.execute(
         "UPDATE sources SET enabled=1-enabled, "
         "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
@@ -4024,36 +4033,46 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
     recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
         demote_orphaned_recommended_candidates(con, source_id=source_id)
-    return became_enabled
+        if _is_builtin_demo_source(source):
+            purged_demo = purge_demo_reads(con)
+    return became_enabled, purged_demo
+
+
+def _source_toggle_job_id(
+    source_id: int, source, became_enabled: bool, purged_demo: int
+) -> int | None:
+    if became_enabled and source["kind"] not in {"builtin", "association"}:
+        return enqueue_job(f"source:{source_id}", dedupe=True)
+    if _is_builtin_demo_source(source) and (purged_demo > 0 or became_enabled):
+        return enqueue_job("score", dedupe=True)
+    return None
 
 
 @app.put("/api/sources/default/toggle")
 def toggle_default_source():
     with transaction() as con:
         source = con.execute(
-            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+            "SELECT id,url,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
         ).fetchone()
         if not source:
             raise HTTPException(404, "Default source not found.")
         source_id = source["id"]
-        became_enabled = _toggle_source_row(con, source_id, source)
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if became_enabled and source["kind"] not in {"builtin", "association"}
-        else None
-    )
+        became_enabled, purged_demo = _toggle_source_row(con, source_id, source)
+    job_id = _source_toggle_job_id(source_id, source, became_enabled, purged_demo)
     return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
 
 
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
-        source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
+        source = con.execute("SELECT url,enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = _toggle_source_row(con, source_id, source)
+        became_enabled, purged_demo = _toggle_source_row(con, source_id, source)
     if became_enabled and source["kind"] not in {"builtin", "association"}:
         _bump_source_scan_generation(source_id)
         job_id = enqueue_followup_job(f"source:{source_id}")
+    elif _is_builtin_demo_source(source) and (purged_demo > 0 or became_enabled):
+        job_id = enqueue_job("score", dedupe=True)
     else:
         job_id = None
     return {"id":source_id, "job_id":job_id}

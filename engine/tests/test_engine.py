@@ -66,6 +66,7 @@ from afterword_engine.main import (
     source_sync_due_sources,
     source_sync_is_due,
     sync,
+    tracked_recommendations,
 )
 from afterword_engine.digest import digest_is_due, digest_preview, send_digest, validate_digest_config
 
@@ -1906,11 +1907,14 @@ def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
     with TestClient(app, headers=authenticated_headers()) as client:
         disabled = client.put("/api/sources/default/toggle")
         assert disabled.status_code == 200
-        assert disabled.json() == {
-            "id": default_source["id"],
-            "enabled": 0,
-            "job_id": None,
+        disabled_payload = disabled.json()
+        assert disabled_payload["id"] == default_source["id"]
+        assert disabled_payload["enabled"] == 0
+        assert disabled_payload["job_id"] is not None
+        assert row("SELECT kind FROM jobs WHERE id=?", (disabled_payload["job_id"],)) == {
+            "kind": "score",
         }
+        assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
         assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 0
         assert (
             row(
@@ -1922,11 +1926,10 @@ def test_toggle_default_source_is_atomic_and_returns_404_when_absent(database):
 
         reenabled = client.put("/api/sources/default/toggle")
         assert reenabled.status_code == 200
-        assert reenabled.json() == {
-            "id": default_source["id"],
-            "enabled": 1,
-            "job_id": None,
-        }
+        reenabled_payload = reenabled.json()
+        assert reenabled_payload["id"] == default_source["id"]
+        assert reenabled_payload["enabled"] == 1
+        assert reenabled_payload["job_id"] is not None
         assert row("SELECT enabled FROM sources WHERE id=?", (default_source["id"],))["enabled"] == 1
 
         with transaction() as con:
@@ -3888,6 +3891,875 @@ def test_retry_of_corrupt_delivery_is_recorded_as_a_failure(database):
         "error": "Stored delivery payload is invalid",
         "attempts": 1,
     }
+
+
+def _seed_demo_derived_artifacts_for_test():
+    """Populate scoring batches, serving snapshots, outcomes, and stale read status from demo reads."""
+    from datetime import datetime, timedelta, timezone
+    from afterword_engine.learning import attribute_read_outcomes
+
+    past_ts = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        piranesi_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,80,'recommended',?)",
+            (
+                "Piranesi",
+                "Susanna Clarke",
+                "A house of infinite halls and statues flooded by tides.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("Piranesi", "Susanna Clarke"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (piranesi_candidate_id,),
+        )
+
+    assert asyncio.run(score_all("local", "hashing-768")) >= 4
+    served, run_id = tracked_recommendations()
+    assert served and run_id
+
+    # Create an exposure for Piranesi preceding the demo read timestamp so
+    # attribute_read_outcomes() records a synthetic demo outcome + read event.
+    with transaction() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO recommendation_impressions"
+            "(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES(?,?,99,80.0,1.0,?,?)",
+            (run_id, piranesi_candidate_id, past_ts, past_ts),
+        )
+        # Simulate the pre-fix mark-read state where a candidate's status became
+        # 'read' while its matching reads row remained source='demo'.
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (piranesi_candidate_id,),
+        )
+
+    attributed = attribute_read_outcomes()
+    assert attributed["reads_attributed"] >= 1
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] >= 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] >= 4
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] >= 1
+    return piranesi_candidate_id, run_id
+
+
+def test_disabling_builtin_demo_source_purges_demo_reads_derived_evidence_and_preserves_toggle_off(
+    database,
+):
+    from afterword_engine.database import initialize as init_db
+
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
+    with transaction() as con:
+        builtin_candidate_id = con.execute(
+            "SELECT c.id FROM candidates c JOIN sources s ON s.id=c.source_id "
+            "WHERE s.url='builtin://upcoming' ORDER BY c.id LIMIT 1"
+        ).fetchone()[0]
+        demo_read_id = con.execute(
+            "SELECT id FROM reads WHERE source='demo' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (builtin_candidate_id,),
+        )
+        con.execute(
+            "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
+            "VALUES(?,?,'read',5.0,'manual_read',?)",
+            (
+                f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
+                builtin_candidate_id,
+                json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
+            ),
+        )
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+
+    client = TestClient(app, headers=authenticated_headers())
+    initial_overview = client.get("/api/overview").json()
+    builtin = next(item for item in initial_overview["sources"] if item["is_default"])
+    assert builtin["enabled"] == 1
+
+    toggled = client.put(f"/api/sources/{builtin['id']}/toggle")
+    assert toggled.status_code == 200
+    job_id = toggled.json()["job_id"]
+    assert job_id is not None
+
+    assert row("SELECT kind,status FROM jobs WHERE id=?", (job_id,)) == {
+        "kind": "score",
+        "status": "queued",
+    }
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_events")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_evidence_vectors")["count"] == 0
+    expected_exposure_bytes = row(
+        "SELECT COALESCE(SUM(160 + length(CAST(candidate_snapshot_json AS BLOB))), 0) bytes "
+        "FROM recommendation_evidence_exposures"
+    )["bytes"]
+    assert (
+        row("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1")["used_bytes"]
+        == expected_exposure_bytes
+    )
+    assert row("SELECT status,score FROM candidates WHERE id=?", (builtin_candidate_id,)) == {
+        "status": "new",
+        "score": 0.0,
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT enabled,is_default FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+        "is_default": 1,
+    }
+
+    updated_overview = client.get("/api/overview").json()
+    assert "Piranesi" in {item["title"] for item in updated_overview["recommendations"]}
+
+    # Even if both candidates and reads are empty, re-running initialize(seed_demo=True)
+    # must respect the user's toggle-off and never re-enable or re-seed demo data.
+    with transaction() as con:
+        con.execute("DELETE FROM candidates")
+    init_db(seed_demo=True)
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+    }
+    assert row("SELECT COUNT(*) count FROM candidates")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+
+
+def test_goodreads_csv_import_updates_matching_demo_title_and_cleans_derived_artifacts(
+    database,
+):
+    piranesi_id, _run_id = _seed_demo_derived_artifacts_for_test()
+
+    # While synthetic demo reads and status='read' are present, Piranesi is hidden.
+    assert "Piranesi" not in {item["title"] for item in recommendation_list()}
+
+    csv_payload = (
+        b"Title,Author,My Rating,Date Read,ISBN13,Exclusive Shelf\n"
+        b"Sea of Tranquility,Emily St. John Mandel,3,2025/04/01,9780593321447,read\n"
+        b"Project Hail Mary,Andy Weir,5,2025/05/01,9780593135204,read\n"
+    )
+    assert import_goodreads_csv(csv_payload) == 2
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row(
+        "SELECT rating,source,isbn FROM reads WHERE title='Sea of Tranquility'"
+    ) == {
+        "rating": 3.0,
+        "source": "goodreads_csv",
+        "isbn": "9780593321447",
+    }
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 2
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_id,)) == {
+        "status": "recommended",
+    }
+    assert "Piranesi" in {item["title"] for item in recommendation_list()}
+
+    asyncio.run(score_all("local", "hashing-768"))
+    assert "Piranesi" in {item["title"] for item in recommendation_list()}
+
+
+def test_goodreads_rss_and_manual_read_replace_demo_source_preserve_already_present_and_reset_candidates(
+    database, monkeypatch
+):
+    async def fake_fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class Feed:
+        entries = [
+            {
+                "title": "Piranesi",
+                "author_name": "Susanna Clarke",
+                "user_rating": "4",
+                "user_read_at": "2025/03/10",
+                "isbn13": "9781635575637",
+            },
+            {
+                "title": "Dune",
+                "author_name": "Frank Herbert",
+                "user_rating": "5",
+                "user_read_at": "2025/03/12",
+                "isbn13": "9780441172719",
+            },
+        ]
+
+    monkeypatch.setattr(ingestion, "fetch_bytes", fake_fetch_bytes)
+    monkeypatch.setattr(ingestion.feedparser, "parse", lambda _content: Feed())
+
+    assert asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    ) == 2
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT rating,source,isbn FROM reads WHERE title='Piranesi'") == {
+        "rating": 4.0,
+        "source": "goodreads_rss",
+        "isbn": "9781635575637",
+    }
+
+    # Re-seed synthetic demo reads to verify Mark Read preserves already_present=True
+    # for a matching demo row without inheriting its synthetic rating, purges other
+    # demo reads, and resets stale status='read' on other demo-backed candidates.
+    with transaction() as con:
+        con.execute("DELETE FROM reads")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES"
+            "('Sea of Tranquility','Emily St. John Mandel',5,'demo'),"
+            "('The Fifth Season','N. K. Jemisin',5,'demo')"
+        )
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,source_id,score,status,normalized_key) "
+            "VALUES('Sea of Tranquility','Emily St. John Mandel',?,82,'recommended',?)",
+            (web_source_id, normalize_key("Sea of Tranquility", "Emily St. John Mandel")),
+        ).lastrowid
+        fifth_season_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,source_id,score,status,normalized_key) "
+            "VALUES('The Fifth Season','N. K. Jemisin',?,85,'read',?)",
+            (web_source_id, normalize_key("The Fifth Season", "N. K. Jemisin")),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id IN (?,?)",
+            (candidate_id, fifth_season_candidate_id),
+        )
+
+    client = TestClient(app, headers=authenticated_headers())
+    marked = client.post(f"/api/recommendations/{candidate_id}/read", json={})
+
+    assert marked.status_code == 200
+    assert marked.json()["already_present"] is True
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT rating,source FROM reads WHERE title='Sea of Tranquility'") == {
+        "rating": None,
+        "source": "manual",
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (candidate_id,)) == {
+        "status": "read",
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (fifth_season_candidate_id,)) == {
+        "status": "recommended",
+    }
+
+
+def test_migration_31_purges_stale_demo_reads_derived_rows_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-31.db"))
+    init_db(seed_demo=True)
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
+
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        mandel_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,0,'new',?)",
+            (
+                "The Glass Hotel",
+                "Emily St. John Mandel",
+                "A financial collapse and disappearance at the edge of the wilderness.",
+                json.dumps(["literary fiction"]),
+                web_source_id,
+                normalize_key("The Glass Hotel", "Emily St. John Mandel"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (mandel_candidate_id,),
+        )
+        # Simulate an installation upgraded from before demo-read purging where real
+        # reads coexist alongside the 4 seeded demo reads.
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) "
+            "VALUES('Dune','Frank Herbert',5,'goodreads_csv')"
+        )
+
+    asyncio.run(score_all("local", "hashing-768"))
+    pre_upgrade_reasons = json.loads(
+        row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
+    )
+    assert "You rated a book by this author highly" in pre_upgrade_reasons
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] >= 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] >= 5
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune' AND source='goodreads_csv'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
+
+    asyncio.run(score_all("local", "hashing-768"))
+    post_upgrade_reasons = json.loads(
+        row("SELECT explanation FROM candidates WHERE id=?", (mandel_candidate_id,))["explanation"]
+    )
+    assert "You rated a book by this author highly" not in post_upgrade_reasons
+
+    # Re-running initialize() and re-applying migration 31 must be idempotent and
+    # preserve post-upgrade real scoring batches without queuing duplicate jobs.
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+
+    with transaction() as con:
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+
+
+def test_migration_31_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
+    tmp_path, monkeypatch
+):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(
+        settings, "db", str(tmp_path / "upgrade-migration-31-disabled-builtin.db")
+    )
+    init_db(seed_demo=True)
+    piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
+
+    with transaction() as con:
+        builtin_candidate_id = con.execute(
+            "SELECT c.id FROM candidates c JOIN sources s ON s.id=c.source_id "
+            "WHERE s.url='builtin://upcoming' ORDER BY c.id LIMIT 1"
+        ).fetchone()[0]
+        demo_read_id = con.execute(
+            "SELECT id FROM reads WHERE source='demo' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET status='read' WHERE id=?",
+            (builtin_candidate_id,),
+        )
+        # Every event-key form a demo read can leave behind must be purged.
+        for demo_event_key in (
+            f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
+            f"read:{demo_read_id:08d}:{builtin_candidate_id}",
+            f"attribution:read:{demo_read_id:08d}:{builtin_candidate_id}",
+        ):
+            con.execute(
+                "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
+                "VALUES(?,?,'read',5.0,'manual_read',?)",
+                (
+                    demo_event_key,
+                    builtin_candidate_id,
+                    json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
+                ),
+            )
+        con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
+    assert row("SELECT status,score FROM candidates WHERE id=?", (builtin_candidate_id,)) == {
+        "status": "new",
+        "score": 0.0,
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (piranesi_candidate_id,)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 0,
+    }
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
+
+    # Re-running migration 31 when already clean is a no-op.
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+    init_db(seed_demo=True)
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
+
+
+def test_migration_31_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
+    from afterword_engine.database import initialize as init_db
+
+    monkeypatch.setattr(
+        settings, "db", str(tmp_path / "upgrade-migration-31-keep-demo.db")
+    )
+    init_db(seed_demo=True)
+    assert asyncio.run(score_all("local", "hashing-768")) == 4
+    served, run_id = tracked_recommendations()
+    assert len(served) == 4 and run_id
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT enabled FROM sources WHERE url='builtin://upcoming'") == {
+        "enabled": 1,
+    }
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM embeddings WHERE entity_type='read'")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM scoring_batch_reads")["count"] == 4
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
+
+
+def _seed_shared_run_with_demo_and_real_data():
+    """Create a serving run shared by a demo read outcome, a real read outcome, and real feedback."""
+    from datetime import datetime, timedelta, timezone
+    from afterword_engine.learning import attribute_read_outcomes
+
+    past_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    real_read_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+
+    with transaction() as con:
+        web_source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=0 AND enabled=1 LIMIT 1"
+        ).fetchone()[0]
+        piranesi_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,80,'recommended',?)",
+            (
+                "Piranesi",
+                "Susanna Clarke",
+                "A house of infinite halls and statues flooded by tides.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("Piranesi", "Susanna Clarke"),
+            ),
+        ).lastrowid
+        dune_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,88,'recommended',?)",
+            (
+                "Dune",
+                "Frank Herbert",
+                "Politics and ecology on a desert world.",
+                json.dumps(["science fiction"]),
+                web_source_id,
+                normalize_key("Dune", "Frank Herbert"),
+            ),
+        ).lastrowid
+        jemisin_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,85,'read',?)",
+            (
+                "The Fifth Season",
+                "N. K. Jemisin",
+                "Orogenes and seismic catastrophe across the Stillness.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("The Fifth Season", "N. K. Jemisin"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id IN (?,?,?)",
+            (piranesi_candidate_id, dune_candidate_id, jemisin_candidate_id),
+        )
+        attr_demo_cid = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,81,'recommended',?)",
+            (
+                "Mongrels",
+                "Stephen Graham Jones",
+                "Coming-of-age werewolf road novel across the American South.",
+                json.dumps(["horror"]),
+                web_source_id,
+                normalize_key("Mongrels", "Stephen Graham Jones"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (attr_demo_cid,),
+        )
+
+    assert asyncio.run(score_all("local", "hashing-768")) >= 6
+    served, shared_run_id = tracked_recommendations()
+    assert len(served) >= 6 and shared_run_id
+    builtin_ids = [
+        int(item["id"])
+        for item in served
+        if int(item["id"])
+        not in {
+            piranesi_candidate_id,
+            dune_candidate_id,
+            jemisin_candidate_id,
+            attr_demo_cid,
+        }
+    ]
+    feedback_candidate_id, mark_read_candidate_id, stale_prior_cid, manual_demo_cid = (
+        builtin_ids[0],
+        builtin_ids[1],
+        builtin_ids[2],
+        builtin_ids[3],
+    )
+
+    with transaction() as con:
+        for rank_offset, cid in enumerate(
+            (
+                piranesi_candidate_id,
+                dune_candidate_id,
+                jemisin_candidate_id,
+                mark_read_candidate_id,
+                manual_demo_cid,
+                attr_demo_cid,
+            ),
+            start=90,
+        ):
+            con.execute(
+                "INSERT INTO recommendation_impressions"
+                "(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+                "VALUES(?,?,?,82.0,1.0,?,?) "
+                "ON CONFLICT(run_id,candidate_id) DO UPDATE SET presented_at=excluded.presented_at, visible_at=excluded.visible_at",
+                (shared_run_id, cid, rank_offset, past_ts, past_ts),
+            )
+        jemisin_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='The Fifth Season'"
+            ).fetchone()[0]
+        )
+        from afterword_engine.learning import record_event_in_connection
+
+        # Seed a prior 2-part read event on stale_prior_cid so attribute_read_outcomes()
+        # natively emits a 3-part read:<demo_id>:<jemisin_candidate_id> event and an
+        # unlinked retraction revision for the superseded 2-part key.
+        record_event_in_connection(
+            con,
+            event_key=f"read:{jemisin_demo_id:08d}",
+            candidate_id=stale_prior_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=5.0,
+            source="read_import",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+        )
+        real_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) "
+            "VALUES('Dune','Frank Herbert',5,?,'goodreads_csv')",
+            (real_read_ts,),
+        ).lastrowid
+
+    profiles.initialize_auth()
+    client = TestClient(app, headers=authenticated_headers())
+    fb = client.post(
+        f"/api/recommendations/{feedback_candidate_id}/feedback",
+        json={"action": "save", "run_id": shared_run_id},
+    )
+    assert fb.status_code == 200
+    feedback_decision_id = fb.json()["decision_id"]
+
+    attributed = attribute_read_outcomes()
+    assert attributed["reads_attributed"] == 3
+
+    with transaction() as con:
+        from afterword_engine.learning import record_event_in_connection
+
+        piranesi_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='Piranesi'"
+            ).fetchone()[0]
+        )
+        mandel_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='Sea of Tranquility'"
+            ).fetchone()[0]
+        )
+        jones_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='The Only Good Indians'"
+            ).fetchone()[0]
+        )
+        demo_manual_key = f"manual-read:{manual_demo_cid}:{mandel_demo_id:08d}"
+        demo_attr_key = f"attribution:read:{jones_demo_id:08d}:{attr_demo_cid}"
+        record_event_in_connection(
+            con,
+            event_key=demo_manual_key,
+            candidate_id=manual_demo_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=5.0,
+            source="manual_read",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+            read_id=mandel_demo_id,
+        )
+        record_event_in_connection(
+            con,
+            event_key=demo_attr_key,
+            candidate_id=attr_demo_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=4.0,
+            source="read_import",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+            read_id=jones_demo_id,
+        )
+
+    demo_keys = {
+        f"read:{piranesi_demo_id:08d}",
+        f"read:{jemisin_demo_id:08d}:{jemisin_candidate_id}",
+        demo_manual_key,
+        demo_attr_key,
+    }
+    for table in (
+        "recommendation_events",
+        "recommendation_evidence_events",
+        "recommendation_evidence_outcomes",
+    ):
+        present = {
+            item["event_key"]
+            for item in rows(f"SELECT DISTINCT event_key FROM {table}")
+        }
+        assert demo_keys.issubset(present)
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events "
+            "WHERE event_key=? AND run_id IS NULL",
+            (f"read:{jemisin_demo_id:08d}",),
+        )["count"]
+        == 1
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes o "
+            "JOIN recommendation_impressions i ON i.id=o.impression_id "
+            "WHERE i.run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == 6
+    )
+    return {
+        "shared_run_id": shared_run_id,
+        "piranesi_candidate_id": piranesi_candidate_id,
+        "dune_candidate_id": dune_candidate_id,
+        "real_read_id": real_read_id,
+        "feedback_candidate_id": feedback_candidate_id,
+        "feedback_event_key": f"feedback:{feedback_decision_id}",
+        "mark_read_candidate_id": mark_read_candidate_id,
+        "three_part_demo_cid": jemisin_candidate_id,
+    }
+
+
+def test_runtime_purge_and_migration_31_preserve_real_outcomes_and_feedback_on_shared_run(
+    tmp_path, monkeypatch
+):
+    from afterword_engine.database import initialize as init_db
+
+    # 1. Runtime purge_demo_reads via manual Mark Read on a shared run.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-runtime.db"))
+    init_db(seed_demo=True)
+    ctx = _seed_shared_run_with_demo_and_real_data()
+    shared_run_id = ctx["shared_run_id"]
+    real_event_key = f"read:{ctx['real_read_id']:08d}"
+    feedback_event_key = ctx["feedback_event_key"]
+    impression_count_before = row(
+        "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+    exposure_count_before = row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+        (shared_run_id,),
+    )["count"]
+
+    client = TestClient(app, headers=authenticated_headers())
+    marked = client.post(
+        f"/api/recommendations/{ctx['mark_read_candidate_id']}/read",
+        json={"rating": 4},
+    )
+    assert marked.status_code == 200
+    manual_read_id = marked.json()["read_id"]
+    manual_event_key = f"manual-read:{ctx['mark_read_candidate_id']}:{manual_read_id:08d}"
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT status FROM candidates WHERE id=?", (ctx["three_part_demo_cid"],)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (shared_run_id,)) == {"ok": 1}
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == impression_count_before
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+            (shared_run_id,),
+        )["count"]
+        == exposure_count_before
+    )
+    # Demo outcome and event are gone, while real read outcome, explicit feedback outcome,
+    # and the newly recorded manual read outcome on the shared run all remain intact.
+    remaining_events = rows(
+        "SELECT event_key, run_id, event_type FROM recommendation_events ORDER BY event_key"
+    )
+    assert {item["event_key"] for item in remaining_events} == {
+        feedback_event_key,
+        manual_event_key,
+        real_event_key,
+    }
+    assert all(item["run_id"] == shared_run_id for item in remaining_events)
+    remaining_outcomes = rows(
+        "SELECT o.read_id, o.label_kind, e.event_key "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "ORDER BY e.event_key"
+    )
+    assert remaining_outcomes == [
+        {
+            "read_id": None,
+            "label_kind": "explicit_feedback",
+            "event_key": feedback_event_key,
+        },
+        {
+            "read_id": manual_read_id,
+            "label_kind": "rating_positive",
+            "event_key": manual_event_key,
+        },
+        {
+            "read_id": ctx["real_read_id"],
+            "label_kind": "rating_positive",
+            "event_key": real_event_key,
+        },
+    ]
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_outcomes WHERE run_id=?",
+            (shared_run_id,),
+        )
+    } == {feedback_event_key, manual_event_key, real_event_key}
+    assert {
+        item["event_key"]
+        for item in rows("SELECT event_key FROM recommendation_evidence_events")
+    } == {feedback_event_key, manual_event_key, real_event_key}
+
+    # 2. Migration 31 on a shared run with demo outcome + real outcome + real feedback.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-31.db"))
+    init_db(seed_demo=True)
+    mctx = _seed_shared_run_with_demo_and_real_data()
+    mrun_id = mctx["shared_run_id"]
+    m_real_event_key = f"read:{mctx['real_read_id']:08d}"
+    m_feedback_event_key = mctx["feedback_event_key"]
+    m_impressions_before = row(
+        "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+        (mrun_id,),
+    )["count"]
+    m_exposures_before = row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+        (mrun_id,),
+    )["count"]
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
+
+    init_db(seed_demo=True)
+
+    assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT COUNT(*) count FROM reads WHERE id=?", (mctx["real_read_id"],))["count"] == 1
+    assert row("SELECT status FROM candidates WHERE id=?", (mctx["three_part_demo_cid"],)) == {
+        "status": "recommended",
+    }
+    assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (mrun_id,)) == {"ok": 1}
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_impressions WHERE run_id=?",
+            (mrun_id,),
+        )["count"]
+        == m_impressions_before
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_exposures WHERE run_id=?",
+            (mrun_id,),
+        )["count"]
+        == m_exposures_before
+    )
+    assert rows(
+        "SELECT event_key, run_id FROM recommendation_events ORDER BY event_key"
+    ) == [
+        {"event_key": m_feedback_event_key, "run_id": mrun_id},
+        {"event_key": m_real_event_key, "run_id": mrun_id},
+    ]
+    assert rows(
+        "SELECT o.read_id, o.label_kind, e.event_key "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "ORDER BY e.event_key"
+    ) == [
+        {
+            "read_id": None,
+            "label_kind": "explicit_feedback",
+            "event_key": m_feedback_event_key,
+        },
+        {
+            "read_id": mctx["real_read_id"],
+            "label_kind": "rating_positive",
+            "event_key": m_real_event_key,
+        },
+    ]
+    assert {
+        item["event_key"]
+        for item in rows(
+            "SELECT event_key FROM recommendation_evidence_outcomes WHERE run_id=?",
+            (mrun_id,),
+        )
+    } == {m_feedback_event_key, m_real_event_key}
+    assert {
+        item["event_key"]
+        for item in rows("SELECT event_key FROM recommendation_evidence_events")
+    } == {m_feedback_event_key, m_real_event_key}
+    assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
 
 
 def test_update_custom_source_persists_name_and_url_and_returns_409_on_duplicate(
