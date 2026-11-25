@@ -2,19 +2,36 @@ import asyncio
 import logging
 import sqlite3
 import stat
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from auth_helpers import authenticated_headers
 from cryptography.fernet import Fernet
 
-from afterword_engine import backups, profiles
+from afterword_engine import backups, database as db_module, profiles, scoring
 from afterword_engine.config import settings
-from afterword_engine.database import initialize, private_setting, row, transaction
-from afterword_engine.main import app, lifespan
+from afterword_engine.database import (
+    MIGRATIONS,
+    RestoreEpochError,
+    bind_restore_epoch,
+    connect,
+    current_restore_epoch,
+    database_lock,
+    initialize,
+    private_setting,
+    row,
+    rows,
+    transaction,
+)
+from afterword_engine.embeddings import content_hash, vector_blob
+from afterword_engine.jobs import enqueue_job, worker_loop
+from afterword_engine.main import app, handle_job, lifespan, queue_goodreads_rss_if_due
 from afterword_engine.secrets import installation_key_path, seal
 from afterword_engine.tenancy import profile_database_path, profile_scope
 
@@ -1785,6 +1802,745 @@ def test_dismiss_auth_hold_uses_database_lock_and_lifespan_recovers_before_auth_
     assert locked_paths == [profiles.auth_path()]
 
 
+def test_restore_while_rebuild_embeddings_awaits_vectors_preserves_restored_embeddings(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    reads_list = rows("SELECT * FROM reads ORDER BY id")
+    candidates_list = rows("SELECT * FROM candidates ORDER BY id")
+    expected_total = len(reads_list) + len(candidates_list)
+    assert expected_total >= 8
+
+    with transaction() as con:
+        con.execute("DELETE FROM embeddings")
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','ollama',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','nomic-embed-text',0)"
+        )
+        for entity_type, items in (("read", reads_list), ("candidate", candidates_list)):
+            for item in items:
+                vector = [0.25] * 4
+                con.execute(
+                    "INSERT INTO embeddings(entity_type,entity_id,backend,model,vector,dimensions,content_hash) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        entity_type,
+                        item["id"],
+                        "ollama",
+                        "nomic-embed-text",
+                        vector_blob(vector),
+                        len(vector),
+                        content_hash(scoring.document(item)),
+                    ),
+                )
+    snapshot = backups.create_backup()
+
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','openai',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','text-embedding-3-small',0)"
+        )
+
+    awaiting_vectors = asyncio.Event()
+    release_vectors = asyncio.Event()
+
+    class SlowEmbedder:
+        name = "openai"
+        model = "text-embedding-3-small"
+
+        async def embed(self, texts):
+            awaiting_vectors.set()
+            await release_vectors.wait()
+            return [[0.75] * 4 for _ in texts]
+
+    monkeypatch.setattr(scoring, "get_embedder", lambda *_args, **_kwargs: SlowEmbedder())
+
+    # 1. Worker-managed rebuild_embeddings is canceled during restore quiescence.
+    enqueue_job("rebuild_embeddings", dedupe=True)
+    stop = asyncio.Event()
+
+    async def run_worker_restore():
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
+        await asyncio.wait_for(awaiting_vectors.wait(), timeout=2)
+        await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+        stop.set()
+        release_vectors.set()
+        await asyncio.wait_for(worker, timeout=2)
+
+    asyncio.run(run_worker_restore())
+
+    stored = rows("SELECT entity_type,entity_id,backend,model FROM embeddings")
+    assert len(stored) == expected_total
+    assert {(item["backend"], item["model"]) for item in stored} == {
+        ("ollama", "nomic-embed-text")
+    }
+    assert private_setting("embedding_backend") == "ollama"
+    assert current_restore_epoch() == 1
+    assert rows("SELECT id FROM jobs WHERE status IN ('queued','running')") == []
+
+    # 2. Even if an unfenced coroutine/thread resumes from await after restore swaps
+    #    an older snapshot (epoch 0 -> 2), transaction() blocks all writes by epoch.
+    awaiting_vectors = asyncio.Event()
+    release_vectors = asyncio.Event()
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_backend','openai',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('embedding_model','text-embedding-3-small',0)"
+        )
+
+    async def run_late_resumed_rebuild():
+        rebuild_task = asyncio.create_task(handle_job("rebuild_embeddings"))
+        await asyncio.wait_for(awaiting_vectors.wait(), timeout=2)
+        await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+        release_vectors.set()
+        with pytest.raises(RestoreEpochError):
+            await asyncio.wait_for(rebuild_task, timeout=2)
+
+    asyncio.run(run_late_resumed_rebuild())
+
+    stored_after = rows("SELECT entity_type,entity_id,backend,model FROM embeddings")
+    assert len(stored_after) == expected_total
+    assert {(item["backend"], item["model"]) for item in stored_after} == {
+        ("ollama", "nomic-embed-text")
+    }
+    assert current_restore_epoch() == 2
+
+
+def test_restore_and_startup_recovery_preserve_queued_jobs_and_requeue_running_rows(database):
+    today = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+    created_iso = today.isoformat()
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('goodreads_rss_url','https://www.goodreads.com/review/list_rss/1',0)"
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,created_at) VALUES('job-queued','digest:manual','queued',?)",
+            (created_iso,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,started_at,heartbeat_at,lease_token,attempts,created_at) "
+            "VALUES('job-running','goodreads_rss','running',?,?,?,1,?)",
+            (created_iso, created_iso, "stale-lease", created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,result,finished_at,created_at) "
+            "VALUES('job-complete','score','complete','{\"scored\": 4}',?,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,error,attempts,finished_at,created_at) "
+            "VALUES('job-failed','sync','failed','network timeout',3,?,?)",
+            (created_iso, created_iso),
+        )
+    snapshot = backups.create_backup()
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,created_at) VALUES('safety-queued','sync','queued',?)",
+            (created_iso,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,started_at,lease_token,attempts,created_at) "
+            "VALUES('safety-running','score','running',?,'live-lease',1,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,result,finished_at,created_at) "
+            "VALUES('safety-complete','goodreads_rss','complete','{}',?,?)",
+            (created_iso, created_iso),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,error,attempts,finished_at,created_at) "
+            "VALUES('safety-failed','digest','failed','smtp down',3,?,?)",
+            (created_iso, created_iso),
+        )
+
+    result = backups.restore_backup(snapshot["id"])
+    assert current_restore_epoch() == 1
+    restored_jobs = {
+        item["id"]: item
+        for item in rows(
+            "SELECT id,status,started_at,heartbeat_at,lease_token,attempts FROM jobs"
+        )
+    }
+    assert {job_id: item["status"] for job_id, item in restored_jobs.items()} == {
+        "job-queued": "queued",
+        "job-running": "queued",
+        "job-complete": "complete",
+        "job-failed": "failed",
+    }
+    assert restored_jobs["job-running"]["started_at"] is None
+    assert restored_jobs["job-running"]["heartbeat_at"] is None
+    assert restored_jobs["job-running"]["lease_token"] is None
+    assert restored_jobs["job-running"]["attempts"] == 0
+    # Requeuing the interrupted goodreads_rss row preserves pending work without
+    # waiting for a dead lease to expire.
+    scheduled_job_id = queue_goodreads_rss_if_due(today)
+    assert scheduled_job_id == "job-running"
+
+    # Simulate an interrupted restore rolling back to safety_backup on startup.
+    safety_path = database / "backups" / f"{result['safety_backup']['id']}.sqlite3"
+    backups._write_restore_journal(safety_path, safety_path)
+    assert backups.recover_interrupted_restore() is True
+    assert current_restore_epoch() == 2
+    recovered_jobs = {
+        item["id"]: item
+        for item in rows(
+            "SELECT id,status,started_at,heartbeat_at,lease_token,attempts FROM jobs"
+        )
+    }
+    assert {job_id: item["status"] for job_id, item in recovered_jobs.items()} == {
+        "safety-queued": "queued",
+        "safety-running": "queued",
+        "safety-complete": "complete",
+        "safety-failed": "failed",
+    }
+    assert recovered_jobs["safety-running"]["started_at"] is None
+    assert recovered_jobs["safety-running"]["heartbeat_at"] is None
+    assert recovered_jobs["safety-running"]["lease_token"] is None
+    assert recovered_jobs["safety-running"]["attempts"] == 0
+
+
+def test_failed_restore_prechecks_preserve_active_jobs_and_restore_epoch(database):
+    profiles.initialize_auth()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("precheck_secret", seal("live secret")),
+        )
+    valid_backup = backups.create_backup()
+    key_sidecar = database / "backups" / f"{valid_backup['id']}.secret.key"
+    original_key = key_sidecar.read_bytes()
+    key_sidecar.write_bytes(Fernet.generate_key())
+    key_sidecar.chmod(0o600)
+
+    corrupt_id = "bookward-20260102T000000Z-badbad00"
+    corrupt_snapshot = database / "backups" / f"{corrupt_id}.sqlite3"
+    with sqlite3.connect(corrupt_snapshot) as con:
+        con.execute("CREATE TABLE not_bookward (id INTEGER)")
+
+    job_id = enqueue_job("keep_running")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    stop = asyncio.Event()
+    cancelled = False
+
+    async def active_handler(kind):
+        nonlocal cancelled
+        assert kind == "keep_running"
+        started.set()
+        try:
+            await release.wait()
+            stop.set()
+            return {"preserved": True}
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async def run():
+        worker = asyncio.create_task(worker_loop(active_handler, stop))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        try:
+            for bad_id in ("../invalid", corrupt_id, valid_backup["id"]):
+                with pytest.raises(backups.BackupError):
+                    await asyncio.to_thread(backups.restore_backup, bad_id)
+            assert cancelled is False
+            assert current_restore_epoch() == 0
+        finally:
+            release.set()
+            await asyncio.wait_for(worker, timeout=2)
+            key_sidecar.write_bytes(original_key)
+
+    asyncio.run(run())
+
+    assert cancelled is False
+    assert current_restore_epoch() == 0
+    finished = row("SELECT status,result FROM jobs WHERE id=?", (job_id,))
+    assert finished == {"status": "complete", "result": '{"preserved": true}'}
+
+
+def test_restore_lock_acquire_timeout_on_stuck_connection_clears_restoring_state(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    monkeypatch.setattr(db_module, "RESTORE_QUIESCENCE_TIMEOUT_SECONDS", 0.05)
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES('Live read','Reader','test')"
+        )
+    snapshot = backups.create_backup()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,source) VALUES('After snapshot','Reader','test')"
+        )
+
+    # Direct acquire(deadline) timeout raises BackupError and wakes waiting readers.
+    lock = database_lock()
+    held_ready = threading.Event()
+    release_held = threading.Event()
+
+    def hold_open_connection():
+        con = connect()
+        try:
+            held_ready.set()
+            release_held.wait(timeout=5)
+        finally:
+            con.close()
+
+    holder = threading.Thread(target=hold_open_connection, daemon=True)
+    holder.start()
+    assert held_ready.wait(timeout=2)
+    try:
+        with pytest.raises(
+            backups.BackupError, match="could not be safely closed for restore"
+        ):
+            lock.acquire(time.monotonic() + 0.03)
+        assert not lock.is_locked()
+
+        # Full restore_backup times out at quiesce's deadline, resets _restoring_count,
+        # and leaves worker_loop able to process jobs once the stuck connection closes.
+        stop = asyncio.Event()
+        job_done = asyncio.Event()
+
+        async def handler(kind):
+            assert kind == "post_timeout_job"
+            job_done.set()
+            stop.set()
+            return {"ok": True}
+
+        async def run():
+            worker = asyncio.create_task(worker_loop(handler, stop))
+            try:
+                started_at = time.monotonic()
+                with pytest.raises(
+                    backups.BackupError, match="could not be safely closed for restore"
+                ):
+                    await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+                assert time.monotonic() - started_at < 1.5
+                assert not lock.is_restoring()
+                assert not lock.is_locked()
+                assert current_restore_epoch() == 0
+
+                release_held.set()
+                await asyncio.to_thread(holder.join, 2.0)
+                job_id = enqueue_job("post_timeout_job")
+                await asyncio.wait_for(job_done.wait(), timeout=2)
+                await asyncio.wait_for(worker, timeout=2)
+                return job_id
+            finally:
+                stop.set()
+                release_held.set()
+
+        completed_job_id = asyncio.run(run())
+    finally:
+        release_held.set()
+        holder.join(timeout=2)
+
+    assert row("SELECT 1 FROM reads WHERE title='After snapshot'") is not None
+    assert row("SELECT status FROM jobs WHERE id=?", (completed_job_id,)) == {
+        "status": "complete"
+    }
+
+
+def test_quiesce_timeout_with_live_jobs_finalizes_status_or_fences_post_swap_writes(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    monkeypatch.setattr(db_module, "RESTORE_QUIESCENCE_TIMEOUT_SECONDS", 0.05)
+    snapshot = backups.create_backup()
+
+    # 1 & 2: Handler outlives quiesce while holding an open connection so restore fails
+    #        with BackupError; once the handler finishes (complete or exception) after
+    #        job_aborted was set, worker_loop records terminal status instead of leaving
+    #        the row stuck in 'running'.
+    for mode in ("complete", "fail"):
+        job_id = enqueue_job(f"uninterruptible_{mode}")
+        in_handler = asyncio.Event()
+        finish_handler = threading.Event()
+        stop = asyncio.Event()
+
+        def blocking_db_work():
+            with connect() as con:
+                con.execute("SELECT 1").fetchone()
+                finish_handler.wait(timeout=5)
+
+        async def uninterruptible_handler(kind):
+            in_handler.set()
+            try:
+                await asyncio.shield(asyncio.to_thread(blocking_db_work))
+            except asyncio.CancelledError:
+                await asyncio.to_thread(finish_handler.wait, 5.0)
+            stop.set()
+            if kind.endswith("_fail"):
+                raise RuntimeError("boom after abort")
+            return {"mode": mode}
+
+        async def run_case():
+            worker = asyncio.create_task(worker_loop(uninterruptible_handler, stop))
+            try:
+                await asyncio.wait_for(in_handler.wait(), timeout=2)
+                with pytest.raises(backups.BackupError):
+                    await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+                finish_handler.set()
+                await asyncio.wait_for(worker, timeout=2)
+            finally:
+                finish_handler.set()
+                stop.set()
+
+        asyncio.run(run_case())
+        recorded = row("SELECT status,result,error FROM jobs WHERE id=?", (job_id,))
+        if mode == "complete":
+            assert recorded["status"] == "complete"
+            assert recorded["result"] == '{"mode": "complete"}'
+        else:
+            assert recorded["status"] == "failed"
+            assert "boom after abort" in (recorded["error"] or "")
+
+    # 3: Connectionless handler ignores cancellation past quiesce(0.05) so restore swaps
+    #    the DB to epoch 1 while the job is still running; late writes raise
+    #    RestoreEpochError and completion does not touch the restored DB.
+    job_id = enqueue_job("late_after_swap")
+    started = asyncio.Event()
+    allow_resume = asyncio.Event()
+    late_epoch_error = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def connectionless_uninterruptible(kind):
+        started.set()
+        try:
+            await allow_resume.wait()
+        except asyncio.CancelledError:
+            await allow_resume.wait()
+        try:
+            with transaction() as con:
+                con.execute(
+                    "INSERT INTO reads(title,author,source) VALUES('Stale post-quiesce','Reader','test')"
+                )
+        except RestoreEpochError:
+            late_epoch_error.set()
+        stop.set()
+        return {"late": True}
+
+    async def run_post_swap():
+        worker = asyncio.create_task(worker_loop(connectionless_uninterruptible, stop))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+            assert current_restore_epoch() == 1
+            allow_resume.set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            allow_resume.set()
+            stop.set()
+
+    asyncio.run(run_post_swap())
+    assert late_epoch_error.is_set()
+    assert row("SELECT 1 FROM reads WHERE title='Stale post-quiesce'") is None
+    assert row("SELECT id FROM jobs WHERE id=?", (job_id,)) is None
+
+    # 4: Connectionless handler outlives quiesce(0.05) while restore fails in
+    #    _replace_live_database and rolls back to safety_backup: the job's row
+    #    (captured as 'running' in safety_backup) is requeued instead of deleted,
+    #    the stale run's write/completion is fenced, and worker_loop completes
+    #    the requeued job on the rolled-back epoch.
+    rollback_job_id = enqueue_job("outlived_rollback")
+    first_run_started = asyncio.Event()
+    release_first_run = asyncio.Event()
+    stale_write_fenced = asyncio.Event()
+    requeued_run_done = asyncio.Event()
+    stop = asyncio.Event()
+    run_number = 0
+    real_replace = backups._replace_live_database
+    swap_calls = 0
+
+    def fail_primary_swap(staged: Path, key_source: Path | None = None, **kwargs) -> None:
+        nonlocal swap_calls
+        swap_calls += 1
+        if swap_calls == 1:
+            raise OSError("simulated swap failure after quiesce timeout")
+        real_replace(staged, key_source, **kwargs)
+
+    monkeypatch.setattr(backups, "_replace_live_database", fail_primary_swap)
+
+    async def rollback_outliving_handler(kind):
+        nonlocal run_number
+        assert kind == "outlived_rollback"
+        run_number += 1
+        if run_number == 1:
+            first_run_started.set()
+            try:
+                await release_first_run.wait()
+            except asyncio.CancelledError:
+                await release_first_run.wait()
+            try:
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,source) VALUES('Stale rollback write','Reader','test')"
+                    )
+            except RestoreEpochError:
+                stale_write_fenced.set()
+            return {"stale": True}
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Requeued after rollback','Reader','test')"
+            )
+        requeued_run_done.set()
+        stop.set()
+        return {"requeued": True}
+
+    async def run_rollback_outlived():
+        worker = asyncio.create_task(worker_loop(rollback_outliving_handler, stop))
+        try:
+            await asyncio.wait_for(first_run_started.wait(), timeout=2)
+            with pytest.raises(backups.BackupError, match="previous database remains active"):
+                await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+            assert swap_calls == 2
+            assert current_restore_epoch() == 2
+            requeued_state = row(
+                "SELECT status,lease_token,attempts FROM jobs WHERE id=?",
+                (rollback_job_id,),
+            )
+            assert requeued_state == {
+                "status": "queued",
+                "lease_token": None,
+                "attempts": 0,
+            }
+            release_first_run.set()
+            await asyncio.wait_for(requeued_run_done.wait(), timeout=2)
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            release_first_run.set()
+            stop.set()
+
+    try:
+        asyncio.run(run_rollback_outlived())
+    finally:
+        monkeypatch.setattr(backups, "_replace_live_database", real_replace)
+
+    assert stale_write_fenced.is_set()
+    assert row("SELECT 1 FROM reads WHERE title='Stale rollback write'") is None
+    assert row("SELECT 1 FROM reads WHERE title='Requeued after rollback'") is not None
+    final_job = row("SELECT status,result,attempts FROM jobs WHERE id=?", (rollback_job_id,))
+    assert final_job == {
+        "status": "complete",
+        "result": '{"requeued": true}',
+        "attempts": 1,
+    }
+
+
+def test_rollback_after_replace_failure_advances_epoch_migrates_schema_and_preserves_queued_jobs(
+    database, monkeypatch
+):
+    selected = _prepare_distinct_backup_and_live_state(database)
+    created_iso = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc).isoformat()
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,created_at) VALUES('live-queued','sync','queued',?)",
+            (created_iso,),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,started_at,lease_token,attempts,created_at) "
+            "VALUES('live-running','score','running',?,'stale-lease',1,?)",
+            (created_iso, created_iso),
+        )
+
+    pre_restore_epoch = current_restore_epoch()
+    assert pre_restore_epoch == 0
+
+    # Simulate an older-schema safety snapshot and a pre-rename swap failure.
+    real_create_snapshot = backups._create_snapshot_unlocked
+    real_replace = backups._replace_live_database
+
+    def create_older_schema_safety_snapshot() -> Path:
+        safety_path = real_create_snapshot()
+        with sqlite3.connect(safety_path) as con:
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+            con.execute("DROP TABLE IF EXISTS goodreads_shelf_items")
+            con.execute("DELETE FROM schema_migrations WHERE version IN (24, 25, 26)")
+            con.commit()
+        return safety_path
+
+    calls = 0
+
+    def fail_first_swap(
+        staged: Path, key_source: Path | None = None, **kwargs
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated pre-rename swap failure")
+        real_replace(staged, key_source, **kwargs)
+
+    monkeypatch.setattr(
+        backups, "_create_snapshot_unlocked", create_older_schema_safety_snapshot
+    )
+    monkeypatch.setattr(backups, "_replace_live_database", fail_first_swap)
+
+    with pytest.raises(backups.BackupError, match="previous database remains active"):
+        backups.restore_backup(selected["id"])
+
+    assert calls == 2
+    assert current_restore_epoch() == 1
+    with bind_restore_epoch(pre_restore_epoch):
+        with pytest.raises(RestoreEpochError):
+            with transaction() as con:
+                con.execute(
+                    "INSERT INTO reads(title,author,source) VALUES('Fenced pre-rollback','Reader','test')"
+                )
+    assert row("SELECT 1 FROM reads WHERE title='Live before restore'") is not None
+    assert row("SELECT 1 FROM reads WHERE title='Fenced pre-rollback'") is None
+    rolled_back_jobs = {
+        item["id"]: item
+        for item in rows("SELECT id,status,lease_token,attempts FROM jobs")
+    }
+    assert {job_id: item["status"] for job_id, item in rolled_back_jobs.items()} == {
+        "live-queued": "queued",
+        "live-running": "queued",
+    }
+    assert rolled_back_jobs["live-running"]["lease_token"] is None
+    assert rolled_back_jobs["live-running"]["attempts"] == 0
+    assert row("SELECT MAX(version) AS v FROM schema_migrations")["v"] == MIGRATIONS[-1][0]
+    assert (
+        row(
+            "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='goodreads_shelf_items'"
+        )
+        is not None
+    )
+
+    # Also verify post-rename failure inside _replace_live_database advances rollback
+    # epoch past the staged snapshot's epoch.
+    selected_path = backups._backup_path(selected["id"])
+    con = sqlite3.connect(selected_path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('restore_epoch','4',0)"
+        )
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        con.close()
+
+    post_rename_calls = 0
+
+    def fail_after_rename(
+        staged: Path, key_source: Path | None = None, **kwargs
+    ) -> None:
+        nonlocal post_rename_calls
+        post_rename_calls += 1
+        real_replace(staged, key_source, **kwargs)
+        if post_rename_calls == 1:
+            raise OSError("simulated post-rename directory fsync failure")
+
+    monkeypatch.setattr(backups, "_create_snapshot_unlocked", real_create_snapshot)
+    monkeypatch.setattr(backups, "_replace_live_database", fail_after_rename)
+
+    with pytest.raises(backups.BackupError, match="previous database remains active"):
+        backups.restore_backup(selected["id"])
+
+    assert post_rename_calls == 2
+    # Staged snapshot carried epoch 5 (max(1, 4) + 1), so rollback advances to epoch 6.
+    assert current_restore_epoch() == 6
+    for stale_epoch in (1, 5):
+        with bind_restore_epoch(stale_epoch):
+            with pytest.raises(RestoreEpochError):
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,source) VALUES('Stale epoch write','Reader','test')"
+                    )
+
+
+def test_in_flight_api_writes_during_restore_return_conflict_without_mutating_restored_db(
+    database, monkeypatch
+):
+    headers = authenticated_headers()
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) "
+            "VALUES('librarr_url','http://snapshot.librarr.local:8080',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) "
+            "VALUES('embedding_backend','ollama',0)"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) "
+            "VALUES('embedding_model','nomic-embed-text',0)"
+        )
+    snapshot = backups.create_backup()
+
+    with transaction() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO settings(key,value,secret) "
+            "VALUES('librarr_url','http://stale-live.librarr.local:8080',0)"
+        )
+
+    from afterword_engine import main as main_module
+
+    async def run():
+        health_entered = asyncio.Event()
+        release_health = asyncio.Event()
+
+        class PausingEmbedder:
+            model = "mxbai-embed-large"
+
+            async def health(self):
+                health_entered.set()
+                await release_health.wait()
+                return {"ok": True, "checked": True, "model": self.model}
+
+        monkeypatch.setattr(
+            main_module, "get_embedder", lambda *_args, **_kwargs: PausingEmbedder()
+        )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver", headers=headers
+        ) as client:
+            settings_task = asyncio.create_task(
+                client.put(
+                    "/api/settings",
+                    json={
+                        "embedding_backend": "ollama",
+                        "embedding_model": "mxbai-embed-large",
+                        "embedding_url": "http://127.0.0.1:11434",
+                    },
+                )
+            )
+            await asyncio.wait_for(health_entered.wait(), timeout=2)
+
+            restore_resp = await client.post(
+                f"/api/backups/{snapshot['id']}/restore", json={}
+            )
+            assert restore_resp.status_code == 200
+
+            release_health.set()
+            conflict_resp = await asyncio.wait_for(settings_task, timeout=2)
+            assert conflict_resp.status_code == 409
+            assert "restored" in conflict_resp.json()["detail"].lower()
+
+            # A fresh post-restore write succeeds on the new epoch.
+            fresh_resp = await client.put(
+                "/api/settings",
+                json={"librarr_media_type": "ebook"},
+            )
+            assert fresh_resp.status_code == 200
+
+    asyncio.run(run())
+
+    assert private_setting("librarr_url") == "http://snapshot.librarr.local:8080"
+    assert private_setting("embedding_backend") == "ollama"
+    assert private_setting("librarr_media_type") == "ebook"
+    assert current_restore_epoch() == 1
+
+
 def test_unexpected_recovery_error_returns_static_503_detail(database, monkeypatch):
     headers = authenticated_headers()
     journal_path = backups._restore_journal_path()
@@ -1806,3 +2562,88 @@ def test_unexpected_recovery_error_returns_static_503_detail(database, monkeypat
         assert "unexpected internal traceback detail" not in resp.text
     finally:
         journal_path.unlink(missing_ok=True)
+
+
+def test_backup_scheduler_loop_runs_due_checks_off_event_loop_thread(
+    database, monkeypatch
+):
+    profiles.initialize_auth()
+    alice = profiles.create_account("sched-alice", "sched-alice-password-with-length")
+    bob = profiles.create_account("sched-bob", "sched-bob-password-with-length")
+    from afterword_engine.tenancy import profile_scope
+
+    for profile_id in ("legacy", alice["profile_id"], bob["profile_id"]):
+        with profile_scope(profile_id):
+            initialize(seed_demo=False)
+
+    loop_thread_id: int | None = None
+    observed_threads: dict[str, set[int]] = {
+        "auth_due": set(),
+        "profile_ids": set(),
+        "profile_due": set(),
+    }
+    checked_profiles: list[str] = []
+    stop = asyncio.Event()
+
+    orig_profile_ids = profiles.profile_ids
+
+    def spy_auth_due(now=None):
+        observed_threads["auth_due"].add(threading.get_ident())
+        return False
+
+    def spy_profile_ids(*args, **kwargs):
+        observed_threads["profile_ids"].add(threading.get_ident())
+        return orig_profile_ids(*args, **kwargs)
+
+    def spy_backup_is_due(now=None):
+        observed_threads["profile_due"].add(threading.get_ident())
+        from afterword_engine.tenancy import current_profile_id
+
+        checked_profiles.append(current_profile_id() or "legacy")
+        if len(checked_profiles) >= 2:
+            stop.set()
+        return False
+
+    monkeypatch.setattr(backups, "auth_backup_is_due", spy_auth_due)
+    monkeypatch.setattr(profiles, "profile_ids", spy_profile_ids)
+    monkeypatch.setattr(backups, "backup_is_due", spy_backup_is_due)
+
+    # Hold an exclusive lock on Alice so backup_scheduler_loop skips Alice without blocking.
+    alice_lock = database_lock(backups.profile_database_path(alice["profile_id"]))
+    locked_ready = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_alice():
+        with alice_lock:
+            locked_ready.set()
+            release_lock.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_alice, daemon=True)
+    holder.start()
+    assert locked_ready.wait(timeout=2)
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_initial_wait(coro, timeout):
+        return await orig_wait_for(coro, 0.01 if timeout == 5 else timeout)
+
+    monkeypatch.setattr(backups.asyncio, "wait_for", fast_initial_wait)
+
+    async def run():
+        nonlocal loop_thread_id
+        loop_thread_id = threading.get_ident()
+        await orig_wait_for(backups.backup_scheduler_loop(stop), timeout=2)
+
+    try:
+        asyncio.run(run())
+    finally:
+        stop.set()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert loop_thread_id is not None
+    assert observed_threads["auth_due"] and loop_thread_id not in observed_threads["auth_due"]
+    assert observed_threads["profile_ids"] and loop_thread_id not in observed_threads["profile_ids"]
+    assert observed_threads["profile_due"] and loop_thread_id not in observed_threads["profile_due"]
+    assert alice["profile_id"] not in checked_profiles
+    assert set(checked_profiles) == {"legacy", bob["profile_id"]}

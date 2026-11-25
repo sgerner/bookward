@@ -252,3 +252,52 @@ def test_attach_publication_years_coerces_none_read_fields_consistently(database
     assert partial_read["first_publication_year"] == 1984
     assert partial_read["publication_work_id"] == work_id
 
+
+def test_rejects_future_candidate_work_years_beyond_next_year_and_ignores_other_providers(database):
+    from datetime import datetime, timezone
+
+    next_year = datetime.now(timezone.utc).date().year + 1
+    far_future_year = 2099
+    with transaction() as con:
+        near_id = _insert_candidate(
+            con, "Forthcoming Work", "/works/OL801W", release_date=f"{next_year}-01-01"
+        )
+        _insert_ledger(
+            con,
+            "candidate",
+            near_id,
+            "release_date",
+            "/works/OL801W",
+            str(next_year),
+            "first_publish_year",
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance("
+            "entity_type,entity_id,field,provider,provider_id,source_payload) "
+            "VALUES('candidate',?,'release_date','source','1','{}')",
+            (near_id,),
+        )
+
+        far_id = _insert_candidate(
+            con, "Polluted Future Work", "/works/OL802W", release_date=f"{far_future_year}-01-01"
+        )
+        _insert_ledger(
+            con,
+            "candidate",
+            far_id,
+            "release_date",
+            "/works/OL802W",
+            str(far_future_year),
+            "first_publish_year",
+        )
+
+        items = [
+            {"id": near_id, "quality_work_id": "/works/OL801W", "release_date": f"{next_year}-01-01"},
+            {"id": far_id, "quality_work_id": "/works/OL802W", "release_date": f"{far_future_year}-01-01"},
+        ]
+        attach_publication_years(con, [], items)
+
+    assert items[0]["first_publication_year"] == next_year
+    assert items[0]["publication_work_id"] == "/works/OL801W"
+    assert items[1]["first_publication_year"] is None
+    assert items[1]["publication_work_id"] is None
