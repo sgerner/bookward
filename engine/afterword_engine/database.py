@@ -1007,6 +1007,32 @@ MIGRATIONS = [
         ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
         """,
     ),
+    (
+        28,
+        """
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_visible
+            ON recommendation_impressions(candidate_id, visible_at)
+            WHERE visible_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
+            ON recommendation_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_run_evidence_captured_at
+            ON recommendation_run_evidence(captured_at);
+        CREATE INDEX IF NOT EXISTS idx_scoring_batches_captured_at
+            ON scoring_batches(captured_at);
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_candidate_delete
+        AFTER DELETE ON candidates
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='candidate' AND entity_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_read_delete
+        AFTER DELETE ON reads
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='read' AND entity_id=OLD.id;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1395,6 +1421,9 @@ def connect():
         con.create_function("book_identity", 2, book_identity, deterministic=True)
         con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
         with _database_setup_lock(db_path):
+            page_count = int(con.execute("PRAGMA page_count").fetchone()[0] or 0)
+            if page_count == 0:
+                con.execute("PRAGMA auto_vacuum=INCREMENTAL")
             mode = con.execute("PRAGMA journal_mode").fetchone()[0]
             if str(mode).lower() != "wal":
                 con.execute("PRAGMA journal_mode=WAL")

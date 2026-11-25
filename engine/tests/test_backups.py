@@ -1727,3 +1727,111 @@ def test_job_trigger_routes_run_off_event_loop_during_restore_cutover(
                 await asyncio.gather(restore_task, return_exceptions=True)
 
     asyncio.run(run_scenario())
+
+
+def test_backup_scheduler_offloads_maintenance_and_skips_locked_profiles(
+    database, monkeypatch, caplog
+):
+    import asyncio
+    from threading import Event, Thread, get_ident
+
+    from afterword_engine import profiles
+    from afterword_engine.database import connect, database_lock
+    from afterword_engine.tenancy import (
+        current_profile_id,
+        profile_database_path,
+        profile_scope,
+    )
+
+    monkeypatch.setattr(settings, "retention_enabled", True)
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    profiles.initialize_auth()
+    if profiles.account_count() == 0:
+        profiles.create_first_admin("maint-owner", "maint-owner-password-with-enough-length")
+    alice = profiles.create_account("maint-alice", "maint-alice-password-with-enough-length")
+    bob = profiles.create_account("maint-bob", "maint-bob-password-with-enough-length")
+    carol = profiles.create_account("maint-carol", "maint-carol-password-with-enough-length")
+
+    for account in (alice, bob, carol):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            with transaction() as con:
+                con.execute(
+                    "INSERT INTO jobs(id, kind, status, created_at, finished_at) "
+                    "VALUES('aged-job', 'refresh', 'complete', '2025-01-01 00:00:00', '2025-01-01 00:01:00')"
+                )
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_alice_lock() -> None:
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=10)
+
+    observed_threads: dict[str, list[int]] = {"due": [], "run": []}
+    original_due = backups.maintenance_is_due
+    original_run = backups.run_scheduled_maintenance
+    stop = asyncio.Event()
+
+    def tracked_due(*args, **kwargs):
+        observed_threads["due"].append(get_ident())
+        return original_due(*args, **kwargs)
+
+    def tracked_run(*args, **kwargs):
+        observed_threads["run"].append(get_ident())
+        if current_profile_id() == carol["profile_id"]:
+            raise RuntimeError("simulated carol maintenance failure")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(backups, "maintenance_is_due", tracked_due)
+    monkeypatch.setattr(backups, "run_scheduled_maintenance", tracked_run)
+
+    original_profile_backup = backups._run_scheduled_profile_backup
+
+    def tracked_profile_backup(profile_id: str):
+        result = original_profile_backup(profile_id)
+        if profile_id == carol["profile_id"]:
+            stop.set()
+        return result
+
+    monkeypatch.setattr(backups, "_run_scheduled_profile_backup", tracked_profile_backup)
+
+    async def run_scheduler():
+        loop_thread_id = get_ident()
+        lock_thread = Thread(target=hold_alice_lock, daemon=True)
+        lock_thread.start()
+        try:
+            assert await asyncio.to_thread(lock_acquired.wait, 2)
+            await asyncio.wait_for(backups.backup_scheduler_loop(stop), timeout=10)
+            return loop_thread_id
+        finally:
+            release_lock.set()
+            stop.set()
+            await asyncio.to_thread(lock_thread.join, 2)
+
+    caplog.set_level(logging.ERROR)
+    loop_tid = asyncio.run(run_scheduler())
+
+    assert observed_threads["due"]
+    assert observed_threads["run"]
+    assert all(tid != loop_tid for tid in observed_threads["due"])
+    assert all(tid != loop_tid for tid in observed_threads["run"])
+
+    # Locked Alice was skipped without pruning or blocking; unlocked Bob had aged job pruned;
+    # Carol logged maintenance failure yet still received her scheduled backup.
+    with profile_scope(alice["profile_id"]), connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert backups.list_backups() == []
+    with profile_scope(bob["profile_id"]), connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert len(backups.list_backups()) == 1
+    with profile_scope(carol["profile_id"]), connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert len(backups.list_backups()) == 1
+    assert any(
+        f"Scheduled Bookward storage maintenance failed for profile {carol['profile_id']}"
+        in record.message
+        for record in caplog.records
+    )
