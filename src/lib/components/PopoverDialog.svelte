@@ -1,3 +1,74 @@
+<script module lang="ts">
+	/**
+	 * Shared accessible popover dialog primitive (`role="dialog"` with mounted `[hidden]`
+	 * panel so `aria-controls` never dangles).
+	 *
+	 * When `topLayer` is enabled (e.g., header menus or compact nested popovers inside
+	 * `backdrop-filter` / `z-40` chrome), opening promotes the panel into the browser's
+	 * native HTML Popover API top layer (`popover="manual"`, Baseline 2024: Chrome/Edge 114+,
+	 * Safari 17+, Firefox 125+).
+	 *
+	 * Fallback: In browsers without `HTMLElement.prototype.showPopover`, `syncPopoverTopLayer`
+	 * removes `popover`, sets `[data-popover-fallback]`, and portals the panel to
+	 * `document.body` while open, restoring it to `rootEl` on close so `aria-controls` stays
+	 * connected.
+	 */
+	function isNativePopoverOpen(node: HTMLElement): boolean {
+		try {
+			return typeof node.matches === 'function' && node.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	export function syncPopoverTopLayer(
+		panel: HTMLElement,
+		root: HTMLElement | null,
+	): () => void {
+		const supportsPopover = typeof panel.showPopover === 'function';
+		let portaledToBody = false;
+
+		if (supportsPopover) {
+			panel.setAttribute?.('popover', 'manual');
+			if (!isNativePopoverOpen(panel)) {
+				panel.showPopover();
+			}
+		} else {
+			panel.removeAttribute?.('popover');
+			panel.setAttribute?.('data-popover-fallback', '');
+			if (
+				typeof document !== 'undefined' &&
+				document.body &&
+				typeof document.body.appendChild === 'function' &&
+				panel.parentNode !== document.body
+			) {
+				document.body.appendChild(panel);
+				portaledToBody = true;
+			}
+		}
+
+		panel.scrollTop = 0;
+
+		return () => {
+			if (supportsPopover) {
+				if (isNativePopoverOpen(panel) && typeof panel.hidePopover === 'function') {
+					panel.hidePopover();
+				}
+				panel.removeAttribute?.('popover');
+			} else {
+				panel.removeAttribute?.('data-popover-fallback');
+				if (portaledToBody) {
+					if (root?.isConnected && typeof root.appendChild === 'function') {
+						root.appendChild(panel);
+					} else if (typeof panel.remove === 'function') {
+						panel.remove();
+					}
+				}
+			}
+		};
+	}
+</script>
+
 <script lang="ts">
 	import { tick, type Snippet } from 'svelte';
 
@@ -10,8 +81,12 @@
 		'[tabindex]:not([tabindex="-1"])',
 	].join(', ');
 
+	const NESTED_OPEN_OVERLAY_SELECTOR =
+		'[data-popover-root][data-popover-open="true"], dialog[open]';
+
 	let {
 		open = $bindable(false),
+		topLayer = false,
 		panelId,
 		triggerLabel,
 		triggerTitle,
@@ -24,6 +99,7 @@
 		children,
 	}: {
 		open?: boolean;
+		topLayer?: boolean;
 		panelId?: string;
 		triggerLabel?: string;
 		triggerTitle?: string;
@@ -44,21 +120,33 @@
 	let panelEl = $state<HTMLDivElement | null>(null);
 	let pointerDownInside = false;
 
+	function containsNode(node: Node): boolean {
+		return Boolean(rootEl?.contains(node) || panelEl?.contains(node));
+	}
+
+	function hasNestedOpenOverlay(): boolean {
+		return Boolean(
+			rootEl?.querySelector(NESTED_OPEN_OVERLAY_SELECTOR) ||
+				panelEl?.querySelector(NESTED_OPEN_OVERLAY_SELECTOR),
+		);
+	}
+
 	function focusFirstControl() {
 		if (!panelEl) return;
+		panelEl.scrollTop = 0;
 		const candidates = panelEl.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
 		for (const element of candidates) {
 			if (!element.closest('[hidden]')) {
-				element.focus();
+				element.focus({ preventScroll: true });
 				return;
 			}
 		}
-		panelEl.focus();
+		panelEl.focus({ preventScroll: true });
 	}
 
 	function close(restoreFocus = true) {
-		if (restoreFocus) triggerButton?.focus();
 		open = false;
+		if (restoreFocus) triggerButton?.focus({ preventScroll: true });
 	}
 
 	async function openPopover() {
@@ -76,29 +164,46 @@
 	}
 
 	function handleFocusOut(event: FocusEvent) {
-		if (!open || !rootEl) return;
+		if (!open || !rootEl || hasNestedOpenOverlay()) return;
 		const nextTarget = event.relatedTarget;
 		if (nextTarget instanceof Node) {
-			if (!rootEl.contains(nextTarget)) {
+			if (!containsNode(nextTarget)) {
 				close(false);
 			}
 			return;
 		}
 		queueMicrotask(() => {
-			if (!open || pointerDownInside || !rootEl) return;
+			if (!open || pointerDownInside || !rootEl || hasNestedOpenOverlay()) return;
 			const active = typeof document !== 'undefined' ? document.activeElement : null;
-			if (!active || !rootEl.contains(active)) {
+			if (!active || !containsNode(active)) {
 				close(false);
 			}
 		});
 	}
 
+	function handlePanelFocusOut(event: FocusEvent) {
+		if (typeof document !== 'undefined' && panelEl?.parentElement === document.body) {
+			handleFocusOut(event);
+		}
+	}
+
 	$effect(() => {
 		if (!open || typeof window === 'undefined') return;
 
+		const cleanupTopLayer =
+			topLayer && panelEl ? syncPopoverTopLayer(panelEl, rootEl) : undefined;
+
 		const onKeydown = (event: KeyboardEvent) => {
-			if (event.key !== 'Escape' || !open || !rootEl) return;
-			if (rootEl.querySelector('[data-popover-root][data-popover-open="true"]')) return;
+			if (
+				event.key !== 'Escape' ||
+				event.defaultPrevented ||
+				event.isComposing ||
+				!open ||
+				!rootEl
+			) {
+				return;
+			}
+			if (hasNestedOpenOverlay()) return;
 			event.preventDefault();
 			event.stopPropagation();
 			close(true);
@@ -107,7 +212,8 @@
 		const onPointerDown = (event: PointerEvent) => {
 			const target = event.target;
 			if (!open || !rootEl || !(target instanceof Node)) return;
-			if (rootEl.contains(target)) {
+			if (hasNestedOpenOverlay()) return;
+			if (containsNode(target)) {
 				pointerDownInside = true;
 				queueMicrotask(() => {
 					pointerDownInside = false;
@@ -117,12 +223,13 @@
 			}
 		};
 
-		window.addEventListener('keydown', onKeydown, true);
+		window.addEventListener('keydown', onKeydown);
 		document.addEventListener('pointerdown', onPointerDown, true);
 
 		return () => {
-			window.removeEventListener('keydown', onKeydown, true);
+			window.removeEventListener('keydown', onKeydown);
 			document.removeEventListener('pointerdown', onPointerDown, true);
+			cleanupTopLayer?.();
 		};
 	});
 </script>
@@ -155,6 +262,7 @@
 		aria-labelledby={dialogLabelledby}
 		tabindex="-1"
 		hidden={!open}
+		onfocusout={handlePanelFocusOut}
 		class={`popover-panel ${panelClass}`.trim()}
 	>
 		{@render children({ close, panelId: resolvedPanelId })}

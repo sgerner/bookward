@@ -151,16 +151,20 @@ describe("cover proportions, intrinsic image sizes, and modal viewports", () => 
 
   it("renders 2:3 modal cover boxes with underlying BookOpen fallbacks and 100dvh height caps", () => {
     const source = readTemplate("../routes/+page.svelte");
+    const modalPrimitiveSource = readTemplate("./components/ModalDialog.svelte");
     expect(source).not.toContain("100vh");
+    expect(modalPrimitiveSource).not.toContain("100vh");
+    expect(modalPrimitiveSource).toContain("max-h-[calc(100dvh-2rem)]");
+    expect(modalPrimitiveSource).toContain("overflow-y-auto");
 
     const ast = parse(source, { modern: true }).fragment;
 
     const markReadDialog = collectNodes(
       ast,
       (node) =>
-        node.type === "RegularElement" &&
-        node.name === "div" &&
-        staticAttribute(node, "aria-labelledby") === "mark-read-title",
+        node.type === "Component" &&
+        node.name === "ModalDialog" &&
+        staticAttribute(node, "ariaLabelledby") === "mark-read-title",
     )[0];
     expect(markReadDialog).toBeDefined();
     const markReadClass = staticAttribute(markReadDialog, "class") ?? "";
@@ -170,9 +174,9 @@ describe("cover proportions, intrinsic image sizes, and modal viewports", () => 
     const librarrDialog = collectNodes(
       ast,
       (node) =>
-        node.type === "RegularElement" &&
-        node.name === "dialog" &&
-        staticAttribute(node, "aria-labelledby") === "librarr-search-title",
+        node.type === "Component" &&
+        node.name === "ModalDialog" &&
+        staticAttribute(node, "ariaLabelledby") === "librarr-search-title",
     )[0];
     expect(librarrDialog).toBeDefined();
     const librarrSnippet = source.slice(librarrDialog.start, librarrDialog.end);
