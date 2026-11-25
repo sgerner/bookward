@@ -16,10 +16,14 @@ from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 from .database import (
     MIGRATIONS,
-    _LockedConnection,
-    _restrict_database_files,
     connect,
     database_lock,
+    _LockedConnection,
+    read_restore_epoch,
+    record_restore_epoch,
+    recorded_restore_epoch,
+    RESTORE_EPOCH_KEY,
+    _restrict_database_files,
     transaction,
 )
 from .decision_evidence import (
@@ -41,6 +45,7 @@ from .tenancy import (
     allow_restore_database_access,
     current_profile_id,
     profile_database_path,
+    unbind_restore_epoch,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -239,13 +244,17 @@ def _set_last_error(message: str) -> None:
             _RESTORE_JOURNAL_ERRORS.pop(str(journal), None)
         return
     try:
-        with transaction() as con:
-            con.execute(
-                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
-                "updated_at=CURRENT_TIMESTAMP",
-                (LAST_ERROR_KEY, message[:300]),
-            )
+        with database_lock(profile_database_path()).try_shared() as acquired:
+            if not acquired:
+                LOGGER.warning("Skipped persisting backup status while profile database is locked")
+                return
+            with unbind_restore_epoch(), transaction() as con:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (LAST_ERROR_KEY, message[:300]),
+                )
     except Exception:
         LOGGER.exception("Could not persist backup status")
 
@@ -1206,7 +1215,9 @@ def recover_interrupted_restore() -> bool:
     if not _has_restore_journal(journal):
         return False
     try:
-        with database_lock(profile_database_path()):
+        live_path = profile_database_path()
+        lock = database_lock(live_path)
+        with unbind_restore_epoch(), lock.quiesce() as deadline, lock.exclusive(deadline):
             journal = _restore_journal_path()
             if not _has_restore_journal(journal):
                 return False
@@ -1216,9 +1227,14 @@ def recover_interrupted_restore() -> bool:
             safety_key, clear_key = _rollback_key_for_snapshot(
                 safety_path, journal, had_key_file
             )
-            live_parent = profile_database_path().parent
+            live_parent = live_path.parent
             live_parent.mkdir(parents=True, exist_ok=True)
-            staged = _copy_to_stage(safety_path, live_parent)
+            staged, next_epoch = _stage_restored_database(
+                safety_path,
+                live_parent,
+                minimum_epoch=_read_file_restore_epoch(live_path),
+                migrate=True,
+            )
             try:
                 if clear_key:
                     _replace_live_database(
@@ -1226,12 +1242,15 @@ def recover_interrupted_restore() -> bool:
                     )
                 else:
                     _replace_live_database(staged, safety_key, rollback=True)
-            except Exception:
-                staged.unlink(missing_ok=True)
-                _remove_sidecars(staged)
-                raise
-            _clear_restore_journal()
-            _set_last_error("An interrupted restore was rolled back to its safety backup.")
+                staged = None
+            finally:
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
+                    _remove_sidecars(staged)
+            record_restore_epoch(next_epoch, live_path)
+            with allow_restore_database_access():
+                _clear_restore_journal()
+                _set_last_error("An interrupted restore was rolled back to its safety backup.")
         return True
     except BackupError as exc:
         _set_last_error(safe_error_message(exc, limit=200))
@@ -1440,66 +1459,223 @@ def _copy_to_stage(source: Path, directory: Path) -> Path:
         raise
 
 
+def _read_file_restore_epoch(path: Path) -> int:
+    baseline = recorded_restore_epoch(path)
+    if not path.is_file():
+        return baseline
+    con = None
+    try:
+        con = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30
+        )
+        return max(baseline, read_restore_epoch(con))
+    except (OSError, sqlite3.Error):
+        return baseline
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _stage_restored_database(
+    source: Path,
+    directory: Path,
+    *,
+    minimum_epoch: int,
+    migrate: bool = True,
+) -> tuple[Path, int]:
+    staged = _copy_to_stage(source, directory)
+    try:
+        if migrate:
+            from .database import initialize
+            from .tenancy import database_path_override
+
+            with database_path_override(staged):
+                initialize(seed_demo=False)
+        con = sqlite3.connect(staged, timeout=30)
+        try:
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("BEGIN IMMEDIATE")
+            tables = {
+                item[0]
+                for item in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "jobs" in tables:
+                job_columns = {
+                    item[1] for item in con.execute("PRAGMA table_info(jobs)")
+                }
+                if {"started_at", "heartbeat_at", "lease_token", "attempts"} <= job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL, "
+                        "heartbeat_at=NULL, lease_token=NULL, "
+                        "attempts=CASE WHEN COALESCE(attempts, 0) > 0 THEN attempts - 1 ELSE 0 END "
+                        "WHERE status='running'"
+                    )
+                elif "started_at" in job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL "
+                        "WHERE status='running'"
+                    )
+                else:
+                    con.execute("UPDATE jobs SET status='queued' WHERE status='running'")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+                "secret INTEGER NOT NULL DEFAULT 0, "
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            staged_epoch = read_restore_epoch(con)
+            next_epoch = max(minimum_epoch, staged_epoch) + 1
+            setting_columns = {
+                item[1] for item in con.execute("PRAGMA table_info(settings)")
+            }
+            if "updated_at" in setting_columns:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (RESTORE_EPOCH_KEY, str(next_epoch)),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0",
+                    (RESTORE_EPOCH_KEY, str(next_epoch)),
+                )
+            con.commit()
+            mode = con.execute("PRAGMA journal_mode").fetchone()
+            if mode and str(mode[0]).lower() == "wal":
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                con.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            con.close()
+        _remove_sidecars(staged)
+        os.chmod(staged, 0o600)
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
+        _validate_snapshot(staged)
+        return staged, next_epoch
+    except Exception:
+        staged.unlink(missing_ok=True)
+        _remove_sidecars(staged)
+        raise
+
+
 def restore_backup(backup_id: str) -> dict:
     source = _backup_path(backup_id)
     selected_key = None
     safety_backup = None
     staged = None
     replaced = False
+    rollback_failed = False
     had_unrecoverable_journal = False
     live_path = profile_database_path()
+    lock = database_lock(live_path)
     try:
-        with database_lock(live_path):
-            if _has_restore_journal():
-                try:
-                    recover_interrupted_restore()
-                except BackupError as exc:
-                    if _is_lock_backup_error(exc):
-                        raise
-                    had_unrecoverable_journal = True
-            _validate_snapshot(source)
-            selected_key = _restore_key_sidecar(source)
-            _validate_snapshot_key(source, selected_key)
-            live_path.parent.mkdir(parents=True, exist_ok=True)
-            staged = _copy_to_stage(source, live_path.parent)
-
-            # Apply this release's migrations on the staged copy first. If
-            # staging fails, neither the live database nor key is touched.
+        _validate_snapshot(source)
+        selected_key = _restore_key_sidecar(source)
+        _validate_snapshot_key(source, selected_key)
+        with unbind_restore_epoch(), lock.quiesce() as deadline, lock.exclusive(deadline):
             try:
-                from .database import initialize
-                from .tenancy import database_path_override
+                if _has_restore_journal():
+                    try:
+                        recover_interrupted_restore()
+                    except BackupError as exc:
+                        if _is_lock_backup_error(exc):
+                            raise
+                        had_unrecoverable_journal = True
+                source = _backup_path(backup_id)
+                _validate_snapshot(source)
+                selected_key = _restore_key_sidecar(source)
+                _validate_snapshot_key(source, selected_key)
+                live_path.parent.mkdir(parents=True, exist_ok=True)
+                # Apply this release's migrations, requeue any orphaned running
+                # jobs while keeping queued work intact, and advance
+                # restore_epoch on the staged copy first. If staging fails,
+                # neither the live database nor key is touched.
+                staged, next_epoch = _stage_restored_database(
+                    source,
+                    live_path.parent,
+                    minimum_epoch=_read_file_restore_epoch(live_path),
+                    migrate=True,
+                )
 
-                with database_path_override(staged):
-                    initialize(seed_demo=False)
-            except Exception:
-                raise
-            _validate_snapshot(staged)
-
-            if had_unrecoverable_journal:
-                safety_backup = source
-                _write_restore_journal(safety_backup, source, False)
-                replaced = True
-                if selected_key is None:
-                    _replace_live_database(
-                        staged,
-                        selected_key,
-                        rollback=True,
-                        clear_generated_key=True,
-                    )
+                if had_unrecoverable_journal:
+                    safety_backup = source
+                    _write_restore_journal(safety_backup, source, False)
+                    replaced = True
+                    if selected_key is None:
+                        _replace_live_database(
+                            staged,
+                            selected_key,
+                            rollback=True,
+                            clear_generated_key=True,
+                        )
+                    else:
+                        _replace_live_database(staged, selected_key, rollback=True)
                 else:
-                    _replace_live_database(staged, selected_key, rollback=True)
-            else:
-                safety_backup = _create_snapshot_unlocked()
-                _write_restore_journal(safety_backup, source)
-                replaced = True
-                _replace_live_database(staged, selected_key)
-            staged = None
-            with allow_restore_database_access():
-                with transaction() as con:
-                    con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
-                _clear_restore_journal()
-            replaced = False
-            _prune_backups()
+                    safety_backup = _create_snapshot_unlocked()
+                    _write_restore_journal(safety_backup, source)
+                    replaced = True
+                    _replace_live_database(staged, selected_key)
+                staged = None
+                record_restore_epoch(next_epoch, live_path)
+                with allow_restore_database_access():
+                    with transaction() as con:
+                        con.execute("DELETE FROM settings WHERE key=?", (LAST_ERROR_KEY,))
+                    _clear_restore_journal()
+                replaced = False
+                _prune_backups()
+            except Exception:
+                if replaced:
+                    if safety_backup:
+                        rollback = None
+                        try:
+                            journal = _restore_journal_path()
+                            had_key_file = False
+                            if _has_restore_journal(journal):
+                                try:
+                                    _, _, had_key_file = _read_restore_journal_meta(journal)
+                                except BackupError:
+                                    had_key_file = False
+                            safety_key, clear_key = _rollback_key_for_snapshot(
+                                safety_backup, journal, had_key_file
+                            )
+                            rollback, rollback_epoch = _stage_restored_database(
+                                safety_backup,
+                                live_path.parent,
+                                minimum_epoch=_read_file_restore_epoch(live_path),
+                                migrate=True,
+                            )
+                            if clear_key:
+                                _replace_live_database(
+                                    rollback,
+                                    safety_key,
+                                    rollback=True,
+                                    clear_generated_key=True,
+                                )
+                            else:
+                                _replace_live_database(
+                                    rollback,
+                                    safety_key,
+                                    rollback=True,
+                                )
+                            rollback = None
+                            record_restore_epoch(rollback_epoch, live_path)
+                            _clear_restore_journal()
+                        except Exception:
+                            rollback_failed = True
+                            LOGGER.exception(
+                                "Failed to roll back an unsuccessful Bookward restore"
+                            )
+                        finally:
+                            if rollback is not None:
+                                rollback.unlink(missing_ok=True)
+                                _remove_sidecars(rollback)
+                    else:
+                        rollback_failed = True
+                raise
         return {
             "restored_backup": backup_id,
             "safety_backup": _backup_record(safety_backup),
@@ -1507,47 +1683,6 @@ def restore_backup(backup_id: str) -> dict:
     except Exception as exc:
         if not isinstance(exc, BackupError):
             LOGGER.exception("Bookward restore failed")
-        rollback_failed = False
-        if replaced:
-            if safety_backup:
-                rollback = None
-                try:
-                    with database_lock(live_path):
-                        journal = _restore_journal_path()
-                        had_key_file = False
-                        if _has_restore_journal(journal):
-                            try:
-                                _, _, had_key_file = _read_restore_journal_meta(journal)
-                            except BackupError:
-                                had_key_file = False
-                        rollback = _copy_to_stage(safety_backup, live_path.parent)
-                        safety_key, clear_key = _rollback_key_for_snapshot(
-                            safety_backup, journal, had_key_file
-                        )
-                        if clear_key:
-                            _replace_live_database(
-                                rollback,
-                                safety_key,
-                                rollback=True,
-                                clear_generated_key=True,
-                            )
-                        else:
-                            _replace_live_database(
-                                rollback,
-                                safety_key,
-                                rollback=True,
-                            )
-                        rollback = None
-                        _clear_restore_journal()
-                except Exception:
-                    rollback_failed = True
-                    LOGGER.exception("Failed to roll back an unsuccessful Bookward restore")
-                finally:
-                    if rollback is not None:
-                        rollback.unlink(missing_ok=True)
-                        _remove_sidecars(rollback)
-            else:
-                rollback_failed = True
         detail = safe_error_message(exc, limit=200)
         if rollback_failed:
             message = f"Restore failed; automatic rollback did not complete. {detail}"
@@ -1563,6 +1698,30 @@ def restore_backup(backup_id: str) -> dict:
             _remove_sidecars(staged)
 
 
+def _run_scheduled_auth_backup() -> dict | None:
+    if auth_backup_is_due():
+        return create_auth_backup()
+    return None
+
+
+def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
+    from .tenancy import profile_scope
+
+    with profile_scope(profile_id):
+        if _has_restore_journal() or database_lock().is_locked():
+            return None
+        try:
+            if maintenance_is_due():
+                run_scheduled_maintenance()
+        except Exception:
+            LOGGER.exception(
+                "Scheduled Bookward storage maintenance failed for profile %s", profile_id
+            )
+        if not backup_is_due():
+            return None
+        return create_backup()
+
+
 async def backup_scheduler_loop(stop: asyncio.Event) -> None:
     """Create hourly-polled backups without depending on host cron."""
 
@@ -1572,27 +1731,21 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         pass
     while not stop.is_set():
         from .profiles import profile_ids
-        from .tenancy import profile_scope
+
         try:
-            if auth_backup_is_due():
-                await asyncio.to_thread(create_auth_backup)
+            await asyncio.to_thread(_run_scheduled_auth_backup)
         except Exception:
             LOGGER.exception("Scheduled identity-registry backup failed")
-        for profile_id in profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(profile_ids)
+        except Exception:
+            LOGGER.exception("Could not enumerate profiles for scheduled backups")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    if _has_restore_journal():
-                        continue
-                    try:
-                        if maintenance_is_due():
-                            await asyncio.to_thread(run_scheduled_maintenance)
-                    except Exception:
-                        LOGGER.exception(
-                            "Scheduled Bookward storage maintenance failed for profile %s",
-                            profile_id,
-                        )
-                    if backup_is_due():
-                        await asyncio.to_thread(create_backup)
+                await asyncio.to_thread(_run_scheduled_profile_backup, profile_id)
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:
