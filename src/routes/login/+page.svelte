@@ -1,16 +1,31 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
+	import { tick } from 'svelte';
 	import type { ActionData, PageData } from './$types';
 	import { ArrowRight, BookOpen, Check, KeyRound, RefreshCw, Sparkles } from '@lucide/svelte';
+	import FormField from '#lib/components/FormField.svelte';
+	import {
+		fieldError,
+		focusFirstInvalidControl,
+		formErrorBanner,
+		formValue,
+		isCredentialError
+	} from '#lib/form-errors.js';
 	import bookwardMark from '#lib/assets/bookward-mark.svg';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 	let submitting = $state(false);
-	const trackSubmission: SubmitFunction = () => {
+	const loginBanner = $derived(formErrorBanner(form, 'login'));
+	const loginCredentialError = $derived(Boolean(isCredentialError(form, 'login') && loginBanner));
+	const trackSubmission: SubmitFunction = ({ formElement }) => {
 		submitting = true;
-		return async ({ update }) => {
+		return async ({ result, update }) => {
 			try {
-				await update();
+				await update({ reset: result.type === 'success' });
+				if (result.type === 'failure') {
+					await tick();
+					focusFirstInvalidControl(formElement);
+				}
 			} finally {
 				submitting = false;
 			}
@@ -91,16 +106,47 @@
 						Choose a username and password for the first administrator. Setup closes as soon as this account is created.
 					</p>
 					<form class="mt-8 grid gap-5" method="POST" action="?/setup" use:enhance={trackSubmission} aria-describedby="setup-description">
-						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
-							Username
-							<input class="input min-h-12 w-full" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="160" />
-						</label>
-						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
-							Password
-							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="new-password" minlength="12" required aria-describedby="password-help" />
-							<span id="password-help" class="text-sm font-normal leading-6 text-surface-700-300">Use at least 12 characters.</span>
-						</label>
-						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
+						<FormField
+							id="setup-username"
+							label="Username"
+							labelClass="block text-sm font-semibold text-surface-800-200"
+							error={fieldError(form, 'setup', 'username')}
+						>
+							{#snippet children(field)}
+								<input
+									{...field}
+									class="input min-h-12 w-full"
+									name="username"
+									value={formValue(form, 'setup', 'username')}
+									autocomplete="username"
+									autocapitalize="none"
+									spellcheck="false"
+									required
+									maxlength="160"
+								/>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="setup-password"
+							label="Password"
+							labelClass="block text-sm font-semibold text-surface-800-200"
+							hintClass="text-sm font-normal leading-6 text-surface-700-300"
+							hint="Use at least 12 characters."
+							error={fieldError(form, 'setup', 'password')}
+						>
+							{#snippet children(field)}
+								<input
+									{...field}
+									class="input min-h-12 w-full"
+									name="password"
+									type="password"
+									autocomplete="new-password"
+									minlength="12"
+									required
+								/>
+							{/snippet}
+						</FormField>
+						{#if formErrorBanner(form, 'setup')}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{formErrorBanner(form, 'setup')}</p>{/if}
 						<button class="login-submit btn btn-reflow group min-h-12 w-full justify-between text-left" type="submit" disabled={submitting} aria-busy={submitting}>
 							<span class="min-w-0">{submitting ? 'Creating administrator…' : 'Create administrator'}</span>{#if submitting}<RefreshCw size={17} class="shrink-0 animate-spin" />{:else}<ArrowRight size={17} class="shrink-0 transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
@@ -114,15 +160,56 @@
 					{#if data.error}<p class="mt-5 rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{data.error}</p>{/if}
 					<form class="mt-8 grid gap-5" method="POST" action="?/login" use:enhance={trackSubmission}>
 						<input type="hidden" name="next" value={data.next} />
-						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
-							Username
-							<input class="input min-h-12 w-full" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="160" />
-						</label>
-						<label class="grid gap-2 text-sm font-semibold text-surface-800-200">
-							Password
-							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="current-password" required />
-						</label>
-						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
+						{#if loginBanner}
+							<p
+								id="login-error-summary"
+								class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error"
+								role="alert"
+							>
+								{loginBanner}
+							</p>
+						{/if}
+						<FormField
+							id="login-username"
+							label="Username"
+							labelClass="block text-sm font-semibold text-surface-800-200"
+							error={fieldError(form, 'login', 'username')}
+							invalid={loginCredentialError}
+							describedBy={loginCredentialError ? 'login-error-summary' : undefined}
+						>
+							{#snippet children(field)}
+								<input
+									{...field}
+									class="input min-h-12 w-full"
+									name="username"
+									value={formValue(form, 'login', 'username')}
+									autocomplete="username"
+									autocapitalize="none"
+									spellcheck="false"
+									required
+									maxlength="160"
+								/>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="login-password"
+							label="Password"
+							labelClass="block text-sm font-semibold text-surface-800-200"
+							error={fieldError(form, 'login', 'password')}
+							invalid={loginCredentialError}
+							describedBy={loginCredentialError ? 'login-error-summary' : undefined}
+						>
+							{#snippet children(field)}
+								<input
+									{...field}
+									class="input min-h-12 w-full"
+									name="password"
+									type="password"
+									autocomplete="current-password"
+									required
+								/>
+							{/snippet}
+						</FormField>
 						<button class="login-submit btn btn-reflow group min-h-12 w-full justify-between text-left" type="submit" disabled={submitting} aria-busy={submitting}>
 							<span class="min-w-0">{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="shrink-0 animate-spin" />{:else}<ArrowRight size={17} class="shrink-0 transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>
