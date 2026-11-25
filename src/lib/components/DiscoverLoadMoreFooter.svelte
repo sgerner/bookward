@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { ArrowRight, RefreshCw } from '@lucide/svelte';
 	import { discoverSentinel } from '#lib/actions/discover-sentinel.js';
+	import InlineAlert from '#lib/components/InlineAlert.svelte';
 
 	let {
 		observeEnabled = true,
@@ -27,9 +28,7 @@
 	}}
 	class="col-span-full flex flex-col items-center gap-2 pt-1"
 >
-	{#if error}
-		<p class="text-sm text-error-600-400" role="alert">{error}</p>
-	{/if}
+	<InlineAlert message={error} />
 	<button
 		type="button"
 		class="btn btn-sm preset-tonal-secondary"

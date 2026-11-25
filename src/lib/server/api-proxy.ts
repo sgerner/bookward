@@ -85,7 +85,7 @@ export async function proxyApi(event: RequestEvent) {
 
   const responseHeaders = corsHeaders(event.request, methods);
   if (!upstream.ok) {
-    for (const name of ["etag", "location", "www-authenticate"]) {
+    for (const name of ["etag", "location", "retry-after", "www-authenticate"]) {
       const value = upstream.headers.get(name);
       if (value) responseHeaders.set(name, value);
     }

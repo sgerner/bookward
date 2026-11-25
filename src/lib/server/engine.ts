@@ -28,6 +28,7 @@ export function isEngineUnavailable(error: unknown): boolean {
 
 const SAFE_EXACT_5XX_MESSAGES = new Set([
   'Profile database is unavailable because an interrupted restore has not been recovered. Restore a valid backup or ask an administrator to clear the restore journal.',
+  'API token verification is busy. Try again shortly.',
   'Your Bookward profile is temporarily unavailable. Please try again.',
   'The account was created but its profile could not be initialized',
   'The configured SSO issuer must use HTTPS',

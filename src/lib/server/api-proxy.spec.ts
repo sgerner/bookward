@@ -234,12 +234,26 @@ describe("public API proxy", () => {
               },
             ],
           }),
-          {
-            status: 422,
-            headers: { "content-type": "application/json" },
-          },
+            {
+              status: 422,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              detail: "API token verification is busy. Try again shortly.",
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": "1",
+              },
+            },
+          ),
         ),
-      ),
     );
 
     const req500 = new Request("http://bookward.test/api/v1/recommendations", {
@@ -282,6 +296,15 @@ describe("public API proxy", () => {
           msg: "The request could not be completed.",
         },
       ],
+    });
+
+    const res503Busy = await proxyApi(
+      eventFor(new Request("http://bookward.test/api/v1/recommendations")),
+    );
+    expect(res503Busy.status).toBe(503);
+    expect(res503Busy.headers.get("retry-after")).toBe("1");
+    await expect(res503Busy.json()).resolves.toEqual({
+      detail: "API token verification is busy. Try again shortly.",
     });
   });
 });

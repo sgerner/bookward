@@ -119,6 +119,9 @@ describe('private engine client', () => {
 				503
 			)
 		).toContain('interrupted restore');
+		expect(
+			sanitizeEngineMessage('API token verification is busy. Try again shortly.', 503)
+		).toBe('API token verification is busy. Try again shortly.');
 		expect(sanitizeEngineMessage('Librarr search failed: HTTP 401 Unauthorized', 502)).toBe(
 			'Librarr search failed: HTTP 401 Unauthorized'
 		);
