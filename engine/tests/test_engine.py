@@ -4046,12 +4046,12 @@ def test_goodreads_rss_and_manual_read_replace_demo_source_preserve_already_pres
     }
 
 
-def test_migration_29_purges_stale_demo_reads_derived_rows_and_is_idempotent(
+def test_migration_31_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
-    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-29.db"))
+    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-31.db"))
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
 
@@ -4093,7 +4093,7 @@ def test_migration_29_purges_stale_demo_reads_derived_rows_and_is_idempotent(
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
 
     init_db(seed_demo=True)
 
@@ -4115,7 +4115,7 @@ def test_migration_29_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     )
     assert "You rated a book by this author highly" not in post_upgrade_reasons
 
-    # Re-running initialize() and re-applying migration 29 must be idempotent and
+    # Re-running initialize() and re-applying migration 31 must be idempotent and
     # preserve post-upgrade real scoring batches without queuing duplicate jobs.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
@@ -4124,20 +4124,20 @@ def test_migration_29_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
     with transaction() as con:
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune'")["count"] == 1
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
 
-def test_migration_29_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
+def test_migration_31_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-29-disabled-builtin.db")
+        settings, "db", str(tmp_path / "upgrade-migration-31-disabled-builtin.db")
     )
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
@@ -4165,7 +4165,7 @@ def test_migration_29_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
         )
         con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
 
     init_db(seed_demo=True)
 
@@ -4188,20 +4188,20 @@ def test_migration_29_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
     }
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
 
-    # Re-running migration 29 when already clean is a no-op.
+    # Re-running migration 31 when already clean is a no-op.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
 
 
-def test_migration_29_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
+def test_migration_31_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-29-keep-demo.db")
+        settings, "db", str(tmp_path / "upgrade-migration-31-keep-demo.db")
     )
     init_db(seed_demo=True)
     assert asyncio.run(score_all("local", "hashing-768")) == 4
@@ -4210,7 +4210,7 @@ def test_migration_29_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monke
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
 
     init_db(seed_demo=True)
 
@@ -4278,20 +4278,43 @@ def _seed_shared_run_with_demo_and_real_data():
             "WHERE candidate_id IN (?,?,?)",
             (piranesi_candidate_id, dune_candidate_id, jemisin_candidate_id),
         )
+        attr_demo_cid = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,81,'recommended',?)",
+            (
+                "Mongrels",
+                "Stephen Graham Jones",
+                "Coming-of-age werewolf road novel across the American South.",
+                json.dumps(["horror"]),
+                web_source_id,
+                normalize_key("Mongrels", "Stephen Graham Jones"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
+            "WHERE candidate_id=?",
+            (attr_demo_cid,),
+        )
 
-    assert asyncio.run(score_all("local", "hashing-768")) >= 5
+    assert asyncio.run(score_all("local", "hashing-768")) >= 6
     served, shared_run_id = tracked_recommendations()
-    assert len(served) >= 5 and shared_run_id
+    assert len(served) >= 6 and shared_run_id
     builtin_ids = [
         int(item["id"])
         for item in served
         if int(item["id"])
-        not in {piranesi_candidate_id, dune_candidate_id, jemisin_candidate_id}
+        not in {
+            piranesi_candidate_id,
+            dune_candidate_id,
+            jemisin_candidate_id,
+            attr_demo_cid,
+        }
     ]
-    feedback_candidate_id, mark_read_candidate_id, stale_prior_cid = (
+    feedback_candidate_id, mark_read_candidate_id, stale_prior_cid, manual_demo_cid = (
         builtin_ids[0],
         builtin_ids[1],
         builtin_ids[2],
+        builtin_ids[3],
     )
 
     with transaction() as con:
@@ -4301,6 +4324,8 @@ def _seed_shared_run_with_demo_and_real_data():
                 dune_candidate_id,
                 jemisin_candidate_id,
                 mark_read_candidate_id,
+                manual_demo_cid,
+                attr_demo_cid,
             ),
             start=90,
         ):
@@ -4349,6 +4374,82 @@ def _seed_shared_run_with_demo_and_real_data():
 
     attributed = attribute_read_outcomes()
     assert attributed["reads_attributed"] == 3
+
+    with transaction() as con:
+        from afterword_engine.learning import record_event_in_connection
+
+        piranesi_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='Piranesi'"
+            ).fetchone()[0]
+        )
+        mandel_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='Sea of Tranquility'"
+            ).fetchone()[0]
+        )
+        jones_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='The Only Good Indians'"
+            ).fetchone()[0]
+        )
+        demo_manual_key = f"manual-read:{manual_demo_cid}:{mandel_demo_id:08d}"
+        demo_attr_key = f"attribution:read:{jones_demo_id:08d}:{attr_demo_cid}"
+        record_event_in_connection(
+            con,
+            event_key=demo_manual_key,
+            candidate_id=manual_demo_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=5.0,
+            source="manual_read",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+            read_id=mandel_demo_id,
+        )
+        record_event_in_connection(
+            con,
+            event_key=demo_attr_key,
+            candidate_id=attr_demo_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=4.0,
+            source="read_import",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+            read_id=jones_demo_id,
+        )
+
+    demo_keys = {
+        f"read:{piranesi_demo_id:08d}",
+        f"read:{jemisin_demo_id:08d}:{jemisin_candidate_id}",
+        demo_manual_key,
+        demo_attr_key,
+    }
+    for table in (
+        "recommendation_events",
+        "recommendation_evidence_events",
+        "recommendation_evidence_outcomes",
+    ):
+        present = {
+            item["event_key"]
+            for item in rows(f"SELECT DISTINCT event_key FROM {table}")
+        }
+        assert demo_keys.issubset(present)
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events "
+            "WHERE event_key=? AND run_id IS NULL",
+            (f"read:{jemisin_demo_id:08d}",),
+        )["count"]
+        == 1
+    )
     assert (
         row(
             "SELECT COUNT(*) count FROM recommendation_outcomes o "
@@ -4356,7 +4457,7 @@ def _seed_shared_run_with_demo_and_real_data():
             "WHERE i.run_id=?",
             (shared_run_id,),
         )["count"]
-        == 4
+        == 6
     )
     return {
         "shared_run_id": shared_run_id,
@@ -4370,7 +4471,7 @@ def _seed_shared_run_with_demo_and_real_data():
     }
 
 
-def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_shared_run(
+def test_runtime_purge_and_migration_31_preserve_real_outcomes_and_feedback_on_shared_run(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
@@ -4462,14 +4563,11 @@ def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_s
     } == {feedback_event_key, manual_event_key, real_event_key}
     assert {
         item["event_key"]
-        for item in rows(
-            "SELECT event_key FROM recommendation_evidence_events WHERE run_id=?",
-            (shared_run_id,),
-        )
+        for item in rows("SELECT event_key FROM recommendation_evidence_events")
     } == {feedback_event_key, manual_event_key, real_event_key}
 
-    # 2. Migration 29 on a shared run with demo outcome + real outcome + real feedback.
-    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-29.db"))
+    # 2. Migration 31 on a shared run with demo outcome + real outcome + real feedback.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-31.db"))
     init_db(seed_demo=True)
     mctx = _seed_shared_run_with_demo_and_real_data()
     mrun_id = mctx["shared_run_id"]
@@ -4486,7 +4584,7 @@ def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_s
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=29")
+        con.execute("DELETE FROM schema_migrations WHERE version=31")
 
     init_db(seed_demo=True)
 
@@ -4542,10 +4640,7 @@ def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_s
     } == {m_feedback_event_key, m_real_event_key}
     assert {
         item["event_key"]
-        for item in rows(
-            "SELECT event_key FROM recommendation_evidence_events WHERE run_id=?",
-            (mrun_id,),
-        )
+        for item in rows("SELECT event_key FROM recommendation_evidence_events")
     } == {m_feedback_event_key, m_real_event_key}
     assert row("SELECT COUNT(*) count FROM recommendation_run_evidence")["count"] == 0
 
