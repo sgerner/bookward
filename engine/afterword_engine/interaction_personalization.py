@@ -23,7 +23,7 @@ from .database import rows
 from .embeddings import content_hash
 from .identity import book_identity
 from .scoring import document
-from .subjects import normalize_subjects
+from .subjects import normalize_subjects, resolve_subject_label, subject_display_map
 
 
 MAX_INTERACTION_EVENTS = 5_000
@@ -648,7 +648,7 @@ def personalize_recommendations(
             if not isinstance(explanation, list):
                 explanation = []
             message = (
-                "Raised using your saved, imported, or positively rated books"
+                "Raised using books you shortlisted, added to Librarr, or rated highly"
                 if delta > 0
                 else "Lowered using books you rejected or rated poorly"
             )
@@ -666,7 +666,10 @@ def personalize_recommendations(
                 elif feature.startswith("era:"):
                     detail = "publication era"
                 else:
-                    detail = f"subject {feature.removeprefix('subject:')}"
+                    subject_key = feature.removeprefix("subject:")
+                    subject_labels = subject_display_map(item.get("genres"), limit=8)
+                    subject_label = resolve_subject_label(subject_key, subject_labels)
+                    detail = f"subject {subject_label}"
                 message += f" ({detail})"
             if message not in explanation:
                 item["explanation"] = [*explanation, message]

@@ -1304,6 +1304,15 @@ def test_replay_decision_evidence_falls_back_to_runtime_settings_for_missing_fat
             "fatigue_penalty": 4.0,
             "fatigue_visible_days": 4,
             "score": 76.0,
+            # apply_impression_fatigue appends this reason to the explanation on replay.
+            "explanation": [
+                *(
+                    base_candidate["explanation"]
+                    if isinstance(base_candidate.get("explanation"), list)
+                    else []
+                ),
+                "Lowered after appearing on several recent days without a decision",
+            ],
         }
         evidence = build_decision_evidence(
             con,

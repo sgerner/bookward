@@ -83,7 +83,7 @@ from .http_bounds import (
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
-from .ranking import rank_candidates
+from .ranking import normalize_explanation_items, rank_candidates
 from .secrets import auth_registry_key, installation_key_path, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -1828,7 +1828,12 @@ def _format_recommendation_item(
 ) -> dict[str, Any]:
     formatted = dict(item)
     formatted["genres"] = _parse_json_list(formatted.get("genres"))
-    formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    formatted["explanation"] = normalize_explanation_items(
+        _parse_json_list(formatted.get("explanation")),
+        genres=formatted["genres"],
+        author=formatted.get("author"),
+        release_date=formatted.get("release_date"),
+    )
     if format_urls:
         _format_recommendation_urls([formatted])
     return formatted
@@ -2860,7 +2865,12 @@ def recommendation_list(
         )
     for item in result:
         item["genres"] = _parse_json_list(item.get("genres"))
-        item["explanation"] = _parse_json_list(item.get("explanation"))
+        item["explanation"] = normalize_explanation_items(
+            _parse_json_list(item.get("explanation")),
+            genres=item["genres"],
+            author=item.get("author"),
+            release_date=item.get("release_date"),
+        )
     if format_urls:
         _format_recommendation_urls(result)
     return result
