@@ -84,10 +84,23 @@
     resolveLibrarrResultFormat,
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
+  import {
+    applyReadingHistoryScores,
+    createUrlNavigationController,
+    READING_HISTORY_SCORE_BATCH_SIZE,
+    readUrlViewState,
+    reconcileBookMutation,
+    reconcilePagedBooks,
+    runReadingHistoryScoreBatches,
+    sortReadingHistory,
+    type DecisionFilter,
+    type ReadingHistoryScorePatch,
+    type ReadingHistorySort,
+    type View,
+  } from "#lib/page-state.js";
   import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
-  type View = "discover" | "saved" | "decisions" | "sources" | "settings";
   type FilterableView = "discover" | "saved" | "decisions";
   type NavItem = {
     id: View;
@@ -148,7 +161,13 @@
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
-  let activeView = $state<View>(readView(page.url.searchParams.get("view")));
+  const initialUrlState = untrack(() =>
+    readUrlViewState(
+      page.shallow?.url ?? page.url,
+      data.digestReview.requested,
+    ),
+  );
+  let activeView = $state<View>(initialUrlState.view);
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state<number | null>(0);
   let discoverSearch = $state("");
@@ -172,8 +191,12 @@
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
   let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
-  let unfilteredDiscoverOffset = $state(0);
-  let unfilteredDiscoverHasMore = $state(false);
+  let unfilteredDiscoverOffset = $state(
+    untrack(() => data.books.filter((book) => book.status === "recommended").length),
+  );
+  let unfilteredDiscoverHasMore = $state(
+    untrack(() => Boolean(data.recommendations_has_more)),
+  );
   let filteredDiscoverBooks = $state<PageBook[]>([]);
   let filteredDiscoverOffset = $state(0);
   let filteredDiscoverHasMore = $state(false);
@@ -182,7 +205,7 @@
   let discoverFilterAbortController: AbortController | null = null;
   let discoverFilterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let unfilteredDecisionOffset = $state(0);
+  let unfilteredDecisionOffset = $state(untrack(() => data.decisions.length));
   let queriedDecisionBooks = $state<PageBook[]>([]);
   let queriedDecisionOffset = $state(0);
   let queriedDecisionsHasMore = $state(false);
@@ -197,7 +220,7 @@
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
-  let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
+  let decisionFilter = $state<DecisionFilter>(initialUrlState.decisionFilter);
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryImmediate = $state(false);
@@ -206,21 +229,41 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryGeneration = 0;
   let readingHistoryScoreRefreshQueued = false;
+  let bufferedReadingHistoryScores = $state(new Map<number, ReadingHistoryScorePatch>());
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
-  let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
+  let readingHistorySort = $state<ReadingHistorySort>("recent");
   let expandedReadingDetails = $state<number[]>([]);
   let historyRatingOverrides = $state<Record<number, number | null>>({});
   let pendingRatingIds = $state(new Set<number>());
-  // This is only an identity sentinel. Keeping it outside `$state` avoids
-  // proxying `data.books` and retriggering the synchronization effect forever.
-  let previousDataBooks: PageBook[] | null = null;
-  let previousDataRecommendationsHasMore: boolean | null = null;
-  let previousDataDecisions: PageBook[] | null = null;
-  let previousDataDecisionsHasMore: boolean | null = null;
+  // Keep identity sentinels outside `$state` to avoid proxying server arrays
+  // and retriggering synchronization effects unnecessarily.
+  let previousDataBooks: PageBook[] | null = untrack(() => data.books);
+  let previousDataRecommendationsHasMore: boolean | null = untrack(() =>
+    Boolean(data.recommendations_has_more),
+  );
+  let previousDataDecisions: PageBook[] | null = untrack(() => data.decisions);
+  let previousDataDecisionsHasMore: boolean | null = untrack(() =>
+    Boolean(data.decisions_has_more),
+  );
   let previousDataHistory: (typeof data.history) | null = null;
+  let previousProfileId: string | undefined = untrack(
+    () => data.user?.profile_id,
+  );
+  let previousDiscoverSearch = "";
+  let previousDiscoverGenre = "";
+  const undoBookSnapshots = new Map<
+    number,
+    {
+      book: PageBook;
+      previousStatus: string;
+      discoverIndex: number;
+      decisionIndex: number;
+    }
+  >();
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -242,7 +285,7 @@
   let librarrBulkAdding = $state(false);
   let librarrAdded = $state<Set<string>>(new Set());
   let librarrSearchAbortController: AbortController | null = null;
-  let digestMode = $state(page.url.searchParams.get("digest") === "1");
+  let digestMode = $state(initialUrlState.digestMode);
   let selectedDigestIds = $state<Set<number>>(new Set());
   let digestEnabledOverride = $state<boolean | null>(null);
   let digestOnlyNewOverride = $state<boolean | null>(null);
@@ -401,7 +444,8 @@
   const digestSettings = $derived(data.profile.digest);
   const digestVisible = $derived(
     digestMode &&
-      (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
+      (!(page.shallow?.url ?? page.url).searchParams.has("digest_period") ||
+        data.digestReview.requested),
   );
   const digestRequested = $derived(
     digestVisible && data.digestReview.requested,
@@ -608,35 +652,17 @@
     };
     const matchesSearch = (item: ReadingHistoryItem) =>
       !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
-    const timestamps = new Map<number, number>();
-    const readTimestamp = (item: ReadingHistoryItem) => {
-      const cached = timestamps.get(item.id);
-      if (cached !== undefined) return cached;
-      const timestamp = Date.parse(item.read_at ?? item.created_at);
-      const normalized = Number.isFinite(timestamp) ? timestamp : 0;
-      timestamps.set(item.id, normalized);
-      return normalized;
-    };
-    return synchronizedReadingHistory
-      .filter((item) =>
+    const matching = synchronizedReadingHistory.filter(
+      (item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
         (readingHistorySourceFilter === "all" || item.source === readingHistorySourceFilter),
-      )
-      .sort((left, right) => {
-        if (readingHistorySort === "oldest") return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "score_high" || readingHistorySort === "score_low") {
-          if (left.algorithm_score === null) return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
-          if (right.algorithm_score === null) return -1;
-          const scoreOrder = readingHistorySort === "score_high"
-            ? right.algorithm_score - left.algorithm_score
-            : left.algorithm_score - right.algorithm_score;
-          return scoreOrder || left.title.localeCompare(right.title);
-        }
-        if (readingHistorySort === "rating_high") return (right.rating ?? 0) - (left.rating ?? 0) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "title") return left.title.localeCompare(right.title);
-        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
-      });
+    );
+    return sortReadingHistory(
+      matching,
+      readingHistorySort,
+      readingHistoryScoreState === "idle" || readingHistoryScoreState === "loading",
+    );
   });
   const readingHistorySources = $derived(
     [...new Set(readingHistory.map((item) => item.source).filter(Boolean))]
@@ -646,7 +672,9 @@
     filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
   const scoredReadingHistoryCount = $derived(
-    readingHistory.filter((item) => item.algorithm_score !== null).length,
+    readingHistory.filter(
+      (item) => item.algorithm_score !== null || bufferedReadingHistoryScores.has(item.id),
+    ).length,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
   const selectedDigestRunId = $derived.by(() => {
@@ -1024,84 +1052,167 @@
     };
   });
 
-  function readView(value: string | null): View {
-    return value && ["discover", "saved", "decisions", "sources", "settings"].includes(value)
-      ? (value as View)
-      : "discover";
+  function resetClientPagination() {
+    discoverFilterAbortController?.abort();
+    discoverFilterAbortController = null;
+    decisionQueryAbortController?.abort();
+    decisionQueryAbortController = null;
+    additionalDiscoverBooks = [];
+    unfilteredDiscoverOffset = data.books.filter(
+      (book) => book.status === "recommended",
+    ).length;
+    unfilteredDiscoverHasMore = Boolean(data.recommendations_has_more);
+    filteredDiscoverBooks = [];
+    filteredDiscoverOffset = 0;
+    filteredDiscoverHasMore = false;
+    filteredDiscoverLoadedKey = "";
+    filteredDiscoverPending = false;
+    discoverLoading = false;
+    discoverLoadError = "";
+    discoverVisibleCount = DISCOVER_PAGE_SIZE;
+    additionalDecisionBooks = [];
+    unfilteredDecisionOffset = data.decisions.length;
+    queriedDecisionBooks = [];
+    queriedDecisionOffset = 0;
+    queriedDecisionsHasMore = false;
+    queriedDecisionLoadedKey = "";
+    queriedDecisionPending = false;
+    decisionsHasMoreOverride = null;
+    decisionsLoading = false;
+    decisionsLoadError = "";
+    undoBookSnapshots.clear();
   }
+
+  function resetReadingHistory() {
+    readingHistoryGeneration += 1;
+    readingHistoryScoreTask = null;
+    readingHistoryScoreRefreshQueued = false;
+    readingHistory = [];
+    readingHistoryState = "idle";
+    readingHistoryError = "";
+    readingHistoryScoreState = "idle";
+    readingHistoryScoreError = "";
+    readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
+  }
+
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
+    const generation = ++readingHistoryGeneration;
+    readingHistoryScoreTask = null;
     readingHistoryState = "loading";
     readingHistoryImmediate = true;
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
     readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
     try {
       const response = await fetch("/api/reading-history", { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: ReadingHistoryItem[];
         message?: string;
       };
+      if (generation !== readingHistoryGeneration) return;
       if (!response.ok || !Array.isArray(payload.items)) {
         throw new Error(payload.message || "Reading history could not be loaded.");
       }
       readingHistory = payload.items;
       readingHistoryImmediate = true;
       readingHistoryState = "ready";
-      void loadReadingHistoryScores(payload.items.length);
+      void loadReadingHistoryScores(payload.items.length, generation);
     } catch (error) {
+      if (generation !== readingHistoryGeneration) return;
       readingHistoryError = error instanceof Error
         ? error.message
         : "Reading history could not be loaded.";
       readingHistoryState = "error";
     }
   }
-  function loadReadingHistoryScores(total: number) {
+  function loadReadingHistoryScores(total: number, generation = readingHistoryGeneration) {
     if (readingHistoryScoreTask) return readingHistoryScoreTask;
-    const batchSize = 20;
-    if (total === 0) {
+    const batchSize = READING_HISTORY_SCORE_BATCH_SIZE;
+    if (total === 0 || readingHistoryScoreOffset >= total) {
+      if (bufferedReadingHistoryScores.size > 0) {
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          bufferedReadingHistoryScores,
+        );
+        bufferedReadingHistoryScores = new Map();
+      }
       readingHistoryScoreState = "ready";
       return Promise.resolve();
     }
     readingHistoryScoreState = "loading";
     readingHistoryScoreError = "";
-    const task = (async () => {
+    let finished = false;
+    let task: Promise<void> | null = null;
+    const run = async () => {
       try {
-        for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
-          const response = await fetch(
-            `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
-            { headers: profileHeaders },
-          );
-          const payload = (await response.json().catch(() => ({}))) as {
-            scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
-            message?: string;
-          };
-          if (!response.ok || !Array.isArray(payload.scores)) {
-            throw new Error(payload.message || "Reading history scores could not be loaded.");
-          }
-          const scoresById = new Map(payload.scores.map((item) => [item.id, item]));
-          readingHistory = readingHistory.map((item) => {
-            const score = scoresById.get(item.id);
-            return score ? { ...item, ...score } : item;
-          });
-          readingHistoryScoreOffset = offset + batchSize;
+        const outcome = await runReadingHistoryScoreBatches({
+          total,
+          startOffset: readingHistoryScoreOffset,
+          initialBuffer: bufferedReadingHistoryScores,
+          batchSize,
+          isCurrent: () => generation === readingHistoryGeneration,
+          fetchBatch: async (offset, limit) => {
+            const response = await fetch(
+              `/api/reading-history/scores?offset=${offset}&limit=${limit}`,
+              { headers: profileHeaders },
+            );
+            const payload = (await response.json().catch(() => ({}))) as {
+              scores?: ReadingHistoryScorePatch[];
+              message?: string;
+            };
+            return {
+              ok: response.ok,
+              status: response.status,
+              scores: payload.scores,
+              message: payload.message,
+            };
+          },
+          onBatch: ({ nextOffset, buffered }) => {
+            bufferedReadingHistoryScores = buffered;
+            readingHistoryScoreOffset = nextOffset;
+          },
+        });
+        if (outcome.status === "stale") return;
+        if (outcome.status === "error") {
+          readingHistoryScoreOffset = outcome.nextOffset;
+          bufferedReadingHistoryScores = outcome.buffered;
+          readingHistoryScoreError = outcome.message;
+          readingHistoryScoreState = "error";
+          return;
         }
+        readingHistoryScoreOffset = outcome.nextOffset;
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          outcome.buffered,
+        );
+        bufferedReadingHistoryScores = new Map();
         readingHistoryScoreState = "ready";
       } catch (error) {
+        if (generation !== readingHistoryGeneration) return;
         readingHistoryScoreError = error instanceof Error
           ? error.message
           : "Reading history scores could not be loaded.";
         readingHistoryScoreState = "error";
       } finally {
-        readingHistoryScoreTask = null;
+        finished = true;
+        if (task && readingHistoryScoreTask === task) {
+          readingHistoryScoreTask = null;
+        }
       }
-    })();
-    readingHistoryScoreTask = task;
+    };
+    task = run();
+    if (!finished) {
+      readingHistoryScoreTask = task;
+    }
     return task;
   }
   async function refreshReadingHistoryScores() {
     if (readingHistoryState !== "ready") return;
+    const generation = readingHistoryGeneration;
     if (readingHistoryScoreTask) {
       if (readingHistoryScoreRefreshQueued) return;
       readingHistoryScoreRefreshQueued = true;
@@ -1110,10 +1221,11 @@
       } finally {
         readingHistoryScoreRefreshQueued = false;
       }
-      if (readingHistoryState !== "ready") return;
+      if (generation !== readingHistoryGeneration || readingHistoryState !== "ready") return;
     }
     readingHistoryScoreOffset = 0;
-    await loadReadingHistoryScores(readingHistory.length);
+    bufferedReadingHistoryScores = new Map();
+    await loadReadingHistoryScores(readingHistory.length, generation);
   }
   const ratingController = createReadingHistoryRatingController({
     saveRating: async (id, nextRating) => {
@@ -1156,14 +1268,53 @@
     },
     afterDomUpdate: () => tick(),
   });
-  function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+  const urlNavigation = createUrlNavigationController({
+    getState: () =>
+      untrack(() => ({
+        view: activeView,
+        decisionFilter,
+        digestMode,
+      })),
+    setState: (patch) => {
+      if (patch.view !== undefined) activeView = patch.view;
+      if (patch.decisionFilter !== undefined) decisionFilter = patch.decisionFilter;
+      if (patch.digestMode !== undefined) digestMode = patch.digestMode;
+    },
+    getDigestReviewRequested: () => data.digestReview.requested,
+    getCurrentLocationUrl: () =>
+      typeof window !== "undefined" ? new URL(window.location.href) : null,
+    pushUrl: (nextUrl) => pushState(nextUrl, {}),
+    scrollToTop: () => {
+      if (typeof window !== "undefined") {
+        window.scrollTo(0, 0);
+      }
+    },
+    onViewEvaluated: (view) => {
+      const nextToken = tokenForView(view, untrack(() => revealedApiToken));
+      if (!nextToken) apiTokenCopyStatus = null;
+      revealedApiToken = nextToken;
+    },
+    onResetDecisionPagination: () => {
+      readingHistoryVisibleCount = 30;
+    },
+    onClearDecisionsError: () => {
+      decisionsLoadError = "";
+    },
+    onExitDigestMode: () => {
+      clearDigestSelection();
+    },
+    onRequestReadingHistoryLoad: () => {
+      void loadReadingHistory();
+    },
+  });
+  function syncFromUrl(url: Parameters<typeof readUrlViewState>[0]) {
+    urlNavigation.syncFromUrl(url);
+  }
+  function selectDecisionFilter(nextFilter: DecisionFilter) {
     const inDecisionsView = activeView === "decisions";
     recommendationsImmediate = inDecisionsView;
     readingHistoryImmediate = inDecisionsView;
-    decisionFilter = nextFilter;
-    readingHistoryVisibleCount = 30;
-    decisionsLoadError = "";
-    if (nextFilter === "read") void loadReadingHistory();
+    urlNavigation.selectDecisionFilter(nextFilter);
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -1224,18 +1375,22 @@
       ? value
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
-  function go(view: View) {
-    const nextToken = tokenForView(view, revealedApiToken);
-    if (!nextToken) apiTokenCopyStatus = null;
-    revealedApiToken = nextToken;
-    activeView = view;
-    if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
-    if (typeof window !== "undefined") {
-      const url = new URL(window.location.href);
-      url.searchParams.set("view", view);
-      if (view !== "discover") url.searchParams.delete("digest");
-      pushState(url, {});
+  function go(view: View, nextDecisionFilter?: DecisionFilter) {
+    urlNavigation.go(view, nextDecisionFilter);
+  }
+  function onHomeClick(event: MouseEvent) {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
     }
+    event.preventDefault();
+    urlNavigation.goHome();
   }
   async function goToLibrarrSettings() {
     go("settings");
@@ -1318,7 +1473,10 @@
           if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
           optimisticNotificationTimer = null;
           optimisticNotification = null;
-          await update();
+          await update({ navigate: false });
+          if (succeeded && key === "sync") {
+            resetClientPagination();
+          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -1327,8 +1485,7 @@
               key === "csv-import" ||
               key === "goodreads-csv")
           ) {
-            readingHistory = [];
-            readingHistoryState = "idle";
+            resetReadingHistory();
           }
           if (succeeded) change?.commit?.();
           if (
@@ -1338,7 +1495,8 @@
               key === "goodreads-rss" ||
               key === "goodreads-csv" ||
               key === "source" ||
-              key.startsWith("source-"))
+              key.startsWith("source-") ||
+              key.startsWith("refresh-source-"))
           ) {
             if (hasActiveDiscoverFilter) reloadFilteredDiscover();
             if (isQueriedDecisionMode) reloadQueriedDecisions();
@@ -1416,12 +1574,14 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          await update({ reset: false });
+          await update({ reset: false, navigate: false });
           if (succeeded) {
             const nextDrafts = { ...sourceEditDrafts };
             delete nextDrafts[sourceId];
             sourceEditDrafts = nextDrafts;
             setSourceEditOpen(sourceId, false);
+            if (hasActiveDiscoverFilter) reloadFilteredDiscover();
+            if (isQueriedDecisionMode) reloadQueriedDecisions();
           }
         } catch (error) {
           announceActionError(
@@ -1436,25 +1596,42 @@
     };
   }
 
-  function applyCommittedStatusToClientSlices(id: number, status: string) {
-    const knownBook = allBooks.find((item) => item.id === id);
+  function applyCommittedStatusToClientSlices(
+    id: number,
+    status: string,
+    fallbackBook?: PageBook,
+  ) {
+    const knownBook = allBooks.find((item) => item.id === id) ?? fallbackBook;
     const prevFilteredDiscover = filteredDiscoverBooks.find((item) => item.id === id);
-    if (prevFilteredDiscover && prevFilteredDiscover.status === "recommended" && status !== "recommended") {
+    if (
+      prevFilteredDiscover &&
+      prevFilteredDiscover.status === "recommended" &&
+      status !== "recommended"
+    ) {
       filteredDiscoverOffset = Math.max(0, filteredDiscoverOffset - 1);
+    } else if (
+      prevFilteredDiscover &&
+      prevFilteredDiscover.status !== "recommended" &&
+      status === "recommended"
+    ) {
+      filteredDiscoverOffset += 1;
     }
     const prevQueriedDecision = queriedDecisionBooks.find((item) => item.id === id);
-    const wasDecision = prevQueriedDecision && ["rejected", "maybe_later"].includes(prevQueriedDecision.status);
+    const wasDecision = Boolean(
+      prevQueriedDecision &&
+        ["rejected", "maybe_later"].includes(prevQueriedDecision.status),
+    );
     const isDecision = ["rejected", "maybe_later"].includes(status);
     if (wasDecision && !isDecision) {
       queriedDecisionOffset = Math.max(0, queriedDecisionOffset - 1);
+    } else if (!wasDecision && isDecision && prevQueriedDecision) {
+      queriedDecisionOffset += 1;
     }
     const updateSlice = (items: PageBook[]) =>
       items.some((item) => item.id === id)
         ? items.map((item) => (item.id === id ? { ...item, status } : item))
         : items;
-    additionalDiscoverBooks = updateSlice(additionalDiscoverBooks);
     filteredDiscoverBooks = updateSlice(filteredDiscoverBooks);
-    additionalDecisionBooks = updateSlice(additionalDecisionBooks);
     if (
       isDecision &&
       !prevQueriedDecision &&
@@ -1470,20 +1647,54 @@
     }
   }
 
-  function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
+  function optimisticBookStatus(
+    id: number,
+    status: string,
+    recordUndo = false,
+  ): OptimisticChange | void {
+    const discoverIndex = additionalDiscoverBooks.findIndex((item) => item.id === id);
+    const decisionIndex = additionalDecisionBooks.findIndex((item) => item.id === id);
     const book = allBooks.find((item) => item.id === id);
     if (!book) return;
+    if (recordUndo && ["saved", "rejected", "maybe_later"].includes(status)) {
+      undoBookSnapshots.set(id, {
+        book: { ...book },
+        previousStatus: book.status,
+        discoverIndex,
+        decisionIndex,
+      });
+    } else if (status === "recommended" || status === "read") {
+      undoBookSnapshots.delete(id);
+    }
+    const snapshot = { ...book };
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
+        const reconciled = reconcileBookMutation({
+          serverBooks: data.books,
+          serverDecisions: data.decisions,
+          additionalDiscoverBooks,
+          additionalDecisionBooks,
+          id,
+          nextStatus: status,
+          snapshot,
+        });
+        additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+        additionalDecisionBooks = reconciled.additionalDecisionBooks;
+        unfilteredDiscoverOffset =
+          data.books.filter((item) => item.status === "recommended").length +
+          reconciled.additionalDiscoverBooks.length;
+        unfilteredDecisionOffset =
+          data.decisions.length + reconciled.additionalDecisionBooks.length;
         if (bookStatusOverrides[id] !== status) return;
-        applyCommittedStatusToClientSlices(id, status);
+        applyCommittedStatusToClientSlices(id, status, snapshot);
         const next = { ...bookStatusOverrides };
         delete next[id];
         bookStatusOverrides = next;
       },
       rollback: () => {
+        if (recordUndo) undoBookSnapshots.delete(id);
         if (bookStatusOverrides[id] !== status) return;
         const next = { ...bookStatusOverrides };
         if (previous === undefined) delete next[id];
@@ -1497,8 +1708,83 @@
     const id = Number(formData.get("id"));
     const status = String(formData.get("status") ?? "");
     return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
-      ? optimisticBookStatus(id, status)
+      ? optimisticBookStatus(id, status, true)
       : undefined;
+  }
+
+  function optimisticUndoDecision(formData: FormData): OptimisticChange | void {
+    const ids = [
+      ...new Set(
+        formData
+          .getAll("id")
+          .map((value) => Number(value))
+          .filter((id) => Number.isInteger(id)),
+      ),
+    ];
+    if (!ids.length) return;
+    const entries = ids.map((id) => {
+      const undoSnapshot = undoBookSnapshots.get(id);
+      const restoredStatus = undoSnapshot?.previousStatus ?? "recommended";
+      const fallbackBook = allBooks.find((item) => item.id === id);
+      const snapshot =
+        undoSnapshot?.book ?? (fallbackBook ? { ...fallbackBook } : undefined);
+      const previousOverride = bookStatusOverrides[id];
+      return { id, undoSnapshot, restoredStatus, snapshot, previousOverride };
+    });
+    const nextOverrides = { ...bookStatusOverrides };
+    for (const entry of entries) {
+      nextOverrides[entry.id] = entry.restoredStatus;
+    }
+    bookStatusOverrides = nextOverrides;
+    return {
+      commit: () => {
+        let nextDiscover = additionalDiscoverBooks;
+        let nextDecisions = additionalDecisionBooks;
+        for (const entry of entries) {
+          const reconciled = reconcileBookMutation({
+            serverBooks: data.books,
+            serverDecisions: data.decisions,
+            additionalDiscoverBooks: nextDiscover,
+            additionalDecisionBooks: nextDecisions,
+            id: entry.id,
+            nextStatus: entry.restoredStatus,
+            snapshot: entry.snapshot,
+            restoreDiscoverIndex: entry.undoSnapshot?.discoverIndex,
+            restoreDecisionIndex: entry.undoSnapshot?.decisionIndex,
+          });
+          nextDiscover = reconciled.additionalDiscoverBooks;
+          nextDecisions = reconciled.additionalDecisionBooks;
+          undoBookSnapshots.delete(entry.id);
+          applyCommittedStatusToClientSlices(
+            entry.id,
+            entry.restoredStatus,
+            entry.snapshot,
+          );
+        }
+        additionalDiscoverBooks = nextDiscover;
+        additionalDecisionBooks = nextDecisions;
+        unfilteredDiscoverOffset =
+          data.books.filter((item) => item.status === "recommended").length +
+          nextDiscover.length;
+        unfilteredDecisionOffset = data.decisions.length + nextDecisions.length;
+        const cleaned = { ...bookStatusOverrides };
+        for (const entry of entries) {
+          if (cleaned[entry.id] === entry.restoredStatus) {
+            delete cleaned[entry.id];
+          }
+        }
+        bookStatusOverrides = cleaned;
+      },
+      rollback: () => {
+        const reverted = { ...bookStatusOverrides };
+        for (const entry of entries) {
+          if (reverted[entry.id] !== entry.restoredStatus) continue;
+          if (entry.previousOverride === undefined) delete reverted[entry.id];
+          else reverted[entry.id] = entry.previousOverride;
+        }
+        bookStatusOverrides = reverted;
+      },
+    };
   }
 
   function optimisticRead(formData: FormData) {
@@ -1529,7 +1815,7 @@
         .map((value) => Number(value))
         .filter((id) => Number.isInteger(id)),
     )];
-    const changes = ids.map((id) => optimisticBookStatus(id, "saved")).filter(Boolean) as OptimisticChange[];
+    const changes = ids.map((id) => optimisticBookStatus(id, "saved", true)).filter(Boolean) as OptimisticChange[];
     return {
       commit: () => {
         changes.forEach((change) => change.commit?.());
@@ -2196,6 +2482,7 @@
     void searchLibrarr();
   }
   function openMarkRead(book: PageBook) {
+    openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
   }
@@ -2272,35 +2559,71 @@
   });
 
   $effect(() => {
-    const nextBooks = data.books;
-    const nextHasMore = Boolean(data.recommendations_has_more);
-    if (
-      previousDataBooks === nextBooks &&
-      previousDataRecommendationsHasMore === nextHasMore
-    )
-      return;
-    previousDataBooks = nextBooks;
-    previousDataRecommendationsHasMore = nextHasMore;
-    additionalDiscoverBooks = [];
-    unfilteredDiscoverOffset = nextBooks.filter(
-      (book) => book.status === "recommended",
-    ).length;
-    unfilteredDiscoverHasMore = nextHasMore;
-    discoverLoadError = "";
+    const nextProfileId = data.user?.profile_id;
+    if (previousProfileId === nextProfileId) return;
+    previousProfileId = nextProfileId;
+    resetClientPagination();
+    resetReadingHistory();
   });
 
   $effect(() => {
-    const nextDecisions = data.decisions;
-    const nextHasMore = Boolean(data.decisions_has_more);
+    const currentUrl = page.shallow?.url ?? page.url;
+    syncFromUrl(currentUrl);
+  });
+
+  $effect(() => {
     if (
+      activeView === "decisions" &&
+      decisionFilter === "read" &&
+      readingHistoryState === "idle"
+    ) {
+      void loadReadingHistory();
+    }
+  });
+
+  $effect(() => {
+    const nextBooks = data.books;
+    const nextRecommendationsHasMore = Boolean(data.recommendations_has_more);
+    const nextDecisions = data.decisions;
+    const nextDecisionsHasMore = Boolean(data.decisions_has_more);
+    if (
+      previousDataBooks === nextBooks &&
+      previousDataRecommendationsHasMore === nextRecommendationsHasMore &&
       previousDataDecisions === nextDecisions &&
-      previousDataDecisionsHasMore === nextHasMore
-    ) return;
+      previousDataDecisionsHasMore === nextDecisionsHasMore
+    ) {
+      return;
+    }
+    const prevDiscover = untrack(() => additionalDiscoverBooks);
+    const prevDecisions = untrack(() => additionalDecisionBooks);
+    const prevDiscoverHasMore = untrack(() => unfilteredDiscoverHasMore);
+    const prevDecisionsOverride = untrack(() => decisionsHasMoreOverride);
+    previousDataBooks = nextBooks;
+    previousDataRecommendationsHasMore = nextRecommendationsHasMore;
     previousDataDecisions = nextDecisions;
-    previousDataDecisionsHasMore = nextHasMore;
-    additionalDecisionBooks = [];
-    unfilteredDecisionOffset = nextDecisions.length;
-    decisionsHasMoreOverride = null;
+    previousDataDecisionsHasMore = nextDecisionsHasMore;
+    const reconciled = reconcilePagedBooks(
+      nextBooks,
+      nextDecisions,
+      prevDiscover,
+      prevDecisions,
+    );
+    additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+    additionalDecisionBooks = reconciled.additionalDecisionBooks;
+    unfilteredDiscoverOffset =
+      nextBooks.filter((book) => book.status === "recommended").length +
+      reconciled.additionalDiscoverBooks.length;
+    unfilteredDiscoverHasMore =
+      nextRecommendationsHasMore &&
+      (prevDiscover.length > 0 ? prevDiscoverHasMore : true);
+    unfilteredDecisionOffset =
+      nextDecisions.length + reconciled.additionalDecisionBooks.length;
+    decisionsHasMoreOverride = !nextDecisionsHasMore
+      ? false
+      : prevDecisions.length > 0 && prevDecisionsOverride === false
+        ? false
+        : null;
+    discoverLoadError = "";
     decisionsLoadError = "";
   });
 
@@ -2312,8 +2635,16 @@
   });
 
   $effect(() => {
-    discoverSearch;
-    discoverGenre;
+    const nextSearch = discoverSearch;
+    const nextGenre = discoverGenre;
+    if (
+      previousDiscoverSearch === nextSearch &&
+      previousDiscoverGenre === nextGenre
+    ) {
+      return;
+    }
+    previousDiscoverSearch = nextSearch;
+    previousDiscoverGenre = nextGenre;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;
   });
 
@@ -2421,18 +2752,6 @@
     const selected = decisionsGenre.trim().toLowerCase();
     if (selected && !decisionGenres.some((genre) => genre.toLowerCase() === selected)) {
       decisionsGenre = "";
-    }
-  });
-
-  // A delivery link can outlive its notification history. Keep that case
-  // useful by showing the normal Discover feed instead of an empty digest.
-  $effect(() => {
-    if (
-      digestMode &&
-      page.url.searchParams.has("digest_period") &&
-      !data.digestReview.requested
-    ) {
-      digestMode = false;
     }
   });
 
@@ -2648,14 +2967,7 @@
 
   onMount(() => {
     const onPopState = () => {
-      const nextView = readView(
-        new URL(window.location.href).searchParams.get("view"),
-      );
-      const nextToken = tokenForView(nextView, revealedApiToken);
-      if (!nextToken) apiTokenCopyStatus = null;
-      revealedApiToken = nextToken;
-      activeView = nextView;
-      digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
+      syncFromUrl(new URL(window.location.href));
     };
     const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && openReadMenuId !== null) {
@@ -2787,6 +3099,7 @@
         href="/"
         class="flex min-h-11 shrink-0 items-center gap-3 text-surface-950-50 no-underline"
         aria-label="Bookward home"
+        onclick={onHomeClick}
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
           ><img src={bookwardMark} alt="" width="128" height="128" class="size-full object-cover" aria-hidden="true" /></span
         ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
@@ -2925,7 +3238,7 @@
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(notificationUndoKey)}
+                      use:enhance={setPending(notificationUndoKey, optimisticUndoDecision)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
                       {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
@@ -3312,7 +3625,7 @@
         {:else}
           <section
             aria-label="Read books"
-            aria-busy={readingHistoryState === "loading"}
+            aria-busy={readingHistoryState === "idle" || readingHistoryState === "loading"}
             class="min-w-0"
           >
             {#if readingHistoryState === "ready"}
@@ -3372,8 +3685,8 @@
                 <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
-            {#if readingHistoryState === "loading"}
-              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+            {#if readingHistoryState === "idle" || readingHistoryState === "loading"}
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" aria-busy="true"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
               <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
                 <InlineAlert message={readingHistoryError} />
@@ -5350,7 +5663,7 @@
                     ><BookOpen size={19} /></span
                   >
                   <h2 class="text-reflow flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
-                  <button type="button" class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
+                  <button type="button" class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary" onclick={() => go("decisions", "read")}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if recentReads.length}<div
                     class="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3"
