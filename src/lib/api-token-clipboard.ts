@@ -2,6 +2,11 @@ export type ClipboardWriter = {
   writeText: (text: string) => Promise<void>;
 };
 
+export type ApiTokenCopyStatus = {
+  error: boolean;
+  message: string;
+};
+
 export const COPY_SUCCESS_MESSAGE = "Copied to clipboard.";
 export const COPY_FAILURE_MESSAGE =
   "Copy failed. Select the token above and copy it manually.";
@@ -9,12 +14,14 @@ export const COPY_FAILURE_MESSAGE =
 export async function copyApiTokenText(
   token: string,
   clipboard: ClipboardWriter | undefined,
-) {
-  if (!token || !clipboard) return COPY_FAILURE_MESSAGE;
+): Promise<ApiTokenCopyStatus> {
+  if (!token || !clipboard) {
+    return { error: true, message: COPY_FAILURE_MESSAGE };
+  }
   try {
     await clipboard.writeText(token);
-    return COPY_SUCCESS_MESSAGE;
+    return { error: false, message: COPY_SUCCESS_MESSAGE };
   } catch {
-    return COPY_FAILURE_MESSAGE;
+    return { error: true, message: COPY_FAILURE_MESSAGE };
   }
 }

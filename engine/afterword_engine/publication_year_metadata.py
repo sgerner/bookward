@@ -8,7 +8,7 @@ values out of the publication-era feature.
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
-from datetime import date
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import re
@@ -142,6 +142,7 @@ def _fetch_entity_ledger_rows(db, entity_type: str, entity_ids: Sequence[int]):
         rows = db.execute(
             "SELECT entity_id,field,provider,provider_id,source_payload "
             "FROM metadata_field_provenance WHERE entity_type=? "
+            "AND provider='openlibrary' "
             f"AND entity_id IN ({marks})",
             (entity_type, *batch),
         ).fetchall()
@@ -259,7 +260,11 @@ def _verified_candidate_year(
         )
         if year is not None:
             years.add(year)
-    return next(iter(years)) if len(years) == 1 else None
+    if len(years) != 1:
+        return None
+    year = next(iter(years))
+    max_work_year = datetime.now(timezone.utc).date().year + 1
+    return year if year <= max_work_year else None
 
 
 def attach_publication_years(
