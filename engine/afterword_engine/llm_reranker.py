@@ -487,12 +487,19 @@ def clear_circuit_breaker(profile_key: str | None = None) -> None:
 
 
 def clear_llm_rerank_cache(profile_id: str | None = None) -> None:
-    """Clear cached LLM rerank entries globally or for a single profile."""
+    """Clear cached LLM rerank entries (and any open circuit-breaker state) globally or for a single profile."""
     with _RERANK_CACHE_LOCK:
         if profile_id is None:
             _RERANK_CACHE_BY_PROFILE.clear()
         else:
             _RERANK_CACHE_BY_PROFILE.pop(_profile_cache_scope(profile_id), None)
+    with _STATE_LOCK:
+        if profile_id is None:
+            _CIRCUIT_BREAKER.clear()
+        else:
+            prefix = f"{profile_id.strip()}::"
+            for key in [k for k in _CIRCUIT_BREAKER if k.startswith(prefix)]:
+                _CIRCUIT_BREAKER.pop(key, None)
 
 
 def clear_llm_rerank_state(

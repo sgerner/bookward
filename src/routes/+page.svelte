@@ -24,7 +24,6 @@
     KeyRound,
     Library,
     Link2,
-    LogOut,
     Mail,
     MessageCircle,
     RefreshCw,
@@ -40,9 +39,12 @@
   } from "@lucide/svelte";
   import BookCoverTrigger from "#lib/components/BookCoverTrigger.svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import DiscoverLoadMoreFooter from "#lib/components/DiscoverLoadMoreFooter.svelte";
   import InlineAlert from "#lib/components/InlineAlert.svelte";
   import ModalDialog from "#lib/components/ModalDialog.svelte";
   import LabeledSelect from "#lib/components/LabeledSelect.svelte";
+  import LogoutMenuForm from "#lib/components/LogoutMenuForm.svelte";
+  import MarkReadErrorAlert from "#lib/components/MarkReadErrorAlert.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
@@ -55,7 +57,12 @@
     type ApiTokenCopyStatus,
   } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
+  import {
+    createLogoutSubmit,
+    createMarkReadSubmit,
+  } from "#lib/reader-form-actions.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
     canRunDigestNow,
     canTestDigestChannel,
@@ -68,6 +75,11 @@
     resetLlmRerankOverrides,
     selectLlmCatalogProvider,
   } from "#lib/llm-rerank-ui.js";
+  import {
+    createNotificationChannels,
+    type TransientNotice,
+    type UndoBanner,
+  } from "#lib/notification-channels.js";
   import {
     formatLibrarrSearchStatus,
     formatLlmCatalogStatus,
@@ -176,6 +188,7 @@
   let activeView = $state<View>(initialUrlState.view);
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state<number | null>(0);
+  let markReadError = $state("");
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -192,10 +205,7 @@
   const DISCOVER_PAGE_SIZE = 8;
   const DECISION_PAGE_SIZE = 24;
   const FILTER_DEBOUNCE_MS = 180;
-  const FORM_NOTIFICATION_DISMISS_MS = 5000;
-  const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
-  let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
   let unfilteredDiscoverOffset = $state(
     untrack(() => data.books.filter((book) => book.status === "recommended").length),
@@ -315,23 +325,12 @@
   let digestClearSmtpCredentials = $state(false);
   let apiTokenCopyStatus = $state<ApiTokenCopyStatus | null>(null);
   let revealedApiToken = $state<string | null>(null);
-  let formNotificationDismissed = $state(false);
-  let notificationPointerInside = false;
-  let notificationFocusInside = false;
-  let notificationPaused = false;
-  let formNotificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let formNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
-  let optimisticNotification = $state<{
-    message: string;
-    error: boolean;
-    id: number;
-    undo_id?: number;
-    undo_decisions?: Array<{ id: number; decision_id: number }>;
-    undo_label?: string;
-  } | null>(null);
-  let optimisticNotificationId = 0;
-  let optimisticNotificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
+  let transientNotice = $state<TransientNotice | null>(null);
+  let undoBanner = $state<UndoBanner | null>(null);
+  const notifications = createNotificationChannels((snapshot) => {
+    transientNotice = snapshot.transientNotice;
+    undoBanner = snapshot.undoBanner;
+  });
   let defaultSourceEnabledOverride = $state<boolean | null>(null);
   let sourceEnabledOverrides = $state<Record<number, boolean>>({});
   let openSourceEditIds = $state(new Set<number>());
@@ -848,9 +847,9 @@
     llmCatalogError = "";
     try {
       const response = await fetch("/api/llm/models");
-      const body = await response.json();
+      const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        llmCatalogError = body?.message || "Could not load models.dev catalog.";
+        llmCatalogError = payloadErrorMessage(body, "Could not load models.dev catalog.");
         return;
       }
       llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
@@ -996,77 +995,16 @@
     },
   ]);
   const formState = $derived((form ?? null) as FormState);
-  const visibleNotification = $derived(
-    optimisticNotification ??
-      (formState?.message && !formNotificationDismissed ? formState : null),
-  );
-  const formIsError = $derived(Boolean(visibleNotification?.error));
-
-  function scheduleFormNotificationDismiss() {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    if (untrack(() => notificationPaused || Boolean(optimisticNotification))) return;
-    if (formNotificationDismissDelay === 0) return;
-    formNotificationTimer = setTimeout(() => {
-      formNotificationDismissed = true;
-      formNotificationTimer = null;
-    }, formNotificationDismissDelay);
-  }
-
-  function scheduleOptimisticNotificationDismiss() {
-    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-    optimisticNotificationTimer = null;
-    const id = optimisticNotification?.id;
-    if (id === undefined || notificationPaused) return;
-    optimisticNotificationTimer = setTimeout(() => {
-      if (optimisticNotification?.id !== id) return;
-      optimisticNotification = null;
-      formNotificationDismissed = true;
-      optimisticNotificationTimer = null;
-    }, optimisticNotificationDismissDelay);
-  }
-
-  function updateNotificationPause() {
-    const shouldPause = notificationPointerInside || notificationFocusInside;
-    if (shouldPause === notificationPaused) return;
-    notificationPaused = shouldPause;
-    if (notificationPaused) {
-      if (formNotificationTimer) clearTimeout(formNotificationTimer);
-      if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-      formNotificationTimer = null;
-      optimisticNotificationTimer = null;
-    } else if (optimisticNotification) {
-      scheduleOptimisticNotificationDismiss();
-    } else if (formState?.message && !formNotificationDismissed) {
-      scheduleFormNotificationDismiss();
-    }
-  }
+  const formIsError = $derived(Boolean(transientNotice?.error));
 
   function onNotificationFocusOut(event: FocusEvent) {
     const container = event.currentTarget as HTMLElement;
     if (event.relatedTarget instanceof Node && container.contains(event.relatedTarget)) return;
-    notificationFocusInside = false;
-    updateNotificationPause();
+    notifications.setFocusInside(false);
   }
 
   $effect(() => {
-    // Read the prop itself so identical messages from separate submissions
-    // still restart the notification timer.
-    const currentForm = form as FormState;
-    const message = currentForm?.message;
-    formNotificationDismissed = false;
-    if (!message) return;
-
-    formNotificationDismissDelay = currentForm?.error
-      ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id || currentForm?.undo_decisions?.length
-        ? 0
-        : FORM_NOTIFICATION_DISMISS_MS;
-    scheduleFormNotificationDismiss();
-    return () => {
-      if (formNotificationTimer) clearTimeout(formNotificationTimer);
-      formNotificationTimer = null;
-    };
+    notifications.applyForm(form as FormState);
   });
 
   function resetClientPagination() {
@@ -1129,10 +1067,11 @@
       const payload = (await response.json().catch(() => ({}))) as {
         items?: ReadingHistoryItem[];
         message?: string;
+        detail?: string;
       };
       if (generation !== readingHistoryGeneration) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Reading history could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Reading history could not be loaded."));
       }
       readingHistory = payload.items;
       readingHistoryImmediate = true;
@@ -1180,12 +1119,15 @@
             const payload = (await response.json().catch(() => ({}))) as {
               scores?: ReadingHistoryScorePatch[];
               message?: string;
+              detail?: string;
             };
             return {
               ok: response.ok,
               status: response.status,
               scores: payload.scores,
-              message: payload.message,
+              message: response.ok
+                ? payload.message
+                : payloadErrorMessage(payload, "Reading history scores could not be loaded."),
             };
           },
           onBatch: ({ nextOffset, buffered }) => {
@@ -1254,9 +1196,12 @@
       const payload = (await response.json().catch(() => ({}))) as {
         item?: { rating?: number | null };
         message?: string;
+        detail?: string;
       };
       if (!response.ok) {
-        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+        throw new Error(
+          payloadErrorMessage(payload, "Rating could not be saved. Your change was reverted."),
+        );
       }
       return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
     },
@@ -1423,32 +1368,11 @@
     section.focus({ preventScroll: true });
   }
   function announceActionError(message: string) {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    const id = ++optimisticNotificationId;
-    formNotificationDismissed = true;
-    optimisticNotification = { message, error: true, id };
-    optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
-    scheduleOptimisticNotificationDismiss();
+    notifications.announceError(message);
   }
 
   function announceActionSuccess(message: string) {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    const id = ++optimisticNotificationId;
-    formNotificationDismissed = true;
-    optimisticNotification = { message, error: false, id };
-    optimisticNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
-    scheduleOptimisticNotificationDismiss();
-  }
-
-  function dismissNotification() {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-    optimisticNotificationTimer = null;
-    optimisticNotification = null;
-    formNotificationDismissed = true;
+    notifications.announceSuccess(message);
   }
 
   function withPending(key: string, add: boolean) {
@@ -1457,6 +1381,74 @@
     else next.delete(key);
     pendingActions = next;
   }
+
+  function submitUndoDecision(key: string): SubmitFunction {
+    return ({ formData }) => {
+      withPending(key, true);
+      let change: OptimisticChange | void;
+      try {
+        change = optimisticUndoDecision(formData);
+      } catch {
+        change = undefined;
+      }
+      return async ({ update, result }) => {
+        const succeeded = result.type === "success" || result.type === "redirect";
+        const rollback = () => {
+          try {
+            change?.rollback?.();
+          } catch {
+            // A rollback must never obscure the action result.
+          }
+        };
+        try {
+          if (!succeeded) {
+            rollback();
+          }
+          if (result.type === "error") {
+            announceActionError(actionResultMessage(result));
+            return;
+          }
+          if (succeeded) {
+            notifications.clearUndoKey(key);
+          }
+          await update({ navigate: false });
+          if (succeeded) change?.commit?.();
+        } catch (error) {
+          rollback();
+          announceActionError(
+            error instanceof Error
+              ? error.message
+              : "The request could not be completed. Your change was reverted.",
+          );
+        } finally {
+          withPending(key, false);
+        }
+      };
+    };
+  }
+
+  function submitMarkRead(bookId: number): SubmitFunction {
+    return createMarkReadSubmit({
+      bookId,
+      setError: (message) => {
+        markReadError = message;
+      },
+      setPending: withPending,
+      startOptimistic: optimisticShortlistRead,
+      onSuccess: () => {
+        resetReadingHistory();
+        notifications.clearUndoForBook(bookId);
+      },
+    });
+  }
+
+  const submitLogout: SubmitFunction = createLogoutSubmit({
+    setPending: (pending) => withPending("logout", pending),
+    closeMenu: () => {
+      profileMenuOpen = false;
+    },
+    announceError: announceActionError,
+  });
 
   function setPending(
     key: string,
@@ -1492,9 +1484,6 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-          optimisticNotificationTimer = null;
-          optimisticNotification = null;
           await update(
             isLlmTest ? { reset: false, navigate: false } : { navigate: false },
           );
@@ -2131,10 +2120,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (discoverFilterAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Recommendations could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Recommendations could not be loaded."));
       }
       filteredDiscoverBooks = payload.items;
       filteredDiscoverOffset = payload.items.length;
@@ -2210,10 +2200,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (discoverFilterAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Recommendations could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Recommendations could not be loaded."));
       }
       if (filteredMode) {
         if (activeDiscoverFilterKey !== expectedFilterKey) return;
@@ -2278,10 +2269,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (decisionQueryAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Past decisions could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Past decisions could not be loaded."));
       }
       queriedDecisionBooks = payload.items;
       queriedDecisionOffset = payload.items.length;
@@ -2348,10 +2340,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (decisionQueryAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Past decisions could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Past decisions could not be loaded."));
       }
       if (queriedMode) {
         if (activeDecisionQueryKey !== expectedKey) return;
@@ -2528,10 +2521,13 @@
     openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
+    markReadError = "";
+    openReadMenuId = null;
   }
   function closeMarkRead() {
     markReadBook = null;
     markReadRating = 0;
+    markReadError = "";
   }
   function closeLibrarrSearch() {
     librarrSearchAbortController?.abort();
@@ -2797,39 +2793,6 @@
       decisionsGenre = "";
     }
   });
-
-  $effect(() => {
-    const sentinel = loadMoreSentinel;
-    const canLoadMore = hasMoreDiscoverBooks;
-    const loading = discoverLoading;
-    const pending = filteredDiscoverPending;
-    const hasError = Boolean(discoverLoadError);
-    const visibleCount = discoverViewVisibleBooks.length;
-    const serverOffset = hasActiveDiscoverFilter
-      ? filteredDiscoverOffset
-      : unfilteredDiscoverOffset;
-    void visibleCount;
-    void serverOffset;
-    if (
-      !sentinel ||
-      !canLoadMore ||
-      loading ||
-      pending ||
-      hasError ||
-      typeof IntersectionObserver === "undefined"
-    )
-      return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!discoverLoadError && entries.some((entry) => entry.isIntersecting)) {
-          void loadMoreDiscover();
-        }
-      },
-      { rootMargin: "240px 0px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  });
   function handleLibrarrMediaTypeChange(event: Event) {
     const nextMediaType: MediaType =
       (event.currentTarget as HTMLSelectElement).value === "ebook"
@@ -2895,9 +2858,10 @@
         const payload = (await response.json().catch(() => ({}))) as {
           results?: unknown[];
           message?: string;
+          detail?: string;
         };
         if (!response.ok)
-          throw new Error(payload.message || "Librarr search failed.");
+          throw new Error(payloadErrorMessage(payload, "Librarr search failed."));
         librarrResults = Array.isArray(payload.results)
           ? payload.results.filter((item): item is LibrarrResult =>
               Boolean(item && typeof item === "object" && !Array.isArray(item)),
@@ -2910,8 +2874,9 @@
         if (!response.ok) {
           const payload = (await response.json().catch(() => ({}))) as {
             message?: string;
+            detail?: string;
           };
-          throw new Error(payload.message || "Librarr search failed.");
+          throw new Error(payloadErrorMessage(payload, "Librarr search failed."));
         }
         if (!isEventStream) throw new Error("Librarr did not return a search stream.");
         const progress = await readLibrarrSearchStream(response, (results) => {
@@ -2961,9 +2926,11 @@
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
+        detail?: string;
       };
       if (!response.ok)
-        throw new Error(payload.message || "Librarr could not add that book.");
+        throw new Error(payloadErrorMessage(payload, "Librarr could not add that book."));
+      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -3080,7 +3047,10 @@
                   },
                   body,
                 });
-                if (!response.ok) throw new Error("Could not shortlist that book.");
+                if (!response.ok) {
+                  const payload = await response.json().catch(() => ({}));
+                  throw new Error(payloadErrorMessage(payload, "Could not shortlist that book."));
+                }
                 await applyAction(deserialize(await response.text()));
                 await invalidateAll();
                 change?.commit?.();
@@ -3101,6 +3071,7 @@
     }
     return () => {
       lifecycle.abort();
+      notifications.destroy();
       if (discoverFilterDebounceTimer) clearTimeout(discoverFilterDebounceTimer);
       if (decisionQueryDebounceTimer) clearTimeout(decisionQueryDebounceTimer);
       discoverFilterAbortController?.abort();
@@ -3203,10 +3174,11 @@
               {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
               <ThemePicker compact />
             </div>
-            <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
-              <ProfileField profileId={data.user?.profile_id} />
-              <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} aria-hidden="true" />Sign out</button>
-            </form>
+            <LogoutMenuForm
+              profileId={data.user?.profile_id}
+              pending={isPending("logout")}
+              onSubmit={submitLogout}
+            />
           {/snippet}
         </PopoverDialog>
       </div>
@@ -3222,97 +3194,132 @@
         role={formIsError ? "alert" : "status"}
         aria-live={formIsError ? "assertive" : "polite"}
         aria-atomic="true"
-      >{visibleNotification?.message ?? ""}</div>
-      {#if visibleNotification}
-        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
-          ? visibleNotification.undo_decisions
-          : visibleNotification.undo_id && visibleNotification.id
-            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
-            : []}
-        {@const notificationUndoKey = notificationUndoDecisions.length
-          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
-          : null}
-        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
-          <div
-            class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
-          >
-            <div
-              in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
-              out:fly={{ x: 16, duration: motionDuration(170) }}
-              class={`pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
-              role="group"
-              aria-label={formIsError ? "Action error notification" : "Action success notification"}
-              onpointerenter={() => {
-                notificationPointerInside = true;
-                updateNotificationPause();
-              }}
-              onpointerleave={() => {
-                notificationPointerInside = false;
-                updateNotificationPause();
-              }}
-              onfocusin={() => {
-                notificationFocusInside = true;
-                updateNotificationPause();
-              }}
-              onfocusout={onNotificationFocusOut}
-            >
-              <span
-                aria-hidden="true"
-                class={`absolute inset-y-0 left-0 w-1 ${formIsError ? "bg-error-500" : "bg-success-500"}`}
-              ></span>
-              <div class="flex items-start gap-3 pl-1">
+      >{transientNotice?.message ?? ""}</div>
+      <StatusRegion
+        message={undoBanner?.message ?? ""}
+        immediate
+        announceOnMount
+      />
+      {#if undoBanner || transientNotice}
+        <div
+          inert={Boolean(markReadBook || librarrSearchOpen)}
+          class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex flex-col items-end gap-3 px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
+        >
+          {#if undoBanner}
+            {#key undoBanner.key}
+              <div
+                in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+                out:fly={{ x: 16, duration: motionDuration(170) }}
+                class="pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border border-success-500/25 bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl"
+                role="group"
+                aria-label="Decision undo notification"
+              >
                 <span
-                  class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
                   aria-hidden="true"
-                >
-                  {#if formIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
-                </span>
-                <div class="min-w-0 flex-1">
-                  <p
-                    class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${formIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                  class="absolute inset-y-0 left-0 w-1 bg-success-500"
+                ></span>
+                <div class="flex items-start gap-3 pl-1">
+                  <span
+                    class="mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl preset-tonal-success"
+                    aria-hidden="true"
                   >
-                    {formIsError ? "Action needs attention" : "All set"}
-                  </p>
-                  <p class="leading-relaxed text-surface-900-100">
-                    {visibleNotification.message}
-                  </p>
-                  {#if notificationUndoDecisions.length && notificationUndoKey}
+                    <Check size={18} />
+                  </span>
+                  <div class="min-w-0 flex-1">
+                    <p
+                      class="mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-success-600-400"
+                    >
+                      All set
+                    </p>
+                    <p class="leading-relaxed text-surface-900-100">
+                      {undoBanner.message}
+                    </p>
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(notificationUndoKey, optimisticUndoDecision)}
+                      use:enhance={submitUndoDecision(undoBanner.key)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                      {#each undoBanner.decisions as item (`${item.id}-${item.decision_id}`)}
                         <input type="hidden" name="id" value={item.id} />
                         <input type="hidden" name="decision_id" value={item.decision_id} />
                       {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(notificationUndoKey)}
-                        aria-busy={isPending(notificationUndoKey)}
-                        aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
+                        disabled={isPending(undoBanner.key)}
+                        aria-busy={isPending(undoBanner.key)}
+                        aria-label={`Undo ${undoBanner.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(undoBanner.key)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
-                  {/if}
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                    aria-label="Dismiss undo notification"
+                    onclick={() => notifications.dismissUndo()}
+                  >
+                    <X size={15} />
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
-                  aria-label="Dismiss notification"
-                  onclick={dismissNotification}
-                >
-                  <X size={15} />
-                </button>
               </div>
+            {/key}
+          {/if}
+          {#if transientNotice}
+            <div
+              class="pointer-events-auto w-full max-w-md"
+              role="group"
+              aria-label={formIsError ? "Action error notification" : "Action success notification"}
+              onpointerenter={() => notifications.setPointerInside(true)}
+              onpointerleave={() => notifications.setPointerInside(false)}
+              onfocusin={() => notifications.setFocusInside(true)}
+              onfocusout={onNotificationFocusOut}
+            >
+              {#key transientNotice.id}
+                <div
+                  in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+                  out:fly={{ x: 16, duration: motionDuration(170) }}
+                  class={`relative w-full overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
+                >
+                  <span
+                    aria-hidden="true"
+                    class={`absolute inset-y-0 left-0 w-1 ${formIsError ? "bg-error-500" : "bg-success-500"}`}
+                  ></span>
+                  <div class="flex items-start gap-3 pl-1">
+                    <span
+                      class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
+                      aria-hidden="true"
+                    >
+                      {#if formIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
+                    </span>
+                    <div class="min-w-0 flex-1">
+                      <p
+                        class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${formIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                      >
+                        {formIsError ? "Action needs attention" : "All set"}
+                      </p>
+                      <p class="leading-relaxed text-surface-900-100">
+                        {transientNotice.message}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                      aria-label="Dismiss notification"
+                      onclick={() => notifications.dismissTransient()}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+              {/key}
             </div>
-          </div>
-        {/key}
+          {/if}
+        </div>
       {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
@@ -3654,10 +3661,15 @@
                   </button>
                 </form>{/if}
               </div>{/if}{/each}
-          {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              <InlineAlert message={discoverLoadError} />
-              <button type="button" class="btn btn-sm btn-reflow preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
-            </div>{/if}
+          {#if viewHasMoreDiscoverBooks}
+            <DiscoverLoadMoreFooter
+              observeEnabled={hasMoreDiscoverBooks && !filteredDiscoverPending}
+              loading={discoverLoading}
+              error={discoverLoadError}
+              resetKey={`${discoverViewVisibleBooks.length}:${hasActiveDiscoverFilter ? filteredDiscoverOffset : unfilteredDiscoverOffset}`}
+              onLoadMore={loadMoreDiscover}
+            />
+          {/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
               <InlineAlert message={decisionsLoadError} />
               <button type="button" class="btn btn-sm btn-reflow preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
@@ -5842,7 +5854,7 @@
           ><X size={17} /></button>
         </div>
 
-        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
+        <form method="POST" action="?/markRead" use:enhance={submitMarkRead(markReadBook.id)}>
           <div class="min-w-0 p-4 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
@@ -5870,6 +5882,11 @@
             </div>
 
             <p id="mark-read-description" class="mt-5 max-w-md text-sm leading-6 text-surface-700-300">Add this book to your read history. You can leave a rating now, or keep the moment unrated.</p>
+
+            <MarkReadErrorAlert
+              message={markReadError}
+              transitionDuration={motionDuration(180)}
+            />
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">

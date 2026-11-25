@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { engine } = vi.hoisted(() => ({
 	engine: vi.fn()
@@ -14,24 +14,84 @@ vi.mock('#lib/server/engine.js', async (importOriginal) => {
 });
 
 import { EngineError } from '#lib/server/engine.js';
-import { actions } from './+page.server';
+import { actions, load } from './+page.server';
+
+describe('admin page loader', () => {
+	beforeEach(() => engine.mockReset());
+	afterEach(() => engine.mockReset());
+
+	it('throws HTTP 503 instead of redirecting when hooks report an engine outage', async () => {
+		await expect(
+			load({
+				locals: { engineUnavailable: true }
+			} as never)
+		).rejects.toMatchObject({ status: 503 });
+		expect(engine).not.toHaveBeenCalled();
+	});
+
+	it('converts upstream /admin/accounts failures to HTTP 503', async () => {
+		engine.mockImplementation(async () => {
+			throw new Error('upstream offline');
+		});
+
+		await expect(
+			load({
+				locals: {
+					user: {
+						id: 'admin-1',
+						profile_id: 'admin-profile',
+						username: 'admin',
+						display_name: 'Admin',
+						role: 'admin',
+						must_change_password: false
+					}
+				}
+			} as never)
+		).rejects.toMatchObject({ status: 503 });
+	});
+});
 
 const makeLongInput = () => randomUUID();
 const makeShortInput = () => randomUUID().slice(0, 8);
 
+function makeRequest(fields: Record<string, string>) {
+	const body = new URLSearchParams(fields);
+	return new Request('https://bookward.test/admin', {
+		method: 'POST',
+		headers: { 'content-type': 'application/x-www-form-urlencoded' },
+		body
+	});
+}
+
 function assertNoPasswordEcho(result: unknown, submitted: string) {
-	const payload = (result as { data?: { values?: Record<string, unknown> } })?.data ?? result;
+	const payload = (result as { data?: Record<string, unknown> })?.data ?? result;
 	expect(payload).not.toHaveProperty('password');
+	expect(payload).not.toHaveProperty('current_password');
 	if (payload && typeof payload === 'object' && 'values' in payload && payload.values) {
 		expect(payload.values).not.toHaveProperty('password');
+		expect(payload.values).not.toHaveProperty('current_password');
 	}
 	expect(JSON.stringify(result)).not.toContain(submitted);
 }
 
-
-describe('admin page actions', () => {
+describe('admin page load and actions', () => {
 	beforeEach(() => {
 		engine.mockReset();
+	});
+
+	it('loads accounts, identity backup status, and admin password_enabled flag', async () => {
+		engine
+			.mockResolvedValueOnce({ accounts: [{ id: 'admin-1', username: 'owner' }] })
+			.mockResolvedValueOnce({ enabled: true, interval_hours: 24, backups: [] })
+			.mockResolvedValueOnce({ password_enabled: true });
+
+		const loaded = await load({
+			locals: { user: { id: 'admin-1', role: 'admin', profile_id: 'legacy' } }
+		} as never);
+		expect(loaded).toMatchObject({
+			current_user_id: 'admin-1',
+			password_enabled: true
+		});
 	});
 
 	it('returns fieldErrors, preserves non-secret values, and never echoes password when creating an account with invalid fields', async () => {
@@ -115,11 +175,11 @@ describe('admin page actions', () => {
 		const engineBody = new FormData();
 		engineBody.set('account_id', 'acct-42');
 		engineBody.set('password', fullCandidate);
-		const engineResult = await actions.resetPassword!({
+		const engineCallResult = await actions.resetPassword!({
 			request: new Request('https://bookward.test/admin', { method: 'POST', body: engineBody })
 		} as never);
 
-		expect(engineResult).toMatchObject({
+		expect(engineCallResult).toMatchObject({
 			status: 400,
 			data: {
 				formId: 'resetPassword-acct-42',
@@ -127,7 +187,7 @@ describe('admin page actions', () => {
 				fieldErrors: {}
 			}
 		});
-		assertNoPasswordEcho(engineResult, fullCandidate);
+		assertNoPasswordEcho(engineCallResult, fullCandidate);
 	});
 
 	it('scopes setStatus failures to the submitted account row and handles missing or blank account_id cleanly', async () => {
@@ -183,6 +243,114 @@ describe('admin page actions', () => {
 				message: 'Cannot disable the last active administrator.'
 			}
 		});
+
+		engine.mockResolvedValueOnce({ updated: true, status: 'disabled' });
+		const disabled = await actions.setStatus!({
+			request: makeRequest({ account_id: 'reader-2', status: 'disabled' })
+		} as never);
+		expect(disabled).toEqual({ formId: 'setStatus-reader-2', message: 'Account disabled.' });
+	});
+
+	it('validates username confirmation, scopes errors to the target account row, and deletes target accounts without echoing passwords', async () => {
+		const locals = { user: { id: 'admin-1', role: 'admin', profile_id: 'legacy' } };
+		const adminCandidate = makeLongInput();
+		const wrongCandidate = makeLongInput();
+
+		const missingUsername = await actions.deleteAccount!({
+			request: makeRequest({
+				account_id: 'reader-2',
+				confirm_username: '',
+				current_password: adminCandidate
+			}),
+			locals
+		} as never);
+		expect(missingUsername).toMatchObject({
+			status: 400,
+			data: {
+				formId: 'deleteAccount-reader-2',
+				error: true,
+				message: expect.stringContaining('username'),
+				fieldErrors: {
+					confirm_username: 'Type the username to confirm deleting this account.'
+				}
+			}
+		});
+		assertNoPasswordEcho(missingUsername, adminCandidate);
+		expect(engine).not.toHaveBeenCalled();
+
+		engine.mockRejectedValueOnce(new EngineError('Current password is incorrect', 401));
+		const wrongPassword = await actions.deleteAccount!({
+			request: makeRequest({
+				account_id: 'reader-2',
+				confirm_username: 'alice',
+				current_password: wrongCandidate
+			}),
+			locals
+		} as never);
+		expect(wrongPassword).toMatchObject({
+			status: 401,
+			data: {
+				formId: 'deleteAccount-reader-2',
+				error: true,
+				message: 'Current password is incorrect',
+				fieldErrors: {
+					current_password: 'Current password is incorrect'
+				}
+			}
+		});
+		assertNoPasswordEcho(wrongPassword, wrongCandidate);
+
+		engine.mockResolvedValueOnce({ deleted: true, username: 'alice' });
+		const deleted = await actions.deleteAccount!({
+			request: makeRequest({
+				account_id: 'reader-2',
+				confirm_username: 'alice',
+				current_password: adminCandidate
+			}),
+			locals
+		} as never);
+		expect(engine).toHaveBeenLastCalledWith(
+			'/admin/accounts/reader-2',
+			{
+				method: 'DELETE',
+				body: JSON.stringify({
+					confirm_username: 'alice',
+					current_password: adminCandidate
+				})
+			},
+			600_000
+		);
+		expect(deleted).toEqual({
+			formId: 'deleteAccount',
+			message: 'Account alice deleted.'
+		});
+	});
+
+	it('surfaces engine errors when attempting to delete self or sole administrator', async () => {
+		const locals = { user: { id: 'admin-1', role: 'admin', profile_id: 'legacy' } };
+		const adminCandidate = makeLongInput();
+		engine.mockRejectedValueOnce(
+			new EngineError('Use Account settings to delete your own account', 400)
+		);
+
+		const selfDelete = await actions.deleteAccount!({
+			request: makeRequest({
+				account_id: 'admin-1',
+				confirm_username: 'owner',
+				current_password: adminCandidate
+			}),
+			locals
+		} as never);
+		expect(selfDelete).toMatchObject({
+			status: 400,
+			data: {
+				formId: 'deleteAccount-admin-1',
+				error: true,
+				message: 'Use Account settings to delete your own account',
+				fieldErrors: {}
+			}
+		});
+		assertNoPasswordEcho(selfDelete, adminCandidate);
 	});
 
 	it('maps a 404 unlock target through failure() with per-row formId, error=true, and exact status', async () => {

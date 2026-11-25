@@ -211,7 +211,7 @@ describe("page actions", () => {
     expect(isHttpError(thrown, 503)).toBe(true);
     if (isHttpError(thrown, 503)) {
       expect(thrown.body.message).toBe(
-        "Bookward's recommendation engine is unavailable. connect ECONNREFUSED 127.0.0.1:8000",
+        "Bookward's recommendation engine is unavailable.",
       );
     }
     expect(warnSpy).not.toHaveBeenCalled();
@@ -1065,7 +1065,7 @@ describe("page actions", () => {
 
     await expect(actions.rebuildEmbeddings!({} as never)).resolves.toMatchObject({
       status: 502,
-      data: { message: "Connection refused", error: true },
+      data: { message: "Bookward's recommendation engine is unavailable.", error: true },
     });
   });
 
@@ -1271,7 +1271,7 @@ describe("page actions", () => {
 
     await expect(actions.runSync!({} as never)).resolves.toMatchObject({
       status: 502,
-      data: { message: "Sync unreachable", error: true },
+      data: { message: "Bookward's recommendation engine is unavailable.", error: true },
     });
   });
 
@@ -1436,6 +1436,45 @@ describe("page actions", () => {
       ids: [7, 8],
       action: "save",
     });
+  });
+
+  it("throws HTTP 503 without contacting the engine when hooks report an outage", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      load({
+        url: new URL("http://afterword.test/"),
+        locals: { engineUnavailable: true },
+      } as never),
+    ).rejects.toMatchObject({
+      status: 503,
+      body: { message: "Bookward's recommendation engine is unavailable." },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws HTTP 503 without leaking internal error paths when overview fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("sqlite3.OperationalError: /tmp/secret/engine.db")),
+    );
+
+    let caught: unknown;
+    try {
+      await load({
+        url: new URL("http://afterword.test/"),
+        locals: { user: undefined },
+      } as never);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      status: 503,
+      body: { message: "Bookward's recommendation engine is unavailable." },
+    });
+    expect(JSON.stringify(caught)).not.toContain("engine.db");
   });
 
   it("renames a custom source without running preview when its URL is unchanged", async () => {
