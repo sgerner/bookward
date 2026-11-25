@@ -10,11 +10,14 @@ import sqlite3
 import time
 import uuid
 import weakref
+from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
+import numpy as np
 from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,7 +86,7 @@ from .http_bounds import (
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
-from .ranking import rank_candidates
+from .ranking import normalize_explanation_items, rank_candidates
 from .secrets import auth_registry_key, installation_key_path, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -1828,7 +1831,12 @@ def _format_recommendation_item(
 ) -> dict[str, Any]:
     formatted = dict(item)
     formatted["genres"] = _parse_json_list(formatted.get("genres"))
-    formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    formatted["explanation"] = normalize_explanation_items(
+        _parse_json_list(formatted.get("explanation")),
+        genres=formatted["genres"],
+        author=formatted.get("author"),
+        release_date=formatted.get("release_date"),
+    )
     if format_urls:
         _format_recommendation_urls([formatted])
     return formatted
@@ -2549,10 +2557,108 @@ def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn)
     }
 
 
+READING_HISTORY_SCORE_MAX_LIMIT = 200
+_RATED_READ_VECTOR_CACHE_MAX_ENTRIES = 8
+# Bounded by entry count (8 LRU profiles/states); individual entries are not
+# size-capped and hold one frozen float64 vector per rated read in that profile.
+_RATED_READ_VECTOR_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, ...]] = OrderedDict()
+
+
+def _rated_read_state_digest(rated_reads: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for item in rated_reads:
+        digest.update(
+            json.dumps(
+                (
+                    item.get("id"),
+                    item.get("title"),
+                    item.get("author"),
+                    item.get("rating"),
+                    item.get("read_at"),
+                    item.get("genres"),
+                    item.get("description"),
+                ),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _format_read_embedding_digest(entries: Sequence[Any]) -> str:
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
+    query = (
+        "SELECT entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+        "FROM embeddings WHERE entity_type='read' AND backend=? AND model=? "
+        "ORDER BY entity_id"
+    )
+    entries = (
+        connection.execute(query, (backend, model)).fetchall()
+        if connection is not None
+        else rows(query, (backend, model))
+    )
+    return _format_read_embedding_digest(entries)
+
+
+async def _cached_rated_read_vectors(
+    embedder,
+    config: dict[str, Any],
+    rated_reads: list[dict[str, Any]],
+    embedding_cache_digest: str,
+) -> Sequence[Sequence[float]]:
+    tenant_key = (
+        current_profile_id() or "legacy",
+        str(profile_database_path().resolve()),
+    )
+    embedder_base_key = (
+        type(embedder).__qualname__,
+        str(embedder.name),
+        str(embedder.model),
+        str(config.get("embedding_backend") or ""),
+        str(config.get("embedding_model") or ""),
+        str(getattr(embedder, "url", None) or config.get("embedding_url") or ""),
+    )
+    reads_state_key = _rated_read_state_digest(rated_reads)
+    lookup_key = (tenant_key, (*embedder_base_key, embedding_cache_digest), reads_state_key)
+    cached = _RATED_READ_VECTOR_CACHE.get(lookup_key)
+    if cached is not None:
+        _RATED_READ_VECTOR_CACHE.move_to_end(lookup_key)
+        return cached
+
+    computed = await cached_vectors(embedder, "read", rated_reads)
+    frozen: list[np.ndarray] = []
+    for vector in computed:
+        arr = np.asarray(vector, dtype=np.float64).copy()
+        arr.setflags(write=False)
+        frozen.append(arr)
+    stored = tuple(frozen)
+    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
+    _RATED_READ_VECTOR_CACHE[store_key] = stored
+    _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
+    while len(_RATED_READ_VECTOR_CACHE) > _RATED_READ_VECTOR_CACHE_MAX_ENTRIES:
+        _RATED_READ_VECTOR_CACHE.popitem(last=False)
+    return stored
+
+
 @app.get("/api/reading-history/scores")
 async def reading_history_scores(
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=20),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
     with connect() as connection:
@@ -2561,6 +2667,8 @@ async def reading_history_scores(
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
+        if not items:
+            return []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -2578,8 +2686,20 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-    if not items:
-        return []
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+        read_embedding_rows = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+            ).fetchall()
+        ]
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -2607,42 +2727,48 @@ async def reading_history_scores(
         virtual_candidates.append(virtual)
 
     try:
-        if virtual_candidates:
-            config = private_settings()
-            embedder = get_embedder(
-                config.get("embedding_backend"),
-                config.get("embedding_model"),
-                config.get("embedding_url"),
-                config.get("embedding_api_key"),
-            )
-            rated_reads = rows(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            )
-            read_vectors = await cached_vectors(embedder, "read", rated_reads)
-            candidate_vectors = await cached_vectors(
-                embedder,
-                "read_candidate",
-                virtual_candidates,
-                persist=False,
-                expected_dimensions=_vector_dimensions(read_vectors),
-            )
-            ranked = rank_candidates(
-                rated_reads,
-                read_vectors,
-                virtual_candidates,
-                candidate_vectors,
-                exclude_candidate_identity=True,
-            )
-            ranked_by_id = {int(item["id"]): item for item in ranked}
-            return [
-                {
-                    "id": int(item["id"]),
-                    "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
-                    "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
-                    "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
-                }
-                for item in items
+        embedder = get_embedder(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        embedding_cache_digest = _format_read_embedding_digest(
+            [
+                entry
+                for entry in read_embedding_rows
+                if entry["backend"] == embedder.name and entry["model"] == embedder.model
             ]
+        )
+        read_vectors = await _cached_rated_read_vectors(
+            embedder, config, rated_reads, embedding_cache_digest
+        )
+        candidate_vectors = await cached_vectors(
+            embedder,
+            "read_candidate",
+            virtual_candidates,
+            persist=False,
+            expected_dimensions=_vector_dimensions(read_vectors),
+        )
+        ranked = rank_candidates(
+            rated_reads,
+            read_vectors,
+            virtual_candidates,
+            candidate_vectors,
+            exclude_candidate_identity=True,
+        )
+        ranked_by_id = {int(item["id"]): item for item in ranked}
+        return [
+            {
+                "id": int(item["id"]),
+                "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
+                "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
+                "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
+            }
+            for item in items
+        ]
+    except RestoreEpochError:
+        raise
     except Exception:
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise
@@ -2860,7 +2986,12 @@ def recommendation_list(
         )
     for item in result:
         item["genres"] = _parse_json_list(item.get("genres"))
-        item["explanation"] = _parse_json_list(item.get("explanation"))
+        item["explanation"] = normalize_explanation_items(
+            _parse_json_list(item.get("explanation")),
+            genres=item["genres"],
+            author=item.get("author"),
+            release_date=item.get("release_date"),
+        )
     if format_urls:
         _format_recommendation_urls(result)
     return result

@@ -10,9 +10,10 @@ and a replacement must be within five points of the displaced book's score.
 This lets a candidate from as low as rank 11 move into the first eight while
 keeping the rank movement bounded. The pass tries to avoid a third book by the
 same author in the visible slate and pairs whose current hash-valid candidate
-vectors have cosine similarity of at least 0.90. If it cannot find a
-qualifying alternative, it leaves the book in place. Scores and explanations
-remain those produced by the existing ranker; only the item order changes.
+vectors have cosine similarity of at least 0.75. If it cannot find a
+qualifying alternative, it leaves the book in place. Scores remain those
+produced by the existing ranker, while promoted books append a plain-language
+variety note to their explanation.
 
 The author limit and similarity threshold are soft selection rules, not
 eligibility filters. They do not remove an author or a subject from the

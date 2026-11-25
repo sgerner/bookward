@@ -82,7 +82,7 @@ describe('MarkReadErrorAlert and createMarkReadSubmit', () => {
 			result: { type: 'success', status: 200, data: { message: 'Marked as read.' } }
 		});
 
-		expect(update).toHaveBeenCalledWith({ reset: false });
+		expect(update).toHaveBeenCalledWith({ reset: false, navigate: false });
 		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expect(commit).toHaveBeenCalledTimes(1);
 		expect(rollback).not.toHaveBeenCalled();

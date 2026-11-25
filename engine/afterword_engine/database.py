@@ -1226,6 +1226,17 @@ MIGRATIONS = [
         END;
         """,
     ),
+    # Migration 30 adds structured secondary contributor storage for Goodreads
+    # CSV imports without a historical backfill: existing reads and shelf rows
+    # default to '' and match no secondary co-authors until the user re-imports
+    # their Goodreads CSV export.
+    (
+        30,
+        """
+        ALTER TABLE reads ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
+        ALTER TABLE goodreads_shelf_items ADD COLUMN additional_authors TEXT NOT NULL DEFAULT '';
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the

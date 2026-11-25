@@ -44,6 +44,7 @@ describe("page actions", () => {
     const pageBookKeys = [
       "author",
       "cover_url",
+      "explanation",
       "genres",
       "id",
       "metadata_confidence",
@@ -161,6 +162,7 @@ describe("page actions", () => {
         score: 94,
         metadata_confidence: 0.92,
         synopsis: "Recommended summary",
+        explanation: ["Matches rated books", "Trusted list"],
         reason: "Matches rated books · Trusted list",
         status: "recommended",
       },
@@ -180,6 +182,7 @@ describe("page actions", () => {
         score: 81,
         metadata_confidence: 0.8,
         synopsis: "A description",
+        explanation: ["A good match"],
         reason: "A good match",
         status: "maybe_later",
       },

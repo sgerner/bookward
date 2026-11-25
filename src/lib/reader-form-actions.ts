@@ -40,7 +40,7 @@ export function createMarkReadSubmit(options: {
 					options.setError(actionResultMessage(result));
 					return;
 				}
-				await update({ reset: false });
+				await update({ reset: false, navigate: false });
 				options.onSuccess();
 				change?.commit?.();
 			} catch (error) {
@@ -55,7 +55,7 @@ export function createMarkReadSubmit(options: {
 				options.setPending(key, false);
 				if (failed && typeof HTMLElement !== 'undefined' && submitter instanceof HTMLElement) {
 					await tick();
-					const dialogNode = submitter.closest('[role="dialog"]');
+					const dialogNode = submitter.closest('dialog, [role="dialog"]');
 					if (
 						submitter.isConnected &&
 						dialogNode &&
