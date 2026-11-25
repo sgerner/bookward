@@ -67,6 +67,11 @@
     formatReadingHistoryStatus,
     formatRecommendationStatus,
   } from "#lib/live-status.js";
+  import {
+    applyRatingOverrides,
+    createReadingHistoryRatingController,
+    formatRatingConfirmation,
+  } from "#lib/reading-history-ratings.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -140,7 +145,7 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
-  let markReadRating = $state(0);
+  let markReadRating = $state<number | null>(0);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -193,17 +198,21 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -574,6 +583,12 @@
       rawGenre.trim()
     );
   }
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -592,7 +607,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -1014,6 +1029,62 @@
     readingHistoryScoreTask = task;
     return task;
   }
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
+  }
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
+      const response = await fetch(`/api/reading-history/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === id ? { ...entry, rating } : entry,
+      );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        void refreshReadingHistoryScores();
+      }
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
     const inDecisionsView = activeView === "decisions";
     recommendationsImmediate = inDecisionsView;
@@ -2051,6 +2122,13 @@
     unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -3113,6 +3191,16 @@
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
+                    </div>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-3">
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
                     </div>
                     <details
                       class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
@@ -4805,17 +4893,17 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentReads.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -4831,6 +4919,16 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
