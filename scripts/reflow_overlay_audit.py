@@ -97,20 +97,24 @@ def free_port() -> int:
 
 
 def _launch_chromium(playwright):
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    launch_args = ["--no-sandbox", "--disable-gpu"]
     try:
-        return playwright.chromium.launch(headless=True, args=launch_args)
-    except PlaywrightError:
-        pass
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        found = shutil.which(candidate)
-        if found:
-            try:
-                return playwright.chromium.launch(
-                    headless=True, executable_path=found, args=launch_args
-                )
-            except PlaywrightError:
-                continue
+        if Path("/dev/shm").exists() and shutil.disk_usage("/dev/shm").free < 256 * 1024 * 1024:
+            launch_args.append("--disable-dev-shm-usage")
+    except OSError:
+        launch_args.append("--disable-dev-shm-usage")
+    env_exec = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    candidates = [env_exec] if env_exec else []
+    candidates.extend(
+        found for name in ("google-chrome", "chromium", "chromium-browser") if (found := shutil.which(name))
+    )
+    for executable_path in candidates:
+        try:
+            return playwright.chromium.launch(
+                headless=True, executable_path=executable_path, args=launch_args
+            )
+        except PlaywrightError:
+            continue
     return playwright.chromium.launch(headless=True, args=launch_args)
 
 
@@ -181,7 +185,14 @@ def _maybe_screenshot(page, screenshots_dir: Path | None, filename: str) -> None
         page.screenshot(path=str(screenshots_dir / filename))
 
 
-def main(argv: list[str] | None = None) -> None:
+def _goto(page, url: str) -> None:
+    page.goto(url, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]')).every((l) => Boolean(l.sheet))"
+    )
+
+
+def _run_audit(argv: list[str] | None = None) -> None:
     arg_parser = argparse.ArgumentParser(description=__doc__)
     arg_parser.add_argument(
         "--screenshots-dir",
@@ -355,6 +366,7 @@ def main(argv: list[str] | None = None) -> None:
                     },
                 )
                 eng_req("POST", "/api/settings/api-tokens", {"name": "Reflow Audit Token"})
+                eng_req("POST", "/api/backups/create", {})
 
                 auth_cookie = [
                     {
@@ -375,12 +387,8 @@ def main(argv: list[str] | None = None) -> None:
                     page = context.new_page()
 
                     # 1. Settings view (default + expanded conditional subsections)
-                    page.goto(f"{origin}/?view=settings", wait_until="domcontentloaded")
-                    page.wait_for_timeout(250)
-                    backup_btn = page.locator('button:has-text("Create backup")')
-                    if backup_btn.count() > 0:
-                        backup_btn.first.click()
-                        page.wait_for_timeout(400)
+                    _goto(page, f"{origin}/?view=settings")
+                    page.wait_for_timeout(150)
                     csv_rect = page.locator('input[type="file"][name="file"]').bounding_box()
                     digest_switch_rect = page.locator("#digest-enabled").bounding_box()
                     settings_default_audit = page.evaluate(AUDIT_JS)
@@ -403,12 +411,12 @@ def main(argv: list[str] | None = None) -> None:
 
                     # 2. Discover, Sources, Decisions, and Shortlist views at 320x256
                     for extra_view in ("discover", "sources", "decisions"):
-                        page.goto(f"{origin}/?view={extra_view}", wait_until="domcontentloaded")
-                        page.wait_for_timeout(200)
+                        _goto(page, f"{origin}/?view={extra_view}")
+                        page.wait_for_timeout(150)
                         results[f"view_{extra_view}"] = page.evaluate(AUDIT_JS)
 
-                    page.goto(f"{origin}/?view=saved", wait_until="domcontentloaded")
-                    page.wait_for_timeout(250)
+                    _goto(page, f"{origin}/?view=saved")
+                    page.wait_for_timeout(150)
                     results["saved"] = page.evaluate(AUDIT_JS)
                     _maybe_screenshot(page, args.screenshots_dir, "shortlist-320x256.png")
 
@@ -639,13 +647,13 @@ def main(argv: list[str] | None = None) -> None:
                     desktop_ctx = browser.new_context(viewport={"width": 1280, "height": 800})
                     desktop_ctx.add_cookies(auth_cookie)
                     dpage = desktop_ctx.new_page()
-                    dpage.goto(f"{origin}/", wait_until="domcontentloaded")
-                    dpage.wait_for_timeout(250)
+                    _goto(dpage, f"{origin}/")
+                    dpage.wait_for_timeout(150)
                     _maybe_screenshot(dpage, args.screenshots_dir, "discover-desktop-1280x800.png")
                     desktop_audit = dpage.evaluate(AUDIT_JS)
 
-                    dpage.goto(f"{origin}/?view=saved", wait_until="domcontentloaded")
-                    dpage.wait_for_timeout(200)
+                    _goto(dpage, f"{origin}/?view=saved")
+                    dpage.wait_for_timeout(150)
                     dpage.locator('button:has-text("Find in Librarr")').first.click()
                     dpage.wait_for_selector('dialog[open][aria-labelledby="librarr-search-title"]')
                     dpage.wait_for_timeout(150)
@@ -679,8 +687,8 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     fallback_ctx.add_cookies(auth_cookie)
                     fpage = fallback_ctx.new_page()
-                    fpage.goto(f"{origin}/?view=saved", wait_until="domcontentloaded")
-                    fpage.wait_for_timeout(250)
+                    _goto(fpage, f"{origin}/?view=saved")
+                    fpage.wait_for_timeout(150)
 
                     # Verify ModalDialog fallback (Mark Read)
                     fpage.locator('button:has-text("Mark Read")').first.click()
@@ -879,6 +887,17 @@ def main(argv: list[str] | None = None) -> None:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+
+
+def main(argv: list[str] | None = None) -> None:
+    for attempt in range(3):
+        try:
+            _run_audit(argv)
+            return
+        except PlaywrightError as exc:
+            if "Page crashed" in str(exc) and attempt < 2:
+                continue
+            raise
 
 
 if __name__ == "__main__":
