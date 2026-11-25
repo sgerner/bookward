@@ -18,6 +18,7 @@
 		value = 'on',
 		ariaLabel,
 		ariaLabelledBy,
+		ariaDescribedBy,
 		disabled = false,
 		busy,
 		activeClass = 'preset-filled-secondary-500',
@@ -34,6 +35,7 @@
 		value?: string;
 		ariaLabel?: string;
 		ariaLabelledBy?: string;
+		ariaDescribedBy?: string;
 		disabled?: boolean;
 		busy?: boolean;
 		activeClass?: string;
@@ -70,6 +72,7 @@
 	aria-checked={checked}
 	aria-label={ariaLabel}
 	aria-labelledby={ariaLabelledBy}
+	aria-describedby={ariaDescribedBy}
 	aria-busy={busy}
 	{disabled}
 	data-checked={checked ? 'true' : 'false'}
