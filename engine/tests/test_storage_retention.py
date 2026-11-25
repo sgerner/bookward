@@ -170,7 +170,7 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
 ):
     assert (
         '"base_ranker_fallback" if can_personalize else "non_ranking_request"'
-        in inspect.getsource(main_module.tracked_recommendations)
+        in inspect.getsource(main_module._complete_tracked_recommendations)
     )
     monkeypatch.setattr(main_module, "enqueue_job", lambda *_a, **_kw: "job-noop")
     with transaction() as con:
