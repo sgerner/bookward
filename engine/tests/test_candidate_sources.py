@@ -63,7 +63,7 @@ def database(tmp_path: Path):
 def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources_and_is_idempotent(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "upgrade-v27.db"
+    db_path = tmp_path / "upgrade-v28.db"
     settings.db = str(db_path)
 
     with sqlite3.connect(db_path) as con:
@@ -74,7 +74,7 @@ def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources
             "applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 28:
+            if version >= 29:
                 break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -236,7 +236,7 @@ def test_migration_backfills_candidate_sources_handles_null_and_dangling_sources
 
     initialize(seed_demo=False)
 
-    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {28}
+    assert {item["version"] for item in rows("SELECT version FROM schema_migrations")} >= {29}
     assert {
         int(item["source_id"])
         for item in rows(
