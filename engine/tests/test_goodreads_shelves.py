@@ -435,6 +435,113 @@ def test_import_goodreads_shelves_preserves_existing_rows_on_http_404(
     ]
 
 
+def test_import_goodreads_csv_stores_and_updates_additional_authors_preserving_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine.identity import read_metadata_identity_hash
+    from afterword_engine.ingestion import import_goodreads_csv
+    from afterword_engine.scoring import score_all
+
+    db_path = tmp_path / "csv_coauthors.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+
+    initial_csv = (
+        "Title,Author,Additional Authors,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Good Omens,Neil Gaiman,,4,2025/05/01,2025/04/01,read,=\"9780060853983\"\n"
+        "This Is How You Lose the Time War,Amal El-Mohtar,,0,,2026/01/10,to-read,=\"9781534431003\"\n"
+        "The Talisman,Stephen King,,0,,2026/02/01,currently-reading,=\"9781982115524\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(initial_csv) == 1
+
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute(
+            "UPDATE reads SET openlibrary_work_id='/works/OL262458W' WHERE title='Good Omens'"
+        )
+        read_row = dict(con.execute("SELECT * FROM reads WHERE title='Good Omens'").fetchone())
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,"
+            "identity_provider_id,identity_hash,description) VALUES(?,?,?,?,?,?)",
+            (
+                read_row["id"],
+                "/works/OL262458W",
+                "openlibrary",
+                "/works/OL262458W",
+                read_metadata_identity_hash(read_row),
+                "Cached synopsis that must survive additional_authors updates.",
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    updated_csv = (
+        "Title,Author,Additional Authors,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Good Omens,Neil Gaiman,Terry Pratchett,5,2025/05/01,2025/04/01,read,=\"9780060853983\"\n"
+        "This Is How You Lose the Time War,Amal El-Mohtar,Max Gladstone,0,,2026/01/10,to-read,=\"9781534431003\"\n"
+        "The Talisman,Stephen King,Peter Straub,0,,2026/02/01,currently-reading,=\"9781982115524\"\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(updated_csv) == 1
+
+    con = sqlite3.connect(db_path)
+    try:
+        reads = con.execute(
+            "SELECT title, author, additional_authors, rating, openlibrary_work_id FROM reads"
+        ).fetchall()
+        cached_meta = con.execute(
+            "SELECT verified_work_id, description FROM read_metadata"
+        ).fetchall()
+        shelves = con.execute(
+            "SELECT shelf, title, author, additional_authors FROM goodreads_shelf_items ORDER BY shelf"
+        ).fetchall()
+        con.execute(
+            "INSERT OR IGNORE INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'List', 'https://example.com', 'rss', 1)"
+        )
+        for cid, title, author in [
+            (20, "This Is How You Lose the Time War", "Max Gladstone"),
+            (21, "The Talisman", "Peter Straub"),
+        ]:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, status, normalized_key) "
+                "VALUES(?, 999, ?, ?, 'new', ?)",
+                (cid, title, author, f"{title.lower()}|{author.lower()}"),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', metadata_confidence=1.0 "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    assert reads == [
+        ("Good Omens", "Neil Gaiman", "Terry Pratchett", 5.0, "/works/OL262458W")
+    ]
+    assert cached_meta == [
+        ("/works/OL262458W", "Cached synopsis that must survive additional_authors updates.")
+    ]
+    assert shelves == [
+        ("currently-reading", "The Talisman", "Stephen King", "Peter Straub"),
+        ("to-read", "This Is How You Lose the Time War", "Amal El-Mohtar", "Max Gladstone"),
+    ]
+
+    asyncio.run(score_all())
+    con = sqlite3.connect(db_path)
+    try:
+        scored = con.execute(
+            "SELECT id, status, explanation FROM candidates WHERE id IN (20, 21) ORDER BY id"
+        ).fetchall()
+    finally:
+        con.close()
+    assert scored[0][1] == "recommended"
+    assert "On your Goodreads to-read shelf" in scored[0][2]
+    assert scored[1][1] == "hidden"
+
+
 def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_reads(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -497,7 +604,7 @@ def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_
     ]
 
 
-def test_migration_30_recovers_hidden_rows_preserving_user_feedback_dedupes_shelves_and_isolates_profiles(
+def test_migration_32_recovers_hidden_rows_preserving_user_feedback_dedupes_shelves_and_isolates_profiles(
     tmp_path: Path, monkeypatch
 ) -> None:
     root_db = tmp_path / "afterword.db"
@@ -633,7 +740,7 @@ def test_migration_30_recovers_hidden_rows_preserving_user_feedback_dedupes_shel
         assert migrated_statuses[54] == ("new", 0.0)
 
         asyncio.run(score_all())
-        # Second initialize() call verifies idempotency without re-running Migration 30.
+        # Second initialize() call verifies idempotency without re-running Migration 32.
         initialize(seed_demo=False)
         con_a = sqlite3.connect(profile_a_db)
         try:
@@ -662,7 +769,7 @@ def test_migration_30_recovers_hidden_rows_preserving_user_feedback_dedupes_shel
     assert b_shelves == [("currently-reading", "goodreads_csv", "Isolated Book", "Other Author")]
 
 
-def test_migration_30_preserves_csv_only_rows_with_rss_residue_and_clears_scheduled_date_on_disconnect(
+def test_migration_32_preserves_csv_only_rows_with_rss_residue_and_clears_scheduled_date_on_disconnect(
     tmp_path: Path, monkeypatch
 ) -> None:
     db_path = tmp_path / "v26_csv_with_rss_residue.db"
@@ -767,7 +874,7 @@ def test_migration_30_preserves_csv_only_rows_with_rss_residue_and_clears_schedu
     ]
 
 
-def test_migration_30_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_and_cleans_on_csv_reimport(
+def test_migration_32_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_and_cleans_on_csv_reimport(
     tmp_path: Path, monkeypatch
 ) -> None:
     db_path = tmp_path / "v26_csv_plus_rss.db"
@@ -844,7 +951,7 @@ def test_migration_30_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_an
     }
 
     # 1) HTTP 404 private-shelf disconnect path deletes 'goodreads_rss' on to-read
-    #    without deleting pre-v30 'legacy' CSV rows.
+    #    without deleting pre-v32 'legacy' CSV rows.
     async def private_to_read_fetch(url: str, **kwargs):
         if "shelf=to-read" in url:
             req = httpx.Request("GET", url)
@@ -907,10 +1014,10 @@ def test_migration_30_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_an
     ]
 
 
-def test_migration_30_table_rebuild_preserves_extra_columns_via_pragma_table_info(
+def test_migration_32_table_rebuild_preserves_extra_columns_via_pragma_table_info(
     tmp_path: Path, monkeypatch
 ) -> None:
-    db_path = tmp_path / "v29_with_extra_shelf_columns.db"
+    db_path = tmp_path / "v31_with_extra_shelf_columns.db"
     monkeypatch.setattr(settings, "db", str(db_path))
 
     con = sqlite3.connect(db_path)
@@ -919,26 +1026,26 @@ def test_migration_30_table_rebuild_preserves_extra_columns_via_pragma_table_inf
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 30:
+            if version >= 32:
                 continue
             _execute_migration_script(con, script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
-        # Simulate an upstream migration (e.g. #295) adding `additional_authors` and
-        # an extra index onto `goodreads_shelf_items` before this table rebuild runs.
+        # Simulate another upstream migration adding a custom column and index
+        # onto `goodreads_shelf_items` alongside Migration 30's `additional_authors`.
         con.execute(
-            "ALTER TABLE goodreads_shelf_items ADD COLUMN additional_authors TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE goodreads_shelf_items ADD COLUMN custom_shelf_note TEXT NOT NULL DEFAULT ''"
         )
         con.execute(
-            "CREATE INDEX idx_goodreads_shelf_items_additional_authors "
-            "ON goodreads_shelf_items(additional_authors)"
+            "CREATE INDEX idx_goodreads_shelf_items_custom_note "
+            "ON goodreads_shelf_items(custom_shelf_note)"
         )
         con.executemany(
-            "INSERT INTO goodreads_shelf_items(shelf, title, author, additional_authors, updated_at) "
-            "VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO goodreads_shelf_items(shelf, title, author, additional_authors, custom_shelf_note, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
             [
-                ("currently-reading", "Good Omens", "Terry Pratchett", "Neil Gaiman", "2026-01-01 00:00:00"),
-                ("to-read", "Good Omens", "Terry Pratchett", "", "2026-02-01 00:00:00"),
-                ("to-read", "The Talisman", "Stephen King", "Peter Straub", "2026-02-05 00:00:00"),
+                ("currently-reading", "Good Omens", "Terry Pratchett", "Neil Gaiman", "signed copy", "2026-01-01 00:00:00"),
+                ("to-read", "Good Omens", "Terry Pratchett", "", "", "2026-02-01 00:00:00"),
+                ("to-read", "The Talisman", "Stephen King", "Peter Straub", "hardcover", "2026-02-05 00:00:00"),
             ],
         )
         con.commit()
@@ -960,7 +1067,7 @@ def test_migration_30_table_rebuild_preserves_extra_columns_via_pragma_table_inf
             ).fetchall()
         }
         migrated_rows = con.execute(
-            "SELECT shelf, source, title, author, additional_authors "
+            "SELECT shelf, source, title, author, additional_authors, custom_shelf_note "
             "FROM goodreads_shelf_items ORDER BY title"
         ).fetchall()
     finally:
@@ -968,10 +1075,12 @@ def test_migration_30_table_rebuild_preserves_extra_columns_via_pragma_table_inf
 
     assert "additional_authors" in cols
     assert cols["additional_authors"] == ("TEXT", 1, "''")
-    assert "idx_goodreads_shelf_items_additional_authors" in indexes
+    assert "custom_shelf_note" in cols
+    assert cols["custom_shelf_note"] == ("TEXT", 1, "''")
+    assert "idx_goodreads_shelf_items_custom_note" in indexes
     assert migrated_rows == [
-        ("to-read", "legacy", "Good Omens", "Terry Pratchett", "Neil Gaiman"),
-        ("to-read", "legacy", "The Talisman", "Stephen King", "Peter Straub"),
+        ("to-read", "legacy", "Good Omens", "Terry Pratchett", "Neil Gaiman", "signed copy"),
+        ("to-read", "legacy", "The Talisman", "Stephen King", "Peter Straub", "hardcover"),
     ]
 
 
@@ -1123,3 +1232,233 @@ def test_rss_url_switch_and_404_clear_stale_rss_preserving_csv_and_undo_hidden(
     assert scheduled_after_switch == ""
     assert after_switch == [("to-read", "goodreads_csv", "CSV Fallback Book")]
     assert restored_status == "new"
+
+
+def test_source_scoped_shelf_deletes_purge_only_removed_source_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from afterword_engine.database import connect, transaction
+    from afterword_engine.main import tracked_recommendations
+
+    db_path = tmp_path / "source_scoped_evidence_purge.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    initialize(seed_demo=False)
+    rss_url = "https://www.goodreads.com/review/list_rss/12345?key=secret&shelf=read"
+
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO sources(id, name, url, kind, enabled) "
+            "VALUES(999, 'Curated', 'https://example.com/feed', 'rss', 1)"
+        )
+        con.execute(
+            "INSERT INTO reads(title, author, rating, source) "
+            "VALUES('Anchor Read', 'Anchor Author', 5.0, 'goodreads_csv')"
+        )
+
+        def add_candidate(cid: int, title: str, author: str) -> None:
+            con.execute(
+                "INSERT INTO candidates(id, source_id, title, author, description, genres, status, normalized_key) "
+                "VALUES(?, 999, ?, ?, 'Speculative novel', '[\"science fiction\"]', 'new', ?)",
+                (cid, title, author, normalize_key(title, author)),
+            )
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted', quality_score=0.95, "
+                "metadata_confidence=1.0 WHERE candidate_id=?",
+                (cid,),
+            )
+
+        # 1) Score & serve a CSV-boosted candidate in its own batch/run.
+        add_candidate(101, "CSV Removed Boosted", "Author CSV")
+
+    csv_initial = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Anchor Read,Anchor Author,5,2025/05/01,2025/04/01,read,\n"
+        "CSV Removed Boosted,Author CSV,0,,2026/01/10,to-read,\n"
+        "CSV Kept Boosted,Author Kept,0,,2026/01/11,to-read,\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_initial) == 1
+    assert asyncio.run(score_all("local", "hashing-768")) == 1
+    with connect() as con:
+        _, csv_removed_run = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        csv_removed_batch = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=101"
+        ).fetchone()[0]
+    assert csv_removed_run is not None
+    assert csv_removed_batch is not None
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='saved' WHERE id=101")
+        con.execute(
+            "INSERT INTO feedback(candidate_id, action, previous_status) "
+            "VALUES(101, 'save', 'recommended')"
+        )
+
+    # 2) Score & serve an RSS-boosted candidate in its own separate batch/run.
+    to_read_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>RSS Removed Boosted</title>
+        <author_name>Author RSS</author_name>
+      </item>
+    </channel></rss>"""
+    empty_xml = b"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel></channel></rss>"""
+
+    async def rss_with_item(url: str, **kwargs):
+        if "shelf=to-read" in url:
+            return to_read_xml, "application/xml"
+        return empty_xml, "application/xml"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", rss_with_item)
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 1,
+        "currently-reading": 0,
+    }
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO candidates(id, source_id, title, author, description, genres, status, normalized_key) "
+            "VALUES(102, 999, 'RSS Removed Boosted', 'Author RSS', 'Speculative novel', '[\"science fiction\"]', 'new', ?)",
+            (normalize_key("RSS Removed Boosted", "Author RSS"),),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted', quality_score=0.95, "
+            "metadata_confidence=1.0 WHERE candidate_id=102"
+        )
+    assert asyncio.run(score_all("local", "hashing-768")) == 1
+    with connect() as con:
+        _, rss_run = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        rss_batch = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=102"
+        ).fetchone()[0]
+    assert rss_run is not None
+    assert rss_batch is not None
+    assert rss_batch != csv_removed_batch
+
+    # 3) Empty RSS shelf sync purges RSS-only shelf evidence (`rss_batch` + `rss_run`),
+    #    while preserving CSV shelf rows and CSV shelf evidence (`csv_removed_batch` + `csv_removed_run`).
+    async def rss_empty(url: str, **kwargs):
+        return empty_xml, "application/xml"
+
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", rss_empty)
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 0,
+        "currently-reading": 0,
+    }
+    with connect() as con:
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (rss_batch,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (rss_run,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (csv_removed_batch,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (csv_removed_run,)
+            ).fetchone()
+            is not None
+        )
+
+    # 4) Re-add RSS shelf + score (`rss_batch_2`), then disconnect RSS via settings API:
+    #    disconnect purges `rss_batch_2` while keeping CSV shelf evidence intact.
+    monkeypatch.setattr("afterword_engine.ingestion.fetch_bytes", rss_with_item)
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 1,
+        "currently-reading": 0,
+    }
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='new', score=0.0 WHERE id=102")
+    assert asyncio.run(score_all("local", "hashing-768")) == 1
+    with connect() as con:
+        rss_batch_2 = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=102"
+        ).fetchone()[0]
+    assert rss_batch_2 is not None
+    with TestClient(app, headers=authenticated_headers()) as client:
+        assert client.put("/api/settings/goodreads-rss", json={"url": rss_url}).status_code == 200
+        assert client.put("/api/settings/goodreads-rss", json={"url": ""}).status_code == 200
+    with connect() as con:
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (rss_batch_2,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (csv_removed_batch,)
+            ).fetchone()
+            is not None
+        )
+
+    # 5) Re-add RSS shelf + new RSS batch (`rss_batch_3`), then re-import CSV removing `CSV Removed Boosted`:
+    #    CSV re-import purges `csv_removed_batch` + `csv_removed_run`, preserves user `save` feedback,
+    #    and leaves the active RSS shelf and `rss_batch_3` untouched.
+    assert asyncio.run(import_goodreads_shelves(rss_url)) == {
+        "to-read": 1,
+        "currently-reading": 0,
+    }
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='new', score=0.0 WHERE id=102")
+    assert asyncio.run(score_all("local", "hashing-768")) == 1
+    with connect() as con:
+        rss_batch_3 = con.execute(
+            "SELECT score_batch_id FROM candidates WHERE id=102"
+        ).fetchone()[0]
+    assert rss_batch_3 is not None
+
+    csv_after_drop = (
+        "Title,Author,My Rating,Date Read,Date Added,Exclusive Shelf,ISBN13\n"
+        "Anchor Read,Anchor Author,5,2025/05/01,2025/04/01,read,\n"
+        "CSV Kept Boosted,Author Kept,0,,2026/01/11,to-read,\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_after_drop) == 1
+    with connect() as con:
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (csv_removed_batch,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (csv_removed_run,)
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM feedback WHERE candidate_id=101 AND action='save'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM scoring_batches WHERE id=?", (rss_batch_3,)
+            ).fetchone()
+            is not None
+        )
+        remaining_shelves = [
+            tuple(row)
+            for row in con.execute(
+                "SELECT source, title FROM goodreads_shelf_items ORDER BY source, title"
+            ).fetchall()
+        ]
+    assert remaining_shelves == [
+        ("goodreads_csv", "CSV Kept Boosted"),
+        ("goodreads_rss", "RSS Removed Boosted"),
+    ]
+
