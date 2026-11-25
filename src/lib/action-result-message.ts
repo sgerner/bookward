@@ -10,14 +10,17 @@ function payloadMessage(payload: unknown): string | null {
 	return null;
 }
 
-export function actionResultMessage(result: {
-	type: string;
-	data?: unknown;
-	error?: unknown;
-}): string {
+export function actionResultMessage(
+	result: {
+		type: string;
+		data?: unknown;
+		error?: unknown;
+	},
+	fallback = DEFAULT_ACTION_ERROR_MESSAGE
+): string {
 	return (
 		payloadMessage(result.data) ??
 		payloadMessage(result.error) ??
-		DEFAULT_ACTION_ERROR_MESSAGE
+		fallback
 	);
 }

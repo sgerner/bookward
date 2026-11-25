@@ -3,7 +3,6 @@ import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
 	DEFAULT_THEME,
-	THEME_LOADERS,
 	THEMES,
 	loadThemeCss,
 	type SkeletonThemeName,
@@ -239,16 +238,7 @@ async function loadThemeVars(theme: SkeletonThemeName, mode: Mode): Promise<Reco
 		join(process.cwd(), `node_modules/@skeletonlabs/skeleton/src/themes/${theme}.css`),
 		'utf8',
 	);
-	let resolvedThemeCss: string | null = null;
-	if (theme !== DEFAULT_THEME) {
-		const originalLoader = THEME_LOADERS[theme];
-		THEME_LOADERS[theme] = () => Promise.resolve({ default: rawThemeCss });
-		try {
-			resolvedThemeCss = await loadThemeCss(theme);
-		} finally {
-			THEME_LOADERS[theme] = originalLoader;
-		}
-	}
+	const resolvedThemeCss = theme !== DEFAULT_THEME ? await loadThemeCss(theme) : null;
 	return {
 		...parseScopedCssVars(rawThemeCss, theme, mode),
 		...parseScopedCssVars(expandedLayoutCss, theme, mode, 'global'),
@@ -306,6 +296,8 @@ describe('WCAG 2.2 non-text and focus contrast across all 48 theme-mode pairs', 
 		const saharaVars = await loadThemeVars('sahara', 'dark');
 		expect(saharaVars['--control-border']).toBeTruthy();
 		expect(saharaVars['--color-primary-500']).toBeTruthy();
+		expect(saharaVars['--color-root-bg-dark']).not.toBe('var(--color-surface-950)');
+		expect(saharaVars['--color-surface-contrast-50-950']).toBeTruthy();
 	});
 
 	it.each(themeModePairs)(

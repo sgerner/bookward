@@ -1929,10 +1929,10 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
     rater_loads = 0
     original_rater_inputs = main_module._load_reading_history_rater_inputs
 
-    def counting_rater_inputs():
+    def counting_rater_inputs(connection=None):
         nonlocal rater_loads
         rater_loads += 1
-        return original_rater_inputs()
+        return original_rater_inputs(connection)
 
     monkeypatch.setattr(
         main_module, "_load_reading_history_rater_inputs", counting_rater_inputs

@@ -1,10 +1,12 @@
 import json
 import uuid
 import asyncio
+from contextvars import ContextVar
 import logging
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread, get_ident
 import time
+from typing import Any
 
 from .database import (
     RestoreEpochError,
@@ -24,8 +26,61 @@ JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS = 1.0
 JOB_REAPER_SECONDS = 30
 JOB_MAX_ATTEMPTS = 3
 PROFILE_RETRY_SECONDS = 60
+_ACTIVE_JOB_CONTEXT: ContextVar[tuple[str, str, Any] | None] = ContextVar(
+    "afterword_active_job", default=None
+)
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def current_job_context() -> tuple[str, str, Any] | None:
+    """Return the active (job_id, lease_token, stop_event) in this worker task."""
+
+    return _ACTIVE_JOB_CONTEXT.get()
+
+
+def current_job_stop_requested(stop: Any = None) -> bool:
+    """Return whether the caller's or worker's stop signal is set."""
+
+    if stop is not None:
+        return bool(stop.is_set())
+    context = _ACTIVE_JOB_CONTEXT.get()
+    return bool(context and context[2] is not None and context[2].is_set())
+
+
+def update_job_progress(
+    progress: float,
+    *,
+    job_id: str | None = None,
+    con=None,
+) -> int:
+    """Persist fractional job progress, reusing an open transaction when given."""
+
+    bounded = max(0.0, min(1.0, float(progress)))
+    context = _ACTIVE_JOB_CONTEXT.get()
+
+    def _apply(connection) -> int:
+        if job_id is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running'",
+                (bounded, job_id),
+            ).rowcount
+        if context is not None:
+            return connection.execute(
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running' AND lease_token=?",
+                (bounded, context[0], context[1]),
+            ).rowcount
+        return connection.execute(
+            "UPDATE jobs SET progress=? WHERE id=("
+            "SELECT id FROM jobs WHERE kind IN ('candidate_quality','candidate_quality_recovery') "
+            "AND status='running' ORDER BY rowid DESC LIMIT 1)",
+            (bounded,),
+        ).rowcount
+
+    if con is not None:
+        return _apply(con)
+    with transaction() as managed:
+        return _apply(managed)
 
 
 def _reap_abandoned_jobs() -> int:
@@ -301,6 +356,7 @@ async def worker_loop(handler, stop):
                 with profile_scope(profile_id), bind_restore_epoch(epoch):
                     heartbeat_stop = Event()
                     job_aborted = Event()
+                    job_token = _ACTIVE_JOB_CONTEXT.set((job["id"], lease_token, stop))
                     handler_task = asyncio.create_task(handler(job["kind"]))
 
                     def cancel_handler() -> None:
@@ -313,95 +369,98 @@ async def worker_loop(handler, stop):
                         except RuntimeError:
                             pass
 
-                    with lock.track_worker_job(cancel_handler, loop_thread_id):
-                        heartbeat = Thread(
-                            target=_heartbeat,
-                            args=(
-                                profile_id,
-                                job["id"],
-                                lease_token,
-                                heartbeat_stop,
-                                cancel_handler,
-                                epoch,
-                            ),
-                            kwargs={
-                                "lease_started_monotonic": lease_started_monotonic,
-                            },
-                            name=f"job-heartbeat-{job['id'][:8]}",
-                            daemon=True,
-                        )
-                        heartbeat.start()
-                        try:
-                            result = await handler_task
-                            await asyncio.to_thread(
-                                _complete_claimed_job,
-                                profile_id,
-                                job["id"],
-                                lease_token,
-                                epoch,
-                                result,
+                    try:
+                        with lock.track_worker_job(cancel_handler, loop_thread_id):
+                            heartbeat = Thread(
+                                target=_heartbeat,
+                                args=(
+                                    profile_id,
+                                    job["id"],
+                                    lease_token,
+                                    heartbeat_stop,
+                                    cancel_handler,
+                                    epoch,
+                                ),
+                                kwargs={
+                                    "lease_started_monotonic": lease_started_monotonic,
+                                },
+                                name=f"job-heartbeat-{job['id'][:8]}",
+                                daemon=True,
                             )
-                            if job_aborted.is_set():
-                                reset_profile_ready(profile_id)
-                        except asyncio.CancelledError:
-                            outer = asyncio.current_task()
-                            outer_cancelling = (
-                                outer is not None and outer.cancelling() > 0
-                            )
-                            if not job_aborted.is_set() or outer_cancelling:
-                                handler_task.cancel()
-                                await asyncio.gather(
-                                    handler_task, return_exceptions=True
-                                )
-                            reset_profile_ready(profile_id)
+                            heartbeat.start()
                             try:
+                                result = await handler_task
                                 await asyncio.to_thread(
-                                    _requeue_aborted_job,
+                                    _complete_claimed_job,
                                     profile_id,
                                     job["id"],
                                     lease_token,
                                     epoch,
+                                    result,
                                 )
-                            except RestoreEpochError:
-                                pass
+                                if job_aborted.is_set():
+                                    reset_profile_ready(profile_id)
                             except asyncio.CancelledError:
-                                if not outer_cancelling:
-                                    raise
-                            except Exception:
-                                LOGGER.debug(
-                                    "Could not immediately requeue cancelled job %s",
-                                    job["id"],
-                                    exc_info=True,
+                                outer = asyncio.current_task()
+                                outer_cancelling = (
+                                    outer is not None and outer.cancelling() > 0
                                 )
-                            if not job_aborted.is_set() or outer_cancelling:
-                                raise
-                        except RestoreEpochError:
-                            reset_profile_ready(profile_id)
-                        except Exception as exc:
-                            if job_aborted.is_set():
+                                if not job_aborted.is_set() or outer_cancelling:
+                                    handler_task.cancel()
+                                    await asyncio.gather(
+                                        handler_task, return_exceptions=True
+                                    )
                                 reset_profile_ready(profile_id)
-                            try:
-                                await asyncio.to_thread(
-                                    _fail_claimed_job,
-                                    profile_id,
-                                    job["id"],
-                                    lease_token,
-                                    epoch,
-                                    safe_error_message(exc, limit=2000),
-                                )
+                                try:
+                                    await asyncio.to_thread(
+                                        _requeue_aborted_job,
+                                        profile_id,
+                                        job["id"],
+                                        lease_token,
+                                        epoch,
+                                    )
+                                except RestoreEpochError:
+                                    pass
+                                except asyncio.CancelledError:
+                                    if not outer_cancelling:
+                                        raise
+                                except Exception:
+                                    LOGGER.debug(
+                                        "Could not immediately requeue cancelled job %s",
+                                        job["id"],
+                                        exc_info=True,
+                                    )
+                                if not job_aborted.is_set() or outer_cancelling:
+                                    raise
                             except RestoreEpochError:
                                 reset_profile_ready(profile_id)
-                        finally:
-                            heartbeat_stop.set()
-                            outer = asyncio.current_task()
-                            if outer is not None and outer.cancelling() > 0:
-                                heartbeat.join(timeout=1.0)
-                            else:
+                            except Exception as exc:
+                                if job_aborted.is_set():
+                                    reset_profile_ready(profile_id)
                                 try:
-                                    await asyncio.to_thread(heartbeat.join)
-                                except asyncio.CancelledError:
+                                    await asyncio.to_thread(
+                                        _fail_claimed_job,
+                                        profile_id,
+                                        job["id"],
+                                        lease_token,
+                                        epoch,
+                                        safe_error_message(exc, limit=2000),
+                                    )
+                                except RestoreEpochError:
+                                    reset_profile_ready(profile_id)
+                            finally:
+                                heartbeat_stop.set()
+                                outer = asyncio.current_task()
+                                if outer is not None and outer.cancelling() > 0:
                                     heartbeat.join(timeout=1.0)
-                                    raise
+                                else:
+                                    try:
+                                        await asyncio.to_thread(heartbeat.join)
+                                    except asyncio.CancelledError:
+                                        heartbeat.join(timeout=1.0)
+                                        raise
+                    finally:
+                        _ACTIVE_JOB_CONTEXT.reset(job_token)
             except RestoreEpochError:
                 reset_profile_ready(profile_id)
             except Exception:

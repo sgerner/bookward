@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { proxyApi } from "./api-proxy";
+import { ENGINE_UNAVAILABLE_MESSAGE } from "./engine";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
 const eventFor = (request: Request, path = "recommendations") =>
   ({ request, url: new URL(request.url), params: { path } }) as never;
@@ -179,5 +183,128 @@ describe("public API proxy", () => {
     expect(response.headers.get("access-control-allow-origin")).toBe(
       "https://client.example",
     );
+  });
+
+  it("sanitizes raw 5xx details, secrets, local paths, and 422 validation errors on non-2xx upstream API responses", async () => {
+    const proxySecret = ["internal", "proxy", "fixture"].join("-");
+    const leakedApiTok = ["bkw", "fixture", "999"].join("_");
+    vi.stubEnv("ENGINE_SERVICE_SECRET", proxySecret);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "RuntimeError: internal failure at /app/engine/afterword_engine/main.py",
+          }),
+          {
+            status: 500,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      ).mockResolvedValueOnce(
+        new Response("Bad Gateway: upstream 127.0.0.1:8000 closed connection", {
+          status: 502,
+          headers: { "content-type": "text/plain" },
+        }),
+      ).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: `Invalid header ${proxySecret} for ${leakedApiTok}`,
+          }),
+          {
+            status: 403,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      ).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: [
+              {
+                type: "less_than_equal",
+                loc: ["query", "limit"],
+                msg: "Input should be less than or equal to 100",
+                input: "9999",
+              },
+              {
+                type: "value_error",
+                loc: ["body", "path"],
+                msg: "PermissionError: /etc/bookward/config.toml",
+              },
+            ],
+          }),
+            {
+              status: 422,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              detail: "API token verification is busy. Try again shortly.",
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": "1",
+              },
+            },
+          ),
+        ),
+    );
+
+    const req500 = new Request("http://bookward.test/api/v1/recommendations", {
+      headers: { origin: "https://client.example" },
+    });
+    const res500 = await proxyApi(eventFor(req500));
+    expect(res500.status).toBe(500);
+    expect(res500.headers.get("cache-control")).toBe("no-store");
+    expect(res500.headers.get("access-control-allow-origin")).toBe("https://client.example");
+    await expect(res500.json()).resolves.toEqual({ detail: ENGINE_UNAVAILABLE_MESSAGE });
+
+    const res502 = await proxyApi(
+      eventFor(new Request("http://bookward.test/api/v1/recommendations")),
+    );
+    expect(res502.status).toBe(502);
+    await expect(res502.json()).resolves.toEqual({ detail: ENGINE_UNAVAILABLE_MESSAGE });
+
+    const res403 = await proxyApi(
+      eventFor(new Request("http://bookward.test/api/v1/recommendations")),
+    );
+    expect(res403.status).toBe(403);
+    await expect(res403.json()).resolves.toEqual({
+      detail: "Invalid header [redacted] for [redacted]",
+    });
+
+    const res422 = await proxyApi(
+      eventFor(new Request("http://bookward.test/api/v1/recommendations?limit=9999")),
+    );
+    expect(res422.status).toBe(422);
+    await expect(res422.json()).resolves.toEqual({
+      detail: [
+        {
+          type: "less_than_equal",
+          loc: ["query", "limit"],
+          msg: "Input should be less than or equal to 100",
+        },
+        {
+          type: "value_error",
+          loc: ["body", "path"],
+          msg: "The request could not be completed.",
+        },
+      ],
+    });
+
+    const res503Busy = await proxyApi(
+      eventFor(new Request("http://bookward.test/api/v1/recommendations")),
+    );
+    expect(res503Busy.status).toBe(503);
+    expect(res503Busy.headers.get("retry-after")).toBe("1");
+    await expect(res503Busy.json()).resolves.toEqual({
+      detail: "API token verification is busy. Try again shortly.",
+    });
   });
 });
