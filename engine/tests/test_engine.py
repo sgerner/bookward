@@ -4265,15 +4265,21 @@ def test_migration_31_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
             "UPDATE candidates SET status='read' WHERE id=?",
             (builtin_candidate_id,),
         )
-        con.execute(
-            "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
-            "VALUES(?,?,'read',5.0,'manual_read',?)",
-            (
-                f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
-                builtin_candidate_id,
-                json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
-            ),
-        )
+        # Every event-key form a demo read can leave behind must be purged.
+        for demo_event_key in (
+            f"manual-read:{builtin_candidate_id}:{demo_read_id:08d}",
+            f"read:{demo_read_id:08d}:{builtin_candidate_id}",
+            f"attribution:read:{demo_read_id:08d}:{builtin_candidate_id}",
+        ):
+            con.execute(
+                "INSERT INTO recommendation_events(event_key,candidate_id,event_type,value,source,metadata) "
+                "VALUES(?,?,'read',5.0,'manual_read',?)",
+                (
+                    demo_event_key,
+                    builtin_candidate_id,
+                    json.dumps({"read_source": "demo", "time_precision": "timestamp"}),
+                ),
+            )
         con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
         con.execute("DELETE FROM jobs")
         con.execute("DELETE FROM schema_migrations WHERE version=31")
