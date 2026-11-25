@@ -621,6 +621,212 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert "600x600bb" in candidate["cover_url"]
 
 
+@respx.mock
+def test_audit_populates_missing_work_dates_and_preserves_source_and_mixed_provenance(database):
+    from afterword_engine.database import connect, persist_metadata_field_provenance
+    from afterword_engine.publication_year_metadata import attach_publication_years
+
+    undated_id = add_candidate("Classic Undated Reissue", "Agatha Christie")
+    source_kind_id = add_candidate("Classic Source Date", "Dorothy L. Sayers")
+    mixed_prov_id = add_candidate("Classic Mixed Provenance", "Ngaio Marsh")
+    manual_id = add_candidate("Manual Classic", "Margery Allingham")
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET release_date='2023-12-25',date_kind='source' WHERE id=?",
+            (source_kind_id,),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            source_kind_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "source",
+                            "provider_id": str(source_id),
+                            "kind": "source_item",
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [],
+                }
+            },
+            default_provider="source",
+            default_provider_id=str(source_id),
+        )
+        # Mixed provenance set on release_date (source + google_books), with
+        # empty description so _store_result runs the selected_fields write path.
+        con.execute(
+            "UPDATE candidates SET description='',release_date='2020-05-10',date_kind='day' WHERE id=?",
+            (mixed_prov_id,),
+        )
+        for prov_name, prov_id, kind in (
+            ("source", str(source_id), "source_item"),
+            ("google_books", "gb-mixed-1", "day"),
+        ):
+            persist_metadata_field_provenance(
+                con,
+                "candidate",
+                mixed_prov_id,
+                "release_date",
+                {
+                    "metadata_provenance": {
+                        "fields": {
+                            "release_date": {
+                                "provider": prov_name,
+                                "provider_id": prov_id,
+                                "kind": kind,
+                            }
+                        },
+                        "fetch_trace": [],
+                        "source_payloads": [],
+                    }
+                },
+                default_provider=prov_name,
+                default_provider_id=prov_id,
+            )
+        con.execute(
+            "UPDATE candidates SET release_date='1999-01-01',date_kind='manual' WHERE id=?",
+            (manual_id,),
+        )
+
+    def openlibrary_side_effect(request):
+        title = request.url.params.get("title", "")
+        if "Undated" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL471579W",
+                "title": "Classic Undated Reissue",
+                "author_name": ["Agatha Christie"],
+                "first_publish_year": 1934,
+                "description": "Original 1934 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        if "Source Date" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL193500W",
+                "title": "Classic Source Date",
+                "author_name": ["Dorothy L. Sayers"],
+                "first_publish_date": "1935-10-01",
+                "description": "Original 1935 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        if "Mixed" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL193700W",
+                "title": "Classic Mixed Provenance",
+                "author_name": ["Ngaio Marsh"],
+                "first_publish_year": 1937,
+                "description": "Original 1937 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        return httpx.Response(200, json={"docs": [{
+            "key": "/works/OL193600W",
+            "title": "Manual Classic",
+            "author_name": ["Margery Allingham"],
+            "first_publish_year": 1936,
+            "description": "Original 1936 mystery novel.",
+            "subject": ["Mystery"],
+        }]})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=openlibrary_side_effect)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(200, json={"items": [{
+            "id": "reissue-vol",
+            "volumeInfo": {
+                "title": "Classic Undated Reissue",
+                "authors": ["Agatha Christie"],
+                "publishedDate": "2023-12-25",
+            },
+        }]})
+    )
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    asyncio.run(audit_candidates(only_pending=False))
+
+    cand_undated = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (undated_id,))
+    cand_source = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (source_kind_id,))
+    cand_mixed = row("SELECT id,description,release_date,date_kind FROM candidates WHERE id=?", (mixed_prov_id,))
+    cand_manual = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (manual_id,))
+
+    assert cand_undated["release_date"] == "1934-01-01"
+    assert cand_undated["date_kind"] == "year"
+    assert cand_source["release_date"] == "2023-12-25"
+    assert cand_source["date_kind"] == "source"
+    assert cand_mixed["description"] == "Original 1937 mystery novel."
+    assert cand_mixed["release_date"] == "2020-05-10"
+    assert cand_mixed["date_kind"] == "day"
+    assert cand_manual["release_date"] == "1999-01-01"
+    assert cand_manual["date_kind"] == "manual"
+
+    undated_prov = rows(
+        "SELECT provider,provider_id,source_payload FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+        (undated_id,),
+    )
+    assert len(undated_prov) == 1
+    assert undated_prov[0]["provider"] == "openlibrary"
+    assert undated_prov[0]["provider_id"] == "/works/OL471579W"
+    assert json.loads(undated_prov[0]["source_payload"])["field_provenance"]["source_field"] == "first_publish_year"
+
+    source_prov = rows(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+        (source_kind_id,),
+    )
+    assert [item["provider"] for item in source_prov] == ["source"]
+
+    mixed_prov = rows(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date' ORDER BY provider",
+        (mixed_prov_id,),
+    )
+    assert [(item["provider"], item["provider_id"]) for item in mixed_prov] == [
+        ("google_books", "gb-mixed-1"),
+        ("source", str(source_id)),
+    ]
+    assert {item["provider"] for item in mixed_prov} == {"google_books", "source"}
+
+    # Both undated candidates (via release_date + OL provenance) and candidates
+    # that gained Open Library description provenance resolve verified work years
+    # without rewriting existing source release_date values, activating the
+    # batch ranker's publication-era gate (ranking.py).
+    from types import SimpleNamespace
+    from afterword_engine import publication_era_signal
+    from afterword_engine.ranking import rank_candidates
+
+    items = [
+        {**dict(cand_undated), "title": "Classic Undated Reissue", "author": "Agatha Christie"},
+        {**dict(cand_mixed), "title": "Classic Mixed Provenance", "author": "Ngaio Marsh"},
+    ]
+    with connect() as con:
+        attach_publication_years(con, [], items)
+    assert items[0]["first_publication_year"] == 1934
+    assert items[0]["publication_work_id"] == "/works/OL471579W"
+    assert items[1]["first_publication_year"] == 1937
+    assert items[1]["publication_work_id"] == "/works/OL193700W"
+
+    reads = [{"id": 1, "title": "Modern Thriller", "author": "Contemporary Writer", "rating": 5}]
+    vectors = [[1.0, 0.0]]
+    cand_vectors = [[1.0, 0.0], [1.0, 0.0]]
+    baseline = rank_candidates(reads, vectors, items, cand_vectors, publication_era=False)
+    orig_fit = publication_era_signal.fit_publication_era_signal
+    publication_era_signal.fit_publication_era_signal = lambda *_: SimpleNamespace(
+        adjustment=lambda year: -1.5 if year and year < 1950 else 0.0,
+        diagnostics={"enabled": True, "reason": "validated"},
+    )
+    try:
+        era_ranked = rank_candidates(reads, vectors, items, cand_vectors)
+    finally:
+        publication_era_signal.fit_publication_era_signal = orig_fit
+    assert [entry["score"] for entry in era_ranked] == [
+        round(entry["score"] - 1.5, 1) for entry in baseline
+    ]
+
+
 def test_fetch_catalog_json_registers_trace_before_await_and_handles_json_edges():
     observed_mid_flight: list[dict[str, object]] = []
 

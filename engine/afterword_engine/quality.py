@@ -915,7 +915,7 @@ async def _open_library_match(
             "opening_sentence": opening_sentence,
             "genres": genres,
             "identifiers": projected_identifiers,
-            "publication_date": _clean_metadata_text(doc.get("first_publish_date") or doc.get("first_publish_year"), 40),
+            "publication_date": _clean_metadata_text(doc.get(release_date_source_field), 40) if release_date else "",
             "publication_date_source_field": release_date_source_field if release_date else "",
             "cover_id": str(doc.get("cover_i") or "")[:40],
         }
@@ -1546,6 +1546,15 @@ async def resolve_catalog_match(
             ),
             None,
         )
+        # Intentional precedence reversal over pure precision ranking: bounded
+        # Open Library work dates (first_publish_date / first_publish_year,
+        # storing year-only dates as YYYY-01-01 with date_kind="year") rank
+        # ahead of day-precision edition dates (Google publishedDate, Apple
+        # releaseDate), with day > month > year tie-breaking within each tier.
+        # On undated candidates, this populates original work provenance for
+        # attach_publication_years -> ranking.py era fitting and feeds original
+        # era keys via release_date in interaction_personalization._book_features,
+        # while _store_result leaves existing source dates untouched.
         date_rank = {"day": 3, "month": 2, "year": 1}
         eligible_date_records = (
             record
@@ -1556,11 +1565,13 @@ async def resolve_catalog_match(
         date_record = max(
             eligible_date_records,
             key=lambda record: (
-                bool(record.get("identifier_verified")),
-                float(record.get("quality_score", 0) or 0.0),
+                record.get("provider") == "openlibrary"
+                and record.get("release_date_source_field") in {"first_publish_date", "first_publish_year"},
                 date_rank.get(
                     record.get("release_date_kind") or _publication_date_kind(record.get("release_date")), 0
                 ),
+                bool(record.get("identifier_verified")),
+                float(record.get("quality_score", 0) or 0.0),
                 len(str(record.get("release_date") or "")),
             ),
             default=None,
