@@ -722,6 +722,25 @@
   const catalogAuditPercent = $derived(
     Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
   );
+  const catalogAuditStatusMessage = $derived.by(() => {
+    const modeLabel =
+      catalogAudit.mode === "full" ? "Full catalog sweep" : "Incremental audit";
+    const remainingLabel = `${catalogAudit.remaining} ${catalogAudit.remaining === 1 ? "book" : "books"} remaining`;
+    if (catalogAudit.status === "failed") {
+      return "";
+    }
+    if (catalogAudit.active) {
+      const stateLabel = catalogAudit.status === "queued" ? "queued" : "running";
+      return `${modeLabel} ${stateLabel}: ${catalogAuditPercent}% of current ${catalogAudit.batch_size}-book batch, ${remainingLabel}.`;
+    }
+    if (catalogAudit.status === "paused") {
+      return `${modeLabel} paused with ${remainingLabel}.`;
+    }
+    if (catalogAudit.remaining > 0) {
+      return `Catalog audit: ${catalogAudit.remaining} ${catalogAudit.remaining === 1 ? "book" : "books"} due for check.`;
+    }
+    return "Catalog audit is up to date.";
+  });
   $effect(() => {
     if (typeof window === "undefined") return;
     if (activeView !== "settings" || !catalogAudit.active) return;
@@ -4480,10 +4499,14 @@
                   Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
                 </p>
 
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
+
                 <div
                   class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm"
-                  role="status"
-                  aria-live="polite"
                 >
                   <div class="flex flex-wrap items-center justify-between gap-2">
                     <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
@@ -4532,10 +4555,9 @@
                 {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
                   <div
                     class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
-                    role="alert"
                   >
-                    <TriangleAlert size={16} class="shrink-0" />
-                    <span class="min-w-0 flex-1">
+                    <TriangleAlert size={16} class="shrink-0" aria-hidden="true" />
+                    <span class="min-w-0 flex-1" role="alert">
                       <strong>
                         {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
                       </strong>
