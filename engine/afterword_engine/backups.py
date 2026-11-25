@@ -1,6 +1,7 @@
 """Private, WAL-safe SQLite backups and guarded in-place recovery."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,15 +18,18 @@ from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 from .database import (
     MIGRATIONS,
+    RESTORE_EPOCH_KEY,
+    TOMBSTONE_SUFFIX,
+    _LockedConnection,
+    _restrict_database_files,
     connect,
     database_lock,
-    _LockedConnection,
+    is_database_deleted,
     read_restore_epoch,
     record_restore_epoch,
     recorded_restore_epoch,
-    RESTORE_EPOCH_KEY,
-    _restrict_database_files,
     transaction,
+    update_tombstone_marker,
 )
 from .decision_evidence import (
     EVIDENCE_HIGH_WATERMARK_RATIO,
@@ -42,9 +47,11 @@ from .maintenance import (
 from .secrets import clear_auth_registry_key_cache, installation_key, installation_key_path
 from .security import safe_error_message
 from .tenancy import (
+    ProfileDeletedError,
     allow_restore_database_access,
     current_profile_id,
     profile_database_path,
+    profile_scope,
     unbind_restore_epoch,
 )
 
@@ -61,6 +68,9 @@ AUTH_BACKUP_ATTEMPT_KEY = "auth_backup_last_attempt_at"
 AUTH_BACKUP_SUCCESS_KEY = "auth_backup_last_success_at"
 AUTH_BACKUP_RESTORE_KEY = "auth_backup_last_restore_at"
 AUTH_BACKUP_HOLD_KEY = "auth_backup_recovery_hold"
+BACKUP_INITIAL_DELAY_SECONDS = 5
+BACKUP_POLL_SECONDS = 60
+_AUTH_BACKUP_LOCK = threading.RLock()
 INCREMENTAL_VACUUM_STEP_PAGES = 4_096
 MIN_VACUUM_FREE_SPACE_BYTES = 16 * 1024 * 1024
 RESTORE_FENCE_DETAIL = (
@@ -69,6 +79,28 @@ RESTORE_FENCE_DETAIL = (
     "restore journal."
 )
 _RESTORE_JOURNAL_ERRORS: dict[str, str] = {}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _sha256_hex(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _lockout_notice_username_sha256(key: object) -> str:
+    raw = str(key)
+    if not raw.startswith("lockout_notice:"):
+        return ""
+    rest = raw[len("lockout_notice:") :]
+    length_str, sep, remainder = rest.partition(":")
+    if not sep or not length_str.isdigit():
+        return ""
+    length = int(length_str)
+    if len(remainder) <= length or remainder[length] != ":":
+        return ""
+    return _sha256_hex(remainder[:length])
 
 
 class BackupError(ValueError):
@@ -365,7 +397,7 @@ def dismiss_auth_recovery_hold(*, confirm: bool = False) -> dict:
     from .profiles import auth_path
 
     path = auth_path()
-    with database_lock(path):
+    with _AUTH_BACKUP_LOCK, database_lock(path):
         if not path.is_file():
             raise BackupError("The Bookward identity registry is not available.")
         con = sqlite3.connect(path, timeout=30)
@@ -395,6 +427,8 @@ def database_storage_metrics(
     skip_database: bool = False,
 ) -> dict:
     db_path = profile_database_path()
+    if is_database_deleted(db_path):
+        raise ProfileDeletedError("Profile has been deleted")
     wal_path = Path(f"{db_path}-wal")
     database_bytes = _file_size(db_path)
     wal_bytes = _file_size(wal_path)
@@ -508,6 +542,8 @@ def backup_status() -> dict:
 
 def maintenance_is_due(now: datetime | None = None) -> bool:
     db_path = profile_database_path()
+    if is_database_deleted(db_path):
+        raise ProfileDeletedError("Profile has been deleted")
     if not db_path.is_file() or _has_restore_journal():
         return False
     current = now or datetime.now(timezone.utc)
@@ -713,8 +749,218 @@ def identity_backup_status() -> dict:
     }
 
 
+def _pending_auth_scrubs_path() -> Path:
+    from .profiles import auth_path
+
+    registry = auth_path()
+    return registry.with_name(f".{registry.name}.scrub-pending.json")
+
+
+def _load_pending_auth_backup_scrubs_unlocked() -> list[dict[str, str]]:
+    by_account: dict[str, dict[str, str]] = {}
+    journal = _pending_auth_scrubs_path()
+    if journal.is_file() and not journal.is_symlink():
+        try:
+            raw = json.loads(journal.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    acct = str(item.get("account_id") or "").strip()
+                    prof = str(item.get("profile_id") or "").strip()
+                    uhash = str(item.get("username_sha256") or "").strip()
+                    if acct and prof:
+                        by_account[acct] = {
+                            "account_id": acct,
+                            "profile_id": prof,
+                            "username_sha256": uhash,
+                        }
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            LOGGER.warning("Could not read pending auth-backup scrub journal")
+
+    profiles_dir = Path(settings.db).parent / "profiles"
+    if profiles_dir.is_dir() and not profiles_dir.is_symlink():
+        try:
+            for marker in profiles_dir.iterdir():
+                if (
+                    marker.is_symlink()
+                    or not marker.is_file()
+                    or not marker.name.endswith(f".sqlite3{TOMBSTONE_SUFFIX}")
+                ):
+                    continue
+                try:
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or not payload.get("scrub_pending"):
+                    continue
+                acct = str(payload.get("account_id") or "").strip()
+                prof = str(payload.get("profile_id") or "").strip()
+                uhash = str(payload.get("username_sha256") or "").strip()
+                if acct and prof and acct not in by_account:
+                    by_account[acct] = {
+                        "account_id": acct,
+                        "profile_id": prof,
+                        "username_sha256": uhash,
+                    }
+        except OSError:
+            pass
+    return list(by_account.values())
+
+
+def _save_pending_auth_backup_scrubs_unlocked(entries: list[dict[str, str]]) -> None:
+    journal = _pending_auth_scrubs_path()
+    if not entries:
+        journal.unlink(missing_ok=True)
+        return
+    journal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".bookward-auth-scrub-pending-", suffix=".tmp", dir=journal.parent
+    )
+    os.fchmod(descriptor, 0o600)
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(json.dumps(entries, sort_keys=True).encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, journal)
+        os.chmod(journal, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def has_pending_auth_backup_scrubs() -> bool:
+    with _AUTH_BACKUP_LOCK:
+        return bool(_load_pending_auth_backup_scrubs_unlocked())
+
+
+def pending_auth_backup_scrub_account_ids() -> set[str]:
+    with _AUTH_BACKUP_LOCK:
+        return {
+            item["account_id"]
+            for item in _load_pending_auth_backup_scrubs_unlocked()
+        }
+
+
+def record_pending_auth_backup_scrub(
+    account_id: str, profile_id: str, normalized_username: str
+) -> str:
+    username_sha256 = _sha256_hex(normalized_username)
+    with _AUTH_BACKUP_LOCK:
+        entries = [
+            item
+            for item in _load_pending_auth_backup_scrubs_unlocked()
+            if item["account_id"] != account_id
+        ]
+        entries.append(
+            {
+                "account_id": account_id,
+                "profile_id": profile_id,
+                "username_sha256": username_sha256,
+            }
+        )
+        _save_pending_auth_backup_scrubs_unlocked(entries)
+        if profile_id != "legacy":
+            update_tombstone_marker(
+                profile_id,
+                scrub_pending=True,
+                account_id=account_id,
+                username_sha256=username_sha256,
+            )
+    return username_sha256
+
+
+def complete_auth_backup_scrub(
+    account_id: str,
+    profile_id: str,
+    normalized_username: str = "",
+    *,
+    username_sha256: str = "",
+    create_snapshot: bool = True,
+) -> None:
+    with _AUTH_BACKUP_LOCK:
+        scrub_account_from_auth_backups(
+            account_id,
+            profile_id,
+            normalized_username,
+            username_sha256=username_sha256,
+        )
+        if create_snapshot and not auth_recovery_hold_active():
+            _create_auth_backup_unlocked(prune=True)
+        remaining = [
+            item
+            for item in _load_pending_auth_backup_scrubs_unlocked()
+            if item["account_id"] != account_id
+        ]
+        _save_pending_auth_backup_scrubs_unlocked(remaining)
+        if profile_id != "legacy":
+            update_tombstone_marker(profile_id, scrub_pending=False)
+
+
+def retry_pending_auth_backup_scrubs(*, create_snapshot: bool = True) -> int:
+    from .profiles import auth_path
+
+    with _AUTH_BACKUP_LOCK:
+        entries = _load_pending_auth_backup_scrubs_unlocked()
+        if not entries:
+            return 0
+        live_account_ids: set[str] = set()
+        registry = auth_path()
+        if registry.is_file():
+            con = sqlite3.connect(
+                registry.resolve().as_uri() + "?mode=ro", uri=True, timeout=30
+            )
+            try:
+                placeholders = ",".join("?" for _ in entries)
+                live_account_ids = {
+                    str(row[0])
+                    for row in con.execute(
+                        f"SELECT id FROM accounts WHERE id IN ({placeholders})",
+                        [item["account_id"] for item in entries],
+                    )
+                }
+            except sqlite3.Error:
+                pass
+            finally:
+                con.close()
+        ready_entries = [
+            item for item in entries if item["account_id"] not in live_account_ids
+        ]
+        still_pending = [
+            item for item in entries if item["account_id"] in live_account_ids
+        ]
+        if not ready_entries:
+            return 0
+        try:
+            for item in ready_entries:
+                scrub_account_from_auth_backups(
+                    item["account_id"],
+                    item["profile_id"],
+                    username_sha256=item.get("username_sha256", ""),
+                )
+            if create_snapshot and not still_pending and not auth_recovery_hold_active():
+                _create_auth_backup_unlocked(prune=True)
+        except (BackupError, OSError) as exc:
+            _record_auth_backup_state(error=exc)
+            raise
+        _save_pending_auth_backup_scrubs_unlocked(still_pending)
+        for item in ready_entries:
+            if item["profile_id"] != "legacy":
+                update_tombstone_marker(item["profile_id"], scrub_pending=False)
+        return len(ready_entries)
+
+
 def create_auth_backup(*, prune: bool = True) -> dict:
     """Snapshot the account/profile registry alongside personal database backups."""
+    with _AUTH_BACKUP_LOCK:
+        if _load_pending_auth_backup_scrubs_unlocked():
+            retry_pending_auth_backup_scrubs(create_snapshot=False)
+        return _create_auth_backup_unlocked(prune=prune)
+
+
+def _create_auth_backup_unlocked(*, prune: bool = True) -> dict:
     from .profiles import auth_path
 
     source_path = auth_path()
@@ -781,6 +1027,266 @@ def create_auth_backup(*, prune: bool = True) -> dict:
             source.close()
 
 
+def scrub_account_from_auth_backups(
+    account_id: str,
+    profile_id: str,
+    normalized_username: str = "",
+    *,
+    username_sha256: str = "",
+) -> int:
+    """Remove an erased account's rows and vacuum older auth-registry snapshots."""
+
+    target_hash = username_sha256 or (
+        _sha256_hex(normalized_username) if normalized_username else ""
+    )
+    with _AUTH_BACKUP_LOCK:
+        directory = auth_backup_directory()
+        if directory.is_symlink():
+            raise BackupError("The identity-registry backup directory is invalid.")
+        if not directory.exists():
+            return 0
+        _ensure_private_directory(directory)
+        entries = list(directory.iterdir())
+
+        scrubbed = 0
+        deferred_error: Exception | None = None
+        for snapshot_path in entries:
+            if (
+                snapshot_path.is_symlink()
+                or not snapshot_path.is_file()
+                or snapshot_path.suffix != ".sqlite3"
+                or not AUTH_BACKUP_ID.fullmatch(snapshot_path.stem)
+            ):
+                continue
+            staged = None
+            con = None
+            vacuum_con = None
+            try:
+                orig_stat = snapshot_path.stat()
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=".bookward-auth-scrub-", suffix=".tmp", dir=directory
+                )
+                os.fchmod(descriptor, 0o600)
+                os.close(descriptor)
+                staged = Path(temp_name)
+                shutil.copyfile(snapshot_path, staged)
+                os.chmod(staged, 0o600)
+
+                con = sqlite3.connect(staged, timeout=30)
+                con.create_function("sha256_hex", 1, _sha256_hex, deterministic=True)
+                con.create_function(
+                    "lockout_username_sha256",
+                    1,
+                    _lockout_notice_username_sha256,
+                    deterministic=True,
+                )
+                con.execute("PRAGMA foreign_keys=ON")
+                con.execute("PRAGMA busy_timeout=5000")
+                con.execute("PRAGMA secure_delete=ON")
+                tables = {
+                    item[0]
+                    for item in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                changed = 0
+                con.execute("BEGIN IMMEDIATE")
+                if "login_attempts" in tables:
+                    if normalized_username:
+                        changed += max(
+                            0,
+                            con.execute(
+                                "DELETE FROM login_attempts WHERE normalized_username=?",
+                                (normalized_username,),
+                            ).rowcount,
+                        )
+                    elif target_hash:
+                        changed += max(
+                            0,
+                            con.execute(
+                                "DELETE FROM login_attempts WHERE sha256_hex(normalized_username)=?",
+                                (target_hash,),
+                            ).rowcount,
+                        )
+                if "oidc_identities" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM oidc_identities WHERE account_id=?",
+                            (account_id,),
+                        ).rowcount,
+                    )
+                if "auth_sessions" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM auth_sessions WHERE account_id=?",
+                            (account_id,),
+                        ).rowcount,
+                    )
+                if "auth_transactions" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM auth_transactions WHERE account_id=?",
+                            (account_id,),
+                        ).rowcount,
+                    )
+                if "accounts" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM accounts WHERE id=?",
+                            (account_id,),
+                        ).rowcount,
+                    )
+                if "auth_meta" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM auth_meta WHERE key=?",
+                            (f"erasure_pending:{account_id}",),
+                        ).rowcount,
+                    )
+                    if normalized_username:
+                        notice_prefix = (
+                            f"lockout_notice:{len(normalized_username)}:{normalized_username}:"
+                        )
+                        notice_end = (
+                            f"lockout_notice:{len(normalized_username)}:{normalized_username};"
+                        )
+                        changed += max(
+                            0,
+                            con.execute(
+                                "DELETE FROM auth_meta WHERE key>=? AND key<?",
+                                (notice_prefix, notice_end),
+                            ).rowcount,
+                        )
+                    elif target_hash:
+                        changed += max(
+                            0,
+                            con.execute(
+                                "DELETE FROM auth_meta WHERE key>='lockout_notice:' AND key<'lockout_notice;' "
+                                "AND lockout_username_sha256(key)=?",
+                                (target_hash,),
+                            ).rowcount,
+                        )
+                if "api_tokens" in tables:
+                    changed += max(
+                        0,
+                        con.execute(
+                            "DELETE FROM api_tokens WHERE profile_id=?",
+                            (profile_id,),
+                        ).rowcount,
+                    )
+                if "profiles" in tables:
+                    if profile_id != "legacy":
+                        has_other_account = (
+                            "accounts" in tables
+                            and con.execute(
+                                "SELECT 1 FROM accounts WHERE profile_id=? LIMIT 1",
+                                (profile_id,),
+                            ).fetchone()
+                            is not None
+                        )
+                        if not has_other_account:
+                            changed += max(
+                                0,
+                                con.execute(
+                                    "DELETE FROM profiles WHERE id=?",
+                                    (profile_id,),
+                                ).rowcount,
+                            )
+                    else:
+                        has_legacy_account = (
+                            "accounts" in tables
+                            and con.execute(
+                                "SELECT 1 FROM accounts WHERE profile_id='legacy' LIMIT 1"
+                            ).fetchone()
+                            is not None
+                        )
+                        if not has_legacy_account:
+                            row_state = con.execute(
+                                "SELECT status,display_name FROM profiles WHERE id='legacy'"
+                            ).fetchone()
+                            if row_state and (
+                                row_state[0] != "disabled"
+                                or row_state[1] != "My profile"
+                            ):
+                                changed += max(
+                                    0,
+                                    con.execute(
+                                        "UPDATE profiles SET status='disabled',display_name='My profile' WHERE id='legacy'"
+                                    ).rowcount,
+                                )
+                con.commit()
+                con.close()
+                con = None
+
+                if changed > 0:
+                    vacuum_con = sqlite3.connect(staged, timeout=30, isolation_level=None)
+                    vacuum_con.execute("PRAGMA busy_timeout=5000")
+                    vacuum_con.execute("VACUUM")
+                    vacuum_con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    integrity = vacuum_con.execute("PRAGMA integrity_check").fetchone()
+                    if (
+                        not integrity
+                        or integrity[0] != "ok"
+                        or vacuum_con.execute("PRAGMA foreign_key_check").fetchone()
+                    ):
+                        raise BackupError("Scrubbed identity-registry snapshot failed integrity check.")
+                    vacuum_con.close()
+                    vacuum_con = None
+                    with staged.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                    os.chmod(staged, 0o600)
+                    os.utime(staged, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+                    os.replace(staged, snapshot_path)
+                    staged = None
+                    scrubbed += 1
+            except Exception as exc:
+                LOGGER.warning(
+                    "Removing unreadable identity-registry snapshot %s during account erasure",
+                    snapshot_path.name,
+                )
+                try:
+                    snapshot_path.unlink(missing_ok=True)
+                    _remove_sidecars(snapshot_path)
+                except OSError as unlink_exc:
+                    LOGGER.exception(
+                        "Could not remove damaged identity-registry snapshot %s",
+                        snapshot_path.name,
+                    )
+                    if deferred_error is None:
+                        deferred_error = unlink_exc
+                else:
+                    # Only fail the scrub if snapshot_path still exists (e.g. a
+                    # transient copy/chmod/replace error where unlink was mocked or blocked).
+                    if snapshot_path.exists() and deferred_error is None:
+                        deferred_error = exc
+            finally:
+                if con is not None:
+                    con.close()
+                if vacuum_con is not None:
+                    vacuum_con.close()
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
+                    _remove_sidecars(staged)
+
+        if scrubbed > 0:
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        if deferred_error is not None:
+            raise BackupError("Could not scrub all identity-registry snapshots.") from deferred_error
+        return scrubbed
+
+
 def _validate_auth_snapshot(path: Path) -> None:
     con = None
     try:
@@ -835,6 +1341,11 @@ def restore_auth_backup(backup_id: str) -> dict:
     This is an operator recovery action and must only run with the engine
     stopped. It is intentionally not exposed as a browser route.
     """
+    with _AUTH_BACKUP_LOCK:
+        return _restore_auth_backup_unlocked(backup_id)
+
+
+def _restore_auth_backup_unlocked(backup_id: str) -> dict:
     if not AUTH_BACKUP_ID.fullmatch(backup_id):
         raise BackupError("Choose a valid identity-registry snapshot.")
     directory = auth_backup_directory()
@@ -980,7 +1491,11 @@ def _backup_record(path: Path) -> dict:
     }
 
 
-def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
+def _prune_backups(
+    *,
+    preserve_ids: set[str] | None = None,
+    expire_before: datetime | None = None,
+) -> None:
     journal = _restore_journal_path()
     protected_ids: set[str] = set()
     if _has_restore_journal(journal):
@@ -996,10 +1511,22 @@ def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
     if preserve_ids:
         protected_ids.update(preserve_ids)
     retained = list_backups()
-    retained_ids = (
-        {item["id"] for item in retained[: backup_retention_count()]} | protected_ids
-    )
-    for old in retained[backup_retention_count() :]:
+    keep = []
+    expired = []
+    retention = backup_retention_count()
+    for index, item in enumerate(retained):
+        if item["id"] in protected_ids:
+            keep.append(item)
+            continue
+        created_at = datetime.fromisoformat(item["created_at"])
+        if index >= retention or (
+            expire_before is not None and created_at <= expire_before
+        ):
+            expired.append(item)
+        else:
+            keep.append(item)
+    retained_ids = {item["id"] for item in keep} | protected_ids
+    for old in expired:
         if old["id"] in retained_ids:
             continue
         try:
@@ -1009,6 +1536,8 @@ def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
         except (OSError, BackupError):
             LOGGER.warning("Could not remove an expired Bookward backup")
     directory = backup_directory()
+    if not directory.is_dir():
+        return
     for sidecar in directory.glob("bookward-*.secret.key"):
         backup_id = sidecar.name.removesuffix(".secret.key")
         if backup_id not in retained_ids and not sidecar.is_symlink():
@@ -1018,6 +1547,77 @@ def _prune_backups(*, preserve_ids: set[str] | None = None) -> None:
                 LOGGER.warning("Could not remove an orphaned Bookward key recovery file")
 
 
+def purge_profile_backups(profile_id: str | None = None) -> int:
+    """Remove all snapshots and generated-key sidecars for one profile."""
+
+    configured = str(settings.backup_dir or "").strip()
+    base = Path(configured) if configured else Path(settings.db).parent / "backups"
+    selected = profile_id if profile_id is not None else (current_profile_id() or "legacy")
+    removed = 0
+    first_error: OSError | None = None
+    if selected == "legacy":
+        if not base.is_dir() or base.is_symlink():
+            return 0
+        for entry in list(base.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                continue
+            name = entry.name
+            if (
+                (name.startswith("bookward-") and not name.startswith("bookward-auth-"))
+                or name.startswith(".bookward-backup-")
+                or name.startswith(".bookward-key-")
+            ):
+                try:
+                    entry.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    LOGGER.warning("Could not remove a legacy backup file")
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
+        return removed
+
+    if not re.fullmatch(r"[0-9a-f]{32}", selected):
+        raise ValueError("Invalid profile identifier")
+    directory = base / selected
+    if directory.is_symlink():
+        directory.unlink(missing_ok=True)
+        return 1
+    if not directory.is_dir():
+        return 0
+    try:
+        if directory.resolve(strict=True).parent != base.resolve(strict=True):
+            raise BackupError("Profile backup directory resolved outside backup root.")
+    except FileNotFoundError:
+        return 0
+    for entry in list(directory.iterdir()):
+        if entry.is_dir() and not entry.is_symlink():
+            try:
+                shutil.rmtree(entry)
+            except OSError as exc:
+                LOGGER.warning("Could not remove a profile backup subdirectory")
+                if first_error is None:
+                    first_error = exc
+        else:
+            try:
+                entry.unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                LOGGER.warning("Could not remove a profile backup file")
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        shutil.rmtree(directory)
+    return removed
+
+
 def _reclaim_incremental_pages_step(
     live_path: Path,
     *,
@@ -1025,6 +1625,8 @@ def _reclaim_incremental_pages_step(
 ) -> int:
     """Reclaim up to `max_pages` free pages online without exclusive `database_lock`."""
 
+    if is_database_deleted(live_path):
+        raise ProfileDeletedError("Profile has been deleted")
     if not live_path.is_file() or live_path.is_symlink() or _has_restore_journal():
         return 0
     con = None
@@ -1048,25 +1650,36 @@ def _reclaim_incremental_pages_step(
     finally:
         if con is not None:
             con.close()
-        _restrict_database_files()
+        if not is_database_deleted(live_path):
+            _restrict_database_files()
 
 
 def _checkpoint_wal_unlocked(live_path: Path, *, mode: str = "PASSIVE") -> None:
+    if is_database_deleted(live_path):
+        raise ProfileDeletedError("Profile has been deleted")
     if not live_path.is_file() or live_path.is_symlink() or _has_restore_journal():
         return
     checkpoint_mode = mode if mode in {"PASSIVE", "TRUNCATE"} else "PASSIVE"
     raw = None
     try:
-        raw = sqlite3.connect(live_path, timeout=30, isolation_level=None)
+        raw = sqlite3.connect(
+            live_path,
+            timeout=30,
+            isolation_level=None,
+            factory=_LockedConnection,
+        )
         raw.execute(f"PRAGMA wal_checkpoint({checkpoint_mode})").fetchone()
     finally:
         if raw is not None:
             raw.close()
-        _restrict_database_files()
+        if not is_database_deleted(live_path):
+            _restrict_database_files()
 
 
 def _run_maintenance_if_initialized(*, now: datetime | None = None) -> dict | None:
     live_path = profile_database_path()
+    if is_database_deleted(live_path):
+        raise ProfileDeletedError("Profile has been deleted")
     if not live_path.is_file() or live_path.is_symlink() or _has_restore_journal():
         return None
     with connect() as con:
@@ -1081,9 +1694,11 @@ def _run_maintenance_if_initialized(*, now: datetime | None = None) -> dict | No
 def run_scheduled_maintenance(*, now: datetime | None = None) -> dict:
     """Run batched retention outside `database_lock` and reclaim bounded free pages."""
 
+    live_path = profile_database_path()
+    if is_database_deleted(live_path):
+        raise ProfileDeletedError("Profile has been deleted")
     if _has_restore_journal():
         return {}
-    live_path = profile_database_path()
     maintenance = _run_maintenance_if_initialized(now=now) or {}
     if maintenance and not maintenance.get("skipped") and not maintenance.get("truncated"):
         reclaimed_pages = _reclaim_incremental_pages_step(
@@ -1099,6 +1714,8 @@ def compact_database() -> dict:
 
     live_path = profile_database_path()
     try:
+        if is_database_deleted(live_path):
+            raise ProfileDeletedError("Profile has been deleted")
         if _has_restore_journal():
             raise BackupError(
                 "Storage compaction cannot run while an interrupted restore is awaiting recovery."
@@ -1186,6 +1803,8 @@ def compact_database() -> dict:
             "auto_vacuum_mode": status.get("auto_vacuum_mode", "incremental"),
             "status": status,
         }
+    except ProfileDeletedError:
+        raise
     except BackupError:
         raise
     except Exception as exc:
@@ -1218,7 +1837,7 @@ def create_backup(*, confirm_clear_hold: bool = False) -> dict:
             if not hold_was_active:
                 _prune_backups()
         return _backup_record(path)
-    except RecoveryHoldError:
+    except (RecoveryHoldError, ProfileDeletedError):
         raise
     except BackupError as exc:
         if not _has_restore_journal():
@@ -1273,12 +1892,13 @@ def _remove_sidecars(path: Path) -> None:
         Path(f"{path}{suffix}").unlink(missing_ok=True)
 
 
-def _restore_journal_path(profile_id: str | None = None) -> Path:
-    path = (
-        profile_database_path()
-        if profile_id is None
-        else profile_database_path(profile_id)
-    )
+def _restore_journal_path(target: str | Path | None = None) -> Path:
+    if target is None:
+        path = profile_database_path()
+    elif isinstance(target, Path):
+        path = target
+    else:
+        path = profile_database_path(target)
     return path.parent / f".{path.stem}{RESTORE_JOURNAL_NAME}"
 
 
@@ -1458,6 +2078,8 @@ def recover_interrupted_restore() -> bool:
                 _clear_restore_journal()
                 _set_last_error("An interrupted restore was rolled back to its safety backup.")
         return True
+    except ProfileDeletedError:
+        raise
     except BackupError as exc:
         _set_last_error(safe_error_message(exc, limit=200))
         LOGGER.exception("Could not recover an interrupted Bookward restore")
@@ -1891,6 +2513,8 @@ def restore_backup(backup_id: str) -> dict:
             "restored_backup": backup_id,
             "safety_backup": _backup_record(safety_backup),
         }
+    except ProfileDeletedError:
+        raise
     except Exception as exc:
         if not isinstance(exc, BackupError):
             LOGGER.exception("Bookward restore failed")
@@ -1910,6 +2534,9 @@ def restore_backup(backup_id: str) -> dict:
 
 
 def _run_scheduled_auth_backup() -> dict | None:
+    if has_pending_auth_backup_scrubs():
+        retry_pending_auth_backup_scrubs()
+        return None
     if backup_interval_hours() <= 0:
         return None
     auth_hold = _auth_recovery_hold_value()
@@ -1930,8 +2557,6 @@ def _run_scheduled_auth_backup() -> dict | None:
 
 
 def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
-    from .tenancy import profile_scope
-
     with profile_scope(profile_id):
         if _has_restore_journal() or database_lock().is_locked():
             return None
@@ -1953,6 +2578,8 @@ def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
         try:
             if maintenance_is_due():
                 run_scheduled_maintenance()
+        except ProfileDeletedError:
+            raise
         except Exception:
             LOGGER.exception(
                 "Scheduled Bookward storage maintenance failed for profile %s", profile_id
@@ -1966,12 +2593,16 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
     """Create hourly-polled backups without depending on host cron."""
 
     try:
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await asyncio.wait_for(stop.wait(), timeout=BACKUP_INITIAL_DELAY_SECONDS)
     except TimeoutError:
         pass
     while not stop.is_set():
-        from .profiles import profile_ids
+        from .profiles import profile_ids, recover_incomplete_account_erasures
 
+        try:
+            await asyncio.to_thread(recover_incomplete_account_erasures)
+        except Exception:
+            LOGGER.exception("Scheduled completion of tombstoned account erasure failed")
         try:
             await asyncio.to_thread(_run_scheduled_auth_backup)
         except Exception:
@@ -1981,14 +2612,54 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
         except Exception:
             LOGGER.exception("Could not enumerate profiles for scheduled backups")
             active_profiles = []
+        active_set = set(active_profiles)
         for profile_id in active_profiles:
             if stop.is_set():
                 break
             try:
                 await asyncio.to_thread(_run_scheduled_profile_backup, profile_id)
+            except ProfileDeletedError:
+                continue
             except Exception:
                 LOGGER.exception("Scheduled Bookward backup failed for profile %s", profile_id)
         try:
-            await asyncio.wait_for(stop.wait(), timeout=60)
+            all_profiles = await asyncio.to_thread(profile_ids, False)
+        except Exception:
+            LOGGER.exception("Could not enumerate disabled profiles for backup pruning")
+            all_profiles = []
+        disabled_profiles = [
+            profile_id
+            for profile_id in all_profiles
+            if profile_id not in active_set
+        ]
+        interval = backup_interval_hours()
+        expire_before = (
+            _utc_now()
+            - timedelta(hours=interval * backup_retention_count())
+            if interval > 0
+            else None
+        )
+        for profile_id in disabled_profiles:
+            try:
+                with profile_scope(profile_id):
+                    if not backup_directory().is_dir():
+                        continue
+
+                    def _prune_disabled():
+                        with database_lock(profile_database_path()):
+                            if recovery_hold_active():
+                                return
+                            _prune_backups(expire_before=expire_before)
+
+                    await asyncio.to_thread(_prune_disabled)
+            except ProfileDeletedError:
+                continue
+            except Exception:
+                LOGGER.exception(
+                    "Scheduled Bookward backup pruning failed for disabled profile %s",
+                    profile_id,
+                )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=BACKUP_POLL_SECONDS)
         except TimeoutError:
             pass

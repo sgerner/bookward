@@ -42,7 +42,9 @@
 			(account) =>
 				form.formId === `setStatus-${account.id}` ||
 				form.formId === `unlock-${account.id}` ||
-				(account.id !== data.current_user_id && form.formId === `resetPassword-${account.id}`)
+				(account.id !== data.current_user_id &&
+					(form.formId === `resetPassword-${account.id}` ||
+						form.formId === `deleteAccount-${account.id}`))
 		);
 		if (renderedInRow) return undefined;
 		return typeof form.message === 'string' && form.message.trim() ? form.message.trim() : undefined;
@@ -144,6 +146,9 @@
 	</section>
 	<section class="mt-8 grid gap-4">
 		<h2 class="text-xl font-semibold">Accounts</h2>
+		{#if formSuccessBanner(form, 'deleteAccount')}
+			<p class="rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, 'deleteAccount')}</p>
+		{/if}
 		{#if accountsSectionError}
 			<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">{accountsSectionError}</p>
 		{/if}
@@ -153,6 +158,15 @@
 			{@const statusFormId = `setStatus-${account.id}`}
 			{@const unlockFormId = `unlock-${account.id}`}
 			{@const resetFormId = `resetPassword-${account.id}`}
+			{@const deleteFormId = `deleteAccount-${account.id}`}
+			{@const deleteHasError = Boolean(
+				fieldError(form, deleteFormId, 'current_password') ||
+					fieldError(form, deleteFormId, 'confirm_username') ||
+					formErrorBanner(form, deleteFormId)
+			)}
+			{@const deleteRateLimited = Boolean(
+				form && form.formId === deleteFormId && 'rateLimited' in form && form.rateLimited
+			)}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
 					<div>
@@ -168,20 +182,66 @@
 							{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}{#if failedCount > 0} <span aria-hidden="true">·</span> {failedCount} recent failed sign-in attempt{failedCount === 1 ? '' : 's'}{/if}
 						</p>
 					</div>
-					<div class="flex flex-wrap items-center gap-2">
+					<div class="flex flex-wrap items-start gap-2">
 						<form method="POST" action="?/unlock" use:enhance={enhanceForm}>
 							<ProfileField profileId={data.user?.profile_id} />
 							<input type="hidden" name="account_id" value={account.id} />
 							<button
-								class="btn btn-sm {lockedCount > 0 ? 'preset-tonal-warning' : 'preset-tonal-surface'}"
+								class="btn btn-sm btn-reflow {lockedCount > 0 ? 'preset-tonal-warning' : 'preset-tonal-surface'}"
 								type="submit"
 								aria-label={`Unlock account ${account.display_name || account.username}`}
 							>
 								Unlock
 							</button>
 						</form>
-						{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
-							<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+						{#if account.id !== data.current_user_id}
+							<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
+								<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm btn-reflow {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button>
+							</form>
+							<details open={deleteHasError} class="max-w-full">
+								<summary class="btn btn-sm btn-reflow cursor-pointer preset-tonal-error" aria-label={`Delete account ${account.display_name || account.username}`}>Delete</summary>
+								<form method="POST" action="?/deleteAccount" use:enhance={enhanceForm} class="mt-3 grid max-w-xs min-w-0 gap-3 rounded-xl border border-surface-300-700 bg-surface-50-900 p-3">
+									<ProfileField profileId={data.user?.profile_id} />
+									<input type="hidden" name="account_id" value={account.id} />
+									<p class="text-xs text-surface-700-300">Permanently removes this login, profile database, encryption key, and snapshots.</p>
+									{#if data.password_enabled !== false}
+										<FormField
+											id={`delete-password-${account.id}`}
+											label="Your password"
+											srLabel={`to delete ${account.display_name || account.username}`}
+											error={fieldError(form, deleteFormId, 'current_password')}
+											class="grid min-w-0 gap-1"
+											labelClass="block text-xs font-medium text-surface-800-200"
+										>
+											{#snippet children(field)}
+												<input {...field} class="input min-w-0 text-sm" type="password" name="current_password" autocomplete="current-password" required />
+											{/snippet}
+										</FormField>
+									{:else}
+										<p class="text-xs text-surface-700-300">Deleting an account requires a sign-in within the last 10 minutes.</p>
+									{/if}
+									<FormField
+										id={`delete-confirm-${account.id}`}
+										label="Confirm username"
+										srLabel={`for ${account.display_name || account.username}`}
+										hint={`Type ${account.username} to confirm.`}
+										error={fieldError(form, deleteFormId, 'confirm_username')}
+										class="grid min-w-0 gap-1"
+										labelClass="block text-xs font-medium text-surface-800-200"
+									>
+										{#snippet children(field)}
+											<input {...field} class="input min-w-0 text-sm" name="confirm_username" autocomplete="off" required />
+										{/snippet}
+									</FormField>
+									{#if formErrorBanner(form, deleteFormId)}
+										<p class="rounded-xl p-2 text-xs {deleteRateLimited ? 'preset-tonal-warning' : 'preset-tonal-error'}" role="alert">{formErrorBanner(form, deleteFormId)}</p>
+									{/if}
+									<button class="btn btn-sm btn-reflow preset-filled-error-500 justify-self-start" type="submit" aria-label={`Confirm deleting account ${account.display_name || account.username}`}>Delete permanently</button>
+								</form>
+							</details>
+						{:else}
+							<a class="btn btn-sm btn-reflow preset-tonal-surface" href="/account">Account settings</a>
+						{/if}
 					</div>
 				</div>
 				{#if formSuccessBanner(form, unlockFormId)}

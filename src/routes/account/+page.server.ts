@@ -1,6 +1,10 @@
 import { error as httpError, fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
+import {
+	SESSION_COOKIE,
+	sessionCookieDeleteOptions,
+	sessionCookieOptions
+} from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
 import { formatWaitDuration } from '#lib/lockout-ui.js';
 import {
@@ -128,5 +132,123 @@ export const actions: Actions = {
 				message: error instanceof Error ? error.message : 'Login method could not be removed.'
 			});
 		}
+	},
+	resetHistory: async (event) => {
+		const { request, setHeaders } = event;
+		const form = await request.formData();
+		const hasCurrentPassword = form.has('current_password');
+		const current_password = String(form.get('current_password') || '');
+		const confirm = String(form.get('confirm') || '').trim();
+		const fieldErrors: Record<string, string> = {};
+		if (hasCurrentPassword && !current_password) {
+			fieldErrors.current_password = 'Enter your current password.';
+		}
+		if (confirm !== 'RESET') {
+			fieldErrors.confirm = 'Type RESET to confirm resetting your reading history.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			return fail(400, {
+				formId: 'resetHistory',
+				message: fieldErrors.confirm ?? fieldErrors.current_password!,
+				fieldErrors
+			});
+		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
+		try {
+			await withRequestContext({ sessionToken: currentSessionToken(), clientIp }, () =>
+				engine(
+					'/auth/account/reset-history',
+					{ method: 'POST', body: JSON.stringify({ current_password, confirm }) },
+					10 * 60_000
+				)
+			);
+			return {
+				formId: 'resetHistory',
+				message: 'Reading history and recommendation evidence were reset.'
+			};
+		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId: 'resetHistory',
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
+			const status = error instanceof EngineError ? error.status : 503;
+			const msg =
+				error instanceof Error ? error.message : 'Reading history could not be reset.';
+			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)
+				? { current_password: msg }
+				: status === 400 && /confirm resetting/i.test(msg)
+					? { confirm: msg }
+					: {};
+			return fail(status, {
+				formId: 'resetHistory',
+				message: msg,
+				fieldErrors: mappedFieldErrors
+			});
+		}
+	},
+	deleteAccount: async (event) => {
+		const { request, cookies, url, setHeaders } = event;
+		const form = await request.formData();
+		const hasCurrentPassword = form.has('current_password');
+		const current_password = String(form.get('current_password') || '');
+		const confirm = String(form.get('confirm') || '').trim();
+		const fieldErrors: Record<string, string> = {};
+		if (hasCurrentPassword && !current_password) {
+			fieldErrors.current_password = 'Enter your current password.';
+		}
+		if (confirm !== 'DELETE') {
+			fieldErrors.confirm = 'Type DELETE to confirm deleting your account.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			return fail(400, {
+				formId: 'deleteAccount',
+				message: fieldErrors.confirm ?? fieldErrors.current_password!,
+				fieldErrors
+			});
+		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
+		try {
+			await withRequestContext({ sessionToken: currentSessionToken(), clientIp }, () =>
+				engine(
+					'/auth/account',
+					{ method: 'DELETE', body: JSON.stringify({ current_password, confirm }) },
+					10 * 60_000
+				)
+			);
+		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId: 'deleteAccount',
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
+			const status = error instanceof EngineError ? error.status : 503;
+			if (error instanceof EngineError && error.status === 503) {
+				cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(url));
+			}
+			const msg = error instanceof Error ? error.message : 'Account could not be deleted.';
+			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)
+				? { current_password: msg }
+				: status === 400 && /confirm deleting/i.test(msg)
+					? { confirm: msg }
+					: {};
+			return fail(status, {
+				formId: 'deleteAccount',
+				message: msg,
+				fieldErrors: mappedFieldErrors
+			});
+		}
+		cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(url));
+		throw redirect(303, '/login?manual=1');
 	}
 };

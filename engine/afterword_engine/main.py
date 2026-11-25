@@ -39,6 +39,7 @@ from .database import (
     private_setting,
     purge_demo_reads,
     recompute_candidate_sources,
+    reset_profile_history,
     row,
     rows,
     scheduler_fenced,
@@ -55,10 +56,12 @@ from .backups import (
     create_backup,
     dismiss_auth_recovery_hold,
     dismiss_recovery_hold,
+    has_pending_auth_backup_scrubs,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
+    retry_pending_auth_backup_scrubs,
 )
 from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
@@ -174,7 +177,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_database_path, profile_scope
+from .tenancy import ProfileDeletedError, current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -216,6 +219,21 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class AccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class HistoryResetIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class AdminAccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm_username: str | None = Field(default=None, max_length=160)
 
 
 class CandidateAuditIn(BaseModel):
@@ -299,13 +317,41 @@ def _require_admin(request):
     return account
 
 
-def _require_recent_authentication(account):
+def _require_recent_authentication(
+    account, message: str = "Sign in again before adding a login method"
+):
     try:
         authenticated_at = datetime.fromisoformat(account.get("session_created_at", ""))
     except (TypeError, ValueError):
         raise HTTPException(401, "Sign in again to confirm this change")
     if datetime.now(timezone.utc) - authenticated_at > timedelta(minutes=10):
-        raise HTTPException(401, "Sign in again before adding a login method")
+        raise HTTPException(401, message)
+
+
+def _verify_account_confirmation(account: dict, current_password: str, request: Request) -> None:
+    methods = identity_store.auth_methods(account["id"])
+    if methods["password_enabled"]:
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
+        if not verified or verified["id"] != account["id"]:
+            raise HTTPException(401, "Current password is incorrect")
+    else:
+        _require_recent_authentication(account, "Sign in again to confirm this change")
 
 
 def _mark_private_no_store(response: Response) -> None:
@@ -545,7 +591,7 @@ async def source_scheduler_loop(stop):
                         enqueue_job("sync_due", dedupe=True)
                     if check_enrichment_retries:
                         _queue_due_enrichment_retries()
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 # A transient profile database error must not stop schedules
@@ -572,7 +618,7 @@ async def digest_scheduler_loop(stop):
                         continue
                     if digest_is_due(private_settings()) and not active_job("digest"):
                         enqueue_job("digest", dedupe=True)
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
@@ -645,7 +691,7 @@ async def goodreads_rss_scheduler_loop(stop):
             try:
                 with profile_scope(profile_id):
                     queue_goodreads_rss_if_due()
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
@@ -1020,7 +1066,6 @@ async def handle_job(kind: str):
 @asynccontextmanager
 async def lifespan(app):
     _warn_if_shared_rate_limit_bucket()
-    ready_profiles: set[str] = set()
     legacy_recovered = False
     try:
         with profile_scope("legacy"):
@@ -1029,17 +1074,28 @@ async def lifespan(app):
     except Exception:
         LOGGER.exception("Could not recover profile legacy during startup")
     identity_store.initialize_auth()
-    if legacy_recovered:
+    try:
+        identity_store.recover_incomplete_account_erasures()
+    except Exception:
+        LOGGER.warning("Could not complete interrupted account erasures during startup")
+    if not has_restore_journal("legacy") or installation_key_path().is_file():
+        auth_registry_key()
+    ready_profiles: set[str] = set()
+    legacy_active = "legacy" in identity_store.profile_ids()
+    if has_pending_auth_backup_scrubs():
+        try:
+            retry_pending_auth_backup_scrubs()
+        except Exception:
+            LOGGER.warning("Could not complete pending auth-backup scrubs during startup")
+    if legacy_active and legacy_recovered:
         try:
             with profile_scope("legacy"):
-                initialize()
+                initialize(seed_demo=True)
                 legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
             identity_store.migrate_legacy_api_tokens(legacy_tokens)
             ready_profiles.add("legacy")
         except Exception:
             LOGGER.exception("Could not initialize profile legacy during startup")
-    if not has_restore_journal("legacy") or installation_key_path().is_file():
-        auth_registry_key()
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -1224,6 +1280,12 @@ async def authenticate_engine_request(request: Request, call_next):
         if has_restore_journal(token["profile_id"]):
             try:
                 await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+            except ProfileDeletedError:
+                return JSONResponse(
+                    {"detail": "A valid API token is required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
             except Exception:
                 LOGGER.exception(
                     "Authenticated profile is unavailable during API request recovery"
@@ -1233,15 +1295,21 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-        with profile_scope(token["profile_id"]), bind_request_restore_epoch():
-            try:
+        try:
+            with profile_scope(token["profile_id"]), bind_request_restore_epoch():
                 response = await call_next(request)
-            except RestoreEpochError:
-                return JSONResponse(
-                    {"detail": "Profile database was restored during this request; retry the action."},
-                    status_code=409,
-                    headers={"cache-control": "private, no-store"},
-                )
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "A valid API token is required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+        except RestoreEpochError:
+            return JSONResponse(
+                {"detail": "Profile database was restored during this request; retry the action."},
+                status_code=409,
+                headers={"cache-control": "private, no-store"},
+            )
         _mark_private_no_store(response)
         return response
 
@@ -1274,6 +1342,12 @@ async def authenticate_engine_request(request: Request, call_next):
     ):
         try:
             await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "Authentication required"},
+                status_code=401,
+                headers={"cache-control": "private, no-store"},
+            )
         except Exception:
             if not (request.method == "GET" and path == "/api/backups"):
                 LOGGER.exception(
@@ -1285,15 +1359,21 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-    with profile_scope(account["profile_id"]), bind_request_restore_epoch():
-        try:
+    try:
+        with profile_scope(account["profile_id"]), bind_request_restore_epoch():
             response = await call_next(request)
-        except RestoreEpochError:
-            return JSONResponse(
-                {"detail": "Profile database was restored during this request; retry the action."},
-                status_code=409,
-                headers={"cache-control": "private, no-store"},
-            )
+    except ProfileDeletedError:
+        return JSONResponse(
+            {"detail": "Authentication required"},
+            status_code=401,
+            headers={"cache-control": "private, no-store"},
+        )
+    except RestoreEpochError:
+        return JSONResponse(
+            {"detail": "Profile database was restored during this request; retry the action."},
+            status_code=409,
+            headers={"cache-control": "private, no-store"},
+        )
     _mark_private_no_store(response)
     return response
 
@@ -1400,6 +1480,49 @@ def auth_unlink_identity(identity_id: int, request: Request):
     return {"unlinked": True, "identity_id": identity_id}
 
 
+@app.post("/auth/account/reset-history")
+def auth_reset_history(
+    request: Request,
+    payload: HistoryResetIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "RESET":
+        raise HTTPException(400, "Type RESET to confirm resetting your reading history")
+    _verify_account_confirmation(account, payload.current_password, request)
+    if has_restore_journal(account["profile_id"]):
+        try:
+            _recover_profile_for_request(account["profile_id"])
+        except Exception as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
+    return reset_profile_history(account["profile_id"])
+
+
+@app.delete("/auth/account")
+def auth_delete_account(
+    request: Request,
+    payload: AccountDeleteIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "DELETE":
+        raise HTTPException(400, "Type DELETE to confirm deleting your account")
+    _verify_account_confirmation(account, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account["id"], actor_account_id=account["id"]
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked; remaining profile cleanup will finish automatically.",
+        ) from exc
+
+
 @app.get("/admin/accounts")
 def admin_accounts(request: Request):
     _require_admin(request)
@@ -1463,12 +1586,65 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
         # Disabled profiles are excluded from startup/background work. Apply
         # any migrations accumulated while this account was disabled before
         # making its data available to a new session.
-        _ensure_profile_database(found["profile_id"])
+        try:
+            _ensure_profile_database(found["profile_id"])
+        except ProfileDeletedError as exc:
+            raise HTTPException(
+                400, "Account deletion is incomplete; retry deleting this account"
+            ) from exc
+        except BackupError as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
     try:
         identity_store.set_account_status(account_id, status)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"updated": True, "account_id": account_id, "status": status}
+
+
+@app.delete("/admin/accounts/{account_id}")
+def admin_delete_account(
+    account_id: str,
+    request: Request,
+    payload: AdminAccountDeleteIn | None = Body(default=None),
+):
+    admin = _require_admin(request)
+    target = identity_store.account_by_id(account_id)
+    if not target:
+        raise HTTPException(404, "Account not found")
+    if target["role"] == "admin":
+        remaining_active_admins = [
+            item
+            for item in identity_store.accounts_list()
+            if item["role"] == "admin" and item["status"] == "active" and item["id"] != account_id
+        ]
+        if not remaining_active_admins:
+            raise HTTPException(400, "The installation must retain an active administrator")
+    if admin["id"] == account_id:
+        raise HTTPException(400, "Use Account settings to delete your own account")
+    if (
+        payload is None
+        or payload.confirm_username is None
+        or payload.confirm_username.strip() != target["username"]
+    ):
+        raise HTTPException(400, f"Type {target['username']} to confirm deleting this account")
+    _verify_account_confirmation(admin, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account_id,
+            actor_account_id=admin["id"],
+            require_active_admin_actor=True,
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked, but profile cleanup could not complete immediately. Retry deleting this account or wait for background cleanup.",
+        ) from exc
 
 
 @app.delete("/admin/profiles/{profile_id}/restore-journal")
@@ -1479,8 +1655,13 @@ def admin_delete_restore_journal(profile_id: str, request: Request):
         and profile_id not in identity_store.profile_ids(active_only=False)
     ):
         raise HTTPException(404, "Profile not found")
-    with profile_scope(profile_id):
-        cleared = clear_interrupted_restore_journal()
+    try:
+        with profile_scope(profile_id):
+            cleared = clear_interrupted_restore_journal()
+    except ProfileDeletedError as exc:
+        raise HTTPException(
+            400, "Account deletion is incomplete; retry deleting this account"
+        ) from exc
     return {"cleared": cleared, "profile_id": profile_id}
 
 

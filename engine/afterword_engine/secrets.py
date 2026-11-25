@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
-from .tenancy import current_profile_id
+from .tenancy import ProfileDeletedError, current_profile_id, profile_database_path
 
 _AUTH_REGISTRY_KEY_LOCK = threading.Lock()
 _AUTH_REGISTRY_KEY_CACHE: tuple[tuple[str, int, int, int, int, int], bytes] | None = None
@@ -33,14 +33,45 @@ def installation_key_path() -> Path:
         return database.with_name(f"{database.name}.secret.key")
     return database.with_name("secret.key")
 
-def _generated_key(path: Path) -> bytes:
+
+def _profile_database_for_key(path: Path) -> Path | None:
+    root_key = Path(settings.db).with_name("secret.key")
+    if path == root_key:
+        return None
+    if path.parent.name == "profiles" and path.name.endswith(".sqlite3.secret.key"):
+        return path.with_name(path.name.removesuffix(".secret.key"))
+    profile_id = current_profile_id()
+    if profile_id and profile_id != "legacy":
+        return profile_database_path(profile_id)
+    return None
+
+
+def _read_or_create_key_file(path: Path) -> bytes:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as handle: handle.write(Fernet.generate_key())
-        except FileExistsError: pass
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(Fernet.generate_key())
+        except FileExistsError:
+            pass
     return path.read_bytes().strip()
+
+
+def _generated_key(path: Path) -> bytes:
+    db_path = _profile_database_for_key(path)
+    if db_path is None:
+        return _read_or_create_key_file(path)
+    from .database import database_lock
+
+    lock = database_lock(db_path)
+    if lock.is_deleted:
+        raise ProfileDeletedError("Profile has been deleted")
+    owner = lock.acquire_connection()
+    try:
+        return _read_or_create_key_file(path)
+    finally:
+        lock.release_connection(owner)
 
 
 def installation_key():
