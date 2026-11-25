@@ -1723,3 +1723,90 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
         item["name"] for item in rows("PRAGMA table_info(read_metadata)")
     }
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
+
+
+def test_candidate_quality_recovery_job_reaudits_non_isbn_v4_rows_and_preserves_source_provenance(
+    database, monkeypatch
+):
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        homonym_cid = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_url,source_id,status,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "Home",
+                "Marilynne Robinson",
+                "Wrong Michael Robinson catalog blurb.",
+                json.dumps(["Literary fiction", "Biography"]),
+                "https://example.com/home",
+                source_id,
+                "recommended",
+                "home marilynne robinson v4",
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "provider='openlibrary',provider_id='/works/OLMICHAELW',work_id='/works/OLMICHAELW',"
+            "metadata_provider='openlibrary',metadata_provider_id='/works/OLMICHAELW' "
+            "WHERE candidate_id=?",
+            (homonym_cid,),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'genres','source',?,1.0,'{}')",
+            (homonym_cid, str(source_id)),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'description','openlibrary','/works/OLMICHAELW',0.95,?)",
+            (homonym_cid, json.dumps({"payload": {"description": "Wrong Michael Robinson catalog blurb."}})),
+        )
+        con.execute(
+            "INSERT INTO metadata_field_provenance(entity_type,entity_id,field,provider,provider_id,confidence,source_payload) "
+            "VALUES('candidate',?,'genres','openlibrary','/works/OLMICHAELW',0.95,?)",
+            (homonym_cid, json.dumps({"payload": {"genres": ["Biography"]}})),
+        )
+
+    from afterword_engine import quality as quality_mod
+
+    async def fake_resolve(title, author, **_kwargs):
+        return {
+            "provider": "openlibrary",
+            "provider_id": "/works/OLMICHAELW",
+            "work_id": "/works/OLMICHAELW",
+            "isbn13": "",
+            "isbn10": "",
+            "title_match": 1.0,
+            "author_match": 0.55,
+            "quality_score": 0.8425,
+            "metadata_provenance": {"fields": {}, "fetch_trace": [], "source_payloads": []},
+        }
+
+    scored_calls = []
+
+    async def fake_score_all(*_args, **_kwargs):
+        scored_calls.append(True)
+        return 0
+
+    monkeypatch.setattr(quality_mod, "resolve_catalog_match", fake_resolve)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+
+    outcome = asyncio.run(handle_job("candidate_quality_recovery"))
+    assert outcome["audited"] == 1
+    assert outcome["quarantine"] == 1
+    assert scored_calls == [True]
+
+    after_candidate = row("SELECT description,genres FROM candidates WHERE id=?", (homonym_cid,))
+    after_quality = row(
+        "SELECT quality_status,audit_version,work_id,metadata_provider FROM candidate_quality WHERE candidate_id=?",
+        (homonym_cid,),
+    )
+    assert after_quality == {
+        "quality_status": "quarantine",
+        "audit_version": QUALITY_VERSION,
+        "work_id": "",
+        "metadata_provider": "",
+    }
+    assert after_candidate["description"] == ""
+    assert json.loads(after_candidate["genres"]) == ["Literary fiction"]

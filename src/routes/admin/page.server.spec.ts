@@ -63,6 +63,7 @@ function assertNoPasswordEcho(result: unknown, submitted: string) {
 	expect(JSON.stringify(result)).not.toContain(submitted);
 }
 
+
 describe('admin page actions', () => {
 	beforeEach(() => {
 		engine.mockReset();
@@ -216,6 +217,103 @@ describe('admin page actions', () => {
 				error: true,
 				message: 'Cannot disable the last active administrator.'
 			}
+		});
+	});
+
+	it('maps a 404 unlock target through failure() with per-row formId, error=true, and exact status', async () => {
+		engine.mockRejectedValueOnce(new EngineError('Account not found.', 404));
+		const form = new FormData();
+		form.set('account_id', 'missing-account-id');
+
+		const result = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: form
+			})
+		} as never);
+
+		expect(engine).toHaveBeenCalledWith('/admin/accounts/missing-account-id/unlock', {
+			method: 'POST',
+			body: '{}'
+		});
+		expect(result).toEqual({
+			status: 404,
+			data: {
+				formId: 'unlock-missing-account-id',
+				message: 'Account not found.',
+				error: true,
+				fieldErrors: {}
+			}
+		});
+	});
+
+	it('rejects blank account_id with 400 and maps unexpected network errors to 503', async () => {
+		const blankForm = new FormData();
+		blankForm.set('account_id', '   ');
+		const blankResult = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: blankForm
+			})
+		} as never);
+		expect(blankResult).toEqual({
+			status: 400,
+			data: {
+				formId: 'unlock',
+				message: 'Choose a valid account.',
+				error: true,
+				fieldErrors: {}
+			}
+		});
+		expect(engine).not.toHaveBeenCalled();
+
+		engine.mockRejectedValueOnce(new TypeError('fetch failed'));
+		const errorForm = new FormData();
+		errorForm.set('account_id', 'acc-1');
+		const networkResult = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: errorForm
+			})
+		} as never);
+		expect(networkResult).toEqual({
+			status: 503,
+			data: {
+				formId: 'unlock-acc-1',
+				message: 'fetch failed',
+				error: true,
+				fieldErrors: {}
+			}
+		});
+	});
+
+	it('formats per-row unlock confirmation messages when attempts were cleared or already zero', async () => {
+		engine.mockResolvedValueOnce({ unlocked: true, username: 'reader', cleared_attempts: 10 });
+		const form = new FormData();
+		form.set('account_id', 'acc-reader');
+		const unlocked = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: form
+			})
+		} as never);
+		expect(unlocked).toEqual({
+			formId: 'unlock-acc-reader',
+			message: 'Unlocked reader (10 failed sign-in attempts cleared).'
+		});
+
+		engine.mockResolvedValueOnce({ unlocked: true, username: 'reader', cleared_attempts: 0 });
+		const zeroForm = new FormData();
+		zeroForm.set('account_id', 'acc-reader');
+		const zeroUnlocked = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: zeroForm
+			})
+		} as never);
+		expect(zeroUnlocked).toEqual({
+			formId: 'unlock-acc-reader',
+			message: 'Sign-in lockouts cleared for reader.'
 		});
 	});
 });

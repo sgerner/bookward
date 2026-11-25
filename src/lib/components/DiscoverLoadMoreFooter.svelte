@@ -31,7 +31,7 @@
 	<InlineAlert message={error} />
 	<button
 		type="button"
-		class="btn btn-sm preset-tonal-secondary"
+		class="btn btn-sm btn-reflow preset-tonal-secondary"
 		onclick={onLoadMore}
 		disabled={loading}
 		aria-busy={loading}

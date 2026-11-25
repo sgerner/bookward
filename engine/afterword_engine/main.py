@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import json
 import asyncio
 import logging
@@ -35,6 +36,7 @@ from .database import (
     fenced_async,
     initialize,
     normalize_key,
+    private_setting,
     recompute_candidate_sources,
     row,
     rows,
@@ -137,10 +139,14 @@ from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
+    CATALOG_QUARANTINE_RETRY_DAYS,
     QUALITY_AUDIT_BATCH_SIZE,
+    QUALITY_SWEEP_ACTIVE_KEY,
+    _utc_audit_timestamp,
     audit_candidates,
     configure_candidate_quality_sweep,
     finish_candidate_quality_batch,
+    get_candidate_quality_sweep_status,
     has_candidate_quality_audit_candidates,
     prepare_candidate_quality_batch,
     quality_summary,
@@ -174,8 +180,13 @@ GOODREADS_RSS_MAX_ATTEMPTS = 3
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 ENRICHMENT_RETRY_POLL_SECONDS = 300
+QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS = 120.0
+QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY = "candidate_quality_recovery_chain_started_at"
+QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY = "candidate_quality_recovery_deferred_until"
+QUALITY_RETRY_QUARANTINED_BEFORE_KEY = "candidate_quality_retry_quarantined_before"
 GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
+_recovery_clock = time.time
 
 
 class LocalLoginIn(BaseModel):
@@ -205,7 +216,12 @@ class AccountPasswordIn(BaseModel):
 
 class CandidateAuditIn(BaseModel):
     mode: Literal["incremental", "full"] | None = None
+    dry_run: bool = False
+    count_only: bool = False
+    only_pending: bool | None = None
     retry: bool = False
+    retry_quarantined: bool = False
+    limit: int | None = Field(default=None, ge=1, le=500)
 
 
 def _ensure_profile_database(profile_id: str):
@@ -219,6 +235,57 @@ def _principal(request):
     if account is None:
         raise HTTPException(401, "Authentication required")
     return account
+
+
+def _normalize_ip(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if not candidate or len(candidate) > 80:
+        return None
+    if candidate.startswith("[") and "]" in candidate:
+        host_part, _, remainder = candidate[1:].partition("]")
+        if remainder and not (remainder.startswith(":") and remainder[1:].isdigit()):
+            return None
+        candidate = host_part
+    elif candidate.count(":") == 1:
+        host_part, port_part = candidate.split(":", 1)
+        if port_part.isdigit():
+            candidate = host_part
+    zone_stripped = candidate.split("%", 1)[0]
+    try:
+        parsed = ipaddress.ip_address(zone_stripped)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return str(parsed)
+
+
+def _verified_client_ip(request: Request, *, service_authenticated: bool = False) -> str:
+    peer_host = request.client.host if request.client and request.client.host else ""
+    if service_authenticated:
+        forwarded = _normalize_ip(request.headers.get("x-bookward-client-ip"))
+        if forwarded:
+            return forwarded
+    normalized_peer = _normalize_ip(peer_host)
+    if normalized_peer:
+        return normalized_peer
+    return peer_host[:80] if peer_host else "unknown"
+
+
+def _warn_if_shared_rate_limit_bucket() -> None:
+    if not settings.service_secret.strip():
+        LOGGER.warning(
+            "AFTERWORD_SERVICE_SECRET is not set; x-bookward-client-ip headers are ignored "
+            "and sign-in rate limiting shares the caller peer IP bucket. Set ENGINE_SERVICE_SECRET "
+            "(and ADDRESS_HEADER behind a reverse proxy) for per-client IP isolation."
+        )
+
+
+def _request_client_ip(request: Request) -> str:
+    resolved = getattr(request.state, "client_ip", None)
+    if resolved:
+        return resolved
+    return _verified_client_ip(request)
 
 
 def _require_admin(request):
@@ -356,8 +423,48 @@ def enqueue_followup_job(kind: str):
         return job_id
 
 
+def _get_quality_recovery_setting_float(key: str) -> float | None:
+    raw = private_setting(key, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _set_quality_recovery_settings(**values: str) -> None:
+    if not values:
+        return
+    with transaction() as con:
+        for key, value in values.items():
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+
+
+def _is_quality_recovery_deferred(now: float | None = None) -> bool:
+    deferred_until = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY)
+    if deferred_until is None:
+        return False
+    current = _recovery_clock() if now is None else now
+    return current < deferred_until and (deferred_until - current) <= (ENRICHMENT_RETRY_POLL_SECONDS * 2)
+
+
+def _has_due_quality_recovery() -> bool:
+    retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+    if retry_cutoff:
+        return has_candidate_quality_audit_candidates(
+            include_quarantined=True,
+            quarantine_before=retry_cutoff,
+        )
+    return has_candidate_quality_audit_candidates()
+
+
 def _enqueue_candidate_quality_followup():
-    if has_candidate_quality_audit_candidates():
+    if not _is_quality_recovery_deferred() and _has_due_quality_recovery():
         return enqueue_followup_job("candidate_quality_recovery")
     return None
 
@@ -367,11 +474,20 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
+    now_ts = _recovery_clock()
     if (
         not active_job("candidate_quality")
         and not active_job("candidate_quality_recovery")
-        and has_candidate_quality_audit_candidates()
+        and not _is_quality_recovery_deferred(now_ts)
+        and _has_due_quality_recovery()
     ):
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        updates: dict[str, str] = {QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: ""}
+        if started is not None and (
+            started > now_ts or (now_ts - started) >= QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS
+        ):
+            updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**updates)
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -679,8 +795,54 @@ async def handle_job(kind: str):
             "score_job_id": score_job_id,
         }
     if kind == "candidate_quality_recovery":
-        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
+        profile_key = current_profile_id()
+        now_ts = _recovery_clock()
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        max_chain_age = QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
+        if started is None or started > now_ts or (now_ts - started) > max_chain_age:
+            started = now_ts
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                }
+            )
+        retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+        if retry_cutoff:
+            quality = await audit_candidates(
+                only_pending=True,
+                limit=QUALITY_AUDIT_BATCH_SIZE,
+                retry_quarantined=True,
+                quarantine_before=retry_cutoff,
+            )
+        else:
+            quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        after_ts = _recovery_clock()
+        followup_deferred = False
+        if _has_due_quality_recovery():
+            if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+                _enqueue_candidate_quality_followup()
+            else:
+                _set_quality_recovery_settings(
+                    **{
+                        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                        QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
+                    }
+                )
+                followup_deferred = True
+                LOGGER.info(
+                    "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
+                    profile_key,
+                    QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
+                )
+        else:
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                    QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+                }
+            )
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
@@ -688,7 +850,7 @@ async def handle_job(kind: str):
             config.get("embedding_url"),
             config.get("embedding_api_key"),
         )
-        return {**quality, "scored": scored}
+        return {**quality, "scored": scored, "followup_deferred": followup_deferred}
     if kind.startswith("source:"):
         try:
             source_id = int(kind.partition(":")[2])
@@ -853,6 +1015,7 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    _warn_if_shared_rate_limit_bucket()
     identity_store.initialize_auth()
     ready_profiles: set[str] = set()
     try:
@@ -892,7 +1055,11 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
+                if (
+                    not active_job("candidate_quality")
+                    and not _is_quality_recovery_deferred()
+                    and _has_due_quality_recovery()
+                ):
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -977,7 +1144,8 @@ async def authenticate_engine_request(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or path == "/api/health":
         return await call_next(request)
-    if settings.service_secret:
+    service_authenticated = False
+    if settings.service_secret.strip():
         supplied = request.headers.get("x-bookward-service", "")
         if not hmac.compare_digest(supplied, settings.service_secret):
             return JSONResponse(
@@ -985,6 +1153,10 @@ async def authenticate_engine_request(request: Request, call_next):
                 status_code=401,
                 headers={"cache-control": "no-store"},
             )
+        service_authenticated = True
+    request.state.client_ip = _verified_client_ip(
+        request, service_authenticated=service_authenticated
+    )
 
     if path == "/api/v1" or path.startswith("/api/v1/"):
         authorization = request.headers.get("authorization", "")
@@ -1127,10 +1299,18 @@ def auth_config():
 
 @app.post("/auth/login")
 def local_login(payload: LocalLoginIn, request: Request):
-    account = identity_store.authenticate_local(
-        payload.username, payload.password,
-        request.client.host if request.client else "unknown",
-    )
+    try:
+        account = identity_store.authenticate_local(
+            payload.username,
+            payload.password,
+            _request_client_ip(request),
+        )
+    except identity_store.LoginRateLimitError as exc:
+        raise HTTPException(
+            429,
+            str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     if not account:
         raise HTTPException(401, "Username or password is incorrect")
     raw, account = identity_store.create_session(account["id"])
@@ -1167,10 +1347,23 @@ def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
     if methods["password_enabled"]:
-        verified = identity_store.authenticate_local(
-            account["username"], payload.current_password,
-            request.client.host if request.client else "unknown",
-        )
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                payload.current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
@@ -1232,6 +1425,15 @@ def admin_reset_password(account_id: str, payload: AccountPasswordIn, request: R
     except (ValueError, LookupError) as exc:
         raise HTTPException(400 if isinstance(exc, ValueError) else 404, str(exc)) from exc
     return {"changed": True, "account_id": account_id}
+
+
+@app.post("/admin/accounts/{account_id}/unlock")
+def admin_unlock_account(account_id: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        return identity_store.unlock_account(account_id, admin_id=admin["id"])
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.put("/admin/accounts/{account_id}/status")
@@ -4530,13 +4732,75 @@ async def sync():
 async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
-@app.post("/api/candidates/audit")
-async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
-    """Queue a bounded incremental or full catalog identity and quality audit."""
+def _has_resumable_manual_sweep() -> bool:
+    if private_setting(QUALITY_SWEEP_ACTIVE_KEY, "") == "1":
+        return True
+    if active_job("candidate_quality"):
+        return True
+    return bool(get_candidate_quality_sweep_status().get("can_retry"))
 
-    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
-    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
-    return configure_candidate_quality_sweep(mode=mode, retry=retry)
+
+@app.post("/api/candidates/audit")
+@fenced_async
+async def candidate_audit(
+    payload: Annotated[CandidateAuditIn | None, Body()] = None,
+    mode: Annotated[Literal["incremental", "full"] | None, Query()] = None,
+    dry_run: Annotated[bool, Query()] = False,
+    count_only: Annotated[bool, Query()] = False,
+    only_pending: Annotated[bool | None, Query()] = None,
+    retry: Annotated[bool, Query()] = False,
+    retry_quarantined: Annotated[bool, Query()] = False,
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+):
+    """Queue a bounded incremental/full catalog audit, retry quarantined rows, or preview scope."""
+
+    has_payload = isinstance(payload, CandidateAuditIn)
+    effective_mode = mode if mode is not None else (payload.mode if has_payload else None)
+    effective_dry_run = bool(dry_run or (has_payload and payload.dry_run))
+    effective_count_only = bool(count_only or (has_payload and payload.count_only))
+    effective_retry = bool(retry or (has_payload and payload.retry))
+    effective_retry_quarantined = bool(
+        retry_quarantined or (has_payload and payload.retry_quarantined)
+    )
+    if effective_dry_run or effective_count_only:
+        payload_only_pending = payload.only_pending if has_payload else None
+        effective_only_pending = (
+            only_pending
+            if only_pending is not None
+            else (
+                payload_only_pending
+                if payload_only_pending is not None
+                else (effective_mode != "full")
+            )
+        )
+        effective_limit = (
+            limit if limit is not None else (payload.limit if has_payload else None)
+        )
+        return await audit_candidates(
+            only_pending=effective_only_pending,
+            limit=effective_limit,
+            dry_run=effective_dry_run,
+            count_only=effective_count_only,
+            retry_quarantined=bool(effective_retry or effective_retry_quarantined),
+        )
+    if effective_retry_quarantined or (
+        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
+    ):
+        cutoff = _utc_audit_timestamp()
+        settings_updates = {
+            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+        }
+        if not active_job("candidate_quality_recovery"):
+            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**settings_updates)
+        return {
+            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "mode": "incremental",
+            "retry_quarantined": True,
+            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
+        }
+    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():

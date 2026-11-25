@@ -2,13 +2,27 @@ import { error as httpError, fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
+import { formatWaitDuration } from '#lib/lockout-ui.js';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resolveClientAddress,
+	setCurrentSessionToken,
+	withRequestContext
+} from '#lib/server/request-context.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
 type AuthMethods = { password_enabled: boolean; oidc_identities: IdentityInfo[] };
 type AuthConfig = { oidc_enabled: boolean };
 const fail = (
 	status: number,
-	data: { formId: string; message: string; fieldErrors?: Record<string, string> }
+	data: {
+		formId: string;
+		message: string;
+		fieldErrors?: Record<string, string>;
+		rateLimited?: true;
+		retryAfterSeconds?: number;
+	}
 ) => kitFail(status, { fieldErrors: {}, ...data, error: true as const });
 
 export const load: PageServerLoad = async ({ locals, url }) => {
@@ -39,7 +53,8 @@ export const load: PageServerLoad = async ({ locals, url }) => {
 };
 
 export const actions: Actions = {
-	changePassword: async ({ request, cookies, url }) => {
+	changePassword: async (event) => {
+		const { request, cookies, locals, url, setHeaders } = event;
 		const form = await request.formData();
 		const hasCurrentPassword = form.has('current_password');
 		const current_password = String(form.get('current_password') || '');
@@ -60,13 +75,30 @@ export const actions: Actions = {
 				fieldErrors
 			});
 		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
 		try {
-			const result = await engine<{ session_token: string; max_age: number }>('/auth/password/change', {
-				method: 'POST', body: JSON.stringify({ current_password, new_password })
-			});
+			const result = await withRequestContext({ sessionToken: currentSessionToken(), clientIp }, () =>
+				engine<{ session_token: string; max_age: number }>('/auth/password/change', {
+					method: 'POST', body: JSON.stringify({ current_password, new_password })
+				})
+			);
 			cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
+			setCurrentSessionToken(result.session_token);
+			if (locals?.user) {
+				locals.user = { ...locals.user, must_change_password: false };
+			}
 			return { formId: 'changePassword', message: 'Password updated.' };
 		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId: 'changePassword',
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
 			const status = error instanceof EngineError ? error.status : 503;
 			const msg = error instanceof Error ? error.message : 'Password could not be updated.';
 			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)

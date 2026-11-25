@@ -14,6 +14,11 @@ vi.mock('#lib/server/engine.js', async (importOriginal) => {
 });
 
 import { EngineError } from '#lib/server/engine.js';
+import {
+	currentClientIp,
+	currentSessionToken,
+	withSessionToken
+} from '#lib/server/request-context.js';
 import { actions, load } from './+page.server';
 
 describe('account page loader', () => {
@@ -195,12 +200,97 @@ describe('account page actions', () => {
 		});
 	});
 
+	it('updates the active request-context session token and forwards client IP when rotating passwords', async () => {
+		let seenClientIp: string | undefined;
+		engine.mockImplementationOnce(async () => {
+			seenClientIp = currentClientIp();
+			return { session_token: 'rotated-session', max_age: 3600 };
+		});
+		const cookiesSet = vi.fn();
+		const locals = {
+			user: {
+				id: 1,
+				username: 'reader',
+				role: 'user',
+				profile_id: 'reader',
+				must_change_password: true
+			}
+		};
+		const currentCandidate = makeLongInput();
+		const nextCandidate = makeLongInput();
+		const form = new FormData();
+		form.set('current_password', currentCandidate);
+		form.set('new_password', nextCandidate);
+
+		await withSessionToken('old-session', async () => {
+			const result = await actions.changePassword({
+				request: new Request('https://bookward.test/account?/changePassword', {
+					method: 'POST',
+					body: form
+				}),
+				cookies: { set: cookiesSet },
+				locals,
+				url: new URL('https://bookward.test/account?force_password_change=1'),
+				getClientAddress: () => '198.51.100.42'
+			} as never);
+
+			expect(result).toEqual({ formId: 'changePassword', message: 'Password updated.' });
+			expect(seenClientIp).toBe('198.51.100.42');
+			expect(currentSessionToken()).toBe('rotated-session');
+			expect(locals.user.must_change_password).toBe(false);
+			assertNoPasswordEcho(result, currentCandidate, nextCandidate);
+		});
+
+		expect(cookiesSet).toHaveBeenCalledWith(
+			'bookward_session',
+			'rotated-session',
+			expect.objectContaining({ maxAge: 3600, path: '/' })
+		);
+	});
+
+	it('displays remaining wait time and sets Retry-After on HTTP 429 session lockouts', async () => {
+		engine.mockRejectedValue(
+			new EngineError('Too many failed password attempts.', 429, 720)
+		);
+		const setHeaders = vi.fn();
+		const currentCandidate = makeLongInput();
+		const nextCandidate = makeLongInput();
+		const form = new FormData();
+		form.set('current_password', currentCandidate);
+		form.set('new_password', nextCandidate);
+
+		const result = await actions.changePassword({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				body: form
+			}),
+			cookies: { set: vi.fn() },
+			url: new URL('https://bookward.test/account?force_password_change=1'),
+			setHeaders,
+			getClientAddress: () => '198.51.100.42'
+		} as never);
+
+		expect(setHeaders).toHaveBeenCalledWith({ 'retry-after': '720' });
+		expect(result).toMatchObject({
+			status: 429,
+			data: {
+				formId: 'changePassword',
+				error: true,
+				rateLimited: true,
+				retryAfterSeconds: 720,
+				fieldErrors: {},
+				message: expect.stringContaining('Wait 12 minutes')
+			}
+		});
+		assertNoPasswordEcho(result, currentCandidate, nextCandidate);
+	});
+
 	it('applies Secure cookie flags from the request URL when rotating the session on password change', async () => {
 		engine.mockResolvedValue({ session_token: 'rotated-session', max_age: 7200 });
 		const httpCookies = { set: vi.fn() };
 		const form = new URLSearchParams({
-			current_password: 'Old-valid-password-1',
-			new_password: 'New-valid-password-2'
+			current_password: makeLongInput(),
+			new_password: makeLongInput()
 		});
 
 		await actions.changePassword({
