@@ -707,21 +707,28 @@ describe('+page.svelte interactive client DOM wiring across views', () => {
 			ariaChecked: string | null;
 			hasDiscordChannelInput: boolean;
 			hasWebhookField: boolean;
-			hasDirtyNotice: boolean;
+			hasVisibleDirtyNotice: boolean;
+			hasLiveRegionNotice: boolean;
 		}>(`
-			(() => {
+			(async () => {
 				const discordLabel = document.getElementById('digest-discord-label');
 				discordLabel.click();
 				window.__flush();
 				const discordSwitch = document.getElementById('digest-discord');
 				const hiddenChannel = document.querySelector('input[type="hidden"][name="channels"][value="discord"]');
 				const webhookField = document.querySelector('input[name="discordWebhook"][type="url"]');
+				const digestForm = discordSwitch.closest('form');
+				const hasVisibleDirtyNotice = Boolean(
+					digestForm?.textContent?.includes('Save digest settings to apply your edits'),
+				);
+				await new Promise((r) => setTimeout(r, 380));
 				const notices = Array.from(document.querySelectorAll('[role="status"]')).map((n) => n.textContent ?? '');
 				return {
 					ariaChecked: discordSwitch.getAttribute('aria-checked'),
 					hasDiscordChannelInput: Boolean(hiddenChannel),
 					hasWebhookField: Boolean(webhookField),
-					hasDirtyNotice: notices.some((t) => t.includes('Save digest settings to apply your edits')),
+					hasVisibleDirtyNotice,
+					hasLiveRegionNotice: notices.some((t) => t.includes('Save digest settings to apply your edits')),
 				};
 			})()
 		`);
@@ -729,7 +736,8 @@ describe('+page.svelte interactive client DOM wiring across views', () => {
 			ariaChecked: 'true',
 			hasDiscordChannelInput: true,
 			hasWebhookField: true,
-			hasDirtyNotice: true,
+			hasVisibleDirtyNotice: true,
+			hasLiveRegionNotice: true,
 		});
 	});
 });
