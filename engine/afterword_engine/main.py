@@ -28,6 +28,7 @@ from .backups import (
     backup_scheduler_loop,
     backup_status,
     clear_interrupted_restore_journal,
+    compact_database,
     create_backup,
     dismiss_auth_recovery_hold,
     dismiss_recovery_hold,
@@ -36,6 +37,8 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
+from .decision_evidence import set_evidence_rotation_enabled
+from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
@@ -1257,6 +1260,40 @@ def dismiss_database_backup_hold(payload: RecoveryHoldDismissIn):
     return {"dismissed": True, "status": status}
 
 
+class StorageRetentionIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/backups/compact")
+def compact_database_storage():
+    try:
+        return compact_database()
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/backups/retention")
+def update_storage_retention(payload: StorageRetentionIn):
+    set_storage_retention_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "retention_enabled": bool(status.get("retention_enabled", payload.enabled)),
+        "status": status,
+    }
+
+
+@app.post("/api/backups/evidence-rotation")
+def update_evidence_rotation(payload: StorageRetentionIn):
+    set_evidence_rotation_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "evidence_rotation_enabled": bool(
+            status.get("evidence_rotation_enabled", payload.enabled)
+        ),
+        "status": status,
+    }
+
+
 @app.post("/api/backups/{backup_id}/restore")
 def restore_database_backup(backup_id: str):
     try:
@@ -1730,6 +1767,7 @@ def tracked_recommendations(
             identity_context=identity_context,
             include_imported=include_imported,
         )
+        return recommendations, ""
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -1980,6 +2018,7 @@ async def reading_history_scores(
                 embedder,
                 "read_candidate",
                 virtual_candidates,
+                persist=False,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
@@ -2025,6 +2064,7 @@ def _recommendation_identity_context(connection=None):
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlist_rows = fetch(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
@@ -2091,7 +2131,8 @@ def _recommendation_rows(
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
-        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
         f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -2240,7 +2281,8 @@ def recommendations(
         )
     for item in values:
         item["recommendation_run_id"] = run_id
-    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    if run_id:
+        response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
 
@@ -3424,7 +3466,8 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                 for item in connection.execute(
                     "SELECT c.*,s.name source_name,q.metadata_confidence,"
                     "q.work_id quality_work_id,"
-                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+                    "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
                     "LEFT JOIN sources s ON s.id=c.source_id "
