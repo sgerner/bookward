@@ -7,6 +7,16 @@
 
 @import '@skeletonlabs/skeleton/themes/cerberus';
 
+@layer components {
+	.card,
+	.input,
+	.select,
+	input[type='file'] {
+		min-width: 0;
+		max-width: 100%;
+	}
+}
+
 /* Clear the sticky top header (65px) and mobile bottom nav (65px + safe-area) on keyboard focus (WCAG 2.2 C43). */
 html:has([data-sticky-shell]) {
 	scroll-padding-top: calc(5rem + env(safe-area-inset-top, 0px));
@@ -21,6 +31,37 @@ html:has([data-sticky-shell]) {
 
 [data-sticky-shell] [role='switch'] {
 	scroll-margin-block: 4rem;
+}
+
+@media (max-width: 24rem) {
+	.btn:not(.btn-icon) {
+		max-width: 100%;
+		height: auto;
+		white-space: normal;
+		line-height: 1.25;
+		text-align: center;
+	}
+
+	.btn:not(.btn-icon) > :where(svg) {
+		flex-shrink: 0;
+	}
+}
+
+@media (max-height: 20rem) {
+	html:has([data-sticky-shell]) {
+		scroll-padding-top: 0;
+		scroll-padding-bottom: 0;
+	}
+
+	[data-sticky-shell] [role='switch'] {
+		scroll-margin-block: 0;
+	}
+
+	header.sticky,
+	nav.fixed,
+	.sticky {
+		position: static;
+	}
 }
 
 :root,
