@@ -28,9 +28,11 @@ from .database import (
     bind_request_restore_epoch,
     connect,
     database_lock,
+    demote_orphaned_recommended_candidates,
     fenced_async,
     initialize,
     normalize_key,
+    recompute_candidate_sources,
     row,
     rows,
     scheduler_fenced,
@@ -3629,13 +3631,9 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
         "WHERE id=?",
         (source_id,),
     )
+    recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE source_id=? AND status='recommended'",
-            (source_id,),
-        )
+        demote_orphaned_recommended_candidates(con, source_id=source_id)
     return became_enabled
 
 
@@ -4256,12 +4254,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND COALESCE(s.enabled,1)=1",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }
