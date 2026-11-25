@@ -1585,7 +1585,7 @@ def _resolve_exploration_seed(
             )
         )
         if run_row is not None and is_discovery_run_metadata(run_row["metadata"]):
-            resolved_session = session_id or str(run_row["session_id"] or "")
+            resolved_session = str(run_row["session_id"] or "") or session_id
             return (
                 _extract_run_exploration_seed(run_row["metadata"]) or validated_seed,
                 resolved_session,
@@ -1679,7 +1679,7 @@ def tracked_recommendations_page(
 
     ranking_at = datetime.now(timezone.utc)
     planned_run_id = str(uuid.uuid4())
-    exploration_seed, effective_session_id = _resolve_exploration_seed(
+    exploration_seed, seed_session_id = _resolve_exploration_seed(
         connection,
         planned_run_id=planned_run_id,
         offset=offset,
@@ -1688,7 +1688,8 @@ def tracked_recommendations_page(
         seed_run_id=seed_run_id,
         track_impressions=track_impressions,
     )
-    exploration_scope = f"{current_profile_id() or 'legacy'}:{effective_session_id}"
+    run_session_id = effective_session_id or seed_session_id
+    exploration_scope = f"{current_profile_id() or 'legacy'}:{seed_session_id}"
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
     cached_vectors = {}
@@ -1957,7 +1958,7 @@ def tracked_recommendations_page(
     run_id = create_recommendation_run(
         discovery_slice,
         run_id=planned_run_id,
-        session_id=effective_session_id,
+        session_id=run_session_id,
         exploration_seed=exploration_seed,
         decision_evidence=decision_evidence,
         status=status,

@@ -162,6 +162,7 @@ async function shouldTrackDiscoverImpressions(
   }
   const isInvalidatedDataRequest = (() => {
     if (url.searchParams.has("x-sveltekit-invalidated")) return true;
+    if (request?.headers?.get("x-sveltekit-invalidated")?.trim()) return true;
     if (!request?.url) return false;
     try {
       return new URL(request.url).searchParams.has("x-sveltekit-invalidated");

@@ -1805,7 +1805,18 @@ describe("page actions", () => {
     } as never);
     expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
 
-    // 6. Standard initial GET / without x-sveltekit-invalidated still tracks Discover impressions.
+    // 6. x-sveltekit-invalidated header without explicit ?view= fails closed.
+    fetchMock.mockClear();
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/__data.json", {
+        headers: { "x-sveltekit-invalidated": "11", referer: "http://afterword.test/" },
+      }),
+      locals: { user: null },
+    } as never);
+    expect(fetchMock.mock.calls[0][0]).toContain("track_impressions=false");
+
+    // 7. Standard initial GET / without x-sveltekit-invalidated still tracks Discover impressions.
     fetchMock.mockClear();
     await load({
       url: new URL("http://afterword.test/"),

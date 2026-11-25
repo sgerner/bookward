@@ -2070,11 +2070,21 @@ def test_authenticated_http_discovery_isolates_exploration_seed_per_session(
         assert v1_page.status_code == 200
         run_v1 = v1_page.headers["X-Bookward-Recommendation-Run"]
 
+        # When an API token explicitly passes seed_run_id for Session A's run,
+        # it reproduces Session A's exact partition while keeping its api-token session_id.
+        v1_seeded = client.get(
+            f"/api/v1/recommendations?status=recommended&limit=8&offset=24&seed_run_id={run_a0}",
+            headers=v1_headers,
+        )
+        assert v1_seeded.status_code == 200
+        assert [item["id"] for item in v1_seeded.json()] == ids_a1
+        run_v1_seeded = v1_seeded.headers["X-Bookward-Recommendation-Run"]
+
     runs_by_id = {
         item["id"]: item
         for item in rows(
-            "SELECT id, session_id, metadata FROM recommendation_runs WHERE id IN (?, ?, ?, ?, ?)",
-            (run_a0, run_b0, run_a1, run_b1, run_v1),
+            "SELECT id, session_id, metadata FROM recommendation_runs WHERE id IN (?, ?, ?, ?, ?, ?)",
+            (run_a0, run_b0, run_a1, run_b1, run_v1, run_v1_seeded),
         )
     }
     assert runs_by_id[run_a0]["session_id"].startswith("sess:")
@@ -2083,6 +2093,7 @@ def test_authenticated_http_discovery_isolates_exploration_seed_per_session(
     assert runs_by_id[run_a1]["session_id"] == runs_by_id[run_a0]["session_id"]
     assert runs_by_id[run_b1]["session_id"] == runs_by_id[run_b0]["session_id"]
     assert runs_by_id[run_v1]["session_id"].startswith("api-token:")
+    assert runs_by_id[run_v1_seeded]["session_id"] == runs_by_id[run_v1]["session_id"]
 
     meta_a1 = json.loads(runs_by_id[run_a1]["metadata"])
     meta_b1 = json.loads(runs_by_id[run_b1]["metadata"])
