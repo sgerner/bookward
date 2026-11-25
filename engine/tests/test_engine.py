@@ -4261,10 +4261,22 @@ def _seed_shared_run_with_demo_and_real_data():
                 normalize_key("Dune", "Frank Herbert"),
             ),
         ).lastrowid
+        jemisin_candidate_id = con.execute(
+            "INSERT INTO candidates(title,author,description,genres,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,85,'read',?)",
+            (
+                "The Fifth Season",
+                "N. K. Jemisin",
+                "Orogenes and seismic catastrophe across the Stillness.",
+                json.dumps(["fantasy"]),
+                web_source_id,
+                normalize_key("The Fifth Season", "N. K. Jemisin"),
+            ),
+        ).lastrowid
         con.execute(
             "UPDATE candidate_quality SET quality_status='accepted',metadata_confidence=0.9 "
-            "WHERE candidate_id IN (?,?)",
-            (piranesi_candidate_id, dune_candidate_id),
+            "WHERE candidate_id IN (?,?,?)",
+            (piranesi_candidate_id, dune_candidate_id, jemisin_candidate_id),
         )
 
     assert asyncio.run(score_all("local", "hashing-768")) >= 5
@@ -4273,13 +4285,23 @@ def _seed_shared_run_with_demo_and_real_data():
     builtin_ids = [
         int(item["id"])
         for item in served
-        if int(item["id"]) not in {piranesi_candidate_id, dune_candidate_id}
+        if int(item["id"])
+        not in {piranesi_candidate_id, dune_candidate_id, jemisin_candidate_id}
     ]
-    feedback_candidate_id, mark_read_candidate_id = builtin_ids[0], builtin_ids[1]
+    feedback_candidate_id, mark_read_candidate_id, stale_prior_cid = (
+        builtin_ids[0],
+        builtin_ids[1],
+        builtin_ids[2],
+    )
 
     with transaction() as con:
         for rank_offset, cid in enumerate(
-            (piranesi_candidate_id, dune_candidate_id, mark_read_candidate_id),
+            (
+                piranesi_candidate_id,
+                dune_candidate_id,
+                jemisin_candidate_id,
+                mark_read_candidate_id,
+            ),
             start=90,
         ):
             con.execute(
@@ -4289,6 +4311,27 @@ def _seed_shared_run_with_demo_and_real_data():
                 "ON CONFLICT(run_id,candidate_id) DO UPDATE SET presented_at=excluded.presented_at, visible_at=excluded.visible_at",
                 (shared_run_id, cid, rank_offset, past_ts, past_ts),
             )
+        jemisin_demo_id = int(
+            con.execute(
+                "SELECT id FROM reads WHERE source='demo' AND title='The Fifth Season'"
+            ).fetchone()[0]
+        )
+        from afterword_engine.learning import record_event_in_connection
+
+        # Seed a prior 2-part read event on stale_prior_cid so attribute_read_outcomes()
+        # natively emits a 3-part read:<demo_id>:<jemisin_candidate_id> event and an
+        # unlinked retraction revision for the superseded 2-part key.
+        record_event_in_connection(
+            con,
+            event_key=f"read:{jemisin_demo_id:08d}",
+            candidate_id=stale_prior_cid,
+            event_type="read",
+            run_id=shared_run_id,
+            value=5.0,
+            source="read_import",
+            metadata={"read_source": "demo", "time_precision": "timestamp"},
+            occurred_at=real_read_ts,
+        )
         real_read_id = con.execute(
             "INSERT INTO reads(title,author,rating,read_at,source) "
             "VALUES('Dune','Frank Herbert',5,?,'goodreads_csv')",
@@ -4305,7 +4348,7 @@ def _seed_shared_run_with_demo_and_real_data():
     feedback_decision_id = fb.json()["decision_id"]
 
     attributed = attribute_read_outcomes()
-    assert attributed["reads_attributed"] == 2
+    assert attributed["reads_attributed"] == 3
     assert (
         row(
             "SELECT COUNT(*) count FROM recommendation_outcomes o "
@@ -4313,7 +4356,7 @@ def _seed_shared_run_with_demo_and_real_data():
             "WHERE i.run_id=?",
             (shared_run_id,),
         )["count"]
-        == 3
+        == 4
     )
     return {
         "shared_run_id": shared_run_id,
@@ -4323,6 +4366,7 @@ def _seed_shared_run_with_demo_and_real_data():
         "feedback_candidate_id": feedback_candidate_id,
         "feedback_event_key": f"feedback:{feedback_decision_id}",
         "mark_read_candidate_id": mark_read_candidate_id,
+        "three_part_demo_cid": jemisin_candidate_id,
     }
 
 
@@ -4357,6 +4401,9 @@ def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_s
     manual_event_key = f"manual-read:{ctx['mark_read_candidate_id']}:{manual_read_id:08d}"
 
     assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
+    assert row("SELECT status FROM candidates WHERE id=?", (ctx["three_part_demo_cid"],)) == {
+        "status": "recommended",
+    }
     assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (shared_run_id,)) == {"ok": 1}
     assert (
         row(
@@ -4445,6 +4492,9 @@ def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_s
 
     assert row("SELECT COUNT(*) count FROM reads WHERE source='demo'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads WHERE id=?", (mctx["real_read_id"],))["count"] == 1
+    assert row("SELECT status FROM candidates WHERE id=?", (mctx["three_part_demo_cid"],)) == {
+        "status": "recommended",
+    }
     assert row("SELECT 1 ok FROM recommendation_runs WHERE id=?", (mrun_id,)) == {"ok": 1}
     assert (
         row(

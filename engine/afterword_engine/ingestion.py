@@ -914,6 +914,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             batches[-1][1].append(values)
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
+    from .learning import attribute_read_outcomes
     with transaction() as con:
         if count > 0:
             purge_demo_reads(con)
@@ -946,12 +947,11 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 "isbn=COALESCE(excluded.isbn,reads.isbn)",
                 values,
             )
-    # Importing a history is also the point at which naturally supplied
-    # ratings can become outcomes for recommendations shown earlier. Import
-    # lazily to keep the ingestion module independent of the telemetry module
-    # during application startup.
-    from .learning import attribute_read_outcomes
-    attribute_read_outcomes()
+        # Importing a history is also the point at which naturally supplied
+        # ratings can become outcomes for recommendations shown earlier. Import
+        # lazily to keep the ingestion module independent of the telemetry
+        # module during application startup.
+        attribute_read_outcomes(con)
     return {"imported": count, "source": source}
 
 
@@ -2294,6 +2294,7 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
     feed = feedparser.parse(content)
     count = 0
     read_rows = []
+    from .learning import attribute_read_outcomes
     with transaction() as con:
         for entry in feed.entries[:500]:
             title = str(entry.get("title", "")).strip()[:500]
@@ -2326,8 +2327,7 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             "isbn=COALESCE(excluded.isbn,reads.isbn)",
             read_rows,
         )
-    from .learning import attribute_read_outcomes
-    attribute_read_outcomes()
+        attribute_read_outcomes(con)
     return count
 
 

@@ -1085,7 +1085,8 @@ MIGRATIONS = [
         WHERE EXISTS (
             SELECT 1 FROM temp._m29_demo_reads r
             WHERE e.event_key = printf('read:%08d', r.id)
-               OR e.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR e.event_key GLOB printf('read:%08d:*', r.id)
+               OR e.event_key GLOB printf('manual-read:*:%08d', r.id)
                OR e.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR (
@@ -1106,7 +1107,8 @@ MIGRATIONS = [
         WHERE EXISTS (
             SELECT 1 FROM temp._m29_demo_reads r
             WHERE ee.event_key = printf('read:%08d', r.id)
-               OR ee.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR ee.event_key GLOB printf('read:%08d:*', r.id)
+               OR ee.event_key GLOB printf('manual-read:*:%08d', r.id)
                OR ee.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
@@ -1116,7 +1118,8 @@ MIGRATIONS = [
         WHERE EXISTS (
             SELECT 1 FROM temp._m29_demo_reads r
             WHERE eo.event_key = printf('read:%08d', r.id)
-               OR eo.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
+               OR eo.event_key GLOB printf('read:%08d:*', r.id)
+               OR eo.event_key GLOB printf('manual-read:*:%08d', r.id)
                OR eo.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
            OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
@@ -2053,15 +2056,17 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
         if item.get("candidate_id") is not None
     }
     demo_event_ids = {int(item["id"]) for item in orphan_demo_events}
-    for start in range(0, len(demo_ids), 150):
-        batch = demo_ids[start : start + 150]
+    for start in range(0, len(demo_ids), 100):
+        batch = demo_ids[start : start + 100]
         clauses = " OR ".join(
-            "event_key = ? OR event_key GLOB ? OR event_key GLOB ?" for _ in batch
+            "event_key = ? OR event_key GLOB ? OR event_key GLOB ? OR event_key GLOB ?"
+            for _ in batch
         )
         params: list[str] = []
         for read_id in batch:
             params.append(f"read:{read_id:08d}")
-            params.append(f"manual-read:[0-9]*:{read_id:08d}")
+            params.append(f"read:{read_id:08d}:*")
+            params.append(f"manual-read:*:{read_id:08d}")
             params.append(f"attribution:read:{read_id:08d}:*")
         for event_row in con.execute(
             f"SELECT id, candidate_id FROM recommendation_events WHERE {clauses}",
