@@ -11,6 +11,9 @@
 	} from '#lib/form-errors.js';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
+	const changePasswordRateLimited = $derived(
+		Boolean(form && form.formId === 'changePassword' && 'rateLimited' in form && form.rateLimited)
+	);
 
 	const enhanceForm: SubmitFunction = ({ formElement }) => {
 		return async ({ result, update }) => {
@@ -68,7 +71,12 @@
 				{/snippet}
 			</FormField>
 			{#if formErrorBanner(form, 'changePassword')}
-				<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">
+				<p
+					class="rounded-xl p-3 text-sm {changePasswordRateLimited
+						? 'preset-tonal-warning'
+						: 'preset-tonal-error'}"
+					role="alert"
+				>
 					{formErrorBanner(form, 'changePassword')}
 				</p>
 			{/if}

@@ -1983,6 +1983,14 @@ def test_provisional_isbn_skips_quality_fallback_and_runs_metadata_fallbacks_con
     ]
 
 
+def _without_fetched_at(value):
+    if isinstance(value, dict):
+        return {k: _without_fetched_at(v) for k, v in value.items() if k != "fetched_at"}
+    if isinstance(value, list):
+        return [_without_fetched_at(v) for v in value]
+    return value
+
+
 @pytest.mark.parametrize("resolver_kind", ["quality", "covers"])
 def test_concurrent_workers_space_openlibrary_starts_with_fake_clock_without_blocking_google(
     monkeypatch, resolver_kind
@@ -2069,7 +2077,9 @@ def test_concurrent_workers_space_openlibrary_starts_with_fake_clock_without_blo
 
     results = asyncio.run(run())
     assert len(results) == 13
-    assert results[0] == results[-1]
+    # fetched_at comes from the wall clock (second resolution), so the first and last
+    # lookups can straddle a second boundary; compare everything else.
+    assert _without_fetched_at(results[0]) == _without_fetched_at(results[-1])
     assert ol_peak == 1
     assert gb_peak == 8
     assert len(ol_starts) == 12

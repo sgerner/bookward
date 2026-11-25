@@ -2,10 +2,15 @@ import { once } from 'node:events';
 import http from 'node:http';
 import { registerHooks } from 'node:module';
 import type { AddressInfo } from 'node:net';
+import { forwardedAddress } from '@sveltejs/adapter-server/runtime';
 import { isRedirect } from '@sveltejs/kit';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
-import { currentSessionToken } from '#lib/server/request-context.js';
+import { handle, init, isPublicApiPath, withSecurityHeaders } from './hooks.server';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resetClientAddressFallbackWarning
+} from '#lib/server/request-context.js';
 import { actions as loginActions } from './routes/login/+page.server';
 import { attachOriginGuard, prepareRuntimeEnv } from '../server.js';
 
@@ -54,8 +59,10 @@ const adapterRespond = vi.fn<AdapterResponder>();
 adapterBridge.__bookwardHooksSpecRespond = (request) => adapterRespond(request);
 
 afterEach(() => {
+	resetClientAddressFallbackWarning();
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
+	vi.restoreAllMocks();
 	adapterRespond.mockReset();
 });
 
@@ -427,6 +434,188 @@ describe('authentication boundary', () => {
 		} as never);
 		expect(response.status).toBe(200);
 		expect(sessionInRoute).toBe('valid-session');
+	});
+
+	it('propagates verified client IPs to unauthenticated and authenticated handlers and survives missing proxy headers', async () => {
+		let loginClientIp: string | undefined;
+		const loginEvent = {
+			...(eventFor(new Request('http://afterword.test/login')) as Record<string, unknown>),
+			getClientAddress: () => '198.51.100.42'
+		};
+		const loginResponse = await handle({
+			event: loginEvent as never,
+			resolve: vi.fn(() => {
+				loginClientIp = currentClientIp();
+				return Promise.resolve(new Response('login'));
+			})
+		} as never);
+		expect(loginResponse.status).toBe(200);
+		expect(loginClientIp).toBe('198.51.100.42');
+
+		const fallbackWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+		let fallbackClientIp: string | undefined;
+		const localEventWithoutProxyHeader = {
+			...(eventFor(new Request('http://afterword.test/login')) as Record<string, unknown>),
+			getClientAddress: () => {
+				throw new Error('Address header was specified with ADDRESS_HEADER=x-forwarded-for but is absent from request');
+			},
+			platform: { req: { socket: { remoteAddress: '127.0.0.1' } } }
+		};
+		const fallbackResponse = await handle({
+			event: localEventWithoutProxyHeader as never,
+			resolve: vi.fn(() => {
+				fallbackClientIp = currentClientIp();
+				return Promise.resolve(new Response('ok'));
+			})
+		} as never);
+		expect(fallbackResponse.status).toBe(200);
+		expect(fallbackClientIp).toBe('127.0.0.1');
+		expect(fallbackWarnSpy).toHaveBeenCalledTimes(1);
+		expect(fallbackWarnSpy).toHaveBeenCalledWith(
+			expect.stringContaining('Configured ADDRESS_HEADER could not resolve a client IP')
+		);
+
+		// Subsequent missing-header requests still fall back cleanly without spamming logs.
+		const secondFallback = await handle({
+			event: localEventWithoutProxyHeader as never,
+			resolve: vi.fn(() => Promise.resolve(new Response('ok')))
+		} as never);
+		expect(secondFallback.status).toBe(200);
+		expect(fallbackWarnSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it('validates ADDRESS_HEADER / ENGINE_SERVICE_SECRET in init and resolves XFF_DEPTH hops accurately', async () => {
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+		vi.stubEnv('ADDRESS_HEADER', 'x-forwarded-for');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', '');
+		expect(() => init()).toThrow(/ENGINE_SERVICE_SECRET must be set/);
+
+		vi.stubEnv('ADDRESS_HEADER', '');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', '');
+		init();
+		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('ENGINE_SERVICE_SECRET is not set'));
+
+		warnSpy.mockClear();
+		vi.stubEnv('ADDRESS_HEADER', 'x-forwarded-for');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', 'shared-proxy-secret');
+		vi.stubEnv('XFF_DEPTH', '1');
+		init();
+		expect(warnSpy).not.toHaveBeenCalled();
+
+		const runAdapterAddressCase = async (options: {
+			addressHeader: string;
+			xffDepth: number;
+			headers?: Record<string, string>;
+			socketIp: string;
+		}) => {
+			const reqHeaders = new Headers(options.headers);
+			const request = new Request('http://afterword.test/login', { headers: reqHeaders });
+			let resolvedIp: string | undefined;
+			const addressHeaderLower = options.addressHeader.toLowerCase();
+			await handle({
+				event: {
+					...(eventFor(request) as Record<string, unknown>),
+					platform: { req: { socket: { remoteAddress: options.socketIp } } },
+					getClientAddress: () => {
+						if (addressHeaderLower) {
+							return forwardedAddress({
+								header: addressHeaderLower,
+								value: reqHeaders.get(addressHeaderLower) ?? undefined,
+								depth: options.xffDepth,
+								envPrefix: ''
+							});
+						}
+						return options.socketIp;
+					}
+				} as never,
+				resolve: vi.fn(() => {
+					resolvedIp = currentClientIp();
+					return Promise.resolve(new Response('ok'));
+				})
+			} as never);
+			return resolvedIp;
+		};
+
+		// Unset ADDRESS_HEADER ignores spoofed X-Forwarded-For and uses the socket peer IP.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: '',
+				xffDepth: 1,
+				headers: { 'x-forwarded-for': '203.0.113.9' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('172.18.0.5');
+
+		// XFF_DEPTH=1 picks the rightmost X-Forwarded-For entry (ignoring client-prepended spoofed IPs).
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 1,
+				headers: { 'x-forwarded-for': '192.0.2.99, 198.51.100.42' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.42');
+
+		// XFF_DEPTH=2 picks the second-from-right entry behind two trusted proxy hops.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 2,
+				headers: { 'x-forwarded-for': '192.0.2.99, 198.51.100.42, 10.0.0.2' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.42');
+
+		// Single-value proxy header (e.g. cf-connecting-ip) returns the header value directly.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'cf-connecting-ip',
+				xffDepth: 1,
+				headers: { 'cf-connecting-ip': '198.51.100.88' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.88');
+
+		// Missing configured ADDRESS_HEADER or XFF_DEPTH hop underflow logs once and falls back to socket remoteAddress.
+		resetClientAddressFallbackWarning();
+		warnSpy.mockClear();
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 1,
+				headers: {},
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			expect.stringContaining('Configured ADDRESS_HEADER could not resolve a client IP')
+		);
+
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 3,
+				headers: { 'x-forwarded-for': '198.51.100.42' },
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+
+		// Blank single-value header with ADDRESS_HEADER set also warns once and falls back to socket remoteAddress.
+		resetClientAddressFallbackWarning();
+		warnSpy.mockClear();
+		vi.stubEnv('ADDRESS_HEADER', 'cf-connecting-ip');
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'cf-connecting-ip',
+				xffDepth: 1,
+				headers: { 'cf-connecting-ip': '   ' },
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it('parses multipart uploads once without cloning the request and reuses formData in actions', async () => {
