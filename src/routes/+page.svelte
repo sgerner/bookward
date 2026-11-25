@@ -65,6 +65,11 @@
     formatReadingHistoryStatus,
     formatRecommendationStatus,
   } from "#lib/live-status.js";
+  import {
+    applyRatingOverrides,
+    createReadingHistoryRatingController,
+    formatRatingConfirmation,
+  } from "#lib/reading-history-ratings.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -138,7 +143,7 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
-  let markReadRating = $state(0);
+  let markReadRating = $state<number | null>(0);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -191,17 +196,21 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -572,6 +581,12 @@
       rawGenre.trim()
     );
   }
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -590,7 +605,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -669,6 +684,67 @@
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const catalogQuality = $derived(
+    data.catalogQuality ?? {
+      statuses: [],
+      identifiers: { total: 0, with_isbn13: 0, with_catalog_match: 0 },
+      flags: {},
+      version: "",
+      audit: {
+        status: "idle" as const,
+        active: false,
+        mode: "incremental" as const,
+        last_mode: null,
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 0,
+        progress: 0,
+        started_at: null,
+        completed_at: null,
+        job_id: null,
+        last_error: null,
+        can_retry: false,
+      },
+    },
+  );
+  const catalogAudit = $derived(catalogQuality.audit);
+  const catalogStatusCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const item of catalogQuality.statuses) {
+      counts[item.quality_status] = item.count;
+    }
+    return {
+      accepted: counts.accepted ?? 0,
+      quarantine: counts.quarantine ?? 0,
+      pending: counts.pending ?? 0,
+    };
+  });
+  const catalogAuditPercent = $derived(
+    Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
+  );
+  // State changes only: the remaining count changes on every poll and would be
+  // re-announced every few seconds.
+  const catalogAuditStatusMessage = $derived(
+    catalogAudit.status === "failed"
+      ? "Catalog audit needs retry."
+      : catalogAudit.active
+        ? `${catalogAudit.mode === "full" ? "Full" : "Incremental"} catalog audit ${
+            catalogAudit.status === "queued" ? "queued" : "running"
+          }.`
+        : catalogAudit.status === "paused"
+          ? "Catalog audit paused."
+          : catalogAudit.remaining > 0
+            ? "Catalog audit has books due."
+            : "Catalog audit up to date.",
+  );
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    if (activeView !== "settings" || !catalogAudit.active) return;
+    const timer = window.setInterval(() => {
+      void invalidateAll();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  });
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -1012,6 +1088,62 @@
     readingHistoryScoreTask = task;
     return task;
   }
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
+  }
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
+      const response = await fetch(`/api/reading-history/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === id ? { ...entry, rating } : entry,
+      );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        void refreshReadingHistoryScores();
+      }
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
     const inDecisionsView = activeView === "decisions";
     recommendationsImmediate = inDecisionsView;
@@ -2049,6 +2181,13 @@
     unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -3108,6 +3247,16 @@
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
+                    </div>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-3">
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
                     </div>
                     <details
                       class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
@@ -4298,6 +4447,183 @@
                 </form>
               </section>
               <section
+                id="catalog-audit-settings"
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><Database size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Catalog audit
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${
+                      catalogAudit.status === "failed"
+                        ? "preset-tonal-error"
+                        : catalogAudit.active
+                          ? "preset-tonal-secondary"
+                          : catalogAudit.remaining > 0
+                            ? "preset-tonal-warning"
+                            : "preset-tonal-success"
+                    }`}
+                  >
+                    {#if catalogAudit.status === "failed"}
+                      Needs retry
+                    {:else if catalogAudit.active}
+                      {catalogAudit.mode === "full" ? "Full sweep" : "Incremental"} · {catalogAudit.status === "queued" ? "Queued" : "Running"}
+                    {:else if catalogAudit.status === "paused"}
+                      Paused · {catalogAudit.remaining} left
+                    {:else if catalogAudit.remaining > 0}
+                      {catalogAudit.remaining} due
+                    {:else}
+                      Up to date
+                    {/if}
+                  </span>
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
+                </p>
+
+                <div class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
+                      {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
+                        ? "Active sweep mode"
+                        : "Default mode"}
+                    </span>
+                    <span class="font-medium text-surface-950-50">
+                      {catalogAudit.mode === "full"
+                        ? "Full catalog sweep"
+                        : "Incremental"}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-surface-700-300">Remaining to check</span>
+                    <strong class="text-surface-950-50">
+                      {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"}
+                    </strong>
+                  </div>
+                  <p class="text-xs text-surface-600-400">
+                    {catalogStatusCounts.accepted} accepted · {catalogStatusCounts.quarantine} quarantined{#if catalogStatusCounts.pending > 0} · {catalogStatusCounts.pending} pending{/if}
+                  </p>
+                  {#if catalogAudit.active}
+                    <div class="pt-1">
+                      <div class="mb-1 flex items-center justify-between text-xs text-surface-700-300">
+                        <span>Current {catalogAudit.batch_size}-book batch</span>
+                        <span>{catalogAuditPercent}%</span>
+                      </div>
+                      <div
+                        class="h-2 w-full overflow-hidden rounded-full bg-surface-300-700/50"
+                        role="progressbar"
+                        aria-label="Current catalog audit batch progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={catalogAuditPercent}
+                      >
+                        <div
+                          class="h-full rounded-full preset-filled-secondary-500 transition-all"
+                          style={`width: ${catalogAuditPercent}%`}
+                        ></div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  paused={activeView !== "settings"}
+                />
+
+                {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
+                  <div
+                    class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
+                    role="alert"
+                  >
+                    <TriangleAlert size={16} class="shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <strong>
+                        {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
+                      </strong>
+                      {#if catalogAudit.remaining > 0}
+                        · {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"} remaining
+                      {/if}
+                      {#if catalogAudit.last_error}
+                        <span class="mt-1 block text-xs">{catalogAudit.last_error}</span>
+                      {/if}
+                    </span>
+                    <form
+                      method="POST"
+                      action="?/retryCatalogAudit"
+                      use:enhance={setPending("catalog-audit-retry")}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button
+                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                        type="submit"
+                        disabled={isPending("catalog-audit-retry") || catalogAudit.active}
+                        aria-busy={isPending("catalog-audit-retry")}
+                      >
+                        {#if isPending("catalog-audit-retry")}<RefreshCw
+                            size={14}
+                            class="animate-spin"
+                          />{:else}<RefreshCw size={14} />{/if} Retry
+                      </button>
+                    </form>
+                  </div>
+                {/if}
+
+                <div class="mt-4 grid gap-2 sm:grid-cols-2">
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-incremental")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="incremental" />
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
+                      aria-busy={isPending("catalog-audit-incremental")}
+                    >
+                      {#if isPending("catalog-audit-incremental") || (catalogAudit.active && catalogAudit.mode === "incremental")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Search size={16} />{/if} Audit due books
+                    </button>
+                  </form>
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-full")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="full" />
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
+                      aria-busy={isPending("catalog-audit-full")}
+                    >
+                      {#if isPending("catalog-audit-full") || (catalogAudit.active && catalogAudit.mode === "full")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<RefreshCw size={16} />{/if} Re-check full catalog
+                    </button>
+                  </form>
+                </div>
+              </section>
+              <section
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
@@ -4792,17 +5118,17 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentReads.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -4818,6 +5144,16 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
