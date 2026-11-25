@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -49,6 +50,7 @@ TOKEN_DERIVATION_CONCURRENCY = max(1, min(2, (os.cpu_count() or 2) // 2))
 TOKEN_DERIVATION_WAIT_SECONDS = 5.0
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
+ERASURE_PENDING_PREFIX = "erasure_pending:"
 
 
 def format_lockout_message(retry_after_seconds: int) -> str:
@@ -80,7 +82,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
-    profile_id TEXT NOT NULL UNIQUE REFERENCES profiles(id),
+    profile_id TEXT NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE,
     username TEXT NOT NULL,
     normalized_username TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL DEFAULT '',
@@ -149,6 +151,29 @@ CREATE INDEX IF NOT EXISTS idx_profile_api_tokens
 
 def auth_path() -> Path:
     return Path(f"{settings.db}.auth.sqlite3")
+
+
+def _restrict_auth_files() -> None:
+    path = auth_path()
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            candidate.chmod(0o600)
+        except FileNotFoundError:
+            continue
+
+
+def _vacuum_auth_registry() -> None:
+    path = auth_path()
+    if not path.is_file():
+        return
+    con = sqlite3.connect(path, timeout=30, isolation_level=None)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("VACUUM")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        con.close()
+    _restrict_auth_files()
 
 
 class _AuthConnection(sqlite3.Connection):
@@ -996,14 +1021,27 @@ def revoke_session(raw: str | None):
 def set_account_status(account_id: str, status: str):
     if status not in {"active", "disabled"}:
         raise ValueError("Invalid account status.")
+    from .database import is_profile_tombstoned
+
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
         target = con.execute(
-            "SELECT role,status,profile_id FROM accounts WHERE id=?", (account_id,)
+            "SELECT profile_id,role,status FROM accounts WHERE id=?", (account_id,)
         ).fetchone()
         if not target:
             con.rollback()
             raise LookupError("Account not found.")
+        if status == "active":
+            pending_erasure = (
+                con.execute(
+                    "SELECT 1 FROM auth_meta WHERE key=?",
+                    (f"{ERASURE_PENDING_PREFIX}{account_id}",),
+                ).fetchone()
+                is not None
+            )
+            if pending_erasure or is_profile_tombstoned(str(target["profile_id"])):
+                con.rollback()
+                raise ValueError("Account deletion is incomplete; retry deleting this account")
         if target["role"] == "admin" and target["status"] == "active" and status == "disabled":
             active_admins = con.execute(
                 "SELECT COUNT(*) FROM accounts WHERE role='admin' AND status='active'"
@@ -1027,6 +1065,241 @@ def set_account_status(account_id: str, status: str):
                 (target["profile_id"],),
             )
     invalidate_auth_caches(account_id=account_id, profile_id=target["profile_id"])
+
+
+def delete_account(
+    account_id: str,
+    *,
+    actor_account_id: str | None = None,
+    require_active_admin_actor: bool = False,
+) -> dict:
+    """Erase an account, its sessions/tokens, personal database, keys, and backups."""
+
+    from . import backups
+    from .database import erase_profile_database
+
+    actor_id_log = (actor_account_id or "direct").replace("\r", "").replace("\n", "")
+    actor_username = "direct"
+
+    with auth_connect() as con:
+        con.execute("PRAGMA secure_delete=ON")
+        con.execute("BEGIN IMMEDIATE")
+        target = con.execute(
+            "SELECT * FROM accounts WHERE id=?", (account_id,)
+        ).fetchone()
+        if not target:
+            con.rollback()
+            raise LookupError("Account not found.")
+        target_id = str(target["id"]).replace("\r", "").replace("\n", "")
+        if target["role"] == "admin":
+            remaining_active_admins = con.execute(
+                "SELECT COUNT(*) FROM accounts WHERE role='admin' AND status='active' AND id!=?",
+                (target_id,),
+            ).fetchone()[0]
+            if remaining_active_admins == 0:
+                con.rollback()
+                raise ValueError("The installation must retain an active administrator")
+        if actor_account_id is not None:
+            actor = con.execute(
+                "SELECT a.id,a.username,a.role,a.status,p.status AS profile_status "
+                "FROM accounts a JOIN profiles p ON p.id=a.profile_id WHERE a.id=?",
+                (actor_account_id,),
+            ).fetchone()
+            if (
+                not actor
+                or actor["status"] != "active"
+                or actor["profile_status"] != "active"
+                or (require_active_admin_actor and actor["role"] != "admin")
+            ):
+                con.rollback()
+                raise PermissionError("Authentication required")
+            actor_id_log = str(actor["id"]).replace("\r", "").replace("\n", "")
+            actor_username = str(actor["username"]).replace("\r", "").replace("\n", "")
+        profile_id = str(target["profile_id"])
+        username = str(target["username"])
+        normalized_username = str(target["normalized_username"])
+        username_sha256 = hashlib.sha256(
+            normalized_username.encode("utf-8")
+        ).hexdigest()
+        safe_username = username.replace("\r", "").replace("\n", "")
+        safe_profile_id = profile_id.replace("\r", "").replace("\n", "")
+        con.execute(
+            "INSERT INTO auth_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                f"{ERASURE_PENDING_PREFIX}{target_id}",
+                json.dumps(
+                    {
+                        "account_id": target_id,
+                        "profile_id": profile_id,
+                        "username_sha256": username_sha256,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        con.execute(
+            "UPDATE accounts SET status='disabled',auth_version=auth_version+1,"
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (target_id,),
+        )
+        con.execute(
+            "UPDATE profiles SET status='disabled' WHERE id=?",
+            (profile_id,),
+        )
+        con.execute(
+            "UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) "
+            "WHERE account_id=? AND revoked_at IS NULL",
+            (target_id,),
+        )
+        con.execute(
+            "UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) "
+            "WHERE profile_id=? AND revoked_at IS NULL",
+            (profile_id,),
+        )
+        con.commit()
+    invalidate_auth_caches(account_id=target_id, profile_id=profile_id)
+
+    backups.record_pending_auth_backup_scrub(
+        target_id, profile_id, normalized_username
+    )
+    tombstone_meta = (
+        {
+            "scrub_pending": True,
+            "account_id": target_id,
+            "profile_id": profile_id,
+            "username_sha256": username_sha256,
+        }
+        if profile_id != "legacy"
+        else None
+    )
+
+    try:
+        erase_profile_database(profile_id, tombstone_metadata=tombstone_meta)
+        backups.purge_profile_backups(profile_id)
+    except Exception:
+        LOGGER.warning(
+            "audit action=delete_account_failed actor_id=%s actor_username=%s target_id=%s target_username=%s profile_id=%s",
+            actor_id_log,
+            actor_username,
+            target_id,
+            safe_username,
+            safe_profile_id,
+        )
+        raise
+
+    with backups._AUTH_BACKUP_LOCK:
+        with auth_connect() as con:
+            con.execute("PRAGMA secure_delete=ON")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "DELETE FROM login_attempts WHERE normalized_username=?",
+                (normalized_username,),
+            )
+            _clear_account_lockout_notices(con, normalized_username)
+            con.execute("DELETE FROM accounts WHERE id=?", (target_id,))
+            if profile_id != "legacy":
+                con.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+            else:
+                con.execute(
+                    "UPDATE profiles SET status='disabled',display_name='My profile' WHERE id='legacy'"
+                )
+                con.execute("DELETE FROM api_tokens WHERE profile_id='legacy'")
+            con.execute(
+                "DELETE FROM auth_meta WHERE key=?",
+                (f"{ERASURE_PENDING_PREFIX}{target_id}",),
+            )
+            con.commit()
+        _vacuum_auth_registry()
+        invalidate_auth_caches(account_id=target_id, profile_id=profile_id)
+
+        try:
+            backups.complete_auth_backup_scrub(
+                target_id,
+                profile_id,
+                normalized_username,
+                username_sha256=username_sha256,
+                create_snapshot=True,
+            )
+        except (backups.BackupError, OSError) as exc:
+            backups._record_auth_backup_state(error=exc)
+            LOGGER.exception(
+                "Could not update identity-registry backup after account deletion; queued for retry"
+            )
+
+    LOGGER.info(
+        "audit action=delete_account actor_id=%s actor_username=%s target_id=%s target_username=%s profile_id=%s",
+        actor_id_log,
+        actor_username,
+        target_id,
+        safe_username,
+        safe_profile_id,
+    )
+
+    return {
+        "deleted": True,
+        "account_id": target_id,
+        "profile_id": profile_id,
+        "username": username,
+    }
+
+
+def recover_incomplete_account_erasures() -> int:
+    """Finish any account deletions interrupted after Phase 1 session revocation."""
+
+    from . import backups
+    from .database import is_profile_tombstoned
+
+    path = auth_path()
+    if not path.is_file():
+        return 0
+    pending_account_ids = backups.pending_auth_backup_scrub_account_ids()
+    with auth_connect() as con:
+        candidates = [
+            (str(row["id"]), str(row["profile_id"]))
+            for row in con.execute(
+                "SELECT id,profile_id FROM accounts WHERE status='disabled'"
+            )
+        ]
+        candidate_id_set = {account_id for account_id, _ in candidates}
+        meta_keys = [
+            str(row["key"])
+            for row in con.execute(
+                "SELECT key FROM auth_meta WHERE key LIKE ?",
+                (f"{ERASURE_PENDING_PREFIX}%",),
+            )
+        ]
+        stale_meta_keys: list[str] = []
+        for meta_key in meta_keys:
+            acct_id = meta_key.removeprefix(ERASURE_PENDING_PREFIX)
+            if acct_id in candidate_id_set:
+                pending_account_ids.add(acct_id)
+            else:
+                stale_meta_keys.append(meta_key)
+        if stale_meta_keys:
+            con.execute("PRAGMA secure_delete=ON")
+            con.execute("BEGIN IMMEDIATE")
+            for meta_key in stale_meta_keys:
+                con.execute("DELETE FROM auth_meta WHERE key=?", (meta_key,))
+            con.commit()
+    completed = 0
+    for account_id, profile_id in candidates:
+        if account_id not in pending_account_ids and not is_profile_tombstoned(profile_id):
+            continue
+        try:
+            delete_account(account_id)
+            completed += 1
+        except LookupError:
+            continue
+        except Exception:
+            LOGGER.warning("Could not finish an incomplete profile deletion")
+    return completed
+
+
+def reset_profile_history(profile_id: str | None = None) -> dict:
+    from .database import reset_profile_history as _reset_profile_history
+
+    return _reset_profile_history(profile_id)
 
 
 def link_oidc_identity(account_id: str, issuer: str, subject: str, email: str = "") -> None:
