@@ -98,6 +98,10 @@ def free_port() -> int:
 
 def _launch_chromium(playwright):
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    try:
+        return playwright.chromium.launch(headless=True, args=launch_args)
+    except PlaywrightError:
+        pass
     for candidate in ("google-chrome", "chromium", "chromium-browser"):
         found = shutil.which(candidate)
         if found:
