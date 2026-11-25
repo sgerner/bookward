@@ -1692,6 +1692,91 @@ def test_openlibrary_rate_budget_serializes_concurrent_requests_with_fake_clock(
     assert starts == [10.0, 11.0, 12.0, 13.0, 14.0]
 
 
+def test_resolve_catalog_match_prefers_verified_isbn_synopsis_and_blocks_foreign_or_conflicting_editions():
+    verified_synopsis = (
+        "Twenty-year-old Violet Sorrengail was supposed to enter the Scribe Quadrant, "
+        "living a quiet life among books and history."
+    )
+    assert len(verified_synopsis) == 121
+    spanish_guide_blurb = (
+        "Resumen completo y guía de estudio de Alas de Sangre: análisis detallado de capítulos, "
+        "personajes, temas principales y preguntas de discusión para estudiantes y clubes de lectura "
+        "que buscan comprender cada escena de esta edición especial en español ya"
+    )
+    assert len(spanish_guide_blurb) == 251
+
+    def handler(request):
+        params = parse_qs(request.url.query.decode())
+        if request.url.host == "openlibrary.org":
+            if "isbn" in params:
+                return httpx.Response(
+                    200,
+                    json={
+                        "docs": [
+                            {
+                                "key": "/works/OLFOURTHWINGW",
+                                "title": "Fourth Wing",
+                                "author_name": ["Rebecca Yarros"],
+                                "isbn": ["9781649374042"],
+                                "description": verified_synopsis,
+                                "first_publish_date": "2023-05-02",
+                                "subject": ["Fantasy", "Dragons"],
+                                "cover_i": 14315081,
+                                "language": ["eng"],
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLSPANISHW",
+                            "title": "Fourth Wing",
+                            "author_name": ["Rebecca Yarros"],
+                            "isbn": ["9788408279990"],
+                            "description": spanish_guide_blurb,
+                            "subject": ["Study Aids"],
+                            "language": ["spa"],
+                        },
+                        {
+                            "key": "/works/OLCONFLICTISBNW",
+                            "title": "Fourth Wing",
+                            "author_name": ["Rebecca Yarros"],
+                            "isbn": ["9780061120084"],
+                            "description": "Longer unverified conflicting ISBN synopsis " * 8,
+                            "first_publish_date": "2025-01-01",
+                            "subject": ["Biography"],
+                            "language": ["eng"],
+                        },
+                    ]
+                },
+            )
+        if request.url.host == "www.googleapis.com":
+            return httpx.Response(200, json={"items": []})
+        raise AssertionError(f"Unexpected host: {request.url.host}")
+
+    async def run():
+        async with _provider_client(handler) as client:
+            return await resolve_catalog_match(
+                "Fourth Wing",
+                "Rebecca Yarros",
+                client=client,
+                cache={},
+                isbn13="9781649374042",
+            )
+
+    match = asyncio.run(run())
+    assert match is not None
+    assert match["provider"] == "openlibrary"
+    assert match["work_id"] == "/works/OLFOURTHWINGW"
+    assert match["description"] == verified_synopsis
+    assert match["release_date"] == "2023-05-02"
+    assert match["genres"] == ["Fantasy", "Dragons"]
+    assert match["provider_lookup_unavailable"] is False
+
+
 def test_resolvers_call_google_books_without_waiting_on_openlibrary_slot_and_preserve_trace_order(
     monkeypatch,
 ):
@@ -2102,6 +2187,11 @@ def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
         if failure_mode == "http_429"
         else "http_error"
     )
+    expected_audit_flags = (
+        ["catalog_provider_rate_limited", "catalog_provider_unavailable"]
+        if failure_mode == "http_429"
+        else ["catalog_provider_unavailable"]
+    )
 
     async def run_covers():
         ol_gate[:] = [asyncio.Event()]
@@ -2156,14 +2246,16 @@ def test_concurrent_lookup_preserves_surviving_provider_when_other_fails(
     audit_result, skipped_followup = asyncio.run(run_audit())
     assert audit_result["quality_status"] == "accepted"
     assert audit_result["provider"] == expected_survivor
-    assert audit_result["flags"] == []
+    assert audit_result["provider_lookup_unavailable"] is True
+    assert audit_result["flags"] == expected_audit_flags
     audit_traces = audit_result["metadata_provenance"]["fetch_trace"]
     assert [t["provider"] for t in audit_traces] == ["openlibrary", "google_books"]
     failed_audit_trace = next(t for t in audit_traces if t["provider"] == failing_provider)
     assert failed_audit_trace["status"] == expected_audit_failure_status
     if skipped_followup is not None:
         assert skipped_followup["quality_status"] == "accepted"
-        assert skipped_followup["flags"] == []
+        assert skipped_followup["provider_lookup_unavailable"] is True
+        assert skipped_followup["flags"] == expected_audit_flags
         skipped_gb_trace = next(
             t for t in skipped_followup["metadata_provenance"]["fetch_trace"]
             if t["provider"] == "google_books"
