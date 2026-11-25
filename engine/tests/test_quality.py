@@ -548,8 +548,216 @@ def test_audit_recovers_candidate_via_apple_books_when_google_books_rate_limited
     assert quality["quality_status"] == "accepted"
     assert quality["provider"] == "apple_books"
     assert quality["provider_id"] == "6758952748"
+    assert quality["work_id"] == "6758952748"
+    assert "catalog_primary_unavailable" in json.loads(quality["flags_json"])
     assert candidate["release_date"] == "2026-10-06"
     assert "600x600bb" in candidate["cover_url"]
+
+
+@respx.mock
+def test_audit_populates_missing_work_dates_and_preserves_source_and_mixed_provenance(database):
+    from afterword_engine.database import connect, persist_metadata_field_provenance
+    from afterword_engine.publication_year_metadata import attach_publication_years
+
+    undated_id = add_candidate("Classic Undated Reissue", "Agatha Christie")
+    source_kind_id = add_candidate("Classic Source Date", "Dorothy L. Sayers")
+    mixed_prov_id = add_candidate("Classic Mixed Provenance", "Ngaio Marsh")
+    manual_id = add_candidate("Manual Classic", "Margery Allingham")
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE url='builtin://upcoming'").fetchone()[0]
+        con.execute(
+            "UPDATE candidates SET release_date='2023-12-25',date_kind='source' WHERE id=?",
+            (source_kind_id,),
+        )
+        persist_metadata_field_provenance(
+            con,
+            "candidate",
+            source_kind_id,
+            "release_date",
+            {
+                "metadata_provenance": {
+                    "fields": {
+                        "release_date": {
+                            "provider": "source",
+                            "provider_id": str(source_id),
+                            "kind": "source_item",
+                        }
+                    },
+                    "fetch_trace": [],
+                    "source_payloads": [],
+                }
+            },
+            default_provider="source",
+            default_provider_id=str(source_id),
+        )
+        # Mixed provenance set on release_date (source + google_books), with
+        # empty description so _store_result runs the selected_fields write path.
+        con.execute(
+            "UPDATE candidates SET description='',release_date='2020-05-10',date_kind='day' WHERE id=?",
+            (mixed_prov_id,),
+        )
+        for prov_name, prov_id, kind in (
+            ("source", str(source_id), "source_item"),
+            ("google_books", "gb-mixed-1", "day"),
+        ):
+            persist_metadata_field_provenance(
+                con,
+                "candidate",
+                mixed_prov_id,
+                "release_date",
+                {
+                    "metadata_provenance": {
+                        "fields": {
+                            "release_date": {
+                                "provider": prov_name,
+                                "provider_id": prov_id,
+                                "kind": kind,
+                            }
+                        },
+                        "fetch_trace": [],
+                        "source_payloads": [],
+                    }
+                },
+                default_provider=prov_name,
+                default_provider_id=prov_id,
+            )
+        con.execute(
+            "UPDATE candidates SET release_date='1999-01-01',date_kind='manual' WHERE id=?",
+            (manual_id,),
+        )
+
+    def openlibrary_side_effect(request):
+        title = request.url.params.get("title", "")
+        if "Undated" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL471579W",
+                "title": "Classic Undated Reissue",
+                "author_name": ["Agatha Christie"],
+                "first_publish_year": 1934,
+                "description": "Original 1934 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        if "Source Date" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL193500W",
+                "title": "Classic Source Date",
+                "author_name": ["Dorothy L. Sayers"],
+                "first_publish_date": "1935-10-01",
+                "description": "Original 1935 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        if "Mixed" in title:
+            return httpx.Response(200, json={"docs": [{
+                "key": "/works/OL193700W",
+                "title": "Classic Mixed Provenance",
+                "author_name": ["Ngaio Marsh"],
+                "first_publish_year": 1937,
+                "description": "Original 1937 mystery novel.",
+                "subject": ["Mystery"],
+            }]})
+        return httpx.Response(200, json={"docs": [{
+            "key": "/works/OL193600W",
+            "title": "Manual Classic",
+            "author_name": ["Margery Allingham"],
+            "first_publish_year": 1936,
+            "description": "Original 1936 mystery novel.",
+            "subject": ["Mystery"],
+        }]})
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=openlibrary_side_effect)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(200, json={"items": [{
+            "id": "reissue-vol",
+            "volumeInfo": {
+                "title": "Classic Undated Reissue",
+                "authors": ["Agatha Christie"],
+                "publishedDate": "2023-12-25",
+            },
+        }]})
+    )
+    respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"results": []}))
+
+    asyncio.run(audit_candidates(only_pending=False))
+
+    cand_undated = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (undated_id,))
+    cand_source = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (source_kind_id,))
+    cand_mixed = row("SELECT id,description,release_date,date_kind FROM candidates WHERE id=?", (mixed_prov_id,))
+    cand_manual = row("SELECT id,release_date,date_kind FROM candidates WHERE id=?", (manual_id,))
+
+    assert cand_undated["release_date"] == "1934-01-01"
+    assert cand_undated["date_kind"] == "year"
+    assert cand_source["release_date"] == "2023-12-25"
+    assert cand_source["date_kind"] == "source"
+    assert cand_mixed["description"] == "Original 1937 mystery novel."
+    assert cand_mixed["release_date"] == "2020-05-10"
+    assert cand_mixed["date_kind"] == "day"
+    assert cand_manual["release_date"] == "1999-01-01"
+    assert cand_manual["date_kind"] == "manual"
+
+    undated_prov = rows(
+        "SELECT provider,provider_id,source_payload FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+        (undated_id,),
+    )
+    assert len(undated_prov) == 1
+    assert undated_prov[0]["provider"] == "openlibrary"
+    assert undated_prov[0]["provider_id"] == "/works/OL471579W"
+    assert json.loads(undated_prov[0]["source_payload"])["field_provenance"]["source_field"] == "first_publish_year"
+
+    source_prov = rows(
+        "SELECT provider FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date'",
+        (source_kind_id,),
+    )
+    assert [item["provider"] for item in source_prov] == ["source"]
+
+    mixed_prov = rows(
+        "SELECT provider,provider_id FROM metadata_field_provenance "
+        "WHERE entity_type='candidate' AND entity_id=? AND field='release_date' ORDER BY provider",
+        (mixed_prov_id,),
+    )
+    assert [(item["provider"], item["provider_id"]) for item in mixed_prov] == [
+        ("google_books", "gb-mixed-1"),
+        ("source", str(source_id)),
+    ]
+    assert {item["provider"] for item in mixed_prov} == {"google_books", "source"}
+
+    # Both undated candidates (via release_date + OL provenance) and candidates
+    # that gained Open Library description provenance resolve verified work years
+    # without rewriting existing source release_date values, activating the
+    # batch ranker's publication-era gate (ranking.py).
+    from types import SimpleNamespace
+    from afterword_engine import publication_era_signal
+    from afterword_engine.ranking import rank_candidates
+
+    items = [
+        {**dict(cand_undated), "title": "Classic Undated Reissue", "author": "Agatha Christie"},
+        {**dict(cand_mixed), "title": "Classic Mixed Provenance", "author": "Ngaio Marsh"},
+    ]
+    with connect() as con:
+        attach_publication_years(con, [], items)
+    assert items[0]["first_publication_year"] == 1934
+    assert items[0]["publication_work_id"] == "/works/OL471579W"
+    assert items[1]["first_publication_year"] == 1937
+    assert items[1]["publication_work_id"] == "/works/OL193700W"
+
+    reads = [{"id": 1, "title": "Modern Thriller", "author": "Contemporary Writer", "rating": 5}]
+    vectors = [[1.0, 0.0]]
+    cand_vectors = [[1.0, 0.0], [1.0, 0.0]]
+    baseline = rank_candidates(reads, vectors, items, cand_vectors, publication_era=False)
+    orig_fit = publication_era_signal.fit_publication_era_signal
+    publication_era_signal.fit_publication_era_signal = lambda *_: SimpleNamespace(
+        adjustment=lambda year: -1.5 if year and year < 1950 else 0.0,
+        diagnostics={"enabled": True, "reason": "validated"},
+    )
+    try:
+        era_ranked = rank_candidates(reads, vectors, items, cand_vectors)
+    finally:
+        publication_era_signal.fit_publication_era_signal = orig_fit
+    assert [entry["score"] for entry in era_ranked] == [
+        round(entry["score"] - 1.5, 1) for entry in baseline
+    ]
 
 
 def test_fetch_catalog_json_registers_trace_before_await_and_handles_json_edges():
@@ -786,3 +994,1064 @@ def test_apple_books_trace_keys_and_early_guards():
             assert no_match_trace[0]["matched_count"] == 0
 
     asyncio.run(run())
+
+
+@respx.mock
+def test_audit_matches_apple_books_audiobooks_and_filters_container_genres(database):
+    sci_fi_id = add_candidate("The Ministry of Time (Unabridged)", "Kaliane Bradley")
+    generic_genre_id = add_candidate("Orbital", "Samantha Harvey")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, sci_fi_id, generic_genre_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    def apple_handler(request):
+        media = request.url.params.get("media")
+        term = request.url.params.get("term", "")
+        if media == "ebook":
+            return httpx.Response(200, json={"results": []})
+        if "Ministry of Time" in term:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "wrapperType": "audiobook",
+                            "collectionId": 1729854123,
+                            "collectionName": "The Ministry of Time (Unabridged)",
+                            "artistName": "Kaliane Bradley",
+                            "description": "A time-travel romance and thriller.",
+                            "primaryGenreName": "Sci-Fi & Fantasy",
+                            "releaseDate": "2024-05-07T07:00:00Z",
+                            "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music112/v4/aa/bb/cc/cover.jpg/100x100bb.jpg",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "wrapperType": "audiobook",
+                        "collectionId": 1700009999,
+                        "collectionName": "Orbital",
+                        "artistName": "Samantha Harvey",
+                        "description": "Six astronauts orbit Earth over twenty-four hours.",
+                        "genres": ["Audiobooks", "Books"],
+                        "primaryGenreName": "Audiobooks",
+                        "releaseDate": "2023-11-09T08:00:00Z",
+                    }
+                ]
+            },
+        )
+
+    respx.get(APPLE_BOOKS_SEARCH).mock(side_effect=apple_handler)
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 2
+
+    sci_fi_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (sci_fi_id,))
+    sci_fi_candidate = row("SELECT * FROM candidates WHERE id=?", (sci_fi_id,))
+    assert sci_fi_quality["quality_status"] == "accepted"
+    assert sci_fi_quality["provider"] == "apple_books"
+    assert sci_fi_quality["provider_id"] == "1729854123"
+    assert sci_fi_quality["work_id"] == "1729854123"
+    assert json.loads(sci_fi_quality["flags_json"]) == []
+    assert json.loads(sci_fi_candidate["genres"]) == ["Sci-Fi & Fantasy"]
+    assert "600x600bb" in sci_fi_candidate["cover_url"]
+
+    generic_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (generic_genre_id,))
+    generic_candidate = row("SELECT * FROM candidates WHERE id=?", (generic_genre_id,))
+    assert generic_quality["work_id"] == "1700009999"
+    assert json.loads(generic_candidate["genres"]) == []
+
+
+@respx.mock
+def test_audit_dedupes_cross_feed_duplicates_sharing_apple_books_work_id(database):
+    ebook_feed_id = add_candidate("Glass Peninsula", "Maren Solis")
+    audio_feed_id = add_candidate("Glass Peninsula: Special Audio Edition", "Maren Solis")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, ebook_feed_id, audio_feed_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+    respx.get(APPLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "collectionId": 1888777666,
+                        "collectionName": "Glass Peninsula: Special Audio Edition",
+                        "artistName": "Maren Solis",
+                        "description": "An island mystery.",
+                        "primaryGenreName": "Mystery & Thrillers",
+                        "releaseDate": "2026-06-01T07:00:00Z",
+                    },
+                    {
+                        "trackId": 1888777666,
+                        "trackName": "Glass Peninsula",
+                        "artistName": "Maren Solis",
+                        "description": "An island mystery with full synopsis.",
+                        "genres": ["Mysteries & Thrillers", "Books"],
+                        "releaseDate": "2026-06-01T07:00:00Z",
+                    },
+                ]
+            },
+        )
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["accepted"] == 2
+    assert result["deduped"] >= 1
+    ebook_cand = row("SELECT status FROM candidates WHERE id=?", (ebook_feed_id,))
+    audio_cand = row("SELECT status FROM candidates WHERE id=?", (audio_feed_id,))
+    ebook_q = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (ebook_feed_id,))
+    audio_q = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (audio_feed_id,))
+    assert ebook_cand["status"] == "new"
+    assert ebook_q["quality_status"] == "accepted"
+    assert audio_cand["status"] == "rejected"
+    assert audio_q["quality_status"] == "rejected"
+    assert json.loads(audio_q["flags_json"]) == ["duplicate_identity"]
+
+    from afterword_engine.main import recommendation_list
+
+    assert audio_feed_id not in {item["id"] for item in recommendation_list(status="decisions", limit=None)}
+
+
+@respx.mock
+def test_audit_skips_apple_books_for_isbn_when_primaries_healthy_but_falls_back_during_outage(database):
+    healthy_isbn_id = add_candidate(
+        "Healthy Primary Unmatched ISBN",
+        "Cassandra Khaw",
+        isbn13="9780307474278",
+        isbn10="0307474275",
+    )
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, healthy_isbn_id),
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    gb_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 6758952748,
+                        "trackName": "Outage ISBN Candidate",
+                        "artistName": "Cassandra Khaw",
+                        "description": "Matched via Apple fallback during Google Books 429.",
+                    }
+                ]
+            },
+        )
+    )
+
+    healthy_result = asyncio.run(audit_candidates(only_pending=True))
+    healthy_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (healthy_isbn_id,))
+    assert healthy_result["quarantine"] == 1
+    assert len(apple_route.calls) == 0
+    assert healthy_quality["quality_status"] == "quarantine"
+    assert json.loads(healthy_quality["flags_json"]) == ["catalog_unmatched"]
+
+    outage_isbn_id = add_candidate(
+        "Outage ISBN Candidate",
+        "Cassandra Khaw",
+        isbn13="9780061120084",
+        isbn10="0061120081",
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, outage_isbn_id),
+        )
+    ol_route.mock(return_value=httpx.Response(200, json={"docs": []}))
+    gb_route.mock(return_value=httpx.Response(429))
+
+    outage_result = asyncio.run(audit_candidates(only_pending=True))
+    outage_quality = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (outage_isbn_id,))
+    assert outage_result["accepted"] == 1
+    assert len(apple_route.calls) == 1
+    assert outage_quality["quality_status"] == "accepted"
+    assert outage_quality["provider"] == "apple_books"
+    assert outage_quality["provider_id"] == "6758952748"
+    assert outage_quality["work_id"] == "6758952748"
+    assert outage_quality["isbn13"] == "9780061120084"
+    assert outage_quality["isbn10"] == "0061120081"
+    assert "catalog_primary_unavailable" in json.loads(outage_quality["flags_json"])
+
+
+@respx.mock
+def test_audit_classifies_apple_books_429_and_503_as_retryable_outages(database):
+    first_429_id = add_candidate("Apple Rate Limited One", "Author One")
+    second_429_id = add_candidate("Apple Rate Limited Two", "Author Two")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, first_429_id, second_429_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(429))
+
+    result = asyncio.run(audit_candidates(only_pending=True))
+    assert result["quarantine"] == 2
+    assert len(apple_route.calls) == 1
+    for cid in (first_429_id, second_429_id):
+        flags = json.loads(row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))["flags_json"])
+        assert "catalog_provider_unavailable" in flags
+        assert "catalog_provider_rate_limited" in flags
+        assert "catalog_unmatched" not in flags
+
+    service_503_id = add_candidate("Apple Unavailable Three", "Author Three")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, service_503_id),
+        )
+    apple_route.mock(return_value=httpx.Response(503))
+
+    result_503 = asyncio.run(audit_candidates(only_pending=True))
+    assert result_503["audited"] == 1
+    assert result_503["quarantine"] == 1
+    flags_503 = json.loads(
+        row("SELECT flags_json FROM candidate_quality WHERE candidate_id=?", (service_503_id,))["flags_json"]
+    )
+    assert flags_503 == ["catalog_provider_unavailable"]
+
+    assert candidate_quality_audit_candidates(limit=50) == []
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (first_429_id, second_429_id, service_503_id),
+        )
+    due_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert {first_429_id, second_429_id, service_503_id} <= due_ids
+
+
+@respx.mock
+def test_apple_books_outage_fallback_backfills_primary_identifiers_after_recovery(database):
+    backfill_id = add_candidate("Recoverable Primary Work", "Clara Vance")
+    apple_only_id = add_candidate("Apple Exclusive Audiobook", "Devon Hart")
+    legacy_apple_id = add_candidate("Legacy Empty Work ID", "Elena Rostova")
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version=? WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, backfill_id, apple_only_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='555444333',work_id='',audit_version=?,audited_at='2026-10-01T00:00:00+00:00' "
+            "WHERE candidate_id=?",
+            (QUALITY_VERSION, legacy_apple_id),
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    gb_route = respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
+
+    def apple_initial(request):
+        term = request.url.params.get("term", "")
+        media = request.url.params.get("media", "")
+        if "Recoverable Primary Work" in term and media == "ebook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 111222333,
+                            "trackName": "Recoverable Primary Work",
+                            "artistName": "Clara Vance",
+                            "description": "Apple fallback description.",
+                            "genres": ["Fiction", "Books"],
+                            "releaseDate": "2026-04-14T07:00:00Z",
+                        }
+                    ]
+                },
+            )
+        if "Apple Exclusive Audiobook" in term and media == "audiobook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "collectionId": 999888777,
+                            "collectionName": "Apple Exclusive Audiobook",
+                            "artistName": "Devon Hart",
+                            "primaryGenreName": "Mystery & Thrillers",
+                        }
+                    ]
+                },
+            )
+        if "Legacy Empty Work ID" in term and media == "ebook":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 555444333,
+                            "trackName": "Legacy Empty Work ID",
+                            "artistName": "Elena Rostova",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    respx.get(APPLE_BOOKS_SEARCH).mock(side_effect=apple_initial)
+
+    first_run = asyncio.run(audit_candidates(only_pending=True))
+    assert first_run["accepted"] == 3
+    for cid in (backfill_id, apple_only_id):
+        q_row = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert q_row["provider"] == "apple_books"
+        assert "catalog_primary_unavailable" in json.loads(q_row["flags_json"])
+
+    # Not eligible before CATALOG_PROVIDER_RETRY_HOURS.
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+    # Advance past retry window and bring Open Library / Google Books back online.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (backfill_id, apple_only_id, legacy_apple_id),
+        )
+
+    def ol_recovered(request):
+        title = request.url.params.get("title", "")
+        if "Recoverable Primary Work" in title:
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OL987654W",
+                            "title": "Recoverable Primary Work",
+                            "author_name": ["Clara Vance"],
+                            "isbn": ["0307474275"],
+                            "first_publish_year": 2026,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"docs": []})
+
+    ol_route.mock(side_effect=ol_recovered)
+    gb_route.mock(return_value=httpx.Response(200, json={"items": []}))
+
+    due_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert {backfill_id, apple_only_id} <= due_ids
+
+    recovery_run = asyncio.run(audit_candidates(only_pending=True))
+    assert recovery_run["accepted"] >= 2
+
+    recovered_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (backfill_id,))
+    assert recovered_q["provider"] == "openlibrary"
+    assert recovered_q["work_id"] == "/works/OL987654W"
+    assert recovered_q["isbn13"] == "9780307474278"
+    assert recovered_q["isbn10"] == "0307474275"
+    assert json.loads(recovered_q["flags_json"]) == []
+
+    apple_only_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (apple_only_id,))
+    assert apple_only_q["provider"] == "apple_books"
+    assert apple_only_q["work_id"] == "999888777"
+    assert json.loads(apple_only_q["flags_json"]) == []
+
+    legacy_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (legacy_apple_id,))
+    assert legacy_q["work_id"] == "555444333"
+
+    # Even if audited_at is aged again, cleared flags and populated work_id prevent repeat lookups.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?,?)",
+            (backfill_id, apple_only_id, legacy_apple_id),
+        )
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+
+@respx.mock
+def test_reaudit_keeps_accepted_status_when_apple_books_has_transient_outage(database):
+    from afterword_engine.main import recommendation_list
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+
+    primary_outage_id = add_candidate(
+        "Transient Reaudit Primary Outage",
+        "Clara Vance",
+        status="recommended",
+    )
+    legacy_empty_work_id = add_candidate(
+        "Transient Reaudit Legacy Apple",
+        "Elena Rostova",
+        status="recommended",
+    )
+    with transaction() as con:
+        con.execute("UPDATE candidates SET score=92 WHERE id IN (?,?)", (primary_outage_id, legacy_empty_work_id))
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.94,"
+            "provider='apple_books',provider_id='111222333',work_id='111222333',"
+            "title_match=1.0,author_match=1.0,flags_json=?,audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            ('["catalog_primary_unavailable"]', QUALITY_VERSION, primary_outage_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.91,"
+            "provider='apple_books',provider_id='555444333',work_id='',"
+            "title_match=0.95,author_match=1.0,flags_json='[]',audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, legacy_empty_work_id),
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(return_value=httpx.Response(200, json={"docs": []}))
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
+
+    outage_reaudit = asyncio.run(audit_candidates(only_pending=True))
+    assert outage_reaudit["audited"] == 2
+    assert outage_reaudit["accepted"] == 2
+    assert outage_reaudit["quarantine"] == 0
+
+    primary_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (primary_outage_id,))
+    assert primary_q["quality_status"] == "accepted"
+    assert primary_q["quality_score"] == pytest.approx(0.94)
+    assert primary_q["provider"] == "apple_books"
+    assert primary_q["provider_id"] == "111222333"
+    assert primary_q["work_id"] == "111222333"
+    assert set(json.loads(primary_q["flags_json"])) == {
+        "catalog_primary_unavailable",
+        "catalog_provider_unavailable",
+    }
+
+    legacy_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (legacy_empty_work_id,))
+    assert legacy_q["quality_status"] == "accepted"
+    assert legacy_q["quality_score"] == pytest.approx(0.91)
+    assert legacy_q["provider"] == "apple_books"
+    assert legacy_q["provider_id"] == "555444333"
+    assert legacy_q["work_id"] == ""
+    assert json.loads(legacy_q["flags_json"]) == ["catalog_provider_unavailable"]
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert {primary_outage_id, legacy_empty_work_id} <= visible_ids
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+    # Also verify HTTP 429 rate-limit during re-audit keeps accepted status, then recovers cleanly.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (primary_outage_id, legacy_empty_work_id),
+        )
+    apple_route.mock(return_value=httpx.Response(429))
+
+    rate_limit_reaudit = asyncio.run(audit_candidates(only_pending=True))
+    assert rate_limit_reaudit["accepted"] == 2
+    assert rate_limit_reaudit["quarantine"] == 0
+    for cid in (primary_outage_id, legacy_empty_work_id):
+        q_row = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert "catalog_provider_rate_limited" in json.loads(q_row["flags_json"])
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (primary_outage_id, legacy_empty_work_id),
+        )
+
+    def apple_recovered(request):
+        term = request.url.params.get("term", "")
+        if "Primary Outage" in term:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 111222333,
+                            "trackName": "Transient Reaudit Primary Outage",
+                            "artistName": "Clara Vance",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 555444333,
+                        "trackName": "Transient Reaudit Legacy Apple",
+                        "artistName": "Elena Rostova",
+                    }
+                ]
+            },
+        )
+
+    apple_route.mock(side_effect=apple_recovered)
+    recovered = asyncio.run(audit_candidates(only_pending=True))
+    assert recovered["accepted"] == 2
+    for cid, expected_work_id in (
+        (primary_outage_id, "111222333"),
+        (legacy_empty_work_id, "555444333"),
+    ):
+        q_row = row("SELECT quality_status,work_id,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert q_row["work_id"] == expected_work_id
+        assert json.loads(q_row["flags_json"]) == []
+
+
+@respx.mock
+def test_reaudit_keeps_accepted_status_on_weak_primary_match_plus_apple_503(database):
+    from afterword_engine.main import recommendation_list
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+
+    unrelated_author_id = add_candidate(
+        "Weak Primary Match Book",
+        "Clara Vance",
+        status="recommended",
+    )
+    surname_only_id = add_candidate(
+        "Shared Surname Echoes",
+        "Clara Vance",
+        status="recommended",
+    )
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidates SET score=93,description='Verified Apple synopsis.',"
+            "genres='[\"Literary Fiction\"]' WHERE id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.96,"
+            "provider='apple_books',provider_id='777888999',work_id='777888999',"
+            "title_match=1.0,author_match=1.0,flags_json=?,audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            ('["catalog_primary_unavailable"]', QUALITY_VERSION, unrelated_author_id),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.92,"
+            "provider='apple_books',provider_id='888999000',work_id='',"
+            "title_match=0.96,author_match=1.0,flags_json='[]',audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, surname_only_id),
+        )
+
+    def ol_weak_primary(request):
+        title = request.url.params.get("title", "")
+        if "Weak Primary Match Book" in title:
+            # Non-accepted primary match: exact title, completely different author (quality_score=0.65 < 0.82).
+            return httpx.Response(
+                200,
+                json={
+                    "docs": [
+                        {
+                            "key": "/works/OLWEAK1W",
+                            "title": "Weak Primary Match Book",
+                            "author_name": ["Unrelated Author"],
+                            "isbn": ["0306406152"],
+                            "description": "Wrong book synopsis that must not overwrite candidate.",
+                            "subject": ["Cooking"],
+                        }
+                    ]
+                },
+            )
+        # Non-accepted primary match with surname-only author overlap (title_match=1.0, author_match=0.55 < 0.65,
+        # quality_score=0.8425 >= 0.82): still non-accepted and must not quarantine on Apple 503.
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": "/works/OLWEAK2W",
+                        "title": "Shared Surname Echoes",
+                        "author_name": ["Robert Vance"],
+                        "isbn": ["0306406152"],
+                        "description": "Wrong surname-only synopsis.",
+                        "subject": ["Gardening"],
+                    }
+                ]
+            },
+        )
+
+    ol_route = respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_weak_primary)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+    apple_route = respx.get(APPLE_BOOKS_SEARCH).mock(return_value=httpx.Response(503))
+
+    reaudit_503 = asyncio.run(audit_candidates(only_pending=True))
+    assert len(ol_route.calls) == 2
+    assert len(apple_route.calls) == 4  # ebook + audiobook for both candidates
+    assert reaudit_503["audited"] == 2
+    assert reaudit_503["accepted"] == 2
+    assert reaudit_503["quarantine"] == 0
+
+    first_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (unrelated_author_id,))
+    assert first_q["quality_status"] == "accepted"
+    assert first_q["quality_score"] == pytest.approx(0.96)
+    assert first_q["provider"] == "apple_books"
+    assert first_q["provider_id"] == "777888999"
+    assert first_q["work_id"] == "777888999"
+    assert first_q["isbn13"] == ""
+    assert set(json.loads(first_q["flags_json"])) == {
+        "catalog_primary_unavailable",
+        "catalog_provider_unavailable",
+    }
+
+    second_q = row("SELECT * FROM candidate_quality WHERE candidate_id=?", (surname_only_id,))
+    assert second_q["quality_status"] == "accepted"
+    assert second_q["quality_score"] == pytest.approx(0.92)
+    assert second_q["provider"] == "apple_books"
+    assert second_q["provider_id"] == "888999000"
+    assert second_q["work_id"] == ""
+    assert second_q["isbn13"] == ""
+    assert json.loads(second_q["flags_json"]) == ["catalog_provider_unavailable"]
+
+    for cid in (unrelated_author_id, surname_only_id):
+        cand = row("SELECT description,genres FROM candidates WHERE id=?", (cid,))
+        assert cand["description"] == "Verified Apple synopsis."
+        assert json.loads(cand["genres"]) == ["Literary Fiction"]
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert {unrelated_author_id, surname_only_id} <= visible_ids
+    assert candidate_quality_audit_candidates(limit=50) == []
+
+    # Also verify weak primary match + Apple 429 keeps accepted status, and recovery promotes/backfills cleanly.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+    apple_route.mock(return_value=httpx.Response(429))
+
+    reaudit_429 = asyncio.run(audit_candidates(only_pending=True))
+    assert reaudit_429["accepted"] == 2
+    assert reaudit_429["quarantine"] == 0
+    for cid in (unrelated_author_id, surname_only_id):
+        q_row = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert "catalog_provider_rate_limited" in json.loads(q_row["flags_json"])
+
+    # When Apple recovers with an accepted match (even if its score is slightly lower than the surname-only
+    # non-accepted primary match's 0.8425), resolve_catalog_match chooses the verified accepted record.
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET audited_at='2000-01-01 00:00:00' WHERE candidate_id IN (?,?)",
+            (unrelated_author_id, surname_only_id),
+        )
+
+    def apple_recovered(request):
+        term = request.url.params.get("term", "")
+        if "Weak Primary Match Book" in term:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "trackId": 777888999,
+                            "trackName": "Weak Primary Match Book",
+                            "artistName": "Clara Vance",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "trackId": 888999000,
+                        "trackName": "Shared Surname Echoes: A Novel",
+                        "artistName": "C. Vance",
+                    }
+                ]
+            },
+        )
+
+    apple_route.mock(side_effect=apple_recovered)
+    recovered = asyncio.run(audit_candidates(only_pending=True))
+    assert recovered["accepted"] == 2
+    assert recovered["quarantine"] == 0
+    for cid, expected_work_id in (
+        (unrelated_author_id, "777888999"),
+        (surname_only_id, "888999000"),
+    ):
+        q_row = row("SELECT quality_status,provider,work_id,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert q_row["quality_status"] == "accepted"
+        assert q_row["provider"] == "apple_books"
+        assert q_row["work_id"] == expected_work_id
+        assert json.loads(q_row["flags_json"]) == []
+
+
+def test_dedupe_and_hide_reject_candidates_handles_apple_work_keys_and_preserves_winner(database):
+    from afterword_engine.main import recommendation_list
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+
+    imported_id = add_candidate("Saltwater House", "Nora Bell", status="imported")
+    shortlist_dup_id = add_candidate(
+        "Saltwater House: Collector's Edition",
+        "Nora Bell",
+        status="recommended",
+    )
+    winner_id = add_candidate("Cedar Ridge", "Maren Solis", status="recommended")
+    loser_id = add_candidate(
+        "Cedar Ridge: Deluxe Audio Edition",
+        "Maren Solis",
+        status="recommended",
+    )
+    read_dup_id = add_candidate("Already Finished Apple Book", "Devon Hart", status="recommended")
+
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'test')",
+            ("Already Finished Apple Book", "Devon Hart"),
+        )
+        con.execute("UPDATE candidates SET score=70, description='Full synopsis.' WHERE id=?", (winner_id,))
+        con.execute("UPDATE candidates SET score=99, description='' WHERE id=?", (loser_id,))
+        con.execute("UPDATE candidates SET score=95 WHERE id IN (?,?)", (shortlist_dup_id, read_dup_id))
+        for cid, pid, wid, qscore in (
+            (imported_id, "900100200", "900100200", 0.90),
+            (shortlist_dup_id, "900100200", "900100200", 0.90),
+            (winner_id, "900100300", "900100300", 0.95),
+            (loser_id, "900100300", "", 0.88),
+            (read_dup_id, "900100400", "900100400", 0.92),
+        ):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',quality_score=?,"
+                "provider='apple_books',provider_id=?,work_id=? WHERE candidate_id=?",
+                (qscore, pid, wid, cid),
+            )
+
+        # Both connection-backed and default rows()-backed serving filter consistently before dedupe
+        # (serving orders by c.score DESC, so loser_id leads until _dedupe_and_hide promotes quality_score/synopsis).
+        conn_visible = [item["id"] for item in recommendation_list(con, status="recommended", limit=None)]
+    rows_visible = [item["id"] for item in recommendation_list(status="recommended", limit=None)]
+    assert conn_visible == [loser_id]
+    assert rows_visible == [loser_id]
+
+    with transaction() as con:
+        changed = _dedupe_and_hide(con)
+        conn_after_dedupe = [item["id"] for item in recommendation_list(con, status="recommended", limit=None)]
+    assert changed == 3
+    assert conn_after_dedupe == [winner_id]
+    assert [item["id"] for item in recommendation_list(status="recommended", limit=None)] == [winner_id]
+
+    for cid, expected_flag in (
+        (read_dup_id, "read_overlap"),
+        (shortlist_dup_id, "shortlisted_overlap"),
+        (loser_id, "duplicate_identity"),
+    ):
+        cand_row = row("SELECT status FROM candidates WHERE id=?", (cid,))
+        qual_row = row("SELECT quality_status,flags_json FROM candidate_quality WHERE candidate_id=?", (cid,))
+        assert cand_row["status"] == "rejected"
+        assert qual_row["quality_status"] == "rejected"
+        assert json.loads(qual_row["flags_json"]) == [expected_flag]
+
+    winner_cand = row("SELECT status FROM candidates WHERE id=?", (winner_id,))
+    winner_qual = row("SELECT quality_status FROM candidate_quality WHERE candidate_id=?", (winner_id,))
+    assert winner_cand["status"] == "recommended"
+    assert winner_qual["quality_status"] == "accepted"
+    assert recommendation_list(status="decisions", limit=None) == []
+
+
+@respx.mock
+def test_audit_commits_10_row_subbatches_updates_progress_and_preserves_90_rows_at_91(
+    database, monkeypatch
+):
+    from afterword_engine import quality as quality_module
+
+    candidate_ids = [
+        add_candidate(f"Subbatch Book {index}", f"Author {index}")
+        for index in range(100)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,progress) VALUES('job-91','candidate_quality','running',0)"
+        )
+
+    observed_progress: list[float] = []
+    real_audit_one = quality_module._audit_one
+
+    async def interrupting_audit_one(candidate, *args, **kwargs):
+        if candidate["title"] == "Subbatch Book 90":
+            current = row("SELECT progress FROM jobs WHERE id='job-91'")
+            observed_progress.append(float(current["progress"]))
+            raise RuntimeError("Simulated provider crash at row 91")
+        return await real_audit_one(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(quality_module, "_audit_one", interrupting_audit_one)
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{title.replace(' ', '_')}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    with pytest.raises(RuntimeError, match="Simulated provider crash at row 91"):
+        asyncio.run(audit_candidates(only_pending=False, job_id="job-91"))
+
+    assert observed_progress == [pytest.approx(0.9)]
+    job = row("SELECT progress FROM jobs WHERE id='job-91'")
+    assert job["progress"] == pytest.approx(0.9)
+
+    committed = rows(
+        "SELECT candidate_id,quality_status,audit_version,audited_at "
+        "FROM candidate_quality WHERE candidate_id IN (%s) ORDER BY candidate_id"
+        % ",".join("?" for _ in candidate_ids),
+        tuple(candidate_ids),
+    )
+    accepted_ids = [
+        item["candidate_id"]
+        for item in committed
+        if item["quality_status"] == "accepted" and item["audit_version"] == QUALITY_VERSION
+    ]
+    pending_ids = [
+        item["candidate_id"]
+        for item in committed
+        if item["quality_status"] == "pending"
+    ]
+    assert accepted_ids == candidate_ids[:90]
+    assert pending_ids == candidate_ids[90:]
+
+
+@respx.mock
+def test_audit_stops_cleanly_between_subbatches_during_shutdown(database):
+    candidate_ids = [
+        add_candidate(f"Shutdown Book {index}", f"Author {index}")
+        for index in range(25)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+        con.execute(
+            "INSERT INTO jobs(id,kind,status,progress) VALUES('job-stop','candidate_quality','running',0)"
+        )
+
+    stop = asyncio.Event()
+    calls: list[str] = []
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        calls.append(title)
+        if len(calls) == 10:
+            stop.set()
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{len(calls)}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    result = asyncio.run(
+        audit_candidates(only_pending=False, job_id="job-stop", stop=stop)
+    )
+    assert result["audited"] == 10
+    assert result["accepted"] == 10
+    assert result["stopped"] is True
+    assert len(calls) == 10
+    assert row("SELECT progress FROM jobs WHERE id='job-stop'")["progress"] == pytest.approx(0.4)
+
+
+@respx.mock
+def test_full_sweep_skips_curated_demo_rows_and_already_audited_sweep_rows(database):
+    first = add_candidate("Sweep Book One", "Writer One")
+    second = add_candidate("Sweep Book Two", "Writer Two")
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+            "WHERE candidate_id IN (?,?)",
+            (QUALITY_VERSION, first, second),
+        )
+    curated_ids = [
+        item["candidate_id"]
+        for item in rows(
+            "SELECT candidate_id FROM candidate_quality WHERE audit_version='builtin-curated-v1'"
+        )
+    ]
+    assert len(curated_ids) > 0
+
+    called_titles: list[str] = []
+
+    def ol_handler(request):
+        title = request.url.params.get("title", "")
+        called_titles.append(title)
+        return httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{title.replace(' ', '_')}",
+                        "title": title,
+                        "author_name": [request.url.params.get("author", "Writer")],
+                    }
+                ]
+            },
+        )
+
+    respx.get(OPEN_LIBRARY_SEARCH).mock(side_effect=ol_handler)
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(return_value=httpx.Response(200, json={"items": []}))
+
+    # Incremental mode skips current accepted rows and curated demo rows.
+    assert asyncio.run(audit_candidates(only_pending=True))["audited"] == 0
+    assert called_titles == []
+
+    # Full mode re-checks accepted rows once per sweep_started_at while skipping curated demo rows.
+    sweep_started_at = "2026-06-01 00:00:00.000000"
+    first_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=1, audited_before=sweep_started_at)
+    )
+    assert first_pass["audited"] == 1
+    assert called_titles == ["Sweep Book One"]
+
+    second_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=10, audited_before=sweep_started_at)
+    )
+    assert second_pass["audited"] == 1
+    assert called_titles == ["Sweep Book One", "Sweep Book Two"]
+
+    third_pass = asyncio.run(
+        audit_candidates(only_pending=False, limit=10, audited_before=sweep_started_at)
+    )
+    assert third_pass["audited"] == 0
+
+
+@respx.mock
+def test_audit_runs_dedupe_and_hide_once_after_subbatch_loop(database, monkeypatch):
+    from afterword_engine import quality as quality_module
+
+    candidate_ids = [
+        add_candidate(f"Batch Dedupe Book {index}", f"Author {index}")
+        for index in range(35)
+    ]
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='pending',audit_version='candidate-quality-v1' "
+            "WHERE candidate_id=?",
+            ((cid,) for cid in candidate_ids),
+        )
+
+    dedupe_calls = 0
+    real_dedupe = quality_module._dedupe_and_hide
+
+    def counted_dedupe(con):
+        nonlocal dedupe_calls
+        dedupe_calls += 1
+        return real_dedupe(con)
+
+    monkeypatch.setattr(quality_module, "_dedupe_and_hide", counted_dedupe)
+    respx.get(OPEN_LIBRARY_SEARCH).mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "docs": [
+                    {
+                        "key": f"/works/OL_{req.url.params.get('title', '').replace(' ', '_')}",
+                        "title": req.url.params.get("title", ""),
+                        "author_name": [req.url.params.get("author", "Author")],
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(GOOGLE_BOOKS_SEARCH).mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    result = asyncio.run(audit_candidates(only_pending=True, limit=50))
+    assert result["audited"] == 35
+    assert result["accepted"] == 35
+    assert dedupe_calls == 1
+
+
+def test_candidate_quality_audit_remaining_matches_apple_books_retry_and_work_id_gates(database):
+    from afterword_engine.quality import candidate_quality_audit_remaining
+
+    accepted_provider_outage = add_candidate("Accepted Outage Retry", "Clara Vance")
+    accepted_primary_outage = add_candidate("Accepted Primary Retry", "Devon Hart")
+    legacy_apple_no_work = add_candidate("Legacy Apple Empty Work", "Elena Rostova")
+    settled_apple = add_candidate("Settled Apple Book", "Maren Solis")
+
+    with transaction() as con:
+        con.execute("UPDATE sources SET enabled=1 WHERE url='builtin://upcoming'")
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='101',work_id='101',flags_json=?,audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            ('["catalog_provider_unavailable"]', QUALITY_VERSION, accepted_provider_outage),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='102',work_id='102',flags_json=?,audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            ('["catalog_primary_unavailable"]', QUALITY_VERSION, accepted_primary_outage),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='103',work_id='',flags_json='[]',audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, legacy_apple_no_work),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='apple_books',"
+            "provider_id='104',work_id='104',flags_json='[]',audit_version=?,"
+            "audited_at='2000-01-01 00:00:00' WHERE candidate_id=?",
+            (QUALITY_VERSION, settled_apple),
+        )
+
+    selected_ids = {int(item["id"]) for item in candidate_quality_audit_candidates(limit=50)}
+    assert selected_ids == {
+        accepted_provider_outage,
+        accepted_primary_outage,
+        legacy_apple_no_work,
+    }
+    assert candidate_quality_audit_remaining(mode="incremental") == 3

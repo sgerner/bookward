@@ -1594,6 +1594,156 @@ describe("page actions", () => {
     });
   });
 
+  it("exposes database storage and evidence quota metrics and compacts storage online", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const backupStatus = {
+      enabled: true,
+      interval_hours: 24,
+      retention_count: 7,
+      last_success_at: "2026-11-21T00:00:00+00:00",
+      last_error: null,
+      next_backup_at: "2026-11-22T00:00:00+00:00",
+      backups: [],
+      live_size_bytes: 12 * 1024 * 1024,
+      reclaimable_bytes: 2 * 1024 * 1024,
+      auto_vacuum_mode: "incremental",
+      evidence_used_bytes: 64 * 1024 * 1024,
+      evidence_quota_bytes: 512 * 1024 * 1024,
+      evidence_status: "healthy",
+    };
+    let compactCalls = 0;
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (String(input).includes("/api/backups/compact")) {
+        compactCalls += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              compactCalls === 1
+                ? {
+                    reclaimed_bytes: 2 * 1024 * 1024,
+                    after_bytes: 10 * 1024 * 1024,
+                  }
+                : {
+                    reclaimed_bytes: 0,
+                    after_bytes: 10 * 1024 * 1024,
+                  },
+            ),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups/evidence-rotation")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ evidence_rotation_enabled: true, status: backupStatus }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups/retention")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ retention_enabled: false, status: backupStatus }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      if (String(input).includes("/api/backups")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(backupStatus), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      backupStatus: typeof backupStatus & {
+        retention_enabled?: boolean;
+        evidence_rotation_enabled?: boolean;
+      };
+    };
+    expect(loaded.backupStatus.retention_enabled).toBe(false);
+    expect(loaded.backupStatus.evidence_rotation_enabled).toBe(false);
+    expect(loaded.backupStatus.live_size_bytes).toBe(12 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_used_bytes).toBe(64 * 1024 * 1024);
+    expect(loaded.backupStatus.evidence_status).toBe("healthy");
+
+    const compactResult = await actions.compactStorage!({} as never);
+    expect(compactResult).toEqual({
+      message: "Storage compacted; reclaimed 2.0 MB. Live database: 10.0 MB.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/compact",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    const alreadyCompact = await actions.compactStorage!({} as never);
+    expect(alreadyCompact).toEqual({
+      message: "Database already compact. Live database: 10.0 MB.",
+    });
+
+    const pauseForm = new FormData();
+    pauseForm.set("enabled", "0");
+    const paused = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: pauseForm }),
+    } as never);
+    expect(paused).toEqual({ message: "Automatic storage retention paused." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/retention",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: false }),
+      }),
+    );
+
+    const resumeForm = new FormData();
+    resumeForm.set("enabled", "1");
+    const resumed = await actions.setStorageRetention!({
+      request: new Request("http://afterword.test", { method: "POST", body: resumeForm }),
+    } as never);
+    expect(resumed).toEqual({ message: "Automatic storage retention enabled." });
+
+    const rotationForm = new FormData();
+    rotationForm.set("enabled", "1");
+    const rotationEnabled = await actions.setEvidenceRotation!({
+      request: new Request("http://afterword.test", { method: "POST", body: rotationForm }),
+    } as never);
+    expect(rotationEnabled).toEqual({ message: "Replay evidence rotation enabled." });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/evidence-rotation",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ enabled: true }),
+      }),
+    );
+  });
+
   it("removes a shortlisted or imported book with restore and exposes its undo token", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: 12, status: "recommended", decision_id: 77 }), {
@@ -1683,6 +1833,152 @@ describe("page actions", () => {
       ids: [7, 8],
       action: "save",
       run_id: "run-digest-1",
+    });
+  });
+
+  it("loads active catalog sweep progress, remaining rows, and retry status in Settings", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const quality = {
+      statuses: [
+        { quality_status: "accepted", count: 80 },
+        { quality_status: "quarantine", count: 12 },
+      ],
+      identifiers: { total: 92, with_isbn13: 70, with_catalog_match: 80 },
+      flags: { catalog_unmatched: 12 },
+      version: "candidate-quality-v4",
+      audit: {
+        status: "failed",
+        active: false,
+        mode: "full",
+        last_mode: "full",
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 42,
+        progress: 0.6,
+        started_at: "2026-11-21 20:00:00.000000",
+        completed_at: null,
+        job_id: "job-audit-1",
+        last_error: "Catalog provider timed out",
+        can_retry: true,
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      const payload = input.includes("/api/candidates/quality") ? quality : overview;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      catalogQuality: {
+        audit: {
+          status: string;
+          mode: string;
+          remaining: number;
+          progress: number;
+          last_error: string | null;
+          can_retry: boolean;
+        };
+      };
+    };
+    expect(result.catalogQuality.audit).toMatchObject({
+      status: "failed",
+      mode: "full",
+      remaining: 42,
+      progress: 0.6,
+      last_error: "Catalog provider timed out",
+      can_retry: true,
+    });
+  });
+
+  it("queues incremental, full, and retried catalog audits through the engine", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ job_id: "12345678-audit", mode: "full", remaining: 120 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ job_id: "87654321-retry", mode: "full", remaining: 70 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ remaining: 20 }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const fullForm = new FormData();
+    fullForm.set("mode", "full");
+    const fullPending = actions.auditCatalog!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: fullForm,
+      }),
+    } as never);
+    await vi.advanceTimersByTimeAsync(2 * 250);
+    await expect(fullPending).resolves.toEqual({
+      message: "Full catalog audit queued in bounded 50-book batches (120 books remaining).",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/candidates/audit",
+    );
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      mode: "full",
+    });
+
+    const retryPending = actions.retryCatalogAudit!({} as never);
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(retryPending).resolves.toEqual({
+      message:
+        "Catalog audit retry batch finished; 20 books remaining in the background.",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[3][1] as RequestInit).body))).toEqual({
+      retry: true,
     });
   });
 

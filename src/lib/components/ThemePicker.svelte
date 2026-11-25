@@ -75,11 +75,12 @@
 
 <PopoverDialog
 	bind:open={appearanceOpen}
+	topLayer={compact}
 	triggerClass={compact ? 'btn min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
 	triggerLabel="Choose appearance"
 	triggerTitle="Choose appearance"
 	dialogLabelledby={headingId}
-	panelClass={`${compact ? 'fixed right-4 top-20' : 'absolute right-0 top-[calc(100%+0.75rem)]'} z-50 max-h-[min(42rem,calc(100dvh-2rem))] w-[min(24rem,calc(100vw-2rem))] overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5`}
+	panelClass={`${compact ? 'fixed right-4 top-4 left-auto bottom-auto z-[55] m-0 space-y-4 rounded-container border border-surface-200-800 sm:top-20 sm:max-h-[min(42rem,calc(100dvh-6rem))]' : 'absolute right-0 top-[calc(100%+0.75rem)] z-50'} max-h-[min(42rem,calc(100dvh-2rem))] min-w-0 w-[min(24rem,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5`}
 >
 	{#snippet trigger()}
 		<Palette size={18} strokeWidth={1.8} aria-hidden="true" />
@@ -134,7 +135,7 @@
 				getValue={(entry) => entry.id}
 				labelledBy="appearance-theme-legend"
 				columns={2}
-				class="-mx-1.5 grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto p-1.5"
+				class={compact ? 'grid grid-cols-2 gap-2' : '-mx-1.5 grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto p-1.5'}
 				onSelect={(entry) => void chooseTheme(entry.id)}
 			>
 				{#snippet item(entry, radio)}

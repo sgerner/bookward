@@ -38,14 +38,22 @@
     Upload,
     X,
   } from "@lucide/svelte";
+  import BookCoverTrigger from "#lib/components/BookCoverTrigger.svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import InlineAlert from "#lib/components/InlineAlert.svelte";
+  import ModalDialog from "#lib/components/ModalDialog.svelte";
+  import LabeledSelect from "#lib/components/LabeledSelect.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import StatusRegion from "#lib/components/StatusRegion.svelte";
   import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
-  import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import {
+    copyApiTokenText,
+    type ApiTokenCopyStatus,
+  } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import {
@@ -54,6 +62,17 @@
     hasUnsavedDigestChanges,
     shouldShowDigestTestButton,
   } from "#lib/digest-ui.js";
+  import {
+    formatLibrarrSearchStatus,
+    formatLlmCatalogStatus,
+    formatReadingHistoryStatus,
+    formatRecommendationStatus,
+  } from "#lib/live-status.js";
+  import {
+    applyRatingOverrides,
+    createReadingHistoryRatingController,
+    formatRatingConfirmation,
+  } from "#lib/reading-history-ratings.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -65,7 +84,6 @@
     resolveLibrarrResultFormat,
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
-  import { modalFocus } from "#lib/actions/modal-focus.js";
   import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
@@ -127,7 +145,7 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
-  let markReadRating = $state(0);
+  let markReadRating = $state<number | null>(0);
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -167,28 +185,34 @@
   let previousQueriedDecisionStatus = "decisions";
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
+  let recommendationsImmediate = $state(false);
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let readingHistoryImmediate = $state(false);
   let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -232,7 +256,7 @@
   let digestSmtpUsername = $state("");
   let digestSmtpPassword = $state("");
   let digestClearSmtpCredentials = $state(false);
-  let apiTokenCopyMessage = $state<string | null>(null);
+  let apiTokenCopyStatus = $state<ApiTokenCopyStatus | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
   let notificationPointerInside = false;
@@ -268,8 +292,11 @@
     models: Array<{ id: string; name: string }>;
   };
   let llmCatalogProviders = $state<LlmCatalogProvider[]>([]);
+  let llmCatalogLoaded = $state(false);
   let llmCatalogLoading = $state(false);
   let llmCatalogError = $state("");
+  let llmCatalogImmediate = $state(false);
+  let llmActiveFilter = $state<"none" | "provider" | "model">("none");
   let llmProviderSearch = $state("");
   let llmModelSearch = $state("");
   let llmEnabledOverride = $state<boolean | null>(null);
@@ -310,6 +337,11 @@
     return discoverSearch;
   }
   function setSearchForView(view: FilterableView, value: string) {
+    if (view === "decisions" && decisionFilter === "read") {
+      readingHistoryImmediate = false;
+    } else {
+      recommendationsImmediate = false;
+    }
     if (view === "saved") savedSearch = value;
     else if (view === "decisions") decisionsSearch = value;
     else discoverSearch = value;
@@ -320,6 +352,7 @@
     return discoverGenre;
   }
   function setGenreForView(view: FilterableView, value: string) {
+    recommendationsImmediate = false;
     if (view === "saved") savedGenre = value;
     else if (view === "decisions") decisionsGenre = value;
     else discoverGenre = value;
@@ -550,6 +583,12 @@
       rawGenre.trim()
     );
   }
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -568,7 +607,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -647,6 +686,67 @@
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const catalogQuality = $derived(
+    data.catalogQuality ?? {
+      statuses: [],
+      identifiers: { total: 0, with_isbn13: 0, with_catalog_match: 0 },
+      flags: {},
+      version: "",
+      audit: {
+        status: "idle" as const,
+        active: false,
+        mode: "incremental" as const,
+        last_mode: null,
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 0,
+        progress: 0,
+        started_at: null,
+        completed_at: null,
+        job_id: null,
+        last_error: null,
+        can_retry: false,
+      },
+    },
+  );
+  const catalogAudit = $derived(catalogQuality.audit);
+  const catalogStatusCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const item of catalogQuality.statuses) {
+      counts[item.quality_status] = item.count;
+    }
+    return {
+      accepted: counts.accepted ?? 0,
+      quarantine: counts.quarantine ?? 0,
+      pending: counts.pending ?? 0,
+    };
+  });
+  const catalogAuditPercent = $derived(
+    Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
+  );
+  // State changes only: the remaining count changes on every poll and would be
+  // re-announced every few seconds.
+  const catalogAuditStatusMessage = $derived(
+    catalogAudit.status === "failed"
+      ? "Catalog audit needs retry."
+      : catalogAudit.active
+        ? `${catalogAudit.mode === "full" ? "Full" : "Incremental"} catalog audit ${
+            catalogAudit.status === "queued" ? "queued" : "running"
+          }.`
+        : catalogAudit.status === "paused"
+          ? "Catalog audit paused."
+          : catalogAudit.remaining > 0
+            ? "Catalog audit has books due."
+            : "Catalog audit up to date.",
+  );
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    if (activeView !== "settings" || !catalogAudit.active) return;
+    const timer = window.setInterval(() => {
+      void invalidateAll();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  });
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -670,6 +770,22 @@
     );
   });
 
+  const llmCatalogStatusMessage = $derived(
+    formatLlmCatalogStatus({
+      loaded: llmCatalogLoaded,
+      loading: llmCatalogLoading,
+      hasError: Boolean(llmCatalogError),
+      totalProviders: llmCatalogProviders.length,
+      matchedProviders: filteredLlmProviders.length,
+      providerQuery: llmProviderSearch,
+      selectedProviderName: selectedCatalogProvider?.name ?? null,
+      totalModels: selectedCatalogProvider?.models.length ?? 0,
+      matchedModels: filteredLlmModels.length,
+      modelQuery: llmModelSearch,
+      activeFilter: llmActiveFilter,
+    }),
+  );
+
   async function loadLlmCatalog() {
     if (llmCatalogLoading) return;
     llmCatalogLoading = true;
@@ -682,6 +798,9 @@
         return;
       }
       llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
+      llmCatalogLoaded = true;
+      llmActiveFilter = "none";
+      llmCatalogImmediate = true;
     } catch (error) {
       llmCatalogError =
         error instanceof Error
@@ -695,6 +814,8 @@
   function handleLlmProviderChange(providerId: string) {
     llmProviderOverride = providerId;
     llmModelSearch = "";
+    llmActiveFilter = "none";
+    llmCatalogImmediate = true;
     const match = llmCatalogProviders.find((p) => p.id === providerId);
     if (!match) return;
     if (match.api) {
@@ -901,6 +1022,7 @@
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
     readingHistoryState = "loading";
+    readingHistoryImmediate = true;
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
@@ -915,6 +1037,7 @@
         throw new Error(payload.message || "Reading history could not be loaded.");
       }
       readingHistory = payload.items;
+      readingHistoryImmediate = true;
       readingHistoryState = "ready";
       void loadReadingHistoryScores(payload.items.length);
     } catch (error) {
@@ -967,7 +1090,66 @@
     readingHistoryScoreTask = task;
     return task;
   }
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
+  }
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
+      const response = await fetch(`/api/reading-history/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === id ? { ...entry, rating } : entry,
+      );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        void refreshReadingHistoryScores();
+      }
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+    const inDecisionsView = activeView === "decisions";
+    recommendationsImmediate = inDecisionsView;
+    readingHistoryImmediate = inDecisionsView;
     decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
     decisionsLoadError = "";
@@ -995,7 +1177,9 @@
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
   function go(view: View) {
-    revealedApiToken = tokenForView(view, revealedApiToken);
+    const nextToken = tokenForView(view, revealedApiToken);
+    if (!nextToken) apiTokenCopyStatus = null;
+    revealedApiToken = nextToken;
     activeView = view;
     if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
     if (typeof window !== "undefined") {
@@ -1459,6 +1643,20 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  function formatStorageSize(bytes: number | undefined) {
+    const safe = Math.max(0, Number(bytes ?? 0));
+    if (safe === 0) return "0 KB";
+    if (safe < 1024 * 1024) return `${Math.max(1, Math.round(safe / 1024))} KB`;
+    if (safe < 1024 * 1024 * 1024) return `${(safe / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(safe / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function evidencePercent(usedBytes: number | undefined, quotaBytes: number | undefined) {
+    const quota = Math.max(1, Number(quotaBytes ?? 512 * 1024 * 1024));
+    const used = Math.max(0, Number(usedBytes ?? 0));
+    return Math.min(100, Math.round((used / quota) * 100));
+  }
+
   async function fetchInitialFilteredDiscover(
     key: string,
     searchQuery: string,
@@ -1496,6 +1694,7 @@
       filteredDiscoverLoadedKey = key;
       filteredDiscoverPending = false;
       discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
       discoverLoadError =
@@ -1517,6 +1716,7 @@
 
   function reloadFilteredDiscover() {
     if (!hasActiveDiscoverFilter) return;
+    recommendationsImmediate = true;
     filteredDiscoverPending = true;
     void fetchInitialFilteredDiscover(
       activeDiscoverFilterKey,
@@ -1528,6 +1728,7 @@
   async function loadMoreDiscover() {
     if (discoverLoading || filteredDiscoverPending || digestRequested) return;
     if (discoverVisibleCount < discoverViewBooks.length) {
+      recommendationsImmediate = true;
       discoverVisibleCount = Math.min(
         discoverVisibleCount + DISCOVER_PAGE_SIZE,
         discoverViewBooks.length,
@@ -1586,6 +1787,7 @@
         unfilteredDiscoverOffset = offset + payload.items.length;
         unfilteredDiscoverHasMore = payload.has_more === true;
       }
+      recommendationsImmediate = true;
       discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
@@ -1638,6 +1840,7 @@
       queriedDecisionsHasMore = payload.has_more === true;
       queriedDecisionLoadedKey = key;
       queriedDecisionPending = false;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError =
@@ -1659,6 +1862,7 @@
 
   function reloadQueriedDecisions() {
     if (!isQueriedDecisionMode) return;
+    recommendationsImmediate = true;
     queriedDecisionPending = true;
     void fetchInitialQueriedDecisions(
       activeDecisionQueryKey,
@@ -1721,6 +1925,7 @@
         unfilteredDecisionOffset = offset + payload.items.length;
         decisionsHasMoreOverride = payload.has_more === true;
       }
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError = error instanceof Error
@@ -1832,6 +2037,17 @@
       .map((result, index) => ({ result, index, score: resultScore(result) }))
       .filter((item): item is { result: LibrarrResult; index: number; score: number } => item.score !== null && item.score >= 90),
   );
+  const librarrStatusMessage = $derived(
+    formatLibrarrSearchStatus({
+      state: librarrSearchState,
+      resultCount: librarrResults.length,
+      mediaType: librarrSearchedMediaType,
+    }),
+  );
+  const librarrSearchImmediate = $derived(
+    librarrSearchState === "ready" ||
+      (librarrSearchState === "searching" && librarrResults.length === 0),
+  );
   function resultKey(result: LibrarrResult, index: number) {
     return `${resultIdentity(result)}-${index}`;
   }
@@ -1918,15 +2134,22 @@
   }
 
   async function copyApiToken() {
-    apiTokenCopyMessage = await copyApiTokenText(
+    apiTokenCopyStatus = null;
+    await tick();
+    apiTokenCopyStatus = await copyApiTokenText(
       revealedApiToken ?? "",
       navigator.clipboard,
     );
   }
 
   $effect(() => {
-    if (formState?.token) revealedApiToken = formState.token;
-    else if (formState) revealedApiToken = null;
+    if (formState?.token) {
+      revealedApiToken = formState.token;
+      apiTokenCopyStatus = null;
+    } else if (formState) {
+      revealedApiToken = null;
+      apiTokenCopyStatus = null;
+    }
   });
 
   $effect(() => {
@@ -1960,6 +2183,13 @@
     unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -2110,7 +2340,9 @@
       return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) void loadMoreDiscover();
+        if (!discoverLoadError && entries.some((entry) => entry.isIntersecting)) {
+          void loadMoreDiscover();
+        }
       },
       { rootMargin: "240px 0px" },
     );
@@ -2300,13 +2532,13 @@
       const nextView = readView(
         new URL(window.location.href).searchParams.get("view"),
       );
-      revealedApiToken = tokenForView(nextView, revealedApiToken);
+      const nextToken = tokenForView(nextView, revealedApiToken);
+      if (!nextToken) apiTokenCopyStatus = null;
+      revealedApiToken = nextToken;
       activeView = nextView;
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
     const onKeydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && markReadBook) closeMarkRead();
-      if (event.key === "Escape" && librarrSearchOpen) closeLibrarrSearch();
       if (event.key === "Escape" && openReadMenuId !== null) {
         const menuId = openReadMenuId;
         openReadMenuId = null;
@@ -2476,11 +2708,12 @@
           </form>{/if}
         <PopoverDialog
           bind:open={profileMenuOpen}
+          topLayer
           panelId="profile-menu-panel"
           triggerLabel="Open profile menu"
           triggerTitle="Profile"
           dialogLabel="Profile"
-          panelClass="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
+          panelClass="fixed right-4 top-[4.25rem] left-auto bottom-auto z-50 m-0 max-h-[calc(100dvh-4.5rem)] min-w-0 w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
         >
           {#snippet trigger()}
             <CircleUserRound size={19} strokeWidth={1.8} aria-hidden="true" />
@@ -2490,7 +2723,7 @@
               <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
               {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
-            <div class="grid gap-1 py-2">
+            <div class="grid min-w-0 gap-1 py-2">
               <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} aria-hidden="true" />Account settings</a>
               {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
               <ThemePicker compact />
@@ -2608,7 +2841,6 @@
       {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
-
         {@const viewSearch = searchForView(view)}
         {@const viewGenre = genreForView(view)}
         {@const viewGenres = genresForView(view)}
@@ -2618,11 +2850,33 @@
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || effectiveDiscoverHasMore)}
         {@const viewInitialLoading = (view === "discover" && hasActiveDiscoverFilter && (filteredDiscoverPending || (discoverLoading && filteredDiscoverLoadedKey !== activeDiscoverFilterKey))) || (view === "decisions" && isQueriedDecisionMode && (queriedDecisionPending || (decisionsLoading && queriedDecisionLoadedKey !== activeDecisionQueryKey)))}
         {@const viewFilterError = view === "discover" && hasActiveDiscoverFilter ? discoverLoadError : view === "decisions" && isQueriedDecisionMode ? decisionsLoadError : ""}
-        <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
+        {@const totalDecisionBooks = unfilteredDecisionBooks.length}
+        {@const recommendationStatusMessage = formatRecommendationStatus({
+          view,
+          visibleCount: viewVisibleBooks.length,
+          matchedCount: viewBooks.length,
+          shortlistTotalCount,
+          totalDecisionCount: totalDecisionBooks,
+          hasActiveFilter: viewHasFilter,
+          decisionFilter,
+          digestVisible,
+          digestRequested,
+          discoverHasMore: effectiveDiscoverHasMore,
+          loading: viewInitialLoading,
+          hasError: Boolean(viewFilterError),
+        })}
+        {@const hasActiveReadingFilter = Boolean(decisionsSearch.trim() || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all")}
+        {@const readingHistoryStatusMessage = formatReadingHistoryStatus({
+          state: readingHistoryState,
+          visibleCount: visibleReadingHistory.length,
+          matchedCount: filteredReadingHistory.length,
+          hasActiveFilter: hasActiveReadingFilter,
+        })}
+        <section class="mb-8 flex min-w-0 flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
-            class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
+            class="min-w-0 break-words text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
-          <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
+          <div class="flex min-w-0 w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
               <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
                 <label class="flex min-h-11 min-w-0 flex-1 cursor-text items-center gap-2 self-stretch pl-3 pr-2">
                   <Search size={17} class="shrink-0 text-surface-600-400" />
@@ -2637,32 +2891,45 @@
                 {#if viewSearch}<button type="button" class="btn-icon btn-icon-sm mr-1.5 min-h-8 min-w-8 shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => setSearchForView(view, "")}><X size={15} /></button>{/if}
               </div>
               {#if viewGenres.length && !(view === "decisions" && decisionFilter === "read")}
-                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
-                  Genre
-                  <select
-                    class="select mt-1 min-h-11 w-full preset-tonal-surface"
-                    value={viewGenre}
-                    onchange={(event) => setGenreForView(view, event.currentTarget.value)}
-                    aria-label={view === "saved" ? "Filter shortlist by genre" : view === "decisions" ? "Filter past decisions by genre" : "Filter books by genre"}
-                  >
-                    <option value="">All genres</option>
-                    {#each viewGenres as genre (genre)}<option value={genre} selected={viewGenre.toLowerCase() === genre.toLowerCase()}>{genre}</option>{/each}
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44"
+                  selectClass="select mt-1 min-h-11 w-full preset-tonal-surface"
+                  label="Genre"
+                  srLabel={view === "saved" ? "for shortlist" : view === "decisions" ? "for past decisions" : "for books"}
+                  bind:value={() => viewGenre, (next) => setGenreForView(view, next)}
+                >
+                  <option value="">All genres</option>
+                  {#each viewGenres as genre (genre)}<option value={genre} selected={viewGenre.toLowerCase() === genre.toLowerCase()}>{genre}</option>{/each}
+                </LabeledSelect>
               {/if}
               {#if view === "saved"}
-                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
-                  Sort by
-                  <select class="select mt-1 min-h-11 w-full preset-tonal-surface" bind:value={shortlistSort} aria-label="Sort shortlist">
-                    <option value="score">Best match</option>
-                    <option value="title">Title A–Z</option>
-                    <option value="author">Author A–Z</option>
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44"
+                  selectClass="select mt-1 min-h-11 w-full preset-tonal-surface"
+                  label="Sort by"
+                  srLabel="for shortlist"
+                  bind:value={shortlistSort}
+                >
+                  <option value="score">Best match</option>
+                  <option value="title">Title A–Z</option>
+                  <option value="author">Author A–Z</option>
+                </LabeledSelect>
               {/if}
           </div>
         </section>
+        <StatusRegion
+          message={view === "decisions" && decisionFilter === "read" ? "" : recommendationStatusMessage}
+          immediate={recommendationsImmediate}
+          contextKey={view}
+          paused={activeView !== view}
+        />
         {#if view === "decisions"}
+          <StatusRegion
+            message={decisionFilter === "read" ? readingHistoryStatusMessage : ""}
+            immediate={readingHistoryImmediate}
+            contextKey="decisions-read"
+            paused={activeView !== "decisions"}
+          />
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
@@ -2704,8 +2971,7 @@
           </section>
         {/if}
         <section
-          class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
-          aria-live="polite"
+          class="grid min-w-0 gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
@@ -2718,12 +2984,14 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              <div
-                class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
+              <BookCoverTrigger
+                title={book.title}
+                score={book.score}
+                hasCover={Boolean(book.cover_url)}
+                expanded={expandedRecommendationDetails.has(book.id)}
+                class="aspect-[2/3] self-start"
+                onclick={() => toggleRecommendationDetails(book.id)}
               >
-                <span class="absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex" aria-hidden="true">
-                  <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
-                </span>
                 {#if book.cover_url}<img
                     in:fade={{ duration: motionDuration(340) }}
                     class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px] sm:scale-100 sm:opacity-100 sm:blur-none sm:transition sm:duration-500 sm:group-hover:scale-[1.05]"
@@ -2734,18 +3002,7 @@
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <div class="pointer-events-none absolute inset-0 preset-filled-surface-50-950 opacity-[0.82] sm:hidden" aria-hidden="true"></div>
-                <div class="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15 sm:hidden" aria-hidden="true"></div>
-                <button
-                  type="button"
-                  class="hidden text-left sm:absolute sm:inset-0 sm:z-20 sm:block focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-500"
-                  onclick={() => toggleRecommendationDetails(book.id)}
-                  aria-label={`View details for ${book.title}`}
-                  aria-expanded={expandedRecommendationDetails.has(book.id)}
-                >
-                  <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
-                </button>
-              </div>
+              </BookCoverTrigger>
               <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   {#if view === "discover" && digestVisible && book.status === "recommended"}
@@ -2775,9 +3032,9 @@
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
                 </div>
-                <div>
-                  <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
-                  <p class="mt-1 text-base text-surface-700-300">{book.author}</p>
+                <div class="min-w-0">
+                  <h2 class="break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="mt-1 break-words text-base text-surface-700-300">{book.author}</p>
                 </div>
                 <details
                   class="group/details text-base text-surface-700-300"
@@ -2872,11 +3129,11 @@
               </div>
             </article>
           {:else}
-            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status">
+            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300">
                 <RefreshCw size={17} class="animate-spin" />{view === "decisions" ? "Loading past decisions…" : "Searching recommendations…"}
               </div>
-            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{viewFilterError}</p>
+            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={viewFilterError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
@@ -2894,11 +3151,11 @@
                 </form>{/if}
               </div>{/if}{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if discoverLoadError}<p class="text-sm text-error-600-400" role="alert">{discoverLoadError}</p>{/if}
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
+              <InlineAlert message={discoverLoadError} />
+              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if decisionsLoadError}<p class="text-sm text-error-600-400" role="alert">{decisionsLoadError}</p>{/if}
+              <InlineAlert message={decisionsLoadError} />
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
                 {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
               </button>
@@ -2912,51 +3169,66 @@
           >
             {#if readingHistoryState === "ready"}
               <div class="mb-5 grid gap-3 sm:grid-cols-3" role="group" aria-label="Filter and sort read books">
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Rating
-                  <select bind:value={readingHistoryRatingFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
-                    <option value="all">Any rating</option>
-                    <option value="rated">Rated</option>
-                    <option value="unrated">Unrated</option>
-                  </select>
-                </label>
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Source
-                  <select bind:value={readingHistorySourceFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
-                    <option value="all">All sources</option>
-                    {#each readingHistorySources as source (source)}
-                      <option value={source}>{readingSourceLabel(source)}</option>
-                    {/each}
-                  </select>
-                </label>
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Sort by
-                  <select bind:value={readingHistorySort} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Sort read books">
-                    <option value="recent">Most recently read</option>
-                    <option value="oldest">Oldest read</option>
-                    <option value="score_high">Highest Bookward score</option>
-                    <option value="score_low">Lowest Bookward score</option>
-                    <option value="rating_high">Highest rating</option>
-                    <option value="title">Title A–Z</option>
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Rating"
+                  srLabel="for read books"
+                  bind:value={readingHistoryRatingFilter}
+                  onchange={() => (readingHistoryImmediate = false)}
+                >
+                  <option value="all">Any rating</option>
+                  <option value="rated">Rated</option>
+                  <option value="unrated">Unrated</option>
+                </LabeledSelect>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Source"
+                  srLabel="for read books"
+                  bind:value={readingHistorySourceFilter}
+                  onchange={() => (readingHistoryImmediate = false)}
+                >
+                  <option value="all">All sources</option>
+                  {#each readingHistorySources as source (source)}
+                    <option value={source}>{readingSourceLabel(source)}</option>
+                  {/each}
+                </LabeledSelect>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Sort by"
+                  srLabel="for read books"
+                  bind:value={readingHistorySort}
+                >
+                  <option value="recent">Most recently read</option>
+                  <option value="oldest">Oldest read</option>
+                  <option value="score_high">Highest Bookward score</option>
+                  <option value="score_low">Lowest Bookward score</option>
+                  <option value="rating_high">Highest rating</option>
+                  <option value="title">Title A–Z</option>
+                </LabeledSelect>
               </div>
             {/if}
             {#if readingHistoryScoreState === "loading"}
-              <p class="mb-4 text-sm text-surface-700-300" role="status" aria-live="polite">
+              <p class="mb-4 text-sm text-surface-700-300">
                 Calculating Bookward scores for {scoredReadingHistoryCount} of {readingHistory.length} read books…
               </p>
             {:else if readingHistoryScoreState === "error"}
-              <div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-surface-700-300" role="status">
-                <span>{readingHistoryScoreError} Scores loaded for {scoredReadingHistoryCount} of {readingHistory.length} books.</span>
-                <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+              <div class="mb-4 flex flex-wrap items-center gap-3">
+                <InlineAlert
+                  tone="warning"
+                  size="sm"
+                  message={`${readingHistoryScoreError} Scores loaded for ${scoredReadingHistoryCount} of ${readingHistory.length} books.`}
+                />
+                <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
             {#if readingHistoryState === "loading"}
-              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
-              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{readingHistoryError}</p>
+              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={readingHistoryError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
@@ -2979,6 +3251,16 @@
                           <span class="badge preset-tonal-surface">Unrated</span>
                         {/if}
                       </div>
+                    </div>
+                    <div class="mt-3 border-t border-surface-300-700/40 pt-3">
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
                     </div>
                     <details
                       class="group/details mt-3 border-t border-surface-300-700/40 pt-2"
@@ -3028,7 +3310,7 @@
                 {/each}
               </div>
               {#if visibleReadingHistory.length < filteredReadingHistory.length}
-                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => (readingHistoryVisibleCount += 30)}><ArrowRight size={14} /> Load more books</button></div>
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
               {/if}
             {:else}
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
@@ -3049,7 +3331,7 @@
         {#if activeView === "discover"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3058,7 +3340,7 @@
         {:else if activeView === "saved"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3067,7 +3349,7 @@
         {:else if activeView === "decisions"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3140,6 +3422,15 @@
                   </div>
                 </div>
                 <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
+                  <StatusRegion
+                    message={formState?.sourcePreview
+                      ? formState.sourcePreview.count === 0
+                        ? `Preview matched 0 of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.`
+                        : `Preview matched ${formState.sourcePreview.count} of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}.`
+                      : ""}
+                    immediate
+                    paused={activeView !== "sources"}
+                  />
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -3342,7 +3633,6 @@
                                 {#if formState?.sourcePreview?.id === source.id}
                                   <div
                                     class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
-                                    role="status"
                                   >
                                     {#if formState.sourcePreview.count === 0}
                                       Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
@@ -3564,7 +3854,7 @@
         {:else}
           <div
             data-view="settings"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3575,7 +3865,7 @@
                 Settings.
               </h1>
             </section>
-            <section class="grid gap-5 lg:grid-cols-2">
+            <section class="grid min-w-0 gap-5 lg:grid-cols-2">
               <section class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2">
                 <div class="mb-5 flex items-start gap-3">
                   <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"><Database size={19} /></span>
@@ -3593,16 +3883,121 @@
                   </div>
                 </div>
 
+                <StatusRegion
+                  message={data.backupStatus.last_error ?? ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if data.backupStatus.last_error}
-                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
+                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm">{data.backupStatus.last_error}</p>
                 {/if}
 
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
-                  Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
+                  Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code class="break-words wrap-anywhere">AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
                 </p>
 
-                <div class="grid gap-5 lg:grid-cols-2">
-                  <div>
+                <div class="mb-5 grid min-w-0 gap-4 border border-surface-300-700/50 p-4 sm:grid-cols-3">
+                  <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Live database</span>
+                      <span class={`badge text-xs ${data.backupStatus.auto_vacuum_mode === "incremental" ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                        {data.backupStatus.auto_vacuum_mode === "incremental" ? "Incremental vacuum" : "Legacy layout"}
+                      </span>
+                    </div>
+                    <p class="mt-1 text-xl font-semibold text-surface-950-50">
+                      {formatStorageSize(data.backupStatus.live_size_bytes ?? data.backupStatus.database_size_bytes)}
+                    </p>
+                    <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                      {#if (data.backupStatus.reclaimable_bytes ?? 0) > 0}
+                        {formatStorageSize(data.backupStatus.reclaimable_bytes)} reclaimable free pages
+                      {:else}
+                        No uncompacted free pages
+                      {/if}
+                      {#if data.backupStatus.backups.length}
+                        · {formatStorageSize(data.backupStatus.backup_total_size_bytes)} across {data.backupStatus.backups.length} {data.backupStatus.backups.length === 1 ? "snapshot" : "snapshots"}
+                      {/if}
+                    </p>
+                  </div>
+
+                  <div class="flex min-w-0 flex-col justify-between gap-3">
+                    <div>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Evidence quota</span>
+                        <span class={`badge text-xs ${data.backupStatus.evidence_status === "exceeded" ? "preset-tonal-error" : data.backupStatus.evidence_status === "warning" ? "preset-tonal-warning" : "preset-tonal-success"}`}>
+                          {data.backupStatus.evidence_status === "exceeded"
+                            ? "Quota reached"
+                            : data.backupStatus.evidence_status === "warning"
+                              ? data.backupStatus.evidence_rotation_enabled
+                                ? "Rotating soon"
+                                : "Near quota"
+                              : "Healthy"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-sm font-medium text-surface-950-50">
+                        {formatStorageSize(data.backupStatus.evidence_used_bytes)} <span class="font-normal text-surface-600-400">of {formatStorageSize(data.backupStatus.evidence_quota_bytes ?? 512 * 1024 * 1024)}</span>
+                      </p>
+                      <div
+                        class="mt-2 h-2 w-full overflow-hidden bg-surface-200-800"
+                        role="progressbar"
+                        aria-label="Replay evidence quota usage"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}
+                      >
+                        <div
+                          class={`h-full transition-all ${data.backupStatus.evidence_status === "exceeded" ? "bg-error-500" : data.backupStatus.evidence_status === "warning" ? "bg-warning-500" : "bg-primary-500"}`}
+                          style={`width: ${evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}%`}
+                        ></div>
+                      </div>
+                      <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                        {#if data.backupStatus.evidence_rotation_enabled}
+                          Auto-rotates oldest unattributed snapshots above 80% down to 65%.
+                        {:else}
+                          Opt-in rotation is off; new captures degrade cleanly at 100%.
+                        {/if}
+                      </p>
+                    </div>
+                    <form method="POST" action="?/setEvidenceRotation" use:enhance={setPending("toggle-evidence-rotation")}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="enabled" value={data.backupStatus.evidence_rotation_enabled ? "0" : "1"} />
+                      <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
+                        {data.backupStatus.evidence_rotation_enabled ? "Pause evidence rotation" : "Enable evidence rotation"}
+                      </button>
+                    </form>
+                  </div>
+
+                  <div class="flex min-w-0 flex-col justify-between gap-3">
+                    <div>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Storage hygiene</span>
+                        <span class={`badge text-xs ${data.backupStatus.retention_enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                          {data.backupStatus.retention_enabled ? "Retention active" : "Retention off"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-xs leading-5 text-surface-700-300">
+                        Compact storage reclaims unused SQLite pages and truncates the write-ahead log without deleting stored history.{#if data.backupStatus.auto_vacuum_mode && data.backupStatus.auto_vacuum_mode !== "incremental"} Compacting once upgrades this database to incremental vacuum.{/if}
+                      </p>
+                    </div>
+                    <div class="grid min-w-0 gap-2">
+                      <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                          <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
+                        </button>
+                      </form>
+                      <form method="POST" action="?/setStorageRetention" use:enhance={setPending("toggle-retention")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <input type="hidden" name="enabled" value={data.backupStatus.retention_enabled ? "0" : "1"} />
+                        <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
+                          {data.backupStatus.retention_enabled ? "Pause automatic retention" : "Enable automatic retention"}
+                        </button>
+                      </form>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="grid min-w-0 gap-5 lg:grid-cols-2">
+                  <div class="min-w-0">
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
@@ -3623,18 +4018,18 @@
                     </div>
                   </div>
 
-                  <div class="border border-surface-300-700/50 p-4">
+                  <div class="min-w-0 border border-surface-300-700/50 p-4">
                     <h3 class="font-semibold text-surface-950-50">Restore a backup</h3>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
                     {#if data.backupStatus.backups.length}
                       <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <label class="block text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
+                        <label class="block min-w-0 text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
                           {#each data.backupStatus.backups as backup (backup.id)}
                             <option value={backup.id}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
                           {/each}
                         </select></label>
-                        <label class="block text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
+                        <label class="block min-w-0 text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
                         <button class="btn min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
                           {#if isPending("restore-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<RefreshCw size={16} />{/if} Restore selected backup
                         </button>
@@ -3751,7 +4146,7 @@
                   Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
-                  class="mt-5 block text-sm font-medium text-surface-800-200"
+                  class="mt-5 block min-w-0 text-sm font-medium text-surface-800-200"
                   >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
@@ -4056,6 +4451,183 @@
                 </form>
               </section>
               <section
+                id="catalog-audit-settings"
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><Database size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Catalog audit
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${
+                      catalogAudit.status === "failed"
+                        ? "preset-tonal-error"
+                        : catalogAudit.active
+                          ? "preset-tonal-secondary"
+                          : catalogAudit.remaining > 0
+                            ? "preset-tonal-warning"
+                            : "preset-tonal-success"
+                    }`}
+                  >
+                    {#if catalogAudit.status === "failed"}
+                      Needs retry
+                    {:else if catalogAudit.active}
+                      {catalogAudit.mode === "full" ? "Full sweep" : "Incremental"} · {catalogAudit.status === "queued" ? "Queued" : "Running"}
+                    {:else if catalogAudit.status === "paused"}
+                      Paused · {catalogAudit.remaining} left
+                    {:else if catalogAudit.remaining > 0}
+                      {catalogAudit.remaining} due
+                    {:else}
+                      Up to date
+                    {/if}
+                  </span>
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
+                </p>
+
+                <div class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
+                      {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
+                        ? "Active sweep mode"
+                        : "Default mode"}
+                    </span>
+                    <span class="font-medium text-surface-950-50">
+                      {catalogAudit.mode === "full"
+                        ? "Full catalog sweep"
+                        : "Incremental"}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-surface-700-300">Remaining to check</span>
+                    <strong class="text-surface-950-50">
+                      {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"}
+                    </strong>
+                  </div>
+                  <p class="text-xs text-surface-600-400">
+                    {catalogStatusCounts.accepted} accepted · {catalogStatusCounts.quarantine} quarantined{#if catalogStatusCounts.pending > 0} · {catalogStatusCounts.pending} pending{/if}
+                  </p>
+                  {#if catalogAudit.active}
+                    <div class="pt-1">
+                      <div class="mb-1 flex items-center justify-between text-xs text-surface-700-300">
+                        <span>Current {catalogAudit.batch_size}-book batch</span>
+                        <span>{catalogAuditPercent}%</span>
+                      </div>
+                      <div
+                        class="h-2 w-full overflow-hidden rounded-full bg-surface-300-700/50"
+                        role="progressbar"
+                        aria-label="Current catalog audit batch progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={catalogAuditPercent}
+                      >
+                        <div
+                          class="h-full rounded-full preset-filled-secondary-500 transition-all"
+                          style={`width: ${catalogAuditPercent}%`}
+                        ></div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  paused={activeView !== "settings"}
+                />
+
+                {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
+                  <div
+                    class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
+                    role="alert"
+                  >
+                    <TriangleAlert size={16} class="shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <strong>
+                        {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
+                      </strong>
+                      {#if catalogAudit.remaining > 0}
+                        · {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"} remaining
+                      {/if}
+                      {#if catalogAudit.last_error}
+                        <span class="mt-1 block text-xs">{catalogAudit.last_error}</span>
+                      {/if}
+                    </span>
+                    <form
+                      method="POST"
+                      action="?/retryCatalogAudit"
+                      use:enhance={setPending("catalog-audit-retry")}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button
+                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                        type="submit"
+                        disabled={isPending("catalog-audit-retry") || catalogAudit.active}
+                        aria-busy={isPending("catalog-audit-retry")}
+                      >
+                        {#if isPending("catalog-audit-retry")}<RefreshCw
+                            size={14}
+                            class="animate-spin"
+                          />{:else}<RefreshCw size={14} />{/if} Retry
+                      </button>
+                    </form>
+                  </div>
+                {/if}
+
+                <div class="mt-4 grid gap-2 sm:grid-cols-2">
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-incremental")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="incremental" />
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
+                      aria-busy={isPending("catalog-audit-incremental")}
+                    >
+                      {#if isPending("catalog-audit-incremental") || (catalogAudit.active && catalogAudit.mode === "incremental")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Search size={16} />{/if} Audit due books
+                    </button>
+                  </form>
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-full")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="full" />
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
+                      aria-busy={isPending("catalog-audit-full")}
+                    >
+                      {#if isPending("catalog-audit-full") || (catalogAudit.active && catalogAudit.mode === "full")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<RefreshCw size={16} />{/if} Re-check full catalog
+                    </button>
+                  </form>
+                </div>
+              </section>
+              <section
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
@@ -4091,7 +4663,7 @@
                   >
                   or enter an endpoint directly.
                 </p>
-                <div class="mt-4 space-y-3 border border-surface-300-700/50 p-3">
+                <div class="mt-4 min-w-0 space-y-3 border border-surface-300-700/50 p-3">
                   <div class="flex flex-wrap items-center justify-between gap-2">
                     <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
                       >models.dev selector</span
@@ -4101,6 +4673,7 @@
                       class="btn btn-sm min-h-9 preset-tonal-secondary"
                       onclick={() => void loadLlmCatalog()}
                       disabled={llmCatalogLoading}
+                      aria-busy={llmCatalogLoading}
                     >
                       {#if llmCatalogLoading}<RefreshCw
                           size={14}
@@ -4109,21 +4682,28 @@
                       {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
                     </button>
                   </div>
-                  {#if llmCatalogError}
-                    <p class="text-xs text-error-600-400" role="alert">{llmCatalogError}</p>
-                  {/if}
+                  <StatusRegion
+                    message={llmCatalogStatusMessage}
+                    immediate={llmCatalogImmediate}
+                    paused={activeView !== "settings"}
+                  />
+                  <InlineAlert message={llmCatalogError} size="sm" />
                   {#if llmCatalogProviders.length > 0}
-                    <div class="grid gap-3 sm:grid-cols-2">
-                      <div>
-                        <label class="block text-xs font-medium text-surface-700-300"
+                    <div class="grid min-w-0 gap-3 sm:grid-cols-2">
+                      <div class="min-w-0">
+                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
                           >Filter provider<input
                             class="input mt-1"
                             type="search"
                             bind:value={llmProviderSearch}
+                            oninput={() => {
+                              llmActiveFilter = "provider";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search OpenAI, Google, Groq…"
                           /></label
                         >
-                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
                           >Provider<select
                             class="select mt-1"
                             value={llmProvider}
@@ -4141,17 +4721,21 @@
                           </select></label
                         >
                       </div>
-                      <div>
-                        <label class="block text-xs font-medium text-surface-700-300"
+                      <div class="min-w-0">
+                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
                           >Filter model<input
                             class="input mt-1"
                             type="search"
                             bind:value={llmModelSearch}
+                            oninput={() => {
+                              llmActiveFilter = "model";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search model ID or name…"
                             disabled={!selectedCatalogProvider}
                           /></label
                         >
-                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
                           >Model<select
                             class="select mt-1"
                             value={llmModel}
@@ -4270,19 +4854,21 @@
                   </div>
                 </div>
 
-                <div class="mb-5 border border-surface-300-700/50 p-3 text-sm">
+                <div class="mb-5 min-w-0 border border-surface-300-700/50 p-3 text-sm">
                   <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
                   <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
-                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
+                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code class="break-words wrap-anywhere">Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
                 {#if revealedApiToken}
-                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
+                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4">
                     <div class="flex items-start gap-3">
-                      <Check size={18} class="mt-0.5 shrink-0" />
+                      <Check size={18} class="mt-0.5 shrink-0" aria-hidden="true" />
                       <div class="min-w-0 flex-1">
-                        <p class="font-semibold">Copy this token now</p>
-                        <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        <div role="alert">
+                          <p class="font-semibold">Copy this token now</p>
+                          <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        </div>
                         <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
@@ -4293,10 +4879,16 @@
                         onclick={() => void copyApiToken()}
                       ><Copy size={14} /> Copy</button>
                     </div>
-                    {#if apiTokenCopyMessage}
-                      <p class="mt-3 text-xs" role="status">{apiTokenCopyMessage}</p>
-                    {/if}
                   </div>
+                {/if}
+                <StatusRegion
+                  message={apiTokenCopyStatus && !apiTokenCopyStatus.error ? apiTokenCopyStatus.message : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                  class={apiTokenCopyStatus && !apiTokenCopyStatus.error ? "mb-3 text-xs text-surface-700-300" : "sr-only"}
+                />
+                {#if apiTokenCopyStatus?.error}
+                  <InlineAlert message={apiTokenCopyStatus.message} size="sm" class="mb-3" />
                 {/if}
 
                 <form method="POST" action="?/createApiToken" use:enhance={setPending("create-api-token")} class="flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -4318,7 +4910,7 @@
                         <li class="flex flex-wrap items-center gap-3 p-3">
                           <div class="min-w-0 flex-1">
                             <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
-                            <p class="mt-1 text-xs text-surface-700-300"><code>{token.token_prefix}…</code> · Created {token.created_at}</p>
+                            <p class="mt-1 text-xs text-surface-700-300"><code class="break-words wrap-anywhere">{token.token_prefix}…</code> · Created {token.created_at}</p>
                             {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
                           </div>
                           {#if token.revoked_at}
@@ -4350,36 +4942,39 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <div class="flex flex-wrap items-center gap-4">
-                    <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
+                  <div class="relative flex min-w-0 flex-wrap items-center gap-4">
+                    <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><Bell size={20} /></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-3">
-                        <h2 class="text-lg font-semibold text-surface-950-50">Weekly digest</h2>
+                        <h2 class="text-lg font-semibold text-surface-950-50">
+                          <label id="digest-enabled-label" for="digest-enabled" class="cursor-pointer after:absolute after:inset-0 after:z-10 after:content-['']">Weekly digest</label>
+                        </h2>
                         <span class="badge preset-tonal-surface">{digestEnabled ? "On" : "Off"}</span>
                       </div>
-                      <p class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
+                      <p id="digest-enabled-description" class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
                     </div>
                     <SwitchControl
                       id="digest-enabled"
                       name="enabled"
-                      checked={digestEnabled}
-                      ariaLabel="Enable weekly digest"
-                      onToggle={(next) => (digestEnabledOverride = next)}
+                      ariaLabelledBy="digest-enabled-label"
+                      ariaDescribedBy="digest-enabled-description"
+                      class="z-20"
+                      bind:checked={() => digestEnabled, (next) => (digestEnabledOverride = next)}
                     />
                   </div>
 
-                  <div class="mt-6">
-                    <div class="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
-                      <section class="preset-tonal-surface p-4 sm:p-5">
-                        <div class="mb-4 flex items-center justify-between gap-3">
-                          <div>
+                  <div class="mt-6 min-w-0">
+                    <div class="grid min-w-0 gap-5 lg:grid-cols-[0.95fr_1.05fr]">
+                      <section class="min-w-0 preset-tonal-surface p-4 sm:p-5">
+                        <div class="mb-4 flex min-w-0 flex-wrap items-center justify-between gap-3">
+                          <div class="min-w-0">
                             <h3 class="font-semibold text-surface-950-50">Schedule</h3>
                             <p class="mt-1 text-sm text-surface-700-300">When should Bookward check in?</p>
                           </div>
-                          <span class="badge preset-tonal-secondary">{digestEnabled ? "Automatic" : "Paused"}</span>
+                          <span class="badge shrink-0 preset-tonal-secondary">{digestEnabled ? "Automatic" : "Paused"}</span>
                         </div>
-                        <div class="grid gap-4 sm:grid-cols-2">
-                          <label class="block text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day" value={String(digestDay)} onchange={(event) => (digestDayOverride = Number((event.currentTarget as HTMLSelectElement).value))}>
+                        <div class="grid min-w-0 gap-4 sm:grid-cols-2">
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day" value={String(digestDay)} onchange={(event) => (digestDayOverride = Number((event.currentTarget as HTMLSelectElement).value))}>
                             <option value="1" selected={digestDay === 1}>Monday</option>
                             <option value="2" selected={digestDay === 2}>Tuesday</option>
                             <option value="3" selected={digestDay === 3}>Wednesday</option>
@@ -4388,78 +4983,83 @@
                             <option value="6" selected={digestDay === 6}>Saturday</option>
                             <option value="7" selected={digestDay === 7}>Sunday</option>
                           </select></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestTime} oninput={(event) => (digestTimeOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestTimezone} oninput={(event) => (digestTimezoneOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="America/Phoenix" required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestMinimumScore} oninput={(event) => (digestMinimumScoreOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestMaximumBooks} oninput={(event) => (digestMaximumBooksOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestTime} oninput={(event) => (digestTimeOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestTimezone} oninput={(event) => (digestTimezoneOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="America/Phoenix" required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestMinimumScore} oninput={(event) => (digestMinimumScoreOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestMaximumBooks} oninput={(event) => (digestMaximumBooksOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
                         </div>
-                        <div class="mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
-                          <label for="digest-only-new" class="cursor-pointer">
-                            <span class="block text-surface-950-50">Only send new books</span>
-                            <span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span>
-                          </label>
+                        <div class="relative mt-4 flex min-w-0 items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
+                          <div class="min-w-0 flex-1">
+                            <label id="digest-only-new-label" for="digest-only-new" class="block cursor-pointer text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Only send new books</label>
+                            <p id="digest-only-new-description" class="mt-1 text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</p>
+                          </div>
                           <SwitchControl
                             id="digest-only-new"
                             name="onlyNew"
-                            checked={digestOnlyNew}
-                            ariaLabel="Only send new books"
-                            onToggle={(next) => (digestOnlyNewOverride = next)}
+                            ariaLabelledBy="digest-only-new-label"
+                            ariaDescribedBy="digest-only-new-description"
+                            class="z-20"
+                            bind:checked={() => digestOnlyNew, (next) => (digestOnlyNewOverride = next)}
                           />
                         </div>
                       </section>
 
-                      <section class="preset-tonal-surface p-4 sm:p-5">
-                        <div class="mb-4">
+                      <section class="min-w-0 preset-tonal-surface p-4 sm:p-5">
+                        <div class="mb-4 min-w-0">
                           <h3 class="font-semibold text-surface-950-50">Delivery</h3>
                           <p class="mt-1 text-sm text-surface-700-300">Configure and test one or both channels before turning on the schedule.</p>
                         </div>
-                        <div class="grid gap-3">
-                          <div class="relative border border-surface-300-700/50 p-4">
-                            <div class="flex items-center gap-3">
-                              <label for="digest-discord" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
-                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
-                              </label>
+                        <div class="grid min-w-0 gap-3">
+                          <div class="relative min-w-0 border border-surface-300-700/50 p-4">
+                            <div class="relative flex min-w-0 items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><MessageCircle size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-discord-label" for="digest-discord" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Discord</label>
+                                <p id="digest-discord-description" class="mt-0.5 text-xs text-surface-700-300">Post to a webhook</p>
+                              </div>
                               <SwitchControl
                                 id="digest-discord"
                                 name="channels"
                                 value="discord"
-                                checked={digestDiscord}
-                                ariaLabel="Send digest to Discord"
-                                onToggle={(next) => (digestDiscordOverride = next)}
+                                ariaLabelledBy="digest-discord-label"
+                                ariaDescribedBy="digest-discord-description"
+                                class="z-20"
+                                bind:checked={() => digestDiscord, (next) => (digestDiscordOverride = next)}
                               />
                             </div>
-                            {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
-                              <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" value={digestDiscordWebhook} oninput={(event) => (digestDiscordWebhook = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
+                            {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 min-w-0 space-y-3">
+                              <label class="block min-w-0 text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" value={digestDiscordWebhook} oninput={(event) => (digestDiscordWebhook = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
                               {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" checked={digestClearDiscord} onchange={(event) => (digestClearDiscord = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
-                          <div class="relative border border-surface-300-700/50 p-4">
-                            <div class="flex items-center gap-3">
-                              <label for="digest-email" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
-                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
-                              </label>
+                          <div class="relative min-w-0 border border-surface-300-700/50 p-4">
+                            <div class="relative flex min-w-0 items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary" aria-hidden="true"><Mail size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-email-label" for="digest-email" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Email</label>
+                                <p id="digest-email-description" class="mt-0.5 text-xs text-surface-700-300">Send through your SMTP server</p>
+                              </div>
                               <SwitchControl
                                 id="digest-email"
                                 name="channels"
                                 value="email"
-                                checked={digestEmail}
-                                ariaLabel="Send digest by email"
+                                ariaLabelledBy="digest-email-label"
+                                ariaDescribedBy="digest-email-description"
                                 activeClass="preset-filled-tertiary-500"
-                                onToggle={(next) => (digestEmailOverride = next)}
+                                class="z-20"
+                                bind:checked={() => digestEmail, (next) => (digestEmailOverride = next)}
                               />
                             </div>
-                            {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
-                              <div class="grid gap-4 sm:grid-cols-2">
-                                <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestEmailTo} oninput={(event) => (digestEmailToOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="you@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestEmailFrom} oninput={(event) => (digestEmailFromOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="bookward@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSmtpHost} oninput={(event) => (digestSmtpHostOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="smtp.example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSmtpPort} oninput={(event) => (digestSmtpPortOverride = (event.currentTarget as HTMLInputElement).value)} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity" value={digestSmtpSecurity} onchange={(event) => (digestSmtpSecurityOverride = (event.currentTarget as HTMLSelectElement).value as "none" | "starttls" | "ssl")}><option value="starttls" selected={digestSmtpSecurity === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSmtpSecurity === "ssl"}>SSL / TLS</option><option value="none" selected={digestSmtpSecurity === "none"}>None</option></select></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value={digestSmtpUsername} oninput={(event) => (digestSmtpUsername = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" value={digestSmtpPassword} oninput={(event) => (digestSmtpPassword = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
+                            {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 min-w-0 space-y-4">
+                              <div class="grid min-w-0 gap-4 sm:grid-cols-2">
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestEmailTo} oninput={(event) => (digestEmailToOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="you@example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestEmailFrom} oninput={(event) => (digestEmailFromOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="bookward@example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSmtpHost} oninput={(event) => (digestSmtpHostOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="smtp.example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSmtpPort} oninput={(event) => (digestSmtpPortOverride = (event.currentTarget as HTMLInputElement).value)} /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity" value={digestSmtpSecurity} onchange={(event) => (digestSmtpSecurityOverride = (event.currentTarget as HTMLSelectElement).value as "none" | "starttls" | "ssl")}><option value="starttls" selected={digestSmtpSecurity === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSmtpSecurity === "ssl"}>SSL / TLS</option><option value="none" selected={digestSmtpSecurity === "none"}>None</option></select></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value={digestSmtpUsername} oninput={(event) => (digestSmtpUsername = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" value={digestSmtpPassword} oninput={(event) => (digestSmtpPassword = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
                               {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" checked={digestClearSmtpCredentials} onchange={(event) => (digestClearSmtpCredentials = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved credentials</label>{/if}
                             </div>{:else}<input type="hidden" name="emailTo" value={digestEmailTo} /><input type="hidden" name="emailFrom" value={digestEmailFrom} /><input type="hidden" name="smtpHost" value={digestSmtpHost} /><input type="hidden" name="smtpPort" value={digestSmtpPort} /><input type="hidden" name="smtpSecurity" value={digestSmtpSecurity} />{/if}
@@ -4467,11 +5067,15 @@
                         </div>
                       </section>
                     </div>
-                    <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
+                    <label class="mt-5 block min-w-0 text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
+                  <StatusRegion
+                    message={digestDirty ? "Save digest settings to apply your edits before sending a test or running the digest." : ""}
+                    paused={activeView !== "settings"}
+                  />
                   <div class="mt-6 flex flex-col gap-3 border-t border-surface-300-700/40 pt-5 sm:flex-row sm:items-center sm:justify-between">
                     {#if digestDirty}
-                      <p class="text-sm font-medium text-warning-700-300" role="status">Save digest settings to apply your edits before sending a test or running the digest.</p>
+                      <p class="text-sm font-medium text-warning-700-300">Save digest settings to apply your edits before sending a test or running the digest.</p>
                     {:else if digestEnabled}
                       <p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>
                     {:else}
@@ -4493,9 +5097,16 @@
                     <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
+                <StatusRegion
+                  message={digestSettings.last_delivery
+                    ? `Last ${digestSettings.last_delivery.channel} delivery: ${digestSettings.last_delivery.status}${digestSettings.last_delivery.error ? `. ${digestSettings.last_delivery.error}` : ""}`
+                    : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if digestSettings.last_delivery}
                   {@const delivery = digestSettings.last_delivery}
-                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`} role="status">
+                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`}>
                     {#if delivery.status === "sent"}<Check size={16} class="shrink-0" />{:else if delivery.status === "failed"}<TriangleAlert size={16} class="shrink-0" />{:else}<RefreshCw size={16} class="shrink-0 animate-spin" />{/if}
                     <span class="min-w-0 flex-1">Last {delivery.channel} delivery: <strong>{delivery.status}</strong>{#if delivery.sent_at} · {formatDeliveryDate(delivery.sent_at)}{:else if delivery.updated_at} · {formatDeliveryDate(delivery.updated_at)}{/if}{#if delivery.error}<span class="mt-1 block text-xs">{delivery.error}</span>{/if}</span>
                     {#if delivery.status === "failed"}<form method="POST" action="?/retryDigest" use:enhance={setPending("digest-retry")}>
@@ -4519,17 +5130,17 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
-                    class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
+                {#if recentReads.length}<div
+                    class="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -4545,6 +5156,16 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}
@@ -4567,7 +5188,7 @@
   >
     {#each navItems as item}{@const Icon = item.icon}<button
         type="button"
-        class={`relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
+        class={`relative flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 px-0.5 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
         aria-current={activeView === item.id ? "page" : undefined}
         onclick={() => go(item.id)}
         ><Icon
@@ -4582,38 +5203,25 @@
       >{/each}
   </nav>
   {#if markReadBook}
-    <div
-      in:fade={{ duration: motionDuration(240) }}
-      out:fade={{ duration: motionDuration(180) }}
-      class="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-surface-950/75 p-4 backdrop-blur-md"
-      role="presentation"
-      onclick={(event) => {
-        if (event.target === event.currentTarget) closeMarkRead();
-      }}
+    <ModalDialog
+      open={Boolean(markReadBook)}
+      ariaLabelledby="mark-read-title"
+      ariaDescribedby="mark-read-description"
+      onClose={closeMarkRead}
+      class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
     >
-      <div
-        use:modalFocus
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="mark-read-title"
-        aria-describedby="mark-read-description"
-        tabindex="-1"
-        in:scale={{ duration: motionDuration(260), start: 0.94 }}
-        out:scale={{ duration: motionDuration(170), start: 0.97 }}
-        class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-full max-w-xl overflow-x-hidden overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
-      >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
           <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
         </div>
-        <div class="flex items-start justify-between gap-5 border-b border-surface-200-800/70 p-5 sm:p-7">
-          <div class="flex min-w-0 items-center gap-4">
+        <div class="flex items-start justify-between gap-4 border-b border-surface-200-800/70 p-4 sm:gap-5 sm:p-7">
+          <div class="flex min-w-0 items-center gap-3 sm:gap-4">
             <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
               <BookOpen size={22} />
             </span>
             <div class="min-w-0">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
+              <h2 id="mark-read-title" class="mt-1 break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -4626,7 +5234,7 @@
         </div>
 
         <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
-          <div class="p-5 sm:p-7">
+          <div class="min-w-0 p-4 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
@@ -4675,29 +5283,17 @@
             </button>
           </div>
         </form>
-      </div>
-    </div>
+    </ModalDialog>
   {/if}
   {#if librarrSearchOpen}
-    <div
-      in:fade={{ duration: motionDuration(180) }}
-      out:fade={{ duration: motionDuration(120) }}
-      class="fixed inset-0 z-50 grid place-items-center bg-surface-950/70 p-4 backdrop-blur-sm"
-      role="presentation"
-      onclick={closeLibrarrSearch}
+    <ModalDialog
+      open={librarrSearchOpen}
+      ariaLabelledby="librarr-search-title"
+      onClose={closeLibrarrSearch}
+      class="card max-h-[min(44rem,calc(100dvh-2rem))] w-[min(42rem,calc(100vw-2rem))] preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30 [@media(min-height:28rem)]:flex [@media(min-height:28rem)]:flex-col [@media(min-height:28rem)]:overflow-y-hidden"
     >
-      <dialog
-        use:modalFocus
-        open
-        in:scale={{ duration: motionDuration(220) }}
-        out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 card flex max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
-        aria-labelledby="librarr-search-title"
-        aria-modal="true"
-        onclick={(event) => event.stopPropagation()}
-      >
         <div
-          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
+          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-4 sm:p-6"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium text-primary-600-400">
@@ -4720,7 +5316,7 @@
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
         </div>
-        <div class="max-h-[calc(100dvh-11rem)] min-h-0 flex-1 overflow-y-auto p-5 sm:p-6">
+        <div class="min-w-0 p-4 sm:p-6 [@media(min-height:28rem)]:max-h-[calc(100dvh-11rem)] [@media(min-height:28rem)]:min-h-0 [@media(min-height:28rem)]:flex-1 [@media(min-height:28rem)]:overflow-y-auto">
           <form
             class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
@@ -4758,12 +5354,20 @@
                 />{:else}<Search size={16} />{/if} Search</button
             >
           </form>
+          <StatusRegion
+            message={librarrStatusMessage}
+            immediate={librarrSearchImmediate}
+            announceOnMount
+          />
+          <StatusRegion
+            message={librarrSearchMessage}
+            immediate
+          />
           {#if librarrSearchMessage}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
               class="mt-4 flex items-center gap-2 preset-tonal-success p-3 text-sm"
-              role="status"
             >
-              <Check size={16} />
+              <Check size={16} aria-hidden="true" />
               {librarrSearchMessage}
             </div>{/if}
           {#if librarrSearchError}<div
@@ -4796,8 +5400,6 @@
           {:else if librarrSearchState === "searching"}
             <div
               class="mt-4 flex items-center gap-2 text-sm text-surface-700-300"
-              role="status"
-              aria-live="polite"
             >
               <RefreshCw size={15} class="animate-spin text-primary-500" />
               Searching Librarr… {librarrResults.length} matches so far
@@ -4817,7 +5419,7 @@
           {/if}
           {#if librarrResults.length}
             {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
-            <div class="mt-5 space-y-3" aria-live="polite">
+            <div class="mt-5 space-y-3">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
                 <article
@@ -4826,7 +5428,7 @@
                     duration: motionDuration(220),
                     delay: motionDelay(index, 24),
                   }}
-                  class="flex items-center gap-4 preset-tonal-surface p-3 sm:p-4"
+                  class="flex min-w-0 items-center gap-4 preset-tonal-surface p-3 sm:p-4"
                 >
                   <div
                     class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
@@ -4887,7 +5489,6 @@
             </div>
           {/if}
         </div>
-      </dialog>
-    </div>
+    </ModalDialog>
   {/if}
 </div>

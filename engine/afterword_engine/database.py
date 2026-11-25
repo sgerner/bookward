@@ -1,8 +1,11 @@
+import functools
 import json
 import sqlite3
 import threading
+import time
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from .config import settings
@@ -15,10 +18,23 @@ from .covers import (
 from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path, restore_fence_bypassed
+from .tenancy import (
+    active_restore_epoch_binding,
+    bound_restore_epoch,
+    profile_database_path,
+    restore_epoch_latch_scope,
+    restore_epoch_scope,
+    restore_fence_bypassed,
+)
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
 SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
+RESTORE_EPOCH_KEY = "restore_epoch"
+RESTORE_QUIESCENCE_TIMEOUT_SECONDS = 5.0
+
+
+class RestoreEpochError(RuntimeError):
+    """Raised when a pre-restore task attempts to write after profile recovery."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -1004,6 +1020,212 @@ MIGRATIONS = [
         ALTER TABLE candidate_quality ADD COLUMN metadata_retry_status TEXT NOT NULL DEFAULT '';
         """,
     ),
+    (
+        28,
+        """
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_visible
+            ON recommendation_impressions(candidate_id, visible_at)
+            WHERE visible_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
+            ON recommendation_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_run_evidence_captured_at
+            ON recommendation_run_evidence(captured_at);
+        CREATE INDEX IF NOT EXISTS idx_scoring_batches_captured_at
+            ON scoring_batches(captured_at);
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_candidate_delete
+        AFTER DELETE ON candidates
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='candidate' AND entity_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_read_delete
+        AFTER DELETE ON reads
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='read' AND entity_id=OLD.id;
+        END;
+        """,
+    ),
+    (
+        29,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_sources (
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            source_url TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(candidate_id, source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_sources_source
+            ON candidate_sources(source_id, candidate_id);
+        INSERT OR IGNORE INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        SELECT
+            c.id,
+            c.source_id,
+            c.source_url,
+            COALESCE(c.created_at, CURRENT_TIMESTAMP),
+            COALESCE(c.updated_at, c.created_at, CURRENT_TIMESTAMP)
+        FROM candidates c
+        WHERE c.source_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = c.source_id);
+        INSERT OR IGNORE INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        SELECT
+            ae.candidate_id,
+            s.id,
+            MAX(ae.source_url),
+            COALESCE(MIN(ae.fetched_at), CURRENT_TIMESTAMP),
+            COALESCE(MAX(ae.fetched_at), CURRENT_TIMESTAMP)
+        FROM association_evidence ae
+        JOIN candidates c ON c.id = ae.candidate_id
+        JOIN sources s ON s.url = 'association://' || ae.provider AND s.kind = 'association'
+        GROUP BY ae.candidate_id, s.id;
+        UPDATE candidates
+        SET source_id = resolved.next_source_id
+        FROM (
+            SELECT c.id AS candidate_id, best.source_id AS next_source_id
+            FROM candidates c
+            LEFT JOIN (
+                SELECT candidate_id, source_id
+                FROM (
+                    SELECT
+                        cs.candidate_id,
+                        cs.source_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cs.candidate_id
+                            ORDER BY
+                                s.enabled DESC,
+                                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.weight DESC,
+                                s.id ASC
+                        ) AS rn
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                )
+                WHERE rn = 1
+            ) AS best ON best.candidate_id = c.id
+            WHERE c.source_id IS NOT best.source_id
+        ) AS resolved
+        WHERE candidates.id = resolved.candidate_id;
+        CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_insert
+        AFTER INSERT ON candidates
+        WHEN NEW.source_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
+        BEGIN
+            INSERT INTO candidate_sources(
+                candidate_id, source_id, source_url, first_seen_at, last_seen_at
+            )
+            VALUES (
+                NEW.id,
+                NEW.source_id,
+                NEW.source_url,
+                COALESCE(NEW.created_at, CURRENT_TIMESTAMP),
+                COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+            )
+            ON CONFLICT(candidate_id, source_id) DO NOTHING;
+        END;
+        CREATE TRIGGER IF NOT EXISTS candidate_sources_after_candidate_source_reassign
+        AFTER UPDATE OF source_id ON candidates
+        WHEN NEW.source_id IS NOT OLD.source_id
+        BEGIN
+            DELETE FROM candidate_sources
+            WHERE candidate_id = NEW.id
+              AND (
+                  NEW.source_id IS NULL
+                  OR (
+                      OLD.source_id IS NOT NULL
+                      AND source_id = OLD.source_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidate_sources cs
+                          WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
+                      )
+                  )
+              );
+            INSERT INTO candidate_sources(
+                candidate_id, source_id, source_url, first_seen_at, last_seen_at
+            )
+            SELECT
+                NEW.id,
+                NEW.source_id,
+                NEW.source_url,
+                COALESCE(NEW.created_at, CURRENT_TIMESTAMP),
+                COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+            WHERE NEW.source_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM sources s WHERE s.id = NEW.source_id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM candidate_sources cs
+                  WHERE cs.candidate_id = NEW.id AND cs.source_id = NEW.source_id
+              );
+            UPDATE candidates
+            SET source_id = resolved.next_source_id
+            FROM (
+                SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                FROM candidates c
+                LEFT JOIN (
+                    SELECT candidate_id, source_id
+                    FROM (
+                        SELECT
+                            cs.candidate_id,
+                            cs.source_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY cs.candidate_id
+                                ORDER BY
+                                    s.enabled DESC,
+                                    CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                    s.weight DESC,
+                                    s.id ASC
+                            ) AS rn
+                        FROM candidate_sources cs
+                        JOIN sources s ON s.id = cs.source_id
+                        WHERE cs.candidate_id = NEW.id
+                    )
+                    WHERE rn = 1
+                ) AS best ON best.candidate_id = c.id
+                WHERE c.id = NEW.id
+                  AND c.source_id IS NOT best.source_id
+            ) AS resolved
+            WHERE candidates.id = resolved.candidate_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS candidates_sync_source_after_source_update
+        AFTER UPDATE OF enabled, weight, kind ON sources
+        WHEN OLD.enabled IS NOT NEW.enabled
+          OR OLD.weight IS NOT NEW.weight
+          OR OLD.kind IS NOT NEW.kind
+        BEGIN
+            UPDATE candidates
+            SET source_id = resolved.next_source_id,
+                updated_at = CURRENT_TIMESTAMP
+            FROM (
+                SELECT candidate_id, source_id AS next_source_id
+                FROM (
+                    SELECT
+                        cs.candidate_id,
+                        cs.source_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cs.candidate_id
+                            ORDER BY
+                                s.enabled DESC,
+                                CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+                                s.weight DESC,
+                                s.id ASC
+                        ) AS rn
+                    FROM candidate_sources cs
+                    JOIN sources s ON s.id = cs.source_id
+                    WHERE cs.candidate_id IN (
+                        SELECT candidate_id FROM candidate_sources WHERE source_id = NEW.id
+                    )
+                )
+                WHERE rn = 1
+            ) AS resolved
+            WHERE candidates.id = resolved.candidate_id
+              AND candidates.source_id IS NOT resolved.next_source_id;
+        END;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1054,8 +1276,22 @@ DEFAULT_SOURCES = (
     ("NYT Books overview · API key required", "https://api.nytimes.com/svc/books/v3/lists/overview.json", 0),
 )
 
+@dataclass(eq=False)
+class _ActiveWorkerJob:
+    cancel: object
+    loop_thread_id: int
+    done: threading.Event
+
+
 class _ProfileDatabaseLock:
-    """Allow concurrent connections and let backup/restore take an exclusive lock."""
+    """Coordinate shared readers, exclusive writers, and restore quiescence per profile DB.
+
+    ``shared()``, ``try_shared()``, and ``is_locked()`` allow concurrent readers
+    (including shared online backups) when idle, while refusing new readers both
+    during exclusive writer acquisition and during ``quiesce()``'s drain window
+    (``_restoring_count > 0``). ``acquire(deadline=None)`` blocks without a
+    timeout by default and raises ``BackupError`` when a restore deadline expires.
+    """
 
     def __init__(self):
         self._condition = threading.Condition()
@@ -1064,6 +1300,120 @@ class _ProfileDatabaseLock:
         self._waiting_writers = 0
         self._connections = 0
         self._connections_by_thread: dict[int, int] = {}
+        self._restoring_count = 0
+        self._quiesce_deadlines: dict[int, list[float]] = {}
+        self._active_jobs: set[_ActiveWorkerJob] = set()
+        self._active_schedulers: set[tuple[object, int]] = set()
+
+    def is_restoring(self) -> bool:
+        with self._condition:
+            return self._restoring_count > 0
+
+    def is_locked(self) -> bool:
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            return (
+                (self._restoring_count > 0 and self._writer != owner)
+                or self._writer not in (None, owner)
+                or (
+                    bool(self._waiting_writers)
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            )
+
+    @contextmanager
+    def scheduler_guard(self):
+        owner = threading.get_ident()
+        entry = (object(), owner)
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if (
+                self._restoring_count > 0
+                or self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
+                allowed = False
+            else:
+                allowed = True
+                self._active_schedulers.add(entry)
+        try:
+            yield allowed
+        finally:
+            if allowed:
+                with self._condition:
+                    self._active_schedulers.discard(entry)
+                    self._condition.notify_all()
+
+    @contextmanager
+    def track_worker_job(self, cancel_callback, loop_thread_id: int):
+        done = threading.Event()
+        handle = _ActiveWorkerJob(
+            cancel=cancel_callback,
+            loop_thread_id=loop_thread_id,
+            done=done,
+        )
+        with self._condition:
+            if self._restoring_count > 0:
+                cancel_immediately = True
+            else:
+                cancel_immediately = False
+                self._active_jobs.add(handle)
+        if cancel_immediately:
+            cancel_callback()
+            done.set()
+            yield handle
+            return
+        try:
+            yield handle
+        finally:
+            with self._condition:
+                self._active_jobs.discard(handle)
+                self._condition.notify_all()
+            done.set()
+
+    @contextmanager
+    def quiesce(self, timeout: float | None = None):
+        if timeout is None:
+            timeout = RESTORE_QUIESCENCE_TIMEOUT_SECONDS
+        current_thread = threading.get_ident()
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            self._restoring_count += 1
+            self._quiesce_deadlines.setdefault(current_thread, []).append(deadline)
+            jobs_to_cancel = list(self._active_jobs)
+        try:
+            for job_handle in jobs_to_cancel:
+                job_handle.cancel()
+            for job_handle in jobs_to_cancel:
+                if job_handle.loop_thread_id == current_thread:
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                job_handle.done.wait(timeout=remaining)
+            with self._condition:
+                while any(
+                    thread_id != current_thread
+                    for _, thread_id in self._active_schedulers
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(timeout=remaining)
+            yield deadline
+        finally:
+            with self._condition:
+                stack = self._quiesce_deadlines.get(current_thread)
+                if stack:
+                    stack.pop()
+                    if not stack:
+                        del self._quiesce_deadlines[current_thread]
+                self._restoring_count -= 1
+                self._condition.notify_all()
 
     def acquire_connection(self) -> int:
         owner = threading.get_ident()
@@ -1096,20 +1446,80 @@ class _ProfileDatabaseLock:
                 self._connections_by_thread[owner] = count - 1
             self._condition.notify_all()
 
-    def acquire(self) -> None:
+    @contextmanager
+    def shared(self):
+        owner = self.acquire_connection()
+        try:
+            yield self
+        finally:
+            self.release_connection(owner)
+
+    @contextmanager
+    def try_shared(self):
+        owner = threading.get_ident()
+        with self._condition:
+            owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if (
+                (self._restoring_count > 0 and self._writer != owner)
+                or self._writer not in (None, owner)
+                or (
+                    self._waiting_writers
+                    and self._writer != owner
+                    and not owns_connection
+                )
+            ):
+                acquired = False
+            else:
+                acquired = True
+                self._connections += 1
+                self._connections_by_thread[owner] = (
+                    self._connections_by_thread.get(owner, 0) + 1
+                )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self.release_connection(owner)
+
+    def acquire(self, deadline: float | None = None) -> None:
         owner = threading.get_ident()
         with self._condition:
             if self._writer == owner:
                 self._write_depth += 1
                 return
+            effective_deadline = deadline
+            if effective_deadline is None:
+                stack = self._quiesce_deadlines.get(owner)
+                if stack:
+                    effective_deadline = stack[-1]
             self._waiting_writers += 1
             try:
                 while self._writer is not None or self._connections:
-                    self._condition.wait()
+                    if effective_deadline is not None:
+                        remaining = effective_deadline - time.monotonic()
+                        if remaining <= 0:
+                            from .backups import BackupError
+
+                            raise BackupError(
+                                "The active database could not be safely closed for restore."
+                            )
+                        self._condition.wait(timeout=remaining)
+                    else:
+                        self._condition.wait()
                 self._writer = owner
                 self._write_depth = 1
             finally:
                 self._waiting_writers -= 1
+                if self._writer != owner:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def exclusive(self, deadline: float | None = None):
+        self.acquire(deadline)
+        try:
+            yield self
+        finally:
+            self.release()
 
     def release(self) -> None:
         owner = threading.get_ident()
@@ -1136,6 +1546,8 @@ _DATABASE_LOCKS_GUARD = threading.Lock()
 _DATABASE_SETUP_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
     weakref.WeakValueDictionary()
 )
+_RECORDED_RESTORE_EPOCHS: dict[str, int] = {}
+_RESTORE_GENERATIONS: dict[str, int] = {}
 
 
 def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
@@ -1144,6 +1556,28 @@ def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
     key = str(Path(path) if path is not None else profile_database_path())
     with _DATABASE_LOCKS_GUARD:
         return _DATABASE_LOCKS.setdefault(key, _ProfileDatabaseLock())
+
+
+def recorded_restore_epoch(path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _DATABASE_LOCKS_GUARD:
+        return _RECORDED_RESTORE_EPOCHS.get(key, 0)
+
+
+def record_restore_epoch(epoch: int, path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    normalized = max(0, int(epoch))
+    with _DATABASE_LOCKS_GUARD:
+        updated = max(_RECORDED_RESTORE_EPOCHS.get(key, 0), normalized)
+        _RECORDED_RESTORE_EPOCHS[key] = updated
+        _RESTORE_GENERATIONS[key] = _RESTORE_GENERATIONS.get(key, 0) + 1
+        return updated
+
+
+def profile_restore_generation(path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _DATABASE_LOCKS_GUARD:
+        return _RESTORE_GENERATIONS.get(key, 0)
 
 
 def _database_setup_lock(path: Path) -> threading.RLock:
@@ -1206,12 +1640,25 @@ def connect():
         con.create_function("book_identity", 2, book_identity, deterministic=True)
         con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
         with _database_setup_lock(db_path):
+            page_count = int(con.execute("PRAGMA page_count").fetchone()[0] or 0)
+            if page_count == 0:
+                con.execute("PRAGMA auto_vacuum=INCREMENTAL")
             mode = con.execute("PRAGMA journal_mode").fetchone()[0]
             if str(mode).lower() != "wal":
                 con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("PRAGMA busy_timeout=5000")
             _restrict_database_files()
+        binding = active_restore_epoch_binding(db_path)
+        if (
+            binding is not None
+            and binding.epoch is None
+            and (
+                binding.generation is None
+                or profile_restore_generation(db_path) == binding.generation
+            )
+        ):
+            binding.epoch = read_restore_epoch(con)
         return con
     except Exception:
         con.close()
@@ -1258,11 +1705,99 @@ def _backfill_source_isbns(con):
             (next_isbn13, next_isbn10, candidate["id"]),
         )
 
+def read_restore_epoch(con: sqlite3.Connection) -> int:
+    try:
+        found = con.execute(
+            "SELECT value FROM settings WHERE key=?", (RESTORE_EPOCH_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if not found:
+        return 0
+    try:
+        return max(0, int(found[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def current_restore_epoch() -> int:
+    db_path = profile_database_path()
+    if not db_path.is_file():
+        return recorded_restore_epoch(db_path)
+    with connect() as con:
+        return read_restore_epoch(con)
+
+
+@contextmanager
+def bind_restore_epoch(epoch: int | None = None):
+    target_path = profile_database_path()
+    existing = bound_restore_epoch(target_path)
+    if epoch is None and existing is not None:
+        yield existing
+        return
+    resolved = current_restore_epoch() if epoch is None else max(0, int(epoch))
+    with restore_epoch_scope(resolved, target_path):
+        yield resolved
+
+
+@contextmanager
+def bind_request_restore_epoch(path: str | Path | None = None):
+    target_path = Path(path) if path is not None else profile_database_path()
+    existing = active_restore_epoch_binding(target_path)
+    if existing is not None:
+        yield existing
+        return
+    with restore_epoch_latch_scope(
+        generation=profile_restore_generation(target_path),
+        path=target_path,
+    ) as binding:
+        yield binding
+
+
+def fenced_async(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with bind_request_restore_epoch():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+def scheduler_fenced(*, default=None):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with database_lock().scheduler_guard() as can_schedule:
+                if not can_schedule:
+                    return default() if callable(default) else default
+                with bind_request_restore_epoch():
+                    return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 @contextmanager
 def transaction():
     con = connect()
     try:
         con.execute("BEGIN IMMEDIATE")
+        binding = active_restore_epoch_binding()
+        if binding is not None:
+            actual_epoch = read_restore_epoch(con)
+            if (
+                binding.generation is not None
+                and profile_restore_generation() != binding.generation
+            ):
+                raise RestoreEpochError(
+                    f"Profile restore generation changed during operation (epoch -> {actual_epoch})"
+                )
+            if binding.epoch is not None and actual_epoch != binding.epoch:
+                raise RestoreEpochError(
+                    f"Profile restore epoch changed ({binding.epoch} -> {actual_epoch})"
+                )
+            binding.epoch = actual_epoch
         yield con
         con.commit()
     except Exception:
@@ -1400,6 +1935,10 @@ def initialize(*, seed_demo: bool = True):
                 raise sqlite3.DatabaseError(
                     f"Schema migration {version} failed: {exc}"
                 ) from exc
+        con.execute(
+            "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
+            (RESTORE_EPOCH_KEY, str(recorded_restore_epoch(db_path))),
+        )
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),
@@ -1545,6 +2084,180 @@ def initialize(*, seed_demo: bool = True):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
     _restrict_database_files()
+
+
+_CANDIDATE_SOURCE_PRIORITY_ORDER = """
+    s.enabled DESC,
+    CASE WHEN s.kind != 'association' THEN 1 ELSE 0 END DESC,
+    s.weight DESC,
+    s.id ASC
+"""
+
+
+def recompute_candidate_sources(
+    con: sqlite3.Connection,
+    candidate_ids=None,
+    *,
+    source_id: int | None = None,
+) -> int:
+    """Materialize primary candidates.source_id strictly from candidate_sources."""
+
+    if candidate_ids is not None:
+        ids = sorted({int(cid) for cid in candidate_ids})
+        if not ids:
+            return 0
+        updated = 0
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            marks = ",".join("?" for _ in batch)
+            updated += con.execute(
+                f"""UPDATE candidates
+                SET source_id = resolved.next_source_id,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                    FROM candidates c
+                    LEFT JOIN (
+                        SELECT candidate_id, source_id
+                        FROM (
+                            SELECT
+                                cs.candidate_id,
+                                cs.source_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY cs.candidate_id
+                                    ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
+                                ) AS rn
+                            FROM candidate_sources cs
+                            JOIN sources s ON s.id = cs.source_id
+                            WHERE cs.candidate_id IN ({marks})
+                        )
+                        WHERE rn = 1
+                    ) AS best ON best.candidate_id = c.id
+                    WHERE c.id IN ({marks})
+                      AND c.source_id IS NOT best.source_id
+                ) AS resolved
+                WHERE candidates.id = resolved.candidate_id""",
+                (*batch, *batch),
+            ).rowcount
+        return max(0, updated)
+    if source_id is not None:
+        sid = int(source_id)
+        return max(
+            0,
+            con.execute(
+                f"""WITH affected(candidate_id) AS (
+                    SELECT candidate_id FROM candidate_sources WHERE source_id = ?
+                    UNION
+                    SELECT id FROM candidates WHERE source_id = ?
+                ),
+                best AS (
+                    SELECT candidate_id, source_id
+                    FROM (
+                        SELECT
+                            cs.candidate_id,
+                            cs.source_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY cs.candidate_id
+                                ORDER BY {_CANDIDATE_SOURCE_PRIORITY_ORDER}
+                            ) AS rn
+                        FROM candidate_sources cs
+                        JOIN affected a ON a.candidate_id = cs.candidate_id
+                        JOIN sources s ON s.id = cs.source_id
+                    )
+                    WHERE rn = 1
+                ),
+                resolved AS (
+                    SELECT c.id AS candidate_id, best.source_id AS next_source_id
+                    FROM candidates c
+                    JOIN affected a ON a.candidate_id = c.id
+                    LEFT JOIN best ON best.candidate_id = c.id
+                    WHERE c.source_id IS NOT best.source_id
+                )
+                UPDATE candidates
+                SET source_id = resolved.next_source_id,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM resolved
+                WHERE candidates.id = resolved.candidate_id""",
+                (sid, sid),
+            ).rowcount,
+        )
+    raise ValueError("Specify candidate_ids or source_id")
+
+
+def upsert_candidate_source(
+    con: sqlite3.Connection,
+    candidate_id: int,
+    source_id: int,
+    source_url: str = "",
+) -> int | None:
+    """Record or refresh discovery membership and materialize primary attribution."""
+
+    cid = int(candidate_id)
+    sid = int(source_id)
+    url = str(source_url or "")[:1000]
+    con.execute(
+        """INSERT INTO candidate_sources(
+            candidate_id, source_id, source_url, first_seen_at, last_seen_at
+        )
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(candidate_id, source_id) DO UPDATE SET
+            source_url = CASE
+                WHEN length(excluded.source_url) > 0 THEN excluded.source_url
+                ELSE candidate_sources.source_url
+            END,
+            last_seen_at = CURRENT_TIMESTAMP""",
+        (cid, sid, url),
+    )
+    recompute_candidate_sources(con, (cid,))
+    found = con.execute(
+        "SELECT source_id FROM candidates WHERE id=?", (cid,)
+    ).fetchone()
+    return int(found["source_id"]) if found and found["source_id"] is not None else None
+
+
+def demote_orphaned_recommended_candidates(
+    con: sqlite3.Connection,
+    candidate_ids=None,
+    *,
+    source_id: int | None = None,
+) -> int:
+    """Reset recommended rows that lack any remaining enabled owner."""
+
+    no_enabled_owner = (
+        "NOT EXISTS ("
+        "SELECT 1 FROM sources s "
+        "WHERE s.id = candidates.source_id AND s.enabled = 1"
+        ")"
+    )
+    if candidate_ids is not None:
+        ids = sorted({int(cid) for cid in candidate_ids})
+        if not ids:
+            return 0
+        demoted = 0
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            marks = ",".join("?" for _ in batch)
+            demoted += con.execute(
+                "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+                f"WHERE id IN ({marks}) AND status='recommended' AND {no_enabled_owner}",
+                batch,
+            ).rowcount
+        return max(0, demoted)
+    if source_id is not None:
+        return max(
+            0,
+            con.execute(
+                "UPDATE candidates SET status='new', score=0, explanation='[]', "
+                "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='recommended' "
+                "AND (id IN (SELECT candidate_id FROM candidate_sources WHERE source_id=?) OR source_id=?) "
+                f"AND {no_enabled_owner}",
+                (int(source_id), int(source_id)),
+            ).rowcount,
+        )
+    raise ValueError("Specify candidate_ids or source_id")
+
 
 def rows(query: str, params=()):
     with connect() as con:
