@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -72,7 +73,7 @@ from .security import safe_error_message, validate_public_url, validate_service_
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
 from .ranking import rank_candidates
-from .secrets import seal, unseal
+from .secrets import auth_registry_key, installation_key_path, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
     download as librarr_download,
@@ -695,6 +696,8 @@ async def lifespan(app):
         ready_profiles.add("legacy")
     except Exception:
         LOGGER.exception("Could not initialize profile legacy during startup")
+    if not has_restore_journal("legacy") or installation_key_path().is_file():
+        auth_registry_key()
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -762,6 +765,34 @@ app.add_middleware(
 )
 
 
+_API_TOKEN_DERIVATION_LIMITERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _api_token_derivation_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    limiter = _API_TOKEN_DERIVATION_LIMITERS.get(loop)
+    if limiter is None:
+        limiter = asyncio.Semaphore(identity_store.TOKEN_DERIVATION_CONCURRENCY)
+        _API_TOKEN_DERIVATION_LIMITERS[loop] = limiter
+    return limiter
+
+
+@asynccontextmanager
+async def _acquire_api_token_derivation_slot():
+    limiter = _api_token_derivation_limiter()
+    acquired = False
+    try:
+        async with asyncio.timeout(identity_store.TOKEN_DERIVATION_WAIT_SECONDS):
+            await limiter.acquire()
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            limiter.release()
+
+
 _RESTORE_ROUTE_RE = re.compile(r"^/api/backups/[^/]+/restore$")
 
 
@@ -814,7 +845,23 @@ async def authenticate_engine_request(request: Request, call_next):
                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
             )
         candidate = bearer or api_key
-        token = identity_store.authenticate_api_token(candidate)
+        if (
+            identity_store.is_valid_api_token_format(candidate)
+            and not await asyncio.to_thread(identity_store.has_cached_api_token, candidate)
+        ):
+            try:
+                async with _acquire_api_token_derivation_slot():
+                    token = await asyncio.to_thread(
+                        identity_store.authenticate_api_token, candidate
+                    )
+            except TimeoutError:
+                return JSONResponse(
+                    {"detail": "API token verification is busy. Try again shortly."},
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
+                )
+        else:
+            token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
         if not token:
             return JSONResponse(
                 {"detail": "A valid API token is required"},
@@ -851,13 +898,17 @@ async def authenticate_engine_request(request: Request, call_next):
     oidc_login_start = path == "/auth/oidc/start" and request.query_params.get("intent", "login") == "login"
     oidc_callback = path == "/auth/oidc/callback"
     if oidc_callback and request.headers.get("x-bookward-session"):
-        request.state.account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+        request.state.account = await asyncio.to_thread(
+            identity_store.resolve_session, request.headers.get("x-bookward-session")
+        )
     if public_auth or oidc_login_start or oidc_callback:
         response = await call_next(request)
         response.headers["cache-control"] = "no-store"
         return response
 
-    account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+    account = await asyncio.to_thread(
+        identity_store.resolve_session, request.headers.get("x-bookward-session")
+    )
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
