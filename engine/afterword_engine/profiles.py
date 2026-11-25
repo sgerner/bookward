@@ -4,11 +4,13 @@ Recommendation data lives in a separate SQLite file per profile. This module
 stores only login identity and the opaque mapping that selects that file.
 """
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import hashlib
 import hmac
+import ipaddress
 import logging
+import math
 import os
 import secrets
 import sqlite3
@@ -16,6 +18,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
@@ -36,12 +39,36 @@ from .secrets import auth_registry_key
 LOGGER = logging.getLogger(__name__)
 SESSION_IDLE_HOURS = 24
 SESSION_ABSOLUTE_DAYS = 7
+LOGIN_FAILURE_LIMIT = 10
+LOGIN_LOCKOUT_WINDOW = timedelta(minutes=15)
+LOGIN_ATTEMPT_RETENTION = timedelta(days=1)
+LOCKOUT_NOTICE_PREFIX = "lockout_notice:"
 AUTH_BUSY_TIMEOUT_MS = 5000
 TOKEN_CACHE_MAX_ENTRIES = 1024
 TOKEN_DERIVATION_CONCURRENCY = max(1, min(2, (os.cpu_count() or 2) // 2))
 TOKEN_DERIVATION_WAIT_SECONDS = 5.0
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
+
+
+def format_lockout_message(retry_after_seconds: int) -> str:
+    seconds = max(1, int(retry_after_seconds))
+    if seconds >= 60:
+        minutes = (seconds + 59) // 60
+        unit = "minute" if minutes == 1 else "minutes"
+        wait = f"{minutes} {unit}"
+    else:
+        unit = "second" if seconds == 1 else "seconds"
+        wait = f"{seconds} {unit}"
+    return f"Too many failed password attempts. Wait {wait} before trying again."
+
+
+class LoginRateLimitError(PermissionError):
+    """Raised when a username and client/session bucket has reached the failure limit."""
+
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        super().__init__(format_lockout_message(self.retry_after_seconds))
 
 AUTH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS auth_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -409,18 +436,30 @@ def update_password(account_id: str, password: str) -> None:
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        updated = con.execute(
+        target = con.execute(
+            "SELECT normalized_username FROM accounts WHERE id=? AND status='active'",
+            (account_id,),
+        ).fetchone()
+        if not target:
+            con.rollback()
+            raise LookupError("Account not found.")
+        con.execute(
             "UPDATE accounts SET password_hash=?,must_change_password=0,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND status='active'",
             (password_hash, account_id),
-        ).rowcount
-        if not updated:
-            con.rollback()
-            raise LookupError("Account not found.")
+        )
         con.execute(
             "UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL",
             (account_id,),
         )
+        con.execute(
+            "DELETE FROM login_attempts WHERE normalized_username=? AND ("
+            "(remote_address>='session:' AND remote_address<'session;') OR "
+            "(remote_address>='pwchange:' AND remote_address<'pwchange;')"
+            ") AND succeeded=0",
+            (target["normalized_username"],),
+        )
+        _clear_account_lockout_notices(con, target["normalized_username"], password_change_only=True)
     invalidate_auth_caches(account_id=account_id)
 
 
@@ -430,14 +469,23 @@ def reset_password(account_id: str, password: str) -> None:
     password_hash = PASSWORD_HASHER.hash(password)
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        updated = con.execute(
-            "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND status='active'", (password_hash, account_id)
-        ).rowcount
-        if not updated:
+        target = con.execute(
+            "SELECT normalized_username FROM accounts WHERE id=? AND status='active'",
+            (account_id,),
+        ).fetchone()
+        if not target:
             con.rollback()
             raise LookupError("Account not found.")
+        con.execute(
+            "UPDATE accounts SET password_hash=?,must_change_password=1,auth_version=auth_version+1,updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='active'", (password_hash, account_id)
+        )
         con.execute("UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE account_id=? AND revoked_at IS NULL", (account_id,))
+        con.execute(
+            "DELETE FROM login_attempts WHERE normalized_username=? AND succeeded=0",
+            (target["normalized_username"],),
+        )
+        _clear_account_lockout_notices(con, target["normalized_username"])
     invalidate_auth_caches(account_id=account_id)
 
 
@@ -460,59 +508,433 @@ def account_by_id(account_id: str):
         return _account(found) if found else None
 
 
+def _sanitize_log_field(value: object) -> str:
+    return str(value).replace("\r", "").replace("\n", "")
+
+
+def _login_bucket(remote_address: str, scope: Literal["login", "session"] = "login") -> str:
+    if scope == "session":
+        session_digest = (remote_address or "").removeprefix("session:").strip()[:64] or "unknown"
+        return f"session:{session_digest}"
+    cleaned = (remote_address or "").strip()
+    while cleaned.lower().startswith(("session:", "pwchange:")):
+        prefix_len = 8 if cleaned.lower().startswith("session:") else 9
+        cleaned = cleaned[prefix_len:].strip()
+    return cleaned[:80] or "unknown"
+
+
+def _password_change_ip_bucket(client_address: str) -> str | None:
+    if not (client_address or "").strip():
+        return None
+    return f"pwchange:{_login_bucket(client_address, 'login')}"
+
+
+def _log_rate_limited_verification(
+    scope: Literal["login", "session"],
+    normalized_username: str,
+    bucket_label: str,
+    retry_after: int,
+) -> None:
+    safe_username = _sanitize_log_field(normalized_username)
+    safe_bucket = _sanitize_log_field(bucket_label)
+    LOGGER.warning(
+        "Rate-limited %s password verification for username=%r bucket=%r after %d failed attempts (retry_after=%ds)",
+        scope,
+        safe_username,
+        safe_bucket,
+        LOGIN_FAILURE_LIMIT,
+        retry_after,
+    )
+
+
+def _redact_ip_for_log(raw_address: str) -> str:
+    candidate = _login_bucket(raw_address, "login")
+    if candidate == "unknown":
+        return "unknown"
+    host = candidate
+    if host.startswith("[") and "]" in host:
+        host_part, _, remainder = host[1:].partition("]")
+        if not remainder or (remainder.startswith(":") and remainder[1:].isdigit()):
+            host = host_part
+    elif host.count(":") == 1:
+        host_part, port_part = host.split(":", 1)
+        if port_part.isdigit():
+            host = host_part
+    try:
+        parsed = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return "non-ip-peer"
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    if isinstance(parsed, ipaddress.IPv4Address):
+        return str(ipaddress.ip_network(f"{parsed}/24", strict=False))
+    return str(ipaddress.ip_network(f"{parsed}/48", strict=False))
+
+
+def _emit_rate_limit_warning(
+    scope: Literal["login", "session"],
+    normalized_username: str,
+    log_bucket_index: int,
+    remote_address: str,
+    client_address: str,
+    retry_after: int,
+) -> None:
+    if scope == "session":
+        bucket_label = (
+            "authenticated-session"
+            if log_bucket_index == 0
+            else f"pwchange:{_redact_ip_for_log(client_address)}"
+        )
+    else:
+        bucket_label = _redact_ip_for_log(remote_address)
+    _log_rate_limited_verification(scope, normalized_username, bucket_label, retry_after)
+
+
+def _log_account_unlock(admin_id: str, target_account_id: str, cleared_attempts: int) -> None:
+    LOGGER.warning(
+        "Account unlock completed: admin_id=%s target_account_id=%s cleared_attempts=%d",
+        _sanitize_log_field(admin_id),
+        _sanitize_log_field(target_account_id),
+        int(cleared_attempts),
+    )
+
+
+def _lockout_notice_key(normalized_username: str, bucket: str) -> str:
+    return f"{LOCKOUT_NOTICE_PREFIX}{len(normalized_username)}:{normalized_username}:{bucket}"
+
+
+def _clear_account_lockout_notices(
+    con, normalized_username: str, *, password_change_only: bool = False
+) -> None:
+    prefix = f"{LOCKOUT_NOTICE_PREFIX}{len(normalized_username)}:{normalized_username}:"
+    if password_change_only:
+        con.execute(
+            "DELETE FROM auth_meta WHERE (key>=? AND key<?) OR (key>=? AND key<?)",
+            (f"{prefix}session:", f"{prefix}session;", f"{prefix}pwchange:", f"{prefix}pwchange;"),
+        )
+    else:
+        end = f"{LOCKOUT_NOTICE_PREFIX}{len(normalized_username)}:{normalized_username};"
+        con.execute("DELETE FROM auth_meta WHERE key>=? AND key<?", (prefix, end))
+
+
+def _clear_all_lockout_notices(con) -> None:
+    con.execute("DELETE FROM auth_meta WHERE key>='lockout_notice:' AND key<'lockout_notice;'")
+
+
+def _parse_attempt_time(raw: str, fallback: datetime) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace(" ", "T").replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _retry_after_from_attempt(tenth_attempt_raw: str, now_dt: datetime) -> tuple[int, str]:
+    tenth_dt = _parse_attempt_time(tenth_attempt_raw, now_dt)
+    unlock_at = tenth_dt + LOGIN_LOCKOUT_WINDOW
+    remaining = math.ceil((unlock_at - now_dt).total_seconds())
+    retry_after = max(1, min(int(LOGIN_LOCKOUT_WINDOW.total_seconds()), remaining))
+    return retry_after, iso(unlock_at)
+
+
 def accounts_list():
+    now_dt = utc_now()
+    cutoff = iso(now_dt - LOGIN_LOCKOUT_WINDOW)
     with auth_connect() as con:
-        return [
-            {key: value for key, value in _account(row).items() if key != "auth_version"}
-            for row in con.execute("SELECT * FROM accounts ORDER BY created_at,username")
-        ]
+        account_rows = con.execute("SELECT * FROM accounts ORDER BY created_at,username").fetchall()
+        attempt_rows = con.execute(
+            "SELECT normalized_username,remote_address,attempted_at FROM login_attempts "
+            "WHERE succeeded=0 AND attempted_at>? ORDER BY attempted_at DESC,id DESC",
+            (cutoff,),
+        ).fetchall()
+    buckets_by_user: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for attempt in attempt_rows:
+        buckets_by_user[attempt["normalized_username"]][attempt["remote_address"]].append(
+            attempt["attempted_at"]
+        )
+    result = []
+    for row in account_rows:
+        item = {key: value for key, value in _account(row).items() if key != "auth_version"}
+        user_buckets = buckets_by_user.get(row["normalized_username"], {})
+        locked_count = 0
+        max_retry_after = 0
+        total_recent = 0
+        for attempts in user_buckets.values():
+            total_recent += len(attempts)
+            if len(attempts) >= LOGIN_FAILURE_LIMIT:
+                locked_count += 1
+                retry_after, _ = _retry_after_from_attempt(
+                    attempts[LOGIN_FAILURE_LIMIT - 1], now_dt
+                )
+                max_retry_after = max(max_retry_after, retry_after)
+        item["recent_failed_attempts"] = total_recent
+        item["locked_bucket_count"] = locked_count
+        item["lockout_retry_after_seconds"] = max_retry_after
+        result.append(item)
+    return result
 
 
-def authenticate_local(username: str, password: str, remote_address: str = ""):
-    normalized = normalize_username(username)
-    now = iso(utc_now())
+def unlock_account(account_id: str, *, admin_id: str = "cli") -> dict:
     with auth_connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        recent = con.execute(
-            "SELECT COUNT(*) FROM login_attempts WHERE normalized_username=? AND remote_address=? "
-            "AND succeeded=0 AND attempted_at>=?",
-            (normalized, remote_address[:80], iso(utc_now() - timedelta(minutes=15))),
-        ).fetchone()[0]
-        if recent >= 10:
+        target = con.execute(
+            "SELECT id,username,normalized_username FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        if not target:
             con.rollback()
-            return None
+            raise LookupError("Account not found.")
+        cleared = con.execute(
+            "DELETE FROM login_attempts WHERE normalized_username=? AND succeeded=0",
+            (target["normalized_username"],),
+        ).rowcount
+        _clear_account_lockout_notices(con, target["normalized_username"])
+        con.commit()
+    _log_account_unlock(admin_id, target["id"], int(cleared))
+    return {
+        "unlocked": True,
+        "account_id": target["id"],
+        "username": target["username"],
+        "cleared_attempts": int(cleared),
+    }
+
+
+def unlock_username(
+    username: str, remote_address: str | None = None, *, admin_id: str = "cli"
+) -> dict:
+    clean = username.strip()
+    if not clean:
+        raise ValueError("Enter a valid username.")
+    normalized = normalize_username(clean)
+    with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        target = con.execute(
+            "SELECT id,username,normalized_username FROM accounts WHERE normalized_username=? OR id=?",
+            (normalized, clean),
+        ).fetchone()
+        if not target:
+            con.rollback()
+            raise LookupError(f"Account not found: {clean}")
+        account_norm = target["normalized_username"]
+        if remote_address is not None and remote_address.strip():
+            bucket = _login_bucket(remote_address, "login")
+            pwchange_bucket = f"pwchange:{bucket}"
+            cleared = con.execute(
+                "DELETE FROM login_attempts WHERE normalized_username=? AND remote_address IN (?,?) AND succeeded=0",
+                (account_norm, bucket, pwchange_bucket),
+            ).rowcount
+            con.execute(
+                "DELETE FROM auth_meta WHERE key IN (?,?)",
+                (
+                    _lockout_notice_key(account_norm, bucket),
+                    _lockout_notice_key(account_norm, pwchange_bucket),
+                ),
+            )
+        else:
+            cleared = con.execute(
+                "DELETE FROM login_attempts WHERE normalized_username=? AND succeeded=0",
+                (account_norm,),
+            ).rowcount
+            _clear_account_lockout_notices(con, account_norm)
+        con.commit()
+    _log_account_unlock(admin_id, target["id"], int(cleared))
+    return {
+        "unlocked": True,
+        "account_id": target["id"],
+        "username": target["username"],
+        "cleared_attempts": int(cleared),
+    }
+
+
+def unlock_all_accounts(*, admin_id: str = "cli") -> dict:
+    with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cleared = con.execute("DELETE FROM login_attempts WHERE succeeded=0").rowcount
+        _clear_all_lockout_notices(con)
+        con.commit()
+    _log_account_unlock(admin_id, "all", int(cleared))
+    return {"unlocked": True, "cleared_attempts": int(cleared)}
+
+
+def _inspect_rate_limit_buckets(
+    con,
+    normalized: str,
+    buckets: list[str],
+    cutoff: str,
+    now_dt: datetime,
+    now: str,
+) -> tuple[dict[str, list], tuple[int, int | None] | None]:
+    rows_by_bucket: dict[str, list] = {}
+    locked_retry_after = 0
+    first_unlogged_index: int | None = None
+    is_locked = False
+    for idx, bucket_key in enumerate(buckets):
+        recent_rows = con.execute(
+            "SELECT attempted_at FROM login_attempts WHERE normalized_username=? AND remote_address=? "
+            "AND succeeded=0 AND attempted_at>? ORDER BY attempted_at DESC,id DESC LIMIT ?",
+            (normalized, bucket_key, cutoff, LOGIN_FAILURE_LIMIT),
+        ).fetchall()
+        rows_by_bucket[bucket_key] = recent_rows
+        if len(recent_rows) >= LOGIN_FAILURE_LIMIT:
+            is_locked = True
+            retry_after, unlock_iso = _retry_after_from_attempt(
+                recent_rows[LOGIN_FAILURE_LIMIT - 1]["attempted_at"], now_dt
+            )
+            locked_retry_after = max(locked_retry_after, retry_after)
+            notice_key = _lockout_notice_key(normalized, bucket_key)
+            existing_notice = con.execute(
+                "SELECT value FROM auth_meta WHERE key=?", (notice_key,)
+            ).fetchone()
+            if existing_notice is None or existing_notice["value"] <= now:
+                con.execute(
+                    "INSERT INTO auth_meta(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (notice_key, unlock_iso),
+                )
+                if first_unlogged_index is None:
+                    first_unlogged_index = idx
+    if is_locked:
+        return rows_by_bucket, (locked_retry_after, first_unlogged_index)
+    return rows_by_bucket, None
+
+
+def authenticate_local(
+    username: str,
+    password: str,
+    remote_address: str = "",
+    *,
+    scope: Literal["login", "session"] = "login",
+    client_address: str = "",
+):
+    normalized = normalize_username(username)
+    primary_bucket = _login_bucket(remote_address, scope)
+    buckets = [primary_bucket]
+    if scope == "session":
+        pwchange_bucket = _password_change_ip_bucket(client_address)
+        if pwchange_bucket:
+            buckets.append(pwchange_bucket)
+
+    now_dt = utc_now()
+    now = iso(now_dt)
+    cutoff = iso(now_dt - LOGIN_LOCKOUT_WINDOW)
+    with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "DELETE FROM login_attempts WHERE attempted_at<?",
+            (iso(now_dt - LOGIN_ATTEMPT_RETENTION),),
+        )
+        con.execute(
+            "DELETE FROM auth_meta WHERE key>='lockout_notice:' AND key<'lockout_notice;' AND value<=?",
+            (now,),
+        )
+        _, locked_info = _inspect_rate_limit_buckets(
+            con, normalized, buckets, cutoff, now_dt, now
+        )
+        if locked_info is not None:
+            retry_after, log_bucket_index = locked_info
+            con.commit()
+            if log_bucket_index is not None:
+                _emit_rate_limit_warning(
+                    scope, normalized, log_bucket_index, remote_address, client_address, retry_after
+                )
+            raise LoginRateLimitError(retry_after)
         found = con.execute(
             "SELECT * FROM accounts WHERE normalized_username=? AND status='active'",
             (normalized,),
         ).fetchone()
-        valid = False
-        con.execute("DELETE FROM login_attempts WHERE attempted_at<?", (iso(utc_now() - timedelta(days=1)),))
-        if found and found["password_hash"]:
-            try:
-                valid = PASSWORD_HASHER.verify(found["password_hash"], password)
-            except (VerifyMismatchError, VerificationError, InvalidHashError):
+        con.commit()
+
+    valid = False
+    rehashed: str | None = None
+    if found and found["password_hash"]:
+        try:
+            valid = PASSWORD_HASHER.verify(found["password_hash"], password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            valid = False
+        if valid and PASSWORD_HASHER.check_needs_rehash(found["password_hash"]):
+            rehashed = PASSWORD_HASHER.hash(password)
+    else:
+        try:
+            PASSWORD_HASHER.verify(DUMMY_PASSWORD_HASH, password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            pass
+
+    now_dt = utc_now()
+    now = iso(now_dt)
+    cutoff = iso(now_dt - LOGIN_LOCKOUT_WINDOW)
+    log_bucket_index: int | None = None
+    retry_after = 0
+    with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        rows_by_bucket, locked_info = _inspect_rate_limit_buckets(
+            con, normalized, buckets, cutoff, now_dt, now
+        )
+        if locked_info is not None:
+            retry_after, log_bucket_index = locked_info
+            con.commit()
+            if log_bucket_index is not None:
+                _emit_rate_limit_warning(
+                    scope, normalized, log_bucket_index, remote_address, client_address, retry_after
+                )
+            raise LoginRateLimitError(retry_after)
+
+        current_found = None
+        if valid and found is not None:
+            current_found = con.execute(
+                "SELECT * FROM accounts WHERE id=? AND status='active'",
+                (found["id"],),
+            ).fetchone()
+            if not current_found or current_found["auth_version"] != found["auth_version"]:
                 valid = False
-            if valid and PASSWORD_HASHER.check_needs_rehash(found["password_hash"]):
+
+        if valid and current_found is not None:
+            if rehashed is not None:
                 con.execute(
                     "UPDATE accounts SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (PASSWORD_HASHER.hash(password), found["id"]),
+                    (rehashed, current_found["id"]),
                 )
-        else:
-            try:
-                PASSWORD_HASHER.verify(DUMMY_PASSWORD_HASH, password)
-            except (VerifyMismatchError, VerificationError, InvalidHashError):
-                pass
-        con.execute(
-            "INSERT INTO login_attempts(normalized_username,remote_address,succeeded,attempted_at) VALUES(?,?,?,?)",
-            (normalized, remote_address[:80], 1 if valid else 0, now),
-        )
-        if valid:
-            con.execute(
-                "DELETE FROM login_attempts WHERE normalized_username=? AND remote_address=? AND succeeded=0",
-                (normalized, remote_address[:80]),
-            )
+            for bucket_key in buckets:
+                con.execute(
+                    "INSERT INTO login_attempts(normalized_username,remote_address,succeeded,attempted_at) VALUES(?,?,1,?)",
+                    (normalized, bucket_key, now),
+                )
+                con.execute(
+                    "DELETE FROM login_attempts WHERE normalized_username=? AND remote_address=? AND succeeded=0",
+                    (normalized, bucket_key),
+                )
+                con.execute(
+                    "DELETE FROM auth_meta WHERE key=?",
+                    (_lockout_notice_key(normalized, bucket_key),),
+                )
             con.commit()
-            return _account(found)
+            return _account(current_found)
+
+        for idx, bucket_key in enumerate(buckets):
+            con.execute(
+                "INSERT INTO login_attempts(normalized_username,remote_address,succeeded,attempted_at) VALUES(?,?,0,?)",
+                (normalized, bucket_key, now),
+            )
+            recent_rows = rows_by_bucket[bucket_key]
+            if len(recent_rows) + 1 >= LOGIN_FAILURE_LIMIT:
+                tenth_raw = (
+                    recent_rows[LOGIN_FAILURE_LIMIT - 2]["attempted_at"]
+                    if LOGIN_FAILURE_LIMIT >= 2 and len(recent_rows) >= LOGIN_FAILURE_LIMIT - 1
+                    else now
+                )
+                bucket_retry_after, unlock_iso = _retry_after_from_attempt(tenth_raw, now_dt)
+                retry_after = max(retry_after, bucket_retry_after)
+                con.execute(
+                    "INSERT INTO auth_meta(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (_lockout_notice_key(normalized, bucket_key), unlock_iso),
+                )
+                if log_bucket_index is None:
+                    log_bucket_index = idx
+        con.commit()
+    if log_bucket_index is not None:
+        _emit_rate_limit_warning(
+            scope, normalized, log_bucket_index, remote_address, client_address, retry_after
+        )
     return None
 
 
@@ -567,6 +989,7 @@ def resolve_session(raw: str | None):
         con.commit()
         account = _account(found)
         account["session_created_at"] = found["session_created_at"]
+        account["session_token_hash"] = found["token_hash"]
         return account
 
 

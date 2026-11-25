@@ -871,7 +871,7 @@ def restore_auth_backup(backup_id: str) -> dict:
             con.execute("DELETE FROM auth_transactions")
             con.execute("DELETE FROM login_attempts")
             con.execute(
-                "DELETE FROM auth_meta WHERE key IN ('setup_token_hash', ?)",
+                "DELETE FROM auth_meta WHERE key IN ('setup_token_hash', ?) OR (key>='lockout_notice:' AND key<'lockout_notice;')",
                 (AUTH_BACKUP_HOLD_KEY,),
             )
             con.commit()

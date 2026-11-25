@@ -3,6 +3,7 @@
 	import { tick } from 'svelte';
 	import FormField from '#lib/components/FormField.svelte';
 	import ProfileField from '#lib/components/ProfileField.svelte';
+	import { formatWaitDuration } from '#lib/lockout-ui.js';
 	import {
 		fieldError,
 		focusFirstInvalidControl,
@@ -40,6 +41,7 @@
 		const renderedInRow = data.accounts.some(
 			(account) =>
 				form.formId === `setStatus-${account.id}` ||
+				form.formId === `unlock-${account.id}` ||
 				(account.id !== data.current_user_id && form.formId === `resetPassword-${account.id}`)
 		);
 		if (renderedInRow) return undefined;
@@ -146,14 +148,48 @@
 			<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">{accountsSectionError}</p>
 		{/if}
 		{#each data.accounts as account}
+			{@const lockedCount = account.locked_bucket_count ?? 0}
+			{@const failedCount = account.recent_failed_attempts ?? 0}
 			{@const statusFormId = `setStatus-${account.id}`}
+			{@const unlockFormId = `unlock-${account.id}`}
 			{@const resetFormId = `resetPassword-${account.id}`}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
-					<div><h3 class="font-semibold">{account.display_name || account.username}</h3><p class="text-sm text-surface-700-300">{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}</p></div>
-					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
-						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+					<div>
+						<div class="flex flex-wrap items-center gap-2">
+							<h3 class="font-semibold">{account.display_name || account.username}</h3>
+							{#if lockedCount > 0}
+								<span class="badge preset-tonal-warning">
+									Rate-limited ({lockedCount} {lockedCount === 1 ? 'source' : 'sources'} <span aria-hidden="true">·</span> {formatWaitDuration(account.lockout_retry_after_seconds)} left)
+								</span>
+							{/if}
+						</div>
+						<p class="text-sm text-surface-700-300">
+							{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}{#if failedCount > 0} <span aria-hidden="true">·</span> {failedCount} recent failed sign-in attempt{failedCount === 1 ? '' : 's'}{/if}
+						</p>
+					</div>
+					<div class="flex flex-wrap items-center gap-2">
+						<form method="POST" action="?/unlock" use:enhance={enhanceForm}>
+							<ProfileField profileId={data.user?.profile_id} />
+							<input type="hidden" name="account_id" value={account.id} />
+							<button
+								class="btn btn-sm {lockedCount > 0 ? 'preset-tonal-warning' : 'preset-tonal-surface'}"
+								type="submit"
+								aria-label={`Unlock account ${account.display_name || account.username}`}
+							>
+								Unlock
+							</button>
+						</form>
+						{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
+							<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+					</div>
 				</div>
+				{#if formSuccessBanner(form, unlockFormId)}
+					<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, unlockFormId)}</p>
+				{/if}
+				{#if formErrorBanner(form, unlockFormId)}
+					<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, unlockFormId)}</p>
+				{/if}
 				{#if formSuccessBanner(form, statusFormId)}
 					<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, statusFormId)}</p>
 				{/if}

@@ -30,10 +30,11 @@ from .decision_evidence import (
     purge_recommendation_evidence,
     build_decision_evidence,
 )
-from .identity import _isbn_match_keys, book_identity, book_row_identity_match_keys
+from .identity import _isbn_match_keys, book_identity, book_row_exact_and_prefix_match_keys
 
 
 LOGGER = logging.getLogger(__name__)
+IMPRESSION_QUERY_CHUNK_SIZE = 500
 EVENT_TYPES = {
     "visible",
     "detail_open",
@@ -590,24 +591,12 @@ def _read_label(read: dict[str, Any]):
     return 0.5, "rating_neutral", 0.25
 
 
-def _latest_preceding_impression(
-    con,
-    candidate_id: int,
-    read_time: datetime | None,
-    day_precision: bool,
-):
-    if read_time is None:
-        return None
-    impression_rows = con.execute(
-        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-        "FROM recommendation_impressions WHERE candidate_id=? "
-        "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-        (candidate_id,),
-    ).fetchall()
-    return next(
-        (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
-        None,
-    )
+def _impression_sort_key(impression) -> tuple[datetime, int]:
+    raw_time = impression["visible_at"] or impression["presented_at"]
+    parsed, _ = _read_time(raw_time)
+    if parsed is None:
+        parsed = datetime.min.replace(tzinfo=timezone.utc)
+    return (parsed, int(impression["id"]))
 
 
 def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
@@ -633,15 +622,25 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         dict(item)
         for item in con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,c.status,c.score,c.isbn13,c.isbn10,"
-            "q.work_id quality_work_id,q.provider quality_provider,"
-            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
+            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
+            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
+            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider_id ELSE '' END AS quality_provider_id,"
+            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
+            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10 "
+            "FROM candidates c "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "ORDER BY c.id"
         ).fetchall()
     ]
-    candidates_by_key: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    by_any_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    by_exact_match_key: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
     for item in candidates:
-        for key in book_row_identity_match_keys(item):
-            candidates_by_key[key].append(item)
+        cand_exact, cand_prefix = book_row_exact_and_prefix_match_keys(item)
+        for key in cand_exact:
+            by_exact_match_key[key].append(item)
+            by_any_match_key[key].append(item)
+        for key in cand_prefix:
+            by_any_match_key[key].append(item)
 
     existing_read_events_by_read_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for event_row in con.execute(
@@ -658,12 +657,30 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         elif len(parts) == 3 and parts[0] == "manual-read" and parts[2].isdigit():
             existing_read_events_by_read_id[int(parts[2])].append(event_dict)
 
+    eligible_reads: list[
+        tuple[
+            dict[str, Any],
+            int,
+            datetime,
+            bool,
+            dict[int, dict[str, Any]],
+            list[dict[str, Any]],
+            dict[str, str],
+            float | None,
+            Any,
+        ]
+    ] = []
+    needed_candidate_ids: set[int] = set()
     for read in reads:
         scanned += 1
         read_id = int(read["id"])
+        read_exact, read_prefix = book_row_exact_and_prefix_match_keys(read)
         matched_by_id: dict[int, dict[str, Any]] = {}
-        for key in book_row_identity_match_keys(read):
-            for item in candidates_by_key.get(key, ()):
+        for key in read_exact:
+            for item in by_any_match_key.get(key, ()):
+                matched_by_id[int(item["id"])] = item
+        for key in read_prefix:
+            for item in by_exact_match_key.get(key, ()):
                 matched_by_id[int(item["id"])] = item
 
         read_time, day_precision = _read_time(read.get("read_at"))
@@ -703,26 +720,74 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         if read_time is None:
             continue
 
+        eligible_reads.append(
+            (
+                read,
+                read_id,
+                read_time,
+                day_precision,
+                matched_by_id,
+                existing_events,
+                metadata,
+                read_value,
+                occurred_at,
+            )
+        )
+        needed_candidate_ids.update(matched_by_id)
+
+    impression_rows_by_candidate: dict[int, list[sqlite3.Row]] = {}
+    sorted_candidate_ids = sorted(needed_candidate_ids)
+    for start in range(0, len(sorted_candidate_ids), IMPRESSION_QUERY_CHUNK_SIZE):
+        chunk = sorted_candidate_ids[start : start + IMPRESSION_QUERY_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        for item in con.execute(
+            "SELECT id,run_id,candidate_id,rank,score,propensity,presented_at,visible_at "
+            f"FROM recommendation_impressions WHERE candidate_id IN ({placeholders}) "
+            "ORDER BY candidate_id, COALESCE(visible_at,presented_at) DESC, id DESC",
+            chunk,
+        ).fetchall():
+            impression_rows_by_candidate.setdefault(int(item["candidate_id"]), []).append(item)
+
+    for (
+        read,
+        read_id,
+        read_time,
+        day_precision,
+        matched_by_id,
+        existing_events,
+        metadata,
+        read_value,
+        occurred_at,
+    ) in eligible_reads:
         exact_identity = book_identity(read["title"], read["author"])
         read_isbn_keys = _isbn_match_keys(read)
         impressions_by_candidate: dict[int, Any] = {
-            cand_id: _latest_preceding_impression(con, cand_id, read_time, day_precision)
+            cand_id: next(
+                (
+                    item
+                    for item in impression_rows_by_candidate.get(cand_id, ())
+                    if _impression_precedes(item, read_time, day_precision)
+                ),
+                None,
+            )
             for cand_id in matched_by_id
         }
 
         def _candidate_rank_key(item: dict[str, Any]):
             cand_id = int(item["id"])
             imp = impressions_by_candidate[cand_id]
-            imp_time = str(imp["visible_at"] or imp["presented_at"] or "") if imp is not None else ""
-            imp_id = int(imp["id"]) if imp is not None else 0
+            imp_sort = (
+                _impression_sort_key(imp)
+                if imp is not None
+                else (datetime.min.replace(tzinfo=timezone.utc), 0)
+            )
             return (
                 1 if book_identity(item["title"], item["author"]) == exact_identity else 0,
                 1 if bool(read_isbn_keys and (_isbn_match_keys(item) & read_isbn_keys)) else 0,
                 1 if imp is not None else 0,
                 1 if str(item.get("status") or "") not in INACTIVE_CANDIDATE_STATUSES else 0,
                 float(item.get("score") or 0.0),
-                imp_time,
-                imp_id,
+                imp_sort,
                 -cand_id,
             )
 

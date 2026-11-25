@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import json
 import asyncio
 import logging
@@ -10,11 +11,14 @@ import sqlite3
 import time
 import uuid
 import weakref
+from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
+import numpy as np
 from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -219,6 +223,57 @@ def _principal(request):
     if account is None:
         raise HTTPException(401, "Authentication required")
     return account
+
+
+def _normalize_ip(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if not candidate or len(candidate) > 80:
+        return None
+    if candidate.startswith("[") and "]" in candidate:
+        host_part, _, remainder = candidate[1:].partition("]")
+        if remainder and not (remainder.startswith(":") and remainder[1:].isdigit()):
+            return None
+        candidate = host_part
+    elif candidate.count(":") == 1:
+        host_part, port_part = candidate.split(":", 1)
+        if port_part.isdigit():
+            candidate = host_part
+    zone_stripped = candidate.split("%", 1)[0]
+    try:
+        parsed = ipaddress.ip_address(zone_stripped)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return str(parsed)
+
+
+def _verified_client_ip(request: Request, *, service_authenticated: bool = False) -> str:
+    peer_host = request.client.host if request.client and request.client.host else ""
+    if service_authenticated:
+        forwarded = _normalize_ip(request.headers.get("x-bookward-client-ip"))
+        if forwarded:
+            return forwarded
+    normalized_peer = _normalize_ip(peer_host)
+    if normalized_peer:
+        return normalized_peer
+    return peer_host[:80] if peer_host else "unknown"
+
+
+def _warn_if_shared_rate_limit_bucket() -> None:
+    if not settings.service_secret.strip():
+        LOGGER.warning(
+            "AFTERWORD_SERVICE_SECRET is not set; x-bookward-client-ip headers are ignored "
+            "and sign-in rate limiting shares the caller peer IP bucket. Set ENGINE_SERVICE_SECRET "
+            "(and ADDRESS_HEADER behind a reverse proxy) for per-client IP isolation."
+        )
+
+
+def _request_client_ip(request: Request) -> str:
+    resolved = getattr(request.state, "client_ip", None)
+    if resolved:
+        return resolved
+    return _verified_client_ip(request)
 
 
 def _require_admin(request):
@@ -853,6 +908,7 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    _warn_if_shared_rate_limit_bucket()
     ready_profiles: set[str] = set()
     legacy_recovered = False
     try:
@@ -984,7 +1040,8 @@ async def authenticate_engine_request(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or path == "/api/health":
         return await call_next(request)
-    if settings.service_secret:
+    service_authenticated = False
+    if settings.service_secret.strip():
         supplied = request.headers.get("x-bookward-service", "")
         if not hmac.compare_digest(supplied, settings.service_secret):
             return JSONResponse(
@@ -992,6 +1049,10 @@ async def authenticate_engine_request(request: Request, call_next):
                 status_code=401,
                 headers={"cache-control": "no-store"},
             )
+        service_authenticated = True
+    request.state.client_ip = _verified_client_ip(
+        request, service_authenticated=service_authenticated
+    )
 
     if path == "/api/v1" or path.startswith("/api/v1/"):
         authorization = request.headers.get("authorization", "")
@@ -1134,10 +1195,18 @@ def auth_config():
 
 @app.post("/auth/login")
 def local_login(payload: LocalLoginIn, request: Request):
-    account = identity_store.authenticate_local(
-        payload.username, payload.password,
-        request.client.host if request.client else "unknown",
-    )
+    try:
+        account = identity_store.authenticate_local(
+            payload.username,
+            payload.password,
+            _request_client_ip(request),
+        )
+    except identity_store.LoginRateLimitError as exc:
+        raise HTTPException(
+            429,
+            str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     if not account:
         raise HTTPException(401, "Username or password is incorrect")
     raw, account = identity_store.create_session(account["id"])
@@ -1174,10 +1243,23 @@ def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
     if methods["password_enabled"]:
-        verified = identity_store.authenticate_local(
-            account["username"], payload.current_password,
-            request.client.host if request.client else "unknown",
-        )
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                payload.current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
@@ -1239,6 +1321,15 @@ def admin_reset_password(account_id: str, payload: AccountPasswordIn, request: R
     except (ValueError, LookupError) as exc:
         raise HTTPException(400 if isinstance(exc, ValueError) else 404, str(exc)) from exc
     return {"changed": True, "account_id": account_id}
+
+
+@app.post("/admin/accounts/{account_id}/unlock")
+def admin_unlock_account(account_id: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        return identity_store.unlock_account(account_id, admin_id=admin["id"])
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.put("/admin/accounts/{account_id}/status")
@@ -2605,10 +2696,108 @@ def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn)
     }
 
 
+READING_HISTORY_SCORE_MAX_LIMIT = 200
+_RATED_READ_VECTOR_CACHE_MAX_ENTRIES = 8
+# Bounded by entry count (8 LRU profiles/states); individual entries are not
+# size-capped and hold one frozen float64 vector per rated read in that profile.
+_RATED_READ_VECTOR_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, ...]] = OrderedDict()
+
+
+def _rated_read_state_digest(rated_reads: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for item in rated_reads:
+        digest.update(
+            json.dumps(
+                (
+                    item.get("id"),
+                    item.get("title"),
+                    item.get("author"),
+                    item.get("rating"),
+                    item.get("read_at"),
+                    item.get("genres"),
+                    item.get("description"),
+                ),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _format_read_embedding_digest(entries: Sequence[Any]) -> str:
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
+    query = (
+        "SELECT entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+        "FROM embeddings WHERE entity_type='read' AND backend=? AND model=? "
+        "ORDER BY entity_id"
+    )
+    entries = (
+        connection.execute(query, (backend, model)).fetchall()
+        if connection is not None
+        else rows(query, (backend, model))
+    )
+    return _format_read_embedding_digest(entries)
+
+
+async def _cached_rated_read_vectors(
+    embedder,
+    config: dict[str, Any],
+    rated_reads: list[dict[str, Any]],
+    embedding_cache_digest: str,
+) -> Sequence[Sequence[float]]:
+    tenant_key = (
+        current_profile_id() or "legacy",
+        str(profile_database_path().resolve()),
+    )
+    embedder_base_key = (
+        type(embedder).__qualname__,
+        str(embedder.name),
+        str(embedder.model),
+        str(config.get("embedding_backend") or ""),
+        str(config.get("embedding_model") or ""),
+        str(getattr(embedder, "url", None) or config.get("embedding_url") or ""),
+    )
+    reads_state_key = _rated_read_state_digest(rated_reads)
+    lookup_key = (tenant_key, (*embedder_base_key, embedding_cache_digest), reads_state_key)
+    cached = _RATED_READ_VECTOR_CACHE.get(lookup_key)
+    if cached is not None:
+        _RATED_READ_VECTOR_CACHE.move_to_end(lookup_key)
+        return cached
+
+    computed = await cached_vectors(embedder, "read", rated_reads)
+    frozen: list[np.ndarray] = []
+    for vector in computed:
+        arr = np.asarray(vector, dtype=np.float64).copy()
+        arr.setflags(write=False)
+        frozen.append(arr)
+    stored = tuple(frozen)
+    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
+    _RATED_READ_VECTOR_CACHE[store_key] = stored
+    _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
+    while len(_RATED_READ_VECTOR_CACHE) > _RATED_READ_VECTOR_CACHE_MAX_ENTRIES:
+        _RATED_READ_VECTOR_CACHE.popitem(last=False)
+    return stored
+
+
 @app.get("/api/reading-history/scores")
 async def reading_history_scores(
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=20),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
     with connect() as connection:
@@ -2617,6 +2806,8 @@ async def reading_history_scores(
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
+        if not items:
+            return []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -2634,8 +2825,20 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-    if not items:
-        return []
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+        read_embedding_rows = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+            ).fetchall()
+        ]
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -2663,42 +2866,48 @@ async def reading_history_scores(
         virtual_candidates.append(virtual)
 
     try:
-        if virtual_candidates:
-            config = private_settings()
-            embedder = get_embedder(
-                config.get("embedding_backend"),
-                config.get("embedding_model"),
-                config.get("embedding_url"),
-                config.get("embedding_api_key"),
-            )
-            rated_reads = rows(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            )
-            read_vectors = await cached_vectors(embedder, "read", rated_reads)
-            candidate_vectors = await cached_vectors(
-                embedder,
-                "read_candidate",
-                virtual_candidates,
-                persist=False,
-                expected_dimensions=_vector_dimensions(read_vectors),
-            )
-            ranked = rank_candidates(
-                rated_reads,
-                read_vectors,
-                virtual_candidates,
-                candidate_vectors,
-                exclude_candidate_identity=True,
-            )
-            ranked_by_id = {int(item["id"]): item for item in ranked}
-            return [
-                {
-                    "id": int(item["id"]),
-                    "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
-                    "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
-                    "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
-                }
-                for item in items
+        embedder = get_embedder(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        embedding_cache_digest = _format_read_embedding_digest(
+            [
+                entry
+                for entry in read_embedding_rows
+                if entry["backend"] == embedder.name and entry["model"] == embedder.model
             ]
+        )
+        read_vectors = await _cached_rated_read_vectors(
+            embedder, config, rated_reads, embedding_cache_digest
+        )
+        candidate_vectors = await cached_vectors(
+            embedder,
+            "read_candidate",
+            virtual_candidates,
+            persist=False,
+            expected_dimensions=_vector_dimensions(read_vectors),
+        )
+        ranked = rank_candidates(
+            rated_reads,
+            read_vectors,
+            virtual_candidates,
+            candidate_vectors,
+            exclude_candidate_identity=True,
+        )
+        ranked_by_id = {int(item["id"]): item for item in ranked}
+        return [
+            {
+                "id": int(item["id"]),
+                "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
+                "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
+                "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
+            }
+            for item in items
+        ]
+    except RestoreEpochError:
+        raise
     except Exception:
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise
