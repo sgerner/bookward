@@ -170,6 +170,8 @@ describe("recommendation card presentation", () => {
 
     expect(body).toContain("Rank 81.2");
     expect(body).toContain("Rank 81.3");
+    expect(body).not.toContain("Rank 81.24");
+    expect(body).not.toContain("Rank 81.25");
     expect(body).toContain("A lone human emissary is sent to Winter");
     expect(body).toContain("line-clamp-3");
     expect(body).toContain("Read full summary");

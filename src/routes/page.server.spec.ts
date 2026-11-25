@@ -1839,6 +1839,152 @@ describe("page actions", () => {
     });
   });
 
+  it("loads active catalog sweep progress, remaining rows, and retry status in Settings", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const quality = {
+      statuses: [
+        { quality_status: "accepted", count: 80 },
+        { quality_status: "quarantine", count: 12 },
+      ],
+      identifiers: { total: 92, with_isbn13: 70, with_catalog_match: 80 },
+      flags: { catalog_unmatched: 12 },
+      version: "candidate-quality-v4",
+      audit: {
+        status: "failed",
+        active: false,
+        mode: "full",
+        last_mode: "full",
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 42,
+        progress: 0.6,
+        started_at: "2026-11-21 20:00:00.000000",
+        completed_at: null,
+        job_id: "job-audit-1",
+        last_error: "Catalog provider timed out",
+        can_retry: true,
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      const payload = input.includes("/api/candidates/quality") ? quality : overview;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      catalogQuality: {
+        audit: {
+          status: string;
+          mode: string;
+          remaining: number;
+          progress: number;
+          last_error: string | null;
+          can_retry: boolean;
+        };
+      };
+    };
+    expect(result.catalogQuality.audit).toMatchObject({
+      status: "failed",
+      mode: "full",
+      remaining: 42,
+      progress: 0.6,
+      last_error: "Catalog provider timed out",
+      can_retry: true,
+    });
+  });
+
+  it("queues incremental, full, and retried catalog audits through the engine", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ job_id: "12345678-audit", mode: "full", remaining: 120 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ status: "running", error: null, result: null }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ job_id: "87654321-retry", mode: "full", remaining: 70 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            status: "complete",
+            error: null,
+            result: JSON.stringify({ remaining: 20 }),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const fullForm = new FormData();
+    fullForm.set("mode", "full");
+    const fullPending = actions.auditCatalog!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: fullForm,
+      }),
+    } as never);
+    await vi.advanceTimersByTimeAsync(2 * 250);
+    await expect(fullPending).resolves.toEqual({
+      message: "Full catalog audit queued in bounded 50-book batches (120 books remaining).",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/candidates/audit",
+    );
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+      mode: "full",
+    });
+
+    const retryPending = actions.retryCatalogAudit!({} as never);
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(retryPending).resolves.toEqual({
+      message:
+        "Catalog audit retry batch finished; 20 books remaining in the background.",
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[3][1] as RequestInit).body))).toEqual({
+      retry: true,
+    });
+  });
+
   it("surfaces skipped reasons and delivered book counts from manual digest runs", async () => {
     vi.useFakeTimers();
     try {
