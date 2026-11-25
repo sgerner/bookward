@@ -466,6 +466,7 @@ def apply_llm_rerank_adjustments(
     cap = max(0.0, float(max_delta))
     adjusted_count = 0
     seen_ids: set[int] = set()
+    validated_adjustments: list[dict[str, Any]] = []
     for entry in adjustments:
         if not isinstance(entry, dict):
             continue
@@ -492,6 +493,13 @@ def apply_llm_rerank_adjustments(
                 explanation = list(cand.get("explanation") or [])
                 explanation.append(f"LLM delta ({applied_delta:+.2f}): {reason}")
                 cand["explanation"] = explanation
+            validated_adjustments.append(
+                {
+                    "id": cid,
+                    "delta": clipped_delta,
+                    "reason": reason,
+                }
+            )
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
@@ -500,6 +508,9 @@ def apply_llm_rerank_adjustments(
             "applied": True,
             "adjusted_count": 0,
             "mode": "adjustments",
+            "top_k": limit,
+            "max_delta": cap,
+            "adjustments": [],
         }
 
     reranked_head = [
@@ -513,6 +524,9 @@ def apply_llm_rerank_adjustments(
         "applied": True,
         "adjusted_count": adjusted_count,
         "mode": "adjustments",
+        "top_k": limit,
+        "max_delta": cap,
+        "adjustments": validated_adjustments,
     }
 
 
@@ -581,10 +595,17 @@ def apply_llm_rerank_order(
             key=lambda pair: (-float(pair[1].get("score") or 0.0), pair[0]),
         )
     ]
+    validated_rankings = [
+        {"id": cid, **({"reason": reasons[cid]} if cid in reasons else {})}
+        for cid in ordered_ids
+    ]
     return reranked_head + tail, {
         "applied": True,
         "reranked_count": len(reasons) or n,
         "mode": "listwise",
+        "top_k": limit,
+        "max_delta": float(max_nudge),
+        "rankings": validated_rankings,
     }
 
 
