@@ -984,17 +984,17 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
 
 
-def test_migration_28_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+def test_migration_29_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
     from afterword_engine.identity import ReadIdentityIndex
     from afterword_engine.main import recommendation_list
 
-    settings.db = str(tmp_path / "legacy-v27.db")
+    settings.db = str(tmp_path / "legacy-v28.db")
     con = sqlite3.connect(settings.db)
     con.execute(
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     for version, script in MIGRATIONS:
-        if version >= 28:
+        if version >= 29:
             break
         con.executescript(script)
         con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -1197,7 +1197,7 @@ def test_migration_28_decouples_work_ids_verifies_source_isbns_and_requeues_only
 
     initialize(seed_demo=False)
 
-    assert row("SELECT version FROM schema_migrations WHERE version=28") == {"version": 28}
+    assert row("SELECT version FROM schema_migrations WHERE version=29") == {"version": 29}
     assert row(
         "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
         (ol_verified,),
