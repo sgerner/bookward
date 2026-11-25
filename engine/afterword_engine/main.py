@@ -2274,11 +2274,10 @@ def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]
         if not batch:
             continue
         marks = ",".join("?" for _ in batch)
+        projection = _candidate_quality_identity_projection(connection)
         try:
             found = fetch(
-                "SELECT c.id,c.source_url,c.isbn13,c.isbn10,"
-                "q.work_id quality_work_id,q.provider quality_provider,"
-                "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+                f"SELECT c.id,c.source_url,c.isbn13,c.isbn10,{projection} "
                 "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                 f"WHERE c.id IN ({marks})",
                 batch,

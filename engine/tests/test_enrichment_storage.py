@@ -1942,6 +1942,14 @@ def test_migration_32_decouples_work_ids_verifies_source_isbns_and_requeues_only
 
     assert row("SELECT version FROM schema_migrations WHERE version=31") == {"version": 31}
     assert row("SELECT version FROM schema_migrations WHERE version=32") == {"version": 32}
+    quality_columns = {
+        col["name"]: col for col in rows("PRAGMA table_info(candidate_quality)")
+    }
+    assert "openlibrary_work_id" in quality_columns
+    assert "isbn_verified" in quality_columns
+    assert row(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_candidate_quality_openlibrary_work_id'"
+    ) == {"name": "idx_candidate_quality_openlibrary_work_id"}
     assert row(
         "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
         (ol_verified,),
@@ -2104,6 +2112,139 @@ def test_migration_32_decouples_work_ids_verifies_source_isbns_and_requeues_only
         )
         == snapshot_quality
     )
+
+
+def test_upgrade_from_main_migration_28_applies_through_migration_32_columns_index_and_backfill(
+    tmp_path,
+):
+    from afterword_engine.database import (
+        MIGRATIONS,
+        _execute_migration_script,
+    )
+
+    settings.db = str(tmp_path / "legacy-v28.db")
+    con = sqlite3.connect(settings.db)
+    con.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    for version, script in MIGRATIONS:
+        if version > 28:
+            break
+        _execute_migration_script(con, script)
+        con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+    con.commit()
+
+    source_id = con.execute(
+        "INSERT INTO sources(name,url) VALUES('Test Feed v28','https://example.com/feed-v28')"
+    ).lastrowid
+
+    def insert_v28_candidate(
+        title,
+        *,
+        status="new",
+        source_url="",
+        c_isbn13="",
+        c_isbn10="",
+        q_status="accepted",
+        provider="openlibrary",
+        work_id="",
+        q_isbn13="",
+        q_isbn10="",
+        flags="[]",
+    ):
+        cid = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,status,isbn13,isbn10,score,normalized_key) "
+            "VALUES(?,?,?,?,?,?,?,80.0,?)",
+            (
+                title,
+                "Writer",
+                source_url,
+                source_id,
+                status,
+                c_isbn13,
+                c_isbn10,
+                title.lower().replace(" ", "-"),
+            ),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status=?,provider=?,work_id=?,isbn13=?,isbn10=?,flags_json=?,audit_version='candidate-quality-v4' "
+            "WHERE candidate_id=?",
+            (q_status, provider, work_id, q_isbn13, q_isbn10, flags, cid),
+        )
+        return cid
+
+    ol_verified = insert_v28_candidate(
+        "V28 OpenLibrary Verified",
+        c_isbn13="9780307474278",
+        work_id="/works/OL888W",
+        q_isbn13="9780307474278",
+    )
+    gb_source_work = insert_v28_candidate(
+        "V28 Google Books With Source Work",
+        source_url="https://openlibrary.org/works/OL889W?edition=1",
+        c_isbn13="9780804172448",
+        c_isbn10="043942089X",
+        provider="google_books",
+        work_id="gb-v28-vol",
+        q_isbn13="9780143127550",
+        q_isbn10="0307474275",
+    )
+    requeued_overlap = insert_v28_candidate(
+        "V28 False Catalog Read Overlap",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap","short_description"]',
+    )
+    con.commit()
+    con.close()
+
+    initialize(seed_demo=False)
+
+    applied_versions = {
+        item["version"]
+        for item in rows("SELECT version FROM schema_migrations WHERE version >= 28")
+    }
+    assert {28, 29, 30, 31, 32}.issubset(applied_versions)
+    quality_columns = {
+        col["name"]: col for col in rows("PRAGMA table_info(candidate_quality)")
+    }
+    assert "openlibrary_work_id" in quality_columns
+    assert "isbn_verified" in quality_columns
+    assert row(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_candidate_quality_openlibrary_work_id'"
+    ) == {"name": "idx_candidate_quality_openlibrary_work_id"}
+
+    assert row(
+        "SELECT openlibrary_work_id,work_id,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (ol_verified,),
+    ) == {
+        "openlibrary_work_id": "/works/OL888W",
+        "work_id": "/works/OL888W",
+        "isbn_verified": 1,
+    }
+    assert row(
+        "SELECT openlibrary_work_id,work_id,isbn13,isbn10,isbn_verified FROM candidate_quality WHERE candidate_id=?",
+        (gb_source_work,),
+    ) == {
+        "openlibrary_work_id": "/works/OL889W",
+        "work_id": "gb-v28-vol",
+        "isbn13": "9780143127550",
+        "isbn10": "0307474275",
+        "isbn_verified": 0,
+    }
+    assert row("SELECT status FROM candidates WHERE id=?", (requeued_overlap,)) == {
+        "status": "new"
+    }
+    assert row(
+        "SELECT quality_status,isbn13,isbn_verified,flags_json FROM candidate_quality WHERE candidate_id=?",
+        (requeued_overlap,),
+    ) == {
+        "quality_status": "pending",
+        "isbn13": "9780345538376",
+        "isbn_verified": 0,
+        "flags_json": '["short_description"]',
+    }
 
 
 def test_mark_recommendation_read_carries_decoupled_openlibrary_work_id(database):
@@ -2357,3 +2498,37 @@ def test_candidate_quality_recovery_job_reaudits_non_isbn_v4_rows_and_preserves_
     }
     assert after_candidate["description"] == ""
     assert json.loads(after_candidate["genres"]) == ["Literary fiction"]
+
+
+def test_load_llm_rerank_inputs_projects_decoupled_quality_identity_fields(database):
+    from afterword_engine.database import connect
+    from afterword_engine.main import _load_llm_rerank_inputs
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        cid = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
+            "VALUES('LLM Rerank Identity Book','Author One',88,'recommended',?,'','llm-rerank-identity-book')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',provider_id='gb-id-9',"
+            "work_id='gb-vol-9',openlibrary_work_id='/works/OL999W',isbn13='9780345538376',isbn_verified=0,"
+            "audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, cid),
+        )
+
+    with connect() as con:
+        _read_rows, llm_events = _load_llm_rerank_inputs(
+            con,
+            [{"candidate_id": cid, "action": "save", "title": "LLM Rerank Identity Book", "author": "Author One"}],
+        )
+
+    assert len(llm_events) == 1
+    assert llm_events[0]["quality_openlibrary_work_id"] == "/works/OL999W"
+    assert llm_events[0]["quality_provider_id"] == "gb-id-9"
+    assert llm_events[0]["quality_isbn_verified"] == 0
+    assert llm_events[0]["quality_status"] == "accepted"
+    assert llm_events[0]["quality_audit_version"] == QUALITY_VERSION
