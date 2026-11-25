@@ -194,7 +194,12 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
   return [...seen.values()].sort((left, right) => left.localeCompare(right));
 };
 
-export const load: PageServerLoad = async ({ url, request, locals }) => {
+export const load: PageServerLoad = async ({
+  url,
+  request,
+  isDataRequest,
+  locals,
+}) => {
   if (locals?.engineUnavailable) {
     throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
@@ -234,7 +239,13 @@ export const load: PageServerLoad = async ({ url, request, locals }) => {
     recommendation_limit: "24",
     decision_limit: "24",
   });
+  // SvelteKit's respond() deletes `x-sveltekit-invalidated` from `event.url` on
+  // `/__data.json` requests while setting `isDataRequest = true`. Gate run
+  // creation on data requests as well as explicit invalidation params/headers so
+  // shallow-routed (#311) client updates never mint phantom Discover runs.
   const isClientInvalidation =
+    Boolean(isDataRequest) ||
+    Boolean(request?.url && request.url.includes("/__data.json")) ||
     url.searchParams.has("x-sveltekit-invalidated") ||
     Boolean(request?.headers?.get("x-sveltekit-invalidated"));
   const isPostFallbackWithoutRefresh =

@@ -492,7 +492,16 @@ export function createPendingSubmit(deps: {
         } else {
           await update({ reset: succeeded, navigate: false });
         }
-        if (succeeded && (key === "sync" || key === "restore-backup")) {
+        if (
+          succeeded &&
+          (key === "sync" ||
+            key === "restore-backup" ||
+            key === "goodreads-rss" ||
+            key === "csv-import" ||
+            key === "goodreads-csv" ||
+            key === "toggle-default" ||
+            key.startsWith("toggle-source-"))
+        ) {
           onResetClientPagination?.();
         }
         if (
@@ -517,7 +526,9 @@ export function createPendingSubmit(deps: {
             key === "goodreads-csv" ||
             key === "source" ||
             key.startsWith("source-") ||
-            key.startsWith("refresh-source-")
+            key.startsWith("refresh-source-") ||
+            key === "toggle-default" ||
+            key.startsWith("toggle-source-")
           ) {
             onReloadFilteredLists?.();
           }

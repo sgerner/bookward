@@ -213,12 +213,13 @@
   const DECISION_PAGE_SIZE = 24;
   const FILTER_DEBOUNCE_MS = 180;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
-  const initialViewIsDiscover = initialUrlState.view === "discover";
   let activeRunIdOverride = $state<string | null>(null);
   const activeRunId = $derived(
     activeRunIdOverride ?? (data.recommendation_run_id ?? ""),
   );
-  let discoverSessionInitializedOverride = $state(initialViewIsDiscover);
+  let discoverSessionInitializedOverride = $state(
+    untrack(() => Boolean(data.recommendation_run_id)),
+  );
   const discoverSessionInitialized = $derived(
     discoverSessionInitializedOverride || Boolean(data.recommendation_run_id),
   );
@@ -2638,7 +2639,7 @@
     if (previousProfileId === nextProfileId) return;
     previousProfileId = nextProfileId;
     activeRunIdOverride = null;
-    discoverSessionInitializedOverride = activeView === "discover";
+    discoverSessionInitializedOverride = Boolean(data.recommendation_run_id);
     clientDiscoverBooks = null;
     sessionBooksById = {};
     bookStatusOverrides = {};
@@ -4102,7 +4103,7 @@
                         class="ml-auto shrink-0"
                         method="POST"
                         action="?/toggleDefault"
-                        use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
+                        use:enhance={setPending("toggle-default", () => optimisticDefaultToggle(), { refreshDiscoverRun: true })}
                       >
                         <ProfileField profileId={data.user?.profile_id} />
                         <SwitchControl
@@ -4383,7 +4384,7 @@
                               <form
                                 method="POST"
                                 action="?/refreshSource"
-                                use:enhance={setPending(`refresh-source-${source.id}`)}
+                                use:enhance={setPending(`refresh-source-${source.id}`, undefined, { refreshDiscoverRun: true })}
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
@@ -4406,7 +4407,7 @@
                               class="shrink-0"
                               method="POST"
                               action="?/toggleSource"
-                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
+                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle, { refreshDiscoverRun: true })}
                             >
                               <ProfileField profileId={data.user?.profile_id} />
                               <input
@@ -4498,7 +4499,7 @@
                   class="card h-fit min-w-0 preset-tonal-surface p-4 sm:p-6"
                   method="POST"
                   action="?/source"
-                  use:enhance={setPending("source")}
+                  use:enhance={setPending("source", undefined, { refreshDiscoverRun: true })}
                 >
                   <ProfileField profileId={data.user?.profile_id} />
                   <div class="flex items-center gap-3">
@@ -4770,7 +4771,7 @@
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/connectGoodreads"
-                use:enhance={setPending("goodreads-rss")}
+                use:enhance={setPending("goodreads-rss", undefined, { refreshDiscoverRun: true })}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -4844,7 +4845,7 @@
                 method="POST"
                 action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("csv-import")}
+                use:enhance={setPending("csv-import", undefined, { refreshDiscoverRun: true })}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex flex-wrap items-center justify-between gap-3">

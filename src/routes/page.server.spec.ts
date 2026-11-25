@@ -3047,51 +3047,67 @@ describe("page actions", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     // 1. Shallow-routed client invalidation via query param on `/` must pass track_run=false
+    // 1. Real SvelteKit `/__data.json` data request (where respond() already
+    // stripped `x-sveltekit-invalidated` from `event.url` and set `isDataRequest: true`)
     await load({
-      url: new URL("http://afterword.test/?x-sveltekit-invalidated=01"),
+      url: new URL("http://afterword.test/"),
       request: new Request("http://afterword.test/__data.json?x-sveltekit-invalidated=01"),
+      isDataRequest: true,
       locals: { user: null },
     } as never);
 
-    // 2. Client invalidation via header on `/` must pass track_run=false
+    // 2. Direct `isDataRequest: true` with plain Request URL
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/"),
+      isDataRequest: true,
+      locals: { user: null },
+    } as never);
+
+    // 3. Client invalidation via header on `/` must pass track_run=false
     await load({
       url: new URL("http://afterword.test/"),
       request: new Request("http://afterword.test/", {
         headers: { "x-sveltekit-invalidated": "1" },
       }),
+      isDataRequest: false,
       locals: { user: null },
     } as never);
 
-    // 3. Non-refresh no-JS POST fallback on `/` (e.g. ?/decide) must pass track_run=false
+    // 4. Non-refresh no-JS POST fallback on `/` (e.g. ?/decide) must pass track_run=false
     await load({
       url: new URL("http://afterword.test/?/decide"),
       request: new Request("http://afterword.test/?/decide", { method: "POST" }),
+      isDataRequest: false,
       locals: { user: null },
     } as never);
 
-    // 4. Initial SSR GET on `/` tracks Discover run (no track_run=false)
+    // 5. Initial SSR GET on `/` tracks Discover run (no track_run=false)
     await load({
       url: new URL("http://afterword.test/"),
       request: new Request("http://afterword.test/", { method: "GET" }),
+      isDataRequest: false,
       locals: { user: null },
     } as never);
 
-    // 5. No-JS POST fallback for ?/runSync on `/` tracks fresh Discover run
+    // 6. No-JS POST fallback for ?/runSync on `/` tracks fresh Discover run
     await load({
       url: new URL("http://afterword.test/?/runSync"),
       request: new Request("http://afterword.test/?/runSync", { method: "POST" }),
+      isDataRequest: false,
       locals: { user: null },
     } as never);
 
     const overviewCalls = fetchMock.mock.calls
       .map(([input]) => String(input))
       .filter((calledUrl) => calledUrl.includes("/api/overview"));
-    expect(overviewCalls).toHaveLength(5);
+    expect(overviewCalls).toHaveLength(6);
     expect(overviewCalls[0]).toContain("track_run=false");
     expect(overviewCalls[1]).toContain("track_run=false");
     expect(overviewCalls[2]).toContain("track_run=false");
-    expect(overviewCalls[3]).not.toContain("track_run=false");
+    expect(overviewCalls[3]).toContain("track_run=false");
     expect(overviewCalls[4]).not.toContain("track_run=false");
+    expect(overviewCalls[5]).not.toContain("track_run=false");
   });
 
   it("passes track_run=false when configureSourceFilters looks up an existing source without a submitted URL", async () => {

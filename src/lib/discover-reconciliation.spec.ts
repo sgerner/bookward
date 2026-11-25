@@ -448,9 +448,15 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
       (form) =>
         form.action === "?/runSync" ||
         form.action === "?/rebuildEmbeddings" ||
-        form.action === "?/restoreBackup",
+        form.action === "?/restoreBackup" ||
+        form.action === "?/connectGoodreads" ||
+        form.action === "?/importCsv" ||
+        form.action === "?/source" ||
+        form.action === "?/refreshSource" ||
+        form.action === "?/toggleDefault" ||
+        form.action === "?/toggleSource",
     );
-    expect(refreshForms.length).toBe(4);
+    expect(refreshForms.length).toBe(10);
     for (const form of refreshForms) {
       expect(source.slice(form.start, form.end)).toContain(
         "refreshDiscoverRun: true",
@@ -624,10 +630,11 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
     const getActiveRunId = () =>
       state.activeRunIdOverride ?? serverData.recommendation_run_id;
 
-    const runReload = async (url: URL) => {
+    const runReload = async (url: URL, isDataRequest = true) => {
       currentViewUrl = url;
       const nextData = (await load({
         url: currentViewUrl,
+        isDataRequest,
         locals: { user: null },
       } as never)) as typeof serverData;
       loadCalls += 1;
@@ -853,8 +860,9 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
     expect(getAllBooks().find((b) => b.id === 26)?.status).toBe("recommended");
 
     // Shallow-navigate via pushState to Shortlist (?view=saved) and submit `importLibrar`:
-    // SvelteKit keeps `current.url` at `/` and appends `?x-sveltekit-invalidated=01` when `update()` runs!
-    currentViewUrl = new URL("http://afterword.test/?x-sveltekit-invalidated=01");
+    // Real SvelteKit respond() strips `x-sveltekit-invalidated` from `event.url` (`http://afterword.test/`)
+    // and passes `isDataRequest: true` when `update()` runs!
+    currentViewUrl = new URL("http://afterword.test/");
     const importFd = new FormData();
     importFd.set("id", "1");
     importFd.set("run_id", "run-session-1");
