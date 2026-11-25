@@ -14,6 +14,7 @@ vi.mock('#lib/server/engine.js', async (importOriginal) => {
 });
 
 import { EngineError } from '#lib/server/engine.js';
+import { currentClientIp } from '#lib/server/request-context.js';
 import { actions, load } from './+page.server';
 
 const oidcConfig = { setup_required: false, local_login_enabled: true, oidc_enabled: true };
@@ -72,10 +73,70 @@ describe('login page loader', () => {
 			.rejects.toMatchObject({ status: 303, location: '/auth/oidc/start?intent=login&next=%2F' });
 	});
 
+	it('forwards client IPs and distinguishes HTTP 429 wait guidance from HTTP 401 errors', async () => {
+		let seenClientIp: string | undefined;
+		engine.mockImplementationOnce(() => {
+			seenClientIp = currentClientIp();
+			return Promise.reject(new EngineError('Username or password is incorrect', 401));
+		});
+		const candidate = makeLongInput();
+		const makeFormRequest = () => {
+			const form = new FormData();
+			form.set('username', 'bookward');
+			form.set('password', candidate);
+			return new Request('https://bookward.test/login?/login', { method: 'POST', body: form });
+		};
+		const setHeaders = vi.fn();
+
+		const wrongPassword = await actions.login({
+			request: makeFormRequest(),
+			cookies: { set: vi.fn() },
+			url: new URL('https://bookward.test/login'),
+			setHeaders,
+			getClientAddress: () => '203.0.113.10'
+		} as never);
+		expect(seenClientIp).toBe('203.0.113.10');
+		expect(wrongPassword).toMatchObject({
+			status: 401,
+			data: {
+				formId: 'login',
+				error: true,
+				credentialError: true,
+				message: 'Username or password is incorrect.',
+				values: { username: 'bookward' }
+			}
+		});
+		assertNoPasswordEcho(wrongPassword, candidate);
+		expect(setHeaders).not.toHaveBeenCalled();
+
+		engine.mockRejectedValueOnce(new EngineError('Too many failed password attempts.', 429, 895));
+		const lockedOut = await actions.login({
+			request: makeFormRequest(),
+			cookies: { set: vi.fn() },
+			url: new URL('https://bookward.test/login'),
+			setHeaders,
+			getClientAddress: () => '203.0.113.10'
+		} as never);
+		expect(setHeaders).toHaveBeenCalledWith({ 'retry-after': '895' });
+		expect(lockedOut).toMatchObject({
+			status: 429,
+			data: {
+				formId: 'login',
+				error: true,
+				rateLimited: true,
+				retryAfterSeconds: 895,
+				message: expect.stringContaining('Wait 15 minutes'),
+				values: { username: 'bookward' }
+			}
+		});
+		expect((lockedOut as { data?: Record<string, unknown> }).data).not.toHaveProperty('credentialError');
+		assertNoPasswordEcho(lockedOut, candidate);
+	});
+
 	it('omits Secure on HTTP setup and login session cookies and sets Secure on HTTPS', async () => {
 		engine.mockResolvedValue({ session_token: 'admin-session', max_age: 86400 });
 		const httpCookies = { set: vi.fn() };
-		const body = new URLSearchParams({ username: 'admin', password: 'Strong-setup-password-1' });
+		const body = new URLSearchParams({ username: 'admin', password: makeLongInput() });
 
 		await expect(
 			actions.setup({

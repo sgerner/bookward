@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import json
 import asyncio
 import logging
@@ -219,6 +220,57 @@ def _principal(request):
     if account is None:
         raise HTTPException(401, "Authentication required")
     return account
+
+
+def _normalize_ip(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if not candidate or len(candidate) > 80:
+        return None
+    if candidate.startswith("[") and "]" in candidate:
+        host_part, _, remainder = candidate[1:].partition("]")
+        if remainder and not (remainder.startswith(":") and remainder[1:].isdigit()):
+            return None
+        candidate = host_part
+    elif candidate.count(":") == 1:
+        host_part, port_part = candidate.split(":", 1)
+        if port_part.isdigit():
+            candidate = host_part
+    zone_stripped = candidate.split("%", 1)[0]
+    try:
+        parsed = ipaddress.ip_address(zone_stripped)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return str(parsed)
+
+
+def _verified_client_ip(request: Request, *, service_authenticated: bool = False) -> str:
+    peer_host = request.client.host if request.client and request.client.host else ""
+    if service_authenticated:
+        forwarded = _normalize_ip(request.headers.get("x-bookward-client-ip"))
+        if forwarded:
+            return forwarded
+    normalized_peer = _normalize_ip(peer_host)
+    if normalized_peer:
+        return normalized_peer
+    return peer_host[:80] if peer_host else "unknown"
+
+
+def _warn_if_shared_rate_limit_bucket() -> None:
+    if not settings.service_secret.strip():
+        LOGGER.warning(
+            "AFTERWORD_SERVICE_SECRET is not set; x-bookward-client-ip headers are ignored "
+            "and sign-in rate limiting shares the caller peer IP bucket. Set ENGINE_SERVICE_SECRET "
+            "(and ADDRESS_HEADER behind a reverse proxy) for per-client IP isolation."
+        )
+
+
+def _request_client_ip(request: Request) -> str:
+    resolved = getattr(request.state, "client_ip", None)
+    if resolved:
+        return resolved
+    return _verified_client_ip(request)
 
 
 def _require_admin(request):
@@ -853,6 +905,7 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    _warn_if_shared_rate_limit_bucket()
     identity_store.initialize_auth()
     ready_profiles: set[str] = set()
     try:
@@ -977,7 +1030,8 @@ async def authenticate_engine_request(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or path == "/api/health":
         return await call_next(request)
-    if settings.service_secret:
+    service_authenticated = False
+    if settings.service_secret.strip():
         supplied = request.headers.get("x-bookward-service", "")
         if not hmac.compare_digest(supplied, settings.service_secret):
             return JSONResponse(
@@ -985,6 +1039,10 @@ async def authenticate_engine_request(request: Request, call_next):
                 status_code=401,
                 headers={"cache-control": "no-store"},
             )
+        service_authenticated = True
+    request.state.client_ip = _verified_client_ip(
+        request, service_authenticated=service_authenticated
+    )
 
     if path == "/api/v1" or path.startswith("/api/v1/"):
         authorization = request.headers.get("authorization", "")
@@ -1127,10 +1185,18 @@ def auth_config():
 
 @app.post("/auth/login")
 def local_login(payload: LocalLoginIn, request: Request):
-    account = identity_store.authenticate_local(
-        payload.username, payload.password,
-        request.client.host if request.client else "unknown",
-    )
+    try:
+        account = identity_store.authenticate_local(
+            payload.username,
+            payload.password,
+            _request_client_ip(request),
+        )
+    except identity_store.LoginRateLimitError as exc:
+        raise HTTPException(
+            429,
+            str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     if not account:
         raise HTTPException(401, "Username or password is incorrect")
     raw, account = identity_store.create_session(account["id"])
@@ -1167,10 +1233,23 @@ def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
     if methods["password_enabled"]:
-        verified = identity_store.authenticate_local(
-            account["username"], payload.current_password,
-            request.client.host if request.client else "unknown",
-        )
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                payload.current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
@@ -1232,6 +1311,15 @@ def admin_reset_password(account_id: str, payload: AccountPasswordIn, request: R
     except (ValueError, LookupError) as exc:
         raise HTTPException(400 if isinstance(exc, ValueError) else 404, str(exc)) from exc
     return {"changed": True, "account_id": account_id}
+
+
+@app.post("/admin/accounts/{account_id}/unlock")
+def admin_unlock_account(account_id: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        return identity_store.unlock_account(account_id, admin_id=admin["id"])
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.put("/admin/accounts/{account_id}/status")
