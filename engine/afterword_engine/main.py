@@ -72,6 +72,14 @@ from .ingestion import (
     refresh_missing_candidate_metadata,
     scan_source,
 )
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    ResponseBoundsError,
+    ResponseTooLargeError,
+    iter_bounded_bytes_async,
+    stream_bytes_async,
+    stream_json_async,
+)
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
@@ -3368,10 +3376,23 @@ async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Bo
         validate_service_url(config["librarr_url"], allowed)
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             media_type = normalize_media_type(config.get("librarr_media_type"))
-            response = await client.post(f"{config['librarr_url'].rstrip('/')}/api/wishlist", headers={"X-Api-Key":config["librarr_api_key"],"Idempotency-Key":key}, json={"title":candidate["title"],"author":candidate["author"],"media_type":media_type})
-            response.raise_for_status()
-            try: data = response.json()
-            except ValueError: data = {}
+            _response, body = await stream_bytes_async(
+                client,
+                "POST",
+                f"{config['librarr_url'].rstrip('/')}/api/wishlist",
+                headers={"X-Api-Key": config["librarr_api_key"], "Idempotency-Key": key},
+                json={"title": candidate["title"], "author": candidate["author"], "media_type": media_type},
+                max_bytes=settings.librarr_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Librarr returned an unsupported wishlist content type",
+                size_error="Librarr wishlist response is too large",
+            )
+            try:
+                parsed_body = json.loads(body) if body.strip() else {}
+                data = parsed_body if isinstance(parsed_body, dict) else {}
+            except ValueError:
+                data = {}
         remote_id = str(data.get("id", "imported"))
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
@@ -3394,10 +3415,10 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         media = normalize_media_type(media_type)
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 @app.get("/api/librarr/search/stream")
@@ -3413,18 +3434,30 @@ async def stream_librarr_search(
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
     assert client is not None and upstream is not None
 
     async def stream_bytes():
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
+            async for chunk in iter_bounded_bytes_async(
+                upstream,
+                max_bytes=settings.librarr_stream_max_bytes,
+                size_error="Librarr search stream is too large",
+            ):
+                yield chunk
+        except ResponseTooLargeError:
+            LOGGER.warning(
+                "Aborted Librarr SSE stream after exceeding %d bytes",
+                settings.librarr_stream_max_bytes,
+            )
+            error_payload = json.dumps(
+                {"message": "Librarr search stream exceeded the maximum response size."}
+            )
+            yield f"\n\nevent: error\ndata: {error_payload}\n\n".encode("utf-8")
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -3484,10 +3517,10 @@ async def download_librarr(payload: LibrarrDownloadIn):
                     )
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @fenced_async
 async def _import_csv_upload(file: UploadFile):
@@ -3951,22 +3984,45 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
+    """Return the cached models.dev provider catalog for the Settings picker.
+
+    Refreshes connect directly with ``follow_redirects=False`` and
+    ``trust_env=False`` (matching public source and catalog fetches so ambient
+    ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` and ``SSL_CERT_*`` variables
+    are ignored). Deployments that require an outbound HTTP proxy receive HTTP
+    502 here and should configure the LLM reranker endpoint URL and model ID
+    directly in Settings.
+    """
+
     now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get("https://models.dev/api.json")
-            resp.raise_for_status()
-            providers = _normalize_models_dev_catalog(resp.json())
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _resp, raw_catalog = await stream_json_async(
+                client,
+                "GET",
+                "https://models.dev/api.json",
+                max_bytes=settings.models_dev_max_bytes,
+                size_error="models.dev catalog response is too large",
+            )
+        if not isinstance(raw_catalog, dict):
+            raise ValueError("models.dev catalog must be a JSON object")
+        providers = _normalize_models_dev_catalog(raw_catalog)
         _MODELS_DEV_CACHE["providers"] = providers
         _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
         return {"providers": providers, "cached": False}
     except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
 
 
 def _validate_source_update_guardrails(source: dict[str, Any] | sqlite3.Row, payload: SourceUpdateIn):
@@ -4444,7 +4500,7 @@ async def preview_google_book_associations():
     try:
         associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+        raise HTTPException(502, f"Google Books preview failed: {safe_error_message(exc)}") from exc
     return {
         "provider": provider.provider,
         "count": len(associations),
