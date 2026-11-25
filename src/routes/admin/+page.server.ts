@@ -2,7 +2,17 @@ import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
-type Account = { id: string; profile_id: string; username: string; display_name: string; role: 'admin' | 'user'; status: 'active' | 'disabled' };
+type Account = {
+	id: string;
+	profile_id: string;
+	username: string;
+	display_name: string;
+	role: 'admin' | 'user';
+	status: 'active' | 'disabled';
+	recent_failed_attempts?: number;
+	locked_bucket_count?: number;
+	lockout_retry_after_seconds?: number;
+};
 type IdentityBackupStatus = {
 	enabled: boolean;
 	interval_hours: number;
@@ -52,6 +62,22 @@ export const actions: Actions = {
 		try {
 			await engine(`/admin/accounts/${encodeURIComponent(account_id)}/password`, { method: 'POST', body: JSON.stringify({ password }) });
 			return { message: 'Password reset; previous sessions were signed out.' };
+		} catch (error) { return failure(error); }
+	},
+	unlock: async ({ request }) => {
+		const form = await request.formData();
+		const account_id = String(form.get('account_id') || '').trim();
+		if (!account_id) return fail(400, { message: 'Choose a valid account.', error: true as const });
+		try {
+			const result = await engine<{ unlocked: boolean; username: string; cleared_attempts: number }>(
+				`/admin/accounts/${encodeURIComponent(account_id)}/unlock`,
+				{ method: 'POST', body: '{}' }
+			);
+			return {
+				message: result.cleared_attempts > 0
+					? `Unlocked ${result.username} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
+					: `Sign-in lockouts cleared for ${result.username}.`
+			};
 		} catch (error) { return failure(error); }
 	}
 };

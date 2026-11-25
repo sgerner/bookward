@@ -2,6 +2,14 @@ import { fail as kitFail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
+import { formatWaitDuration } from '#lib/lockout-ui.js';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resolveClientAddress,
+	setCurrentSessionToken,
+	withRequestContext
+} from '#lib/server/request-context.js';
 
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
 type AuthMethods = { password_enabled: boolean; oidc_identities: IdentityInfo[] };
@@ -26,18 +34,36 @@ export const load: PageServerLoad = async ({ locals, url }) => {
 };
 
 export const actions: Actions = {
-	changePassword: async ({ request, cookies, url }) => {
+	changePassword: async (event) => {
+		const { request, cookies, locals, url, setHeaders } = event;
 		const form = await request.formData();
 		const current_password = String(form.get('current_password') || '');
 		const new_password = String(form.get('new_password') || '');
 		if (new_password.length < 12) return fail(400, { message: 'Use at least 12 characters.' });
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
 		try {
-			const result = await engine<{ session_token: string; max_age: number }>('/auth/password/change', {
-				method: 'POST', body: JSON.stringify({ current_password, new_password })
-			});
+			const result = await withRequestContext({ sessionToken: currentSessionToken(), clientIp }, () =>
+				engine<{ session_token: string; max_age: number }>('/auth/password/change', {
+					method: 'POST', body: JSON.stringify({ current_password, new_password })
+				})
+			);
 			cookies.set(SESSION_COOKIE, result.session_token, sessionCookieOptions(url, result.max_age));
+			setCurrentSessionToken(result.session_token);
+			if (locals?.user) {
+				locals.user = { ...locals.user, must_change_password: false };
+			}
 			return { message: 'Password updated.' };
 		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return kitFail(429, {
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					error: true as const,
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
 			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Password could not be updated.' });
 		}
 	},

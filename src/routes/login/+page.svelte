@@ -122,7 +122,16 @@
 							Password
 							<input class="input min-h-12 w-full" name="password" type="password" autocomplete="current-password" required />
 						</label>
-						{#if form?.message}<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>{/if}
+						{#if form?.message}
+							{#if 'rateLimited' in form && form.rateLimited}
+								<div class="rounded-xl border border-warning-500/30 p-3.5 text-sm leading-6 preset-tonal-warning" role="alert">
+									<p class="font-medium">{form.message}</p>
+									<p class="mt-1 text-xs opacity-90">An administrator can also unlock this account in Manage accounts or with <code class="rounded bg-surface-950/10 px-1 py-0.5 font-mono">auth_admin unlock</code>.</p>
+								</div>
+							{:else}
+								<p class="rounded-xl border border-error-500/30 p-3 text-sm leading-6 preset-tonal-error" role="alert">{form.message}</p>
+							{/if}
+						{/if}
 						<button class="login-submit btn group min-h-12 w-full justify-between" type="submit" disabled={submitting} aria-busy={submitting}>
 							<span>{submitting ? 'Signing in…' : 'Sign in'}</span>{#if submitting}<RefreshCw size={17} class="animate-spin" />{:else}<ArrowRight size={17} class="transition-transform group-hover:translate-x-0.5" />{/if}
 						</button>

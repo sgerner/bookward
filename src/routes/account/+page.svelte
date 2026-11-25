@@ -13,7 +13,9 @@
 	<h1 class="mt-6 text-3xl font-semibold">Account</h1>
 	<p class="mt-2 text-surface-700-300">Signed in as <strong>{data.user.display_name || data.user.username}</strong>. Your recommendations and reading lists are private to this profile.</p>
 	{#if data.forcePasswordChange}<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">Set a personal password before continuing. Your administrator supplied a temporary password for this first sign-in.</p>{/if}
-	{#if form?.message && form.error}
+	{#if form?.message && 'rateLimited' in form && form.rateLimited}
+		<p class="mt-5 rounded-xl p-4 preset-tonal-warning" role="alert">{form.message}</p>
+	{:else if form?.message && form.error}
 		<p class="mt-5 rounded-xl p-4 preset-tonal-error" role="alert">{form.message}</p>
 	{:else if form?.message}
 		<p class="mt-5 rounded-xl p-4 preset-tonal-success" role="status">{form.message}</p>

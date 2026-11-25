@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import ProfileField from '#lib/components/ProfileField.svelte';
+	import { formatWaitDuration } from '#lib/lockout-ui.js';
 	import type { ActionData, PageData } from './$types';
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 	const backupTime = new Intl.DateTimeFormat('en', {
@@ -33,11 +34,38 @@
 	<section class="mt-8 grid gap-4">
 		<h2 class="text-xl font-semibold">Accounts</h2>
 		{#each data.accounts as account}
+			{@const lockedCount = account.locked_bucket_count ?? 0}
+			{@const failedCount = account.recent_failed_attempts ?? 0}
 			<article class="rounded-2xl border border-surface-300-700 p-5">
 				<div class="flex flex-wrap items-start justify-between gap-4">
-					<div><h3 class="font-semibold">{account.display_name || account.username}</h3><p class="text-sm text-surface-700-300">{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}</p></div>
-					{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
-						<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+					<div>
+						<div class="flex flex-wrap items-center gap-2">
+							<h3 class="font-semibold">{account.display_name || account.username}</h3>
+							{#if lockedCount > 0}
+								<span class="badge preset-tonal-warning">
+									Rate-limited ({lockedCount} {lockedCount === 1 ? 'source' : 'sources'} <span aria-hidden="true">·</span> {formatWaitDuration(account.lockout_retry_after_seconds)} left)
+								</span>
+							{/if}
+						</div>
+						<p class="text-sm text-surface-700-300">
+							{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}{#if failedCount > 0} <span aria-hidden="true">·</span> {failedCount} recent failed sign-in attempt{failedCount === 1 ? '' : 's'}{/if}
+						</p>
+					</div>
+					<div class="flex flex-wrap items-center gap-2">
+						<form method="POST" action="?/unlock" use:enhance>
+							<ProfileField profileId={data.user?.profile_id} />
+							<input type="hidden" name="account_id" value={account.id} />
+							<button
+								class="btn btn-sm {lockedCount > 0 ? 'preset-tonal-warning' : 'preset-tonal-surface'}"
+								type="submit"
+								aria-label={`Unlock account ${account.display_name || account.username}`}
+							>
+								Unlock
+							</button>
+						</form>
+						{#if account.id !== data.current_user_id}<form method="POST" action="?/setStatus" use:enhance>
+							<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button></form>{/if}
+					</div>
 				</div>
 				{#if account.id !== data.current_user_id}<form method="POST" action="?/resetPassword" use:enhance class="mt-4 flex flex-wrap items-end gap-3">
 					<ProfileField profileId={data.user?.profile_id} />

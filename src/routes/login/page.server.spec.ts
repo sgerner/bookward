@@ -6,11 +6,19 @@ const { engine } = vi.hoisted(() => ({
 
 vi.mock('#lib/server/engine.js', () => ({
 	EngineError: class EngineError extends Error {
-		status = 500;
+		constructor(
+			message: string,
+			readonly status = 500,
+			readonly retryAfterSeconds?: number
+		) {
+			super(message);
+		}
 	},
 	engine,
 }));
 
+import { EngineError } from '#lib/server/engine.js';
+import { currentClientIp } from '#lib/server/request-context.js';
 import { actions, load } from './+page.server';
 
 const oidcConfig = { setup_required: false, local_login_enabled: true, oidc_enabled: true };
@@ -57,6 +65,53 @@ describe('login page loader', () => {
 
 		await expect(load({ url: new URL('https://bookward.test/login?next=%2F%2Fevil.example') } as never))
 			.rejects.toMatchObject({ status: 303, location: '/auth/oidc/start?intent=login&next=%2F' });
+	});
+
+	it('forwards client IPs and distinguishes HTTP 429 wait guidance from HTTP 401 errors', async () => {
+		let seenClientIp: string | undefined;
+		engine.mockImplementationOnce(() => {
+			seenClientIp = currentClientIp();
+			return Promise.reject(new EngineError('Username or password is incorrect', 401));
+		});
+		const makeFormRequest = () => {
+			const form = new FormData();
+			form.set('username', 'bookward');
+			form.set('password', 'wrong-password');
+			return new Request('https://bookward.test/login?/login', { method: 'POST', body: form });
+		};
+		const setHeaders = vi.fn();
+
+		const wrongPassword = await actions.login({
+			request: makeFormRequest(),
+			cookies: { set: vi.fn() },
+			url: new URL('https://bookward.test/login'),
+			setHeaders,
+			getClientAddress: () => '203.0.113.10'
+		} as never);
+		expect(seenClientIp).toBe('203.0.113.10');
+		expect(wrongPassword).toMatchObject({
+			status: 401,
+			data: { message: 'Username or password is incorrect.' }
+		});
+		expect(setHeaders).not.toHaveBeenCalled();
+
+		engine.mockRejectedValueOnce(new EngineError('Too many failed password attempts.', 429, 895));
+		const lockedOut = await actions.login({
+			request: makeFormRequest(),
+			cookies: { set: vi.fn() },
+			url: new URL('https://bookward.test/login'),
+			setHeaders,
+			getClientAddress: () => '203.0.113.10'
+		} as never);
+		expect(setHeaders).toHaveBeenCalledWith({ 'retry-after': '895' });
+		expect(lockedOut).toMatchObject({
+			status: 429,
+			data: {
+				rateLimited: true,
+				retryAfterSeconds: 895,
+				message: expect.stringContaining('Wait 15 minutes')
+			}
+		});
 	});
 
 	it('omits Secure on HTTP setup and login session cookies and sets Secure on HTTPS', async () => {
