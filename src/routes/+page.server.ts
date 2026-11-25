@@ -7,6 +7,11 @@ import {
   engineStatus,
   isPayloadTooLarge,
 } from "#lib/server/engine.js";
+import {
+  INVALID_LLM_RERANK_MODE_MESSAGE,
+  type LlmRerankMode,
+  parseLlmRerankMode,
+} from "#lib/llm-rerank.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -133,7 +138,7 @@ type Overview = {
     digest: DigestSettings;
     llm_rerank?: {
       enabled: boolean;
-      mode?: "cloud" | "ollama" | "openai-compatible";
+      mode?: LlmRerankMode;
       provider: string;
       api_url: string;
       model: string;
@@ -329,6 +334,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,
       ...overview.settings,
+      ...(overview.settings.llm_rerank
+        ? {
+            llm_rerank: {
+              ...overview.settings.llm_rerank,
+              mode:
+                parseLlmRerankMode(overview.settings.llm_rerank.mode, "cloud") ??
+                "cloud",
+            },
+          }
+        : {}),
       source_sync_interval_hours: overview.settings.source_sync_interval_hours ?? 24,
       digest: overview.settings.digest,
       // Keep the UI compatible while an already-running engine is being
@@ -1252,15 +1267,12 @@ export const actions: Actions = {
   configureLlmRerank: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
-    const modeResult = z
-      .enum(["cloud", "ollama", "openai-compatible"])
-      .safeParse(String(data.get("mode") || "cloud").trim().toLowerCase());
-    if (!modeResult.success) {
+    const mode = parseLlmRerankMode(data.get("mode"), "cloud");
+    if (!mode) {
       return fail(400, {
-        message: "Choose a valid LLM reranker mode.",
+        message: INVALID_LLM_RERANK_MODE_MESSAGE,
       });
     }
-    const mode = modeResult.data;
     const provider = String(data.get("provider") || "").trim();
     const rawApiUrl = String(data.get("apiUrl") || "").trim();
     const apiUrl =

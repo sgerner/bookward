@@ -2271,12 +2271,34 @@ def test_existing_cloud_setup_with_encrypted_key_loads_reranks_and_clears(
 
 def test_validated_llm_target_url_rejects_traversal_and_canonicalizes_components() -> None:
     import pytest
+    import afterword_engine.llm_reranker as llm_reranker_module
     from afterword_engine.llm_reranker import (
         _build_validated_llm_target_url,
-        validate_llm_rerank_url,
+        canonical_llm_endpoint_key,
+        validate_llm_api_url,
     )
 
+    assert not hasattr(llm_reranker_module, "validate_llm_rerank_url")
+    assert not hasattr(llm_reranker_module, "_validate_and_split_llm_origin")
+    assert not hasattr(llm_reranker_module, "llm_url_origin")
+
     allowed = {"ollama", "vllm"}
+    assert (
+        validate_llm_api_url("http://OLLAMA.:11434/v1", allowed, has_api_key=False)
+        == "http://ollama:11434/v1/chat/completions"
+    )
+    assert canonical_llm_endpoint_key("http://OLLAMA.:11434/api/chat", "ollama") == (
+        "http",
+        "ollama",
+        11434,
+        "",
+    )
+    assert canonical_llm_endpoint_key("http://vllm:8000", "openai-compatible") == (
+        "http",
+        "vllm",
+        8000,
+        "/v1/chat/completions",
+    )
     assert (
         _build_validated_llm_target_url(
             "http://OLLAMA.:11434/api/chat",
@@ -2314,18 +2336,35 @@ def test_validated_llm_target_url_rejects_traversal_and_canonicalizes_components
         == "http://vllm:8000/v1/models"
     )
 
+    assert (
+        validate_llm_api_url(
+            "http://ollama:11434/v1?api-version=2024-10-21#frag",
+            allowed,
+            has_api_key=False,
+        )
+        == "http://ollama:11434/v1/chat/completions?api-version=2024-10-21"
+    )
+    assert canonical_llm_endpoint_key("http://ollama:11434/v1#frag", "ollama") is None
+    with pytest.raises(ValueError):
+        _build_validated_llm_target_url(
+            "http://ollama:11434/v1#frag",
+            mode="ollama",
+            endpoint="chat",
+            allowed_hosts=allowed,
+        )
+
     malformed_urls = [
         "http://ollama:11434/../../admin",
         "http://ollama:11434/%2e%2e/admin",
         "http://ollama:11434\\@127.0.0.1",
         "http://user:secret@ollama:11434",
         "http://ollama:11434/v1?redirect=http://127.0.0.1",
-        "http://ollama:11434/v1#frag",
         "http://ollama:99999/v1",
     ]
     for bad in malformed_urls:
         with pytest.raises(ValueError):
-            validate_llm_rerank_url(bad, allowed)
+            validate_llm_api_url(bad, allowed, has_api_key=False)
+        assert canonical_llm_endpoint_key(bad, "ollama") is None
         with pytest.raises(ValueError):
             _build_validated_llm_target_url(
                 bad, mode="ollama", endpoint="chat", allowed_hosts=allowed
@@ -2787,3 +2826,123 @@ def test_clear_api_key_suppresses_env_llm_rerank_api_key_and_custom_urls_do_not_
             )
         assert main_module.effective_llm_rerank_settings()["api_key"] == ""
         assert client.get("/api/settings/llm-rerank").json()["api_key_set"] is False
+
+
+def test_mode_allowlist_rejects_unknown_modes_with_400_and_guards_stored_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    from afterword_engine.llm_reranker import (
+        LLM_RERANK_MODES,
+        read_stored_llm_rerank_mode,
+    )
+    from afterword_engine.secrets import seal
+    import afterword_engine.main as main_module
+
+    assert LLM_RERANK_MODES == ("cloud", "ollama", "openai-compatible")
+    assert read_stored_llm_rerank_mode("OLLAMA") == ("ollama", True)
+    assert read_stored_llm_rerank_mode(None) == ("cloud", True)
+    assert read_stored_llm_rerank_mode("  ") == ("cloud", True)
+    assert read_stored_llm_rerank_mode("anthropic-native") == ("cloud", False)
+
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMRerankSettingsIn(mode="anthropic-native").validate_values()
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMRerankTestIn(mode="anthropic-native").validate_values()
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMModelsDiscoverIn(mode="anthropic-native").validate_values()
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "mode_allowlist.db"))
+    monkeypatch.setattr(settings, "llm_rerank_mode", "cloud")
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    initialize()
+    profiles.initialize_auth()
+
+    with TestClient(main_module.app, headers=authenticated_headers()) as client:
+        bad_save = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": "unknown-mode",
+                "api_url": "http://ollama:11434",
+                "model": "qwen2.5:7b",
+            },
+        )
+        assert bad_save.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_save.json()["detail"]
+
+        bad_test = client.post(
+            "/api/llm/test",
+            json={
+                "mode": "unknown-mode",
+                "api_url": "http://ollama:11434",
+                "model": "qwen2.5:7b",
+            },
+        )
+        assert bad_test.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_test.json()["detail"]
+
+        bad_get_models = client.get("/api/llm/models", params={"mode": "unknown-mode"})
+        assert bad_get_models.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_get_models.json()["detail"]
+
+        bad_post_models = client.post(
+            "/api/llm/models",
+            json={"mode": "unknown-mode", "api_url": "http://ollama:11434"},
+        )
+        assert bad_post_models.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_post_models.json()["detail"]
+
+        # Corrupted/unknown stored SQLite mode falls back safely without exposing or rebinding a saved key
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_mode','corrupted-mode',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='corrupted-mode',secret=0"
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_api_url','https://api.openai.com/v1/chat/completions',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='https://api.openai.com/v1/chat/completions',secret=0"
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_api_key',?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+                (seal("sk-bound-to-corrupted-mode"),),
+            )
+
+        effective = main_module.effective_llm_rerank_settings()
+        assert effective["mode"] == "cloud"
+        assert effective["api_key"] == ""
+
+        safe = client.get("/api/settings/llm-rerank")
+        assert safe.status_code == 200
+        assert safe.json()["mode"] == "cloud"
+        assert safe.json()["api_key_set"] is False
+
+        # Saving under cloud with blank key must reject reusing the corrupted-mode key unless cleared/replaced
+        rebind_attempt = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": "cloud",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-4o-mini",
+            },
+        )
+        assert rebind_attempt.status_code == 400
+
+        # Invalid env mode also falls back safely without attaching env key
+        with transaction() as con:
+            con.execute("DELETE FROM settings WHERE key IN ('llm_rerank_mode','llm_rerank_api_key')")
+        monkeypatch.setattr(settings, "llm_rerank_mode", "invalid-env-mode")
+        monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-env-should-not-leak")
+        env_effective = main_module.effective_llm_rerank_settings()
+        assert env_effective["mode"] == "cloud"
+        assert env_effective["api_key"] == ""
+

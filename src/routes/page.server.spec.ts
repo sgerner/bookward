@@ -1528,6 +1528,18 @@ describe("page actions", () => {
     } as never)) as { status: number; data: { message: string } };
     expect(blocked.status).toBe(400);
     expect(blocked.data.message).toContain("Private, loopback");
+
+    const invalidModeBody = new FormData();
+    invalidModeBody.set("mode", "unsupported-mode");
+    const invalidMode = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: invalidModeBody,
+      }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(invalidMode.status).toBe(400);
+    expect(invalidMode.data.message).toBe("Choose a valid LLM reranker mode.");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("throws HTTP 503 without contacting the engine when hooks report an outage", async () => {

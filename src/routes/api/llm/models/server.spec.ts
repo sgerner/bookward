@@ -153,4 +153,47 @@ describe("/api/llm routes", () => {
       use_saved_key: true,
     });
   });
+
+  it("rejects unknown mode values with HTTP 400 without contacting the engine", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const badGet = await GET({
+      url: new URL("http://afterword.test/api/llm/models?mode=bogus"),
+    } as never);
+    expect(badGet.status).toBe(400);
+    await expect(badGet.json()).resolves.toEqual({
+      message: "Choose a valid LLM reranker mode.",
+    });
+
+    const badPostModels = await POST({
+      request: new Request("http://afterword.test/api/llm/models", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode: "bogus", api_url: "http://ollama:11434" }),
+      }),
+    } as never);
+    expect(badPostModels.status).toBe(400);
+    await expect(badPostModels.json()).resolves.toEqual({
+      message: "Choose a valid LLM reranker mode.",
+    });
+
+    const badPostTest = await testPOST({
+      request: new Request("http://afterword.test/api/llm/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          mode: "bogus",
+          api_url: "http://ollama:11434",
+          model: "qwen2.5:7b",
+        }),
+      }),
+    } as never);
+    expect(badPostTest.status).toBe(400);
+    await expect(badPostTest.json()).resolves.toEqual({
+      message: "Choose a valid LLM reranker mode.",
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

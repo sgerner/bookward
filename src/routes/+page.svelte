@@ -64,6 +64,10 @@
   import { tokenForView } from "#lib/api-token-ui.js";
   import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
+    parseLlmRerankMode,
+    type LlmRerankMode,
+  } from "#lib/llm-rerank.js";
+  import {
     canRunDigestNow,
     canTestDigestChannel,
     hasUnsavedDigestChanges,
@@ -336,7 +340,6 @@
   let embeddingBackendOverride = $state<string | null>(null);
   let embeddingModelOverride = $state<string | null>(null);
   let embeddingUrlOverride = $state<string | null>(null);
-  type LlmRerankMode = "cloud" | "ollama" | "openai-compatible";
   type LlmModelItem = { id: string; name: string };
   type LlmCatalogProvider = {
     id: string;
@@ -735,7 +738,7 @@
   );
   const llmEnabled = $derived(llmEnabledOverride ?? llmRerank.enabled);
   const llmMode = $derived(
-    (llmModeOverride ?? llmRerank.mode ?? "cloud") as LlmRerankMode,
+    parseLlmRerankMode(llmModeOverride ?? llmRerank.mode, "cloud") ?? "cloud",
   );
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);

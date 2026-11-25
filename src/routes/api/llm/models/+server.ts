@@ -1,10 +1,15 @@
 import type { RequestHandler } from "./$types";
 import { engine, engineStatus } from "#lib/server/engine.js";
+import {
+  INVALID_LLM_RERANK_MODE_MESSAGE,
+  type LlmRerankMode,
+  parseLlmRerankMode,
+} from "#lib/llm-rerank.js";
 
 type LlmModelEntry = { id: string; name: string };
 
 type LlmCatalogResponse = {
-  mode?: "cloud" | "ollama" | "openai-compatible";
+  mode?: LlmRerankMode;
   api_url?: string;
   models?: LlmModelEntry[];
   providers?: Array<{
@@ -23,10 +28,16 @@ const errorMessage = (error: unknown) =>
 
 export const GET: RequestHandler = async ({ url }) => {
   try {
-    const mode = (url.searchParams.get("mode") || "").trim();
+    const mode = parseLlmRerankMode(url.searchParams.get("mode"), "cloud");
+    if (!mode) {
+      return Response.json(
+        { message: INVALID_LLM_RERANK_MODE_MESSAGE },
+        { status: 400 },
+      );
+    }
     const apiUrl = (url.searchParams.get("api_url") || "").trim();
     const params = new URLSearchParams();
-    if (mode && mode !== "cloud") params.set("mode", mode);
+    if (mode !== "cloud") params.set("mode", mode);
     if (apiUrl) params.set("api_url", apiUrl);
     const query = params.toString();
     const catalog = await engine<LlmCatalogResponse>(
@@ -46,10 +57,17 @@ export const POST: RequestHandler = async ({ request }) => {
       api_key?: unknown;
       use_saved_key?: unknown;
     };
+    const mode = parseLlmRerankMode(payload.mode, "cloud");
+    if (!mode) {
+      return Response.json(
+        { message: INVALID_LLM_RERANK_MODE_MESSAGE },
+        { status: 400 },
+      );
+    }
     const catalog = await engine<LlmCatalogResponse>("/api/llm/models", {
       method: "POST",
       body: JSON.stringify({
-        mode: typeof payload.mode === "string" ? payload.mode : "cloud",
+        mode,
         api_url: typeof payload.api_url === "string" ? payload.api_url : "",
         api_key: typeof payload.api_key === "string" ? payload.api_key : "",
         use_saved_key: payload.use_saved_key === true,
