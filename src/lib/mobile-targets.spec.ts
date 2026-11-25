@@ -223,19 +223,35 @@ describe("mobile target sizes and modal bounds", () => {
 
   it("bounds Librarr Search dialog with flex layout and sizes modal close and acquisition buttons", () => {
     const { source, fragment } = readTemplate("../routes/+page.svelte");
-    const dialogs = collectElements(fragment, "dialog");
+    const collectComponents = (node: unknown, name: string): AstNode[] => {
+      if (!node || typeof node !== "object") return [];
+      const record = node as AstNode;
+      const found: AstNode[] =
+        record.type === "Component" && record.name === name ? [record] : [];
+      for (const [key, value] of Object.entries(record)) {
+        if (key === "attributes") continue;
+        if (Array.isArray(value)) {
+          for (const child of value) found.push(...collectComponents(child, name));
+        } else if (value && typeof value === "object") {
+          found.push(...collectComponents(value, name));
+        }
+      }
+      return found;
+    };
+    const dialogs = collectComponents(fragment, "ModalDialog").filter(
+      (node) => getStaticAttr(node, "ariaLabelledby") === "librarr-search-title",
+    );
     expect(dialogs.length).toBe(1);
 
-    const dialog = dialogs[0].element;
+    const dialog = dialogs[0];
     const dialogClass = getRawAttrSlice(source, dialog, "class");
     expect(dialogClass).toContain("flex");
     expect(dialogClass).toContain("flex-col");
-    expect(source.slice(dialog.start ?? 0, dialog.end ?? 0)).not.toContain(
-      "max-h-[calc(100vh-11rem)]",
-    );
-    expect(source.slice(dialog.start ?? 0, dialog.end ?? 0)).toContain(
-      "min-h-0 flex-1 overflow-y-auto",
-    );
+    const dialogSlice = source.slice(dialog.start ?? 0, dialog.end ?? 0);
+    expect(dialogSlice).not.toContain("max-h-[calc(100vh-11rem)]");
+    expect(dialogSlice).toContain("min-h-0");
+    expect(dialogSlice).toContain("flex-1");
+    expect(dialogSlice).toContain("overflow-y-auto");
 
     const closeButtons = collectElements(fragment, "button").filter(({ element }) => {
       const label = getStaticAttr(element, "aria-label");
