@@ -39,13 +39,18 @@
     X,
   } from "@lucide/svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import InlineAlert from "#lib/components/InlineAlert.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
   import StarRatingBadge from "#lib/components/StarRatingBadge.svelte";
+  import StatusRegion from "#lib/components/StatusRegion.svelte";
   import SwitchControl from "#lib/components/SwitchControl.svelte";
   import ThemePicker from "#lib/components/ThemePicker.svelte";
-  import { copyApiTokenText } from "#lib/api-token-clipboard.js";
+  import {
+    copyApiTokenText,
+    type ApiTokenCopyStatus,
+  } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
   import { tokenForView } from "#lib/api-token-ui.js";
   import {
@@ -60,6 +65,12 @@
     resetLlmRerankOverrides,
     selectLlmCatalogProvider,
   } from "#lib/llm-rerank-ui.js";
+  import {
+    formatLibrarrSearchStatus,
+    formatLlmCatalogStatus,
+    formatReadingHistoryStatus,
+    formatRecommendationStatus,
+  } from "#lib/live-status.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -173,12 +184,14 @@
   let previousQueriedDecisionStatus = "decisions";
   let discoverLoading = $state(false);
   let discoverLoadError = $state("");
+  let recommendationsImmediate = $state(false);
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
   let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let readingHistoryImmediate = $state(false);
   let readingHistoryScoreState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryError = $state("");
   let readingHistoryScoreError = $state("");
@@ -238,7 +251,7 @@
   let digestSmtpUsername = $state("");
   let digestSmtpPassword = $state("");
   let digestClearSmtpCredentials = $state(false);
-  let apiTokenCopyMessage = $state<string | null>(null);
+  let apiTokenCopyStatus = $state<ApiTokenCopyStatus | null>(null);
   let revealedApiToken = $state<string | null>(null);
   let formNotificationDismissed = $state(false);
   let notificationPointerInside = false;
@@ -274,8 +287,11 @@
     models: Array<{ id: string; name: string }>;
   };
   let llmCatalogProviders = $state<LlmCatalogProvider[]>([]);
+  let llmCatalogLoaded = $state(false);
   let llmCatalogLoading = $state(false);
   let llmCatalogError = $state("");
+  let llmCatalogImmediate = $state(false);
+  let llmActiveFilter = $state<"none" | "provider" | "model">("none");
   let llmProviderSearch = $state("");
   let llmModelSearch = $state("");
   let llmEnabledOverride = $state<boolean | null>(null);
@@ -316,6 +332,11 @@
     return discoverSearch;
   }
   function setSearchForView(view: FilterableView, value: string) {
+    if (view === "decisions" && decisionFilter === "read") {
+      readingHistoryImmediate = false;
+    } else {
+      recommendationsImmediate = false;
+    }
     if (view === "saved") savedSearch = value;
     else if (view === "decisions") decisionsSearch = value;
     else discoverSearch = value;
@@ -326,6 +347,7 @@
     return discoverGenre;
   }
   function setGenreForView(view: FilterableView, value: string) {
+    recommendationsImmediate = false;
     if (view === "saved") savedGenre = value;
     else if (view === "decisions") decisionsGenre = value;
     else discoverGenre = value;
@@ -688,6 +710,22 @@
     );
   });
 
+  const llmCatalogStatusMessage = $derived(
+    formatLlmCatalogStatus({
+      loaded: llmCatalogLoaded,
+      loading: llmCatalogLoading,
+      hasError: Boolean(llmCatalogError),
+      totalProviders: llmCatalogProviders.length,
+      matchedProviders: filteredLlmProviders.length,
+      providerQuery: llmProviderSearch,
+      selectedProviderName: selectedCatalogProvider?.name ?? null,
+      totalModels: selectedCatalogProvider?.models.length ?? 0,
+      matchedModels: filteredLlmModels.length,
+      modelQuery: llmModelSearch,
+      activeFilter: llmActiveFilter,
+    }),
+  );
+
   async function loadLlmCatalog() {
     if (llmCatalogLoading) return;
     llmCatalogLoading = true;
@@ -700,6 +738,9 @@
         return;
       }
       llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
+      llmCatalogLoaded = true;
+      llmActiveFilter = "none";
+      llmCatalogImmediate = true;
     } catch (error) {
       llmCatalogError =
         error instanceof Error
@@ -714,6 +755,8 @@
     const selection = selectLlmCatalogProvider(providerId, llmCatalogProviders);
     llmProviderOverride = selection.provider;
     llmModelSearch = "";
+    llmActiveFilter = "none";
+    llmCatalogImmediate = true;
     if (selection.apiUrl !== null) {
       llmApiUrlOverride = selection.apiUrl;
     }
@@ -918,6 +961,7 @@
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
     readingHistoryState = "loading";
+    readingHistoryImmediate = true;
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
@@ -932,6 +976,7 @@
         throw new Error(payload.message || "Reading history could not be loaded.");
       }
       readingHistory = payload.items;
+      readingHistoryImmediate = true;
       readingHistoryState = "ready";
       void loadReadingHistoryScores(payload.items.length);
     } catch (error) {
@@ -985,6 +1030,9 @@
     return task;
   }
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+    const inDecisionsView = activeView === "decisions";
+    recommendationsImmediate = inDecisionsView;
+    readingHistoryImmediate = inDecisionsView;
     decisionFilter = nextFilter;
     readingHistoryVisibleCount = 30;
     decisionsLoadError = "";
@@ -1012,7 +1060,9 @@
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
   function go(view: View) {
-    revealedApiToken = tokenForView(view, revealedApiToken);
+    const nextToken = tokenForView(view, revealedApiToken);
+    if (!nextToken) apiTokenCopyStatus = null;
+    revealedApiToken = nextToken;
     activeView = view;
     if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
     if (typeof window !== "undefined") {
@@ -1500,6 +1550,20 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  function formatStorageSize(bytes: number | undefined) {
+    const safe = Math.max(0, Number(bytes ?? 0));
+    if (safe === 0) return "0 KB";
+    if (safe < 1024 * 1024) return `${Math.max(1, Math.round(safe / 1024))} KB`;
+    if (safe < 1024 * 1024 * 1024) return `${(safe / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(safe / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function evidencePercent(usedBytes: number | undefined, quotaBytes: number | undefined) {
+    const quota = Math.max(1, Number(quotaBytes ?? 512 * 1024 * 1024));
+    const used = Math.max(0, Number(usedBytes ?? 0));
+    return Math.min(100, Math.round((used / quota) * 100));
+  }
+
   async function fetchInitialFilteredDiscover(
     key: string,
     searchQuery: string,
@@ -1537,6 +1601,7 @@
       filteredDiscoverLoadedKey = key;
       filteredDiscoverPending = false;
       discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
       discoverLoadError =
@@ -1558,6 +1623,7 @@
 
   function reloadFilteredDiscover() {
     if (!hasActiveDiscoverFilter) return;
+    recommendationsImmediate = true;
     filteredDiscoverPending = true;
     void fetchInitialFilteredDiscover(
       activeDiscoverFilterKey,
@@ -1569,6 +1635,7 @@
   async function loadMoreDiscover() {
     if (discoverLoading || filteredDiscoverPending || digestRequested) return;
     if (discoverVisibleCount < discoverViewBooks.length) {
+      recommendationsImmediate = true;
       discoverVisibleCount = Math.min(
         discoverVisibleCount + DISCOVER_PAGE_SIZE,
         discoverViewBooks.length,
@@ -1627,6 +1694,7 @@
         unfilteredDiscoverOffset = offset + payload.items.length;
         unfilteredDiscoverHasMore = payload.has_more === true;
       }
+      recommendationsImmediate = true;
       discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
@@ -1679,6 +1747,7 @@
       queriedDecisionsHasMore = payload.has_more === true;
       queriedDecisionLoadedKey = key;
       queriedDecisionPending = false;
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError =
@@ -1700,6 +1769,7 @@
 
   function reloadQueriedDecisions() {
     if (!isQueriedDecisionMode) return;
+    recommendationsImmediate = true;
     queriedDecisionPending = true;
     void fetchInitialQueriedDecisions(
       activeDecisionQueryKey,
@@ -1762,6 +1832,7 @@
         unfilteredDecisionOffset = offset + payload.items.length;
         decisionsHasMoreOverride = payload.has_more === true;
       }
+      recommendationsImmediate = true;
     } catch (error) {
       if (controller.signal.aborted || decisionQueryAbortController !== controller) return;
       decisionsLoadError = error instanceof Error
@@ -1873,6 +1944,17 @@
       .map((result, index) => ({ result, index, score: resultScore(result) }))
       .filter((item): item is { result: LibrarrResult; index: number; score: number } => item.score !== null && item.score >= 90),
   );
+  const librarrStatusMessage = $derived(
+    formatLibrarrSearchStatus({
+      state: librarrSearchState,
+      resultCount: librarrResults.length,
+      mediaType: librarrSearchedMediaType,
+    }),
+  );
+  const librarrSearchImmediate = $derived(
+    librarrSearchState === "ready" ||
+      (librarrSearchState === "searching" && librarrResults.length === 0),
+  );
   function resultKey(result: LibrarrResult, index: number) {
     return `${resultIdentity(result)}-${index}`;
   }
@@ -1959,15 +2041,22 @@
   }
 
   async function copyApiToken() {
-    apiTokenCopyMessage = await copyApiTokenText(
+    apiTokenCopyStatus = null;
+    await tick();
+    apiTokenCopyStatus = await copyApiTokenText(
       revealedApiToken ?? "",
       navigator.clipboard,
     );
   }
 
   $effect(() => {
-    if (formState?.token) revealedApiToken = formState.token;
-    else if (formState) revealedApiToken = null;
+    if (formState?.token) {
+      revealedApiToken = formState.token;
+      apiTokenCopyStatus = null;
+    } else if (formState) {
+      revealedApiToken = null;
+      apiTokenCopyStatus = null;
+    }
   });
 
   $effect(() => {
@@ -2151,7 +2240,9 @@
       return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) void loadMoreDiscover();
+        if (!discoverLoadError && entries.some((entry) => entry.isIntersecting)) {
+          void loadMoreDiscover();
+        }
       },
       { rootMargin: "240px 0px" },
     );
@@ -2341,7 +2432,9 @@
       const nextView = readView(
         new URL(window.location.href).searchParams.get("view"),
       );
-      revealedApiToken = tokenForView(nextView, revealedApiToken);
+      const nextToken = tokenForView(nextView, revealedApiToken);
+      if (!nextToken) apiTokenCopyStatus = null;
+      revealedApiToken = nextToken;
       activeView = nextView;
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
@@ -2649,7 +2742,6 @@
       {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
-
         {@const viewSearch = searchForView(view)}
         {@const viewGenre = genreForView(view)}
         {@const viewGenres = genresForView(view)}
@@ -2659,6 +2751,28 @@
         {@const viewHasMoreDiscoverBooks = view === "discover" && (viewVisibleBooks.length < viewBooks.length || effectiveDiscoverHasMore)}
         {@const viewInitialLoading = (view === "discover" && hasActiveDiscoverFilter && (filteredDiscoverPending || (discoverLoading && filteredDiscoverLoadedKey !== activeDiscoverFilterKey))) || (view === "decisions" && isQueriedDecisionMode && (queriedDecisionPending || (decisionsLoading && queriedDecisionLoadedKey !== activeDecisionQueryKey)))}
         {@const viewFilterError = view === "discover" && hasActiveDiscoverFilter ? discoverLoadError : view === "decisions" && isQueriedDecisionMode ? decisionsLoadError : ""}
+        {@const totalDecisionBooks = unfilteredDecisionBooks.length}
+        {@const recommendationStatusMessage = formatRecommendationStatus({
+          view,
+          visibleCount: viewVisibleBooks.length,
+          matchedCount: viewBooks.length,
+          shortlistTotalCount,
+          totalDecisionCount: totalDecisionBooks,
+          hasActiveFilter: viewHasFilter,
+          decisionFilter,
+          digestVisible,
+          digestRequested,
+          discoverHasMore: effectiveDiscoverHasMore,
+          loading: viewInitialLoading,
+          hasError: Boolean(viewFilterError),
+        })}
+        {@const hasActiveReadingFilter = Boolean(decisionsSearch.trim() || readingHistoryRatingFilter !== "all" || readingHistorySourceFilter !== "all")}
+        {@const readingHistoryStatusMessage = formatReadingHistoryStatus({
+          state: readingHistoryState,
+          visibleCount: visibleReadingHistory.length,
+          matchedCount: filteredReadingHistory.length,
+          hasActiveFilter: hasActiveReadingFilter,
+        })}
         <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
             class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
@@ -2703,7 +2817,19 @@
               {/if}
           </div>
         </section>
+        <StatusRegion
+          message={view === "decisions" && decisionFilter === "read" ? "" : recommendationStatusMessage}
+          immediate={recommendationsImmediate}
+          contextKey={view}
+          paused={activeView !== view}
+        />
         {#if view === "decisions"}
+          <StatusRegion
+            message={decisionFilter === "read" ? readingHistoryStatusMessage : ""}
+            immediate={readingHistoryImmediate}
+            contextKey="decisions-read"
+            paused={activeView !== "decisions"}
+          />
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
@@ -2746,7 +2872,6 @@
         {/if}
         <section
           class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
-          aria-live="polite"
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
@@ -2913,11 +3038,11 @@
               </div>
             </article>
           {:else}
-            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status">
+            {#if viewInitialLoading}<div class="card col-span-full flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300">
                 <RefreshCw size={17} class="animate-spin" />{view === "decisions" ? "Loading past decisions…" : "Searching recommendations…"}
               </div>
-            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{viewFilterError}</p>
+            {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={viewFilterError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
@@ -2935,11 +3060,11 @@
                 </form>{/if}
               </div>{/if}{/each}
           {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if discoverLoadError}<p class="text-sm text-error-600-400" role="alert">{discoverLoadError}</p>{/if}
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
+              <InlineAlert message={discoverLoadError} />
+              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
             </div>{/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
-              {#if decisionsLoadError}<p class="text-sm text-error-600-400" role="alert">{decisionsLoadError}</p>{/if}
+              <InlineAlert message={decisionsLoadError} />
               <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
                 {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
               </button>
@@ -2955,7 +3080,7 @@
               <div class="mb-5 grid gap-3 sm:grid-cols-3" role="group" aria-label="Filter and sort read books">
                 <label class="block text-sm font-medium text-surface-800-200">
                   Rating
-                  <select bind:value={readingHistoryRatingFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
+                  <select bind:value={readingHistoryRatingFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
                     <option value="all">Any rating</option>
                     <option value="rated">Rated</option>
                     <option value="unrated">Unrated</option>
@@ -2963,7 +3088,7 @@
                 </label>
                 <label class="block text-sm font-medium text-surface-800-200">
                   Source
-                  <select bind:value={readingHistorySourceFilter} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
+                  <select bind:value={readingHistorySourceFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
                     <option value="all">All sources</option>
                     {#each readingHistorySources as source (source)}
                       <option value={source}>{readingSourceLabel(source)}</option>
@@ -2984,20 +3109,24 @@
               </div>
             {/if}
             {#if readingHistoryScoreState === "loading"}
-              <p class="mb-4 text-sm text-surface-700-300" role="status" aria-live="polite">
+              <p class="mb-4 text-sm text-surface-700-300">
                 Calculating Bookward scores for {scoredReadingHistoryCount} of {readingHistory.length} read books…
               </p>
             {:else if readingHistoryScoreState === "error"}
-              <div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-surface-700-300" role="status">
-                <span>{readingHistoryScoreError} Scores loaded for {scoredReadingHistoryCount} of {readingHistory.length} books.</span>
-                <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+              <div class="mb-4 flex flex-wrap items-center gap-3">
+                <InlineAlert
+                  tone="warning"
+                  size="sm"
+                  message={`${readingHistoryScoreError} Scores loaded for ${scoredReadingHistoryCount} of ${readingHistory.length} books.`}
+                />
+                <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
             {#if readingHistoryState === "loading"}
-              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" role="status"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
-              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center" role="alert">
-                <p class="text-sm text-surface-700-300">{readingHistoryError}</p>
+              <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
+                <InlineAlert message={readingHistoryError} />
                 <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
@@ -3069,7 +3198,7 @@
                 {/each}
               </div>
               {#if visibleReadingHistory.length < filteredReadingHistory.length}
-                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => (readingHistoryVisibleCount += 30)}><ArrowRight size={14} /> Load more books</button></div>
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
               {/if}
             {:else}
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
@@ -3181,6 +3310,15 @@
                   </div>
                 </div>
                 <div id="source-filter-panel" role="tabpanel" aria-labelledby={`source-tab-${sourceFilter}`} tabindex="0" class="min-w-0 divide-y divide-surface-200-800">
+                  <StatusRegion
+                    message={formState?.sourcePreview
+                      ? formState.sourcePreview.count === 0
+                        ? `Preview matched 0 of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.`
+                        : `Preview matched ${formState.sourcePreview.count} of ${formState.sourcePreview.rawCount} book${formState.sourcePreview.rawCount === 1 ? "" : "s"}.`
+                      : ""}
+                    immediate
+                    paused={activeView !== "sources"}
+                  />
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
@@ -3383,7 +3521,6 @@
                                 {#if formState?.sourcePreview?.id === source.id}
                                   <div
                                     class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
-                                    role="status"
                                   >
                                     {#if formState.sourcePreview.count === 0}
                                       Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
@@ -3634,13 +3771,118 @@
                   </div>
                 </div>
 
+                <StatusRegion
+                  message={data.backupStatus.last_error ?? ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if data.backupStatus.last_error}
-                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm" role="status">{data.backupStatus.last_error}</p>
+                  <p class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-3 text-sm">{data.backupStatus.last_error}</p>
                 {/if}
 
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
                   Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
                 </p>
+
+                <div class="mb-5 grid gap-4 border border-surface-300-700/50 p-4 sm:grid-cols-3">
+                  <div>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Live database</span>
+                      <span class={`badge text-xs ${data.backupStatus.auto_vacuum_mode === "incremental" ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                        {data.backupStatus.auto_vacuum_mode === "incremental" ? "Incremental vacuum" : "Legacy layout"}
+                      </span>
+                    </div>
+                    <p class="mt-1 text-xl font-semibold text-surface-950-50">
+                      {formatStorageSize(data.backupStatus.live_size_bytes ?? data.backupStatus.database_size_bytes)}
+                    </p>
+                    <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                      {#if (data.backupStatus.reclaimable_bytes ?? 0) > 0}
+                        {formatStorageSize(data.backupStatus.reclaimable_bytes)} reclaimable free pages
+                      {:else}
+                        No uncompacted free pages
+                      {/if}
+                      {#if data.backupStatus.backups.length}
+                        · {formatStorageSize(data.backupStatus.backup_total_size_bytes)} across {data.backupStatus.backups.length} {data.backupStatus.backups.length === 1 ? "snapshot" : "snapshots"}
+                      {/if}
+                    </p>
+                  </div>
+
+                  <div class="flex flex-col justify-between gap-3">
+                    <div>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Evidence quota</span>
+                        <span class={`badge text-xs ${data.backupStatus.evidence_status === "exceeded" ? "preset-tonal-error" : data.backupStatus.evidence_status === "warning" ? "preset-tonal-warning" : "preset-tonal-success"}`}>
+                          {data.backupStatus.evidence_status === "exceeded"
+                            ? "Quota reached"
+                            : data.backupStatus.evidence_status === "warning"
+                              ? data.backupStatus.evidence_rotation_enabled
+                                ? "Rotating soon"
+                                : "Near quota"
+                              : "Healthy"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-sm font-medium text-surface-950-50">
+                        {formatStorageSize(data.backupStatus.evidence_used_bytes)} <span class="font-normal text-surface-600-400">of {formatStorageSize(data.backupStatus.evidence_quota_bytes ?? 512 * 1024 * 1024)}</span>
+                      </p>
+                      <div
+                        class="mt-2 h-2 w-full overflow-hidden bg-surface-200-800"
+                        role="progressbar"
+                        aria-label="Replay evidence quota usage"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}
+                      >
+                        <div
+                          class={`h-full transition-all ${data.backupStatus.evidence_status === "exceeded" ? "bg-error-500" : data.backupStatus.evidence_status === "warning" ? "bg-warning-500" : "bg-primary-500"}`}
+                          style={`width: ${evidencePercent(data.backupStatus.evidence_used_bytes, data.backupStatus.evidence_quota_bytes)}%`}
+                        ></div>
+                      </div>
+                      <p class="mt-1 text-xs leading-5 text-surface-600-400">
+                        {#if data.backupStatus.evidence_rotation_enabled}
+                          Auto-rotates oldest unattributed snapshots above 80% down to 65%.
+                        {:else}
+                          Opt-in rotation is off; new captures degrade cleanly at 100%.
+                        {/if}
+                      </p>
+                    </div>
+                    <form method="POST" action="?/setEvidenceRotation" use:enhance={setPending("toggle-evidence-rotation")}>
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <input type="hidden" name="enabled" value={data.backupStatus.evidence_rotation_enabled ? "0" : "1"} />
+                      <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
+                        {data.backupStatus.evidence_rotation_enabled ? "Pause evidence rotation" : "Enable evidence rotation"}
+                      </button>
+                    </form>
+                  </div>
+
+                  <div class="flex flex-col justify-between gap-3">
+                    <div>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Storage hygiene</span>
+                        <span class={`badge text-xs ${data.backupStatus.retention_enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                          {data.backupStatus.retention_enabled ? "Retention active" : "Retention off"}
+                        </span>
+                      </div>
+                      <p class="mt-1 text-xs leading-5 text-surface-700-300">
+                        Compact storage reclaims unused SQLite pages and truncates the write-ahead log without deleting stored history.{#if data.backupStatus.auto_vacuum_mode && data.backupStatus.auto_vacuum_mode !== "incremental"} Compacting once upgrades this database to incremental vacuum.{/if}
+                      </p>
+                    </div>
+                    <div class="grid gap-2">
+                      <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                          <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
+                        </button>
+                      </form>
+                      <form method="POST" action="?/setStorageRetention" use:enhance={setPending("toggle-retention")}>
+                        <ProfileField profileId={data.user?.profile_id} />
+                        <input type="hidden" name="enabled" value={data.backupStatus.retention_enabled ? "0" : "1"} />
+                        <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
+                          {data.backupStatus.retention_enabled ? "Pause automatic retention" : "Enable automatic retention"}
+                        </button>
+                      </form>
+                    </div>
+                  </div>
+                </div>
 
                 <div class="grid gap-5 lg:grid-cols-2">
                   <div>
@@ -4157,6 +4399,7 @@
                       class="btn btn-sm min-h-9 preset-tonal-secondary"
                       onclick={() => void loadLlmCatalog()}
                       disabled={llmCatalogLoading}
+                      aria-busy={llmCatalogLoading}
                     >
                       {#if llmCatalogLoading}<RefreshCw
                           size={14}
@@ -4165,9 +4408,12 @@
                       {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
                     </button>
                   </div>
-                  {#if llmCatalogError}
-                    <p class="text-xs text-error-600-400" role="alert">{llmCatalogError}</p>
-                  {/if}
+                  <StatusRegion
+                    message={llmCatalogStatusMessage}
+                    immediate={llmCatalogImmediate}
+                    paused={activeView !== "settings"}
+                  />
+                  <InlineAlert message={llmCatalogError} size="sm" />
                   {#if llmCatalogProviders.length > 0}
                     <div class="grid gap-3 sm:grid-cols-2">
                       <div>
@@ -4176,6 +4422,10 @@
                             class="input mt-1"
                             type="search"
                             bind:value={llmProviderSearch}
+                            oninput={() => {
+                              llmActiveFilter = "provider";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search OpenAI, Google, Groq…"
                           /></label
                         >
@@ -4203,6 +4453,10 @@
                             class="input mt-1"
                             type="search"
                             bind:value={llmModelSearch}
+                            oninput={() => {
+                              llmActiveFilter = "model";
+                              llmCatalogImmediate = false;
+                            }}
                             placeholder="Search model ID or name…"
                             disabled={!selectedCatalogProvider}
                           /></label
@@ -4349,12 +4603,14 @@
                 </div>
 
                 {#if revealedApiToken}
-                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4" role="alert">
+                  <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4">
                     <div class="flex items-start gap-3">
-                      <Check size={18} class="mt-0.5 shrink-0" />
+                      <Check size={18} class="mt-0.5 shrink-0" aria-hidden="true" />
                       <div class="min-w-0 flex-1">
-                        <p class="font-semibold">Copy this token now</p>
-                        <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        <div role="alert">
+                          <p class="font-semibold">Copy this token now</p>
+                          <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
+                        </div>
                         <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
@@ -4365,10 +4621,16 @@
                         onclick={() => void copyApiToken()}
                       ><Copy size={14} /> Copy</button>
                     </div>
-                    {#if apiTokenCopyMessage}
-                      <p class="mt-3 text-xs" role="status">{apiTokenCopyMessage}</p>
-                    {/if}
                   </div>
+                {/if}
+                <StatusRegion
+                  message={apiTokenCopyStatus && !apiTokenCopyStatus.error ? apiTokenCopyStatus.message : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                  class={apiTokenCopyStatus && !apiTokenCopyStatus.error ? "mb-3 text-xs text-surface-700-300" : "sr-only"}
+                />
+                {#if apiTokenCopyStatus?.error}
+                  <InlineAlert message={apiTokenCopyStatus.message} size="sm" class="mb-3" />
                 {/if}
 
                 <form method="POST" action="?/createApiToken" use:enhance={setPending("create-api-token")} class="flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -4541,9 +4803,13 @@
                     </div>
                     <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
+                  <StatusRegion
+                    message={digestDirty ? "Save digest settings to apply your edits before sending a test or running the digest." : ""}
+                    paused={activeView !== "settings"}
+                  />
                   <div class="mt-6 flex flex-col gap-3 border-t border-surface-300-700/40 pt-5 sm:flex-row sm:items-center sm:justify-between">
                     {#if digestDirty}
-                      <p class="text-sm font-medium text-warning-700-300" role="status">Save digest settings to apply your edits before sending a test or running the digest.</p>
+                      <p class="text-sm font-medium text-warning-700-300">Save digest settings to apply your edits before sending a test or running the digest.</p>
                     {:else if digestEnabled}
                       <p class="text-sm text-surface-700-300">Bookward checks this schedule even while the browser is closed.</p>
                     {:else}
@@ -4565,9 +4831,16 @@
                     <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
+                <StatusRegion
+                  message={digestSettings.last_delivery
+                    ? `Last ${digestSettings.last_delivery.channel} delivery: ${digestSettings.last_delivery.status}${digestSettings.last_delivery.error ? `. ${digestSettings.last_delivery.error}` : ""}`
+                    : ""}
+                  immediate
+                  paused={activeView !== "settings"}
+                />
                 {#if digestSettings.last_delivery}
                   {@const delivery = digestSettings.last_delivery}
-                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`} role="status">
+                  <div class={`mt-4 flex flex-wrap items-center gap-3 border-l-2 p-3 text-sm ${delivery.status === "failed" ? "border-error-500 preset-tonal-error" : delivery.status === "sent" ? "border-success-500 preset-tonal-success" : "border-secondary-500 preset-tonal-secondary"}`}>
                     {#if delivery.status === "sent"}<Check size={16} class="shrink-0" />{:else if delivery.status === "failed"}<TriangleAlert size={16} class="shrink-0" />{:else}<RefreshCw size={16} class="shrink-0 animate-spin" />{/if}
                     <span class="min-w-0 flex-1">Last {delivery.channel} delivery: <strong>{delivery.status}</strong>{#if delivery.sent_at} · {formatDeliveryDate(delivery.sent_at)}{:else if delivery.updated_at} · {formatDeliveryDate(delivery.updated_at)}{/if}{#if delivery.error}<span class="mt-1 block text-xs">{delivery.error}</span>{/if}</span>
                     {#if delivery.status === "failed"}<form method="POST" action="?/retryDigest" use:enhance={setPending("digest-retry")}>
@@ -4830,12 +5103,20 @@
                 />{:else}<Search size={16} />{/if} Search</button
             >
           </form>
+          <StatusRegion
+            message={librarrStatusMessage}
+            immediate={librarrSearchImmediate}
+            announceOnMount
+          />
+          <StatusRegion
+            message={librarrSearchMessage}
+            immediate
+          />
           {#if librarrSearchMessage}<div
               in:fly={{ y: -8, duration: motionDuration(180) }}
               class="mt-4 flex items-center gap-2 preset-tonal-success p-3 text-sm"
-              role="status"
             >
-              <Check size={16} />
+              <Check size={16} aria-hidden="true" />
               {librarrSearchMessage}
             </div>{/if}
           {#if librarrSearchError}<div
@@ -4868,8 +5149,6 @@
           {:else if librarrSearchState === "searching"}
             <div
               class="mt-4 flex items-center gap-2 text-sm text-surface-700-300"
-              role="status"
-              aria-live="polite"
             >
               <RefreshCw size={15} class="animate-spin text-primary-500" />
               Searching Librarr… {librarrResults.length} matches so far
@@ -4889,7 +5168,7 @@
           {/if}
           {#if librarrResults.length}
             {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
-            <div class="mt-5 space-y-3" aria-live="polite">
+            <div class="mt-5 space-y-3">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
                 <article

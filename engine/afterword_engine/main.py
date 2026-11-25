@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -20,19 +21,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
+from .database import (
+    DEFAULT_DIGEST_APP_URLS,
+    RestoreEpochError,
+    bind_request_restore_epoch,
+    connect,
+    database_lock,
+    fenced_async,
+    initialize,
+    normalize_key,
+    row,
+    rows,
+    scheduler_fenced,
+    transaction,
+)
 from .backups import (
     BackupError,
     RESTORE_FENCE_DETAIL,
     backup_scheduler_loop,
     backup_status,
     clear_interrupted_restore_journal,
+    compact_database,
     create_backup,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
 )
+from .decision_evidence import set_evidence_rotation_enabled
+from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
@@ -56,7 +73,7 @@ from .security import safe_error_message, validate_public_url, validate_service_
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
 from .ranking import rank_candidates
-from .secrets import seal, unseal
+from .secrets import auth_registry_key, installation_key_path, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
     download as librarr_download,
@@ -295,6 +312,7 @@ def _enqueue_candidate_quality_followup():
     return None
 
 
+@scheduler_fenced(default=dict)
 def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
@@ -308,12 +326,15 @@ def _queue_due_enrichment_retries():
     return queued
 
 
+@scheduler_fenced()
 def queue_digest_if_due():
     """Schedule a digest immediately after scoring, when its window is open."""
 
     try:
         if digest_is_due(private_settings()) and not active_job("digest"):
             return enqueue_job("digest", dedupe=True)
+    except RestoreEpochError:
+        raise
     except Exception:
         return None
     return None
@@ -339,7 +360,9 @@ async def source_scheduler_loop(stop):
             next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
         for profile_id in identity_store.profile_ids():
             try:
-                with profile_scope(profile_id):
+                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
+                    if not can_schedule:
+                        continue
                     if (
                         source_sync_is_due()
                         and not active_job("sync")
@@ -348,6 +371,8 @@ async def source_scheduler_loop(stop):
                         enqueue_job("sync_due", dedupe=True)
                     if check_enrichment_retries:
                         _queue_due_enrichment_retries()
+            except RestoreEpochError:
+                continue
             except Exception:
                 # A transient profile database error must not stop schedules
                 # for other profiles or terminate the scheduler.
@@ -368,9 +393,13 @@ async def digest_scheduler_loop(stop):
     while not stop.is_set():
         for profile_id in identity_store.profile_ids():
             try:
-                with profile_scope(profile_id):
+                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
+                    if not can_schedule:
+                        continue
                     if digest_is_due(private_settings()) and not active_job("digest"):
                         enqueue_job("digest", dedupe=True)
+            except RestoreEpochError:
+                continue
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
         try:
@@ -379,6 +408,7 @@ async def digest_scheduler_loop(stop):
             pass
 
 
+@scheduler_fenced()
 def queue_goodreads_rss_if_due(current_time=None):
     """Queue the nightly Goodreads feed sync and retry failures up to three times."""
 
@@ -441,6 +471,8 @@ async def goodreads_rss_scheduler_loop(stop):
             try:
                 with profile_scope(profile_id):
                     queue_goodreads_rss_if_due()
+            except RestoreEpochError:
+                continue
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
         try:
@@ -448,6 +480,7 @@ async def goodreads_rss_scheduler_loop(stop):
         except TimeoutError:
             pass
 
+@fenced_async
 async def handle_job(kind: str):
     config = private_settings()
     if kind == "read_work_identities":
@@ -590,6 +623,8 @@ async def handle_job(kind: str):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
+        except RestoreEpochError:
+            raise
         except Exception as exc:
             message = safe_error_message(exc)
             with transaction() as con:
@@ -626,6 +661,8 @@ async def handle_job(kind: str):
         for source in sources:
             try:
                 total += await scan_source(source)
+            except RestoreEpochError:
+                raise
             except Exception as exc:
                 message = safe_error_message(exc)
                 with transaction() as con:
@@ -660,6 +697,8 @@ async def lifespan(app):
         ready_profiles.add("legacy")
     except Exception:
         LOGGER.exception("Could not initialize profile legacy during startup")
+    if not has_restore_journal("legacy") or installation_key_path().is_file():
+        auth_registry_key()
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -703,6 +742,17 @@ async def lifespan(app):
         await worker
 
 app = FastAPI(title="Bookward Engine", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(RestoreEpochError)
+async def handle_restore_epoch_error(_request: Request, _exc: RestoreEpochError):
+    return JSONResponse(
+        {"detail": "Profile database was restored during this request; retry the action."},
+        status_code=409,
+        headers={"cache-control": "private, no-store"},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     # The web app's public proxy owns cross-origin access. Keep the engine's
@@ -714,6 +764,34 @@ app.add_middleware(
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
+
+
+_API_TOKEN_DERIVATION_LIMITERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _api_token_derivation_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    limiter = _API_TOKEN_DERIVATION_LIMITERS.get(loop)
+    if limiter is None:
+        limiter = asyncio.Semaphore(identity_store.TOKEN_DERIVATION_CONCURRENCY)
+        _API_TOKEN_DERIVATION_LIMITERS[loop] = limiter
+    return limiter
+
+
+@asynccontextmanager
+async def _acquire_api_token_derivation_slot():
+    limiter = _api_token_derivation_limiter()
+    acquired = False
+    try:
+        async with asyncio.timeout(identity_store.TOKEN_DERIVATION_WAIT_SECONDS):
+            await limiter.acquire()
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            limiter.release()
 
 
 _RESTORE_ROUTE_RE = re.compile(r"^/api/backups/[^/]+/restore$")
@@ -768,7 +846,23 @@ async def authenticate_engine_request(request: Request, call_next):
                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
             )
         candidate = bearer or api_key
-        token = identity_store.authenticate_api_token(candidate)
+        if (
+            identity_store.is_valid_api_token_format(candidate)
+            and not await asyncio.to_thread(identity_store.has_cached_api_token, candidate)
+        ):
+            try:
+                async with _acquire_api_token_derivation_slot():
+                    token = await asyncio.to_thread(
+                        identity_store.authenticate_api_token, candidate
+                    )
+            except TimeoutError:
+                return JSONResponse(
+                    {"detail": "API token verification is busy. Try again shortly."},
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
+                )
+        else:
+            token = await asyncio.to_thread(identity_store.authenticate_api_token, candidate)
         if not token:
             return JSONResponse(
                 {"detail": "A valid API token is required"},
@@ -789,8 +883,15 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-        with profile_scope(token["profile_id"]):
-            response = await call_next(request)
+        with profile_scope(token["profile_id"]), bind_request_restore_epoch():
+            try:
+                response = await call_next(request)
+            except RestoreEpochError:
+                return JSONResponse(
+                    {"detail": "Profile database was restored during this request; retry the action."},
+                    status_code=409,
+                    headers={"cache-control": "private, no-store"},
+                )
         _mark_private_no_store(response)
         return response
 
@@ -798,13 +899,17 @@ async def authenticate_engine_request(request: Request, call_next):
     oidc_login_start = path == "/auth/oidc/start" and request.query_params.get("intent", "login") == "login"
     oidc_callback = path == "/auth/oidc/callback"
     if oidc_callback and request.headers.get("x-bookward-session"):
-        request.state.account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+        request.state.account = await asyncio.to_thread(
+            identity_store.resolve_session, request.headers.get("x-bookward-session")
+        )
     if public_auth or oidc_login_start or oidc_callback:
         response = await call_next(request)
         response.headers["cache-control"] = "no-store"
         return response
 
-    account = identity_store.resolve_session(request.headers.get("x-bookward-session"))
+    account = await asyncio.to_thread(
+        identity_store.resolve_session, request.headers.get("x-bookward-session")
+    )
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
@@ -830,8 +935,15 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-    with profile_scope(account["profile_id"]):
-        response = await call_next(request)
+    with profile_scope(account["profile_id"]), bind_request_restore_epoch():
+        try:
+            response = await call_next(request)
+        except RestoreEpochError:
+            return JSONResponse(
+                {"detail": "Profile database was restored during this request; retry the action."},
+                status_code=409,
+                headers={"cache-control": "private, no-store"},
+            )
     _mark_private_no_store(response)
     return response
 
@@ -1205,6 +1317,40 @@ def make_backup():
     except BackupError as exc:
         raise HTTPException(500, str(exc)) from exc
     return {"backup": created, "status": backup_status()}
+
+
+class StorageRetentionIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/backups/compact")
+def compact_database_storage():
+    try:
+        return compact_database()
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/backups/retention")
+def update_storage_retention(payload: StorageRetentionIn):
+    set_storage_retention_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "retention_enabled": bool(status.get("retention_enabled", payload.enabled)),
+        "status": status,
+    }
+
+
+@app.post("/api/backups/evidence-rotation")
+def update_evidence_rotation(payload: StorageRetentionIn):
+    set_evidence_rotation_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "evidence_rotation_enabled": bool(
+            status.get("evidence_rotation_enabled", payload.enabled)
+        ),
+        "status": status,
+    }
 
 
 @app.post("/api/backups/{backup_id}/restore")
@@ -1908,6 +2054,7 @@ def tracked_recommendations(
             identity_context=identity_context,
             include_imported=include_imported,
         )
+        return recommendations, ""
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
     # before, while enabled traffic records exact tail propensities.
@@ -2161,6 +2308,7 @@ async def reading_history_scores(
                 embedder,
                 "read_candidate",
                 virtual_candidates,
+                persist=False,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
@@ -2206,6 +2354,7 @@ def _recommendation_identity_context(connection=None):
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlist_rows = fetch(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
@@ -2272,7 +2421,8 @@ def _recommendation_rows(
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
-        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
         f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -2422,7 +2572,8 @@ def recommendations(
         )
     for item in values:
         item["recommendation_run_id"] = run_id
-    response.headers["X-Bookward-Recommendation-Run"] = run_id
+    if run_id:
+        response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
 
 
@@ -2789,8 +2940,9 @@ def _record_librarr_import_in_connection(con, candidate_id: int, *, run_id: str 
 
 
 @app.post("/api/recommendations/{candidate_id}/import")
+@fenced_async
 async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Body(default=None)):
-    run_id = payload.run_id if payload else None
+    run_id = payload.run_id if isinstance(payload, LibrarrImportIn) else None
     with connect() as con:
         candidate_row = con.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
         if not candidate_row:
@@ -2909,6 +3061,7 @@ class LibrarrDownloadIn(BaseModel):
 
 
 @app.post("/api/librarr/download")
+@fenced_async
 async def download_librarr(payload: LibrarrDownloadIn):
     try:
         media = normalize_media_type(payload.media_type)
@@ -2950,6 +3103,7 @@ async def download_librarr(payload: LibrarrDownloadIn):
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
+@fenced_async
 async def _import_csv_upload(file: UploadFile):
     content = bytearray()
     while chunk := await file.read(1024 * 1024):
@@ -2975,6 +3129,7 @@ async def goodreads_csv(file: UploadFile = File(...)):
     return await _import_csv_upload(file)
 
 
+@fenced_async
 async def _sync_goodreads_rss(url: str):
     try:
         async with ingestion._source_client() as client:
@@ -2989,6 +3144,8 @@ async def _sync_goodreads_rss(url: str):
             raise shelf_results
         count = read_result
         shelves = ingestion._apply_goodreads_shelves(shelf_results)
+    except RestoreEpochError:
+        raise
     except Exception as exc:
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         message = safe_error_message(exc, limit=300)
@@ -3843,7 +4000,8 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                 for item in connection.execute(
                     "SELECT c.*,s.name source_name,q.metadata_confidence,"
                     "q.work_id quality_work_id,"
-                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+                    "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
                     "LEFT JOIN sources s ON s.id=c.source_id "
@@ -4214,6 +4372,7 @@ def revoke_api_token(token_id: int):
     return _revoke_api_token(token_id)
 
 @app.put("/api/settings")
+@fenced_async
 async def update_settings(payload: EngineSettings):
     embedding_fields = (
         "embedding_backend", "embedding_model", "embedding_url", "embedding_api_key"

@@ -23,6 +23,22 @@ type BackupStatus = {
   last_error: string | null;
   next_backup_at: string | null;
   backups: Array<{ id: string; created_at: string; size_bytes: number }>;
+  retention_enabled?: boolean;
+  evidence_rotation_enabled?: boolean;
+  database_size_bytes?: number;
+  wal_size_bytes?: number;
+  live_size_bytes?: number;
+  reclaimable_bytes?: number;
+  backup_total_size_bytes?: number;
+  auto_vacuum_mode?: "none" | "full" | "incremental";
+  evidence_used_bytes?: number;
+  evidence_quota_bytes?: number;
+  evidence_high_watermark_bytes?: number;
+  evidence_low_watermark_bytes?: number;
+  evidence_usage_ratio?: number;
+  evidence_status?: "healthy" | "warning" | "exceeded";
+  evidence_complete_runs?: number;
+  evidence_incomplete_runs?: number;
 };
 
 type Overview = {
@@ -163,13 +179,29 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     last_error: null,
     next_backup_at: null,
     backups: [],
+    retention_enabled: false,
+    evidence_rotation_enabled: false,
+    database_size_bytes: 0,
+    wal_size_bytes: 0,
+    live_size_bytes: 0,
+    reclaimable_bytes: 0,
+    backup_total_size_bytes: 0,
+    auto_vacuum_mode: "incremental",
+    evidence_used_bytes: 0,
+    evidence_quota_bytes: 512 * 1024 * 1024,
+    evidence_high_watermark_bytes: Math.floor(512 * 1024 * 1024 * 0.8),
+    evidence_low_watermark_bytes: Math.floor(512 * 1024 * 1024 * 0.65),
+    evidence_usage_ratio: 0,
+    evidence_status: "healthy",
+    evidence_complete_runs: 0,
+    evidence_incomplete_runs: 0,
   };
   const overviewRequest = engine<Overview>(
     "/api/overview?recommendation_limit=24&decision_limit=24",
   );
-  const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
-    () => fallbackBackupStatus,
-  );
+  const backupStatusRequest = engine<BackupStatus>("/api/backups")
+    .then((status) => ({ ...fallbackBackupStatus, ...status }))
+    .catch(() => fallbackBackupStatus);
   let digestPeriod = url.searchParams.get("digest_period");
   const digestReviewRequest = digestPeriod
     ? engine<{
@@ -356,6 +388,74 @@ export const actions: Actions = {
         10 * 60_000,
       );
       return { message: `Backup created at ${result.backup.created_at}.` };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  compactStorage: async () => {
+    try {
+      const result = await engine<{
+        reclaimed_bytes?: number;
+        after_bytes?: number;
+        migrated_auto_vacuum?: boolean;
+      }>("/api/backups/compact", { method: "POST", body: "{}" }, 10 * 60_000);
+      const reclaimed = Math.max(0, Number(result.reclaimed_bytes ?? 0));
+      const afterBytes = Math.max(0, Number(result.after_bytes ?? 0));
+      const formatSize = (bytes: number) =>
+        bytes <= 0
+          ? "0 KB"
+          : bytes < 1024 * 1024
+            ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+            : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      const liveSummary = afterBytes > 0 ? ` Live database: ${formatSize(afterBytes)}.` : "";
+      return {
+        message:
+          reclaimed > 0
+            ? `Storage compacted; reclaimed ${formatSize(reclaimed)}.${liveSummary}`
+            : result.migrated_auto_vacuum
+              ? `Incremental vacuum enabled.${liveSummary}`
+              : `Database already compact.${liveSummary}`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setStorageRetention: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid storage retention setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/retention", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Automatic storage retention enabled."
+          : "Automatic storage retention paused.",
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setEvidenceRotation: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid evidence rotation setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/evidence-rotation", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Replay evidence rotation enabled."
+          : "Replay evidence rotation paused.",
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
