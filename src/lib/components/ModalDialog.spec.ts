@@ -13,12 +13,14 @@ function createFakeDialog(withNativeShowModal = true) {
 	const listeners = new Map<string, Set<Listener>>();
 	const attributes = new Map<string, string>();
 	const initialButton = {
+		isConnected: true,
 		tabIndex: 0,
 		focus: vi.fn(),
 		getClientRects: () => [{ top: 24, left: 24, width: 32, height: 32 }],
 		closest: () => null,
 	};
 	const selectControl = {
+		isConnected: true,
 		tagName: 'SELECT',
 		tabIndex: 0,
 		focus: vi.fn(),
@@ -26,6 +28,7 @@ function createFakeDialog(withNativeShowModal = true) {
 		closest: () => null,
 	};
 	const dialog = {
+		isConnected: true,
 		open: false,
 		scrollTop: 92,
 		showModal: withNativeShowModal
@@ -121,7 +124,10 @@ describe('ModalDialog', () => {
 		vi.stubGlobal('getComputedStyle', () => ({ visibility: 'visible' }));
 
 		const onClose = vi.fn();
-		const { dialog, initialButton } = createFakeDialog(true);
+		const { dialog, initialButton, selectControl } = createFakeDialog(true);
+		// modalFocus only treats real HTMLElement instances as focus targets.
+		Object.setPrototypeOf(initialButton, FakeHTMLElement.prototype);
+		Object.setPrototypeOf(selectControl, FakeHTMLElement.prototype);
 		// Simulate showModal shifting activeElement inside the dialog
 		dialog.showModal = vi.fn(() => {
 			dialog.open = true;
