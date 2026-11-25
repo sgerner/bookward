@@ -14,7 +14,16 @@ import {
 type IdentityInfo = { id: number; issuer: string; email: string; created_at: string };
 type AuthMethods = { password_enabled: boolean; oidc_identities: IdentityInfo[] };
 type AuthConfig = { oidc_enabled: boolean };
-const fail = (status: number, data: { message: string }) => kitFail(status, { ...data, error: true as const });
+const fail = (
+	status: number,
+	data: {
+		formId: string;
+		message: string;
+		fieldErrors?: Record<string, string>;
+		rateLimited?: true;
+		retryAfterSeconds?: number;
+	}
+) => kitFail(status, { fieldErrors: {}, ...data, error: true as const });
 
 export const load: PageServerLoad = async ({ locals, url }) => {
 	if (!locals.user) throw redirect(303, '/login');
@@ -37,9 +46,25 @@ export const actions: Actions = {
 	changePassword: async (event) => {
 		const { request, cookies, locals, url, setHeaders } = event;
 		const form = await request.formData();
+		const hasCurrentPassword = form.has('current_password');
 		const current_password = String(form.get('current_password') || '');
 		const new_password = String(form.get('new_password') || '');
-		if (new_password.length < 12) return fail(400, { message: 'Use at least 12 characters.' });
+		const fieldErrors: Record<string, string> = {};
+		if (hasCurrentPassword && !current_password) {
+			fieldErrors.current_password = 'Enter your current password.';
+		}
+		if (!new_password) {
+			fieldErrors.new_password = 'Enter a new password.';
+		} else if (new_password.length < 12 || new_password.length > 1024) {
+			fieldErrors.new_password = 'Use a password between 12 and 1024 characters.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			return fail(400, {
+				formId: 'changePassword',
+				message: fieldErrors.current_password ?? fieldErrors.new_password!,
+				fieldErrors
+			});
+		}
 		const clientIp = currentClientIp() ?? resolveClientAddress(event);
 		try {
 			const result = await withRequestContext({ sessionToken: currentSessionToken(), clientIp }, () =>
@@ -52,30 +77,46 @@ export const actions: Actions = {
 			if (locals?.user) {
 				locals.user = { ...locals.user, must_change_password: false };
 			}
-			return { message: 'Password updated.' };
+			return { formId: 'changePassword', message: 'Password updated.' };
 		} catch (error) {
 			if (error instanceof EngineError && error.status === 429) {
 				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
 				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
-				return kitFail(429, {
+				return fail(429, {
+					formId: 'changePassword',
 					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
-					error: true as const,
 					rateLimited: true as const,
 					retryAfterSeconds
 				});
 			}
-			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Password could not be updated.' });
+			const status = error instanceof EngineError ? error.status : 503;
+			const msg = error instanceof Error ? error.message : 'Password could not be updated.';
+			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)
+				? { current_password: msg }
+				: status === 400 && /password/i.test(msg)
+					? { new_password: msg }
+					: {};
+			return fail(status, {
+				formId: 'changePassword',
+				message: msg,
+				fieldErrors: mappedFieldErrors
+			});
 		}
 	},
 	unlink: async ({ request }) => {
 		const form = await request.formData();
 		const id = Number(form.get('id'));
-		if (!Number.isSafeInteger(id) || id <= 0) return fail(400, { message: 'Choose a valid login method.' });
+		if (!Number.isSafeInteger(id) || id <= 0) {
+			return fail(400, { formId: 'unlink', message: 'Choose a valid login method.' });
+		}
 		try {
 			await engine(`/auth/identities/${id}`, { method: 'DELETE' });
-			return { message: 'SSO login disconnected.' };
+			return { formId: 'unlink', message: 'SSO login disconnected.' };
 		} catch (error) {
-			return fail(error instanceof EngineError ? error.status : 503, { message: error instanceof Error ? error.message : 'Login method could not be removed.' });
+			return fail(error instanceof EngineError ? error.status : 503, {
+				formId: 'unlink',
+				message: error instanceof Error ? error.message : 'Login method could not be removed.'
+			});
 		}
 	}
 };

@@ -1398,7 +1398,7 @@ def candidate_quality_audit_candidates(
             "q.provider,q.provider_id,q.work_id "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "LEFT JOIN sources s ON s.id=c.source_id "
-            f"WHERE c.id>? AND c.status!='rejected' AND (COALESCE(s.enabled,1)=1 OR c.status IN ('saved','imported')) AND {predicate} "
+            f"WHERE c.id>? AND c.status!='rejected' AND (s.enabled=1 OR c.status IN ('saved','imported')) AND {predicate} "
             "ORDER BY c.id LIMIT ?",
             (last_id, *params, page_size),
         )
@@ -1795,15 +1795,20 @@ def _dedupe_and_hide(con) -> int:
 
     accepted = con.execute(
         """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
-        c.isbn13,c.isbn10,q.quality_score,q.work_id AS quality_work_id,
+        c.isbn13,c.isbn10,
+        CASE WHEN s.enabled=1 THEN 1 ELSE 0 END AS source_enabled,
+        q.quality_score,q.work_id AS quality_work_id,
         q.provider AS quality_provider,q.provider_id AS quality_provider_id,
         q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
-        FROM candidates c JOIN candidate_quality q ON q.candidate_id=c.id
+        FROM candidates c
+        JOIN candidate_quality q ON q.candidate_id=c.id
+        JOIN sources s ON s.id=c.source_id
         WHERE c.status IN ('new','recommended') AND q.quality_status='accepted'"""
     ).fetchall()
     ordered = sorted(
         accepted,
         key=lambda item: (
+            -int(item["source_enabled"] or 0),
             -float(item["quality_score"] or 0),
             -int(bool(item["description"])),
             -int(bool(item["cover_url"])),

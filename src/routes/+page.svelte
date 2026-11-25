@@ -38,8 +38,11 @@
     Upload,
     X,
   } from "@lucide/svelte";
+  import BookCoverTrigger from "#lib/components/BookCoverTrigger.svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
   import InlineAlert from "#lib/components/InlineAlert.svelte";
+  import ModalDialog from "#lib/components/ModalDialog.svelte";
+  import LabeledSelect from "#lib/components/LabeledSelect.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
@@ -81,7 +84,6 @@
     resolveLibrarrResultFormat,
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
-  import { modalFocus } from "#lib/actions/modal-focus.js";
   import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
@@ -2537,8 +2539,6 @@
       digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
     };
     const onKeydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && markReadBook) closeMarkRead();
-      if (event.key === "Escape" && librarrSearchOpen) closeLibrarrSearch();
       if (event.key === "Escape" && openReadMenuId !== null) {
         const menuId = openReadMenuId;
         openReadMenuId = null;
@@ -2708,11 +2708,12 @@
           </form>{/if}
         <PopoverDialog
           bind:open={profileMenuOpen}
+          topLayer
           panelId="profile-menu-panel"
           triggerLabel="Open profile menu"
           triggerTitle="Profile"
           dialogLabel="Profile"
-          panelClass="absolute right-0 top-[calc(100%+0.5rem)] z-50 max-h-[calc(100dvh-5rem)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
+          panelClass="fixed right-4 top-[4.25rem] left-auto bottom-auto z-50 m-0 max-h-[calc(100dvh-4.5rem)] min-w-0 w-[min(20rem,calc(100vw-2rem))] overflow-y-auto rounded-container border border-surface-200-800 preset-filled-surface-50-950 p-3 shadow-xl"
         >
           {#snippet trigger()}
             <CircleUserRound size={19} strokeWidth={1.8} aria-hidden="true" />
@@ -2722,7 +2723,7 @@
               <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
               {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
-            <div class="grid gap-1 py-2">
+            <div class="grid min-w-0 gap-1 py-2">
               <a href="/account" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><CircleUserRound size={17} aria-hidden="true" />Account settings</a>
               {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
               <ThemePicker compact />
@@ -2871,11 +2872,11 @@
           matchedCount: filteredReadingHistory.length,
           hasActiveFilter: hasActiveReadingFilter,
         })}
-        <section class="mb-8 flex flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
+        <section class="mb-8 flex min-w-0 flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
-            class="text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
+            class="min-w-0 break-words text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
-          <div class="flex w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
+          <div class="flex min-w-0 w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
               <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
                 <label class="flex min-h-11 min-w-0 flex-1 cursor-text items-center gap-2 self-stretch pl-3 pr-2">
                   <Search size={17} class="shrink-0 text-surface-600-400" />
@@ -2890,28 +2891,29 @@
                 {#if viewSearch}<button type="button" class="btn-icon btn-icon-sm mr-1.5 min-h-8 min-w-8 shrink-0 preset-tonal-surface" aria-label="Clear book search" onclick={() => setSearchForView(view, "")}><X size={15} /></button>{/if}
               </div>
               {#if viewGenres.length && !(view === "decisions" && decisionFilter === "read")}
-                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
-                  Genre
-                  <select
-                    class="select mt-1 min-h-11 w-full preset-tonal-surface"
-                    value={viewGenre}
-                    onchange={(event) => setGenreForView(view, event.currentTarget.value)}
-                    aria-label={view === "saved" ? "Filter shortlist by genre" : view === "decisions" ? "Filter past decisions by genre" : "Filter books by genre"}
-                  >
-                    <option value="">All genres</option>
-                    {#each viewGenres as genre (genre)}<option value={genre} selected={viewGenre.toLowerCase() === genre.toLowerCase()}>{genre}</option>{/each}
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44"
+                  selectClass="select mt-1 min-h-11 w-full preset-tonal-surface"
+                  label="Genre"
+                  srLabel={view === "saved" ? "for shortlist" : view === "decisions" ? "for past decisions" : "for books"}
+                  bind:value={() => viewGenre, (next) => setGenreForView(view, next)}
+                >
+                  <option value="">All genres</option>
+                  {#each viewGenres as genre (genre)}<option value={genre} selected={viewGenre.toLowerCase() === genre.toLowerCase()}>{genre}</option>{/each}
+                </LabeledSelect>
               {/if}
               {#if view === "saved"}
-                <label class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44">
-                  Sort by
-                  <select class="select mt-1 min-h-11 w-full preset-tonal-surface" bind:value={shortlistSort} aria-label="Sort shortlist">
-                    <option value="score">Best match</option>
-                    <option value="title">Title A–Z</option>
-                    <option value="author">Author A–Z</option>
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block min-w-0 text-xs font-medium text-surface-700-300 sm:w-44"
+                  selectClass="select mt-1 min-h-11 w-full preset-tonal-surface"
+                  label="Sort by"
+                  srLabel="for shortlist"
+                  bind:value={shortlistSort}
+                >
+                  <option value="score">Best match</option>
+                  <option value="title">Title A–Z</option>
+                  <option value="author">Author A–Z</option>
+                </LabeledSelect>
               {/if}
           </div>
         </section>
@@ -2969,7 +2971,7 @@
           </section>
         {/if}
         <section
-          class="grid gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
+          class="grid min-w-0 gap-3 sm:gap-4 lg:grid-cols-2 lg:items-start"
         >
           {#each viewVisibleBooks as book, index (book.id)}
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
@@ -2982,12 +2984,14 @@
               animate:flip={{ duration: motionDuration(360) }}
               class={`relative isolate card group grid min-w-0 grid-cols-1 bg-gradient-to-br from-primary-500/8 via-transparent to-secondary-500/8 ${view === "decisions" ? decisionVariant : "preset-tonal-surface"} shadow-lg shadow-primary-500/5 transition duration-300 hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary-500/10 ${openReadMenuId === book.id ? "z-30 overflow-visible" : "overflow-hidden"} sm:grid-cols-[10rem_minmax(0,1fr)] ${index === 0 && view === "discover" ? "lg:col-span-2 lg:grid-cols-[12rem_minmax(0,1fr)]" : ""}`}
             >
-              <div
-                class={`${book.cover_url ? "pointer-events-none absolute inset-0 z-0" : "hidden"} aspect-[2/3] h-full w-full self-start overflow-hidden rounded-[inherit] sm:pointer-events-auto sm:relative sm:inset-auto sm:z-auto sm:block sm:h-auto sm:rounded-none sm:rounded-tl-[inherit] sm:preset-tonal-surface sm:before:pointer-events-none sm:before:absolute sm:before:inset-0 sm:before:z-10 sm:before:bg-gradient-to-t sm:before:from-primary-950/30 sm:before:via-transparent sm:before:to-secondary-500/10 sm:before:content-['']`}
+              <BookCoverTrigger
+                title={book.title}
+                score={book.score}
+                hasCover={Boolean(book.cover_url)}
+                expanded={expandedRecommendationDetails.has(book.id)}
+                class="aspect-[2/3] self-start"
+                onclick={() => toggleRecommendationDetails(book.id)}
               >
-                <span class="absolute inset-0 hidden flex-col items-center justify-center gap-3 p-4 text-center text-surface-600-400 sm:flex" aria-hidden="true">
-                  <BookOpen size={28} /><span class="line-clamp-3 text-xs">{book.title}</span>
-                </span>
                 {#if book.cover_url}<img
                     in:fade={{ duration: motionDuration(340) }}
                     class="absolute inset-0 h-full w-full scale-105 object-cover opacity-75 blur-[2px] sm:scale-100 sm:opacity-100 sm:blur-none sm:transition sm:duration-500 sm:group-hover:scale-[1.05]"
@@ -2998,18 +3002,7 @@
                     loading={index > 2 ? "lazy" : "eager"}
                     onerror={(event) => ((event.currentTarget as HTMLImageElement).hidden = true)}
                   />{/if}
-                <div class="pointer-events-none absolute inset-0 preset-filled-surface-50-950 opacity-[0.82] sm:hidden" aria-hidden="true"></div>
-                <div class="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary-500/10 via-transparent to-secondary-500/15 sm:hidden" aria-hidden="true"></div>
-                <button
-                  type="button"
-                  class="hidden text-left sm:absolute sm:inset-0 sm:z-20 sm:block focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary-500"
-                  onclick={() => toggleRecommendationDetails(book.id)}
-                  aria-label={`View details for ${book.title}`}
-                  aria-expanded={expandedRecommendationDetails.has(book.id)}
-                >
-                  <span in:scale={{ duration: motionDuration(160) }} class="badge absolute bottom-3 left-3 preset-filled-primary-500" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
-                </button>
-              </div>
+              </BookCoverTrigger>
               <div class="z-10 flex min-w-0 flex-col gap-2 p-3 sm:z-auto sm:gap-2.5 sm:p-4">
               <div class="flex flex-wrap items-center gap-2 text-xs font-medium text-surface-600-400 sm:text-sm">
                   {#if view === "discover" && digestVisible && book.status === "recommended"}
@@ -3039,9 +3032,9 @@
                       aria-label={`Open source for ${book.title}`}><ExternalLink size={13} /></a
                     >{/if}
                 </div>
-                <div>
-                  <h2 class="text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
-                  <p class="mt-1 text-base text-surface-700-300">{book.author}</p>
+                <div class="min-w-0">
+                  <h2 class="break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="mt-1 break-words text-base text-surface-700-300">{book.author}</p>
                 </div>
                 <details
                   class="group/details text-base text-surface-700-300"
@@ -3176,34 +3169,45 @@
           >
             {#if readingHistoryState === "ready"}
               <div class="mb-5 grid gap-3 sm:grid-cols-3" role="group" aria-label="Filter and sort read books">
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Rating
-                  <select bind:value={readingHistoryRatingFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by rating">
-                    <option value="all">Any rating</option>
-                    <option value="rated">Rated</option>
-                    <option value="unrated">Unrated</option>
-                  </select>
-                </label>
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Source
-                  <select bind:value={readingHistorySourceFilter} onchange={() => (readingHistoryImmediate = false)} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Filter read books by source">
-                    <option value="all">All sources</option>
-                    {#each readingHistorySources as source (source)}
-                      <option value={source}>{readingSourceLabel(source)}</option>
-                    {/each}
-                  </select>
-                </label>
-                <label class="block text-sm font-medium text-surface-800-200">
-                  Sort by
-                  <select bind:value={readingHistorySort} class="select mt-2 min-h-10 w-full preset-tonal-surface" aria-label="Sort read books">
-                    <option value="recent">Most recently read</option>
-                    <option value="oldest">Oldest read</option>
-                    <option value="score_high">Highest Bookward score</option>
-                    <option value="score_low">Lowest Bookward score</option>
-                    <option value="rating_high">Highest rating</option>
-                    <option value="title">Title A–Z</option>
-                  </select>
-                </label>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Rating"
+                  srLabel="for read books"
+                  bind:value={readingHistoryRatingFilter}
+                  onchange={() => (readingHistoryImmediate = false)}
+                >
+                  <option value="all">Any rating</option>
+                  <option value="rated">Rated</option>
+                  <option value="unrated">Unrated</option>
+                </LabeledSelect>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Source"
+                  srLabel="for read books"
+                  bind:value={readingHistorySourceFilter}
+                  onchange={() => (readingHistoryImmediate = false)}
+                >
+                  <option value="all">All sources</option>
+                  {#each readingHistorySources as source (source)}
+                    <option value={source}>{readingSourceLabel(source)}</option>
+                  {/each}
+                </LabeledSelect>
+                <LabeledSelect
+                  class="block text-sm font-medium text-surface-800-200"
+                  selectClass="select mt-2 min-h-10 w-full preset-tonal-surface"
+                  label="Sort by"
+                  srLabel="for read books"
+                  bind:value={readingHistorySort}
+                >
+                  <option value="recent">Most recently read</option>
+                  <option value="oldest">Oldest read</option>
+                  <option value="score_high">Highest Bookward score</option>
+                  <option value="score_low">Lowest Bookward score</option>
+                  <option value="rating_high">Highest rating</option>
+                  <option value="title">Title A–Z</option>
+                </LabeledSelect>
               </div>
             {/if}
             {#if readingHistoryScoreState === "loading"}
@@ -3327,7 +3331,7 @@
         {#if activeView === "discover"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3336,7 +3340,7 @@
         {:else if activeView === "saved"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3345,7 +3349,7 @@
         {:else if activeView === "decisions"}
           <div
             data-view="recommendations"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3850,7 +3854,7 @@
         {:else}
           <div
             data-view="settings"
-            class="col-start-1 row-start-1"
+            class="col-start-1 row-start-1 min-w-0 w-full"
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
@@ -3861,7 +3865,7 @@
                 Settings.
               </h1>
             </section>
-            <section class="grid gap-5 lg:grid-cols-2">
+            <section class="grid min-w-0 gap-5 lg:grid-cols-2">
               <section class="card preset-tonal-surface p-5 sm:p-6 lg:col-span-2">
                 <div class="mb-5 flex items-start gap-3">
                   <span class="grid size-10 shrink-0 place-items-center preset-tonal-primary"><Database size={19} /></span>
@@ -3889,11 +3893,11 @@
                 {/if}
 
                 <p class="mb-4 border-l-2 border-warning-500/50 preset-tonal-warning p-3 text-sm leading-6 text-surface-800-200">
-                  Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code>AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
+                  Backups contain private reading data, encrypted integration credentials, and a matching generated-key recovery file. Both files stay in the engine's private backup directory and are restored together. A configured <code class="break-words wrap-anywhere">AFTERWORD_SECRET_KEY</code> remains external and must stay the same.
                 </p>
 
-                <div class="mb-5 grid gap-4 border border-surface-300-700/50 p-4 sm:grid-cols-3">
-                  <div>
+                <div class="mb-5 grid min-w-0 gap-4 border border-surface-300-700/50 p-4 sm:grid-cols-3">
+                  <div class="min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
                       <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Live database</span>
                       <span class={`badge text-xs ${data.backupStatus.auto_vacuum_mode === "incremental" ? "preset-tonal-success" : "preset-tonal-surface"}`}>
@@ -3915,7 +3919,7 @@
                     </p>
                   </div>
 
-                  <div class="flex flex-col justify-between gap-3">
+                  <div class="flex min-w-0 flex-col justify-between gap-3">
                     <div>
                       <div class="flex flex-wrap items-center justify-between gap-2">
                         <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Evidence quota</span>
@@ -3962,7 +3966,7 @@
                     </form>
                   </div>
 
-                  <div class="flex flex-col justify-between gap-3">
+                  <div class="flex min-w-0 flex-col justify-between gap-3">
                     <div>
                       <div class="flex flex-wrap items-center justify-between gap-2">
                         <span class="text-xs font-medium uppercase tracking-wider text-surface-600-400">Storage hygiene</span>
@@ -3974,7 +3978,7 @@
                         Compact storage reclaims unused SQLite pages and truncates the write-ahead log without deleting stored history.{#if data.backupStatus.auto_vacuum_mode && data.backupStatus.auto_vacuum_mode !== "incremental"} Compacting once upgrades this database to incremental vacuum.{/if}
                       </p>
                     </div>
-                    <div class="grid gap-2">
+                    <div class="grid min-w-0 gap-2">
                       <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
@@ -3992,8 +3996,8 @@
                   </div>
                 </div>
 
-                <div class="grid gap-5 lg:grid-cols-2">
-                  <div>
+                <div class="grid min-w-0 gap-5 lg:grid-cols-2">
+                  <div class="min-w-0">
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
@@ -4014,18 +4018,18 @@
                     </div>
                   </div>
 
-                  <div class="border border-surface-300-700/50 p-4">
+                  <div class="min-w-0 border border-surface-300-700/50 p-4">
                     <h3 class="font-semibold text-surface-950-50">Restore a backup</h3>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
                     {#if data.backupStatus.backups.length}
                       <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <label class="block text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
+                        <label class="block min-w-0 text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
                           {#each data.backupStatus.backups as backup (backup.id)}
                             <option value={backup.id}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
                           {/each}
                         </select></label>
-                        <label class="block text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
+                        <label class="block min-w-0 text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
                         <button class="btn min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
                           {#if isPending("restore-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<RefreshCw size={16} />{/if} Restore selected backup
                         </button>
@@ -4142,7 +4146,7 @@
                   Import completed books, ratings, and read dates from a Goodreads or The StoryGraph CSV export. Bookward detects the format automatically.
                 </p>
                 <label
-                  class="mt-5 block text-sm font-medium text-surface-800-200"
+                  class="mt-5 block min-w-0 text-sm font-medium text-surface-800-200"
                   >Goodreads or StoryGraph CSV<input
                     class="input mt-2"
                     name="file"
@@ -4659,7 +4663,7 @@
                   >
                   or enter an endpoint directly.
                 </p>
-                <div class="mt-4 space-y-3 border border-surface-300-700/50 p-3">
+                <div class="mt-4 min-w-0 space-y-3 border border-surface-300-700/50 p-3">
                   <div class="flex flex-wrap items-center justify-between gap-2">
                     <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
                       >models.dev selector</span
@@ -4685,9 +4689,9 @@
                   />
                   <InlineAlert message={llmCatalogError} size="sm" />
                   {#if llmCatalogProviders.length > 0}
-                    <div class="grid gap-3 sm:grid-cols-2">
-                      <div>
-                        <label class="block text-xs font-medium text-surface-700-300"
+                    <div class="grid min-w-0 gap-3 sm:grid-cols-2">
+                      <div class="min-w-0">
+                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
                           >Filter provider<input
                             class="input mt-1"
                             type="search"
@@ -4699,7 +4703,7 @@
                             placeholder="Search OpenAI, Google, Groq…"
                           /></label
                         >
-                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
                           >Provider<select
                             class="select mt-1"
                             value={llmProvider}
@@ -4717,8 +4721,8 @@
                           </select></label
                         >
                       </div>
-                      <div>
-                        <label class="block text-xs font-medium text-surface-700-300"
+                      <div class="min-w-0">
+                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
                           >Filter model<input
                             class="input mt-1"
                             type="search"
@@ -4731,7 +4735,7 @@
                             disabled={!selectedCatalogProvider}
                           /></label
                         >
-                        <label class="mt-2 block text-xs font-medium text-surface-700-300"
+                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
                           >Model<select
                             class="select mt-1"
                             value={llmModel}
@@ -4850,10 +4854,10 @@
                   </div>
                 </div>
 
-                <div class="mb-5 border border-surface-300-700/50 p-3 text-sm">
+                <div class="mb-5 min-w-0 border border-surface-300-700/50 p-3 text-sm">
                   <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
                   <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
-                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</span>
+                  <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code class="break-words wrap-anywhere">Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
                 {#if revealedApiToken}
@@ -4906,7 +4910,7 @@
                         <li class="flex flex-wrap items-center gap-3 p-3">
                           <div class="min-w-0 flex-1">
                             <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
-                            <p class="mt-1 text-xs text-surface-700-300"><code>{token.token_prefix}…</code> · Created {token.created_at}</p>
+                            <p class="mt-1 text-xs text-surface-700-300"><code class="break-words wrap-anywhere">{token.token_prefix}…</code> · Created {token.created_at}</p>
                             {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
                           </div>
                           {#if token.revoked_at}
@@ -4938,36 +4942,39 @@
               >
                 <form method="POST" action="?/configureDigest" use:enhance={setPending("digest-settings", optimisticDigestSettings)}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <div class="flex flex-wrap items-center gap-4">
-                    <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary"><Bell size={20} /></span>
+                  <div class="relative flex min-w-0 flex-wrap items-center gap-4">
+                    <span class="grid size-11 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><Bell size={20} /></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-3">
-                        <h2 class="text-lg font-semibold text-surface-950-50">Weekly digest</h2>
+                        <h2 class="text-lg font-semibold text-surface-950-50">
+                          <label id="digest-enabled-label" for="digest-enabled" class="cursor-pointer after:absolute after:inset-0 after:z-10 after:content-['']">Weekly digest</label>
+                        </h2>
                         <span class="badge preset-tonal-surface">{digestEnabled ? "On" : "Off"}</span>
                       </div>
-                      <p class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
+                      <p id="digest-enabled-description" class="mt-1 text-sm text-surface-700-300">A short list of your strongest new matches, on your schedule.</p>
                     </div>
                     <SwitchControl
                       id="digest-enabled"
                       name="enabled"
-                      checked={digestEnabled}
-                      ariaLabel="Enable weekly digest"
-                      onToggle={(next) => (digestEnabledOverride = next)}
+                      ariaLabelledBy="digest-enabled-label"
+                      ariaDescribedBy="digest-enabled-description"
+                      class="z-20"
+                      bind:checked={() => digestEnabled, (next) => (digestEnabledOverride = next)}
                     />
                   </div>
 
-                  <div class="mt-6">
-                    <div class="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
-                      <section class="preset-tonal-surface p-4 sm:p-5">
-                        <div class="mb-4 flex items-center justify-between gap-3">
-                          <div>
+                  <div class="mt-6 min-w-0">
+                    <div class="grid min-w-0 gap-5 lg:grid-cols-[0.95fr_1.05fr]">
+                      <section class="min-w-0 preset-tonal-surface p-4 sm:p-5">
+                        <div class="mb-4 flex min-w-0 flex-wrap items-center justify-between gap-3">
+                          <div class="min-w-0">
                             <h3 class="font-semibold text-surface-950-50">Schedule</h3>
                             <p class="mt-1 text-sm text-surface-700-300">When should Bookward check in?</p>
                           </div>
-                          <span class="badge preset-tonal-secondary">{digestEnabled ? "Automatic" : "Paused"}</span>
+                          <span class="badge shrink-0 preset-tonal-secondary">{digestEnabled ? "Automatic" : "Paused"}</span>
                         </div>
-                        <div class="grid gap-4 sm:grid-cols-2">
-                          <label class="block text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day" value={String(digestDay)} onchange={(event) => (digestDayOverride = Number((event.currentTarget as HTMLSelectElement).value))}>
+                        <div class="grid min-w-0 gap-4 sm:grid-cols-2">
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Day<select class="select mt-2" name="day" value={String(digestDay)} onchange={(event) => (digestDayOverride = Number((event.currentTarget as HTMLSelectElement).value))}>
                             <option value="1" selected={digestDay === 1}>Monday</option>
                             <option value="2" selected={digestDay === 2}>Tuesday</option>
                             <option value="3" selected={digestDay === 3}>Wednesday</option>
@@ -4976,78 +4983,83 @@
                             <option value="6" selected={digestDay === 6}>Saturday</option>
                             <option value="7" selected={digestDay === 7}>Sunday</option>
                           </select></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestTime} oninput={(event) => (digestTimeOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestTimezone} oninput={(event) => (digestTimezoneOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="America/Phoenix" required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestMinimumScore} oninput={(event) => (digestMinimumScoreOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
-                          <label class="block text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestMaximumBooks} oninput={(event) => (digestMaximumBooksOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Time<input class="input mt-2" name="time" type="time" value={digestTime} oninput={(event) => (digestTimeOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200 sm:col-span-2">Timezone<input class="input mt-2" name="timezone" value={digestTimezone} oninput={(event) => (digestTimezoneOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="America/Phoenix" required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Minimum match<input class="input mt-2" name="minimumScore" type="number" min="0" max="100" step="1" value={digestMinimumScore} oninput={(event) => (digestMinimumScoreOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
+                          <label class="block min-w-0 text-sm font-medium text-surface-800-200">Books per digest<input class="input mt-2" name="maximumBooks" type="number" min="1" max="20" step="1" value={digestMaximumBooks} oninput={(event) => (digestMaximumBooksOverride = (event.currentTarget as HTMLInputElement).value)} required /></label>
                         </div>
-                        <div class="mt-4 flex items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
-                          <label for="digest-only-new" class="cursor-pointer">
-                            <span class="block text-surface-950-50">Only send new books</span>
-                            <span class="mt-1 block text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</span>
-                          </label>
+                        <div class="relative mt-4 flex min-w-0 items-center justify-between gap-4 border-t border-surface-300-700/40 pt-4 text-sm font-medium text-surface-800-200">
+                          <div class="min-w-0 flex-1">
+                            <label id="digest-only-new-label" for="digest-only-new" class="block cursor-pointer text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Only send new books</label>
+                            <p id="digest-only-new-description" class="mt-1 text-xs font-normal text-surface-700-300">Skip recommendations already included in a digest.</p>
+                          </div>
                           <SwitchControl
                             id="digest-only-new"
                             name="onlyNew"
-                            checked={digestOnlyNew}
-                            ariaLabel="Only send new books"
-                            onToggle={(next) => (digestOnlyNewOverride = next)}
+                            ariaLabelledBy="digest-only-new-label"
+                            ariaDescribedBy="digest-only-new-description"
+                            class="z-20"
+                            bind:checked={() => digestOnlyNew, (next) => (digestOnlyNewOverride = next)}
                           />
                         </div>
                       </section>
 
-                      <section class="preset-tonal-surface p-4 sm:p-5">
-                        <div class="mb-4">
+                      <section class="min-w-0 preset-tonal-surface p-4 sm:p-5">
+                        <div class="mb-4 min-w-0">
                           <h3 class="font-semibold text-surface-950-50">Delivery</h3>
                           <p class="mt-1 text-sm text-surface-700-300">Configure and test one or both channels before turning on the schedule.</p>
                         </div>
-                        <div class="grid gap-3">
-                          <div class="relative border border-surface-300-700/50 p-4">
-                            <div class="flex items-center gap-3">
-                              <label for="digest-discord" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary"><MessageCircle size={17} /></span>
-                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Discord</span><span class="mt-0.5 block text-xs text-surface-700-300">Post to a webhook</span></span>
-                              </label>
+                        <div class="grid min-w-0 gap-3">
+                          <div class="relative min-w-0 border border-surface-300-700/50 p-4">
+                            <div class="relative flex min-w-0 items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-secondary" aria-hidden="true"><MessageCircle size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-discord-label" for="digest-discord" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Discord</label>
+                                <p id="digest-discord-description" class="mt-0.5 text-xs text-surface-700-300">Post to a webhook</p>
+                              </div>
                               <SwitchControl
                                 id="digest-discord"
                                 name="channels"
                                 value="discord"
-                                checked={digestDiscord}
-                                ariaLabel="Send digest to Discord"
-                                onToggle={(next) => (digestDiscordOverride = next)}
+                                ariaLabelledBy="digest-discord-label"
+                                ariaDescribedBy="digest-discord-description"
+                                class="z-20"
+                                bind:checked={() => digestDiscord, (next) => (digestDiscordOverride = next)}
                               />
                             </div>
-                            {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-3">
-                              <label class="block text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" value={digestDiscordWebhook} oninput={(event) => (digestDiscordWebhook = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
+                            {#if digestDiscord}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 min-w-0 space-y-3">
+                              <label class="block min-w-0 text-sm font-medium text-surface-800-200">Webhook URL<input class="input mt-2" name="discordWebhook" type="url" value={digestDiscordWebhook} oninput={(event) => (digestDiscordWebhook = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.discord_webhook_set ? "Already configured · leave blank to keep" : "https://discord.com/api/webhooks/…"} /></label>
                               {#if digestSettings.discord_webhook_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearDiscord" checked={digestClearDiscord} onchange={(event) => (digestClearDiscord = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved webhook</label>{/if}
                             </div>{:else}<input type="hidden" name="discordWebhook" value="" />{/if}
                           </div>
 
-                          <div class="relative border border-surface-300-700/50 p-4">
-                            <div class="flex items-center gap-3">
-                              <label for="digest-email" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
-                                <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary"><Mail size={17} /></span>
-                                <span class="min-w-0 flex-1"><span class="block font-medium text-surface-950-50">Email</span><span class="mt-0.5 block text-xs text-surface-700-300">Send through your SMTP server</span></span>
-                              </label>
+                          <div class="relative min-w-0 border border-surface-300-700/50 p-4">
+                            <div class="relative flex min-w-0 items-center gap-3">
+                              <span class="grid size-9 shrink-0 place-items-center preset-tonal-tertiary" aria-hidden="true"><Mail size={17} /></span>
+                              <div class="min-w-0 flex-1">
+                                <label id="digest-email-label" for="digest-email" class="block cursor-pointer font-medium text-surface-950-50 after:absolute after:inset-0 after:z-10 after:content-['']">Email</label>
+                                <p id="digest-email-description" class="mt-0.5 text-xs text-surface-700-300">Send through your SMTP server</p>
+                              </div>
                               <SwitchControl
                                 id="digest-email"
                                 name="channels"
                                 value="email"
-                                checked={digestEmail}
-                                ariaLabel="Send digest by email"
+                                ariaLabelledBy="digest-email-label"
+                                ariaDescribedBy="digest-email-description"
                                 activeClass="preset-filled-tertiary-500"
-                                onToggle={(next) => (digestEmailOverride = next)}
+                                class="z-20"
+                                bind:checked={() => digestEmail, (next) => (digestEmailOverride = next)}
                               />
                             </div>
-                            {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 space-y-4">
-                              <div class="grid gap-4 sm:grid-cols-2">
-                                <label class="block text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestEmailTo} oninput={(event) => (digestEmailToOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="you@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestEmailFrom} oninput={(event) => (digestEmailFromOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="bookward@example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSmtpHost} oninput={(event) => (digestSmtpHostOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="smtp.example.com" /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSmtpPort} oninput={(event) => (digestSmtpPortOverride = (event.currentTarget as HTMLInputElement).value)} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity" value={digestSmtpSecurity} onchange={(event) => (digestSmtpSecurityOverride = (event.currentTarget as HTMLSelectElement).value as "none" | "starttls" | "ssl")}><option value="starttls" selected={digestSmtpSecurity === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSmtpSecurity === "ssl"}>SSL / TLS</option><option value="none" selected={digestSmtpSecurity === "none"}>None</option></select></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value={digestSmtpUsername} oninput={(event) => (digestSmtpUsername = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
-                                <label class="block text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" value={digestSmtpPassword} oninput={(event) => (digestSmtpPassword = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
+                            {#if digestEmail}<div in:slide={{ duration: motionDuration(200) }} out:fade={{ duration: motionDuration(140) }} class="mt-4 min-w-0 space-y-4">
+                              <div class="grid min-w-0 gap-4 sm:grid-cols-2">
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Recipient<input class="input mt-2" name="emailTo" type="email" value={digestEmailTo} oninput={(event) => (digestEmailToOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="you@example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">From address<input class="input mt-2" name="emailFrom" type="email" value={digestEmailFrom} oninput={(event) => (digestEmailFromOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="bookward@example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200 sm:col-span-2">SMTP host<input class="input mt-2" name="smtpHost" value={digestSmtpHost} oninput={(event) => (digestSmtpHostOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="smtp.example.com" /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Port<input class="input mt-2" name="smtpPort" type="number" min="1" max="65535" value={digestSmtpPort} oninput={(event) => (digestSmtpPortOverride = (event.currentTarget as HTMLInputElement).value)} /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Security<select class="select mt-2" name="smtpSecurity" value={digestSmtpSecurity} onchange={(event) => (digestSmtpSecurityOverride = (event.currentTarget as HTMLSelectElement).value as "none" | "starttls" | "ssl")}><option value="starttls" selected={digestSmtpSecurity === "starttls"}>STARTTLS</option><option value="ssl" selected={digestSmtpSecurity === "ssl"}>SSL / TLS</option><option value="none" selected={digestSmtpSecurity === "none"}>None</option></select></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Username<input class="input mt-2" name="smtpUsername" value={digestSmtpUsername} oninput={(event) => (digestSmtpUsername = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_username_set ? "Already configured · leave blank" : "Optional"} /></label>
+                                <label class="block min-w-0 text-sm font-medium text-surface-800-200">Password<input class="input mt-2" name="smtpPassword" type="password" value={digestSmtpPassword} oninput={(event) => (digestSmtpPassword = (event.currentTarget as HTMLInputElement).value)} placeholder={digestSettings.smtp_password_set ? "Already configured · leave blank" : "Optional"} /></label>
                               </div>
                               {#if digestSettings.smtp_username_set || digestSettings.smtp_password_set}<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"><input class="checkbox size-6 shrink-0" type="checkbox" name="clearSmtpCredentials" checked={digestClearSmtpCredentials} onchange={(event) => (digestClearSmtpCredentials = (event.currentTarget as HTMLInputElement).checked)} /> Clear saved credentials</label>{/if}
                             </div>{:else}<input type="hidden" name="emailTo" value={digestEmailTo} /><input type="hidden" name="emailFrom" value={digestEmailFrom} /><input type="hidden" name="smtpHost" value={digestSmtpHost} /><input type="hidden" name="smtpPort" value={digestSmtpPort} /><input type="hidden" name="smtpSecurity" value={digestSmtpSecurity} />{/if}
@@ -5055,7 +5067,7 @@
                         </div>
                       </section>
                     </div>
-                    <label class="mt-5 block text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
+                    <label class="mt-5 block min-w-0 text-sm font-medium text-surface-800-200">Bookward public URL<input class="input mt-2" name="appUrl" type="url" value={digestAppUrl} oninput={(event) => (digestAppUrlOverride = (event.currentTarget as HTMLInputElement).value)} placeholder="https://bookward.example.com" required /></label>
                   </div>
                   <StatusRegion
                     message={digestDirty ? "Save digest settings to apply your edits before sending a test or running the digest." : ""}
@@ -5119,7 +5131,7 @@
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if recentReads.length}<div
-                    class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
+                    class="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
                     {#each recentReads as item (item.id)}<div
                         in:fly={{
@@ -5128,7 +5140,7 @@
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -5176,7 +5188,7 @@
   >
     {#each navItems as item}{@const Icon = item.icon}<button
         type="button"
-        class={`relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
+        class={`relative flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 px-0.5 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
         aria-current={activeView === item.id ? "page" : undefined}
         onclick={() => go(item.id)}
         ><Icon
@@ -5191,38 +5203,25 @@
       >{/each}
   </nav>
   {#if markReadBook}
-    <div
-      in:fade={{ duration: motionDuration(240) }}
-      out:fade={{ duration: motionDuration(180) }}
-      class="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-surface-950/75 p-4 backdrop-blur-md"
-      role="presentation"
-      onclick={(event) => {
-        if (event.target === event.currentTarget) closeMarkRead();
-      }}
+    <ModalDialog
+      open={Boolean(markReadBook)}
+      ariaLabelledby="mark-read-title"
+      ariaDescribedby="mark-read-description"
+      onClose={closeMarkRead}
+      class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
     >
-      <div
-        use:modalFocus
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="mark-read-title"
-        aria-describedby="mark-read-description"
-        tabindex="-1"
-        in:scale={{ duration: motionDuration(260), start: 0.94 }}
-        out:scale={{ duration: motionDuration(170), start: 0.97 }}
-        class="relative isolate max-h-[min(42rem,calc(100dvh-2rem))] w-full max-w-xl overflow-x-hidden overflow-y-auto rounded-[2rem] border border-primary-500/25 preset-filled-surface-50-950 shadow-2xl shadow-surface-950/60"
-      >
         <div class="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
           <div class="absolute -right-20 -top-28 size-72 rounded-full bg-primary-500/15 blur-3xl"></div>
           <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
         </div>
-        <div class="flex items-start justify-between gap-5 border-b border-surface-200-800/70 p-5 sm:p-7">
-          <div class="flex min-w-0 items-center gap-4">
+        <div class="flex items-start justify-between gap-4 border-b border-surface-200-800/70 p-4 sm:gap-5 sm:p-7">
+          <div class="flex min-w-0 items-center gap-3 sm:gap-4">
             <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
               <BookOpen size={22} />
             </span>
             <div class="min-w-0">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
+              <h2 id="mark-read-title" class="mt-1 break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -5235,7 +5234,7 @@
         </div>
 
         <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
-          <div class="p-5 sm:p-7">
+          <div class="min-w-0 p-4 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
@@ -5284,29 +5283,17 @@
             </button>
           </div>
         </form>
-      </div>
-    </div>
+    </ModalDialog>
   {/if}
   {#if librarrSearchOpen}
-    <div
-      in:fade={{ duration: motionDuration(180) }}
-      out:fade={{ duration: motionDuration(120) }}
-      class="fixed inset-0 z-50 grid place-items-center bg-surface-950/70 p-4 backdrop-blur-sm"
-      role="presentation"
-      onclick={closeLibrarrSearch}
+    <ModalDialog
+      open={librarrSearchOpen}
+      ariaLabelledby="librarr-search-title"
+      onClose={closeLibrarrSearch}
+      class="card max-h-[min(44rem,calc(100dvh-2rem))] w-[min(42rem,calc(100vw-2rem))] preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30 [@media(min-height:28rem)]:flex [@media(min-height:28rem)]:flex-col [@media(min-height:28rem)]:overflow-y-hidden"
     >
-      <dialog
-        use:modalFocus
-        open
-        in:scale={{ duration: motionDuration(220) }}
-        out:scale={{ duration: motionDuration(140) }}
-        class="relative m-0 card flex max-h-[min(44rem,calc(100dvh-2rem))] w-full max-w-2xl flex-col justify-self-center overflow-hidden preset-filled-surface-50-950 shadow-2xl shadow-surface-950/30"
-        aria-labelledby="librarr-search-title"
-        aria-modal="true"
-        onclick={(event) => event.stopPropagation()}
-      >
         <div
-          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-5 sm:p-6"
+          class="flex shrink-0 items-start justify-between gap-4 border-b border-surface-200-800 p-4 sm:p-6"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium text-primary-600-400">
@@ -5329,7 +5316,7 @@
             onclick={closeLibrarrSearch}><X size={17} /></button
           >
         </div>
-        <div class="max-h-[calc(100dvh-11rem)] min-h-0 flex-1 overflow-y-auto p-5 sm:p-6">
+        <div class="min-w-0 p-4 sm:p-6 [@media(min-height:28rem)]:max-h-[calc(100dvh-11rem)] [@media(min-height:28rem)]:min-h-0 [@media(min-height:28rem)]:flex-1 [@media(min-height:28rem)]:overflow-y-auto">
           <form
             class="flex flex-col gap-3 sm:flex-row sm:items-center"
             onsubmit={(event) => {
@@ -5441,7 +5428,7 @@
                     duration: motionDuration(220),
                     delay: motionDelay(index, 24),
                   }}
-                  class="flex items-center gap-4 preset-tonal-surface p-3 sm:p-4"
+                  class="flex min-w-0 items-center gap-4 preset-tonal-surface p-3 sm:p-4"
                 >
                   <div
                     class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
@@ -5502,7 +5489,6 @@
             </div>
           {/if}
         </div>
-      </dialog>
-    </div>
+    </ModalDialog>
   {/if}
 </div>
