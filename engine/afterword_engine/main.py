@@ -2169,6 +2169,9 @@ class LLMRerankTestIn(BaseModel):
     def validate_values(self):
         if self.mode is not None:
             llm_reranker.normalize_llm_rerank_mode(self.mode, allow_blank=True)
+        url = self.api_url.strip()
+        if url:
+            llm_reranker.validate_llm_api_url(url, has_api_key=True)
 
 
 def _persist_llm_rerank_status(

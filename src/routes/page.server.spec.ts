@@ -2516,6 +2516,17 @@ describe("page actions", () => {
         ),
       )
       .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "LLM connection check failed: HTTP 401: Incorrect API key [redacted]",
+          }),
+          {
+            status: 502,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
         new Response(JSON.stringify({ ok: true, model: "gpt-4o-mini" }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -2567,6 +2578,13 @@ describe("page actions", () => {
     } as never)) as { status: number; data: { error: boolean; message: string } };
     expect(blockedResult.status).toBe(400);
     expect(blockedResult.data.message).toContain("Private, loopback");
+
+    const failedSaveProbe = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", { method: "POST", body: validBody }),
+    } as never)) as { status: number; data: { error: boolean; message: string } };
+    expect(failedSaveProbe.status).toBe(502);
+    expect(failedSaveProbe.data.message).toContain("LLM connection check failed:");
+    expect(failedSaveProbe.data.message).toContain("[redacted]");
 
     const testBody = new FormData();
     testBody.set("provider", "openai");
