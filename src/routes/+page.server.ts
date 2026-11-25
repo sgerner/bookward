@@ -107,6 +107,7 @@ type Overview = {
     enabled: number;
     kind: string;
     is_default: number;
+    is_custom?: boolean;
     lifecycle: "permanent" | "one_time";
     filters: SourceFilters;
     last_status: string | null;
@@ -312,7 +313,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     },
     sources: overview.sources
       .filter((source) => !source.is_default)
-      .map((source) => ({ ...source, label: source.name })),
+      .map((source) => ({
+        ...source,
+        label: source.name,
+        is_custom: source.is_custom ?? source.kind === "web",
+      })),
     profile: {
       goodreads_url: overview.settings.goodreads_rss_url ?? "",
       goodreads_rss_last_sync_at: overview.settings.goodreads_rss_last_sync_at ?? "",
@@ -338,6 +343,13 @@ const idSchema = z.coerce.number().int().positive();
 const urlSchema = z.url();
 const fail = <T extends { message: string }>(statusCode: number, data: T) =>
   kitFail(statusCode, { ...data, error: true as const });
+const comparableSourceUrl = (value: string) => {
+  try {
+    return new URL(value).href;
+  } catch {
+    return value.trim();
+  }
+};
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -363,6 +375,29 @@ const sourceFiltersFromForm = (data: FormData): SourceFilters => ({
 const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
+};
+const updateSourceLifecycle = async (
+  rawId: FormDataEntryValue | null,
+  rawLifecycle: FormDataEntryValue | null,
+) => {
+  const id = idSchema.safeParse(rawId);
+  const lifecycle = z.enum(["permanent", "one_time"]).safeParse(rawLifecycle);
+  if (!id.success || !lifecycle.success)
+    return fail(400, { message: "Invalid source." });
+  try {
+    await engine(`/api/sources/${id.data}`, {
+      method: "PUT",
+      body: JSON.stringify({ lifecycle: lifecycle.data }),
+    });
+    return {
+      message:
+        lifecycle.data === "one_time"
+          ? "Source changed to a one-time import."
+          : "Source restored to a permanent feed.",
+    };
+  } catch (error) {
+    return fail(engineStatus(error), { message: message(error) });
+  }
 };
 async function handleCsvImport(request: Request) {
   let incoming: FormData;
@@ -685,6 +720,114 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
+  editSource: async ({ request }) => {
+    const data = await request.formData();
+    const id = idSchema.safeParse(data.get("id"));
+    const rawLabel = String(data.get("label") ?? "");
+    const rawUrl = String(data.get("url") ?? "");
+    if (!id.success) return fail(400, { message: "Invalid source." });
+    const editState = { id: id.data, label: rawLabel, url: rawUrl };
+    const label = z.string().trim().min(2).max(100).safeParse(rawLabel);
+    const url = urlSchema.safeParse(rawUrl.trim());
+    if (!label.success || !url.success)
+      return fail(400, {
+        message: "Add a valid name and public URL.",
+        editSource: editState,
+      });
+    try {
+      const sources = await engine<Overview["sources"]>("/api/sources");
+      const current = sources.find((item) => item.id === id.data);
+      if (!current)
+        return fail(404, {
+          message: "Source not found.",
+          editSource: editState,
+        });
+      if (
+        current.kind !== "web" ||
+        current.is_default ||
+        current.is_custom === false
+      )
+        return fail(400, {
+          message: "Only custom sources can be edited.",
+          editSource: editState,
+        });
+      const nextComparable = comparableSourceUrl(url.data);
+      const urlChanged = nextComparable !== comparableSourceUrl(current.url);
+      if (urlChanged) {
+        if (
+          sources.some(
+            (item) =>
+              item.id !== id.data &&
+              comparableSourceUrl(item.url) === nextComparable,
+          )
+        )
+          return fail(409, {
+            message: "A source with that URL already exists.",
+            editSource: editState,
+          });
+        const filters = current.filters ?? {
+          include_genres: [],
+          exclude_genres: [],
+        };
+        const preview = await engine<{ count: number; url?: string }>(
+          "/api/sources/preview",
+          {
+            method: "POST",
+            body: JSON.stringify({ url: url.data, filters }),
+          },
+        );
+        if (preview.count === 0)
+          return fail(400, {
+            message:
+              filters.include_genres.length || filters.exclude_genres.length
+                ? "No books matched these filters."
+                : "No recognizable books were found at that URL.",
+            editSource: editState,
+          });
+        const resolvedUrl =
+          typeof preview.url === "string" && preview.url.trim()
+            ? preview.url.trim()
+            : url.data;
+        const resolvedComparable = comparableSourceUrl(resolvedUrl);
+        if (
+          sources.some(
+            (item) =>
+              item.id !== id.data &&
+              comparableSourceUrl(item.url) === resolvedComparable,
+          )
+        )
+          return fail(409, {
+            message: "A source with that URL already exists.",
+            editSource: editState,
+          });
+        await engine(`/api/sources/${id.data}`, {
+          method: "PUT",
+          body: JSON.stringify({ name: label.data, url: resolvedUrl }),
+        });
+        const resolvedUrlChanged =
+          resolvedComparable !== comparableSourceUrl(current.url);
+        const provenanceNote = resolvedUrlChanged
+          ? " Earlier books stay attributed to this source."
+          : "";
+        return {
+          message:
+            current.enabled && resolvedUrlChanged
+              ? `Source updated; a fresh scan is queued (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`
+              : `Source updated (${preview.count} book${preview.count === 1 ? "" : "s"} detected).${provenanceNote}`,
+        };
+      }
+      await engine(`/api/sources/${id.data}`, {
+        method: "PUT",
+        body: JSON.stringify({ name: label.data }),
+      });
+      return { message: "Source updated." };
+    } catch (error) {
+      return fail(engineStatus(error), {
+        message: message(error),
+        editSource: editState,
+      });
+    }
+  },
   configureSourceFilters: async ({ request }) => {
     const data = await request.formData();
     const id = idSchema.safeParse(data.get("id"));
@@ -839,15 +982,21 @@ export const actions: Actions = {
       return fail(engineStatus(error), { message: message(error) });
     }
   },
-  switchSourceToOneTime: async ({ request }) => {
+  switchSourceLifecycle: async ({ request }) => {
+    const data = await request.formData();
+    return updateSourceLifecycle(data.get("id"), data.get("lifecycle"));
+  },
+  switchSourceToOneTime: async ({ request }) =>
+    updateSourceLifecycle((await request.formData()).get("id"), "one_time"),
+  refreshSource: async ({ request }) => {
     const id = idSchema.safeParse((await request.formData()).get("id"));
     if (!id.success) return fail(400, { message: "Invalid source." });
     try {
-      await engine(`/api/sources/${id.data}`, {
-        method: "PUT",
-        body: JSON.stringify({ lifecycle: "one_time" }),
+      await engine(`/api/sources/${id.data}/refresh`, {
+        method: "POST",
+        body: "{}",
       });
-      return { message: "Source changed to a one-time import." };
+      return { message: "Source refresh queued." };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }

@@ -30,7 +30,8 @@ from .scoring import document
 
 
 LOGGER = logging.getLogger(__name__)
-SCORING_BATCH_SCHEMA_VERSION = 1
+SCORING_BATCH_SCHEMA_VERSION = 2
+SUPPORTED_SCORING_BATCH_SCHEMA_VERSIONS = frozenset({1, 2})
 MAX_SCORING_READS = 10_000
 MAX_SCORING_CANDIDATES = 5_000
 MAX_SCORING_VECTORS = 15_000
@@ -51,9 +52,9 @@ IDENTITY_READ_FIELDS = (
 )
 CANDIDATE_FIELDS = (
     "id", "title", "author", "description", "genres", "status", "score",
-    "source_id", "source_name", "source_weight", "quality_status",
-    "quality_score", "catalog_confidence", "quality_work_id",
-    "quality_provider", "quality_isbn13", "quality_isbn10", "score_batch_id",
+    "source_id", "source_name", "source_weight", "source_url", "isbn13", "isbn10",
+    "quality_status", "quality_score", "catalog_confidence", "quality_work_id",
+    "quality_provider", "quality_provider_id", "quality_isbn13", "quality_isbn10", "score_batch_id",
     "first_publication_year", "publication_work_id",
 )
 
@@ -158,13 +159,15 @@ def build_scoring_batch_evidence(
     backend: str,
     model: str,
     scoring_batch_size: int,
+    to_read_candidate_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Build replay inputs for the exact inputs and outputs written by a scorer job.
 
     The active scorer's result is a materialized score. This artifact stores
     both the complete read identity projection used for eligibility and the
     rated reads, candidate inputs, exact vectors, and outputs passed/written
-    by that particular invocation.
+    by that particular invocation, plus candidate-scoped `to_read_candidate_ids`
+    without copying raw Goodreads shelf contents.
     """
 
     read_count = len(read_history) if hasattr(read_history, "__len__") else 0
@@ -199,16 +202,53 @@ def build_scoring_batch_evidence(
         rated_read_ids = [int(item["id"]) for item in reads]
         rated_read_snapshots = [_snapshot(item, READ_FIELDS) for item in reads]
         candidate_snapshots = [_snapshot(item, CANDIDATE_FIELDS) for item in candidate_items]
+
+        if to_read_candidate_ids is not None:
+            raw_matched = _bounded_list(
+                to_read_candidate_ids, MAX_SCORING_CANDIDATES, "candidate_limit_exceeded"
+            )
+            matched_to_read_set: set[int] = set()
+            for raw_cid in raw_matched:
+                if isinstance(raw_cid, bool):
+                    raise _LimitError("invalid_shelf_match_manifest")
+                try:
+                    cid = int(raw_cid)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise _LimitError("invalid_shelf_match_manifest") from exc
+                if cid not in candidate_vector_ids:
+                    raise _LimitError("invalid_shelf_match_manifest")
+                matched_to_read_set.add(cid)
+        else:
+            matched_to_read_set = set()
+            for cid in candidate_ids:
+                out = output_by_id[cid]
+                if bool(out.get("on_goodreads_to_read")):
+                    matched_to_read_set.add(cid)
+                    continue
+                try:
+                    if float(out.get("shelf_boost") or 0.0) > 0:
+                        matched_to_read_set.add(cid)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        matched_to_read_ids = sorted(matched_to_read_set)
+
         outputs = []
         candidate_descriptors = {}
         for candidate_id in candidate_ids:
             output = output_by_id[candidate_id]
             try:
                 score = float(output["score"])
+                base_score = float(output.get("base_score", score))
+                shelf_boost = float(output.get("shelf_boost", round(score - base_score, 1)))
                 metadata_confidence = float(output["metadata_confidence"])
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise _LimitError("invalid_candidate_output") from exc
-            if not math.isfinite(score) or not math.isfinite(metadata_confidence):
+            if (
+                not math.isfinite(score)
+                or not math.isfinite(base_score)
+                or not math.isfinite(shelf_boost)
+                or not math.isfinite(metadata_confidence)
+            ):
                 raise _LimitError("invalid_candidate_output")
             candidate_input = by_candidate[candidate_id]
             input_text_hash = content_hash(document(dict(candidate_input)))
@@ -221,7 +261,10 @@ def build_scoring_batch_evidence(
             outputs.append(
                 {
                     "candidate_id": candidate_id,
+                    "base_score": base_score,
                     "score": score,
+                    "shelf_boost": shelf_boost,
+                    "on_goodreads_to_read": candidate_id in matched_to_read_set,
                     "metadata_confidence": metadata_confidence,
                     "explanation": _json_value(output.get("explanation") or []),
                     **({"publication_era": _json_value(output["publication_era"])}
@@ -341,6 +384,7 @@ def build_scoring_batch_evidence(
                     "current_verified_openlibrary_read_work_id"
                 ),
                 "candidate_count": len(candidate_items),
+                "to_read_candidate_ids": matched_to_read_ids,
             },
             "read_history": read_snapshots,
             "read_identity_projection": read_identity,
@@ -432,6 +476,12 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
             evidence=evidence,
             reason=str(evidence.get("reason") or "capture_unavailable"),
         )
+    try:
+        schema_version = int(evidence.get("schema_version") or 0)
+    except (TypeError, ValueError, OverflowError):
+        schema_version = 0
+    if schema_version not in SUPPORTED_SCORING_BATCH_SCHEMA_VERSIONS:
+        return _insert_incomplete(connection, batch_id=batch_id, evidence=evidence, reason="unsupported_schema")
     artifacts = evidence.get("_vector_artifacts")
     candidates = evidence.get("_candidate_descriptors")
     raw_json = evidence.get("_raw_json")
@@ -570,7 +620,7 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             batch_id,
-            SCORING_BATCH_SCHEMA_VERSION,
+            schema_version,
             "complete",
             "",
             str(evidence["captured_at"]),
@@ -644,8 +694,29 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
         payload = json.loads(raw_json)
     except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("Scoring batch payload is unreadable") from exc
-    if not isinstance(payload, dict) or int(payload.get("schema_version", 0)) != SCORING_BATCH_SCHEMA_VERSION:
+    schema_version = int(row["schema_version"])
+    if (
+        not isinstance(payload, dict)
+        or schema_version not in SUPPORTED_SCORING_BATCH_SCHEMA_VERSIONS
+        or int(payload.get("schema_version", 0)) != schema_version
+    ):
         raise ValueError("Unsupported scoring batch schema")
+    if schema_version >= 2:
+        if "goodreads_shelf_items" in payload:
+            raise ValueError("Scoring batch must not persist raw Goodreads shelf items")
+        input_selection = payload.get("input_selection")
+        to_read_ids = (
+            input_selection.get("to_read_candidate_ids")
+            if isinstance(input_selection, dict)
+            else None
+        )
+        if (
+            not isinstance(to_read_ids, list)
+            or len(to_read_ids) > MAX_SCORING_CANDIDATES
+            or any(isinstance(cid, bool) or not isinstance(cid, int) for cid in to_read_ids)
+            or len(set(to_read_ids)) != len(to_read_ids)
+        ):
+            raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
     vectors = []
     for descriptor in payload.get("vectors", []):
         if not isinstance(descriptor, dict):
@@ -708,6 +779,23 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
     }
     if len(expected) != len(outputs) or expected != actual:
         raise ValueError("Scoring batch candidate outputs do not match immutable links")
+    if schema_version >= 2:
+        to_read_id_set = set(payload["input_selection"]["to_read_candidate_ids"])
+        if not to_read_id_set.issubset(expected):
+            raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
+        for item in outputs:
+            try:
+                base_score = float(item["base_score"])
+                shelf_boost = float(item["shelf_boost"])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Scoring batch base-score manifest is invalid") from exc
+            if not math.isfinite(base_score) or not math.isfinite(shelf_boost):
+                raise ValueError("Scoring batch base-score manifest is invalid")
+            if "on_goodreads_to_read" in item and (
+                not isinstance(item["on_goodreads_to_read"], bool)
+                or item["on_goodreads_to_read"] != (int(item["candidate_id"]) in to_read_id_set)
+            ):
+                raise ValueError("Scoring batch Goodreads shelf match manifest is invalid")
     input_by_id = {
         int(item["id"]): item
         for item in payload.get("candidate_inputs", [])
@@ -752,3 +840,158 @@ def load_scoring_batch(connection, batch_id: str) -> dict[str, Any] | None:
     result["decision"] = payload
     result["candidate_links"] = candidates
     return result
+
+
+def replay_scoring_batch(record_or_decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Deterministically replay a scoring batch archive including candidate-scoped shelf boosts."""
+
+    from .ranking import rank_candidates
+
+    if not isinstance(record_or_decision, Mapping):
+        raise ValueError("Scoring batch record must be a mapping")
+    if "decision" in record_or_decision and isinstance(record_or_decision.get("decision"), Mapping):
+        if record_or_decision.get("capture_status") != "complete":
+            raise ValueError("Incomplete scoring batch cannot be replayed")
+        decision = record_or_decision["decision"]
+    else:
+        if record_or_decision.get("capture_status") not in (None, "complete"):
+            raise ValueError("Incomplete scoring batch cannot be replayed")
+        decision = record_or_decision
+
+    schema_version = int(decision.get("schema_version") or 0)
+    if schema_version not in SUPPORTED_SCORING_BATCH_SCHEMA_VERSIONS:
+        raise ValueError("Unsupported scoring batch schema")
+
+    vector_sources = decision.get("_vector_artifacts") or decision.get("vectors") or []
+    vector_map: dict[tuple[str, int], np.ndarray] = {}
+    for item in vector_sources:
+        if not isinstance(item, Mapping) or "vector_bytes" not in item:
+            continue
+        key = (str(item["entity_type"]), int(item["entity_id"]))
+        vector_map[key] = np.frombuffer(bytes(item["vector_bytes"]), dtype="<f4").copy()
+
+    rated_reads = [dict(item) for item in decision.get("rated_read_inputs") or []]
+    candidate_inputs = [dict(item) for item in decision.get("candidate_inputs") or []]
+    read_vectors = [vector_map[("read", int(item["id"]))] for item in rated_reads]
+    candidate_vectors = [
+        vector_map[("candidate", int(item["id"]))] for item in candidate_inputs
+    ]
+
+    archived_outputs = list(decision.get("candidate_outputs") or [])
+    input_selection = decision.get("input_selection")
+    input_selection = input_selection if isinstance(input_selection, Mapping) else {}
+    if schema_version >= 2:
+        raw_to_read_ids = input_selection.get("to_read_candidate_ids") or ()
+        to_read_ids = {
+            int(cid)
+            for cid in raw_to_read_ids
+            if not isinstance(cid, bool)
+        }
+    else:
+        to_read_ids = {
+            int(item["candidate_id"])
+            for item in archived_outputs
+            if isinstance(item, Mapping)
+            and item.get("candidate_id") is not None
+            and not isinstance(item.get("candidate_id"), bool)
+            and isinstance(item.get("explanation"), list)
+            and "On your Goodreads to-read shelf" in item["explanation"]
+        }
+
+    ranked = rank_candidates(
+        rated_reads, read_vectors, candidate_inputs, candidate_vectors
+    )
+    replayed_outputs: list[dict[str, Any]] = []
+    for candidate in ranked:
+        cid = int(candidate["id"])
+        base_score = float(candidate["score"])
+        score = base_score
+        explanation = list(candidate.get("explanation") or [])
+        on_to_read = cid in to_read_ids
+        if on_to_read:
+            score = round(min(100.0, base_score + 10.0), 1)
+            if "On your Goodreads to-read shelf" not in explanation:
+                explanation.insert(0, "On your Goodreads to-read shelf")
+        replayed_outputs.append(
+            {
+                "candidate_id": cid,
+                "base_score": base_score,
+                "score": score,
+                "shelf_boost": round(score - base_score, 1),
+                "on_goodreads_to_read": on_to_read,
+                "metadata_confidence": float(candidate["metadata_confidence"]),
+                "explanation": explanation,
+                **(
+                    {"publication_era": candidate["publication_era"]}
+                    if "publication_era" in candidate
+                    else {}
+                ),
+            }
+        )
+
+    archived_by_id = {int(item["candidate_id"]): item for item in archived_outputs}
+    replayed_by_id = {int(item["candidate_id"]): item for item in replayed_outputs}
+    ids_match = [int(i["candidate_id"]) for i in replayed_outputs] == [
+        int(i["candidate_id"]) for i in archived_outputs
+    ]
+    if set(archived_by_id) == set(replayed_by_id):
+        drifts = [
+            abs(float(replayed_by_id[cid]["score"]) - float(archived_by_id[cid]["score"]))
+            for cid in archived_by_id
+        ]
+        base_drifts = [
+            abs(
+                float(replayed_by_id[cid]["base_score"])
+                - float(archived_by_id[cid].get("base_score", archived_by_id[cid]["score"]))
+            )
+            for cid in archived_by_id
+        ]
+        max_score_drift = round(max(drifts, default=0.0), 6)
+        max_base_score_drift = round(max(base_drifts, default=0.0), 6)
+    else:
+        max_score_drift = float("inf")
+        max_base_score_drift = float("inf")
+
+    scores_match = ids_match and max_score_drift == 0.0
+    base_scores_match = ids_match and (schema_version < 2 or max_base_score_drift == 0.0)
+    explanations_match = ids_match and all(
+        list(replayed_by_id[cid]["explanation"])
+        == list(archived_by_id[cid].get("explanation") or [])
+        for cid in archived_by_id
+    )
+    confidence_match = ids_match and all(
+        abs(
+            float(replayed_by_id[cid]["metadata_confidence"])
+            - float(archived_by_id[cid]["metadata_confidence"])
+        )
+        <= 1e-9
+        for cid in archived_by_id
+    )
+    verification = {
+        "candidate_ids_match": ids_match,
+        "base_scores_match": base_scores_match,
+        "scores_match": scores_match,
+        "explanations_match": explanations_match,
+        "metadata_confidence_match": confidence_match,
+        "max_base_score_drift": max_base_score_drift if schema_version >= 2 else 0.0,
+        "max_score_drift": max_score_drift,
+        "matches_archived": (
+            ids_match
+            and base_scores_match
+            and scores_match
+            and explanations_match
+            and confidence_match
+            and max_score_drift == 0.0
+        ),
+    }
+    return {
+        "schema_version": schema_version,
+        "candidate_outputs": replayed_outputs,
+        "verification": verification,
+    }
+
+
+def verify_scoring_batch_replay(record_or_decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Return replay parity diagnostics for a loaded scoring-batch archive."""
+
+    return replay_scoring_batch(record_or_decision)["verification"]
