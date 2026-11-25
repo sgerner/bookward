@@ -1,13 +1,14 @@
 """Pure, bounded recommendation ranking from read and candidate embeddings."""
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
-from .identity import book_identity
+from .identity import book_author_identity_key, book_identity
 from .read_dates import read_day as _read_day
-from .subjects import normalize_subjects
+from .subjects import normalize_subjects, resolve_subject_label, subject_display_map
 
 
 _BATCH_SIZE = 64
@@ -18,6 +19,144 @@ _KERNEL_FULL_HISTORY = 100
 _KERNEL_ESS_PRIOR = 5.0
 _RECENCY_TIMESCALE_YEARS = 8
 _RECENCY_SCORE_PER_STAR = 20
+_POSITIVE_EXPLANATION_MIN_SIMILARITY = 0.25
+_NEGATIVE_EXPLANATION_MIN_SIMILARITY = 0.25
+_NEGATIVE_EXPLANATION_MEDIAN_MARGIN = 0.12
+_LEGACY_PERSONALIZATION_PREFIXES = (
+    "Raised using your saved, imported, or positively rated books",
+    "Raised using books you saved, imported, or positively rated",
+)
+_PERSONALIZATION_POSITIVE_PREFIX = "Raised using books you shortlisted, added to Librarr, or rated highly"
+_LEGACY_FATIGUE_REASON = "Lowered slightly after appearing on several recent days without a decision"
+_FATIGUE_REASON = "Lowered after appearing on several recent days without a decision"
+_PAREN_DETAILS_RE = re.compile(r"^((?:Raised|Lowered) using [^(]+\()([^()]+)(\))$")
+
+
+def _normalize_feature_token(
+    token: str,
+    *,
+    subject_labels: dict[str, str],
+    candidate_author: str,
+) -> str:
+    stripped = token.strip()
+    if stripped.startswith("subject "):
+        raw_subject = stripped[len("subject "):].strip()
+        display_subject = resolve_subject_label(raw_subject, subject_labels)
+        return f"subject {display_subject}" if display_subject else stripped
+    if stripped.startswith("author "):
+        raw_author = stripped[len("author "):].strip()
+        candidate_key = book_author_identity_key(candidate_author)
+        if candidate_author and candidate_key and book_author_identity_key(raw_author) == candidate_key:
+            return f"author {candidate_author}"
+        return stripped
+    return stripped
+
+
+def _parse_era_decade(value: object) -> int | None:
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        year = int(value)
+    elif isinstance(value, str) and value.strip():
+        match = re.match(r"^(\d{4})", value.strip())
+        if not match:
+            return None
+        year = int(match.group(1))
+    else:
+        return None
+    return (year // 10) * 10 if 1000 <= year <= 2100 else None
+
+
+def format_era_explanation(year_value: object, *, positive: bool) -> str:
+    """Format a plain-language publication-era reason without validation jargon."""
+    decade = _parse_era_decade(year_value)
+    if positive:
+        if decade is not None:
+            return f"Matches your high ratings for books from the {decade}s"
+        return "Matches a publication era you tend to rate highly"
+    if decade is not None:
+        return f"Reduced: books from the {decade}s tend to score lower in your reading history"
+    return "Reduced: books from this publication era tend to score lower in your reading history"
+
+
+def is_caveat_explanation(text: str) -> bool:
+    """Return True when an explanation string is a negative caveat or confidence warning."""
+    lowered = str(text or "").strip().casefold()
+    return (
+        lowered.startswith("reduced:")
+        or lowered.startswith("lowered ")
+        or lowered.startswith("ranking confidence reduced")
+        or "mixed ratings in your reading history" in lowered
+    )
+
+
+def normalize_explanation_items(
+    explanation: object,
+    *,
+    genres: object = None,
+    author: object = None,
+    release_date: object = None,
+    first_publication_year: object = None,
+) -> list[str]:
+    """Rewrite stale stored jargon and order positive reasons ahead of source and caveats."""
+    if not isinstance(explanation, list):
+        return []
+    subject_labels = subject_display_map(genres, limit=8) if genres is not None else {}
+    candidate_author = str(author or "").strip()
+    year_hint = first_publication_year if first_publication_year is not None else release_date
+
+    positives: list[str] = []
+    sources: list[str] = []
+    serving_notes: list[str] = []
+    caveats: list[str] = []
+    seen: set[str] = set()
+
+    for raw in explanation:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        lowered_raw = item.casefold()
+        if item == _LEGACY_FATIGUE_REASON:
+            item = _FATIGUE_REASON
+        elif "held-out ratings" in lowered_raw:
+            is_negative_era = lowered_raw.startswith("reduced") or bool(
+                re.search(r"(?:adjusted\s*)?-\d", lowered_raw)
+            )
+            item = format_era_explanation(year_hint, positive=not is_negative_era)
+        else:
+            for legacy_prefix in _LEGACY_PERSONALIZATION_PREFIXES:
+                if item.startswith(legacy_prefix):
+                    item = _PERSONALIZATION_POSITIVE_PREFIX + item[len(legacy_prefix):]
+                    break
+
+        paren_match = _PAREN_DETAILS_RE.match(item)
+        if paren_match:
+            prefix, raw_details, suffix = paren_match.groups()
+            normalized_tokens = [
+                _normalize_feature_token(
+                    part,
+                    subject_labels=subject_labels,
+                    candidate_author=candidate_author,
+                )
+                for part in raw_details.split(",")
+            ]
+            item = f"{prefix}{', '.join(normalized_tokens)}{suffix}"
+
+        if item in seen:
+            continue
+        seen.add(item)
+
+        lowered = item.casefold()
+        if is_caveat_explanation(item):
+            caveats.append(item)
+        elif lowered.startswith("from "):
+            sources.append(item)
+        elif lowered.startswith("moved up "):
+            serving_notes.append(item)
+        else:
+            positives.append(item)
+
+    return [*positives, *sources, *serving_notes, *caveats]
 
 
 def normalized_vector_matrix(vectors: Sequence[Sequence[float]], dimensions: int | None = None) -> np.ndarray:
@@ -276,30 +415,80 @@ def rank_candidates(
                 # Validate and deploy the same one-decimal baseline scale.
                 score = round(max(0.0, min(100.0, score)), 1) + era_adjustment
             score = max(0.0, min(100.0, score))
-            explanation: list[str] = []
+            positive_reasons: list[str] = []
+            source_reasons: list[str] = []
+            caveat_reasons: list[str] = []
+
             if any(rating >= 4 for rating in author_ratings):
                 if any(rating <= 2 for rating in author_ratings):
-                    explanation.append("This author has mixed ratings in your reading history")
+                    caveat_reasons.append("This author has mixed ratings in your reading history")
                 else:
-                    explanation.append("You rated a book by this author highly")
-            if len(positive_values) and positive_max > .25:
-                nearest = positive_columns[int(np.argmax(positive_values))]
-                explanation.append(f"Closest highly rated title: {positives[nearest][0].get('title', 'a highly rated book')}")
-            if len(negative_values) and negative_max > 0:
-                nearest = negative_columns[int(np.argmax(negative_values))]
-                explanation.append(f"Reduced: similar to a 1–2★ book — {negatives[nearest][0].get('title', 'a low-rated book')}")
-            if era_adjustment:
-                explanation.append(
-                    "Publication-era preference supported by held-out ratings"
-                    if era_adjustment > 0 else
-                    "Reduced: publication-era preference supported by held-out ratings"
+                    positive_reasons.append("You rated a book by this author highly")
+            elif (
+                author_ratings
+                and all(rating <= 2 for rating in author_ratings)
+                and author_delta < 0
+            ):
+                caveat_reasons.append(
+                    "Reduced: you rated a book by this author poorly"
+                    if len(author_ratings) == 1
+                    else "Reduced: you rated books by this author poorly"
                 )
+
+            actual_positive_max = float(positive_values.max()) if len(positive_values) else 0.0
+            if len(positive_values) and actual_positive_max > _POSITIVE_EXPLANATION_MIN_SIMILARITY:
+                nearest = positive_columns[int(np.argmax(positive_values))]
+                positive_reasons.append(
+                    f"Closest highly rated title: {positives[nearest][0].get('title', 'a highly rated book')}"
+                )
+
+            non_negative_similarities = np.asarray(
+                [
+                    all_sim[offset, int(index)]
+                    for index in profile_indices
+                    if float(all_ratings[int(index)][0].get("rating") or 0) > 2
+                ],
+                dtype=np.float32,
+            )
+            if len(profile_similarities) > 1 and len(non_negative_similarities):
+                baseline_similarity = max(
+                    0.0,
+                    min(
+                        float(np.median(profile_similarities)),
+                        float(np.median(non_negative_similarities)),
+                    ),
+                )
+            else:
+                baseline_similarity = 0.0
+
+            if (
+                len(negative_values)
+                and negative_max > _NEGATIVE_EXPLANATION_MIN_SIMILARITY
+                and negative_max > baseline_similarity + _NEGATIVE_EXPLANATION_MEDIAN_MARGIN
+                and (negative_max >= actual_positive_max or score < 50.0)
+            ):
+                nearest = negative_columns[int(np.argmax(negative_values))]
+                caveat_reasons.append(
+                    f"Reduced: similar to a 1–2★ book — {negatives[nearest][0].get('title', 'a low-rated book')}"
+                )
+
+            if era_adjustment:
+                era_reason = format_era_explanation(
+                    candidate.get("first_publication_year"),
+                    positive=era_adjustment > 0,
+                )
+                if era_adjustment > 0:
+                    positive_reasons.append(era_reason)
+                else:
+                    caveat_reasons.append(era_reason)
+
             if candidate.get("source_name"):
-                explanation.append(f"From {candidate['source_name']}")
+                source_reasons.append(f"From {candidate['source_name']}")
             if metadata_confidence < 0.65:
-                explanation.append(
+                caveat_reasons.append(
                     "Ranking confidence reduced because catalog details are sparse"
                 )
+            explanation = [*positive_reasons, *source_reasons, *caveat_reasons]
             results.append(
                 {
                     **candidate,

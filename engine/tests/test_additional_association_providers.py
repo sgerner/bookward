@@ -614,8 +614,8 @@ def test_clients_preserve_byte_caps_mapping_guards_and_google_ttl_boundary(
     assert asyncio.run(openlibrary_client.get_json("/search.json")) == ["raw-list"]
 
     librarything_client = LibraryThingClient("lt-secret", rate_limiter=RateLimiter(0))
-    lt_payload = asyncio.run(librarything_client.recommendations(["9781111111111"]))
-    assert lt_payload["recommendations"] == ["exceeds-twenty-four-bytes"]
+    with pytest.raises(ValueError, match="LibraryThing response is too large"):
+        asyncio.run(librarything_client.recommendations(["9781111111111"]))
 
     monkeypatch.setattr(settings, "source_max_bytes", 2_000_000)
     respx.get("https://93.184.216.34/books/v1/volumes").mock(

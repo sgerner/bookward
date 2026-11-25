@@ -47,12 +47,46 @@ def test_validated_adjustment_uses_exact_baseline_score_scale_and_is_archived(mo
     result = rank_candidates(reads, vectors, [candidate], vectors)[0]
     assert result["score"] == round(baseline["score"] + 2, 1)
     assert result["publication_era"]["score_adjustment"] == round(2, 4)
-    assert "held-out ratings" in " ".join(result["explanation"])
+    joined_explanation = " ".join(result["explanation"])
+    assert "Matches your high ratings for books from the 1970s" in joined_explanation
+    assert "held-out ratings" not in joined_explanation
     assert "first_publication_year" in READ_FIELDS
     assert "first_publication_year" in CANDIDATE_FIELDS
     lineage = source_lineage()
     assert "publication_era_signal.py" in str(lineage)
     assert "publication_year_metadata.py" in str(lineage)
+
+
+def test_negative_era_adjustment_uses_plain_decade_caveat_after_source(monkeypatch):
+    from afterword_engine import publication_era_signal
+
+    reads = [{"id": 1, "title": "Loved Book", "author": "X", "rating": 5}]
+    vectors = np.array([[1., 0.]])
+    candidate = {
+        "id": 2,
+        "title": "Seventies Novel",
+        "author": "Y",
+        "first_publication_year": 1974,
+        "catalog_confidence": 0.9,
+        "source_name": "Literary Weekly",
+    }
+    monkeypatch.setattr(
+        publication_era_signal,
+        "fit_publication_era_signal",
+        lambda *_: SimpleNamespace(
+            adjustment=lambda year: -2.0 if year == 1974 else 0.0,
+            diagnostics={"enabled": True, "reason": "validated"},
+        ),
+    )
+    result = rank_candidates(reads, vectors, [candidate], vectors)[0]
+    explanations = result["explanation"]
+    assert "held-out ratings" not in " ".join(explanations)
+    assert "Reduced: books from the 1970s tend to score lower in your reading history" in explanations
+    source_idx = explanations.index("From Literary Weekly")
+    caveat_idx = explanations.index(
+        "Reduced: books from the 1970s tend to score lower in your reading history"
+    )
+    assert 0 < source_idx < caveat_idx
 
 
 def test_read_metadata_queues_rescore_only_when_verified_year_inputs_change(monkeypatch):

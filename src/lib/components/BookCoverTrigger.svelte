@@ -30,6 +30,7 @@
 	const baseId = $derived(id ?? fallbackId);
 	const titleId = $derived(`${baseId}-title`);
 	const actionId = $derived(`${baseId}-action`);
+	const formattedScore = $derived(Number(score).toFixed(1));
 
 	function motionDuration(duration: number) {
 		if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return duration;
@@ -72,6 +73,6 @@
 			in:scale={{ duration: motionDuration(160) }}
 			class="badge pointer-events-none preset-filled-primary-500"
 			title="Relative ranking score, not a probability or star rating"
-		>Rank {score}</span>
+		>Rank {formattedScore}</span>
 	</span>
 </div>
