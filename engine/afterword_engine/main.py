@@ -2014,6 +2014,7 @@ def _recommendation_identity_context(connection=None):
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
     shortlist_rows = fetch(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
@@ -2080,7 +2081,8 @@ def _recommendation_rows(
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
-        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
         f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -3413,7 +3415,8 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                 for item in connection.execute(
                     "SELECT c.*,s.name source_name,q.metadata_confidence,"
                     "q.work_id quality_work_id,"
-                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+                    "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
                     "LEFT JOIN sources s ON s.id=c.source_id "
