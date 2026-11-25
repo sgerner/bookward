@@ -672,8 +672,6 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
 
     const compiledCss = compiler.build([
       "header-reflow",
-      "modal-scroll-shell",
-      "modal-scroll-body",
       "text-reflow",
       "url-reflow",
       "btn-reflow",
@@ -682,12 +680,16 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
       "h-12",
       "text-left",
       "whitespace-nowrap",
-      "max-h-[min(42rem,calc(100dvh-6rem))]",
     ]);
 
     expect(compiledCss).toMatch(/@layer\s+[^;]*components\s*,\s*utilities\s*;/);
     expect(compiledCss).toContain("@layer components");
-    expect(compiledCss).not.toContain(".btn:not(.btn-icon)");
+    // Only #274's narrow <= 24rem media block may target .btn:not(.btn-icon); no viewport-wide .btn or .badge overrides
+    const withoutNarrowBtnMedia = compiledCss.replace(
+      /@media\s*\(max-width:\s*24rem\)\s*\{[\s\S]*?\n\}/g,
+      "",
+    );
+    expect(withoutNarrowBtnMedia).not.toContain(".btn:not(.btn-icon)");
     expect(compiledCss).not.toContain(".badge:not(");
 
     const btnIdx = compiledCss.indexOf(".btn {");
@@ -698,26 +700,29 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
     expect(whitespaceNowrapIdx).toBeGreaterThan(btnReflowIdx);
   });
 
-  it("renders ThemePicker SSR triggers with PopoverDialog semantics and single modal-scroll-body structure", () => {
+  it("renders ThemePicker SSR triggers with PopoverDialog topLayer semantics and single-scroller structure", () => {
     const compactRender = render(ThemePicker, { props: { compact: true } });
     expect(compactRender.body).toContain('aria-label="Choose appearance"');
     expect(compactRender.body).toMatch(/aria-controls="[^"]+"/);
     expect(compactRender.body).toContain('aria-haspopup="dialog"');
-    expect(compactRender.body).toContain("fixed right-4 top-20");
+    expect(compactRender.body).toContain("fixed right-4 top-4 left-auto bottom-auto z-[55]");
+    expect(compactRender.body).toContain("sm:top-20");
     expect(compactRender.body).toContain("btn-reflow");
     expect(compactRender.body).toContain(">Appearance</span>");
-    expect(compactRender.body).toContain("modal-scroll-body");
+    expect(compactRender.body).toContain("overflow-y-auto");
     expect(compactRender.body).not.toContain("max-h-[min(22rem,45vh)]");
 
     const standaloneRender = render(ThemePicker, { props: { compact: false } });
     expect(standaloneRender.body).toContain("btn-icon");
+    expect(standaloneRender.body).toContain("absolute right-0 top-[calc(100%+0.75rem)] z-50");
     expect(standaloneRender.body).not.toContain(">Appearance</span>");
+    expect(standaloneRender.body).not.toContain("max-h-[min(22rem,45vh)]");
   });
 
   const chromeIt = findChromeBinary() ? it : it.skip;
 
   chromeIt(
-    "mounts the real Svelte route and dialog components in Chromium to verify compact ThemePicker anchoring, 320px sticky nav flow, single-scroll Librarr modalFocus trapping, and .btn reflow across routes",
+    "mounts the real Svelte route and ModalDialog/PopoverDialog components in Chromium to verify compact ThemePicker anchoring, 320px sticky nav flow, single-scroll ModalDialog trapping, and .btn reflow across routes",
     async () => {
       const assets = await buildRealComponentHarness();
       const homeData = createHomeFixtureData();
@@ -734,8 +739,8 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
       await withHarnessServer(assets, async (baseUrl) => {
         await withHeadlessChrome(async (cdp) => {
           await cdp.send("Emulation.setDeviceMetricsOverride", {
-            width: 375,
-            height: 812,
+            width: 1280,
+            height: 800,
             deviceScaleFactor: 2,
             mobile: false,
           });
@@ -750,7 +755,7 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
             await new Promise((r) => setTimeout(r, 50));
           }
 
-          // 1. Verify Tailwind utility cascade wins on plain .btn AND .btn-reflow
+          // 1. Verify Tailwind utility cascade wins on plain .btn AND .btn-reflow above 24rem
           const cascadeMetrics = await cdp.eval<{
             plainHeight: string;
             plainAlign: string;
@@ -785,6 +790,13 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
             overrideHeight: "48px",
             overrideAlign: "left",
             overrideWrap: "nowrap",
+          });
+
+          await cdp.send("Emulation.setDeviceMetricsOverride", {
+            width: 375,
+            height: 812,
+            deviceScaleFactor: 2,
+            mobile: false,
           });
 
           // Mount the REAL +page.svelte component!
@@ -1038,12 +1050,56 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
           );
           await checkVisibleButtons("error:404", { checkPageOverflow: false });
 
-          // 5. Remount REAL +page.svelte and verify single-scroll Librarr dialog (no nested header scroll) + real modalFocus trapping
+          // 5. Remount REAL +page.svelte and verify ModalDialog (Mark Read & Librarr) reflow + single-scroll + focus trapping
+          await cdp.eval(
+            `window.__harness.mountRoute('home', { data: ${JSON.stringify(homeData)}, form: null }, { href: '${baseUrl}/?view=saved' })`,
+          );
+
+          // Verify Mark Read ModalDialog at 320x568 under 200% font size + WCAG 1.4.12 text spacing
+          await cdp.eval(
+            `document.getElementById('mode-override').textContent = ${JSON.stringify(zoomAndSpacingCss)}`,
+          );
+          await cdp.eval(`(() => {
+            const markBtn = document.querySelector('button[aria-label^="Mark Read:"]');
+            markBtn.focus();
+            markBtn.click();
+          })()`);
+          const markReadModalMetrics = await cdp.eval<{
+            isModalTopLayer: boolean;
+            clippedTextCount: number;
+            clippedButtonCount: number;
+            restoredFocusStartsWithMarkRead: boolean;
+          }>(`(async () => {
+            const dialog = document.querySelector('dialog[open][aria-labelledby="mark-read-title"]');
+            const isModalTopLayer = Boolean(dialog && dialog.matches(':modal'));
+            const clippedTextCount = Array.from(dialog.querySelectorAll('.text-reflow')).filter(
+              (el) => el.scrollWidth > el.clientWidth + 2,
+            ).length;
+            const clippedButtonCount = Array.from(dialog.querySelectorAll('.btn')).filter(
+              (btn) => btn.getClientRects().length > 0 && btn.scrollWidth > btn.clientWidth + 2,
+            ).length;
+            dialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+            for (let i = 0; i < 15 && document.querySelector('dialog[open][aria-labelledby="mark-read-title"]'); i++) {
+              await new Promise((r) => setTimeout(r, 20));
+            }
+            return {
+              isModalTopLayer,
+              clippedTextCount,
+              clippedButtonCount,
+              restoredFocusStartsWithMarkRead: (document.activeElement?.getAttribute('aria-label') ?? '').startsWith('Mark Read:'),
+            };
+          })()`);
+          expect(markReadModalMetrics).toEqual({
+            isModalTopLayer: true,
+            clippedTextCount: 0,
+            clippedButtonCount: 0,
+            restoredFocusStartsWithMarkRead: true,
+          });
+
+          // Switch back to Discover and verify Librarr ModalDialog at 320x568 + 200% font size has NO nested header scroll and Close stays pinned
           await cdp.eval(
             `window.__harness.mountRoute('home', { data: ${JSON.stringify(homeData)}, form: null }, { href: '${baseUrl}/' })`,
           );
-
-          // First verify at 320x568 + 200% font size that Librarr's header has NO nested overflow-y:auto and Close button stays pinned
           await cdp.eval(
             `document.getElementById('mode-override').textContent = 'html { font-size: 200% !important; }'`,
           );
@@ -1056,20 +1112,22 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
 
           for (let attempt = 0; attempt < 60; attempt++) {
             const count = await cdp.eval<number>(
-              "document.querySelectorAll('dialog[aria-labelledby=\"librarr-search-title\"] article').length",
+              "document.querySelectorAll('dialog[open][aria-labelledby=\"librarr-search-title\"] article').length",
             );
             if (count === 8) break;
             await new Promise((r) => setTimeout(r, 30));
           }
 
           const mobileLibrarrHeader = await cdp.eval<{
+            isModalTopLayer: boolean;
             headerOverflowY: string;
+            dialogOverflowY: string;
+            bodyOverflowY: string;
             closeVisible: boolean;
             bulkButtonClipped: boolean;
           }>(`(() => {
-            const dialog = document.querySelector('dialog[aria-labelledby="librarr-search-title"]');
-            const header = dialog.firstElementChild;
-            const body = dialog.querySelector('.modal-scroll-body');
+            const dialog = document.querySelector('dialog[open][aria-labelledby="librarr-search-title"]');
+            const [header, body] = Array.from(dialog.children);
             const closeBtn = dialog.querySelector('button[aria-label="Close Librarr search"]');
             const bulkBtn = Array.from(body.querySelectorAll('button')).find((b) =>
               (b.textContent || '').includes('Add high-confidence matches'),
@@ -1077,18 +1135,24 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
             const dr = dialog.getBoundingClientRect();
             const cr = closeBtn.getBoundingClientRect();
             return {
+              isModalTopLayer: dialog.matches(':modal'),
               headerOverflowY: getComputedStyle(header).overflowY,
+              dialogOverflowY: getComputedStyle(dialog).overflowY,
+              bodyOverflowY: getComputedStyle(body).overflowY,
               closeVisible: cr.top >= dr.top - 1 && cr.bottom <= dr.bottom + 1 && cr.right <= dr.right + 1,
               bulkButtonClipped: bulkBtn ? bulkBtn.scrollWidth > bulkBtn.clientWidth + 2 : true,
             };
           })()`);
           expect(mobileLibrarrHeader).toEqual({
+            isModalTopLayer: true,
             headerOverflowY: "visible",
+            dialogOverflowY: "hidden",
+            bodyOverflowY: "auto",
             closeVisible: true,
             bulkButtonClipped: false,
           });
 
-          // Switch to 1280x800 + WCAG 1.4.12 text spacing to verify desktop header wrapping, Librarr scroll bounds, and REAL modalFocus Tab/Shift+Tab/destroy
+          // Switch to 1280x800 + WCAG 1.4.12 text spacing to verify desktop header wrapping, Librarr ModalDialog scroll bounds, and REAL modalFocus Tab/Shift+Tab/destroy
           await cdp.send("Emulation.setDeviceMetricsOverride", {
             width: 1280,
             height: 800,
@@ -1126,11 +1190,11 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
               }
             }
 
-            const dialog = document.querySelector('dialog[aria-labelledby="librarr-search-title"]');
+            const dialog = document.querySelector('dialog[open][aria-labelledby="librarr-search-title"]');
             const lockedBodyOverflow = document.body.style.overflow;
             const initialFocusLabel = document.activeElement?.getAttribute('aria-label') ?? '';
 
-            const body = dialog.querySelector('.modal-scroll-body');
+            const [, body] = Array.from(dialog.children);
             const dr = dialog.getBoundingClientRect();
             const br = body.getBoundingClientRect();
             const clipPx = Math.max(0, br.bottom - dr.bottom);
@@ -1142,7 +1206,7 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
 
             const closeBtn = dialog.querySelector('button[aria-label="Close Librarr search"]');
 
-            // Exercise REAL modalFocus keydown listener attached to <dialog>
+            // Exercise REAL ModalDialog / modalFocus keydown listener attached to <dialog>
             lastAdd.focus();
             dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
             const wrappedForwardLabel = document.activeElement?.getAttribute('aria-label') ?? '';
@@ -1151,9 +1215,9 @@ describe("WCAG 1.4.4 resize text and 1.4.12 text spacing reflow", () => {
             dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
             const wrappedBackwardIsLastAdd = document.activeElement === lastAdd;
 
-            // Close the real dialog and wait for Svelte's 140ms outro transition so modalFocus.destroy() runs
+            // Close the real ModalDialog and verify synchronous focusTrap/showModal cleanup
             closeBtn.click();
-            for (let i = 0; i < 30 && document.querySelector('dialog[aria-labelledby="librarr-search-title"]'); i++) {
+            for (let i = 0; i < 15 && document.querySelector('dialog[open][aria-labelledby="librarr-search-title"]'); i++) {
               await new Promise((r) => setTimeout(r, 20));
             }
 
