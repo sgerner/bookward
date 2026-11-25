@@ -764,8 +764,11 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
     assert oversized_embed.chunks_yielded == 3
     assert oversized_embed.closed is True
 
-    # 2. Sync LLM reranker aborts oversized streams and falls back cleanly.
+    # 2. Sync LLM reranker closes redirect streams without reading bodies and aborts oversized streams.
+    pin_public_dns(monkeypatch)
+    llm_reranker.clear_llm_rerank_cache()
     monkeypatch.setattr(settings, "llm_rerank_max_bytes", 150_000)
+    sync_redirect_stream = CountingSyncStream(b"r" * 40_000, 5)
     sync_llm_stream = CountingSyncStream(b"c" * 60_000, 10)
     candidates = [
         {"id": 1, "title": "First", "author": "A", "score": 90.0},
@@ -773,10 +776,17 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
     ]
 
     respx.post("https://llm-sync.example.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            307,
+            headers={"location": "https://llm-sync.example.test/v2/chat/completions"},
+            stream=sync_redirect_stream,
+        )
+    )
+    respx.post("https://llm-sync.example.test/v2/chat/completions").mock(
         return_value=httpx.Response(200, headers={"content-type": "application/json"}, stream=sync_llm_stream)
     )
     reranked_sync, diag_sync = llm_reranker.rerank_with_llm_sync(
-        [],
+        [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}],
         candidates,
         api_url="https://llm-sync.example.test/v1",
         api_key="sk-test",
@@ -784,11 +794,12 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
     )
     assert diag_sync == {"applied": False, "reason": "fallback"}
     assert [c["id"] for c in reranked_sync] == [1, 2]
+    assert sync_redirect_stream.chunks_yielded == 0
+    assert sync_redirect_stream.closed is True
     assert sync_llm_stream.chunks_yielded == 3
     assert sync_llm_stream.closed is True
 
     # 3. Discord webhook enforces 1 MB cap without leaking webhook token.
-    pin_public_dns(monkeypatch)
     monkeypatch.setattr(settings, "discord_max_bytes", 100_000)
     discord_stream = CountingAsyncStream(b"d" * 40_000, 10)
     secret_webhook = "https://discord.com/api/webhooks/999/super-secret-webhook-token"
