@@ -218,6 +218,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.openlibrary_work_id quality_openlibrary_work_id,"
         "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
         "COALESCE(q.isbn_verified,0) quality_isbn_verified,"
         "q.quality_status quality_status,q.audit_version quality_audit_version,"

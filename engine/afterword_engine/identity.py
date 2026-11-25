@@ -242,17 +242,25 @@ def _work_match_keys(item) -> set[tuple[str, str, str]]:
         if token:
             keys.add(("work", "openlibrary", token))
 
+    quality_provider = (
+        str(_row_value(item, "quality_provider") or "")
+        .strip()
+        .casefold()
+        .replace(" ", "_")
+    )
     provider = str(
-        _row_value(item, "quality_provider")
+        quality_provider
         or _row_value(item, "work_id_provider")
         or _row_value(item, "provider")
         or ""
     ).strip().casefold().replace(" ", "_")
 
+    has_explicit_work_id = False
     for field in ("quality_work_id", "work_id"):
         raw = str(_row_value(item, field) or "").strip()
         if not raw or _OPEN_LIBRARY_EDITION.search(raw):
             continue
+        has_explicit_work_id = True
         token = _extract_openlibrary_work_token(raw, allow_bare=False)
         if token:
             keys.add(("work", "openlibrary", token))
@@ -273,6 +281,17 @@ def _work_match_keys(item) -> set[tuple[str, str, str]]:
             continue
         if provider:
             keys.add(("work", provider, identifier))
+
+    if not has_explicit_work_id and quality_provider == "apple_books":
+        raw_apple_id = str(_row_value(item, "quality_provider_id") or "").strip()
+        if raw_apple_id and not _OPEN_LIBRARY_EDITION.search(raw_apple_id):
+            identifier = raw_apple_id
+            if raw_apple_id.startswith(("http://", "https://")):
+                parsed = urlparse(raw_apple_id)
+                identifier = parsed.path.rstrip("/") or parsed.netloc
+            identifier = identifier.strip().rstrip("/")
+            if identifier and not _OPEN_LIBRARY_EDITION.search(identifier):
+                keys.add(("work", "apple_books", identifier))
 
     source_token = _extract_openlibrary_work_token(
         _row_value(item, "source_url"), allow_bare=False

@@ -1968,6 +1968,7 @@ def _candidate_quality_identity_projection(connection=None) -> str:
         return (
             "q.openlibrary_work_id quality_openlibrary_work_id,"
             "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.provider_id AS quality_provider_id,"
             "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
             "COALESCE(q.isbn_verified,0) quality_isbn_verified,"
             "q.quality_status quality_status,q.audit_version quality_audit_version"
@@ -1979,6 +1980,11 @@ def _candidate_quality_identity_projection(connection=None) -> str:
     ol_expr = (
         "q.openlibrary_work_id"
         if "openlibrary_work_id" in available
+        else "''"
+    )
+    provider_id_expr = (
+        "q.provider_id"
+        if "provider_id" in available
         else "''"
     )
     verified_expr = (
@@ -1994,6 +2000,7 @@ def _candidate_quality_identity_projection(connection=None) -> str:
     return (
         f"{ol_expr} quality_openlibrary_work_id,"
         "q.work_id quality_work_id,q.provider quality_provider,"
+        f"{provider_id_expr} AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
         f"{verified_expr} quality_isbn_verified,"
         f"q.quality_status quality_status,{version_expr} quality_audit_version"
