@@ -6,6 +6,8 @@ import { engine } from '#lib/server/engine.js';
 export const POST: RequestHandler = async ({ cookies, url }) => {
 	try {
 		await engine('/auth/logout', { method: 'POST', body: '{}' });
+	} catch {
+		// Best-effort upstream revocation: always end the local browser session below.
 	} finally {
 		cookies.delete(SESSION_COOKIE, sessionCookieDeleteOptions(url));
 	}

@@ -688,7 +688,7 @@ def restore_auth_backup(backup_id: str) -> dict:
             con.execute("UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)")
             con.execute("DELETE FROM auth_transactions")
             con.execute("DELETE FROM login_attempts")
-            con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
+            con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash' OR (key>='lockout_notice:' AND key<'lockout_notice;')")
             con.commit()
             integrity = con.execute("PRAGMA integrity_check").fetchone()
             if not integrity or integrity[0] != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():

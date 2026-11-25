@@ -12,6 +12,12 @@ from typing import Any
 
 import httpx
 
+from .config import settings
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    stream_bytes_async,
+    validate_response_headers,
+)
 from .security import validate_service_url
 
 MEDIA_TYPES = frozenset({"ebook", "audiobook"})
@@ -76,10 +82,20 @@ async def search(config: dict[str, Any], query: str, media_type: str) -> dict[st
     base_url, headers = _service(config)
     endpoint = "/api/search/audiobooks" if media == "audiobook" else "/api/search"
     async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
-        response = await client.get(f"{base_url}{endpoint}", params={"q": clean_query}, headers=headers)
-        response.raise_for_status()
+        _response, body = await stream_bytes_async(
+            client,
+            "GET",
+            f"{base_url}{endpoint}",
+            params={"q": clean_query},
+            headers=headers,
+            max_bytes=settings.librarr_max_bytes,
+            allowed_content_types=JSON_CONTENT_TYPES,
+            allow_missing_content_type=True,
+            content_type_error="Librarr returned an unsupported search content type",
+            size_error="Librarr search response is too large",
+        )
         try:
-            payload = response.json()
+            payload = json.loads(body)
         except ValueError as exc:
             raise ValueError("Librarr returned an invalid search response") from exc
     return {"results": _results(payload), "media_type": media}
@@ -129,6 +145,13 @@ async def open_search_stream(
             raise StreamingUnsupportedError(
                 "The connected Librarr version does not support streaming search"
             )
+        validate_response_headers(
+            response,
+            max_bytes=settings.librarr_stream_max_bytes,
+            allowed_content_types=("text/event-stream",),
+            allow_missing_content_type=False,
+            size_error="Librarr search stream is too large",
+        )
         return client, response
     except BaseException:
         if response is not None:
@@ -152,10 +175,20 @@ async def download(config: dict[str, Any], result: dict[str, Any], media_type: s
     endpoint = "/api/download/audiobook" if media == "audiobook" else "/api/download"
     request_headers = {**headers, "Idempotency-Key": idempotency_key}
     async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
-        response = await client.post(f"{base_url}{endpoint}", headers=request_headers, json=result)
-        response.raise_for_status()
+        _response, body = await stream_bytes_async(
+            client,
+            "POST",
+            f"{base_url}{endpoint}",
+            headers=request_headers,
+            json=result,
+            max_bytes=settings.librarr_max_bytes,
+            allowed_content_types=JSON_CONTENT_TYPES,
+            allow_missing_content_type=True,
+            content_type_error="Librarr returned an unsupported download content type",
+            size_error="Librarr download response is too large",
+        )
         try:
-            payload = response.json()
+            payload = json.loads(body) if body.strip() else {}
         except ValueError:
             payload = {}
     return payload if isinstance(payload, dict) else {"result": payload}
