@@ -3332,10 +3332,10 @@ def test_initialize_upgrades_v25_database_to_index_goodreads_shelf_title_author(
     assert remaining == [{"shelf": "to-read", "title": "Still Queued", "author": "Author Three"}]
 
 
-def test_initialize_upgrades_v28_database_to_add_additional_authors(tmp_path):
+def test_initialize_upgrades_v29_database_to_add_additional_authors(tmp_path):
     from afterword_engine.identity import ReadIdentityIndex, read_metadata_identity_hash
 
-    settings.db = str(tmp_path / "v28.db")
+    settings.db = str(tmp_path / "v29.db")
     import sqlite3
 
     with sqlite3.connect(settings.db) as con:
@@ -3344,11 +3344,11 @@ def test_initialize_upgrades_v28_database_to_add_additional_authors(tmp_path):
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version > 28:
+            if version > 29:
                 break
             con.executescript(script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
-        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 29))
+        assert {item[0] for item in con.execute("SELECT version FROM schema_migrations")} == set(range(1, 30))
         assert "additional_authors" not in {
             item["name"] for item in con.execute("PRAGMA table_info(reads)")
         }
@@ -3383,7 +3383,7 @@ def test_initialize_upgrades_v28_database_to_add_additional_authors(tmp_path):
 
     initialize(seed_demo=False)
     assert row("SELECT COUNT(*) count FROM schema_migrations")["count"] == len(MIGRATIONS)
-    assert row("SELECT 1 FROM schema_migrations WHERE version=29") is not None
+    assert row("SELECT 1 FROM schema_migrations WHERE version=30") is not None
 
     for table_name in ("reads", "goodreads_shelf_items"):
         col_info = {item["name"]: item for item in rows(f"PRAGMA table_info({table_name})")}

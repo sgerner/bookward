@@ -7,6 +7,7 @@ Guidelines for coding agents working in the Bookward repository.
 - `src/`: SvelteKit web application (Node 24, TypeScript, Svelte 5), server form actions, and unit tests (`src/**/*.spec.ts`).
 - `engine/`: Python 3.12 FastAPI ingestion, scoring, SQLite, and recommendation engine (`engine/afterword_engine/`) with pytest tests (`engine/tests/`).
 - `scripts/community_smoke.py`: End-to-end integration smoke test using isolated temporary storage.
+- `scripts/reflow_overlay_audit.py`: Headless Chromium Playwright audit for 320x256 WCAG 1.4.10 reflow, top-layer `<dialog>` / `Popover` overlays, and legacy top-layer fallbacks.
 - `Dockerfile` and `engine/Dockerfile`: multi-stage container definitions used by Compose and CI.
 
 ## Local verification checks
@@ -28,6 +29,9 @@ uv run --project engine python -m compileall -q engine/afterword_engine
 
 # First-run web/engine integration (requires npm run build)
 uv run --project engine python scripts/community_smoke.py
+
+# Browser reflow & top-layer overlay audit (requires npm run build and Python playwright)
+python3 scripts/reflow_overlay_audit.py
 
 # Container builds
 docker compose build
