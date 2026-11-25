@@ -458,6 +458,198 @@ def test_worker_fails_jobs_after_the_retry_limit(identity_store):
     assert job["lease_token"] is None
 
 
+def test_multi_profile_worker_interleaves_second_profile_score_after_first_50_row_audit_batch(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    alice = profiles.create_account("audit-alice", "audit-alice-password-long")
+    bob = profiles.create_account("score-bob", "score-bob-password-long")
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(300):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Alice Sweep Book {index}",
+                        "Alice Author",
+                        "https://example.com/alice",
+                        source_id,
+                        f"alice sweep book {index}",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        quality_module.configure_candidate_quality_sweep(mode="full")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        bob_score_job_id = enqueue_job("score", dedupe=True)
+
+    monkeypatch.setattr(
+        profiles,
+        "profile_ids",
+        lambda: [alice["profile_id"], bob["profile_id"]],
+    )
+
+    audited_per_turn: list[int] = []
+    execution_order: list[tuple[str, str]] = []
+    stop = asyncio.Event()
+
+    async def fake_audit_one(candidate, *_args, **_kwargs):
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "accepted",
+            "quality_score": 0.9,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{candidate['id']}",
+            "work_id": f"/works/OL{candidate['id']}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    async def fake_score_all(*_args, **_kwargs):
+        return 1
+
+    monkeypatch.setattr(quality_module, "_audit_one", fake_audit_one)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+
+    async def tracked_handler(kind: str):
+        pid = current_profile_id()
+        execution_order.append((pid, kind))
+        result = await engine_main.handle_job(kind)
+        if pid == alice["profile_id"] and kind == "candidate_quality":
+            audited_per_turn.append(int(result["audited"]))
+        if len(execution_order) >= 3:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(tracked_handler, stop))
+
+    # Alice runs one 50-row batch, then Bob immediately runs its score job before Alice's next batch.
+    assert execution_order[0] == (alice["profile_id"], "candidate_quality")
+    assert execution_order[1] == (bob["profile_id"], "score")
+    assert audited_per_turn[0] == quality_module.QUALITY_AUDIT_BATCH_SIZE
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_status = con.execute(
+            "SELECT status FROM jobs WHERE id=?", (bob_score_job_id,)
+        ).fetchone()["status"]
+    assert bob_status == "complete"
+
+
+def test_worker_recovers_interrupted_audit_job_and_skips_committed_subbatches(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    reader = profiles.create_account("recover-reader", "recover-reader-password-long")
+    candidate_ids: list[int] = []
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(65):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Recoverable Sweep {index}",
+                        "Sweep Writer",
+                        "https://example.com/recover",
+                        source_id,
+                        f"recoverable sweep {index}",
+                    ),
+                ).lastrowid
+                candidate_ids.append(cid)
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        sweep = quality_module.configure_candidate_quality_sweep(mode="full")
+        initial_job_id = sweep["job_id"]
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2000-01-01T00:00:00+00:00',"
+                "heartbeat_at='2000-01-01T00:00:00+00:00',lease_token='crashed-worker',attempts=1 "
+                "WHERE id=?",
+                (initial_job_id,),
+            )
+
+    monkeypatch.setattr(profiles, "profile_ids", lambda: [reader["profile_id"]])
+    monkeypatch.setattr(engine_main, "score_all", lambda *_a, **_k: asyncio.sleep(0, result=0))
+
+    seen_candidates: list[int] = []
+    crashed_once = False
+
+    async def crashing_then_healthy_audit_one(candidate, *_args, **_kwargs):
+        nonlocal crashed_once
+        cid = int(candidate["id"])
+        # Crash at candidate index 20 (row 21) on the first run after two 10-row sub-batches commit.
+        if not crashed_once and cid == candidate_ids[20]:
+            crashed_once = True
+            raise RuntimeError("Simulated mid-pass crash at row 21")
+        seen_candidates.append(cid)
+        return {
+            "candidate_id": cid,
+            "quality_status": "accepted",
+            "quality_score": 0.92,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{cid}",
+            "work_id": f"/works/OL{cid}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    monkeypatch.setattr(quality_module, "_audit_one", crashing_then_healthy_audit_one)
+
+    # First attempt crashes at row 21 after committing 20 rows (two 10-row sub-batches).
+    with profile_scope(reader["profile_id"]):
+        with pytest.raises(RuntimeError, match="Simulated mid-pass crash at row 21"):
+            asyncio.run(engine_main.handle_job("candidate_quality"))
+        committed_after_crash = [
+            item["candidate_id"]
+            for item in database.rows(
+                "SELECT candidate_id FROM candidate_quality WHERE julianday(audited_at)>=julianday(?)",
+                (sweep["started_at"],),
+            )
+        ]
+        assert committed_after_crash == candidate_ids[:20]
+
+    # Worker reaps the expired lease and resumes from row 21 without repeating rows 1..20.
+    seen_candidates.clear()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        result = await engine_main.handle_job(kind)
+        if kind == "candidate_quality" and result["remaining"] == 0:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(handler, stop))
+
+    assert seen_candidates == candidate_ids[20:]
+    with profile_scope(reader["profile_id"]):
+        summary = quality_module.quality_summary()
+    assert summary["audit"]["status"] == "complete"
+    assert summary["audit"]["remaining"] == 0
+
+
 def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
     identity_store, monkeypatch
 ):
