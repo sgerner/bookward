@@ -4,13 +4,14 @@ import asyncio
 import logging
 import base64
 import hmac
+import re
 import secrets
 import sqlite3
 import time
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
@@ -20,18 +21,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from .config import settings
-from .database import connect, initialize, normalize_key, row, rows, transaction
+from .database import DEFAULT_DIGEST_APP_URLS, connect, initialize, normalize_key, row, rows, transaction
 from .backups import (
     BackupError,
+    RESTORE_FENCE_DETAIL,
     backup_scheduler_loop,
     backup_status,
+    clear_interrupted_restore_journal,
     create_backup,
+    has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
 )
 from .embeddings import get_embedder
-from .covers import canonical_book_source_url, fallback_cover_url
+from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
 from .ingestion import (
     import_csv,
@@ -162,6 +166,7 @@ class AccountPasswordIn(BaseModel):
 
 def _ensure_profile_database(profile_id: str):
     with profile_scope(profile_id):
+        recover_interrupted_restore()
         initialize(seed_demo=profile_id == "legacy")
 
 
@@ -238,12 +243,13 @@ def source_sync_due_sources(now=None):
     )
     due = []
     for source in sources:
-        if not source["last_scanned_at"]:
+        attempt_at = source["last_attempted_at"] or source["last_scanned_at"]
+        if not attempt_at:
             due.append(source)
             continue
         try:
             last = datetime.fromisoformat(
-                str(source["last_scanned_at"]).replace(" ", "T").replace("Z", "+00:00")
+                str(attempt_at).replace(" ", "T").replace("Z", "+00:00")
             )
         except ValueError:
             due.append(source)
@@ -587,7 +593,7 @@ async def handle_job(kind: str):
             return {"skipped": "managed_by_association_provider", "source_id": source_id}
         if not source["enabled"]:
             return {"skipped": "disabled", "source_id": source_id}
-        if source["lifecycle"] == "one_time" and source["last_scanned_at"]:
+        if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
         try:
             collected = await scan_source(source)
@@ -595,9 +601,7 @@ async def handle_job(kind: str):
             message = safe_error_message(exc)
             with transaction() as con:
                 con.execute(
-                    "UPDATE sources SET last_status=?, "
-                    "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                    "WHERE id=?",
+                    "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                     (f"error:{message}", source_id),
                 )
             raise
@@ -621,7 +625,10 @@ async def handle_job(kind: str):
             sources = rows(
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
-                "AND (lifecycle='permanent' OR (lifecycle='one_time' AND last_scanned_at IS NULL))"
+                "AND (lifecycle='permanent' OR ("
+                "lifecycle='one_time' AND last_scanned_at IS NULL "
+                "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
+                "))"
             )
         for source in sources:
             try:
@@ -630,9 +637,7 @@ async def handle_job(kind: str):
                 message = safe_error_message(exc)
                 with transaction() as con:
                     con.execute(
-                        "UPDATE sources SET last_status=?, "
-                        "last_scanned_at=CASE WHEN lifecycle='one_time' THEN last_scanned_at ELSE CURRENT_TIMESTAMP END "
-                        "WHERE id=?",
+                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                         (f"error:{message}", source["id"]),
                     )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
@@ -652,17 +657,21 @@ async def handle_job(kind: str):
 @asynccontextmanager
 async def lifespan(app):
     identity_store.initialize_auth()
-    with profile_scope("legacy"):
-        recover_interrupted_restore()
-        initialize()
-        legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
-    identity_store.migrate_legacy_api_tokens(legacy_tokens)
+    ready_profiles: set[str] = set()
+    try:
+        with profile_scope("legacy"):
+            recover_interrupted_restore()
+            initialize()
+            legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
+        identity_store.migrate_legacy_api_tokens(legacy_tokens)
+        ready_profiles.add("legacy")
+    except Exception:
+        LOGGER.exception("Could not initialize profile legacy during startup")
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
-                with profile_scope(profile_id):
-                    recover_interrupted_restore()
                 _ensure_profile_database(profile_id)
+                ready_profiles.add(profile_id)
             except Exception:
                 # A broken profile must not prevent the rest of the installation
                 # from serving. Its worker retries initialization with backoff.
@@ -679,6 +688,8 @@ async def lifespan(app):
     # Backfill older rows in the worker so catalog lookups never delay API
     # startup. The dedupe flag keeps restarts from creating duplicate work.
     for profile_id in identity_store.profile_ids():
+        if profile_id not in ready_profiles:
+            continue
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
@@ -710,6 +721,16 @@ app.add_middleware(
     allow_headers=["accept", "content-type", "authorization", "x-api-key", "idempotency-key", "x-bookward-service", "x-bookward-session", "x-oidc-state"],
     allow_credentials=False,
 )
+
+
+_RESTORE_ROUTE_RE = re.compile(r"^/api/backups/[^/]+/restore$")
+
+
+def _recover_profile_for_request(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        recovered = recover_interrupted_restore()
+    if recovered:
+        _ensure_profile_database(profile_id)
 
 
 @app.middleware("http")
@@ -763,6 +784,18 @@ async def authenticate_engine_request(request: Request, call_next):
             )
         request.state.api_token = token
         request.state.account = {"profile_id": token["profile_id"], "role": "user", "id": "api-token"}
+        if has_restore_journal(token["profile_id"]):
+            try:
+                await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+            except Exception:
+                LOGGER.exception(
+                    "Authenticated profile is unavailable during API request recovery"
+                )
+                return JSONResponse(
+                    {"detail": RESTORE_FENCE_DETAIL},
+                    status_code=503,
+                    headers={"cache-control": "private, no-store"},
+                )
         with profile_scope(token["profile_id"]):
             response = await call_next(request)
         _mark_private_no_store(response)
@@ -782,6 +815,28 @@ async def authenticate_engine_request(request: Request, call_next):
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     request.state.account = account
+    is_restore_route = (
+        request.method == "POST" and _RESTORE_ROUTE_RE.fullmatch(path) is not None
+    )
+    if (
+        not path.startswith("/auth/")
+        and not path.startswith("/admin/")
+        and not is_restore_route
+        and has_restore_journal(account["profile_id"])
+    ):
+        try:
+            await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except Exception:
+            if not (request.method == "GET" and path == "/api/backups"):
+                LOGGER.exception(
+                    "Profile %s is unavailable during request recovery",
+                    account["profile_id"],
+                )
+                return JSONResponse(
+                    {"detail": RESTORE_FENCE_DETAIL},
+                    status_code=503,
+                    headers={"cache-control": "private, no-store"},
+                )
     with profile_scope(account["profile_id"]):
         response = await call_next(request)
     _mark_private_no_store(response)
@@ -929,6 +984,19 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"updated": True, "account_id": account_id, "status": status}
+
+
+@app.delete("/admin/profiles/{profile_id}/restore-journal")
+def admin_delete_restore_journal(profile_id: str, request: Request):
+    _require_admin(request)
+    if (
+        profile_id != "legacy"
+        and profile_id not in identity_store.profile_ids(active_only=False)
+    ):
+        raise HTTPException(404, "Profile not found")
+    with profile_scope(profile_id):
+        cleared = clear_interrupted_restore_journal()
+    return {"cleared": cleared, "profile_id": profile_id}
 
 
 def _valid_oidc_url(value: str, *, allow_local_http: bool = False) -> bool:
@@ -1173,6 +1241,7 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
+    url: HttpUrl | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
 
@@ -1190,7 +1259,7 @@ class DigestSettingsIn(BaseModel):
     minimum_score: float = Field(default=80, ge=0, le=100)
     maximum_books: int = Field(default=5, ge=1, le=20)
     only_new: bool = True
-    app_url: str = "http://localhost:5173"
+    app_url: str | None = None
     # Optional secrets preserve the existing value when omitted and clear it
     # when explicitly sent as an empty string.
     discord_webhook_url: str | None = None
@@ -1398,11 +1467,69 @@ def _digest_period_candidate_ids(connection, period: str) -> tuple[list[int], bo
     return ids, bool(deliveries)
 
 
+def _parse_json_list(raw: Any) -> list[Any]:
+    if isinstance(raw, list):
+        return raw
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def _distinct_genres(items: list[dict[str, Any]]) -> list[str]:
+    seen: dict[str, str] = {}
+    for item in items:
+        for genre in _parse_json_list(item.get("genres")):
+            cleaned = str(genre).strip()
+            if cleaned:
+                seen.setdefault(cleaned.casefold(), cleaned)
+    return sorted(seen.values(), key=lambda value: (value.casefold(), value))
+
+
+def _matches_recommendation_filter(
+    item: dict[str, Any],
+    *,
+    search: str | None = None,
+    genre: str | None = None,
+) -> bool:
+    search_norm = (search or "").strip().casefold()
+    genre_norm = (genre or "").strip().casefold()
+    if not search_norm and not genre_norm:
+        return True
+    genres = [str(value).strip() for value in _parse_json_list(item.get("genres")) if str(value).strip()]
+    if genre_norm and not any(value.casefold() == genre_norm for value in genres):
+        return False
+    if search_norm:
+        haystack = (
+            f"{item.get('title', '')} {item.get('author', '')} "
+            f"{' '.join(genres)} {item.get('description', '')}"
+        ).casefold()
+        if search_norm not in haystack:
+            return False
+    return True
+
+
+def _format_recommendation_item(
+    item: dict[str, Any], *, format_urls: bool = True
+) -> dict[str, Any]:
+    formatted = dict(item)
+    formatted["genres"] = _parse_json_list(formatted.get("genres"))
+    formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    if format_urls:
+        _format_recommendation_urls([formatted])
+    return formatted
+
+
 def tracked_recommendations(
     *,
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     connection=None,
     recommended_limit: int | None = None,
     identity_context=None,
@@ -1411,8 +1538,10 @@ def tracked_recommendations(
     track_run: bool = True,
     impression_limit: int | None = None,
     ensure_candidate_ids: Sequence[int] = (),
+    pool_summary: dict[str, Any] | None = None,
 ):
     ranking_at = datetime.now(timezone.utc)
+    is_filtered = bool((search and search.strip()) or (genre and genre.strip()))
     base_pool = personalized_pool = final_pool = None
     interaction_events = []
     cached_vectors = {}
@@ -1447,7 +1576,8 @@ def tracked_recommendations(
                 include_imported=include_imported,
                 format_urls=False,
             )
-            base_pool = [dict(item) for item in ranked]
+            if not is_filtered:
+                base_pool = [dict(item) for item in ranked]
             interaction_events = load_interaction_events(connection)
             # The event primary key orders actions; cached vectors are keyed by
             # candidate id. Normalize only the cache inputs so learner event
@@ -1485,7 +1615,8 @@ def tracked_recommendations(
                     max_penalty=settings.impression_fatigue_max_penalty,
                 )
                 diagnostics["impression_fatigue"] = fatigue_diagnostics
-            personalized_pool = [dict(item) for item in ranked]
+            if not is_filtered:
+                personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
             recommended = [
                 item for item in ranked if item.get("status") == "recommended"
@@ -1495,7 +1626,7 @@ def tracked_recommendations(
                     recommended, cached_vectors
                 )
                 llm_cfg = effective_llm_rerank_settings(connection, private)
-                if llm_cfg["enabled"] and llm_cfg["api_key"].strip():
+                if not is_filtered and llm_cfg["enabled"] and llm_cfg["api_key"].strip():
                     from .llm_reranker import rerank_with_llm_sync
 
                     read_rows = (
@@ -1524,7 +1655,20 @@ def tracked_recommendations(
                 discovery_metadata = empty_discovery_slate_diagnostics(
                     "no_recommended_candidates"
                 )
-            final_pool = [dict(item) for item in ranked]
+            if pool_summary is not None:
+                all_recommended = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                pool_summary["recommended_total"] = len(all_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(all_recommended)
+            if not is_filtered:
+                final_pool = [dict(item) for item in ranked]
+            else:
+                ranked = [
+                    item
+                    for item in ranked
+                    if _matches_recommendation_filter(item, search=search, genre=genre)
+                ]
             if recommended_limit is not None and status is None and offset == 0:
                 recommended = [item for item in ranked if item.get("status") == "recommended"]
                 remaining = [
@@ -1599,11 +1743,22 @@ def tracked_recommendations(
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
             )
+            if pool_summary is not None:
+                fallback_recommended = _recommendation_rows(
+                    connection,
+                    statuses=("recommended",),
+                    limit=None,
+                    identity_context=identity_context,
+                )
+                pool_summary["recommended_total"] = len(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
             recommendations = recommendation_list(
                 connection,
                 status=status,
                 limit=limit,
                 offset=offset,
+                search=search,
+                genre=genre,
                 recommended_limit=recommended_limit,
                 identity_context=identity_context,
                 include_imported=include_imported,
@@ -1654,6 +1809,8 @@ def tracked_recommendations(
             status=status,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             recommended_limit=recommended_limit,
             identity_context=identity_context,
             include_imported=include_imported,
@@ -1667,11 +1824,18 @@ def tracked_recommendations(
         for item in (logged_items if logged_items is not None else recommendations)
         if str(item.get("status") or "").strip().lower() not in NON_DISCOVERY_ITEM_STATUSES
     ]
-    if not items_to_log:
+    if not items_to_log and not is_filtered:
         for item in recommendations:
             item["recommendation_run_id"] = ""
         return recommendations, ""
-    if base_pool is not None and personalized_pool is not None and final_pool is not None:
+    if is_filtered:
+        decision_evidence = {
+            "schema_version": 1,
+            "capture_status": "incomplete",
+            "reason": "filtered_query",
+            "captured_at": ranking_at.isoformat(),
+        }
+    elif base_pool is not None and personalized_pool is not None and final_pool is not None:
         decision_evidence = build_decision_evidence(
             connection,
             base_pool=base_pool,
@@ -1756,6 +1920,8 @@ def paginated_run_recommendations(
     status: str | None = "recommended",
     limit: int = 8,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     track_run: bool = True,
     impression_limit: int | None = None,
 ):
@@ -1806,6 +1972,8 @@ def paginated_run_recommendations(
             item = dict(by_id[cid])
             if snap.get("score") is not None:
                 item["score"] = float(snap["score"])
+            if not _matches_recommendation_filter(item, search=search, genre=genre):
+                continue
             ranked_candidates.append((frozen_rank, item))
     else:
         unlogged, _ = tracked_recommendations(
@@ -1813,6 +1981,8 @@ def paginated_run_recommendations(
             status=target_status,
             limit=1_000_000,
             offset=0,
+            search=search,
+            genre=genre,
             track_run=False,
         )
         next_rank = max(max_rank, start) + 1
@@ -1873,6 +2043,7 @@ def overview_payload(
         ensure_ids: list[int] = []
         if _is_valid_digest_period(digest_period):
             ensure_ids, _ = _digest_period_candidate_ids(connection, str(digest_period))
+        pool_summary: dict[str, Any] = {}
         recommendations, run_id = tracked_recommendations(
             connection=connection,
             limit=recommendation_limit or 100,
@@ -1882,20 +2053,36 @@ def overview_payload(
             private=private,
             track_run=track_run,
             ensure_candidate_ids=ensure_ids,
+            pool_summary=pool_summary,
         )
-        decision_batch = recommendation_list(
+        served_recommended = sum(
+            1 for item in recommendations if item.get("status") == "recommended"
+        )
+        recommendations_has_more = (
+            int(pool_summary.get("recommended_total", served_recommended))
+            > served_recommended
+        )
+        recommendation_genres = list(pool_summary.get("recommendation_genres") or [])
+        all_decision_rows = _recommendation_rows(
             connection,
-            status="decisions",
-            limit=decision_limit + 1,
+            statuses=("rejected", "maybe_later"),
+            limit=None,
             identity_context=identity_context,
         )
-        decisions_has_more = len(decision_batch) > decision_limit
-        decisions = decision_batch[:decision_limit]
+        decision_genres = _distinct_genres(all_decision_rows)
+        decisions_has_more = len(all_decision_rows) > decision_limit
+        decisions = [
+            _format_recommendation_item(item)
+            for item in all_decision_rows[:decision_limit]
+        ]
         return {
             "counts": counts,
             "recommendations": recommendations,
+            "recommendations_has_more": recommendations_has_more,
+            "recommendation_genres": recommendation_genres,
             "decisions": decisions,
             "decisions_has_more": decisions_has_more,
+            "decision_genres": decision_genres,
             "recommendation_run_id": run_id,
             "sources": [source_payload(item) for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
@@ -2098,6 +2285,8 @@ def _recommendation_rows(
     statuses: tuple[str, ...] | None = None,
     limit: int | None = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     identity_context=None,
     include_imported: bool = False,
 ):
@@ -2118,7 +2307,7 @@ def _recommendation_rows(
             if "rejected" in statuses:
                 archive_terms.append(
                     "(c.status='rejected' AND EXISTS(SELECT 1 FROM feedback f "
-                    "WHERE f.candidate_id=c.id AND f.action='reject'))"
+                    "WHERE f.candidate_id=c.id AND f.action='reject' AND f.undone_at IS NULL))"
                 )
             if "maybe_later" in statuses:
                 archive_terms.append("c.status='maybe_later'")
@@ -2127,17 +2316,35 @@ def _recommendation_rows(
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"c.status IN ({placeholders})")
             params.extend(statuses)
+    decision_select = (
+        ",COALESCE((SELECT f.created_at FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL "
+        "AND f.action=CASE c.status WHEN 'rejected' THEN 'reject' ELSE 'maybe_later' END "
+        "ORDER BY f.id DESC LIMIT 1),c.updated_at,c.created_at) active_decision_at"
+        ",COALESCE((SELECT f.id FROM feedback f "
+        "WHERE f.candidate_id=c.id AND f.undone_at IS NULL "
+        "AND f.action=CASE c.status WHEN 'rejected' THEN 'reject' ELSE 'maybe_later' END "
+        "ORDER BY f.id DESC LIMIT 1),0) active_decision_id"
+        if is_decision_archive
+        else ""
+    )
+    order_clause = (
+        " ORDER BY COALESCE(unixepoch(active_decision_at,'subsec'),0) DESC,"
+        "active_decision_at DESC,active_decision_id DESC,c.score DESC,c.id DESC"
+        if is_decision_archive
+        else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC, c.id DESC"
+    )
     query = (
         "SELECT c.*,s.name source_name,q.metadata_confidence,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.isbn13 quality_isbn13,"
-        "q.isbn10 quality_isbn10 "
+        f"q.isbn10 quality_isbn10{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC"
+        + order_clause
     )
     result = (
         [dict(item) for item in connection.execute(query, params).fetchall()]
@@ -2147,9 +2354,12 @@ def _recommendation_rows(
     if identity_context is None:
         identity_context = _recommendation_identity_context(connection)
     read_identity_index, shortlisted_keys = identity_context
+    has_filters = bool((search and search.strip()) or (genre and genre.strip()))
     visible = []
     seen_recommendation_keys = set()
     for item in result:
+        item.pop("active_decision_at", None)
+        item.pop("active_decision_id", None)
         if item["status"] == "saved":
             visible.append(item)
             continue
@@ -2166,6 +2376,12 @@ def _recommendation_rows(
         if item["status"] == "recommended":
             seen_recommendation_keys.update(keys)
         visible.append(item)
+    if has_filters:
+        visible = [
+            item
+            for item in visible
+            if _matches_recommendation_filter(item, search=search, genre=genre)
+        ]
     end = None if limit is None else offset + limit
     return visible[offset:end]
 
@@ -2194,6 +2410,8 @@ def recommendation_list(
     status: str | None = None,
     limit: int | None = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     recommended_limit: int | None = None,
     identity_context=None,
     include_imported: bool = False,
@@ -2207,6 +2425,8 @@ def recommendation_list(
             connection,
             statuses=("recommended",),
             limit=recommended_limit,
+            search=search,
+            genre=genre,
             identity_context=identity_context,
         )
         result.extend(
@@ -2214,6 +2434,8 @@ def recommendation_list(
                 connection,
                 statuses=("saved", "imported", "new"),
                 limit=None,
+                search=search,
+                genre=genre,
                 identity_context=identity_context,
                 include_imported=effective_include_imported,
             )
@@ -2231,12 +2453,14 @@ def recommendation_list(
             statuses=statuses,
             limit=limit,
             offset=offset,
+            search=search,
+            genre=genre,
             identity_context=identity_context,
             include_imported=effective_include_imported,
         )
     for item in result:
-        item["genres"] = json.loads(item["genres"] or "[]")
-        item["explanation"] = json.loads(item["explanation"] or "[]")
+        item["genres"] = _parse_json_list(item.get("genres"))
+        item["explanation"] = _parse_json_list(item.get("explanation"))
     if format_urls:
         _format_recommendation_urls(result)
     return result
@@ -2247,6 +2471,8 @@ def _recommendations_response(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
     run_id: str | None = None,
     track_run: bool = True,
     impression_limit: int | None = None,
@@ -2260,6 +2486,8 @@ def _recommendations_response(
                 status=status,
                 limit=limit,
                 offset=offset,
+                search=search,
+                genre=genre,
                 track_run=track_run,
                 impression_limit=impression_limit,
             )
@@ -2269,6 +2497,8 @@ def _recommendations_response(
                 status=status,
                 limit=limit,
                 offset=offset,
+                search=search,
+                genre=genre,
                 include_imported=status in {"saved", "imported", "all"},
                 track_run=track_run,
                 impression_limit=impression_limit,
@@ -2288,18 +2518,22 @@ def _recommendations_response(
 @app.get("/api/recommendations")
 def recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=100),
-    offset: int = Query(default=0, ge=0, le=1_000_000),
-    run_id: str | None = Query(default=None, max_length=128),
-    track_run: bool = Query(default=True),
-    impression_limit: int | None = Query(default=None, ge=1, le=100),
+    status: Annotated[Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    genre: Annotated[str | None, Query(max_length=100)] = None,
+    run_id: Annotated[str | None, Query(max_length=128)] = None,
+    track_run: Annotated[bool, Query()] = True,
+    impression_limit: Annotated[int | None, Query(ge=1, le=100)] = None,
 ):
     return _recommendations_response(
         response,
         status=status,
         limit=limit,
         offset=offset,
+        search=search,
+        genre=genre,
         run_id=run_id,
         track_run=track_run,
         impression_limit=impression_limit,
@@ -2960,7 +3194,8 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
     became_enabled = not source["enabled"]
     con.execute(
         "UPDATE sources SET enabled=1-enabled, "
-        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END "
+        "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
+        "last_attempted_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_attempted_at END "
         "WHERE id=?",
         (source_id,),
     )
@@ -3037,16 +3272,116 @@ def update_nyt_settings(payload: NYTApiKeyIn):
     return {"saved": True, "api_key_set": bool(api_key)}
 
 
+def _one_time_source_completed(source) -> bool:
+    return bool(
+        source["last_scanned_at"]
+        or (
+            source["last_attempted_at"]
+            and str(source["last_status"] or "") in {"empty:0", "filtered:0"}
+        )
+    )
+
+
+def _clear_google_books_metadata_lockouts(con) -> bool:
+    con.execute(
+        """UPDATE candidate_quality
+        SET metadata_checked_at=NULL,
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE metadata_checked_at IS NOT NULL
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    )
+    requeued = con.execute(
+        """UPDATE candidate_quality
+        SET quality_status='pending',
+            metadata_retry_status='',
+            updated_at=CURRENT_TIMESTAMP
+        WHERE quality_status='quarantine'
+          AND metadata_retry_status IN ('google_books_transient', 'google_books_error')
+          AND (
+            flags_json LIKE '%catalog_provider_unavailable%'
+            OR flags_json LIKE '%catalog_provider_rate_limited%'
+          )
+          AND candidate_id IN (
+            SELECT id FROM candidates WHERE status!='rejected'
+          )"""
+    ).rowcount
+    con.execute(
+        """UPDATE read_metadata
+        SET metadata_checked_at=NULL
+        WHERE metadata_checked_at IS NOT NULL
+          AND (
+            description=''
+            OR cover_url='' OR cover_url LIKE '%/b/isbn/%'
+            OR cover_url LIKE 'https://placehold.co/%'
+            OR release_date=''
+            OR CASE WHEN json_valid(genres) THEN json_array_length(genres) ELSE 0 END=0
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.last_attempt.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.last_attempt.fetch_trace')
+                WHEN json_valid(metadata_provenance)
+                  AND json_type(metadata_provenance, '$.fetch_trace')='array'
+                THEN json_extract(metadata_provenance, '$.fetch_trace')
+                ELSE '[]'
+              END
+            )
+            WHERE json_extract(value, '$.provider')='google_books'
+              AND (
+                json_extract(value, '$.status') IN (
+                  'credential_error',
+                  'rate_limited',
+                  'server_error',
+                  'request_error',
+                  'timeout',
+                  'provider_unavailable'
+                )
+                OR json_extract(value, '$.http_status') IN (400, 401, 403, 408, 429)
+                OR (
+                  json_type(value, '$.http_status')='integer'
+                  AND json_extract(value, '$.http_status')>=500
+                )
+              )
+          )"""
+    )
+    return bool(requeued)
+
+
+def _queue_google_books_metadata_recovery(*, requeued_quality: bool) -> dict[str, int | None]:
+    job_ids = {
+        "metadata": enqueue_job("metadata", dedupe=True),
+        "read_metadata": enqueue_job("read_metadata", dedupe=True),
+    }
+    if requeued_quality:
+        _enqueue_candidate_quality_followup()
+    return job_ids
+
+
 @app.put("/api/settings/google-books")
-def update_google_books_settings(payload: GoogleBooksKeyIn):
+async def update_google_books_settings(payload: GoogleBooksKeyIn):
     current = private_settings().get("association_google_books_api_key", "")
+    submitted_new_key = False
+    validation: dict[str, str] | None = None
     if payload.clear:
         api_key = ""
     elif payload.api_key is None or not payload.api_key.strip():
         api_key = current
     else:
         api_key = payload.api_key.strip()
+        submitted_new_key = True
+        try:
+            validation = await validate_google_books_api_key(api_key)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     stored = seal(api_key) if api_key else ""
+    requeued_quality = False
     with transaction() as con:
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('association_google_books_api_key',?,1) "
@@ -3054,7 +3389,30 @@ def update_google_books_settings(payload: GoogleBooksKeyIn):
             "updated_at=CURRENT_TIMESTAMP",
             (stored,),
         )
-    return {"saved": True, "google_books_api_key_set": bool(api_key)}
+        if submitted_new_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    job_ids = (
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+        if submitted_new_key
+        else {}
+    )
+    return {
+        "saved": True,
+        "google_books_api_key_set": bool(api_key),
+        **({"job_ids": job_ids} if job_ids else {}),
+        **(
+            {
+                "validation_status": validation["status"],
+                **(
+                    {"validation_warning": validation["warning"]}
+                    if validation.get("warning")
+                    else {}
+                ),
+            }
+            if validation
+            else {}
+        ),
+    }
 
 
 @app.get("/api/settings/llm-rerank")
@@ -3175,43 +3533,79 @@ async def llm_models_catalog():
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
+    next_url: str | None = None
+    if payload.url is not None:
+        next_url = str(payload.url)
+        _reject_inline_nyt_key(next_url)
+        try:
+            validate_public_url(next_url)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
     updates = []
     values = []
-    if payload.filters is not None:
-        updates.append("filters=?")
-        values.append(json.dumps(payload.filters.model_dump()))
-    if payload.lifecycle is not None:
-        updates.append("lifecycle=?")
-        values.append(payload.lifecycle)
     with transaction() as con:
         source = con.execute(
-            "SELECT enabled,kind,lifecycle,filters FROM sources WHERE id=?",
+            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+            "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
-        if not source: raise HTTPException(404, "Source not found")
-        if payload.filters is not None and source["kind"] == "builtin":
-            raise HTTPException(400, "The built-in source cannot be filtered")
-        if payload.lifecycle is not None and source["kind"] in {"builtin", "association"}:
-            raise HTTPException(400, "This source lifecycle cannot be changed")
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if next_url is not None:
+            if source["is_default"] or source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source URL cannot be changed")
+            updates.append("url=?")
+            values.append(next_url)
+        if payload.filters is not None:
+            if source["kind"] == "builtin":
+                raise HTTPException(400, "The built-in source cannot be filtered")
+            updates.append("filters=?")
+            values.append(json.dumps(payload.filters.model_dump()))
+        if payload.lifecycle is not None:
+            if source["kind"] in {"builtin", "association"}:
+                raise HTTPException(400, "This source lifecycle cannot be changed")
+            updates.append("lifecycle=?")
+            values.append(payload.lifecycle)
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        if effective_lifecycle == "one_time" and (
+            next_url is not None or payload.filters is not None
+        ):
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_attempted_at=NULL")
         if updates:
-            values.append(source_id)
-            con.execute(
-                f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
-            )
+            try:
+                con.execute(
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?",
+                    (*values, source_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "Source already exists") from exc
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
         else normalize_source_filters(source["filters"])
     )
+    should_queue = bool(
+        updates
+        and source["enabled"]
+        and source["kind"] not in {"builtin", "association"}
+        and not (
+            effective_lifecycle == "one_time"
+            and next_url is None
+            and payload.filters is None
+            and _one_time_source_completed(source)
+        )
+    )
     job_id = (
         enqueue_job(f"source:{source_id}", dedupe=True)
-        if updates and source["enabled"] and source["kind"] != "association"
+        if should_queue
         else None
     )
     return {
         "id": source_id,
+        "url": next_url or source["url"],
         "filters": filters,
-        "lifecycle": payload.lifecycle or source["lifecycle"],
+        "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
 
@@ -3221,9 +3615,20 @@ def _save_digest_settings(updates: dict):
     existing = digest_config(current)
     merged = {**existing, **updates}
     try:
-        validate_digest_config(merged)
+        validate_digest_config(merged, previous=existing)
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
+    next_app_url = str(merged["app_url"] or "").strip().rstrip("/")
+    prev_app_url = str(existing["app_url"] or "").strip().rstrip("/")
+    default_public_url = str(settings.public_url or "").strip().rstrip("/")
+    if "digest_app_url_custom" in current:
+        prev_custom = str(current["digest_app_url_custom"]) == "1"
+    else:
+        prev_custom = bool(prev_app_url and prev_app_url not in DEFAULT_DIGEST_APP_URLS)
+    if "app_url" in updates and next_app_url != prev_app_url:
+        app_url_custom = next_app_url != default_public_url
+    else:
+        app_url_custom = prev_custom
     storage = {
         "digest_enabled": "1" if merged["enabled"] else "0",
         "digest_channels": ",".join(merged["channels"]),
@@ -3233,7 +3638,8 @@ def _save_digest_settings(updates: dict):
         "digest_minimum_score": str(merged["minimum_score"]),
         "digest_maximum_books": str(merged["maximum_books"]),
         "digest_only_new": "1" if merged["only_new"] else "0",
-        "digest_app_url": merged["app_url"],
+        "digest_app_url": next_app_url,
+        "digest_app_url_custom": "1" if app_url_custom else "0",
         "digest_discord_webhook_url": merged["discord_webhook_url"],
         "digest_email_to": merged["email_to"],
         "digest_email_from": merged["email_from"],
@@ -3275,21 +3681,57 @@ def preview_digest():
 
 @app.get("/api/digest/review")
 def digest_review(period: str = Query(min_length=8, max_length=8)):
-    """Return the candidate IDs that were included in a digest period.
+    """Return the candidate IDs and unread book cards for a digest period.
 
     The public review link carries only an ISO week key. Candidate metadata
-    remains behind the normal overview/auth boundary; this endpoint exposes
-    only IDs so the web layer can render the same cards without copying book
+    remains behind the normal overview/auth boundary; this authenticated
+    endpoint hydrates unread period picks on the server without copying book
     data into a notification URL.
     """
 
     if not _is_valid_digest_period(period):
         raise HTTPException(400, "Invalid digest period")
-    ids, found = _digest_period_candidate_ids(None, period)
-    # ``found`` lets the web app distinguish a valid digest with zero books
-    # from a stale link whose delivery history has been pruned or never
-    # existed. Stale links should return readers to the normal Discover feed.
-    return {"period": period, "ids": ids, "found": found}
+    with connect() as connection:
+        ids, found = _digest_period_candidate_ids(connection, period)
+        if not found:
+            # ``found`` lets the web app distinguish a valid digest with zero
+            # books from a stale link whose delivery history has been pruned or
+            # never existed.
+            return {"period": period, "ids": [], "found": False}
+        items: list[dict[str, Any]] = []
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            candidate_rows = {
+                int(item["id"]): dict(item)
+                for item in connection.execute(
+                    "SELECT c.*,s.name source_name,q.metadata_confidence,"
+                    "q.work_id quality_work_id,"
+                    "q.provider quality_provider,q.isbn13 quality_isbn13,"
+                    "q.isbn10 quality_isbn10 "
+                    "FROM candidates c "
+                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                    f"WHERE c.id IN ({placeholders}) "
+                    "AND c.status='recommended' "
+                    "AND q.quality_status='accepted' "
+                    "AND COALESCE(s.enabled,1)=1",
+                    ids,
+                ).fetchall()
+            }
+            read_identity_index, shortlisted_keys = _recommendation_identity_context(
+                connection
+            )
+            seen_keys = set()
+            for candidate_id in ids:
+                candidate = candidate_rows.get(candidate_id)
+                if not candidate:
+                    continue
+                keys = book_row_identity_match_keys(candidate)
+                if read_identity_index.matches(candidate) or keys & shortlisted_keys or keys & seen_keys:
+                    continue
+                seen_keys.update(keys)
+                items.append(_format_recommendation_item(candidate))
+    return {"period": period, "ids": ids, "found": True, "items": items}
 
 
 @app.get("/api/digest/deliveries")
@@ -3359,8 +3801,12 @@ def association_settings():
 
 
 @app.put("/api/associations/settings")
-def update_association_settings(payload: AssociationSettingsIn):
+async def update_association_settings(payload: AssociationSettingsIn):
     current = private_settings()
+    submitted_new_google_key = bool(
+        payload.google_books_api_key is not None
+        and payload.google_books_api_key.strip()
+    )
     values = {
         "association_openlibrary_enabled": "1" if payload.openlibrary_enabled else "0",
         "association_openlibrary_contact": payload.openlibrary_contact.strip(),
@@ -3378,6 +3824,15 @@ def update_association_settings(payload: AssociationSettingsIn):
     }
     if values["association_librarything_enabled"] == "1" and not values["association_librarything_api_key"]:
         raise HTTPException(400, "LibraryThing API key is required when the provider is enabled")
+    google_validation: dict[str, str] | None = None
+    if submitted_new_google_key:
+        try:
+            google_validation = await validate_google_books_api_key(
+                values["association_google_books_api_key"]
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error_message(exc)) from exc
+    requeued_quality = False
     with transaction() as con:
         for key, value in values.items():
             secret = key.endswith("api_key")
@@ -3387,7 +3842,19 @@ def update_association_settings(payload: AssociationSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    return {"saved": True, "associations": safe_association_settings()}
+        if submitted_new_google_key:
+            requeued_quality = _clear_google_books_metadata_lockouts(con)
+    if submitted_new_google_key:
+        _queue_google_books_metadata_recovery(requeued_quality=requeued_quality)
+    return {
+        "saved": True,
+        "associations": safe_association_settings(),
+        **(
+            {"google_books_validation_warning": google_validation["warning"]}
+            if google_validation and google_validation.get("warning")
+            else {}
+        ),
+    }
 
 
 def _association_provider_name(value: str) -> str:
@@ -3754,11 +4221,26 @@ def api_settings():
 @api_v1.get("/recommendations")
 def api_recommendations(
     response: Response,
-    status: Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=100),
-    offset: int = Query(default=0, ge=0, le=1_000_000),
+    status: Annotated[Literal["recommended", "saved", "imported", "all", "decisions", "rejected", "maybe_later"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    genre: Annotated[str | None, Query(max_length=100)] = None,
+    run_id: Annotated[str | None, Query(max_length=128)] = None,
+    track_run: Annotated[bool, Query()] = True,
+    impression_limit: Annotated[int | None, Query(ge=1, le=100)] = None,
 ):
-    return _recommendations_response(response, status=status, limit=limit, offset=offset)
+    return _recommendations_response(
+        response,
+        status=status,
+        limit=limit,
+        offset=offset,
+        search=search,
+        genre=genre,
+        run_id=run_id,
+        track_run=track_run,
+        impression_limit=impression_limit,
+    )
 
 
 @api_v1.post("/recommendations/bulk-feedback")

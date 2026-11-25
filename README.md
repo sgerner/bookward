@@ -243,7 +243,7 @@ Docker is the easiest way to run Bookward as a small self-hosted service.
 cp .env.example .env
 ~~~
 
-Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open. Compose embeds `ORIGIN` in the web build, so rebuild with `docker compose up --build` after changing it. Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
+Set `ORIGIN` and `AFTERWORD_PUBLIC_URL` to the exact URL readers will open (`.env.example` defaults both to `http://127.0.0.1:3000` for local HTTP runs). Plain-HTTP deployments (local or LAN without TLS) **must** set an explicit `http://...` `ORIGIN`; when both `ORIGIN` and `PROTOCOL_HEADER` are blank or unset, Bookward defaults to `https` with the request `Host` header for TLS-terminating reverse proxies (so `http://` mutation `Origin` headers are rejected with `403`). Behind a reverse proxy that forwards scheme and host headers, you can leave `ORIGIN` blank and set `PROTOCOL_HEADER=x-forwarded-proto` and `HOST_HEADER=x-forwarded-host`, **only** if the proxy strips or overwrites client-supplied copies of those headers and the web container port is not directly reachable by clients (a client reaching the port directly could send `x-forwarded-proto: http` and strip `Secure` from login and OIDC cookies). `ORIGIN`, `PROTOCOL_HEADER`, and `HOST_HEADER` are resolved strictly at runtime on the web container (`Dockerfile` `ARG ORIGIN` and `vite.config.ts` `paths.origin` build-time baking were removed — a breaking change if you previously passed `--build-arg ORIGIN=...` without setting runtime `ORIGIN`), so restart with `docker compose up -d` after changing them (no image rebuild needed). Generate a private service secret with `openssl rand -hex 32` and set `ENGINE_SERVICE_SECRET`; this protects private engine routes from other containers on the Docker network. The default `BIND_ADDRESS=127.0.0.1` keeps the service local. If `AFTERWORD_AUTH_PASSWORD` is already configured on an existing install, its username and password become the first administrator account on upgrade. For a new install, the first person to complete setup at `/login` becomes the administrator.
 
 ~~~
 docker compose up --build -d
@@ -293,7 +293,8 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 
 | Variable | Purpose |
 | --- | --- |
-| `ORIGIN` | Canonical browser origin embedded in the web build. |
+| `ORIGIN` | Canonical browser origin checked at runtime for mutations and `Secure` cookies (moved from build-time `ARG ORIGIN` / `paths.origin` to runtime). Plain-HTTP deployments **must** set an explicit `http://...` URL; when both `ORIGIN` and `PROTOCOL_HEADER` are blank, Bookward defaults to `https` with the request `Host` header. |
+| `PROTOCOL_HEADER` / `HOST_HEADER` | Optional reverse-proxy header names (such as `x-forwarded-proto` and `x-forwarded-host`) read at runtime when `ORIGIN` is blank. Must **only** be set behind a proxy that strips/overwrites client-supplied copies without direct port access (otherwise a client could send `x-forwarded-proto: http` and make login/OIDC cookies lose `Secure`). Untrusted `X-Forwarded-*` headers are stripped unless configured here. |
 | `AFTERWORD_PUBLIC_URL` | Base URL included in Discord and email digest links. |
 | `BIND_ADDRESS` | Host interface for the Docker web port; keep `127.0.0.1` unless you have a secured deployment. |
 | `BODY_SIZE_LIMIT` | Maximum HTTP request body accepted by the Node web server; defaults to `12M` so Goodreads or StoryGraph CSV exports up to 10 MB (20,000 books) can upload. |
@@ -334,11 +335,15 @@ uv run --project engine python -m compileall -q engine/afterword_engine
 # First-run web/engine integration, with isolated temporary data (requires the web build)
 uv run --project engine python scripts/community_smoke.py
 
-# Container smoke build
-docker compose build
+# Optional container validation and disposable container smoke check
+docker compose --profile ollama -f compose.yaml config --quiet
+docker compose --profile ollama -f compose.yaml -f compose.gpu.yaml config --quiet
+ORIGIN=http://127.0.0.1:3000 docker compose -p bookward-smoke up --build -d
+BOOKWARD_SMOKE_URL=http://127.0.0.1:3000 uv run --project engine python scripts/community_smoke.py
+docker compose -p bookward-smoke down -v
 ~~~
 
-The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds on pull requests.
+The frontend suite covers Svelte/type checks and unit tests; `npm run check` fails on Svelte warnings (compiler, accessibility, and CSS). The engine suite covers imports, source validation, scoring, jobs, Librarr idempotency, digest delivery, and secret handling. Engine `pytest` runs offline by default: `engine/tests/conftest.py` disables startup background loops (`settings.enable_background_loops = False` via an autouse fixture), skips Open Library rate-limit sleeps, and blocks non-loopback network sockets so unmocked external calls fail immediately while allowing loopback (`127.0.0.1`, `::1`, `localhost`), ASGI `TestClient`, and `respx` or `httpx.MockTransport` mocks. Production runs, Docker containers, and `scripts/community_smoke.py` keep `AFTERWORD_ENABLE_BACKGROUND_LOOPS=true` by default; see [AGENTS.md](AGENTS.md) for per-test overrides. The GitHub Actions workflow also runs CodeQL, dependency review, and both Docker image builds with container startup and HTTP smoke checks on pull requests.
 
 ## Contributing
 

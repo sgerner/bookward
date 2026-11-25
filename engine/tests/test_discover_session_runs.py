@@ -552,11 +552,52 @@ def test_paginated_run_recommendations_rejects_non_discovery_or_cross_profile_ru
     )
 
 
-def test_untracked_recommendations_skip_exploration_reordering(seeded_db, monkeypatch):
+def test_untracked_recommendations_skip_exploration_reordering_and_log_no_propensity(
+    seeded_db, monkeypatch
+):
+    from afterword_engine.database import connect
+    from afterword_engine.main import tracked_recommendations
+
     _, candidate_ids = seeded_db
     monkeypatch.setattr(settings, "exploration_enabled", True)
     monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
     monkeypatch.setattr(settings, "exploration_stable_top_k", 4)
+
+    with connect() as con:
+        # Mark one candidate saved and one user-rejected (with active feedback row)
+        # so non-discovery status queries return items while exercising `should_track == False`.
+        con.execute("UPDATE candidates SET status='saved' WHERE id=?", (candidate_ids[28],))
+        con.execute("UPDATE candidates SET status='rejected' WHERE id=?", (candidate_ids[29],))
+        con.execute(
+            "INSERT INTO feedback(candidate_id, action) VALUES(?, 'reject')",
+            (candidate_ids[29],),
+        )
+        con.commit()
+
+        direct_items, direct_run_id = tracked_recommendations(
+            connection=con,
+            status="recommended",
+            limit=24,
+            offset=0,
+            track_run=False,
+        )
+        assert direct_run_id == ""
+        assert [item["id"] for item in direct_items] == candidate_ids[:24]
+        assert all("propensity" not in item for item in direct_items)
+        assert all(item["recommendation_run_id"] == "" for item in direct_items)
+
+        for non_discovery_status in ("saved", "rejected", "decisions"):
+            non_disc_items, non_disc_run_id = tracked_recommendations(
+                connection=con,
+                status=non_discovery_status,
+                limit=24,
+                offset=0,
+                track_run=True,
+            )
+            assert non_disc_run_id == ""
+            assert len(non_disc_items) >= 1
+            assert all("propensity" not in item for item in non_disc_items)
+            assert all(item["recommendation_run_id"] == "" for item in non_disc_items)
 
     client = TestClient(app, headers=authenticated_headers())
     for _ in range(5):
@@ -572,15 +613,23 @@ def test_untracked_recommendations_skip_exploration_reordering(seeded_db, monkey
             if item["status"] == "recommended"
         ]
         assert returned_ids == candidate_ids[:24]
+        assert all("propensity" not in item for item in payload["recommendations"])
 
         recs = client.get(
             "/api/recommendations?status=recommended&limit=24&offset=0&track_run=false"
         )
         assert recs.status_code == 200
-        assert [item["id"] for item in recs.json()] == candidate_ids[:24]
+        assert "x-bookward-recommendation-run" not in recs.headers
+        rec_items = recs.json()
+        assert [item["id"] for item in rec_items] == candidate_ids[:24]
+        assert all("propensity" not in item for item in rec_items)
+        assert all(item["recommendation_run_id"] == "" for item in rec_items)
 
     assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 0
     assert row("SELECT COUNT(*) count FROM recommendation_impressions")["count"] == 0
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_evidence_exposures")["count"] == 0
+    )
 
 
 def test_load_rows_excludes_historical_non_discovery_runs_from_ndcg():

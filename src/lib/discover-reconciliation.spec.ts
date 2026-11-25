@@ -6,6 +6,7 @@ import {
   buildBaseBooks,
   commitLocalBookStatus,
   createOptimisticBookStatus,
+  createOptimisticImport,
   createPendingSubmit,
   extractActionBookId,
   extractActionBookStatus,
@@ -838,22 +839,17 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
     currentViewUrl = new URL("http://afterword.test/?view=saved");
     const importFd = new FormData();
     importFd.set("id", "1");
+    importFd.set("run_id", "run-session-1");
     await simulateEnhanceSubmit({
       key: "import-1",
       localOnly: false,
       formData: importFd,
       optimistic: (fd) =>
-        createOptimisticBookStatus(
-          {
-            hasBook: (bookId) => getAllBooks().some((item) => item.id === bookId),
-            getOverrides: () => state.bookStatusOverrides,
-            setOverrides: (next) => {
-              state = { ...state, bookStatusOverrides: next };
-            },
-          },
-          Number(fd.get("id")),
-          "imported",
-        ),
+        createOptimisticImport(fd, (committedId, committedStatus) => {
+          const book = getAllBooks().find((item) => item.id === committedId);
+          const next = commitLocalBookStatus(state, book, committedId, committedStatus);
+          state = { ...state, ...next };
+        }),
       serverAction: (body) =>
         actions.importLibrar!({
           request: new Request("http://afterword.test/?view=saved", {
@@ -876,5 +872,45 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
         .filter((b) => b.status === "recommended")
         .map((b) => b.id),
     ).toContain(32);
+  });
+
+  it("derives import status strictly from server response without hard-coding imported and preserves run_id input", () => {
+    const pagePath = fileURLToPath(
+      new URL("../routes/+page.svelte", import.meta.url),
+    );
+    const source = readFileSync(pagePath, "utf8");
+    const importFormMatch = source.match(
+      /<form[^>]*action="\?\/importLibrar"[\s\S]*?<\/form>/,
+    );
+    expect(importFormMatch?.[0]).toContain('name="run_id"');
+    expect(source).not.toContain('optimisticBookStatus(id, "imported")');
+
+    const committed: Array<{ id: number; status: string }> = [];
+    const fd = new FormData();
+    fd.set("id", "19");
+    const change = createOptimisticImport(fd, (id, status) => {
+      committed.push({ id, status });
+    });
+    expect(committed).toEqual([]);
+
+    // When action response carries unified server status (e.g. "read" for an already-read candidate), it uses it.
+    change?.commit?.({
+      type: "success",
+      status: 200,
+      data: { id: 19, status: "read" },
+    });
+    expect(committed).toEqual([{ id: 19, status: "read" }]);
+
+    // When action response omits status and relies on non-localOnly Shortlist load, nothing is fabricated client-side.
+    const committedWithoutStatus: Array<{ id: number; status: string }> = [];
+    const changeNoStatus = createOptimisticImport(fd, (id, status) => {
+      committedWithoutStatus.push({ id, status });
+    });
+    changeNoStatus?.commit?.({
+      type: "success",
+      status: 200,
+      data: { message: "Book added to the Librarr wishlist." },
+    });
+    expect(committedWithoutStatus).toEqual([]);
   });
 });

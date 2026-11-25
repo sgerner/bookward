@@ -394,6 +394,25 @@ export function resolveLibrarrDownloadReconciliation(
   };
 }
 
+export function createOptimisticImport(
+  formData: FormData,
+  onCommitStatus: (id: number, status: string) => void,
+): OptimisticChange | void {
+  const id = Number(formData.get("id"));
+  if (!Number.isInteger(id) || id <= 0) return undefined;
+  return {
+    commit: (result) => {
+      // Never hard-code "imported" client-side: derive any post-action status
+      // from the server response (or let the non-localOnly Shortlist reload
+      // fetch the unified server status, e.g. "imported" vs "read").
+      const serverStatus = extractActionBookStatus(result);
+      if (serverStatus) {
+        onCommitStatus(extractActionBookId(result, id), serverStatus);
+      }
+    },
+  };
+}
+
 export function createPendingSubmit(deps: {
   key: string;
   optimistic?: OptimisticFactory;
@@ -403,6 +422,7 @@ export function createPendingSubmit(deps: {
   clearOptimisticNotification: () => void;
   announceActionError: (message: string) => void;
   onResetReadingHistory?: () => void;
+  onReloadFilteredLists?: () => void;
   onRefreshDiscoverIfOffView?: () => Promise<void>;
 }): SubmitFunction {
   const {
@@ -414,6 +434,7 @@ export function createPendingSubmit(deps: {
     clearOptimisticNotification,
     announceActionError,
     onResetReadingHistory,
+    onReloadFilteredLists,
     onRefreshDiscoverIfOffView,
   } = deps;
 
@@ -464,6 +485,17 @@ export function createPendingSubmit(deps: {
         }
         if (succeeded) {
           change?.commit?.(result);
+          if (
+            key === "sync" ||
+            key === "rebuild-embeddings" ||
+            key === "goodreads-rss" ||
+            key === "csv-import" ||
+            key === "goodreads-csv" ||
+            key === "source" ||
+            key.startsWith("source-")
+          ) {
+            onReloadFilteredLists?.();
+          }
           if (options?.refreshDiscoverIfOffView) {
             await onRefreshDiscoverIfOffView?.();
           }
