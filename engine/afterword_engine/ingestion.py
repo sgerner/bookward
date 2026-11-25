@@ -27,7 +27,17 @@ from .covers import (
     safe_cover_url,
     wait_for_openlibrary_request_slot,
 )
-from .database import normalize_key, persist_metadata_field_provenance, private_setting, row, rows, transaction
+from .database import (
+    demote_orphaned_recommended_candidates,
+    normalize_key,
+    persist_metadata_field_provenance,
+    private_setting,
+    recompute_candidate_sources,
+    row,
+    rows,
+    transaction,
+    upsert_candidate_source,
+)
 from .identity import (
     book_author_identity_key,
     book_catalog_title_identity_key,
@@ -914,6 +924,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             batches[-1][1].append(values)
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
+    from .learning import attribute_read_outcomes
     with transaction() as con:
         for kind, values in batches:
             if kind == "shelf":
@@ -947,12 +958,11 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 "isbn=COALESCE(excluded.isbn,reads.isbn)",
                 values,
             )
-    # Importing a history is also the point at which naturally supplied
-    # ratings can become outcomes for recommendations shown earlier. Import
-    # lazily to keep the ingestion module independent of the telemetry module
-    # during application startup.
-    from .learning import attribute_read_outcomes
-    attribute_read_outcomes()
+        # Importing a history is also the point at which naturally supplied
+        # ratings can become outcomes for recommendations shown earlier. Import
+        # lazily to keep the ingestion module independent of the telemetry
+        # module during application startup.
+        attribute_read_outcomes(con)
     return {"imported": count, "source": source}
 
 
@@ -2344,6 +2354,7 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
     feed = feedparser.parse(content)
     count = 0
     read_rows = []
+    from .learning import attribute_read_outcomes
     with transaction() as con:
         for entry in feed.entries[:500]:
             title = str(entry.get("title", "")).strip()[:500]
@@ -2377,8 +2388,7 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             "isbn=COALESCE(excluded.isbn,reads.isbn)",
             read_rows,
         )
-    from .learning import attribute_read_outcomes
-    attribute_read_outcomes()
+        attribute_read_outcomes(con)
     return count
 
 
@@ -3973,6 +3983,12 @@ def _persist_scanned_candidate_items(con, source, batch_items, *, checked_at: st
             (key,),
         ).fetchone()
         if candidate:
+            upsert_candidate_source(
+                con,
+                int(candidate["id"]),
+                int(source["id"]),
+                str(item.get("source_url", source["url"]) or ""),
+            )
             description_added = bool(
                 item.get("description")
                 and not (existing["description"] if existing else "")
@@ -4293,11 +4309,48 @@ async def scan_source(source):
             for item in items
         ]
         if seen:
-            placeholders = ",".join("?" for _ in seen)
-            con.execute(
-                f"DELETE FROM candidates WHERE source_id=? AND status IN ('new','recommended') AND normalized_key NOT IN ({placeholders})",
-                (source["id"], *seen),
-            )
+            unique_seen = list(dict.fromkeys(seen))
+            placeholders = ",".join("?" for _ in unique_seen)
+            stale_ids = [
+                int(item["id"])
+                for item in con.execute(
+                    f"""SELECT c.id FROM candidates c
+                    WHERE (
+                        EXISTS (
+                            SELECT 1 FROM candidate_sources cs
+                            WHERE cs.candidate_id=c.id AND cs.source_id=?
+                        )
+                        OR c.source_id=?
+                    )
+                    AND c.normalized_key NOT IN ({placeholders})""",
+                    (source["id"], source["id"], *unique_seen),
+                ).fetchall()
+            ]
+            if stale_ids:
+                for start in range(0, len(stale_ids), 500):
+                    batch = stale_ids[start : start + 500]
+                    id_marks = ",".join("?" for _ in batch)
+                    con.execute(
+                        f"DELETE FROM candidate_sources WHERE source_id=? AND candidate_id IN ({id_marks})",
+                        (source["id"], *batch),
+                    )
+                    con.execute(
+                        f"""DELETE FROM candidates
+                        WHERE id IN ({id_marks})
+                          AND status IN ('new', 'recommended')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM feedback f WHERE f.candidate_id=candidates.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM librarr_imports li WHERE li.candidate_id=candidates.id
+                          )""",
+                        batch,
+                    )
+                recompute_candidate_sources(con, stale_ids)
+                demote_orphaned_recommended_candidates(con, stale_ids)
             con.execute(
                 "UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
                 (f"ok:{len(items)}", source["id"]),
