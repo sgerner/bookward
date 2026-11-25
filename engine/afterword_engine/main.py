@@ -10,11 +10,14 @@ import sqlite3
 import time
 import uuid
 import weakref
+from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import httpx
+import numpy as np
 from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +54,7 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
-from .decision_evidence import set_evidence_rotation_enabled
+from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
@@ -83,7 +86,7 @@ from .http_bounds import (
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
 from .scoring import cached_vectors, rebuild_all_embeddings, score_all, _vector_dimensions
-from .ranking import rank_candidates
+from .ranking import normalize_explanation_items, rank_candidates
 from .secrets import auth_registry_key, installation_key_path, seal, unseal
 from .librarr import (
     StreamingUnsupportedError,
@@ -1898,7 +1901,12 @@ def _format_recommendation_item(
 ) -> dict[str, Any]:
     formatted = dict(item)
     formatted["genres"] = _parse_json_list(formatted.get("genres"))
-    formatted["explanation"] = _parse_json_list(formatted.get("explanation"))
+    formatted["explanation"] = normalize_explanation_items(
+        _parse_json_list(formatted.get("explanation")),
+        genres=formatted["genres"],
+        author=formatted.get("author"),
+        release_date=formatted.get("release_date"),
+    )
     if format_urls:
         _format_recommendation_urls([formatted])
     return formatted
@@ -1983,9 +1991,17 @@ def _prepare_tracked_recommendations(
     recommendations = None
     interaction_events: list[dict[str, Any]] = []
     cached_vectors: dict[int, Any] = {}
+    visible_day_counts: dict[int, int] = {}
+    fatigue_settings = {
+        "enabled": bool(settings.impression_fatigue_enabled),
+        "window_days": int(settings.impression_fatigue_window_days),
+        "grace_days": int(settings.impression_fatigue_grace_days),
+        "penalty_per_day": float(settings.impression_fatigue_penalty_per_day),
+        "max_penalty": float(settings.impression_fatigue_max_penalty),
+    }
     read_rows: list[dict[str, Any]] = []
     llm_events: list[dict[str, Any]] = []
-    llm_cfg = {"enabled": False, "provider": "", "api_url": "", "api_key": "", "model": ""}
+    llm_cfg: dict[str, Any] = {}
     llm_active = False
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata: dict[str, Any] = {
@@ -2060,8 +2076,12 @@ def _prepare_tracked_recommendations(
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
             if not is_filtered and has_recommended:
                 try:
-                    llm_cfg = effective_llm_rerank_settings(connection, private)
-                    llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
+                    llm_cfg = {
+                        **effective_llm_rerank_settings(connection, private),
+                        "top_k": settings.llm_rerank_top_k,
+                        "max_delta": settings.llm_rerank_max_delta,
+                    }
+                    llm_active = bool(llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip())
                     if llm_active:
                         read_rows, llm_events = _load_llm_rerank_inputs(
                             connection, interaction_events
@@ -2079,6 +2099,9 @@ def _prepare_tracked_recommendations(
             fallback_triggered = True
             base_pool = personalized_pool = None
             ranked = None
+            visible_day_counts = {}
+            llm_cfg = {}
+            llm_active = False
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2146,6 +2169,8 @@ def _prepare_tracked_recommendations(
         "recommendations": recommendations,
         "interaction_events": interaction_events,
         "cached_vectors": cached_vectors,
+        "visible_day_counts": visible_day_counts,
+        "fatigue_settings": fatigue_settings,
         "learning_metadata": learning_metadata,
         "discovery_metadata": discovery_metadata,
         "llm_active": llm_active,
@@ -2177,8 +2202,12 @@ def _complete_tracked_recommendations(
     recommendations = prepared["recommendations"]
     interaction_events = prepared["interaction_events"]
     cached_vectors = prepared["cached_vectors"]
+    visible_day_counts = prepared["visible_day_counts"]
+    fatigue_settings = prepared["fatigue_settings"]
     learning_metadata = prepared["learning_metadata"]
     discovery_metadata = prepared["discovery_metadata"]
+    llm_cfg = prepared["llm_cfg"]
+    llm_rerank_output: dict[str, Any] | None = None
     final_pool = None
 
     if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
@@ -2212,7 +2241,12 @@ def _complete_tracked_recommendations(
                         )
                         recommended = unreranked_recommended
                         llm_diag = {"applied": False, "reason": "fallback"}
-                    learning_metadata["llm_rerank"] = llm_diag
+                    llm_rerank_output = llm_diag
+                    learning_metadata["llm_rerank"] = {
+                        key: value
+                        for key, value in llm_diag.items()
+                        if key not in {"adjustments", "rankings"}
+                    }
                 # Apply bounded anti-redundancy swaps after LLM score adjustments.
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
@@ -2260,6 +2294,7 @@ def _complete_tracked_recommendations(
                 "Post-personalization slate assembly failed; serving base ranking"
             )
             base_pool = personalized_pool = final_pool = None
+            llm_rerank_output = None
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2310,7 +2345,7 @@ def _complete_tracked_recommendations(
         )
     if is_filtered:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "filtered_query",
             "captured_at": ranking_at.isoformat(),
@@ -2335,10 +2370,14 @@ def _complete_tracked_recommendations(
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
             },
+            visible_day_counts=visible_day_counts,
+            impression_fatigue_settings=fatigue_settings,
+            llm_rerank_settings=llm_cfg,
+            llm_rerank_output=llm_rerank_output,
         )
     else:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
@@ -2421,27 +2460,20 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        llm_cfg = effective_llm_rerank_settings(connection, private)
-        llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
-        if llm_active:
-            deferred_prepared = _prepare_tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
-            )
+        prepared = _prepare_tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            identity_context=identity_context,
+            include_imported=True,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        if prepared["llm_active"]:
+            deferred_prepared = prepared
         else:
-            recommendations, run_id = tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
+            recommendations, run_id = _complete_tracked_recommendations(
+                prepared, connection=connection
             )
         all_decision_rows = _recommendation_rows(
             connection,
@@ -2595,10 +2627,108 @@ def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn)
     }
 
 
+READING_HISTORY_SCORE_MAX_LIMIT = 200
+_RATED_READ_VECTOR_CACHE_MAX_ENTRIES = 8
+# Bounded by entry count (8 LRU profiles/states); individual entries are not
+# size-capped and hold one frozen float64 vector per rated read in that profile.
+_RATED_READ_VECTOR_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, ...]] = OrderedDict()
+
+
+def _rated_read_state_digest(rated_reads: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for item in rated_reads:
+        digest.update(
+            json.dumps(
+                (
+                    item.get("id"),
+                    item.get("title"),
+                    item.get("author"),
+                    item.get("rating"),
+                    item.get("read_at"),
+                    item.get("genres"),
+                    item.get("description"),
+                ),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _format_read_embedding_digest(entries: Sequence[Any]) -> str:
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update(
+            f"{entry['entity_id']}:{entry['dimensions']}:{entry['content_hash']}:{entry['byte_length']}\n".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _read_embedding_cache_digest(connection, backend: str, model: str) -> str:
+    query = (
+        "SELECT entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+        "FROM embeddings WHERE entity_type='read' AND backend=? AND model=? "
+        "ORDER BY entity_id"
+    )
+    entries = (
+        connection.execute(query, (backend, model)).fetchall()
+        if connection is not None
+        else rows(query, (backend, model))
+    )
+    return _format_read_embedding_digest(entries)
+
+
+async def _cached_rated_read_vectors(
+    embedder,
+    config: dict[str, Any],
+    rated_reads: list[dict[str, Any]],
+    embedding_cache_digest: str,
+) -> Sequence[Sequence[float]]:
+    tenant_key = (
+        current_profile_id() or "legacy",
+        str(profile_database_path().resolve()),
+    )
+    embedder_base_key = (
+        type(embedder).__qualname__,
+        str(embedder.name),
+        str(embedder.model),
+        str(config.get("embedding_backend") or ""),
+        str(config.get("embedding_model") or ""),
+        str(getattr(embedder, "url", None) or config.get("embedding_url") or ""),
+    )
+    reads_state_key = _rated_read_state_digest(rated_reads)
+    lookup_key = (tenant_key, (*embedder_base_key, embedding_cache_digest), reads_state_key)
+    cached = _RATED_READ_VECTOR_CACHE.get(lookup_key)
+    if cached is not None:
+        _RATED_READ_VECTOR_CACHE.move_to_end(lookup_key)
+        return cached
+
+    computed = await cached_vectors(embedder, "read", rated_reads)
+    frozen: list[np.ndarray] = []
+    for vector in computed:
+        arr = np.asarray(vector, dtype=np.float64).copy()
+        arr.setflags(write=False)
+        frozen.append(arr)
+    stored = tuple(frozen)
+    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
+    _RATED_READ_VECTOR_CACHE[store_key] = stored
+    _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
+    while len(_RATED_READ_VECTOR_CACHE) > _RATED_READ_VECTOR_CACHE_MAX_ENTRIES:
+        _RATED_READ_VECTOR_CACHE.popitem(last=False)
+    return stored
+
+
 @app.get("/api/reading-history/scores")
 async def reading_history_scores(
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=20),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
 ):
     """Rank a bounded slice of read books against the current reading profile."""
     with connect() as connection:
@@ -2607,6 +2737,8 @@ async def reading_history_scores(
             "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
+        if not items:
+            return []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -2624,8 +2756,20 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-    if not items:
-        return []
+        config = private_settings(connection)
+        rated_reads = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+            ).fetchall()
+        ]
+        read_embedding_rows = [
+            dict(item)
+            for item in connection.execute(
+                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+            ).fetchall()
+        ]
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -2653,42 +2797,48 @@ async def reading_history_scores(
         virtual_candidates.append(virtual)
 
     try:
-        if virtual_candidates:
-            config = private_settings()
-            embedder = get_embedder(
-                config.get("embedding_backend"),
-                config.get("embedding_model"),
-                config.get("embedding_url"),
-                config.get("embedding_api_key"),
-            )
-            rated_reads = rows(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            )
-            read_vectors = await cached_vectors(embedder, "read", rated_reads)
-            candidate_vectors = await cached_vectors(
-                embedder,
-                "read_candidate",
-                virtual_candidates,
-                persist=False,
-                expected_dimensions=_vector_dimensions(read_vectors),
-            )
-            ranked = rank_candidates(
-                rated_reads,
-                read_vectors,
-                virtual_candidates,
-                candidate_vectors,
-                exclude_candidate_identity=True,
-            )
-            ranked_by_id = {int(item["id"]): item for item in ranked}
-            return [
-                {
-                    "id": int(item["id"]),
-                    "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
-                    "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
-                    "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
-                }
-                for item in items
+        embedder = get_embedder(
+            config.get("embedding_backend"),
+            config.get("embedding_model"),
+            config.get("embedding_url"),
+            config.get("embedding_api_key"),
+        )
+        embedding_cache_digest = _format_read_embedding_digest(
+            [
+                entry
+                for entry in read_embedding_rows
+                if entry["backend"] == embedder.name and entry["model"] == embedder.model
             ]
+        )
+        read_vectors = await _cached_rated_read_vectors(
+            embedder, config, rated_reads, embedding_cache_digest
+        )
+        candidate_vectors = await cached_vectors(
+            embedder,
+            "read_candidate",
+            virtual_candidates,
+            persist=False,
+            expected_dimensions=_vector_dimensions(read_vectors),
+        )
+        ranked = rank_candidates(
+            rated_reads,
+            read_vectors,
+            virtual_candidates,
+            candidate_vectors,
+            exclude_candidate_identity=True,
+        )
+        ranked_by_id = {int(item["id"]): item for item in ranked}
+        return [
+            {
+                "id": int(item["id"]),
+                "algorithm_score": ranked_by_id.get(-int(item["id"]), {}).get("score", 50.0),
+                "algorithm_explanation": ranked_by_id.get(-int(item["id"]), {}).get("explanation", []),
+                "metadata_confidence": ranked_by_id.get(-int(item["id"]), {}).get("metadata_confidence", 1.0),
+            }
+            for item in items
+        ]
+    except RestoreEpochError:
+        raise
     except Exception:
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise
@@ -2906,7 +3056,12 @@ def recommendation_list(
         )
     for item in result:
         item["genres"] = _parse_json_list(item.get("genres"))
-        item["explanation"] = _parse_json_list(item.get("explanation"))
+        item["explanation"] = normalize_explanation_items(
+            _parse_json_list(item.get("explanation")),
+            genres=item["genres"],
+            author=item.get("author"),
+            release_date=item.get("release_date"),
+        )
     if format_urls:
         _format_recommendation_urls(result)
     return result
