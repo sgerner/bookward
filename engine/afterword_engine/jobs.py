@@ -18,6 +18,7 @@ from .database import (
     transaction,
 )
 from .security import safe_error_message
+from .tenancy import ProfileDeletedError
 
 LOGGER = logging.getLogger(__name__)
 JOB_LEASE_SECONDS = 300
@@ -164,6 +165,8 @@ def _claim_profile_job(
 
     with profile_scope(profile_id):
         lock = database_lock()
+        if lock.is_deleted:
+            raise ProfileDeletedError("Profile has been deleted")
         if lock.is_locked():
             return ("busy", None, None, None)
         recovered = False
@@ -317,6 +320,8 @@ async def worker_loop(handler, stop):
             try:
                 with profile_scope(profile_id):
                     lock = database_lock()
+                    if lock.is_deleted:
+                        raise ProfileDeletedError("Profile has been deleted")
                     if lock.is_locked():
                         continue
                     generation = profile_restore_generation()
@@ -419,6 +424,8 @@ async def worker_loop(handler, stop):
                                         lease_token,
                                         epoch,
                                     )
+                                except ProfileDeletedError:
+                                    raise
                                 except RestoreEpochError:
                                     pass
                                 except asyncio.CancelledError:
@@ -432,6 +439,8 @@ async def worker_loop(handler, stop):
                                     )
                                 if not job_aborted.is_set() or outer_cancelling:
                                     raise
+                            except ProfileDeletedError:
+                                raise
                             except RestoreEpochError:
                                 reset_profile_ready(profile_id)
                             except Exception as exc:
@@ -446,6 +455,8 @@ async def worker_loop(handler, stop):
                                         epoch,
                                         safe_error_message(exc, limit=2000),
                                     )
+                                except ProfileDeletedError:
+                                    raise
                                 except RestoreEpochError:
                                     reset_profile_ready(profile_id)
                             finally:
@@ -461,6 +472,11 @@ async def worker_loop(handler, stop):
                                         raise
                     finally:
                         _ACTIVE_JOB_CONTEXT.reset(job_token)
+            except ProfileDeletedError:
+                reset_profile_ready(profile_id)
+                seen_restore_generations.pop(profile_id, None)
+                fenced_profiles.discard(profile_id)
+                profile_retry_after.pop(profile_id, None)
             except RestoreEpochError:
                 reset_profile_ready(profile_id)
             except Exception:
@@ -550,7 +566,7 @@ def _heartbeat(
                         "WHERE id=? AND status='running' AND lease_token=?",
                         (now(), job_id, lease_token),
                     ).rowcount
-        except RestoreEpochError:
+        except (ProfileDeletedError, RestoreEpochError):
             if on_lost_lease is not None:
                 on_lost_lease()
             return
