@@ -41,11 +41,11 @@ MAX_SCORING_JSON_BYTES = 16 * 1024 * 1024
 MAX_SCORING_FIELD_BYTES = 24 * 1024
 
 READ_FIELDS = (
-    "id", "title", "author", "rating", "read_at", "isbn",
+    "id", "title", "author", "additional_authors", "rating", "read_at", "isbn",
     "openlibrary_work_id", "genres", "description", "first_publication_year", "publication_work_id",
 )
 IDENTITY_READ_FIELDS = (
-    "id", "title", "author", "isbn", "openlibrary_work_id",
+    "id", "title", "author", "additional_authors", "isbn", "openlibrary_work_id",
     "quality_work_id", "quality_provider",
     "read_metadata_work_id", "read_metadata_identity_provider",
     "read_metadata_identity_provider_id", "read_metadata_identity_hash",

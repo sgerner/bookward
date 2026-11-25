@@ -2,7 +2,17 @@ import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
-type Account = { id: string; profile_id: string; username: string; display_name: string; role: 'admin' | 'user'; status: 'active' | 'disabled' };
+type Account = {
+	id: string;
+	profile_id: string;
+	username: string;
+	display_name: string;
+	role: 'admin' | 'user';
+	status: 'active' | 'disabled';
+	recent_failed_attempts?: number;
+	locked_bucket_count?: number;
+	lockout_retry_after_seconds?: number;
+};
 type IdentityBackupStatus = {
 	enabled: boolean;
 	interval_hours: number;
@@ -136,6 +146,34 @@ export const actions: Actions = {
 					? { password: msg }
 					: {};
 			return failure(formId, error, mappedFieldErrors);
+		}
+	},
+	unlock: async ({ request }) => {
+		const form = await request.formData();
+		const account_id = String(form.get('account_id') || '').trim();
+		const formId = account_id ? `unlock-${account_id}` : 'unlock';
+		if (!account_id) {
+			return fail(400, {
+				formId,
+				message: 'Choose a valid account.',
+				error: true as const,
+				fieldErrors: {}
+			});
+		}
+		try {
+			const result = await engine<{ unlocked: boolean; username: string; cleared_attempts: number }>(
+				`/admin/accounts/${encodeURIComponent(account_id)}/unlock`,
+				{ method: 'POST', body: '{}' }
+			);
+			return {
+				formId,
+				message:
+					result.cleared_attempts > 0
+						? `Unlocked ${result.username} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
+						: `Sign-in lockouts cleared for ${result.username}.`
+			};
+		} catch (error) {
+			return failure(formId, error);
 		}
 	}
 };

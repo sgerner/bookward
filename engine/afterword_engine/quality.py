@@ -1785,12 +1785,20 @@ def _dedupe_and_hide(con) -> int:
         JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended')"""
     ).fetchall()
-    read_index = ReadIdentityIndex.from_reads(
-        con.execute(
-            """SELECT r.title,r.author,r.isbn,r.openlibrary_work_id,
-            m.verified_work_id AS quality_work_id,m.identity_provider AS quality_provider
-            FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id"""
+    from .ingestion import read_identity_rows_with_current_verified_work_ids
+
+    read_rows = [dict(item) for item in con.execute("SELECT * FROM reads").fetchall()]
+    read_metadata_rows = [
+        dict(item)
+        for item in con.execute(
+            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+            "FROM read_metadata WHERE verified_work_id!=''"
         ).fetchall()
+    ]
+    read_index = ReadIdentityIndex.from_reads(
+        read_identity_rows_with_current_verified_work_ids(
+            read_rows, read_metadata_rows
+        )
     )
     overlap = [item for item in active if read_index.matches(item)]
     reject_candidates((item["id"] for item in overlap), "read_overlap")
