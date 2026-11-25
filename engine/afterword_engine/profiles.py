@@ -838,10 +838,15 @@ def authenticate_api_token(token: str):
         expected_hash = current_hash
         if found is None:
             found = con.execute(_ACTIVE_TOKEN_QUERY, (legacy_hash,)).fetchone()
-            if found is None:
-                return None
-            expected_hash = legacy_hash
-            needs_upgrade = legacy_hash != current_hash
+            if found is not None:
+                expected_hash = legacy_hash
+                needs_upgrade = legacy_hash != current_hash
+            else:
+                # A concurrent legacy upgrade may have committed between the two
+                # lookups, so look for the upgraded hash once more before failing.
+                found = con.execute(_ACTIVE_TOKEN_QUERY, (current_hash,)).fetchone()
+                if found is None:
+                    return None
         return _complete_api_token_auth(
             con,
             found=found,
