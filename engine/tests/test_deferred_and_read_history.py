@@ -468,8 +468,8 @@ def test_put_reading_history_updates_and_clears_fields_reconciles_outcomes_and_v
 
     root_endpoints = client.get("/api/v1", headers=v1_headers).json()["endpoints"]
     assert root_endpoints["mark_read"] == "POST /api/v1/recommendations/{id}/read"
-    assert root_endpoints["reading_history_entry"] == "PUT /api/v1/reading-history/{id}"
-    assert "reading_history" not in root_endpoints
+    assert root_endpoints["reading_history"] == "GET /api/v1/reading-history"
+    assert root_endpoints["reading_history_rating"] == "PUT /api/v1/reading-history/{id}"
 
     marked = client.post(
         f"/api/v1/recommendations/{cid}/read",
@@ -492,10 +492,10 @@ def test_put_reading_history_updates_and_clears_fields_reconciles_outcomes_and_v
     assert client.delete(f"/api/reading-history/{read_id}").status_code == 405
     assert client.delete(f"/api/v1/reading-history/{read_id}", headers=v1_headers).status_code == 405
 
-    # Payload and ID validation (including rejecting empty strings so "" never silently clears).
+    # Payload and ID validation (including rejecting empty strings with 400 so "" never silently clears).
     assert client.put(f"/api/reading-history/{read_id}", json={}).status_code == 422
-    assert client.put(f"/api/reading-history/{read_id}", json={"rating": ""}).status_code == 422
-    assert client.put(f"/api/reading-history/{read_id}", json={"read_at": ""}).status_code == 422
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": ""}).status_code == 400
+    assert client.put(f"/api/reading-history/{read_id}", json={"read_at": ""}).status_code == 400
     assert client.put(f"/api/reading-history/{read_id}", json={"rating": True}).status_code == 422
     assert client.put(f"/api/reading-history/{read_id}", json={"rating": 3.5}).status_code == 422
     assert client.put(f"/api/reading-history/{read_id}", json={"rating": 0}).status_code == 422

@@ -65,6 +65,11 @@
     formatReadingHistoryStatus,
     formatRecommendationStatus,
   } from "#lib/live-status.js";
+  import {
+    applyRatingOverrides,
+    createReadingHistoryRatingController,
+    formatRatingConfirmation,
+  } from "#lib/reading-history-ratings.js";
   import { formatReadingSourceLabel } from "#lib/reading-sources.js";
   import { createTelemetryClient } from "#lib/telemetry.js";
   import {
@@ -139,11 +144,12 @@
   type PageBook = (typeof data.books)[number];
   let activeView = $state<View>(readView(page.url.searchParams.get("view")));
   let markReadBook = $state<PageBook | null>(null);
-  let markReadRating = $state(0);
+  let markReadRating = $state<number | null>(0);
   let markReadHistorical = $state(false);
   let markReadDate = $state("");
   const todayIsoDate = new Date().toISOString().slice(0, 10);
   let readDateDrafts = $state<Record<number, string>>({});
+  let pendingReadDateIds = $state(new Set<number>());
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -196,17 +202,21 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryScoreRefreshQueued = false;
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
   let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
   let expandedReadingDetails = $state<number[]>([]);
+  let historyRatingOverrides = $state<Record<number, number | null>>({});
+  let pendingRatingIds = $state(new Set<number>());
   // This is only an identity sentinel. Keeping it outside `$state` avoids
   // proxying `data.books` and retriggering the synchronization effect forever.
   let previousDataBooks: PageBook[] | null = null;
   let previousDataRecommendationsHasMore: boolean | null = null;
   let previousDataDecisions: PageBook[] | null = null;
   let previousDataDecisionsHasMore: boolean | null = null;
+  let previousDataHistory: (typeof data.history) | null = null;
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -599,6 +609,12 @@
       rawGenre.trim()
     );
   }
+  const synchronizedReadingHistory = $derived(
+    applyRatingOverrides(readingHistory, historyRatingOverrides),
+  );
+  const recentReads = $derived(
+    applyRatingOverrides(data.history, historyRatingOverrides),
+  );
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -619,7 +635,7 @@
       timestamps.set(item.id, normalized);
       return normalized;
     };
-    return readingHistory
+    return synchronizedReadingHistory
       .filter((item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
@@ -706,6 +722,67 @@
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const catalogQuality = $derived(
+    data.catalogQuality ?? {
+      statuses: [],
+      identifiers: { total: 0, with_isbn13: 0, with_catalog_match: 0 },
+      flags: {},
+      version: "",
+      audit: {
+        status: "idle" as const,
+        active: false,
+        mode: "incremental" as const,
+        last_mode: null,
+        batch_size: 50,
+        subbatch_size: 10,
+        remaining: 0,
+        progress: 0,
+        started_at: null,
+        completed_at: null,
+        job_id: null,
+        last_error: null,
+        can_retry: false,
+      },
+    },
+  );
+  const catalogAudit = $derived(catalogQuality.audit);
+  const catalogStatusCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const item of catalogQuality.statuses) {
+      counts[item.quality_status] = item.count;
+    }
+    return {
+      accepted: counts.accepted ?? 0,
+      quarantine: counts.quarantine ?? 0,
+      pending: counts.pending ?? 0,
+    };
+  });
+  const catalogAuditPercent = $derived(
+    Math.round(Math.max(0, Math.min(1, catalogAudit.progress)) * 100),
+  );
+  // State changes only: the remaining count changes on every poll and would be
+  // re-announced every few seconds.
+  const catalogAuditStatusMessage = $derived(
+    catalogAudit.status === "failed"
+      ? "Catalog audit needs retry."
+      : catalogAudit.active
+        ? `${catalogAudit.mode === "full" ? "Full" : "Incremental"} catalog audit ${
+            catalogAudit.status === "queued" ? "queued" : "running"
+          }.`
+        : catalogAudit.status === "paused"
+          ? "Catalog audit paused."
+          : catalogAudit.remaining > 0
+            ? "Catalog audit has books due."
+            : "Catalog audit up to date.",
+  );
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    if (activeView !== "settings" || !catalogAudit.active) return;
+    const timer = window.setInterval(() => {
+      void invalidateAll();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  });
   const filteredLlmProviders = $derived.by(() => {
     const q = llmProviderSearch.trim().toLowerCase();
     if (!q) return llmCatalogProviders;
@@ -1049,6 +1126,62 @@
     readingHistoryScoreTask = task;
     return task;
   }
+  async function refreshReadingHistoryScores() {
+    if (readingHistoryState !== "ready") return;
+    if (readingHistoryScoreTask) {
+      if (readingHistoryScoreRefreshQueued) return;
+      readingHistoryScoreRefreshQueued = true;
+      try {
+        await readingHistoryScoreTask;
+      } finally {
+        readingHistoryScoreRefreshQueued = false;
+      }
+      if (readingHistoryState !== "ready") return;
+    }
+    readingHistoryScoreOffset = 0;
+    await loadReadingHistoryScores(readingHistory.length);
+  }
+  const ratingController = createReadingHistoryRatingController({
+    saveRating: async (id, nextRating) => {
+      const response = await fetch(`/api/reading-history/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ rating: nextRating }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: { rating?: number | null };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+      }
+      return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
+    },
+    onStateChange: ({ overrides, pendingIds }) => {
+      historyRatingOverrides = overrides;
+      pendingRatingIds = pendingIds;
+    },
+    onItemRatingChange: (id, rating) => {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === id ? { ...entry, rating } : entry,
+      );
+    },
+    onCommittedSuccess: ({ title, rating }) => {
+      announceActionSuccess(formatRatingConfirmation(title, rating));
+      void refreshReadingHistoryScores();
+    },
+    onRollbackError: ({ serverMutatedBeforeFailure, error }) => {
+      if (serverMutatedBeforeFailure) {
+        void refreshReadingHistoryScores();
+      }
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Rating could not be saved. Your change was reverted.",
+      );
+    },
+    afterDomUpdate: () => tick(),
+  });
   function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
     const inDecisionsView = activeView === "decisions";
     recommendationsImmediate = inDecisionsView;
@@ -1177,22 +1310,6 @@
           optimisticNotificationTimer = null;
           optimisticNotification = null;
           await update();
-          if (succeeded && key.startsWith("update-read-")) {
-            const updatedRead = result.type === "success"
-              ? (result.data as FormState)?.updated_read
-              : undefined;
-            if (updatedRead && typeof updatedRead.id === "number") {
-              readingHistory = readingHistory.map((item) =>
-                item.id === updatedRead.id ? { ...item, ...updatedRead } : item,
-              );
-              const nextDrafts = { ...readDateDrafts };
-              delete nextDrafts[updatedRead.id];
-              readDateDrafts = nextDrafts;
-            }
-            readingHistoryScoreOffset = 0;
-            readingHistoryScoreState = "idle";
-            void loadReadingHistoryScores(readingHistory.length);
-          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -1323,40 +1440,76 @@
     };
   }
 
-  function optimisticUpdateRead(formData: FormData): OptimisticChange | void {
-    const id = Number(formData.get("id"));
-    if (!Number.isInteger(id)) return;
-    const current = readingHistory.find((item) => item.id === id);
-    if (!current) return;
-    const snapshot = { ...current };
-    const patch: Partial<ReadingHistoryItem> = {};
-    if (String(formData.get("clear_rating") ?? "") === "1") {
-      patch.rating = null;
-    } else if (formData.has("rating")) {
-      const raw = String(formData.get("rating") ?? "").trim();
-      if (raw) {
-        const rating = Number(raw);
-        if (Number.isInteger(rating) && rating >= 1 && rating <= 5) patch.rating = rating;
+  async function saveReadHistoryDate(item: ReadingHistoryItem, explicitReadAt?: string | null) {
+    if (pendingReadDateIds.has(item.id)) return;
+    const rawDraft =
+      explicitReadAt !== undefined
+        ? explicitReadAt
+        : (readDateDrafts[item.id] ?? toDateInputValue(item.read_at)).trim();
+    const nextReadAt = rawDraft === null || rawDraft === "" ? null : rawDraft;
+    if (nextReadAt !== null) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(nextReadAt)) {
+        announceActionError("Enter a valid completion date (YYYY-MM-DD).");
+        return;
+      }
+      if (nextReadAt > todayIsoDate) {
+        announceActionError("Completion date cannot be in the future.");
+        return;
       }
     }
-    if (String(formData.get("clear_read_at") ?? "") === "1") {
-      patch.read_at = null;
-    } else if (formData.has("read_at")) {
-      const raw = String(formData.get("read_at") ?? "").trim();
-      if (!raw) patch.read_at = null;
-      else if (/^\d{4}-\d{2}-\d{2}$/.test(raw) && raw <= todayIsoDate) patch.read_at = raw;
-    }
-    if (!("rating" in patch) && !("read_at" in patch)) return;
-    readingHistory = readingHistory.map((item) =>
-      item.id === id ? { ...item, ...patch } : item,
+    const snapshot = { ...item };
+    const nextPending = new Set(pendingReadDateIds);
+    nextPending.add(item.id);
+    pendingReadDateIds = nextPending;
+    readingHistory = readingHistory.map((entry) =>
+      entry.id === item.id ? { ...entry, read_at: nextReadAt } : entry,
     );
-    return {
-      rollback: () => {
-        readingHistory = readingHistory.map((item) =>
-          item.id === id ? snapshot : item,
-        );
-      },
-    };
+    try {
+      const response = await fetch(`/api/reading-history/${item.id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...profileHeaders },
+        body: JSON.stringify({ read_at: nextReadAt }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        item?: Partial<ReadingHistoryItem> & { id: number };
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || "Completion date could not be saved.");
+      }
+      const committed = payload.item;
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === item.id
+          ? {
+              ...entry,
+              read_at: committed && "read_at" in committed ? (committed.read_at ?? null) : nextReadAt,
+              ...(committed?.source ? { source: committed.source } : {}),
+            }
+          : entry,
+      );
+      const nextDrafts = { ...readDateDrafts };
+      delete nextDrafts[item.id];
+      readDateDrafts = nextDrafts;
+      announceActionSuccess(
+        nextReadAt === null
+          ? `Cleared completion date for "${item.title}".`
+          : `Updated completion date for "${item.title}" to ${nextReadAt}.`,
+      );
+      void refreshReadingHistoryScores();
+    } catch (error) {
+      readingHistory = readingHistory.map((entry) =>
+        entry.id === item.id ? snapshot : entry,
+      );
+      announceActionError(
+        error instanceof Error
+          ? error.message
+          : "Completion date could not be saved. Your change was reverted.",
+      );
+    } finally {
+      const donePending = new Set(pendingReadDateIds);
+      donePending.delete(item.id);
+      pendingReadDateIds = donePending;
+    }
   }
 
   function optimisticImport(formData: FormData) {
@@ -2149,6 +2302,13 @@
     unfilteredDecisionOffset = nextDecisions.length;
     decisionsHasMoreOverride = null;
     decisionsLoadError = "";
+  });
+
+  $effect(() => {
+    const nextHistory = data.history;
+    if (previousDataHistory === nextHistory) return;
+    previousDataHistory = nextHistory;
+    untrack(() => ratingController.reconcileServerHistory());
   });
 
   $effect(() => {
@@ -3262,54 +3422,23 @@
                       </div>
                     </div>
                     <div class="mt-3 flex flex-col gap-2 border-t border-surface-300-700/40 pt-3">
-                      <form
-                        method="POST"
-                        action="?/updateRead"
-                        use:enhance={setPending(`update-read-rating-${item.id}`, optimisticUpdateRead)}
-                        class="flex flex-wrap items-center gap-1"
-                        aria-label={`Rate ${item.title}`}
-                      >
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={item.id} />
-                        {#each [1, 2, 3, 4, 5] as star (star)}
-                          {@const starActive = item.rating !== null && item.rating >= star}
-                          <button
-                            type="submit"
-                            name="rating"
-                            value={star}
-                            class={`grid size-8 place-items-center rounded-lg border text-sm transition ${starActive ? "border-2 border-[var(--star-active-border)] bg-[var(--star-active-bg)] text-[var(--star-active-fg)]" : "border-[1.5px] border-[var(--star-idle-border)] bg-[var(--star-idle-bg)] text-[var(--star-idle-fg)] hover:border-[var(--star-active-border)] hover:text-[var(--star-active-fg)]"}`}
-                            aria-label={`Rate ${item.title} ${star} ${star === 1 ? "star" : "stars"}`}
-                            aria-pressed={item.rating === star}
-                            disabled={isPending(`update-read-rating-${item.id}`)}
-                          ><span aria-hidden="true">{starActive ? "★" : "☆"}</span></button>
-                        {/each}
-                        {#if item.rating !== null && item.rating > 0}
-                          <button
-                            type="submit"
-                            name="clear_rating"
-                            value="1"
-                            class="btn btn-xs ml-1 min-h-8 preset-tonal-surface"
-                            aria-label={`Clear rating for ${item.title}`}
-                            disabled={isPending(`update-read-rating-${item.id}`)}
-                          >Clear</button>
-                        {/if}
-                      </form>
-                      <form
-                        method="POST"
-                        action="?/updateRead"
-                        use:enhance={setPending(`update-read-date-${item.id}`, optimisticUpdateRead)}
-                        class="flex flex-wrap items-center gap-1.5"
-                      >
-                        <ProfileField profileId={data.user?.profile_id} />
-                        <input type="hidden" name="id" value={item.id} />
+                      <StarRating
+                        value={item.rating}
+                        label={`Rating for ${item.title}`}
+                        busy={pendingRatingIds.has(item.id)}
+                        groupKey={`history-${item.id}`}
+                        onchange={(nextRating, trigger, clearedViaButton) =>
+                          void ratingController.update(item, nextRating, "history", trigger, clearedViaButton)}
+                      />
+                      <div class="flex flex-wrap items-center gap-1.5">
                         <label class="sr-only" for={`read-date-${item.id}`}>Completion date for {item.title}</label>
                         <input
                           id={`read-date-${item.id}`}
                           class="input min-h-9 w-auto min-w-[9.5rem] flex-1 px-2.5 py-1 text-xs preset-tonal-surface"
                           type="date"
-                          name="read_at"
                           max={todayIsoDate}
                           value={readDateDrafts[item.id] ?? toDateInputValue(item.read_at)}
+                          disabled={pendingReadDateIds.has(item.id)}
                           oninput={(event) =>
                             (readDateDrafts = {
                               ...readDateDrafts,
@@ -3317,22 +3446,22 @@
                             })}
                         />
                         <button
-                          type="submit"
+                          type="button"
                           class="btn btn-xs min-h-9 preset-tonal-secondary"
                           aria-label={`Save completion date for ${item.title}`}
-                          disabled={isPending(`update-read-date-${item.id}`)}
+                          disabled={pendingReadDateIds.has(item.id)}
+                          onclick={() => void saveReadHistoryDate(item)}
                         >Save date</button>
                         {#if item.read_at}
                           <button
-                            type="submit"
-                            name="clear_read_at"
-                            value="1"
+                            type="button"
                             class="btn btn-xs min-h-9 preset-tonal-surface"
                             aria-label={`Clear completion date for ${item.title}`}
-                            disabled={isPending(`update-read-date-${item.id}`)}
+                            disabled={pendingReadDateIds.has(item.id)}
+                            onclick={() => void saveReadHistoryDate(item, null)}
                           >Clear date</button>
                         {/if}
-                      </form>
+                      </div>
                       {#if item.source === "goodreads_rss"}
                         <p class="text-[11px] leading-4 text-surface-600-400">
                           Synced from Goodreads RSS — future feed syncs may overwrite changes if Goodreads differs.
@@ -4528,6 +4657,183 @@
                 </form>
               </section>
               <section
+                id="catalog-audit-settings"
+                in:fly={{
+                  y: 12,
+                  duration: motionDuration(300),
+                  delay: motionDelay(4),
+                }}
+                class="card preset-tonal-surface p-5 sm:p-6"
+              >
+                <div class="mb-5 flex items-center justify-between gap-4">
+                  <div class="flex min-w-0 items-center gap-3">
+                    <span
+                      class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
+                      ><Database size={19} /></span
+                    >
+                    <h2
+                      class="truncate text-lg font-semibold text-surface-950-50"
+                    >
+                      Catalog audit
+                    </h2>
+                  </div>
+                  <span
+                    class={`badge shrink-0 ${
+                      catalogAudit.status === "failed"
+                        ? "preset-tonal-error"
+                        : catalogAudit.active
+                          ? "preset-tonal-secondary"
+                          : catalogAudit.remaining > 0
+                            ? "preset-tonal-warning"
+                            : "preset-tonal-success"
+                    }`}
+                  >
+                    {#if catalogAudit.status === "failed"}
+                      Needs retry
+                    {:else if catalogAudit.active}
+                      {catalogAudit.mode === "full" ? "Full sweep" : "Incremental"} · {catalogAudit.status === "queued" ? "Queued" : "Running"}
+                    {:else if catalogAudit.status === "paused"}
+                      Paused · {catalogAudit.remaining} left
+                    {:else if catalogAudit.remaining > 0}
+                      {catalogAudit.remaining} due
+                    {:else}
+                      Up to date
+                    {/if}
+                  </span>
+                </div>
+                <p class="text-sm leading-6 text-surface-700-300">
+                  Check pending or retry-eligible quarantined books in bounded {catalogAudit.batch_size}-book batches, or run an explicit full sweep to re-verify accepted books without blocking other profiles.
+                </p>
+
+                <div class="mt-4 space-y-2 border border-surface-300-700/50 p-3 text-sm">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400">
+                      {catalogAudit.active || catalogAudit.status === "failed" || catalogAudit.status === "paused"
+                        ? "Active sweep mode"
+                        : "Default mode"}
+                    </span>
+                    <span class="font-medium text-surface-950-50">
+                      {catalogAudit.mode === "full"
+                        ? "Full catalog sweep"
+                        : "Incremental"}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-surface-700-300">Remaining to check</span>
+                    <strong class="text-surface-950-50">
+                      {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"}
+                    </strong>
+                  </div>
+                  <p class="text-xs text-surface-600-400">
+                    {catalogStatusCounts.accepted} accepted · {catalogStatusCounts.quarantine} quarantined{#if catalogStatusCounts.pending > 0} · {catalogStatusCounts.pending} pending{/if}
+                  </p>
+                  {#if catalogAudit.active}
+                    <div class="pt-1">
+                      <div class="mb-1 flex items-center justify-between text-xs text-surface-700-300">
+                        <span>Current {catalogAudit.batch_size}-book batch</span>
+                        <span>{catalogAuditPercent}%</span>
+                      </div>
+                      <div
+                        class="h-2 w-full overflow-hidden rounded-full bg-surface-300-700/50"
+                        role="progressbar"
+                        aria-label="Current catalog audit batch progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={catalogAuditPercent}
+                      >
+                        <div
+                          class="h-full rounded-full preset-filled-secondary-500 transition-all"
+                          style={`width: ${catalogAuditPercent}%`}
+                        ></div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+                <StatusRegion
+                  message={catalogAuditStatusMessage}
+                  paused={activeView !== "settings"}
+                />
+
+                {#if catalogAudit.status === "failed" || catalogAudit.can_retry}
+                  <div
+                    class="mt-4 flex flex-wrap items-center gap-3 border-l-2 border-error-500 preset-tonal-error p-3 text-sm"
+                    role="alert"
+                  >
+                    <TriangleAlert size={16} class="shrink-0" />
+                    <span class="min-w-0 flex-1">
+                      <strong>
+                        {catalogAudit.mode === "full" ? "Full" : "Incremental"} audit {catalogAudit.status === "paused" ? "paused" : "failed"}
+                      </strong>
+                      {#if catalogAudit.remaining > 0}
+                        · {catalogAudit.remaining} {catalogAudit.remaining === 1 ? "book" : "books"} remaining
+                      {/if}
+                      {#if catalogAudit.last_error}
+                        <span class="mt-1 block text-xs">{catalogAudit.last_error}</span>
+                      {/if}
+                    </span>
+                    <form
+                      method="POST"
+                      action="?/retryCatalogAudit"
+                      use:enhance={setPending("catalog-audit-retry")}
+                    >
+                      <ProfileField profileId={data.user?.profile_id} />
+                      <button
+                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                        type="submit"
+                        disabled={isPending("catalog-audit-retry") || catalogAudit.active}
+                        aria-busy={isPending("catalog-audit-retry")}
+                      >
+                        {#if isPending("catalog-audit-retry")}<RefreshCw
+                            size={14}
+                            class="animate-spin"
+                          />{:else}<RefreshCw size={14} />{/if} Retry
+                      </button>
+                    </form>
+                  </div>
+                {/if}
+
+                <div class="mt-4 grid gap-2 sm:grid-cols-2">
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-incremental")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="incremental" />
+                    <button
+                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
+                      aria-busy={isPending("catalog-audit-incremental")}
+                    >
+                      {#if isPending("catalog-audit-incremental") || (catalogAudit.active && catalogAudit.mode === "incremental")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Search size={16} />{/if} Audit due books
+                    </button>
+                  </form>
+                  <form
+                    method="POST"
+                    action="?/auditCatalog"
+                    use:enhance={setPending("catalog-audit-full")}
+                  >
+                    <ProfileField profileId={data.user?.profile_id} />
+                    <input type="hidden" name="mode" value="full" />
+                    <button
+                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      type="submit"
+                      disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
+                      aria-busy={isPending("catalog-audit-full")}
+                    >
+                      {#if isPending("catalog-audit-full") || (catalogAudit.active && catalogAudit.mode === "full")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<RefreshCw size={16} />{/if} Re-check full catalog
+                    </button>
+                  </form>
+                </div>
+              </section>
+              <section
                 in:fly={{
                   y: 12,
                   duration: motionDuration(300),
@@ -5022,17 +5328,17 @@
                   <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
                   <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
                 </div>
-                {#if data.history.length}<div
+                {#if recentReads.length}<div
                     class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"
                   >
-                    {#each data.history as item (item.id)}<div
+                    {#each recentReads as item (item.id)}<div
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
                           delay: motionDelay(item.id % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
-                        class="flex min-h-16 items-center gap-3 preset-tonal-surface p-3"
+                        class="flex min-h-16 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
                         <div class="min-w-0 flex-1">
@@ -5048,6 +5354,16 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
+                        <div class="min-w-0 basis-full">
+                          <StarRating
+                            value={item.rating}
+                            label={`Rating for ${item.title}`}
+                            busy={pendingRatingIds.has(item.id)}
+                            groupKey={`recent-${item.id}`}
+                            onchange={(nextRating, trigger, clearedViaButton) =>
+                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                          />
+                        </div>
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}

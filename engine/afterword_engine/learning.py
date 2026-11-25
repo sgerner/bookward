@@ -12,7 +12,9 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import uuid
+from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +30,7 @@ from .decision_evidence import (
     purge_recommendation_evidence,
     build_decision_evidence,
 )
-from .identity import book_identity
+from .identity import _isbn_match_keys, book_identity, book_row_identity_match_keys
 
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ EVENT_TYPES = {
     "read",
 }
 HISTORICAL_READ_SOURCES = frozenset({"manual_history", "goodreads_csv", "storygraph_csv"})
+INACTIVE_CANDIDATE_STATUSES = frozenset({"rejected", "maybe_later", "hidden"})
 READ_OUTCOME_LABEL_KINDS = (
     "completed_unrated",
     "rating_positive",
@@ -200,6 +203,16 @@ def _run_impression(con, run_id: str, candidate_id: int):
     ).fetchone()
 
 
+def _values_equal(left: Any, right: float | None) -> bool:
+    return (
+        left is None
+        and right is None
+        or left is not None
+        and right is not None
+        and float(left) == float(right)
+    )
+
+
 def validate_candidate_run_id(con, candidate_id: int | None, run_id: str | None) -> str | None:
     if run_id is None:
         return None
@@ -220,21 +233,18 @@ def _existing_event_matches(
     value: float | None,
     metadata: str,
 ) -> bool:
-    # Goodreads can replace a previously unrated row with a later rating. The
-    # stable read event key is allowed to update its numeric value; every
-    # browser event remains immutable and idempotent.
-    value_matches = event_type == "read" or (
-        existing["value"] is None
-        and value is None
-        or existing["value"] is not None
-        and value is not None
-        and float(existing["value"]) == float(value)
-    )
+    if (
+        int(existing["candidate_id"]) != int(candidate_id)
+        or existing["event_type"] != event_type
+    ):
+        return False
+    # Goodreads and manual reads reconcile run attribution, ratings, and
+    # date-precision metadata across syncs; browser events remain immutable.
+    if event_type == "read":
+        return True
     return (
         existing["run_id"] == run_id
-        and int(existing["candidate_id"]) == int(candidate_id)
-        and existing["event_type"] == event_type
-        and value_matches
+        and _values_equal(existing["value"], value)
         and existing["metadata"] == metadata
     )
 
@@ -307,6 +317,7 @@ def record_event_in_connection(
     label_kind: str | None = None,
     confidence: float | None = None,
     read_id: int | None = None,
+    clear_read_outcome: bool = False,
 ):
     """Insert one validated event inside a caller-owned transaction."""
 
@@ -325,11 +336,12 @@ def record_event_in_connection(
     encoded_metadata = _json_metadata(metadata)
     timestamp = occurred_at or utc_now()
     existing = con.execute(
-        "SELECT id,event_key,run_id,candidate_id,event_type,value,metadata "
+        "SELECT id,event_key,run_id,candidate_id,event_type,value,occurred_at,metadata "
         "FROM recommendation_events WHERE event_key=?",
         (event_key,),
     ).fetchone()
-    read_value_changed = False
+    read_changed = False
+    effective_run_id = run_id
     active_import = None
     if not existing and event_type == "librarr_import":
         latest_lifecycle = con.execute(
@@ -353,12 +365,24 @@ def record_event_in_connection(
             raise ValueError("Event key was already used for a different event")
         event_id = int(existing["id"])
         duplicate = True
-        if event_type == "read" and existing["value"] != value:
+        if (
+            event_type == "read"
+            and run_id is None
+            and label is None
+            and not clear_read_outcome
+        ):
+            effective_run_id = existing["run_id"]
+        if event_type == "read" and (
+            existing["run_id"] != effective_run_id
+            or not _values_equal(existing["value"], value)
+            or existing["metadata"] != encoded_metadata
+            or (occurred_at is not None and existing["occurred_at"] != timestamp)
+        ):
             con.execute(
-                "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
-                (value, timestamp, event_id),
+                "UPDATE recommendation_events SET run_id=?,value=?,occurred_at=?,metadata=? WHERE id=?",
+                (effective_run_id, value, timestamp, encoded_metadata, event_id),
             )
-            read_value_changed = True
+            read_changed = True
     elif active_import is not None:
         event_id = int(active_import["id"])
         event_key = str(active_import["event_key"])
@@ -367,8 +391,9 @@ def record_event_in_connection(
                 "UPDATE recommendation_events SET run_id=? WHERE id=?",
                 (run_id, event_id),
             )
+            effective_run_id = run_id
         else:
-            run_id = active_import["run_id"] or run_id
+            effective_run_id = active_import["run_id"] or run_id
         duplicate = True
     else:
         cursor = con.execute(
@@ -387,24 +412,16 @@ def record_event_in_connection(
         )
         event_id = int(cursor.lastrowid)
         duplicate = False
-    archived_revision = None
-    if not duplicate or read_value_changed:
-        archived_revision = archive_recommendation_event(
-            con,
-            event_key=event_key,
-            run_id=run_id,
-            candidate_id=candidate_id,
-            event_type=event_type,
-            value=value,
-            source=source,
-            occurred_at=timestamp,
-        )
     if event_type == "visible" and run_id is not None:
         con.execute(
             "UPDATE recommendation_impressions SET visible_at=COALESCE(visible_at,?) "
             "WHERE run_id=? AND candidate_id=?",
             (timestamp, run_id, candidate_id),
         )
+    impression = None
+    outcome_at = None
+    read_kind_marks = ",".join("?" for _ in READ_OUTCOME_LABEL_KINDS)
+    deleted_superseded = 0
     if label is not None:
         label = _validate_value(label)
         confidence = 0.5 if confidence is None else float(confidence)
@@ -421,7 +438,20 @@ def record_event_in_connection(
             impression = None
             outcome_status = "unchanged"
         else:
-            impression = _find_latest_impression(con, candidate_id, run_id)
+            impression = _find_latest_impression(con, candidate_id, effective_run_id)
+            if event_type == "read":
+                if impression is None:
+                    deleted_superseded = con.execute(
+                        f"DELETE FROM recommendation_outcomes "
+                        f"WHERE event_id=? AND label_kind IN ({read_kind_marks})",
+                        (event_id, *READ_OUTCOME_LABEL_KINDS),
+                    ).rowcount
+                else:
+                    deleted_superseded = con.execute(
+                        f"DELETE FROM recommendation_outcomes "
+                        f"WHERE event_id=? AND impression_id!=? AND label_kind IN ({read_kind_marks})",
+                        (event_id, int(impression["id"]), *READ_OUTCOME_LABEL_KINDS),
+                    ).rowcount
             outcome_at = utc_now()
             outcome_status = _record_outcome(
                 con,
@@ -433,30 +463,68 @@ def record_event_in_connection(
                 confidence=confidence,
                 attributed_at=outcome_at,
             )
-            if archived_revision is None and active_import is not None and outcome_status in {"created", "updated"}:
-                rev_row = con.execute(
-                    "SELECT MAX(id) id FROM recommendation_evidence_events WHERE event_key=?",
-                    (event_key,),
-                ).fetchone()
-                archived_revision = int(rev_row["id"]) if rev_row and rev_row["id"] is not None else None
-        if (
-            archived_revision is not None
-            and impression is not None
-            and outcome_status in {"created", "updated"}
-        ):
-            archive_recommendation_outcome(
+            if outcome_status == "created" and deleted_superseded > 0:
+                outcome_status = "updated"
+    else:
+        if event_type == "read" and duplicate and clear_read_outcome:
+            deleted_superseded = con.execute(
+                f"DELETE FROM recommendation_outcomes "
+                f"WHERE event_id=? AND label_kind IN ({read_kind_marks})",
+                (event_id, *READ_OUTCOME_LABEL_KINDS),
+            ).rowcount
+        outcome_status = "none"
+    archived_revision: int | None = None
+    if (
+        not duplicate
+        or read_changed
+        or (event_type == "read" and (outcome_status == "updated" or deleted_superseded > 0))
+    ):
+        archived_revision = archive_recommendation_event(
+            con,
+            event_key=event_key,
+            run_id=effective_run_id,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            value=value,
+            source=source,
+            occurred_at=timestamp,
+        )
+    elif active_import is not None and outcome_status in {"created", "updated"}:
+        rev_row = con.execute(
+            "SELECT MAX(revision) revision FROM recommendation_evidence_events WHERE event_key=?",
+            (event_key,),
+        ).fetchone()
+        archived_revision = (
+            int(rev_row["revision"])
+            if rev_row and rev_row["revision"] is not None
+            else archive_recommendation_event(
                 con,
                 event_key=event_key,
-                event_revision=archived_revision,
+                run_id=effective_run_id,
                 candidate_id=candidate_id,
-                impression=impression,
-                label=float(label),
-                label_kind=label_kind or event_type,
-                confidence=confidence,
-                attributed_at=outcome_at,
+                event_type=event_type,
+                value=value,
+                source=source,
+                occurred_at=timestamp,
             )
-    else:
-        outcome_status = "none"
+        )
+    if (
+        archived_revision is not None
+        and impression is not None
+        and label is not None
+        and (read_changed or outcome_status in {"created", "updated"})
+    ):
+        archive_recommendation_outcome(
+            con,
+            event_key=event_key,
+            event_revision=archived_revision,
+            candidate_id=candidate_id,
+            impression=impression,
+            label=float(label),
+            label_kind=label_kind or event_type,
+            confidence=float(confidence),
+            attributed_at=outcome_at or utc_now(),
+        )
     return {"id": event_id, "duplicate": duplicate, "outcome": outcome_status}
 
 
@@ -522,90 +590,450 @@ def _read_label(read: dict[str, Any]):
     return 0.5, "rating_neutral", 0.25
 
 
-def attribute_read_outcomes() -> dict[str, int]:
-    """Join imported reads to the latest preceding recommendation exposure.
+def _latest_preceding_impression(
+    con,
+    candidate_id: int,
+    read_time: datetime | None,
+    day_precision: bool,
+):
+    if read_time is None:
+        return None
+    impression_rows = con.execute(
+        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
+        "FROM recommendation_impressions WHERE candidate_id=? "
+        "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+        (candidate_id,),
+    ).fetchall()
+    return next(
+        (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
+        None,
+    )
 
-    No exposure means no outcome. This function is safe to call repeatedly;
-    event and outcome keys are stable across Goodreads re-imports. Historical
-    imports need an explicit completion date; their creation time is import
-    time, not evidence of when the book was read.
-    """
+
+def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
+    from .ingestion import read_identity_rows_with_current_verified_work_ids
 
     scanned = created = updated = attributed = 0
-    with transaction() as con:
-        reads = [dict(item) for item in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
-        candidates = [dict(item) for item in con.execute("SELECT id,title,author FROM candidates").fetchall()]
-        by_identity = {book_identity(item["title"], item["author"]): item for item in candidates}
-        for read in reads:
-            scanned += 1
-            candidate = by_identity.get(book_identity(read["title"], read["author"]))
-            if not candidate:
-                continue
-            read_time, day_precision = _read_time(read.get("read_at"))
-            source = str(read.get("source") or "").strip().casefold()
-            if read_time is None and source not in HISTORICAL_READ_SOURCES:
-                read_time, day_precision = _read_time(read.get("created_at"))
-            if read_time is None:
-                continue
-            impression_rows = con.execute(
-                "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-                "FROM recommendation_impressions WHERE candidate_id=? "
-                "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-                (candidate["id"],),
+    raw_reads = [dict(item) for item in con.execute("SELECT * FROM reads ORDER BY id").fetchall()]
+    try:
+        read_metadata_rows = [
+            dict(item)
+            for item in con.execute(
+                "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+                "FROM read_metadata WHERE verified_work_id!=''"
             ).fetchall()
-            impression = next(
-                (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
-                None,
+        ]
+    except sqlite3.OperationalError as exc:
+        if "no such table: read_metadata" not in str(exc).casefold():
+            raise
+        read_metadata_rows = []
+    reads = read_identity_rows_with_current_verified_work_ids(raw_reads, read_metadata_rows)
+
+    candidates = [
+        dict(item)
+        for item in con.execute(
+            "SELECT c.id,c.title,c.author,c.source_url,c.status,c.score,c.isbn13,c.isbn10,"
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
+        ).fetchall()
+    ]
+    candidates_by_key: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    for item in candidates:
+        for key in book_row_identity_match_keys(item):
+            candidates_by_key[key].append(item)
+
+    existing_read_events_by_read_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for event_row in con.execute(
+        "SELECT id,event_key,run_id,candidate_id,occurred_at,metadata "
+        "FROM recommendation_events WHERE event_type='read'"
+    ).fetchall():
+        event_dict = dict(event_row)
+        key = str(event_dict["event_key"])
+        parts = key.split(":")
+        if len(parts) == 2 and parts[0] == "read" and parts[1].isdigit():
+            existing_read_events_by_read_id[int(parts[1])].append(event_dict)
+        elif len(parts) == 3 and parts[0] == "read" and parts[1].isdigit():
+            existing_read_events_by_read_id[int(parts[1])].append(event_dict)
+        elif len(parts) == 3 and parts[0] == "manual-read" and parts[2].isdigit():
+            existing_read_events_by_read_id[int(parts[2])].append(event_dict)
+
+    for read in reads:
+        scanned += 1
+        read_id = int(read["id"])
+        matched_by_id: dict[int, dict[str, Any]] = {}
+        for key in book_row_identity_match_keys(read):
+            for item in candidates_by_key.get(key, ()):
+                matched_by_id[int(item["id"])] = item
+
+        read_time, day_precision = _read_time(read.get("read_at"))
+        source = str(read.get("source") or "").strip().casefold()
+        if read_time is None and source not in HISTORICAL_READ_SOURCES:
+            read_time, day_precision = _read_time(read.get("created_at"))
+
+        existing_events = existing_read_events_by_read_id.get(read_id, [])
+        metadata = {
+            "read_source": str(read.get("source") or "unknown")[:32],
+            "time_precision": "day" if day_precision else "timestamp",
+        }
+        read_value = float(read["rating"]) if read.get("rating") is not None else None
+        occurred_at = read.get("read_at") or read.get("created_at") or utc_now()
+
+        # Candidate foreign keys cascade on delete, so any surviving read event
+        # points to a live catalog candidate that this read no longer matches.
+        if not matched_by_id:
+            for existing_event in existing_events:
+                record_event_in_connection(
+                    con,
+                    event_key=str(existing_event["event_key"]),
+                    candidate_id=int(existing_event["candidate_id"]),
+                    event_type="read",
+                    run_id=None,
+                    value=read_value,
+                    source="read_import",
+                    metadata=metadata,
+                    occurred_at=occurred_at,
+                    clear_read_outcome=True,
+                )
+            continue
+
+        if any(
+            str(ev.get("event_key") or "").startswith("manual-read:")
+            and _event_marked_historical(ev.get("metadata"))
+            for ev in existing_events
+        ):
+            continue
+
+        # Preserve earlier attributed labels when a later import omits dates for
+        # a still-matching book; only an explicit read_time that precedes
+        # exposures (or a lost identity match above) clears attribution.
+        if read_time is None:
+            continue
+
+        exact_identity = book_identity(read["title"], read["author"])
+        read_isbn_keys = _isbn_match_keys(read)
+        impressions_by_candidate: dict[int, Any] = {
+            cand_id: _latest_preceding_impression(con, cand_id, read_time, day_precision)
+            for cand_id in matched_by_id
+        }
+
+        def _candidate_rank_key(item: dict[str, Any]):
+            cand_id = int(item["id"])
+            imp = impressions_by_candidate[cand_id]
+            imp_time = str(imp["visible_at"] or imp["presented_at"] or "") if imp is not None else ""
+            imp_id = int(imp["id"]) if imp is not None else 0
+            return (
+                1 if book_identity(item["title"], item["author"]) == exact_identity else 0,
+                1 if bool(read_isbn_keys and (_isbn_match_keys(item) & read_isbn_keys)) else 0,
+                1 if imp is not None else 0,
+                1 if str(item.get("status") or "") not in INACTIVE_CANDIDATE_STATUSES else 0,
+                float(item.get("score") or 0.0),
+                imp_time,
+                imp_id,
+                -cand_id,
             )
-            if impression is None:
-                continue
-            label, label_kind, confidence = _read_label(read)
-            event_key = f"read:{int(read['id']):08d}"
-            manual_event_key = (
-                f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
-            )
-            manual_event = con.execute(
-                "SELECT metadata FROM recommendation_events WHERE event_key=?",
-                (manual_event_key,),
-            ).fetchone()
-            if manual_event:
-                try:
-                    manual_meta = json.loads(manual_event["metadata"] or "{}")
-                except (TypeError, ValueError):
-                    manual_meta = {}
-                if manual_meta.get("historical") is True:
-                    continue
-                event_key = manual_event_key
-            metadata = {
-                "read_source": str(read.get("source") or "unknown")[:32],
-                "time_precision": "day" if day_precision else "timestamp",
-            }
-            result = record_event_in_connection(
-                con,
-                event_key=event_key,
-                candidate_id=int(candidate["id"]),
-                event_type="read",
-                run_id=str(impression["run_id"]),
-                value=float(read["rating"]) if read.get("rating") is not None else None,
-                source="read_import",
-                metadata=metadata,
-                occurred_at=read.get("read_at") or read.get("created_at") or utc_now(),
-                label=label,
-                label_kind=label_kind,
-                confidence=confidence,
-                read_id=int(read["id"]),
-            )
-            if result["outcome"] == "created":
-                created += 1
-            elif result["outcome"] == "updated":
-                updated += 1
-            if result["outcome"] in {"created", "updated"}:
-                attributed += 1
+        candidate = max(matched_by_id.values(), key=_candidate_rank_key)
+        candidate_id = int(candidate["id"])
+        impression = impressions_by_candidate[candidate_id]
+        if impression is None:
+            for existing_event in existing_events:
+                record_event_in_connection(
+                    con,
+                    event_key=str(existing_event["event_key"]),
+                    candidate_id=int(existing_event["candidate_id"]),
+                    event_type="read",
+                    run_id=None,
+                    value=read_value,
+                    source="read_import",
+                    metadata=metadata,
+                    occurred_at=occurred_at,
+                    clear_read_outcome=True,
+                )
+            continue
+
+        label, label_kind, confidence = _read_label(read)
+        manual_event_key = f"manual-read:{candidate_id}:{read_id:08d}"
+        default_event_key = f"read:{read_id:08d}"
+        existing_by_key = {str(item["event_key"]): item for item in existing_events}
+        if manual_event_key in existing_by_key:
+            event_key = manual_event_key
+        elif (
+            default_event_key not in existing_by_key
+            or int(existing_by_key[default_event_key]["candidate_id"]) == candidate_id
+        ):
+            event_key = default_event_key
+        else:
+            event_key = f"read:{read_id:08d}:{candidate_id}"
+
+        for existing_event in existing_events:
+            if str(existing_event["event_key"]) != event_key:
+                record_event_in_connection(
+                    con,
+                    event_key=str(existing_event["event_key"]),
+                    candidate_id=int(existing_event["candidate_id"]),
+                    event_type="read",
+                    run_id=None,
+                    value=read_value,
+                    source="read_import",
+                    metadata=metadata,
+                    occurred_at=occurred_at,
+                    clear_read_outcome=True,
+                )
+
+        result = record_event_in_connection(
+            con,
+            event_key=event_key,
+            candidate_id=candidate_id,
+            event_type="read",
+            run_id=str(impression["run_id"]),
+            value=read_value,
+            source="read_import",
+            metadata=metadata,
+            occurred_at=occurred_at,
+            label=label,
+            label_kind=label_kind,
+            confidence=confidence,
+            read_id=read_id,
+        )
+        if result["outcome"] == "created":
+            created += 1
+        elif result["outcome"] == "updated":
+            updated += 1
+        if result["outcome"] in {"created", "updated"}:
+            attributed += 1
     return {
         "reads_scanned": scanned,
         "outcomes_created": created,
         "outcomes_updated": updated,
         "reads_attributed": attributed,
+    }
+
+
+def _event_marked_historical(raw_metadata: Any) -> bool:
+    try:
+        parsed = json.loads(raw_metadata or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("historical") is True
+
+
+def attribute_read_outcomes(connection=None) -> dict[str, int]:
+    """Join imported reads to the latest preceding recommendation exposure.
+
+    No exposure means no outcome. This function is safe to call repeatedly;
+    event and outcome keys are stable across Goodreads re-imports. Historical
+    imports need an explicit completion date; their creation time is import
+    time, not evidence of when the book was read. If a later import omits a
+    completion date for a still-matching book, previously attributed outcomes
+    are preserved; if a read stops matching any catalog candidate or its
+    explicit completion date moves before all exposures, prior read outcomes
+    are cleared.
+    """
+
+    if connection is not None:
+        return _attribute_read_outcomes_in_connection(connection)
+    with transaction() as con:
+        return _attribute_read_outcomes_in_connection(con)
+
+
+def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
+    """Synchronize read telemetry and attributed outcomes after an inline rating edit."""
+
+    read_id = int(read["id"])
+    rating_raw = read.get("rating")
+    rating_value = _validate_value(float(rating_raw) if rating_raw is not None else None)
+    label, label_kind, confidence = _read_label(read)
+
+    existing_events = [
+        dict(item)
+        for item in con.execute(
+            "SELECT * FROM recommendation_events "
+            "WHERE event_type='read' AND ("
+            "event_key=? OR event_key GLOB ? OR event_key GLOB ? OR "
+            "id IN (SELECT event_id FROM recommendation_outcomes WHERE read_id=?)"
+            ") ORDER BY id",
+            (
+                f"read:{read_id:08d}",
+                f"read:{read_id:08d}:*",
+                f"manual-read:*:{read_id:08d}",
+                read_id,
+            ),
+        ).fetchall()
+    ]
+
+    events_updated = outcomes_created = outcomes_updated = 0
+    if existing_events:
+        for ev in existing_events:
+            event_id = int(ev["id"])
+            event_key = str(ev["event_key"])
+            candidate_id = int(ev["candidate_id"])
+            if not _candidate_exists(con, candidate_id):
+                continue
+            run_id = str(ev["run_id"]) if ev.get("run_id") is not None else None
+            impression = (
+                _run_impression(con, run_id, candidate_id)
+                if run_id is not None
+                else None
+            )
+            if impression is None:
+                impression = con.execute(
+                    "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at "
+                    "FROM recommendation_outcomes o "
+                    "JOIN recommendation_impressions i ON i.id=o.impression_id "
+                    "WHERE o.event_id=? AND o.read_id=? "
+                    "ORDER BY o.id DESC LIMIT 1",
+                    (event_id, read_id),
+                ).fetchone()
+            existing_value = ev.get("value")
+            value_changed = (existing_value is None) != (rating_value is None) or (
+                existing_value is not None
+                and rating_value is not None
+                and float(existing_value) != float(rating_value)
+            )
+            timestamp = str(ev["occurred_at"]) if ev.get("occurred_at") else utc_now()
+            archived_revision = None
+            if value_changed:
+                con.execute(
+                    "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
+                    (rating_value, timestamp, event_id),
+                )
+                archive_run_id = (
+                    str(impression["run_id"])
+                    if impression is not None and impression["run_id"] is not None
+                    else run_id
+                )
+                if archive_run_id:
+                    archived_revision = archive_recommendation_event(
+                        con,
+                        event_key=event_key,
+                        run_id=archive_run_id,
+                        candidate_id=candidate_id,
+                        event_type="read",
+                        value=rating_value,
+                        source=str(ev.get("source") or "read_import"),
+                        occurred_at=timestamp,
+                    )
+            events_updated += 1
+            if impression is not None:
+                outcome_at = utc_now()
+                outcome_status = _record_outcome(
+                    con,
+                    impression_id=int(impression["id"]),
+                    event_id=event_id,
+                    read_id=read_id,
+                    label=float(label),
+                    label_kind=label_kind,
+                    confidence=float(confidence),
+                    attributed_at=outcome_at,
+                )
+                if outcome_status == "created":
+                    outcomes_created += 1
+                elif outcome_status == "updated":
+                    outcomes_updated += 1
+                if outcome_status in {"created", "updated"}:
+                    if archived_revision is None:
+                        archived_revision = archive_recommendation_event(
+                            con,
+                            event_key=event_key,
+                            run_id=str(impression["run_id"]),
+                            candidate_id=candidate_id,
+                            event_type="read",
+                            value=rating_value,
+                            source=str(ev.get("source") or "read_import"),
+                            occurred_at=timestamp,
+                        )
+                    if archived_revision is not None:
+                        archive_recommendation_outcome(
+                            con,
+                            event_key=event_key,
+                            event_revision=archived_revision,
+                            candidate_id=candidate_id,
+                            impression=impression,
+                            label=float(label),
+                            label_kind=label_kind,
+                            confidence=float(confidence),
+                            attributed_at=outcome_at,
+                        )
+        return {
+            "events_updated": events_updated,
+            "outcomes_created": outcomes_created,
+            "outcomes_updated": outcomes_updated,
+        }
+
+    target_identity = book_identity(read["title"], read["author"])
+    candidates = [
+        dict(item) for item in con.execute("SELECT id,title,author FROM candidates").fetchall()
+    ]
+    candidate = next(
+        (
+            item
+            for item in candidates
+            if book_identity(item["title"], item["author"]) == target_identity
+        ),
+        None,
+    )
+    if not candidate:
+        return {
+            "events_updated": 0,
+            "outcomes_created": 0,
+            "outcomes_updated": 0,
+        }
+
+    read_time, day_precision = _read_time(read.get("read_at"))
+    source = str(read.get("source") or "").strip().casefold()
+    if read_time is None and source not in HISTORICAL_READ_SOURCES:
+        read_time, day_precision = _read_time(read.get("created_at"))
+    if read_time is None:
+        return {
+            "events_updated": 0,
+            "outcomes_created": 0,
+            "outcomes_updated": 0,
+        }
+
+    impression_rows = con.execute(
+        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
+        "FROM recommendation_impressions WHERE candidate_id=? "
+        "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+        (candidate["id"],),
+    )
+    impression = next(
+        (item for item in impression_rows.fetchall() if _impression_precedes(item, read_time, day_precision)),
+        None,
+    )
+    if impression is None:
+        return {
+            "events_updated": 0,
+            "outcomes_created": 0,
+            "outcomes_updated": 0,
+        }
+
+    metadata = {
+        "read_source": str(read.get("source") or "unknown")[:32],
+        "time_precision": "day" if day_precision else "timestamp",
+    }
+    result = record_event_in_connection(
+        con,
+        event_key=f"read:{read_id:08d}",
+        candidate_id=int(candidate["id"]),
+        event_type="read",
+        run_id=str(impression["run_id"]),
+        value=rating_value,
+        source="read_import",
+        metadata=metadata,
+        occurred_at=read.get("read_at") or read.get("created_at") or utc_now(),
+        label=label,
+        label_kind=label_kind,
+        confidence=confidence,
+        read_id=read_id,
+    )
+    if result["outcome"] == "created":
+        outcomes_created += 1
+    elif result["outcome"] == "updated":
+        outcomes_updated += 1
+    return {
+        "events_updated": 1,
+        "outcomes_created": outcomes_created,
+        "outcomes_updated": outcomes_updated,
     }
 
 
@@ -618,12 +1046,27 @@ def reconcile_read_outcomes_in_connection(
 ) -> dict[str, Any]:
     """Reconcile linked recommendation_events and recommendation_outcomes for one read.
 
-    Only live ``recommendation_outcomes`` rows for this read's completion/rating
-    labels are updated or removed; unrelated candidates in the same served run
-    and append-only ``recommendation_evidence_*`` rows are never deleted.
+    Rating-only updates delegate to ``sync_read_rating_in_connection`` so stored
+    run linkage is preserved even if live impressions were rotated. Completion-date
+    and historical-triage updates re-evaluate preceding exposures and retract
+    superseded archived outcomes without deleting append-only evidence rows.
     """
 
     read_row = dict(read)
+    if not read_at_updated and not force_historical:
+        synced = sync_read_rating_in_connection(con, read_row)
+        if synced["outcomes_updated"]:
+            outcome_state = "updated"
+        elif synced["outcomes_created"]:
+            outcome_state = "created"
+        else:
+            outcome_state = "none"
+        return {
+            "outcome": outcome_state,
+            "outcomes_deleted": 0,
+            **synced,
+        }
+
     read_id = int(read_row["id"])
     label_placeholders = ",".join("?" for _ in READ_OUTCOME_LABEL_KINDS)
     existing_events = [
@@ -631,9 +1074,16 @@ def reconcile_read_outcomes_in_connection(
         for item in con.execute(
             "SELECT id,event_key,candidate_id,run_id,value,source,metadata,occurred_at "
             "FROM recommendation_events "
-            "WHERE event_key=? OR event_key GLOB ? "
-            "ORDER BY id ASC",
-            (f"read:{read_id:08d}", f"manual-read:[0-9]*:{read_id:08d}"),
+            "WHERE event_type='read' AND ("
+            "event_key=? OR event_key GLOB ? OR event_key GLOB ? OR "
+            "id IN (SELECT event_id FROM recommendation_outcomes WHERE read_id=?)"
+            ") ORDER BY id ASC",
+            (
+                f"read:{read_id:08d}",
+                f"read:{read_id:08d}:*",
+                f"manual-read:[0-9]*:{read_id:08d}",
+                read_id,
+            ),
         ).fetchall()
     ]
     chosen: dict[str, Any] | None = None
@@ -658,9 +1108,19 @@ def reconcile_read_outcomes_in_connection(
             chosen = None
     if candidate_id is None:
         target_identity = book_identity(read_row.get("title", ""), read_row.get("author", ""))
-        for item in con.execute("SELECT id,title,author FROM candidates ORDER BY id ASC").fetchall():
-            if book_identity(item["title"], item["author"]) == target_identity:
-                candidate_id = int(item["id"])
+        read_keys = set(book_row_identity_match_keys(read_row))
+        for item in con.execute(
+            "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "ORDER BY c.id ASC"
+        ).fetchall():
+            row_dict = dict(item)
+            if book_identity(row_dict["title"], row_dict["author"]) == target_identity or (
+                read_keys and (set(book_row_identity_match_keys(row_dict)) & read_keys)
+            ):
+                candidate_id = int(row_dict["id"])
                 event_key = f"read:{read_id:08d}"
                 event_source = "read_import"
                 break
@@ -688,16 +1148,7 @@ def reconcile_read_outcomes_in_connection(
 
     impression = None
     if read_time is not None and not skip_attribution:
-        impression_rows = con.execute(
-            "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-            "FROM recommendation_impressions WHERE candidate_id=? "
-            "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-            (candidate_id,),
-        ).fetchall()
-        impression = next(
-            (item for item in impression_rows if _impression_precedes(item, read_time, day_precision)),
-            None,
-        )
+        impression = _latest_preceding_impression(con, candidate_id, read_time, day_precision)
 
     rating_value = (
         _validate_value(float(read_row["rating"]))
@@ -717,13 +1168,7 @@ def reconcile_read_outcomes_in_connection(
         metadata["historical"] = True
     encoded_metadata = _json_metadata(metadata)
 
-    if impression is not None:
-        target_run_id: str | None = str(impression["run_id"])
-    elif chosen is not None and not read_at_updated and read_time is not None and not skip_attribution:
-        target_run_id = str(chosen["run_id"]) if chosen.get("run_id") else None
-    else:
-        target_run_id = None
-
+    target_run_id: str | None = str(impression["run_id"]) if impression is not None else None
     occurred_at = (
         str(read_row["read_at"])
         if read_row.get("read_at")
@@ -738,14 +1183,7 @@ def reconcile_read_outcomes_in_connection(
     archived_revision: int | None = None
     if chosen is not None:
         event_id = int(chosen["id"])
-        value_changed = (
-            (chosen["value"] is None) != (rating_value is None)
-            or (
-                chosen["value"] is not None
-                and rating_value is not None
-                and float(chosen["value"]) != float(rating_value)
-            )
-        )
+        value_changed = not _values_equal(chosen["value"], rating_value)
         run_changed = chosen["run_id"] != target_run_id
         metadata_changed = chosen["metadata"] != encoded_metadata
         occurred_changed = chosen["occurred_at"] != occurred_at
@@ -755,7 +1193,7 @@ def reconcile_read_outcomes_in_connection(
                 "SET run_id=?,value=?,metadata=?,occurred_at=? WHERE id=?",
                 (target_run_id, rating_value, encoded_metadata, occurred_at, event_id),
             )
-        if value_changed or run_changed or occurred_changed:
+        if value_changed or run_changed or occurred_changed or impression is None:
             archived_revision = archive_recommendation_event(
                 con,
                 event_key=event_key,
@@ -791,6 +1229,26 @@ def reconcile_read_outcomes_in_connection(
             event_type="read",
             value=rating_value,
             source=event_source,
+            occurred_at=occurred_at,
+        )
+
+    for other_event in existing_events:
+        other_id = int(other_event["id"])
+        if event_id is not None and other_id == event_id:
+            continue
+        if other_event.get("run_id") is not None:
+            con.execute(
+                "UPDATE recommendation_events SET run_id=NULL,value=?,occurred_at=? WHERE id=?",
+                (rating_value, occurred_at, other_id),
+            )
+        archive_recommendation_event(
+            con,
+            event_key=str(other_event["event_key"]),
+            run_id=None,
+            candidate_id=int(other_event["candidate_id"]),
+            event_type="read",
+            value=rating_value,
+            source=str(other_event.get("source") or "read_import"),
             occurred_at=occurred_at,
         )
 
@@ -830,14 +1288,6 @@ def reconcile_read_outcomes_in_connection(
         attributed_at=outcome_at,
     )
     if result_outcome in {"created", "updated"}:
-        if archived_revision is None:
-            rev_row = con.execute(
-                "SELECT MAX(id) id FROM recommendation_evidence_events WHERE event_key=?",
-                (event_key,),
-            ).fetchone()
-            archived_revision = (
-                int(rev_row["id"]) if rev_row and rev_row["id"] is not None else None
-            )
         if archived_revision is None:
             archived_revision = archive_recommendation_event(
                 con,
