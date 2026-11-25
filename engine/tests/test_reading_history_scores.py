@@ -124,7 +124,7 @@ def test_100_read_profile_scores_in_single_pass_with_single_rated_read_scan_and_
         for item in items
     ]
     candidate_vectors = asyncio.run(
-        cached_vectors(embedder, "read_candidate", virtual_candidates)
+        cached_vectors(embedder, "read_candidate", virtual_candidates, persist=False)
     )
     expected = {
         -int(entry["id"]): entry["score"]
@@ -146,7 +146,15 @@ def test_rated_read_vector_cache_reuses_vectors_across_batches_and_scopes_invali
     read_vector_computations = 0
     real_cached_vectors = main.cached_vectors
 
-    async def counting_cached_vectors(embedder, entity_type, items, expected_dimensions=None):
+    async def counting_cached_vectors(
+        embedder,
+        entity_type,
+        items,
+        *,
+        force=False,
+        persist=True,
+        expected_dimensions=None,
+    ):
         nonlocal read_vector_computations
         if entity_type == "read":
             read_vector_computations += 1
@@ -154,6 +162,8 @@ def test_rated_read_vector_cache_reuses_vectors_across_batches_and_scopes_invali
             embedder,
             entity_type,
             items,
+            force=force,
+            persist=persist,
             expected_dimensions=expected_dimensions,
         )
 
@@ -220,7 +230,15 @@ def test_rated_read_vector_cache_evicts_least_recently_used_entry_past_8_entries
     read_vector_computations = 0
     real_cached_vectors = main.cached_vectors
 
-    async def counting_cached_vectors(embedder, entity_type, items, expected_dimensions=None):
+    async def counting_cached_vectors(
+        embedder,
+        entity_type,
+        items,
+        *,
+        force=False,
+        persist=True,
+        expected_dimensions=None,
+    ):
         nonlocal read_vector_computations
         if entity_type == "read":
             read_vector_computations += 1
@@ -228,6 +246,8 @@ def test_rated_read_vector_cache_evicts_least_recently_used_entry_past_8_entries
             embedder,
             entity_type,
             items,
+            force=force,
+            persist=persist,
             expected_dimensions=expected_dimensions,
         )
 
@@ -278,7 +298,13 @@ def test_reading_history_scores_second_request_at_offset_200_logs_once_and_retri
     real_cached_vectors = main.cached_vectors
 
     async def fault_injecting_cached_vectors(
-        embedder, entity_type, items, expected_dimensions=None
+        embedder,
+        entity_type,
+        items,
+        *,
+        force=False,
+        persist=True,
+        expected_dimensions=None,
     ):
         nonlocal read_vector_computations, fail_next_request
         if entity_type == "read":
@@ -290,6 +316,8 @@ def test_reading_history_scores_second_request_at_offset_200_logs_once_and_retri
             embedder,
             entity_type,
             items,
+            force=force,
+            persist=persist,
             expected_dimensions=expected_dimensions,
         )
 
