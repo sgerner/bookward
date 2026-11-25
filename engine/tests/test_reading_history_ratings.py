@@ -209,8 +209,8 @@ def test_rating_edits_drive_scoring_associations_llm_prompts_and_preserve_read_e
         [{"id": matching_candidate_id, "title": "Tidewater Cartography", "author": "Clara Vance", "score": 50}],
     )
     unrated_payload = json.loads(prompt_unrated[1]["content"])
-    assert unrated_payload["goodreads_reads_liked"] == []
-    assert unrated_payload["goodreads_reads_disliked"] == []
+    assert unrated_payload["rated_reads_liked"] == []
+    assert unrated_payload["rated_reads_disliked"] == []
 
     asyncio.run(score_all())
     unrated_match_score = row("SELECT score FROM candidates WHERE id=?", (matching_candidate_id,))["score"]
@@ -234,8 +234,8 @@ def test_rating_edits_drive_scoring_associations_llm_prompts_and_preserve_read_e
         [{"id": matching_candidate_id, "title": "Tidewater Cartography", "author": "Clara Vance", "score": high_match["score"]}],
     )
     high_payload = json.loads(prompt_high[1]["content"])
-    assert [b["title"] for b in high_payload["goodreads_reads_liked"]] == ["Oceanic Memory Archive"]
-    assert high_payload["goodreads_reads_disliked"] == []
+    assert [b["title"] for b in high_payload["rated_reads_liked"]] == ["Oceanic Memory Archive"]
+    assert high_payload["rated_reads_disliked"] == []
 
     # Change rating to 1 star -> leaves association seeds, joins disliked signals
     rate_low = client.put(f"/api/reading-history/{read_id}", json={"rating": 1})
@@ -251,8 +251,8 @@ def test_rating_edits_drive_scoring_associations_llm_prompts_and_preserve_read_e
         [{"id": matching_candidate_id, "title": "Tidewater Cartography", "author": "Clara Vance", "score": low_match_score}],
     )
     low_payload = json.loads(prompt_low[1]["content"])
-    assert low_payload["goodreads_reads_liked"] == []
-    assert [b["title"] for b in low_payload["goodreads_reads_disliked"]] == ["Oceanic Memory Archive"]
+    assert low_payload["rated_reads_liked"] == []
+    assert [b["title"] for b in low_payload["rated_reads_disliked"]] == ["Oceanic Memory Archive"]
 
     # Clear rating back to Unrated -> stays Read and excluded from recommendations & association outputs
     clear_resp = client.put(f"/api/reading-history/{read_id}", json={"rating": None})

@@ -2404,6 +2404,50 @@ def test_http_cached_token_revocation_and_active_account_requirement(
     assert profiles.authenticate_api_token(legacy_token["token"]) is None
 
 
+def test_legacy_token_upgraded_between_lookups_still_authenticates(
+    identity_store, monkeypatch
+):
+    from afterword_engine.api_tokens import hash_api_token
+
+    reader = profiles.create_account("legacy-gap", "legacy-gap-password-long")
+    created = profiles.create_profile_api_token(reader["profile_id"], "Legacy gap")
+    raw_token = created["token"]
+    token_id = created["id"]
+    upgraded_hash = hash_api_token(raw_token)
+    legacy_digest = legacy_hash_api_token(raw_token)
+    with profiles.auth_connect() as con:
+        con.execute(
+            "UPDATE api_tokens SET token_hash=? WHERE id=?", (legacy_digest, token_id)
+        )
+    profiles.invalidate_auth_caches(clear_all=True)
+
+    real_auth_connect = profiles.auth_connect
+    upgraded = []
+
+    def upgrade_before_legacy_lookup(statement):
+        # Simulate another request finishing the legacy upgrade right after this
+        # request's lookup of the upgraded hash and before its legacy lookup.
+        if legacy_digest in statement and not upgraded:
+            upgraded.append(True)
+            other = sqlite3.connect(profiles.auth_path(), timeout=5)
+            other.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=?", (upgraded_hash, token_id)
+            )
+            other.commit()
+            other.close()
+
+    def traced_auth_connect(*args, **kwargs):
+        con = real_auth_connect(*args, **kwargs)
+        con.set_trace_callback(upgrade_before_legacy_lookup)
+        return con
+
+    monkeypatch.setattr(profiles, "auth_connect", traced_auth_connect)
+    result = profiles.authenticate_api_token(raw_token)
+
+    assert upgraded
+    assert result is not None and result["id"] == token_id
+
+
 def test_concurrent_legacy_api_token_upgrade_guards_old_token_hash(
     identity_store, monkeypatch
 ):
