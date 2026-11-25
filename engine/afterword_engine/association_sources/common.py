@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from ..associations import record_association_request
+from ..http_bounds import stream_json_async
 from ..identity import book_identity
 from ..security import redact_url, resolve_public_target, sanitize_pinned_error_message
 
@@ -56,12 +57,17 @@ async def fetch_pinned_association_json(
             unpinned_url = client.build_request("GET", original, params=params).url
             public_request = client.build_request("GET", redact_url(unpinned_url))
             try:
-                response = await client.request(
+                response, payload = await stream_json_async(
+                    client,
                     "GET",
                     pinned,
                     params=params,
                     headers={"Host": host_header},
                     extensions={"sni_hostname": hostname},
+                    max_bytes=max_bytes,
+                    content_type_error=f"{source_label} returned an unsupported content type",
+                    size_error=f"{source_label} response is too large",
+                    public_request=public_request,
                 )
             except httpx.RequestError as exc:
                 sanitized = sanitize_pinned_error_message(
@@ -74,11 +80,6 @@ async def fetch_pinned_association_json(
                 except TypeError:
                     rewritten = httpx.RequestError(sanitized, request=public_request)
                 raise rewritten from None
-            response.request = public_request
-            response.raise_for_status()
-            if len(response.content) > max_bytes:
-                raise ValueError(f"{source_label} response is too large")
-            payload = response.json()
             if require_mapping and not isinstance(payload, Mapping):
                 raise ValueError(f"{source_label} response must be an object")
             if on_response is not None:

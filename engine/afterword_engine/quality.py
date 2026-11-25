@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 import httpx
 
+from .config import settings
 from .covers import (
     GOOGLE_BOOKS_SEARCH,
     METADATA_GENRE_LIMIT,
@@ -48,6 +49,7 @@ from .covers import (
     safe_cover_url,
 )
 from .database import connect, persist_metadata_field_provenance, private_setting, row, rows, transaction
+from .http_bounds import JSON_CONTENT_TYPES, stream_response_async
 from .identity import (
     ReadIdentityIndex,
     _AUTHOR_SUFFIXES,
@@ -737,6 +739,13 @@ def _provider_match(
     }
 
 
+_CATALOG_PROVIDER_LABELS: dict[str, str] = {
+    "openlibrary": "Open Library",
+    "google_books": "Google Books",
+    "apple_books": "Apple Books",
+}
+
+
 async def _fetch_catalog_json(
     client: httpx.AsyncClient,
     url: str,
@@ -756,11 +765,23 @@ async def _fetch_catalog_json(
     }
     if trace is not None:
         trace.append(fetch_trace)
+    provider_label = _CATALOG_PROVIDER_LABELS.get(provider, provider)
     try:
         response = (
             await request(client, url, params=params)
             if request is not None
-            else await client.get(url, params=params)
+            else await stream_response_async(
+                client,
+                "GET",
+                url,
+                params=params,
+                max_bytes=settings.source_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                raise_for_status=False,
+                content_type_error=f"{provider_label} returned an unsupported content type",
+                size_error=f"{provider_label} response is too large",
+            )
         )
         fetch_trace["http_status"] = response.status_code
         if response.is_error:
