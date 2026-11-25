@@ -1020,6 +1020,12 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
         def raise_for_status(self) -> None:
             return None
 
+        def iter_bytes(self):
+            yield json.dumps(self.json()).encode("utf-8")
+
+        def close(self) -> None:
+            return None
+
         def json(self) -> dict:
             if rerank_mode == "adjustments":
                 body = {
@@ -1049,10 +1055,14 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
         def __exit__(self, *args):
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
             nonlocal llm_calls
+            assert stream is True
             llm_calls += 1
-            assert "Bearer sk-live-super-secret-bearer-777" == headers["Authorization"]
+            assert "Bearer sk-live-super-secret-bearer-777" == request["headers"]["Authorization"]
             return _FakeLLMResponse()
 
     monkeypatch.setattr(httpx, "Client", _ServingClient)
@@ -1437,6 +1447,12 @@ def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
         def raise_for_status(self) -> None:
             return None
 
+        def iter_bytes(self):
+            yield json.dumps(self.json()).encode("utf-8")
+
+        def close(self) -> None:
+            return None
+
         def json(self) -> dict:
             body = {
                 "adjustments": [
@@ -1455,7 +1471,11 @@ def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
         def __exit__(self, *args):
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
             return _FakeLLMResponse()
 
     monkeypatch.setattr(httpx, "Client", _ServingClient)
