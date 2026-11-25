@@ -12,6 +12,7 @@ from auth_helpers import authenticated_headers
 
 from afterword_engine.config import settings
 from afterword_engine.database import connect, initialize, row, rows, transaction
+from afterword_engine.decision_evidence import build_decision_evidence, load_decision_evidence
 from afterword_engine.ingestion import import_goodreads_csv
 from afterword_engine.learning import (
     attribute_read_outcomes,
@@ -1910,6 +1911,941 @@ def test_internal_settings_and_sources_endpoints_enforce_auth_and_mask_secrets(
     assert settings_payload["digest"]["discord_webhook_set"] is True
     assert settings_payload["digest"]["smtp_password_set"] is True
     assert sources_res.json() == overview_res.json()["sources"]
+
+
+def _expected_evidence_budget(con) -> int:
+    return int(
+        con.execute(
+            "SELECT COALESCE(SUM(length(payload)),0) total "
+            "FROM recommendation_run_evidence WHERE payload IS NOT NULL"
+        ).fetchone()["total"]
+        + con.execute(
+            "SELECT COALESCE(SUM(length(vector)),0) total "
+            "FROM recommendation_evidence_vectors"
+        ).fetchone()["total"]
+        + 96
+        * con.execute(
+            "SELECT COUNT(*) count FROM recommendation_run_evidence_vectors"
+        ).fetchone()["count"]
+        + con.execute(
+            "SELECT COALESCE(SUM(72+length(identity_hash)),0) total "
+            "FROM recommendation_run_evidence_candidates"
+        ).fetchone()["total"]
+        + con.execute(
+            "SELECT COALESCE(SUM(160+length(CAST(candidate_snapshot_json AS BLOB))),0) total "
+            "FROM recommendation_evidence_exposures"
+        ).fetchone()["total"]
+        + con.execute(
+            "SELECT COALESCE(SUM(128+length(CAST(event_key AS BLOB)) "
+            "+length(CAST(event_type AS BLOB))+length(CAST(source AS BLOB)) "
+            "+length(CAST(occurred_at AS BLOB))),0) total "
+            "FROM recommendation_evidence_events"
+        ).fetchone()["total"]
+        + con.execute(
+            "SELECT COALESCE(SUM(192+length(CAST(event_key AS BLOB)) "
+            "+length(CAST(label_kind AS BLOB))+length(CAST(presented_at AS BLOB)) "
+            "+length(CAST(attributed_at AS BLOB)) "
+            "+COALESCE(length(CAST(visible_at AS BLOB)),0)),0) total "
+            "FROM recommendation_evidence_outcomes"
+        ).fetchone()["total"]
+    )
+
+
+def test_manual_read_reconciles_across_goodreads_csv_and_rss_syncs(database, monkeypatch):
+    import afterword_engine.ingestion as ingestion_module
+    from afterword_engine.ingestion import import_goodreads_rss
+
+    recommendations, run_early = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_early, "2025-05-01T10:00:00+00:00")
+    _, run_late = tracked_recommendations()
+    _set_candidate_exposure_time(candidate["id"], run_late, "2025-05-10T10:00:00+00:00")
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        marked = client.post(f"/api/recommendations/{candidate['id']}/read", json={})
+    assert marked.status_code == 200
+    read_id = marked.json()["read_id"]
+    event_key = f"manual-read:{candidate['id']}:{read_id:08d}"
+
+    initial_event = row("SELECT * FROM recommendation_events WHERE event_key=?", (event_key,))
+    assert initial_event["run_id"] == run_late
+    assert initial_event["value"] is None
+    assert json.loads(initial_event["metadata"]) == {
+        "read_source": "manual",
+        "time_precision": "timestamp",
+    }
+
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf)
+    writer.writerow(["Title", "Author", "My Rating", "Date Read", "Exclusive Shelf"])
+    writer.writerow([candidate["title"], candidate["author"], "5", "2025/05/05", "read"])
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    assert import_goodreads_csv(csv_bytes) == 1
+    assert import_goodreads_csv(csv_bytes) == 1
+
+    reconciled = row("SELECT * FROM recommendation_events WHERE event_key=?", (event_key,))
+    assert reconciled["run_id"] == run_early
+    assert reconciled["value"] == 5.0
+    assert json.loads(reconciled["metadata"]) == {
+        "read_source": "manual",
+        "time_precision": "day",
+    }
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 1
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?", (reconciled["id"],))["count"] == 1
+    outcome = row("SELECT * FROM recommendation_outcomes WHERE event_id=?", (reconciled["id"],))
+    assert outcome["label"] == 1.0
+    assert outcome["label_kind"] == "rating_positive"
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key=?",
+        (event_key,),
+    )["count"] == 2
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (event_key,),
+    )["count"] == 2
+    with connect() as con:
+        assert load_decision_evidence(con, run_late)["outcomes"] == []
+        early_outcomes = load_decision_evidence(con, run_early)["outcomes"]
+        assert len(early_outcomes) == 1
+        assert early_outcomes[0]["event_key"] == event_key
+        assert early_outcomes[0]["event_revision"] == 2
+        assert early_outcomes[0]["label"] == 1.0
+        assert early_outcomes[0]["label_kind"] == "rating_positive"
+
+    async def fake_fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class HistoricalFeed:
+        entries = [
+            {
+                "title": candidate["title"],
+                "author_name": candidate["author"],
+                "user_rating": "4",
+                "user_read_at": "2020/01/02",
+            }
+        ]
+
+    monkeypatch.setattr(ingestion_module, "fetch_bytes", fake_fetch_bytes)
+    monkeypatch.setattr(ingestion_module.feedparser, "parse", lambda _content: HistoricalFeed())
+
+    assert asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    ) == 1
+    assert asyncio.run(
+        import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+    ) == 1
+
+    cleared = row("SELECT * FROM recommendation_events WHERE event_key=?", (event_key,))
+    assert cleared["run_id"] is None
+    assert cleared["value"] == 4.0
+    assert cleared["occurred_at"] == "2020/01/02"
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?", (cleared["id"],))["count"] == 0
+    # Append-only evidence rows remain intact while replay filters to the latest revision.
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key=?",
+        (event_key,),
+    )["count"] == 3
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (event_key,),
+    )["count"] == 2
+    with connect() as con:
+        assert load_decision_evidence(con, run_late)["outcomes"] == []
+        assert load_decision_evidence(con, run_early)["outcomes"] == []
+    with transaction() as con:
+        assert (
+            con.execute("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1").fetchone()["used_bytes"]
+            == _expected_evidence_budget(con)
+        )
+
+
+def test_goodreads_import_before_manual_read_reuses_read_event_key_and_keeps_browser_events_immutable(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-01-01T10:00:00+00:00")
+
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf)
+    writer.writerow(["Title", "Author", "My Rating", "Date Read", "Exclusive Shelf"])
+    writer.writerow([candidate["title"], candidate["author"], "0", "2025/01/05", "read"])
+    assert import_goodreads_csv(csv_buf.getvalue().encode("utf-8")) == 1
+
+    read_row = row("SELECT id FROM reads WHERE title=? AND author=?", (candidate["title"], candidate["author"]))
+    expected_key = f"read:{int(read_row['id']):08d}"
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 1
+    assert row("SELECT event_key,value FROM recommendation_events WHERE event_type='read'") == {
+        "event_key": expected_key,
+        "value": None,
+    }
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        marked = client.post(
+            f"/api/recommendations/{candidate['id']}/read",
+            json={"rating": 4},
+        )
+        assert marked.status_code == 200
+
+        accepted = client.post(
+            "/api/telemetry/events",
+            json={
+                "events": [
+                    {
+                        "event_key": "immutable-browser-001",
+                        "candidate_id": candidate["id"],
+                        "run_id": run_id,
+                        "event_type": "detail_open",
+                        "metadata": {"surface": "discover"},
+                    }
+                ]
+            },
+        )
+        rejected_metadata = client.post(
+            "/api/telemetry/events",
+            json={
+                "events": [
+                    {
+                        "event_key": "immutable-browser-001",
+                        "candidate_id": candidate["id"],
+                        "run_id": run_id,
+                        "event_type": "detail_open",
+                        "metadata": {"surface": "saved"},
+                    }
+                ]
+            },
+        )
+        rejected_value = client.post(
+            "/api/telemetry/events",
+            json={
+                "events": [
+                    {
+                        "event_key": "immutable-browser-001",
+                        "candidate_id": candidate["id"],
+                        "run_id": run_id,
+                        "event_type": "detail_open",
+                        "value": 1.0,
+                        "metadata": {"surface": "discover"},
+                    }
+                ]
+            },
+        )
+
+    assert accepted.status_code == 200
+    assert rejected_metadata.status_code == 400
+    assert rejected_value.status_code == 400
+    assert row("SELECT COUNT(*) count FROM recommendation_events WHERE event_type='read'")["count"] == 1
+    assert row("SELECT event_key,value FROM recommendation_events WHERE event_type='read'") == {
+        "event_key": expected_key,
+        "value": 4.0,
+    }
+    assert row(
+        "SELECT label,label_kind FROM recommendation_outcomes WHERE read_id=?",
+        (read_row["id"],),
+    ) == {"label": 1.0, "label_kind": "rating_positive"}
+
+
+def test_goodreads_csv_and_rss_roll_back_reads_when_attribution_fails(database, monkeypatch):
+    import afterword_engine.ingestion as ingestion_module
+    import afterword_engine.learning as learning_module
+    from afterword_engine.ingestion import import_goodreads_rss
+
+    def fail_attribution(_con=None):
+        raise RuntimeError("attribution failure")
+
+    monkeypatch.setattr(learning_module, "attribute_read_outcomes", fail_attribution)
+
+    with pytest.raises(RuntimeError, match="attribution failure"):
+        import_goodreads_csv(
+            b"Title,Author,My Rating,Date Read,Exclusive Shelf\nRollback Book,Writer,5,2025/02/01,read\n"
+        )
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Rollback Book'")["count"] == 0
+
+    async def fake_fetch_bytes(*_args, **_kwargs):
+        return b"", "application/rss+xml"
+
+    class RssFeed:
+        entries = [
+            {
+                "title": "Rollback RSS Book",
+                "author_name": "Writer",
+                "user_rating": "5",
+                "user_read_at": "2025/02/01",
+            }
+        ]
+
+    monkeypatch.setattr(ingestion_module, "fetch_bytes", fake_fetch_bytes)
+    monkeypatch.setattr(ingestion_module.feedparser, "parse", lambda _content: RssFeed())
+    with pytest.raises(RuntimeError, match="attribution failure"):
+        asyncio.run(
+            import_goodreads_rss("https://www.goodreads.com/review/list_rss/reader?shelf=read")
+        )
+    assert row("SELECT COUNT(*) count FROM reads WHERE title='Rollback RSS Book'")["count"] == 0
+
+
+def test_read_attribution_matches_canonical_variants_and_tie_breaks_candidates(database):
+    from afterword_engine.identity import read_metadata_identity_hash
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+
+        def add_cand(
+            title,
+            author,
+            *,
+            key,
+            status="recommended",
+            score=80.0,
+            isbn13="",
+            work_id="",
+            provider="",
+        ):
+            cand_id = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,?)",
+                (title, author, score, status, source_id, key),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',isbn13=?,work_id=?,provider=? "
+                "WHERE candidate_id=?",
+                (isbn13, work_id, provider, cand_id),
+            )
+            return int(cand_id)
+
+        # 1a. Unshown exact title/author beats shown loose subtitle variant (no false-positive attribution)
+        exact_unimpressed = add_cand(
+            "Project Hail Mary", "Andy Weir", key="phm-exact", score=60.0
+        )
+        loose_subtitle_impressed = add_cand(
+            "Project Hail Mary: A Novel", "Andy Weir", key="phm-subtitle", score=99.0
+        )
+        # 1b. Unshown exact ISBN beats shown loose work-ID sibling
+        isbn_exact_unimpressed = add_cand(
+            "Unshown Exact Edition",
+            "Edition Author",
+            key="isbn-unshown-exact",
+            isbn13="9780140449136",
+            work_id="/works/OL1111111W",
+            provider="openlibrary",
+        )
+        loose_work_impressed = add_cand(
+            "Shown Sibling Edition",
+            "Different Translator",
+            key="work-shown-loose",
+            work_id="/works/OL1111111W",
+            provider="openlibrary",
+        )
+        # 1c. Subtitle variant matches when no exact-identity candidate exists
+        subtitle_only_cand = add_cand(
+            "The Dispossessed: An Ambiguous Utopia",
+            "Ursula K. Le Guin",
+            key="dispossessed-subtitle",
+            score=82.0,
+        )
+        # 2. Leading article variant
+        article_cand = add_cand(
+            "The Left Hand of Darkness", "Ursula K. Le Guin", key="lhod-article"
+        )
+        # 3. Numeric alias variant
+        numeric_cand = add_cand(
+            "Slaughterhouse-Five", "Kurt Vonnegut", key="sh5-alias"
+        )
+        # 4. ISBN variant with distinct catalog title + active/score tie-breaking
+        isbn_rejected = add_cand(
+            "Edition Rejected",
+            "Different Credit",
+            key="isbn-rejected",
+            status="rejected",
+            score=98.0,
+            isbn13="9780593418574",
+        )
+        isbn_lower = add_cand(
+            "Edition Active Low",
+            "Different Credit",
+            key="isbn-low",
+            status="recommended",
+            score=75.0,
+            isbn13="9780593418574",
+        )
+        isbn_higher = add_cand(
+            "Edition Active High",
+            "Different Credit",
+            key="isbn-high",
+            status="recommended",
+            score=88.0,
+            isbn13="9780593418574",
+        )
+        # 5. Open Library work variant via projected read_metadata
+        work_cand = add_cand(
+            "Translated Catalog Title",
+            "Catalog Translator",
+            key="ol-work-cand",
+            work_id="/works/OL7654321W",
+            provider="openlibrary",
+        )
+
+    impressed_ids = [
+        loose_subtitle_impressed,
+        loose_work_impressed,
+        subtitle_only_cand,
+        article_cand,
+        numeric_cand,
+        isbn_rejected,
+        isbn_lower,
+        isbn_higher,
+        work_cand,
+    ]
+    run_id = create_recommendation_run(
+        [{"id": cid, "score": 80} for cid in impressed_ids]
+    )
+    for cid in impressed_ids:
+        _set_candidate_exposure_time(cid, run_id, "2025-03-01T12:00:00+00:00")
+    assert exact_unimpressed not in impressed_ids
+    assert isbn_exact_unimpressed not in impressed_ids
+
+    with transaction() as con:
+        con.executemany(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source) VALUES(?,?,?,?,?,?)",
+            [
+                ("Project Hail Mary", "Andy Weir", 5, "2025-03-05", None, "goodreads_csv"),
+                ("Unrelated Reader Title", "Other Credit", 5, "2025-03-05", "9780140449136", "goodreads_csv"),
+                ("The Dispossessed", "Ursula K. Le Guin", 5, "2025-03-05", None, "goodreads_csv"),
+                ("Left Hand of Darkness", "Ursula K. Le Guin", 5, "2025-03-05", None, "goodreads_csv"),
+                ("Slaughterhouse 5", "Kurt Vonnegut Jr.", 4, "2025-03-05", None, "goodreads_csv"),
+                ("Imported ISBN Edition", "Reader Credit", 5, "2025-03-05", "0593418573", "goodreads_csv"),
+            ],
+        )
+        work_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source) VALUES(?,?,?,?,?,?)",
+            ("Original Edition Title", "Original Author", 5, "2025-03-05", "9780306406157", "goodreads_csv"),
+        ).lastrowid
+        work_read = dict(
+            con.execute("SELECT * FROM reads WHERE id=?", (work_read_id,)).fetchone()
+        )
+        con.execute(
+            "INSERT INTO read_metadata(read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash) "
+            "VALUES(?,?,?,?,?)",
+            (
+                work_read_id,
+                "/works/OL7654321W",
+                "openlibrary",
+                "/works/OL7654321W",
+                read_metadata_identity_hash(work_read),
+            ),
+        )
+
+    summary = attribute_read_outcomes()
+    assert summary["outcomes_created"] == 5
+    attributed_candidates = {
+        int(item["candidate_id"])
+        for item in [
+            dict(r)
+            for r in __import__("afterword_engine.database", fromlist=["rows"]).rows(
+                "SELECT candidate_id FROM recommendation_events WHERE event_type='read'"
+            )
+        ]
+    }
+    assert attributed_candidates == {
+        subtitle_only_cand,
+        article_cand,
+        numeric_cand,
+        isbn_higher,
+        work_cand,
+    }
+    assert loose_subtitle_impressed not in attributed_candidates
+    assert loose_work_impressed not in attributed_candidates
+
+
+def test_three_part_read_event_key_cleans_up_on_rematch_and_pre_exposure_date(database):
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        cand_a = int(
+            con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES('Candidate Alpha','Writer One',85,'recommended',?,'cand-alpha')",
+                (source_id,),
+            ).lastrowid
+        )
+        cand_b = int(
+            con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES('Candidate Beta','Writer Two',85,'recommended',?,'cand-beta')",
+                (source_id,),
+            ).lastrowid
+        )
+        for cid in (cand_a, cand_b):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    with connect() as con:
+        evidence = build_decision_evidence(
+            con,
+            base_pool=[],
+            personalized_pool=[],
+            final_pool=[],
+            interaction_events=[],
+            cached_vectors={},
+            ranking_metadata={},
+            discovery_slate_metadata={},
+            request_context={},
+        )
+    run_id = create_recommendation_run(
+        [{"id": cand_a, "score": 85}, {"id": cand_b, "score": 85}],
+        decision_evidence=evidence,
+    )
+    _set_candidate_exposure_time(cand_a, run_id, "2025-03-01T10:00:00+00:00")
+    _set_candidate_exposure_time(cand_b, run_id, "2025-03-01T10:00:00+00:00")
+
+    with transaction() as con:
+        read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Candidate Alpha','Writer One',5,'2025-03-05','goodreads_csv')"
+            ).lastrowid
+        )
+    assert attribute_read_outcomes()["outcomes_created"] == 1
+    default_key = f"read:{read_id:08d}"
+    three_part_key = f"read:{read_id:08d}:{cand_b}"
+
+    # Switch read to Candidate B -> creates read:NNN:CAND_B and clears Candidate A.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Beta',author='Writer Two' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (default_key,))["run_id"] is None
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] == run_id
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 1
+
+    # Switch back to Candidate A -> 3-part key must be parsed and cleaned up (no double counting).
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Alpha',author='Writer One' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (default_key,))["run_id"] == run_id
+    active_outcomes = __import__("afterword_engine.database", fromlist=["rows"]).rows(
+        "SELECT i.candidate_id FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id WHERE o.read_id=?",
+        (read_id,),
+    )
+    assert [int(item["candidate_id"]) for item in active_outcomes] == [cand_a]
+    with connect() as con:
+        replayed = load_decision_evidence(con, run_id)["outcomes"]
+        assert [int(item["candidate_id"]) for item in replayed] == [cand_a]
+
+    # Re-match Candidate B, then stop matching any candidate -> 3-part key is cleaned up,
+    # and a later re-match to Candidate A does not double-count.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Beta',author='Writer Two' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] == run_id
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Unmatched Catalog Title',author='Nobody' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 0
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Alpha',author='Writer One' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 1
+    with connect() as con:
+        assert [int(item["candidate_id"]) for item in load_decision_evidence(con, run_id)["outcomes"]] == [cand_a]
+
+    # Re-match Candidate B then move read_at before all exposures -> 3-part key is cleared too.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Candidate Beta',author='Writer Two' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    with transaction() as con:
+        con.execute("UPDATE reads SET read_at='2020-01-02' WHERE id=?", (read_id,))
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"] == 0
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+    from afterword_engine.decision_evidence import purge_recommendation_evidence
+
+    with transaction() as con:
+        purged = purge_recommendation_evidence(con, read_ids=[read_id])
+        assert purged["runs_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE event_key IN (?,?)",
+                (default_key, three_part_key),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key IN (?,?)",
+                (default_key, three_part_key),
+            ).fetchone()["count"]
+            == 0
+        )
+
+
+def test_undated_reads_and_unlabelled_duplicate_reads_preserve_outcomes_while_unmatched_reads_clean_up(database):
+    recommendations, run_id = tracked_recommendations()
+    candidate = recommendations[0]
+    second_candidate = recommendations[1]
+    _set_candidate_exposure_time(candidate["id"], run_id, "2025-05-01T10:00:00+00:00")
+    _set_candidate_exposure_time(second_candidate["id"], run_id, "2025-05-01T10:00:00+00:00")
+
+    with transaction() as con:
+        read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+                (candidate["title"], candidate["author"], 5, "2025-05-05", "goodreads_csv"),
+            ).lastrowid
+        )
+    assert attribute_read_outcomes()["outcomes_created"] == 1
+    event_key = f"read:{read_id:08d}"
+    event = row("SELECT id,run_id FROM recommendation_events WHERE event_key=?", (event_key,))
+    assert event["run_id"] == run_id
+
+    # Dropping read_at on a historical source for a still-matching book must NOT wipe earlier attributed outcomes.
+    with transaction() as con:
+        con.execute("UPDATE reads SET read_at=NULL WHERE id=?", (read_id,))
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (event_key,))["run_id"] == run_id
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?", (event["id"],))["count"] == 1
+    with connect() as con:
+        assert len(load_decision_evidence(con, run_id)["outcomes"]) == 1
+
+    # Recording a duplicate read without a label must preserve all existing outcomes regardless of label_kind.
+    with transaction() as con:
+        other_imp_id = int(
+            con.execute(
+                "SELECT id FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+                (run_id, second_candidate["id"]),
+            ).fetchone()["id"]
+        )
+        con.execute(
+            "INSERT INTO recommendation_outcomes(impression_id,event_id,label,label_kind,confidence,attributed_at) "
+            "VALUES(?,?,1.0,'explicit_feedback',0.8,'2025-05-06T00:00:00+00:00')",
+            (other_imp_id, event["id"]),
+        )
+        dup_result = record_event_in_connection(
+            con,
+            event_key=event_key,
+            candidate_id=candidate["id"],
+            event_type="read",
+            value=5.0,
+            source="read_import",
+            metadata={"read_source": "goodreads_csv", "time_precision": "day"},
+        )
+        assert dup_result == {"id": event["id"], "duplicate": True, "outcome": "none"}
+        assert (
+            con.execute(
+                "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?",
+                (event["id"],),
+            ).fetchone()["count"]
+            == 2
+        )
+
+    # Becoming unmatched in the catalog cleans up read-derived outcomes while preserving non-read label_kinds.
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title='Unmatched Export Title',read_at='2025-05-05' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (event_key,))["run_id"] is None
+    remaining = [
+        dict(r)
+        for r in __import__("afterword_engine.database", fromlist=["rows"]).rows(
+            "SELECT label_kind FROM recommendation_outcomes WHERE event_id=?",
+            (event["id"],),
+        )
+    ]
+    assert remaining == [{"label_kind": "explicit_feedback"}]
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (event_key,),
+    )["count"] == 1
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+    # Re-matching to a second candidate mints a 3-part read:NNN:CAND key; dropping read_at preserves it,
+    # and becoming unmatched cleans up the 3-part key while preserving non-read label_kinds and evidence history.
+    three_part_key = f"read:{read_id:08d}:{second_candidate['id']}"
+    with transaction() as con:
+        con.execute(
+            "UPDATE reads SET title=?,author=?,read_at='2025-05-07' WHERE id=?",
+            (second_candidate["title"], second_candidate["author"], read_id),
+        )
+    assert attribute_read_outcomes()["outcomes_created"] == 1
+    three_part_event = row(
+        "SELECT id,run_id FROM recommendation_events WHERE event_key=?",
+        (three_part_key,),
+    )
+    assert three_part_event["run_id"] == run_id
+
+    with transaction() as con:
+        con.execute("UPDATE reads SET read_at=NULL WHERE id=?", (read_id,))
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] == run_id
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?",
+        (three_part_event["id"],),
+    )["count"] == 1
+
+    with transaction() as con:
+        first_imp_id = int(
+            con.execute(
+                "SELECT id FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+                (run_id, candidate["id"]),
+            ).fetchone()["id"]
+        )
+        con.execute(
+            "INSERT INTO recommendation_outcomes(impression_id,event_id,label,label_kind,confidence,attributed_at) "
+            "VALUES(?,?,1.0,'explicit_feedback',0.8,'2025-05-08T00:00:00+00:00')",
+            (first_imp_id, three_part_event["id"]),
+        )
+        con.execute(
+            "UPDATE reads SET title='Unmatched Three-Part Export Title',author='Nobody',read_at='2025-05-07' WHERE id=?",
+            (read_id,),
+        )
+    attribute_read_outcomes()
+    assert row("SELECT run_id FROM recommendation_events WHERE event_key=?", (three_part_key,))["run_id"] is None
+    remaining_three_part = [
+        dict(r)
+        for r in __import__("afterword_engine.database", fromlist=["rows"]).rows(
+            "SELECT label_kind FROM recommendation_outcomes WHERE event_id=?",
+            (three_part_event["id"],),
+        )
+    ]
+    assert remaining_three_part == [{"label_kind": "explicit_feedback"}]
+    assert row(
+        "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE event_key=?",
+        (three_part_key,),
+    )["count"] == 1
+    with connect() as con:
+        assert load_decision_evidence(con, run_id)["outcomes"] == []
+
+
+def test_retracted_explicit_outcomes_append_retraction_evidence_and_unmask_read_outcomes(database):
+    from afterword_engine.evaluation import load_rows, signal_diagnostics
+
+    recommendations, run_id = tracked_recommendations()
+    first_cand = recommendations[0]
+    second_cand = recommendations[1]
+    _set_candidate_exposure_time(first_cand["id"], run_id, "2025-04-01T10:00:00+00:00")
+    _set_candidate_exposure_time(second_cand["id"], run_id, "2025-04-01T10:00:00+00:00")
+
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            (first_cand["title"], first_cand["author"], None, "2025-04-05", "goodreads_csv"),
+        )
+    assert attribute_read_outcomes()["outcomes_created"] == 1
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        rejected = client.post(
+            f"/api/recommendations/{first_cand['id']}/feedback",
+            json={"action": "reject", "run_id": run_id},
+        )
+        assert rejected.status_code == 200
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
+        assert by_cand[first_cand["id"]]["label_kind"] == "completed_unrated"
+        assert by_cand[first_cand["id"]]["label"] == 0.75
+        assert {
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        } == {"completed_unrated", "explicit_feedback"}
+        assert signal_diagnostics(run_rows)["shortlist_intent"]["negative_impressions"] == 1
+        with connect() as con:
+            assert [
+                item["label_kind"]
+                for item in load_decision_evidence(con, run_id)["outcomes"]
+                if item["candidate_id"] == first_cand["id"]
+            ] == ["completed_unrated", "explicit_feedback"]
+
+        deferred = client.post(
+            f"/api/recommendations/{first_cand['id']}/feedback",
+            json={"action": "maybe_later", "run_id": run_id},
+        )
+        assert deferred.status_code == 200
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
+        assert by_cand[first_cand["id"]]["label_kind"] == "completed_unrated"
+        assert by_cand[first_cand["id"]]["label"] == 0.75
+        assert [
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        ] == ["completed_unrated"]
+        assert signal_diagnostics(run_rows)["shortlist_intent"]["labeled_impressions"] == 0
+        # Evidence outcomes stay append-only; replay hides retracted explicit feedback.
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
+            "WHERE candidate_id=? AND label_kind='explicit_feedback'",
+            (first_cand["id"],),
+        )["count"] == 1
+        with connect() as con:
+            assert [
+                item["label_kind"]
+                for item in load_decision_evidence(con, run_id)["outcomes"]
+                if item["candidate_id"] == first_cand["id"]
+            ] == ["completed_unrated"]
+
+        saved = client.post(
+            f"/api/recommendations/{first_cand['id']}/feedback",
+            json={"action": "save", "run_id": run_id},
+        ).json()
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
+            "WHERE candidate_id=? AND label_kind='explicit_feedback'",
+            (first_cand["id"],),
+        )["count"] == 2
+        undone = client.post(
+            f"/api/recommendations/{first_cand['id']}/undo",
+            json={"decision_id": saved["decision_id"]},
+        )
+        assert undone.status_code == 200
+        run_rows = [item for item in load_rows(database) if item["run_id"] == run_id]
+        by_cand = {item["candidate_id"]: item for item in run_rows}
+        assert [
+            outcome["label_kind"]
+            for outcome in by_cand[first_cand["id"]]["observed_outcomes"]
+        ] == ["completed_unrated"]
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
+            "WHERE candidate_id=? AND label_kind='explicit_feedback'",
+            (first_cand["id"],),
+        )["count"] == 2
+        with connect() as con:
+            assert [
+                item["label_kind"]
+                for item in load_decision_evidence(con, run_id)["outcomes"]
+                if item["candidate_id"] == first_cand["id"]
+            ] == ["completed_unrated"]
+
+        saved_second = client.post(
+            f"/api/recommendations/{second_cand['id']}/feedback",
+            json={"action": "save", "run_id": run_id},
+        )
+        assert saved_second.status_code == 200
+        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
+        assert by_cand[second_cand["id"]]["label_kind"] == "explicit_feedback"
+        assert by_cand[second_cand["id"]]["label"] == 1.0
+
+        restored = client.post(
+            f"/api/recommendations/{second_cand['id']}/feedback",
+            json={"action": "restore", "run_id": run_id},
+        )
+        assert restored.status_code == 200
+        by_cand = {item["candidate_id"]: item for item in load_rows(database) if item["run_id"] == run_id}
+        assert by_cand[second_cand["id"]]["label_kind"] is None
+        assert by_cand[second_cand["id"]]["observed_outcomes"] == []
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes "
+            "WHERE label_kind='explicit_feedback' AND event_id IN "
+            "(SELECT id FROM recommendation_events WHERE candidate_id=?)",
+            (second_cand["id"],),
+        )["count"] == 0
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_outcomes "
+            "WHERE candidate_id=? AND label_kind='explicit_feedback'",
+            (second_cand["id"],),
+        )["count"] == 1
+        with connect() as con:
+            assert [
+                item
+                for item in load_decision_evidence(con, run_id)["outcomes"]
+                if item["candidate_id"] == second_cand["id"]
+            ] == []
+
+    with transaction() as con:
+        assert (
+            con.execute("SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1").fetchone()["used_bytes"]
+            == _expected_evidence_budget(con)
+        )
+
+
+def test_bulk_feedback_records_previous_status_and_links_matching_run_impressions(database):
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        first_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Bulk Run One','Author One',91,'recommended',?,'bulk run one')",
+            (source_id,),
+        ).lastrowid
+        second_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Bulk Run Two','Author Two',89,'recommended',?,'bulk run two')",
+            (source_id,),
+        ).lastrowid
+
+    run_one = create_recommendation_run([{"id": first_id, "score": 91}])
+    run_two = create_recommendation_run([{"id": second_id, "score": 89}])
+    assert run_two != run_one
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        saved = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [first_id, second_id], "action": "save", "run_id": run_one},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["updated"] == 2
+
+        first_feedback = row(
+            "SELECT id,previous_status FROM feedback WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
+            (first_id,),
+        )
+        second_feedback = row(
+            "SELECT id,previous_status FROM feedback WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
+            (second_id,),
+        )
+        assert first_feedback["previous_status"] == "recommended"
+        assert second_feedback["previous_status"] == "recommended"
+
+        first_event = row("SELECT id,run_id FROM recommendation_events WHERE event_key=?", (f"feedback:{first_feedback['id']}",))
+        second_event = row("SELECT id,run_id FROM recommendation_events WHERE event_key=?", (f"feedback:{second_feedback['id']}",))
+        assert first_event["run_id"] == run_one
+        assert second_event["run_id"] is None
+
+        assert row("SELECT confidence FROM recommendation_outcomes WHERE event_id=?", (first_event["id"],))["confidence"] == 0.8
+        assert row("SELECT confidence FROM recommendation_outcomes WHERE event_id=?", (second_event["id"],))["confidence"] == 0.5
+        assert row(
+            "SELECT confidence FROM recommendation_evidence_outcomes WHERE run_id=? AND candidate_id=?",
+            (run_one, first_id),
+        )["confidence"] == 0.8
+
+        restored = client.post(
+            "/api/recommendations/bulk-feedback",
+            json={"ids": [first_id], "action": "restore", "run_id": run_one},
+        )
+        assert restored.status_code == 200
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes WHERE event_id=?",
+            (first_event["id"],),
+        )["count"] == 0
+        assert row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_outcomes WHERE candidate_id=?",
+            (first_id,),
+        )["count"] == 1
 
 
 @pytest.mark.parametrize("read_at", [None, "not-a-date"], ids=["missing-date", "invalid-date"])
