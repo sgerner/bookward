@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .config import settings
-from .database import row, rows, transaction
+from .database import RestoreEpochError, fenced_async, row, rows, transaction
 from .identity import ReadIdentityIndex, book_row_identity_match_keys
 from .ingestion import read_identity_rows_with_current_verified_work_ids
 from .security import BLOCKED_HOSTS, safe_error_message, validate_public_url
@@ -333,7 +333,8 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     params: list = [config["minimum_score"]]
     query = (
         "SELECT c.*, s.name AS source_name,q.work_id quality_work_id,"
-        "q.provider quality_provider,q.isbn13 quality_isbn13,"
+        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,"
         "q.isbn10 quality_isbn10 FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
@@ -360,6 +361,7 @@ def _candidate_rows(config: dict, include_seen: bool = False) -> list[dict]:
     shortlist_index = ReadIdentityIndex.from_reads(
         rows(
             "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
+            "q.provider_id AS quality_provider_id,"
             "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "WHERE c.status IN ('saved','imported')"
@@ -560,6 +562,7 @@ def _mark_period_sent(key: str, candidate_ids: list[int]) -> None:
         )
 
 
+@fenced_async
 async def send_digest(
     values: dict | None = None,
     *,
@@ -667,6 +670,8 @@ async def send_digest(
                 await _send_email(config, subject, body)
             _delivery_result(delivery_id, True)
             return {"id": delivery_id, "channel": channel, "status": "sent"}
+        except RestoreEpochError:
+            raise
         except Exception as exc:
             error = safe_error_message(exc)
             _delivery_result(delivery_id, False, error)
@@ -698,6 +703,7 @@ async def send_digest(
     }
 
 
+@fenced_async
 async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
     delivery = row("SELECT * FROM notification_deliveries WHERE id=?", (delivery_id,))
     if not delivery:
@@ -736,6 +742,8 @@ async def retry_delivery(delivery_id: str, values: dict | None = None) -> dict:
                 candidate_ids = []
             _mark_period_sent(delivery["period_key"], candidate_ids)
         return {"id": delivery_id, "status": "sent"}
+    except RestoreEpochError:
+        raise
     except Exception as exc:
         error = safe_error_message(exc)
         _delivery_result(delivery_id, False, error)

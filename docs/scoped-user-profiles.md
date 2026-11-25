@@ -43,7 +43,7 @@ On a new install, the first person to complete setup at `/login` chooses the adm
 
 Passwords are stored as salted Argon2id hashes through a maintained library. The implementation applies login throttling, bounded input sizes, generic login errors, and secret redaction. See [OWASP password storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
 
-Password changes verify the current password when one is set; SSO-only accounts must have signed in within the last 10 minutes to add a local password. Administrator resets set a new temporary password and revoke existing sessions; the next login must change it. Email recovery is not included. The last usable login method and last active administrator are protected from removal or disabling.
+Password changes verify the current password when one is set; SSO-only accounts must have signed in within the last 10 minutes to add a local password. Password changes and administrator resets revoke existing browser sessions while leaving personal API tokens active; after an administrator reset, the next login must change the temporary password. Email recovery is not included. The last usable login method and last active administrator are protected from removal or disabling.
 
 ### SSO
 
@@ -97,7 +97,7 @@ Every existing personal table lives in the profile file: candidates, reads, sour
 
 The identity registry maps the special `legacy` profile ID to the already deployed database, so existing data files do not need a destructive table rewrite. Startup creates the registry once, hashes configured legacy credentials into the administrator account when available, and moves legacy API token records into the registry with their profile owner. If no password is configured, the first person to complete `/login` setup creates the administrator; a database write lock and a second account-count check ensure that only one request can succeed. New accounts get independent database files. Every database runs its own normal schema migrations when initialized.
 
-API token hashes and profile ownership live centrally because the profile must be known before the engine opens a profile database. Listing or revoking a token is restricted to the active profile. Disabled accounts revoke their sessions and tokens, disable the profile, and stop its scheduled work. Account management can provision, disable, re-enable, and reset passwords; it does not impersonate or merge profiles.
+API token hashes and profile ownership live centrally because the profile must be known before the engine opens a profile database. Every API token authentication checks that the token is unrevoked, its owning profile is active, and any owning account for that profile is also active. Personal API tokens survive password changes and administrator password resets until explicitly revoked or the account is disabled. Listing or revoking a token is restricted to the active profile. Disabled accounts revoke their sessions and tokens, disable the profile, and stop its scheduled work. Account management can provision, disable, re-enable, and reset passwords; it does not impersonate or merge profiles.
 
 All settings are stored per profile database in this implementation, including embedding provider configuration. Environment values seed defaults; a profile's changes do not alter another profile. This means users may choose different embedding providers. Installation OIDC configuration and service credentials remain environment-level settings.
 
