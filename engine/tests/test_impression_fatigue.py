@@ -28,9 +28,38 @@ def test_apply_impression_fatigue_decays_and_resorts_unacted_recommended() -> No
     assert diag == {"applied": True, "adjusted_candidates": 1, "max_penalty": 6.0}
     assert [item["id"] for item in ranked] == [2, 1, 3]
     assert ranked[0]["score"] == 79.0
+    assert "explanation" not in ranked[0]
     assert ranked[1]["score"] == 76.0
     assert ranked[1]["fatigue_penalty"] == 6.0
+    assert ranked[1]["explanation"] == [
+        "Lowered after appearing on several recent days without a decision"
+    ]
     assert ranked[2]["score"] == 75.0
+
+
+def test_apply_impression_fatigue_preserves_two_decimal_scores_and_explains_decay() -> None:
+    ranked, diag = apply_impression_fatigue(
+        [
+            {
+                "id": 1,
+                "title": "Fractional Decay",
+                "status": "recommended",
+                "score": 82.0,
+                "explanation": ['Similar to "Dune" (5★)', "From Sci-Fi Feed"],
+            }
+        ],
+        {1: 2},
+        grace_days=1,
+        penalty_per_day=0.75,
+        max_penalty=9.0,
+    )
+    assert diag == {"applied": True, "adjusted_candidates": 1, "max_penalty": 0.75}
+    assert ranked[0]["score"] == 81.25
+    assert ranked[0]["explanation"] == [
+        'Similar to "Dune" (5★)',
+        "From Sci-Fi Feed",
+        "Lowered after appearing on several recent days without a decision",
+    ]
 
 
 def test_apply_impression_fatigue_caps_penalty_at_max() -> None:

@@ -103,6 +103,11 @@
     undo_id?: number;
     undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
+    editSource?: {
+      id: number;
+      label: string;
+      url: string;
+    };
     sourcePreview?: {
       id: number;
       url: string;
@@ -155,6 +160,9 @@
   let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
   let expandedRecommendationDetails = $state(new Set<number>());
+  let expandedSynopses = $state(new Set<number>());
+  let measuredSynopses = $state(new Set<number>());
+  let overflowingSynopses = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const DECISION_PAGE_SIZE = 24;
@@ -277,6 +285,8 @@
   let optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
   let defaultSourceEnabledOverride = $state<boolean | null>(null);
   let sourceEnabledOverrides = $state<Record<number, boolean>>({});
+  let openSourceEditIds = $state(new Set<number>());
+  let sourceEditDrafts = $state<Record<number, { label: string; url: string }>>({});
   let sourceScheduleOverride = $state<number | null>(null);
   let librarrUrlOverride = $state<string | null>(null);
   let librarrConnectedOverride = $state<boolean | null>(null);
@@ -1166,6 +1176,44 @@
     else next.add(id);
     expandedRecommendationDetails = next;
   }
+  function toggleSynopsis(id: number) {
+    const next = new Set(expandedSynopses);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    expandedSynopses = next;
+  }
+  function measureSynopsisOverflow(node: HTMLElement, id: number) {
+    let currentId = id;
+    const check = () => {
+      if (untrack(() => expandedSynopses.has(currentId))) return;
+      const overflows = node.scrollHeight > node.clientHeight + 1;
+      untrack(() => {
+        if (!measuredSynopses.has(currentId)) {
+          const nextMeasured = new Set(measuredSynopses);
+          nextMeasured.add(currentId);
+          measuredSynopses = nextMeasured;
+        }
+        if (overflowingSynopses.has(currentId) !== overflows) {
+          const nextOverflow = new Set(overflowingSynopses);
+          if (overflows) nextOverflow.add(currentId);
+          else nextOverflow.delete(currentId);
+          overflowingSynopses = nextOverflow;
+        }
+      });
+    };
+    check();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(check) : null;
+    observer?.observe(node);
+    return {
+      update(nextId: number) {
+        currentId = nextId;
+        check();
+      },
+      destroy() {
+        observer?.disconnect();
+      },
+    };
+  }
   function readingSourceLabel(source: string) {
     return formatReadingSourceLabel(source);
   }
@@ -1315,6 +1363,77 @@
 
   function isPending(key: string) {
     return pendingActions.has(key);
+  }
+
+  function setSourceEditOpen(id: number, isOpen: boolean) {
+    if (openSourceEditIds.has(id) === isOpen) return;
+    const next = new Set(openSourceEditIds);
+    if (isOpen) next.add(id);
+    else next.delete(id);
+    openSourceEditIds = next;
+  }
+
+  function sourceEditDraftValue(
+    source: { id: number; label: string; url: string },
+    field: "label" | "url",
+  ) {
+    const draft = sourceEditDrafts[source.id];
+    if (draft) return draft[field];
+    if (formState?.editSource?.id === source.id) return formState.editSource[field];
+    return source[field];
+  }
+
+  function updateSourceEditDraft(
+    source: { id: number; label: string; url: string },
+    field: "label" | "url",
+    value: string,
+  ) {
+    const existing = sourceEditDrafts[source.id] ?? {
+      label: sourceEditDraftValue(source, "label"),
+      url: sourceEditDraftValue(source, "url"),
+    };
+    sourceEditDrafts = {
+      ...sourceEditDrafts,
+      [source.id]: { ...existing, [field]: value },
+    };
+  }
+
+  function enhanceSourceEdit(sourceId: number): SubmitFunction {
+    const key = `edit-source-${sourceId}`;
+    return ({ formData }) => {
+      withPending(key, true);
+      const submittedLabel = String(formData.get("label") ?? "");
+      const submittedUrl = String(formData.get("url") ?? "");
+      sourceEditDrafts = {
+        ...sourceEditDrafts,
+        [sourceId]: { label: submittedLabel, url: submittedUrl },
+      };
+      setSourceEditOpen(sourceId, true);
+      return async ({ update, result }) => {
+        const succeeded = result.type === "success" || result.type === "redirect";
+        try {
+          if (result.type === "error") {
+            announceActionError(actionResultMessage(result));
+            return;
+          }
+          await update({ reset: false });
+          if (succeeded) {
+            const nextDrafts = { ...sourceEditDrafts };
+            delete nextDrafts[sourceId];
+            sourceEditDrafts = nextDrafts;
+            setSourceEditOpen(sourceId, false);
+          }
+        } catch (error) {
+          announceActionError(
+            error instanceof Error
+              ? error.message
+              : "The request could not be completed.",
+          );
+        } finally {
+          withPending(key, false);
+        }
+      };
+    };
   }
 
   function applyCommittedStatusToClientSlices(id: number, status: string) {
@@ -2687,7 +2806,7 @@
       >{/each}
       </nav>
       <div class="ml-auto flex shrink-0 items-center gap-2">
-        {#if activeView === "discover" || activeView === "saved"}<form
+        {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
             use:enhance={setPending("sync")}
@@ -2977,6 +3096,11 @@
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
+            {@const rationaleLabel = book.status === "rejected" ? "Why Bookward showed this" : book.status === "maybe_later" ? "Why Bookward suggested this" : "Why this might be for you"}
+            {@const synopsisText = (book.synopsis ?? "").trim()}
+            {@const synopsisExpanded = expandedSynopses.has(book.id)}
+            {@const showSynopsisToggle = synopsisExpanded || (measuredSynopses.has(book.id) ? overflowingSynopses.has(book.id) : synopsisText.length > 140)}
+            {@const formattedRank = Number(book.score).toFixed(1)}
             <article
               use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
@@ -3016,7 +3140,7 @@
                       />
                     </label>
                   {/if}
-                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {formattedRank}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
@@ -3036,6 +3160,24 @@
                   <h2 class="text-reflow text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
                   <p class="text-reflow mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
+                {#if synopsisText}
+                  <div class="space-y-1">
+                    <p
+                      id={`book-synopsis-${book.id}`}
+                      use:measureSynopsisOverflow={book.id}
+                      class={`text-sm leading-6 text-surface-800-200 sm:text-base ${synopsisExpanded ? "" : "line-clamp-3"}`}
+                    >{synopsisText}</p>
+                    {#if showSynopsisToggle}
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center text-sm font-medium text-secondary-700-300 underline decoration-secondary-500/60 underline-offset-4 hover:text-secondary-900-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500"
+                        aria-expanded={synopsisExpanded}
+                        aria-controls={`book-synopsis-${book.id}`}
+                        onclick={() => toggleSynopsis(book.id)}
+                      >{synopsisExpanded ? "Show less" : "Read full summary"}</button>
+                    {/if}
+                  </div>
+                {/if}
                 <details
                   class="group/details text-base text-surface-700-300"
                   open={expandedRecommendationDetails.has(book.id)}
@@ -3047,15 +3189,21 @@
                   }}
                 >
                   <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
-                    <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
+                    <Sparkles size={15} /><span>{rationaleLabel}</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
-                  {#if expandedRecommendationDetails.has(book.id)}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
-                      <p class="mt-2 leading-6">{book.reason}</p>
-                      {#if book.synopsis}<div class="mt-4 border-l-2 border-secondary-500/50 pl-3">
-                          <p class="text-xs font-semibold uppercase tracking-[0.16em] text-secondary-600-400">Book summary</p>
-                          <p class="mt-1 leading-6 text-surface-800-200">{book.synopsis}</p>
-                        </div>{/if}
-                    </div>{/if}
+                  <div>
+                    {#if (book.explanation ?? []).length > 0}
+                      <ul class="mt-2 list-disc space-y-1.5 pl-5 text-sm leading-6 text-surface-800-200 sm:text-base">
+                        {#each book.explanation ?? [] as reasonItem, reasonIndex (`${book.id}-${reasonIndex}-${reasonItem}`)}
+                          <li>{reasonItem}</li>
+                        {/each}
+                      </ul>
+                    {:else if book.reason}
+                      <p class="mt-2 text-sm leading-6 text-surface-800-200 sm:text-base">{book.reason}</p>
+                    {:else}
+                      <p class="mt-2 text-sm leading-6 text-surface-700-300 sm:text-base">Ranked from your enabled sources and available catalog details.</p>
+                    {/if}
+                  </div>
                 </details>
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
@@ -3516,11 +3664,12 @@
                                   <form
                                     class="inline-flex"
                                     method="POST"
-                                    action="?/switchSourceToPermanent"
+                                    action="?/switchSourceLifecycle"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
                                   >
                                     <ProfileField profileId={data.user?.profile_id} />
                                     <input type="hidden" name="id" value={source.id} />
+                                    <input type="hidden" name="lifecycle" value="permanent" />
                                     <button
                                       class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
@@ -3544,11 +3693,12 @@
                                   <form
                                     class="inline-flex"
                                     method="POST"
-                                    action="?/switchSourceToOneTime"
+                                    action="?/switchSourceLifecycle"
                                     use:enhance={setPending(`source-lifecycle-${source.id}`)}
                                   >
                                     <ProfileField profileId={data.user?.profile_id} />
                                     <input type="hidden" name="id" value={source.id} />
+                                    <input type="hidden" name="lifecycle" value="one_time" />
                                     <button
                                       class="inline-flex min-h-8 items-center text-left font-medium text-secondary-600-400 underline decoration-secondary-500/50 underline-offset-2 hover:text-secondary-500-300 disabled:opacity-50"
                                       type="submit"
@@ -3567,142 +3717,213 @@
                                 >{formatSourceScan(source.last_scanned_at, source.last_status)}</span>
                               {/if}
                             </span>
-                            <details
-                              class="mt-2 w-full max-w-full"
-                              open={formState?.sourcePreview?.id === source.id || formState?.zeroMatchConfirm?.id === source.id || undefined}
-                            >
-                              <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
-                                {source.kind !== "association" && source.kind !== "builtin" ? "URL & filters" : "Filters"}{source.filters.include_genres.length || source.filters.exclude_genres.length
-                                  ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
-                                  : ""}
-                              </summary>
+                            <div class="mt-2 flex flex-col gap-1">
+                              {#if source.is_custom}
+                                <details
+                                  class="w-full max-w-full"
+                                  open={openSourceEditIds.has(source.id) || formState?.editSource?.id === source.id}
+                                  ontoggle={(event) => {
+                                    const isOpen = (event.currentTarget as HTMLDetailsElement).open;
+                                    setSourceEditOpen(source.id, isOpen);
+                                  }}
+                                >
+                                  <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                    Edit source
+                                  </summary>
+                                  <form
+                                    class="mt-2 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    method="POST"
+                                    action="?/editSource"
+                                    use:enhance={enhanceSourceEdit(source.id)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Name
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="label"
+                                        value={sourceEditDraftValue(source, "label")}
+                                        oninput={(event) => updateSourceEditDraft(source, "label", (event.currentTarget as HTMLInputElement).value)}
+                                        minlength={2}
+                                        maxlength={100}
+                                        required
+                                      />
+                                    </label>
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Public URL
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="url"
+                                        type="url"
+                                        value={sourceEditDraftValue(source, "url")}
+                                        oninput={(event) => updateSourceEditDraft(source, "url", (event.currentTarget as HTMLInputElement).value)}
+                                        placeholder="https://…"
+                                        required
+                                      />
+                                    </label>
+                                    <p class="text-xs leading-5 text-surface-600-400">
+                                      Previously discovered books kept from earlier scans stay attributed to this source after a URL change.
+                                    </p>
+                                    <InlineAlert
+                                      size="sm"
+                                      message={formState?.error && formState?.editSource?.id === source.id ? formState.message : ""}
+                                    />
+                                    <button
+                                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
+                                      type="submit"
+                                      disabled={isPending(`edit-source-${source.id}`)}
+                                      aria-busy={isPending(`edit-source-${source.id}`)}
+                                    >{#if isPending(`edit-source-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save source</button>
+                                  </form>
+                                </details>
+                              {/if}
+                              {#if source.kind !== "association" && source.kind !== "builtin"}
+                                <details
+                                  class="w-full max-w-full"
+                                  open={formState?.sourcePreview?.id === source.id || formState?.zeroMatchConfirm?.id === source.id || undefined}
+                                >
+                                  <summary class="min-h-8 cursor-pointer py-2 text-xs font-medium text-secondary-600-400 hover:text-secondary-500-300">
+                                    Filters{source.filters.include_genres.length || source.filters.exclude_genres.length
+                                      ? ` · ${source.filters.include_genres.length + source.filters.exclude_genres.length} set`
+                                      : ""}
+                                  </summary>
+                                  <form
+                                    class="mt-2 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
+                                    method="POST"
+                                    action="?/configureSourceFilters"
+                                    use:enhance={setPending(`source-filters-${source.id}`)}
+                                  >
+                                    <ProfileField profileId={data.user?.profile_id} />
+                                    <input type="hidden" name="id" value={source.id} />
+                                    <input type="hidden" name="url" value={source.url} />
+                                    <input type="hidden" name="currentUrl" value={source.url} />
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Include genres
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="includeGenres"
+                                        value={formState?.sourcePreview?.id === source.id
+                                          ? formState.sourcePreview.includeGenres
+                                          : formState?.zeroMatchConfirm?.id === source.id
+                                            ? formState.zeroMatchConfirm.includeGenres
+                                            : source.filters.include_genres.join(", ")}
+                                        placeholder="science fiction, fantasy"
+                                      />
+                                    </label>
+                                    <label class="block text-xs font-medium text-surface-800-200">
+                                      Exclude genres
+                                      <input
+                                        class="input mt-1 w-full min-w-0 max-w-full text-sm"
+                                        name="excludeGenres"
+                                        value={formState?.sourcePreview?.id === source.id
+                                          ? formState.sourcePreview.excludeGenres
+                                          : formState?.zeroMatchConfirm?.id === source.id
+                                            ? formState.zeroMatchConfirm.excludeGenres
+                                            : source.filters.exclude_genres.join(", ")}
+                                        placeholder="romance, cookbook"
+                                      />
+                                    </label>
+                                    <p class="text-xs leading-5 text-surface-600-400">
+                                      Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
+                                    </p>
+                                    {#if formState?.sourcePreview?.id === source.id}
+                                      <div
+                                        class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
+                                      >
+                                        {#if formState.sourcePreview.count === 0}
+                                          Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
+                                        {:else}
+                                          Preview matched {formState.sourcePreview.count} of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}.
+                                        {/if}
+                                      </div>
+                                    {/if}
+                                    {#if formState?.zeroMatchConfirm?.id === source.id}
+                                      <div
+                                        class="space-y-2 border-l-2 border-warning-500 preset-tonal-warning p-3 text-xs leading-5"
+                                        role="alert"
+                                      >
+                                        <p class="font-medium">
+                                          0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
+                                        </p>
+                                        <button
+                                          class="btn btn-sm btn-reflow min-h-9 preset-filled-warning-500"
+                                          type="submit"
+                                          name="confirmZeroMatch"
+                                          value="1"
+                                          disabled={isPending(`source-filters-${source.id}`)}
+                                          aria-busy={isPending(`source-filters-${source.id}`)}
+                                        ><TriangleAlert size={14} /> Confirm & save zero-match filters</button>
+                                      </div>
+                                    {/if}
+                                    <div class="flex flex-wrap items-center gap-2">
+                                      <button
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-surface"
+                                        type="submit"
+                                        name="intent"
+                                        value="preview"
+                                        disabled={isPending(`source-filters-${source.id}`)}
+                                        aria-busy={isPending(`source-filters-${source.id}`)}
+                                      ><Search size={14} /> Preview matches</button>
+                                      <button
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
+                                        type="submit"
+                                        name="intent"
+                                        value="save"
+                                        disabled={isPending(`source-filters-${source.id}`)}
+                                        aria-busy={isPending(`source-filters-${source.id}`)}
+                                      >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} Save filters</button>
+                                    </div>
+                                  </form>
+                                </details>
+                              {/if}
+                            </div>
+                          </div>
+                          <div class="ml-auto flex shrink-0 items-center gap-2">
+                            {#if source.kind === "web" && sourceEnabled(source)}
                               <form
-                                class="mt-3 w-full min-w-0 space-y-3 border-l-2 border-secondary-500/30 pl-3"
                                 method="POST"
-                                action="?/configureSourceFilters"
-                                use:enhance={setPending(`source-filters-${source.id}`)}
+                                action="?/refreshSource"
+                                use:enhance={setPending(`refresh-source-${source.id}`)}
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
-                                <input type="hidden" name="currentUrl" value={source.url} />
-                                {#if source.kind !== "association" && source.kind !== "builtin"}
-                                  <label class="block text-xs font-medium text-surface-800-200">
-                                    Feed URL
-                                    <input
-                                      class="input mt-1 w-full min-w-0 max-w-full text-sm"
-                                      name="url"
-                                      type="url"
-                                      required
-                                      value={formState?.sourcePreview?.id === source.id
-                                        ? formState.sourcePreview.url
-                                        : formState?.zeroMatchConfirm?.id === source.id
-                                          ? formState.zeroMatchConfirm.url
-                                          : source.url}
-                                      placeholder="https://example.com/books/rss"
-                                    />
-                                  </label>
-                                {/if}
-                                <label class="block text-xs font-medium text-surface-800-200">
-                                  Include genres
-                                  <input
-                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
-                                    name="includeGenres"
-                                    value={formState?.sourcePreview?.id === source.id
-                                      ? formState.sourcePreview.includeGenres
-                                      : formState?.zeroMatchConfirm?.id === source.id
-                                        ? formState.zeroMatchConfirm.includeGenres
-                                        : source.filters.include_genres.join(", ")}
-                                    placeholder="science fiction, fantasy"
+                                <button
+                                  type="submit"
+                                  class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-secondary"
+                                  aria-label={`Refresh ${source.label}`}
+                                  title={`Refresh ${source.label}`}
+                                  disabled={isPending(`refresh-source-${source.id}`)}
+                                  aria-busy={isPending(`refresh-source-${source.id}`)}
+                                >
+                                  <RefreshCw
+                                    size={15}
+                                    class={isPending(`refresh-source-${source.id}`) ? "animate-spin" : ""}
                                   />
-                                </label>
-                                <label class="block text-xs font-medium text-surface-800-200">
-                                  Exclude genres
-                                  <input
-                                    class="input mt-1 w-full min-w-0 max-w-full text-sm"
-                                    name="excludeGenres"
-                                    value={formState?.sourcePreview?.id === source.id
-                                      ? formState.sourcePreview.excludeGenres
-                                      : formState?.zeroMatchConfirm?.id === source.id
-                                        ? formState.zeroMatchConfirm.excludeGenres
-                                        : source.filters.exclude_genres.join(", ")}
-                                    placeholder="romance, cookbook"
-                                  />
-                                </label>
-                                <p class="text-xs leading-5 text-surface-600-400">
-                                  Separate genres with commas. An include filter requires a matching genre tag; untagged books remain eligible with exclusions alone.
-                                </p>
-                                {#if formState?.sourcePreview?.id === source.id}
-                                  <div
-                                    class={`border-l-2 p-2.5 text-xs leading-5 ${formState.sourcePreview.count === 0 ? "border-warning-500 preset-tonal-warning" : "border-success-500 preset-tonal-success"}`}
-                                  >
-                                    {#if formState.sourcePreview.count === 0}
-                                      Preview matched 0 of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}. Saving zero-match filters will keep existing candidates.
-                                    {:else}
-                                      Preview matched {formState.sourcePreview.count} of {formState.sourcePreview.rawCount} book{formState.sourcePreview.rawCount === 1 ? "" : "s"}.
-                                    {/if}
-                                  </div>
-                                {/if}
-                                {#if formState?.zeroMatchConfirm?.id === source.id}
-                                  <div
-                                    class="space-y-2 border-l-2 border-warning-500 preset-tonal-warning p-3 text-xs leading-5"
-                                    role="alert"
-                                  >
-                                    <p class="font-medium">
-                                      0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
-                                    </p>
-                                    <button
-                                      class="btn btn-sm btn-reflow min-h-9 preset-filled-warning-500"
-                                      type="submit"
-                                      name="confirmZeroMatch"
-                                      value="1"
-                                      disabled={isPending(`source-filters-${source.id}`)}
-                                      aria-busy={isPending(`source-filters-${source.id}`)}
-                                    ><TriangleAlert size={14} /> Confirm & save zero-match filters</button>
-                                  </div>
-                                {/if}
-                                <div class="flex flex-wrap items-center gap-2">
-                                  {#if source.kind !== "association" && source.kind !== "builtin"}
-                                    <button
-                                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-surface"
-                                      type="submit"
-                                      name="intent"
-                                      value="preview"
-                                      disabled={isPending(`source-filters-${source.id}`)}
-                                      aria-busy={isPending(`source-filters-${source.id}`)}
-                                    ><Search size={14} /> Preview matches</button>
-                                  {/if}
-                                  <button
-                                    class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
-                                    type="submit"
-                                    name="intent"
-                                    value="save"
-                                    disabled={isPending(`source-filters-${source.id}`)}
-                                    aria-busy={isPending(`source-filters-${source.id}`)}
-                                  >{#if isPending(`source-filters-${source.id}`)}<RefreshCw size={14} class="animate-spin" />{:else}<Check size={14} />{/if} {source.kind !== "association" && source.kind !== "builtin" ? (source.enabled ? "Save & rescan" : "Save URL & filters") : "Save filters"}</button>
-                                </div>
+                                </button>
                               </form>
-                            </details>
+                            {/if}
+                            <form
+                              class="shrink-0"
+                              method="POST"
+                              action="?/toggleSource"
+                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
+                            >
+                              <ProfileField profileId={data.user?.profile_id} />
+                              <input
+                                type="hidden"
+                                name="id"
+                                value={source.id}
+                              /><SwitchControl
+                                type="submit"
+                                tone="primary"
+                                checked={sourceEnabled(source)}
+                                ariaLabel={`Toggle ${source.label}`}
+                                disabled={isPending(`toggle-source-${source.id}`)}
+                                busy={isPending(`toggle-source-${source.id}`)}
+                              />
+                            </form>
                           </div>
-                          <form
-                            class="ml-auto shrink-0"
-                            method="POST"
-                            action="?/toggleSource"
-                            use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
-                          >
-                            <ProfileField profileId={data.user?.profile_id} />
-                            <input
-                              type="hidden"
-                              name="id"
-                              value={source.id}
-                            /><SwitchControl
-                              type="submit"
-                              tone="primary"
-                              checked={sourceEnabled(source)}
-                              ariaLabel={`Toggle ${source.label}`}
-                              disabled={isPending(`toggle-source-${source.id}`)}
-                              busy={isPending(`toggle-source-${source.id}`)}
-                            />
-                          </form>
                         </div>{/each}
                     {:else}
                       <div class="border-b border-surface-200-800 px-1 py-5 text-sm text-surface-600-400">
