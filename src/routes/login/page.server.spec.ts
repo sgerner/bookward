@@ -73,6 +73,16 @@ describe('login page loader', () => {
 			.rejects.toMatchObject({ status: 303, location: '/auth/oidc/start?intent=login&next=%2F' });
 	});
 
+	it('throws HTTP 503 when /auth/config is unreachable or hooks flagged an outage', async () => {
+		engine.mockRejectedValueOnce(new Error('fetch failed'));
+		await expect(load({ url: new URL('https://bookward.test/login'), locals: {} } as never))
+			.rejects.toMatchObject({ status: 503 });
+
+		await expect(load({ url: new URL('https://bookward.test/login'), locals: { engineUnavailable: true } } as never))
+			.rejects.toMatchObject({ status: 503 });
+		expect(engine).toHaveBeenCalledTimes(1);
+	});
+
 	it('forwards client IPs and distinguishes HTTP 429 wait guidance from HTTP 401 errors', async () => {
 		let seenClientIp: string | undefined;
 		engine.mockImplementationOnce(() => {

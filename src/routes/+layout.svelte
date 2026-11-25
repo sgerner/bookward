@@ -27,11 +27,12 @@
 			field.type = 'hidden'; field.name = '__profile_id'; field.value = profileId()!;
 			event.target.append(field);
 		};
-		const broadcastLogout = (event: Event) => {
-			if (event.target instanceof HTMLFormElement && event.target.action.includes('/auth/logout')) channel?.postMessage({ type: 'logout' });
+		const broadcastLogout = () => {
+			try { localStorage.removeItem('bookward-active-profile'); } catch { /* Profile checks still run through the server session. */ }
+			channel?.postMessage({ type: 'logout' });
 		};
 		document.addEventListener('submit', addProfileToForm, true);
-		document.addEventListener('submit', broadcastLogout, true);
+		window.addEventListener('bookward:logout', broadcastLogout);
 		const current = profileId();
 		if (current) {
 			saveProfile(current);
@@ -42,7 +43,7 @@
 			channel?.removeEventListener('message', onProfile);
 			channel?.close();
 			document.removeEventListener('submit', addProfileToForm, true);
-			document.removeEventListener('submit', broadcastLogout, true);
+			window.removeEventListener('bookward:logout', broadcastLogout);
 		};
 	});
 	$effect(() => {

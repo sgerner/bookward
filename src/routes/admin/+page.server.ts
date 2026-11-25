@@ -1,4 +1,4 @@
-import { fail, redirect } from '@sveltejs/kit';
+import { error as httpError, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
 
@@ -40,12 +40,23 @@ const failure = (
 	});
 
 export const load: PageServerLoad = async ({ locals }) => {
+	if (locals?.engineUnavailable) {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	if (!locals.user) throw redirect(303, '/login');
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
-	const [result, identityBackup] = await Promise.all([
-		engine<{ accounts: Account[] }>('/admin/accounts'),
-		engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
-	]);
+	let result: { accounts: Account[] };
+	let identityBackup: IdentityBackupStatus | null;
+	try {
+		[result, identityBackup] = await Promise.all([
+			engine<{ accounts: Account[] }>('/admin/accounts'),
+			engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
+		]);
+	} catch (error) {
+		if (error instanceof EngineError && error.status === 401) throw redirect(303, '/login');
+		if (error instanceof EngineError && error.status === 403) throw redirect(303, '/');
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	return { accounts: result.accounts, current_user_id: locals.user.id, identityBackup };
 };
 
