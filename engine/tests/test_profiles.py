@@ -20,10 +20,19 @@ from fastapi.testclient import TestClient
 from afterword_engine import backups, database, profiles
 from afterword_engine.api_tokens import generate_api_token, legacy_hash_api_token
 from afterword_engine.config import settings
-from afterword_engine.database import MIGRATIONS, connect, database_lock, initialize, transaction
+from afterword_engine.database import (
+    MIGRATIONS,
+    RestoreEpochError,
+    bind_restore_epoch,
+    connect,
+    current_restore_epoch,
+    database_lock,
+    initialize,
+    transaction,
+)
 import afterword_engine.jobs as jobs
 from afterword_engine.jobs import enqueue_job, worker_loop
-from afterword_engine.main import app
+from afterword_engine.main import app, queue_goodreads_rss_if_due
 from afterword_engine.secrets import installation_key, installation_key_path, seal, unseal
 from afterword_engine.tenancy import current_profile_id, profile_database_path, profile_scope
 
@@ -449,6 +458,198 @@ def test_worker_fails_jobs_after_the_retry_limit(identity_store):
     assert job["status"] == "failed"
     assert job["error"] == "Job lease expired after maximum attempts"
     assert job["lease_token"] is None
+
+
+def test_multi_profile_worker_interleaves_second_profile_score_after_first_50_row_audit_batch(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    alice = profiles.create_account("audit-alice", "audit-alice-password-long")
+    bob = profiles.create_account("score-bob", "score-bob-password-long")
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(300):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Alice Sweep Book {index}",
+                        "Alice Author",
+                        "https://example.com/alice",
+                        source_id,
+                        f"alice sweep book {index}",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        quality_module.configure_candidate_quality_sweep(mode="full")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        bob_score_job_id = enqueue_job("score", dedupe=True)
+
+    monkeypatch.setattr(
+        profiles,
+        "profile_ids",
+        lambda: [alice["profile_id"], bob["profile_id"]],
+    )
+
+    audited_per_turn: list[int] = []
+    execution_order: list[tuple[str, str]] = []
+    stop = asyncio.Event()
+
+    async def fake_audit_one(candidate, *_args, **_kwargs):
+        return {
+            "candidate_id": int(candidate["id"]),
+            "quality_status": "accepted",
+            "quality_score": 0.9,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{candidate['id']}",
+            "work_id": f"/works/OL{candidate['id']}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    async def fake_score_all(*_args, **_kwargs):
+        return 1
+
+    monkeypatch.setattr(quality_module, "_audit_one", fake_audit_one)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+
+    async def tracked_handler(kind: str):
+        pid = current_profile_id()
+        execution_order.append((pid, kind))
+        result = await engine_main.handle_job(kind)
+        if pid == alice["profile_id"] and kind == "candidate_quality":
+            audited_per_turn.append(int(result["audited"]))
+        if len(execution_order) >= 3:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(tracked_handler, stop))
+
+    # Alice runs one 50-row batch, then Bob immediately runs its score job before Alice's next batch.
+    assert execution_order[0] == (alice["profile_id"], "candidate_quality")
+    assert execution_order[1] == (bob["profile_id"], "score")
+    assert audited_per_turn[0] == quality_module.QUALITY_AUDIT_BATCH_SIZE
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_status = con.execute(
+            "SELECT status FROM jobs WHERE id=?", (bob_score_job_id,)
+        ).fetchone()["status"]
+    assert bob_status == "complete"
+
+
+def test_worker_recovers_interrupted_audit_job_and_skips_committed_subbatches(
+    identity_store, monkeypatch
+):
+    from afterword_engine import main as engine_main
+    from afterword_engine import quality as quality_module
+
+    reader = profiles.create_account("recover-reader", "recover-reader-password-long")
+    candidate_ids: list[int] = []
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            source_id = con.execute(
+                "SELECT id FROM sources WHERE url='builtin://upcoming'"
+            ).fetchone()[0]
+            for index in range(65):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,source_url,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        f"Recoverable Sweep {index}",
+                        "Sweep Writer",
+                        "https://example.com/recover",
+                        source_id,
+                        f"recoverable sweep {index}",
+                    ),
+                ).lastrowid
+                candidate_ids.append(cid)
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted',audit_version=?,audited_at='2026-01-01 00:00:00' "
+                    "WHERE candidate_id=?",
+                    (quality_module.QUALITY_VERSION, cid),
+                )
+        sweep = quality_module.configure_candidate_quality_sweep(mode="full")
+        initial_job_id = sweep["job_id"]
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2000-01-01T00:00:00+00:00',"
+                "heartbeat_at='2000-01-01T00:00:00+00:00',lease_token='crashed-worker',attempts=1 "
+                "WHERE id=?",
+                (initial_job_id,),
+            )
+
+    monkeypatch.setattr(profiles, "profile_ids", lambda: [reader["profile_id"]])
+    monkeypatch.setattr(engine_main, "score_all", lambda *_a, **_k: asyncio.sleep(0, result=0))
+
+    seen_candidates: list[int] = []
+    crashed_once = False
+
+    async def crashing_then_healthy_audit_one(candidate, *_args, **_kwargs):
+        nonlocal crashed_once
+        cid = int(candidate["id"])
+        # Crash at candidate index 20 (row 21) on the first run after two 10-row sub-batches commit.
+        if not crashed_once and cid == candidate_ids[20]:
+            crashed_once = True
+            raise RuntimeError("Simulated mid-pass crash at row 21")
+        seen_candidates.append(cid)
+        return {
+            "candidate_id": cid,
+            "quality_status": "accepted",
+            "quality_score": 0.92,
+            "flags": [],
+            "provider": "openlibrary",
+            "provider_id": f"/works/OL{cid}",
+            "work_id": f"/works/OL{cid}",
+            "title_match": 1.0,
+            "author_match": 1.0,
+        }
+
+    monkeypatch.setattr(quality_module, "_audit_one", crashing_then_healthy_audit_one)
+
+    # First attempt crashes at row 21 after committing 20 rows (two 10-row sub-batches).
+    with profile_scope(reader["profile_id"]):
+        with pytest.raises(RuntimeError, match="Simulated mid-pass crash at row 21"):
+            asyncio.run(engine_main.handle_job("candidate_quality"))
+        committed_after_crash = [
+            item["candidate_id"]
+            for item in database.rows(
+                "SELECT candidate_id FROM candidate_quality WHERE julianday(audited_at)>=julianday(?)",
+                (sweep["started_at"],),
+            )
+        ]
+        assert committed_after_crash == candidate_ids[:20]
+
+    # Worker reaps the expired lease and resumes from row 21 without repeating rows 1..20.
+    seen_candidates.clear()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        result = await engine_main.handle_job(kind)
+        if kind == "candidate_quality" and result["remaining"] == 0:
+            stop.set()
+        return result
+
+    asyncio.run(worker_loop(handler, stop))
+
+    assert seen_candidates == candidate_ids[20:]
+    with profile_scope(reader["profile_id"]):
+        summary = quality_module.quality_summary()
+    assert summary["audit"]["status"] == "complete"
+    assert summary["audit"]["remaining"] == 0
 
 
 def test_worker_skips_an_unmigratable_profile_and_keeps_serving_others(
@@ -953,6 +1154,476 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
             executor.shutdown(wait=True)
         assert lock_acquired.wait(timeout=2)
         restore.result(timeout=2)
+
+
+def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_restore(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        snapshot = backups.create_backup()
+        first_job_id = enqueue_job("disappearing_lease")
+
+    init_calls: list[str] = []
+    original_initialize = database.initialize
+
+    def spy_initialize(*, seed_demo=True):
+        init_calls.append(current_profile_id() or "legacy")
+        return original_initialize(seed_demo=seed_demo)
+
+    monkeypatch.setattr(database, "initialize", spy_initialize)
+
+    stop = asyncio.Event()
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    never_complete = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def handler(kind):
+        if kind == "disappearing_lease":
+            first_started.set()
+            try:
+                await never_complete.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+        if kind == "after_restore":
+            second_done.set()
+            stop.set()
+            return {"after_restore": True}
+        return {}
+
+    async def run():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            assert init_calls == ["legacy"]
+            with profile_scope("legacy"), transaction() as con:
+                con.execute("DELETE FROM jobs WHERE id=?", (first_job_id,))
+            await asyncio.wait_for(first_cancelled.wait(), timeout=2)
+
+            with profile_scope("legacy"):
+                await asyncio.to_thread(backups.restore_backup, snapshot["id"])
+                second_job_id = enqueue_job("after_restore")
+
+            await asyncio.wait_for(second_done.wait(), timeout=2)
+            await asyncio.wait_for(worker, timeout=2)
+            return second_job_id
+        finally:
+            stop.set()
+            never_complete.set()
+
+    second_job_id = asyncio.run(run())
+
+    with profile_scope("legacy"), connect() as con:
+        second_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (second_job_id,)
+        ).fetchone()
+    assert first_cancelled.is_set()
+    assert init_calls.count("legacy") >= 2
+    assert second_job["status"] == "complete"
+    assert second_job["result"] == '{"after_restore": true}'
+
+
+def test_heartbeat_defers_lease_renewal_while_profile_database_lock_is_held(
+    identity_store, monkeypatch, caplog
+):
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("deferred_heartbeat")
+        with transaction() as con:
+            con.execute(
+                "UPDATE jobs SET status='running',started_at='2026-01-01T00:00:00+00:00',"
+                "heartbeat_at='2026-01-01T00:00:00+00:00',lease_token='lease-1',attempts=1 "
+                "WHERE id=?",
+                (job_id,),
+            )
+        legacy_path = profile_database_path()
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(legacy_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_exclusive_lock)
+    assert lock_held.wait(timeout=2)
+
+    stop = Event()
+    lost_lease = Event()
+    caplog.set_level("INFO", logger=jobs.LOGGER.name)
+    hb_thread = Thread(
+        target=jobs._heartbeat,
+        args=("legacy", job_id, "lease-1", stop, lost_lease.set, 0),
+        daemon=True,
+    )
+    try:
+        hb_thread.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if any(
+                "Deferred lease renewal for job" in record.getMessage()
+                for record in caplog.records
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            "Deferred lease renewal for job" in record.getMessage()
+            for record in caplog.records
+        )
+        assert not lost_lease.is_set()
+
+        # Once the exclusive lock releases, heartbeat renews heartbeat_at cleanly.
+        release_lock.set()
+        future.result(timeout=2)
+        deadline = time.monotonic() + 1.0
+        renewed = None
+        while time.monotonic() < deadline:
+            with profile_scope("legacy"), connect() as con:
+                renewed = con.execute(
+                    "SELECT heartbeat_at FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()[0]
+            if renewed and renewed != "2026-01-01T00:00:00+00:00":
+                break
+            time.sleep(0.01)
+        assert renewed is not None and renewed != "2026-01-01T00:00:00+00:00"
+        assert not lost_lease.is_set()
+    finally:
+        stop.set()
+        release_lock.set()
+        hb_thread.join(timeout=2)
+        holder.shutdown(wait=True)
+
+
+def test_live_profile_restore_fences_and_quiesces_without_blocking_other_tenants(
+    identity_store,
+):
+    from datetime import datetime, timezone
+
+    alice = profiles.create_account("tenant-alice", "tenant-alice-password-long")
+    bob = profiles.create_account("tenant-bob", "tenant-bob-password-long")
+    sync_time = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+
+    for account, rss_url in (
+        (alice, "https://www.goodreads.com/review/list_rss/alice"),
+        (bob, "https://www.goodreads.com/review/list_rss/bob"),
+    ):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            with transaction() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,0)",
+                    (rss_url,),
+                )
+
+    with profile_scope(alice["profile_id"]):
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice snapshot read','Alice','test')"
+            )
+            con.execute(
+                "INSERT INTO jobs(id,kind,status) VALUES('alice-snapshot-queued','alice_snapshot','queued')"
+            )
+        alice_backup = backups.create_backup()
+        with transaction() as con:
+            con.execute("DELETE FROM jobs WHERE id='alice-snapshot-queued'")
+        alice_live_job = enqueue_job("alice_active")
+
+    with profile_scope(bob["profile_id"]):
+        bob_live_job = enqueue_job("bob_active")
+
+    alice_started = asyncio.Event()
+    alice_cancelled = asyncio.Event()
+    alice_snapshot_done = asyncio.Event()
+    alice_hold = asyncio.Event()
+    bob_started = asyncio.Event()
+    bob_release = asyncio.Event()
+    alice_stop = asyncio.Event()
+    bob_stop = asyncio.Event()
+
+    async def alice_handler(kind):
+        if current_profile_id() != alice["profile_id"]:
+            await asyncio.sleep(0.05)
+            return {}
+        if kind == "alice_snapshot":
+            alice_snapshot_done.set()
+            return {"restored_pending": True}
+        assert kind == "alice_active"
+        alice_started.set()
+        try:
+            await alice_hold.wait()
+        except asyncio.CancelledError:
+            alice_cancelled.set()
+            raise
+        return {"owner": "alice"}
+
+    async def bob_handler(kind):
+        assert current_profile_id() == bob["profile_id"]
+        assert kind == "bob_active"
+        bob_started.set()
+        await bob_release.wait()
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Bob concurrent read','Bob','test')"
+            )
+        bob_stop.set()
+        return {"owner": "bob"}
+
+    async def run():
+        # Run dedicated profile-filtered workers concurrently so Alice's active job
+        # and Bob's active job are both in flight when Alice restores.
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        try:
+            alice_worker = asyncio.create_task(worker_loop(alice_handler, alice_stop))
+            await asyncio.wait_for(alice_started.wait(), timeout=2)
+
+            profiles.profile_ids = lambda: [bob["profile_id"]]
+            bob_worker = asyncio.create_task(worker_loop(bob_handler, bob_stop))
+            await asyncio.wait_for(bob_started.wait(), timeout=2)
+            profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+
+            # While Alice's quiescence barrier is active, Alice's scheduler pauses
+            # while Bob's scheduler still queues work normally.
+            with profile_scope(alice["profile_id"]):
+                alice_lock = database_lock()
+            with alice_lock.quiesce():
+                await asyncio.wait_for(alice_cancelled.wait(), timeout=2)
+                with profile_scope(alice["profile_id"]):
+                    assert queue_goodreads_rss_if_due(sync_time) is None
+                with profile_scope(bob["profile_id"]):
+                    bob_scheduled = queue_goodreads_rss_if_due(sync_time)
+                    assert bob_scheduled is not None
+
+            # Capture a pre-restore epoch fence for Alice before swapping Alice's DB.
+            with profile_scope(alice["profile_id"]):
+                pre_restore_epoch = current_restore_epoch()
+                assert pre_restore_epoch == 0
+                await asyncio.to_thread(backups.restore_backup, alice_backup["id"])
+                with bind_restore_epoch(pre_restore_epoch):
+                    with pytest.raises(RestoreEpochError):
+                        with transaction() as con:
+                            con.execute(
+                                "INSERT INTO reads(title,author,source) VALUES('Late Alice write','Alice','test')"
+                            )
+
+            # Bob's active job was never canceled or fenced by Alice's restore,
+            # and Alice's pending queued job from the snapshot executes cleanly.
+            await asyncio.wait_for(alice_snapshot_done.wait(), timeout=2)
+            bob_release.set()
+            await asyncio.wait_for(bob_worker, timeout=2)
+            alice_stop.set()
+            await asyncio.wait_for(alice_worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            alice_stop.set()
+            bob_stop.set()
+            alice_hold.set()
+            bob_release.set()
+
+    asyncio.run(run())
+
+    with profile_scope(alice["profile_id"]), connect() as con:
+        alice_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        alice_jobs = con.execute(
+            "SELECT id,status FROM jobs WHERE status IN ('queued','running')"
+        ).fetchall()
+        restored_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id='alice-snapshot-queued'"
+        ).fetchone()
+        alice_epoch = current_restore_epoch()
+    assert alice_reads == {"Alice snapshot read"}
+    assert alice_jobs == []
+    assert restored_job["status"] == "complete"
+    assert restored_job["result"] == '{"restored_pending": true}'
+    assert alice_epoch == 1
+    assert alice_live_job is not None
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        bob_reads = {
+            item[0] for item in con.execute("SELECT title FROM reads").fetchall()
+        }
+        bob_job = con.execute(
+            "SELECT status,result FROM jobs WHERE id=?", (bob_live_job,)
+        ).fetchone()
+        bob_epoch = current_restore_epoch()
+    assert "Bob concurrent read" in bob_reads
+    assert bob_job["status"] == "complete"
+    assert bob_job["result"] == '{"owner": "bob"}'
+    assert bob_epoch == 0
+
+
+def test_worker_loop_does_not_block_event_loop_when_profile_lock_is_held(identity_store):
+    alice = profiles.create_account("locked-alice", "locked-alice-password-with-length")
+    bob = profiles.create_account("unlocked-bob", "unlocked-bob-password-with-length")
+    for account in (alice, bob):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+
+    with profile_scope(alice["profile_id"]):
+        enqueue_job("alice_blocked")
+        alice_path = profile_database_path()
+    with profile_scope(bob["profile_id"]):
+        bob_job_id = enqueue_job("bob_unblocked")
+
+    writer_held = Event()
+    release_writer = Event()
+
+    def hold_alice_writer():
+        with database_lock(alice_path):
+            writer_held.set()
+            release_writer.wait(timeout=5)
+
+    holder = ThreadPoolExecutor(max_workers=1)
+    future = holder.submit(hold_alice_writer)
+    assert writer_held.wait(timeout=2)
+
+    bob_done = asyncio.Event()
+    stop = asyncio.Event()
+    max_tick_gap = 0.0
+
+    async def monitor_loop():
+        nonlocal max_tick_gap
+        last = time.monotonic()
+        while not stop.is_set():
+            await asyncio.sleep(0.02)
+            now_mono = time.monotonic()
+            max_tick_gap = max(max_tick_gap, now_mono - last)
+            last = now_mono
+
+    async def handler(kind):
+        if kind == "bob_unblocked":
+            bob_done.set()
+            return {"bob": True}
+        stop.set()
+        return {"alice": True}
+
+    async def run():
+        orig_profile_ids = profiles.profile_ids
+        profiles.profile_ids = lambda: [alice["profile_id"], bob["profile_id"]]
+        monitor = asyncio.create_task(monitor_loop())
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Event loop remained responsive while Alice's exclusive writer lock was held.
+            assert max_tick_gap < 0.25
+            release_writer.set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            profiles.profile_ids = orig_profile_ids
+            release_writer.set()
+            stop.set()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release_writer.set()
+        future.result(timeout=2)
+        holder.shutdown(wait=True)
+
+    with profile_scope(bob["profile_id"]), connect() as con:
+        assert (
+            con.execute("SELECT status FROM jobs WHERE id=?", (bob_job_id,)).fetchone()[0]
+            == "complete"
+        )
+
+
+def test_lifespan_legacy_recovery_failure_is_guarded_and_old_schema_safety_snapshot_recovers(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "legacy-startup.db"
+    monkeypatch.setattr(settings, "db", str(database_path))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    admin = profiles.create_first_admin(
+        "startup-admin", "startup-admin-password-with-length"
+    )
+    alice = profiles.create_account(
+        "startup-alice", "startup-alice-password-with-length"
+    )
+    alice_session, _ = profiles.create_session(alice["id"])
+    admin_session, _ = profiles.create_session(admin["id"])
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Legacy safety read','Author','manual')"
+            )
+        legacy_safety = backups.create_backup()
+        broken_journal = backups._restore_journal_path()
+        broken_journal.write_text('{"safety_backup":"bookward-20260101T000000Z-missing0","selected_backup":"bookward-20260101T000000Z-missing0"}')
+
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,source) VALUES('Alice healthy read','Alice','manual')"
+            )
+
+    # 1. Broken legacy restore journal logs an error during lifespan startup without
+    #    crashing /api/health or healthy secondary tenant profiles.
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        alice_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": alice_session}
+        )
+        assert alice_overview.status_code == 200
+        assert {item["title"] for item in alice_overview.json()["history"]} == {
+            "Alice healthy read"
+        }
+
+    # 2. Old-schema safety snapshot (missing newer tables and missing jobs / settings.updated_at)
+    #    recovers cleanly during lifespan startup and migrates to the latest schema.
+    with profile_scope("legacy"):
+        safety_file = backups.backup_directory() / f"{legacy_safety['id']}.sqlite3"
+        with sqlite3.connect(safety_file) as con:
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+            con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+            con.execute("DROP TABLE IF EXISTS goodreads_shelf_items")
+            con.execute("DROP INDEX IF EXISTS idx_jobs_status_heartbeat")
+            con.execute("DROP TABLE IF EXISTS jobs")
+            existing_settings = con.execute(
+                "SELECT key,value,secret FROM settings"
+            ).fetchall()
+            con.execute("DROP TABLE settings")
+            con.execute(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0)"
+            )
+            con.executemany(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?)",
+                existing_settings,
+            )
+            con.execute("DELETE FROM schema_migrations WHERE version >= 21")
+            con.commit()
+        backups._write_restore_journal(safety_file, safety_file)
+
+    with TestClient(app) as client:
+        legacy_overview = client.get(
+            "/api/overview", headers={"x-bookward-session": admin_session}
+        )
+        assert legacy_overview.status_code == 200
+        assert "Legacy safety read" in {
+            item["title"] for item in legacy_overview.json()["history"]
+        }
+
+    with profile_scope("legacy"), connect() as con:
+        assert not backups._restore_journal_path().exists()
+        assert (
+            con.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            == MIGRATIONS[-1][0]
+        )
+        assert current_restore_epoch() >= 1
 
 
 def test_existing_install_upgrade_preserves_legacy_data_password_and_api_token(tmp_path, monkeypatch):
@@ -1738,6 +2409,786 @@ def test_reenabling_profile_applies_migrations_accumulated_while_disabled(identi
     assert feedback_migration in applied
 
 
+def test_auth_registry_key_caches_disk_secret_and_auth_connect_creates_0600_file(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+    import os
+    import stat
+    from cryptography.fernet import Fernet
+    import afterword_engine.secrets as engine_secrets
+
+    db_one = tmp_path / "one" / "afterword.db"
+    db_two = tmp_path / "two" / "afterword.db"
+    monkeypatch.setattr(settings, "db", str(db_one))
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    engine_secrets.clear_auth_registry_key_cache()
+
+    # Creating a brand-new registry file enforces 0600 and propagates chmod failures.
+    unwritable_chmod_db = tmp_path / "chmod-new-fail" / "afterword.db"
+    with monkeypatch.context() as m:
+        m.setattr(settings, "db", str(unwritable_chmod_db))
+        original_chmod = Path.chmod
+
+        def failing_new_chmod(self: Path, mode: int, *, follow_symlinks: bool = True):
+            if self == profiles.auth_path():
+                raise PermissionError("chmod blocked on new file")
+            return original_chmod(self, mode, follow_symlinks=follow_symlinks)
+
+        m.setattr(Path, "chmod", failing_new_chmod)
+        with pytest.raises(PermissionError, match="chmod blocked on new file"):
+            profiles.auth_connect()
+        assert not profiles.auth_path().exists()
+
+    previous_umask = os.umask(0)
+    try:
+        with profiles.auth_connect() as con:
+            con.execute("SELECT 1").fetchone()
+            inside_con = con
+    finally:
+        os.umask(previous_umask)
+
+    registry = profiles.auth_path()
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    with pytest.raises(sqlite3.ProgrammingError):
+        inside_con.execute("SELECT 1")
+
+    registry.chmod(0o644)
+    with profiles.auth_connect() as con:
+        con.execute("SELECT 1").fetchone()
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+
+    # Pre-existing registry files owned by another uid or on bind mounts log a warning
+    # and continue rather than turning every auth request into a 500.
+    profiles.initialize_auth()
+    reader = profiles.create_account("chmod-reader", "chmod-reader-password-long")
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+    reader_session, _ = profiles.create_session(reader["id"])
+    reader_token = profiles.create_profile_api_token(reader["profile_id"], "Chmod token")["token"]
+
+    with monkeypatch.context() as m:
+        original_chmod = Path.chmod
+
+        def failing_existing_chmod(self: Path, mode: int, *, follow_symlinks: bool = True):
+            if self == registry:
+                raise PermissionError("Operation not permitted")
+            return original_chmod(self, mode, follow_symlinks=follow_symlinks)
+
+        m.setattr(Path, "chmod", failing_existing_chmod)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="afterword_engine.profiles"):
+            with profiles.auth_connect() as con:
+                assert con.execute("SELECT 1").fetchone()[0] == 1
+            with TestClient(app) as client:
+                assert (
+                    client.get(
+                        "/api/v1/me", headers={"Authorization": f"Bearer {reader_token}"}
+                    ).status_code
+                    == 200
+                )
+                assert (
+                    client.get(
+                        "/auth/me", headers={"x-bookward-session": reader_session}
+                    ).status_code
+                    == 200
+                )
+        chmod_warnings = [
+            record.message
+            for record in caplog.records
+            if "Could not restrict permissions on existing auth registry" in record.message
+        ]
+        assert len(chmod_warnings) == 1
+
+    engine_secrets.clear_auth_registry_key_cache()
+    disk_reads = 0
+    original_generated_key = engine_secrets._generated_key
+
+    def counting_generated_key(path: Path) -> bytes:
+        nonlocal disk_reads
+        disk_reads += 1
+        return original_generated_key(path)
+
+    monkeypatch.setattr(engine_secrets, "_generated_key", counting_generated_key)
+
+    first = engine_secrets.auth_registry_key()
+    second = engine_secrets.auth_registry_key()
+    assert first == second
+    assert disk_reads == 1
+
+    env_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("AFTERWORD_SECRET_KEY", env_key)
+    assert engine_secrets.auth_registry_key() == env_key.encode()
+    assert disk_reads == 1
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY")
+    assert engine_secrets.auth_registry_key() == first
+    assert disk_reads == 1
+
+    # Atomic file replacement (os.replace) refreshes the cached secret.
+    key_path = db_one.with_name("secret.key")
+    replacement_file = db_one.with_name("secret.key.next")
+    replacement_key = Fernet.generate_key()
+    replacement_file.write_bytes(replacement_key)
+    replacement_file.replace(key_path)
+    assert engine_secrets.auth_registry_key() == replacement_key
+    assert disk_reads == 2
+    assert engine_secrets.auth_registry_key() == replacement_key
+    assert disk_reads == 2
+
+    # Switching settings.db refreshes automatically.
+    monkeypatch.setattr(settings, "db", str(db_two))
+    other_key = engine_secrets.auth_registry_key()
+    assert other_key != replacement_key
+    assert disk_reads == 3
+
+
+def test_api_token_digest_cache_is_bounded_hmac_keyed_and_excludes_invalid_tokens(
+    identity_store, monkeypatch
+):
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.hmac import HMAC
+    from afterword_engine.api_tokens import hash_api_token
+    from afterword_engine.secrets import auth_registry_key
+
+    profiles.invalidate_auth_caches(clear_all=True)
+    reader = profiles.create_account("cache-reader", "cache-reader-password-long")
+    created_a = profiles.create_profile_api_token(reader["profile_id"], "Token A")
+    created_b = profiles.create_profile_api_token(reader["profile_id"], "Token B")
+    created_c = profiles.create_profile_api_token(reader["profile_id"], "Token C")
+    token_a = created_a["token"]
+
+    # Invalid tokens never enter the verified digest cache.
+    invalid_token = generate_api_token()
+    assert profiles.authenticate_api_token(invalid_token) is None
+    assert len(profiles._VERIFIED_TOKEN_DIGESTS) == 0
+
+    derivations = 0
+
+    def counting_hash(raw: str) -> str:
+        nonlocal derivations
+        derivations += 1
+        return hash_api_token(raw)
+
+    monkeypatch.setattr(profiles, "hash_api_token", counting_hash)
+
+    assert profiles.authenticate_api_token(token_a)["id"] == created_a["id"]
+    assert derivations == 1
+
+    expected_mac = HMAC(auth_registry_key(), hashes.SHA256())
+    expected_mac.update(token_a.encode("utf-8"))
+    expected_hmac_key = expected_mac.finalize().hex()
+    assert list(profiles._VERIFIED_TOKEN_DIGESTS.keys()) == [expected_hmac_key]
+    cached_entry = profiles._VERIFIED_TOKEN_DIGESTS[expected_hmac_key]
+    assert token_a not in profiles._VERIFIED_TOKEN_DIGESTS
+    assert token_a not in repr(cached_entry)
+
+    # Rotating the installation signing secret changes the derived HMAC cache key.
+    with monkeypatch.context() as m:
+        m.setenv("AFTERWORD_SECRET_KEY", Fernet.generate_key().decode())
+        assert profiles._token_cache_key(token_a) != expected_hmac_key
+
+    # Repeat authentications hit the digest cache without recomputing PBKDF2.
+    for _ in range(10):
+        verified = profiles.authenticate_api_token(token_a)
+        assert verified["profile_id"] == reader["profile_id"]
+    assert derivations == 1
+    with profiles.auth_connect() as con:
+        last_used = con.execute(
+            "SELECT last_used_at FROM api_tokens WHERE id=?", (created_a["id"],)
+        ).fetchone()["last_used_at"]
+    assert last_used is not None
+
+    # Bounded LRU eviction keeps at most TOKEN_CACHE_MAX_ENTRIES entries.
+    monkeypatch.setattr(profiles, "TOKEN_CACHE_MAX_ENTRIES", 2)
+    assert profiles.authenticate_api_token(created_b["token"]) is not None
+    assert profiles.authenticate_api_token(token_a) is not None  # Refresh A as MRU
+    assert profiles.authenticate_api_token(created_c["token"]) is not None  # Evicts B
+    assert len(profiles._VERIFIED_TOKEN_DIGESTS) == 2
+    assert profiles.has_cached_api_token(token_a) is True
+    assert profiles.has_cached_api_token(created_c["token"]) is True
+    assert profiles.has_cached_api_token(created_b["token"]) is False
+
+
+def test_http_cached_token_revocation_and_active_account_requirement(
+    identity_store, tmp_path, monkeypatch
+):
+    from afterword_engine.api_tokens import hash_api_token
+
+    reader = profiles.create_account("revoke-reader", "revoke-reader-password-long")
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+    reader_session, _ = profiles.create_session(reader["id"])
+
+    first = profiles.create_profile_api_token(reader["profile_id"], "First")
+    second = profiles.create_profile_api_token(reader["profile_id"], "Second")
+    third = profiles.create_profile_api_token(reader["profile_id"], "Third")
+    status_token = profiles.create_profile_api_token(reader["profile_id"], "Status")
+    uncached_status_token = profiles.create_profile_api_token(
+        reader["profile_id"], "Uncached status"
+    )
+
+    derivations = 0
+
+    def counting_hash(raw: str) -> str:
+        nonlocal derivations
+        derivations += 1
+        return hash_api_token(raw)
+
+    monkeypatch.setattr(profiles, "hash_api_token", counting_hash)
+
+    with TestClient(app) as client:
+        # Warm first token over HTTP and verify repeat call hits cache, then revoke over HTTP.
+        res = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {first['token']}"}
+        )
+        assert res.status_code == 200
+        assert res.json()["profile_id"] == reader["profile_id"]
+        assert profiles.has_cached_api_token(first["token"]) is True
+        derivations_after_warm = derivations
+
+        res_cached = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {first['token']}"}
+        )
+        assert res_cached.status_code == 200
+        assert derivations == derivations_after_warm
+
+        revoke_res = client.post(
+            f"/api/tokens/{first['id']}/revoke",
+            headers={"x-bookward-session": reader_session},
+        )
+        assert revoke_res.status_code == 200
+        assert profiles.has_cached_api_token(first["token"]) is False
+
+        rejected = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {first['token']}"}
+        )
+        assert rejected.status_code == 401
+        assert rejected.headers.get("cache-control") == "no-store"
+
+        # Warm second token and revoke via DELETE /api/settings/api-tokens/{id}.
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {second['token']}"}
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(second["token"]) is True
+        delete_res = client.delete(
+            f"/api/settings/api-tokens/{second['id']}",
+            headers={"x-bookward-session": reader_session},
+        )
+        assert delete_res.status_code == 200
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {second['token']}"}
+            ).status_code
+            == 401
+        )
+
+        # Out-of-band SQLite revocation while still cached in memory is rejected on live SELECT.
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {third['token']}"}
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(third["token"]) is True
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE api_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE id=?",
+                (third["id"],),
+            )
+        assert profiles.has_cached_api_token(third["token"]) is True
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {third['token']}"}
+            ).status_code
+            == 401
+        )
+        assert profiles.has_cached_api_token(third["token"]) is False
+
+        # Password updates and resets immediately drop cached token entries while
+        # personal API tokens survive password rotation (same as main).
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(status_token["token"]) is True
+        profiles.update_password(reader["id"], "updated-reader-password-long")
+        assert profiles.has_cached_api_token(status_token["token"]) is False
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(status_token["token"]) is True
+        profiles.reset_password(reader["id"], "reset-reader-password-long-enough")
+        assert profiles.has_cached_api_token(status_token["token"]) is False
+
+        # Requiring active account status: even if profiles.status remains 'active' and
+        # api_tokens.revoked_at is NULL, disabling accounts.status rejects both cached
+        # and uncached tokens over HTTP and direct calls.
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(status_token["token"]) is True
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE accounts SET status='disabled' WHERE id=?", (reader["id"],)
+            )
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 401
+        )
+        assert profiles.has_cached_api_token(status_token["token"]) is False
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {uncached_status_token['token']}"},
+            ).status_code
+            == 401
+        )
+        assert profiles.authenticate_api_token(uncached_status_token["token"]) is None
+
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE accounts SET status='active' WHERE id=?", (reader["id"],)
+            )
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 200
+        )
+
+        # Standard set_account_status('disabled') and restore_auth_backup also invalidate.
+        profiles.set_account_status(reader["id"], "disabled")
+        assert profiles.has_cached_api_token(status_token["token"]) is False
+        assert (
+            client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {status_token['token']}"},
+            ).status_code
+            == 401
+        )
+
+    other = profiles.create_account("restore-invalidate", "restore-invalidate-password")
+    before_restore = profiles.create_profile_api_token(other["profile_id"], "Snapshot token")
+    snapshot = backups.create_auth_backup()
+    assert profiles.authenticate_api_token(before_restore["token"]) is not None
+    assert profiles.has_cached_api_token(before_restore["token"]) is True
+    backups.restore_auth_backup(snapshot["id"])
+    assert profiles.has_cached_api_token(before_restore["token"]) is False
+    assert profiles.authenticate_api_token(before_restore["token"]) is None
+
+    # Pre-setup legacy profile (no account row yet) still authenticates active legacy tokens,
+    # and create_first_admin invalidates pre-account cached entries.
+    fresh_db = tmp_path / "pre-setup" / "afterword.db"
+    monkeypatch.setattr(settings, "db", str(fresh_db))
+    monkeypatch.delenv("AFTERWORD_AUTH_PASSWORD", raising=False)
+    profiles.invalidate_auth_caches(clear_all=True)
+    profiles.initialize_auth()
+    legacy_token = profiles.create_profile_api_token("legacy", "Pre-setup legacy")
+    assert profiles.authenticate_api_token(legacy_token["token"])["profile_id"] == "legacy"
+    assert profiles.has_cached_api_token(legacy_token["token"]) is True
+    admin = profiles.create_first_admin("bootstrap-admin", "bootstrap-admin-password")
+    assert profiles.has_cached_api_token(legacy_token["token"]) is False
+    assert profiles.authenticate_api_token(legacy_token["token"])["profile_id"] == "legacy"
+    with profiles.auth_connect() as con:
+        con.execute("UPDATE accounts SET status='disabled' WHERE id=?", (admin["id"],))
+    assert profiles.authenticate_api_token(legacy_token["token"]) is None
+
+
+def test_legacy_token_upgraded_between_lookups_still_authenticates(
+    identity_store, monkeypatch
+):
+    from afterword_engine.api_tokens import hash_api_token
+
+    reader = profiles.create_account("legacy-gap", "legacy-gap-password-long")
+    created = profiles.create_profile_api_token(reader["profile_id"], "Legacy gap")
+    raw_token = created["token"]
+    token_id = created["id"]
+    upgraded_hash = hash_api_token(raw_token)
+    legacy_digest = legacy_hash_api_token(raw_token)
+    with profiles.auth_connect() as con:
+        con.execute(
+            "UPDATE api_tokens SET token_hash=? WHERE id=?", (legacy_digest, token_id)
+        )
+    profiles.invalidate_auth_caches(clear_all=True)
+
+    real_auth_connect = profiles.auth_connect
+    upgraded = []
+
+    def upgrade_before_legacy_lookup(statement):
+        # Simulate another request finishing the legacy upgrade right after this
+        # request's lookup of the upgraded hash and before its legacy lookup.
+        if legacy_digest in statement and not upgraded:
+            upgraded.append(True)
+            other = sqlite3.connect(profiles.auth_path(), timeout=5)
+            other.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=?", (upgraded_hash, token_id)
+            )
+            other.commit()
+            other.close()
+
+    def traced_auth_connect(*args, **kwargs):
+        con = real_auth_connect(*args, **kwargs)
+        con.set_trace_callback(upgrade_before_legacy_lookup)
+        return con
+
+    monkeypatch.setattr(profiles, "auth_connect", traced_auth_connect)
+    result = profiles.authenticate_api_token(raw_token)
+
+    assert upgraded
+    assert result is not None and result["id"] == token_id
+
+
+def test_concurrent_legacy_api_token_upgrade_guards_old_token_hash(
+    identity_store, monkeypatch
+):
+    from afterword_engine.api_tokens import hash_api_token
+
+    reader = profiles.create_account("legacy-upgrade", "legacy-upgrade-password-long")
+    created = profiles.create_profile_api_token(reader["profile_id"], "Legacy upgrade")
+    raw_token = created["token"]
+    token_id = created["id"]
+    expected_upgraded_hash = hash_api_token(raw_token)
+    legacy_digest = legacy_hash_api_token(raw_token)
+
+    with profiles.auth_connect() as con:
+        con.execute(
+            "UPDATE api_tokens SET token_hash=?,last_used_at=NULL WHERE id=?",
+            (legacy_digest, token_id),
+        )
+    profiles.invalidate_auth_caches(clear_all=True)
+
+    barrier = Barrier(4)
+
+    def upgrade_worker():
+        barrier.wait(timeout=5)
+        return profiles.authenticate_api_token(raw_token)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(upgrade_worker) for _ in range(4)]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert all(
+        item is not None and item["id"] == token_id and item["token_hash"] == expected_upgraded_hash
+        for item in results
+    )
+    with profiles.auth_connect() as con:
+        stored = con.execute(
+            "SELECT token_hash,last_used_at FROM api_tokens WHERE id=?", (token_id,)
+        ).fetchone()
+    assert stored["token_hash"] == expected_upgraded_hash
+    assert stored["last_used_at"] is not None
+
+    # Verify WHERE id=? AND token_hash=<legacy_hash> prevents overwriting a concurrently
+    # rotated hash if token_hash changes between the read SELECT and BEGIN IMMEDIATE.
+    second = profiles.create_profile_api_token(reader["profile_id"], "Legacy race")
+    second_raw = second["token"]
+    second_id = second["id"]
+    rotated_raw = generate_api_token()
+    rotated_hash = hash_api_token(rotated_raw)
+
+    with profiles.auth_connect() as con:
+        con.execute(
+            "UPDATE api_tokens SET token_hash=?,last_used_at=NULL WHERE id=?",
+            (legacy_hash_api_token(second_raw), second_id),
+        )
+    profiles.invalidate_auth_caches(clear_all=True)
+
+    original_complete = profiles._complete_api_token_auth
+
+    def racing_complete(con, **kwargs):
+        with profiles.auth_connect() as other_con:
+            other_con.execute(
+                "UPDATE api_tokens SET token_hash=? WHERE id=?",
+                (rotated_hash, second_id),
+            )
+            other_con.commit()
+        return original_complete(con, **kwargs)
+
+    monkeypatch.setattr(profiles, "_complete_api_token_auth", racing_complete)
+    assert profiles.authenticate_api_token(second_raw) is None
+    assert profiles.has_cached_api_token(second_raw) is False
+    with profiles.auth_connect() as con:
+        preserved = con.execute(
+            "SELECT token_hash FROM api_tokens WHERE id=?", (second_id,)
+        ).fetchone()["token_hash"]
+    assert preserved == rotated_hash
+
+
+def test_concurrent_api_token_derivations_are_capped_without_blocking_loop_or_sessions(
+    identity_store, monkeypatch
+):
+    import threading
+    from afterword_engine.api_tokens import hash_api_token
+
+    readers = [
+        profiles.create_account(f"api-reader-{idx}", f"api-reader-{idx}-password-long")
+        for idx in range(9)
+    ]
+    for reader in readers:
+        with profile_scope(reader["profile_id"]):
+            initialize(seed_demo=False)
+    session_token, _ = profiles.create_session(readers[0]["id"])
+    valid_tokens = [
+        profiles.create_profile_api_token(readers[idx]["profile_id"], f"Client {idx}")["token"]
+        for idx in range(8)
+    ]
+    cached_bypass_token = profiles.create_profile_api_token(
+        readers[8]["profile_id"], "Warm client"
+    )["token"]
+    assert profiles.authenticate_api_token(cached_bypass_token) is not None
+    assert profiles.has_cached_api_token(cached_bypass_token) is True
+
+    assert not hasattr(profiles, "_TOKEN_DERIVATION_SEMAPHORE")
+    invalid_tokens = [generate_api_token() for _ in range(8)]
+    concurrency_cap = profiles.TOKEN_DERIVATION_CONCURRENCY
+
+    # Verify lifespan primes secret.key at startup and has_cached_api_token runs off the event loop.
+    startup_db = Path(settings.db).parent / "startup-prime" / "afterword.db"
+    with monkeypatch.context() as m:
+        import afterword_engine.secrets as engine_secrets
+
+        m.setattr(settings, "db", str(startup_db))
+        m.delenv("AFTERWORD_SECRET_KEY", raising=False)
+        engine_secrets.clear_auth_registry_key_cache()
+        assert not startup_db.with_name("secret.key").exists()
+        with TestClient(app):
+            assert startup_db.with_name("secret.key").is_file()
+            assert engine_secrets._AUTH_REGISTRY_KEY_CACHE is not None
+
+    original_has_cached = profiles.has_cached_api_token
+    has_cached_threads: list[int] = []
+
+    def tracking_has_cached(token: str | None) -> bool:
+        has_cached_threads.append(threading.get_ident())
+        return original_has_cached(token)
+
+    monkeypatch.setattr(profiles, "has_cached_api_token", tracking_has_cached)
+
+    async def exercise_batch(batch: list[str], expected_status: int) -> int:
+        active_derivations = 0
+        peak_derivations = 0
+        counter_lock = threading.Lock()
+        slots_filled = Event()
+        release_derivations = Event()
+
+        def gated_hash_api_token(token: str) -> str:
+            nonlocal active_derivations, peak_derivations
+            with counter_lock:
+                active_derivations += 1
+                peak_derivations = max(peak_derivations, active_derivations)
+                if active_derivations >= concurrency_cap:
+                    slots_filled.set()
+            try:
+                assert release_derivations.wait(timeout=5)
+                return hash_api_token(token)
+            finally:
+                with counter_lock:
+                    active_derivations -= 1
+
+        monkeypatch.setattr(profiles, "hash_api_token", gated_hash_api_token)
+        for token in valid_tokens:
+            profiles.invalidate_auth_caches(cache_key=profiles._token_cache_key(token))
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            pending = [
+                asyncio.create_task(
+                    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+                )
+                for token in batch
+            ]
+            try:
+                assert await asyncio.to_thread(slots_filled.wait, 5)
+                assert peak_derivations == concurrency_cap
+
+                # While every uncached derivation slot is blocked in worker threads,
+                # the asyncio event loop, /api/health, /auth/me, and cached /api/v1/me
+                # requests all complete without waiting on the derivation limiter.
+                await asyncio.sleep(0)
+                health_res = await client.get("/api/health")
+                assert health_res.status_code == 200
+
+                me_res = await client.get(
+                    "/auth/me", headers={"x-bookward-session": session_token}
+                )
+                assert me_res.status_code == 200
+
+                cached_res = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {cached_bypass_token}"},
+                )
+                assert cached_res.status_code == 200
+            finally:
+                release_derivations.set()
+
+            responses = await asyncio.gather(*pending)
+            assert all(item.status_code == expected_status for item in responses)
+        return peak_derivations
+
+    async def check_off_loop_and_bounded_timeout() -> None:
+        event_loop_thread_id = threading.get_ident()
+        has_cached_threads.clear()
+
+        slots_filled = Event()
+        release_derivations = Event()
+        filler_lock = threading.Lock()
+        active_fillers = 0
+
+        def blocking_hash_api_token(token: str) -> str:
+            nonlocal active_fillers
+            with filler_lock:
+                active_fillers += 1
+                if active_fillers >= concurrency_cap:
+                    slots_filled.set()
+            try:
+                assert release_derivations.wait(timeout=5)
+                return hash_api_token(token)
+            finally:
+                with filler_lock:
+                    active_fillers -= 1
+
+        monkeypatch.setattr(profiles, "hash_api_token", blocking_hash_api_token)
+        monkeypatch.setattr(profiles, "TOKEN_DERIVATION_WAIT_SECONDS", 0.05)
+
+        fillers = [generate_api_token() for _ in range(concurrency_cap)]
+        overflow_cold = valid_tokens[0]
+        profiles.invalidate_auth_caches(cache_key=profiles._token_cache_key(overflow_cold))
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            held_tasks = [
+                asyncio.create_task(
+                    client.get("/api/v1/me", headers={"Authorization": f"Bearer {bad}"})
+                )
+                for bad in fillers
+            ]
+            try:
+                assert await asyncio.to_thread(slots_filled.wait, 5)
+                # Give all concurrency_cap filler tasks a turn to acquire slots.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+                overflow_res = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {overflow_cold}"},
+                )
+                assert overflow_res.status_code == 503
+                assert overflow_res.headers.get("cache-control") == "no-store"
+                assert "profile_id" not in overflow_res.text
+
+                cached_res = await client.get(
+                    "/api/v1/me",
+                    headers={"Authorization": f"Bearer {cached_bypass_token}"},
+                )
+                assert cached_res.status_code == 200
+            finally:
+                release_derivations.set()
+
+            held_responses = await asyncio.gather(*held_tasks)
+            assert all(res.status_code == 401 for res in held_responses)
+
+            # Semaphore permits were cleanly preserved after timeout: cold valid token now succeeds.
+            recovered_res = await client.get(
+                "/api/v1/me",
+                headers={"Authorization": f"Bearer {overflow_cold}"},
+            )
+            assert recovered_res.status_code == 200
+
+        assert has_cached_threads
+        assert all(tid != event_loop_thread_id for tid in has_cached_threads)
+
+    assert asyncio.run(exercise_batch(valid_tokens, 200)) <= concurrency_cap
+    assert asyncio.run(exercise_batch(invalid_tokens, 401)) <= concurrency_cap
+    for bad in invalid_tokens:
+        assert profiles.has_cached_api_token(bad) is False
+    asyncio.run(check_off_loop_and_bounded_timeout())
+
+
+def test_locked_auth_registry_fails_closed_for_cached_and_uncached_requests(
+    identity_store, monkeypatch
+):
+    reader = profiles.create_account("locked-reader", "locked-reader-password-long")
+    with profile_scope(reader["profile_id"]):
+        initialize(seed_demo=False)
+    session_token, _ = profiles.create_session(reader["id"])
+    cached_token = profiles.create_profile_api_token(reader["profile_id"], "Cached")["token"]
+    uncached_token = profiles.create_profile_api_token(reader["profile_id"], "Uncached")["token"]
+
+    assert profiles.authenticate_api_token(cached_token) is not None
+    assert profiles.has_cached_api_token(cached_token) is True
+    assert profiles.has_cached_api_token(uncached_token) is False
+
+    monkeypatch.setattr(profiles, "AUTH_BUSY_TIMEOUT_MS", 50)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        locker = sqlite3.connect(profiles.auth_path(), timeout=5, isolation_level=None)
+        try:
+            locker.execute("BEGIN EXCLUSIVE")
+            health_res = client.get("/api/health")
+            assert health_res.status_code == 200
+
+            cached_res = client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {cached_token}"}
+            )
+            assert cached_res.status_code == 500
+            assert "profile_id" not in cached_res.text
+
+            uncached_res = client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {uncached_token}"}
+            )
+            assert uncached_res.status_code == 500
+            assert profiles.has_cached_api_token(uncached_token) is False
+
+            session_res = client.get(
+                "/auth/me", headers={"x-bookward-session": session_token}
+            )
+            assert session_res.status_code == 500
+            assert "profile_id" not in session_res.text
+        finally:
+            locker.rollback()
+            locker.close()
+
+    with TestClient(app) as client:
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {cached_token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {uncached_token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/auth/me", headers={"x-bookward-session": session_token}
+            ).status_code
+            == 200
+        )
+
+
 @respx.mock
 def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
     identity_store, monkeypatch
@@ -2059,6 +3510,15 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         )
         assert duplicate_username.status_code == 409
 
+        # Warm the personal API token cache before enrollment and verify commit drops the cached digest.
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(sso_api_token) is True
+
         enrolled = client.post(
             "/auth/password/change",
             headers={"x-bookward-session": enroll_session},
@@ -2067,6 +3527,7 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         assert enrolled.status_code == 200
         assert enrolled.json()["username"] == "chosen-reader"
         assert enrolled.json()["has_local_username"] is True
+        assert profiles.has_cached_api_token(sso_api_token) is False
         rotated_session = enrolled.json()["session_token"]
 
         # Enrolling local credentials bumps auth_version and revokes all prior sessions.
@@ -2101,6 +3562,7 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
         )
         assert token_after_enroll.status_code == 200
         assert token_after_enroll.json()["profile_id"] == sso_reader["profile_id"]
+        assert profiles.has_cached_api_token(sso_api_token) is True
 
         admin_reset_after_enroll = client.post(
             f"/admin/accounts/{sso_reader['id']}/password",
@@ -2108,12 +3570,14 @@ def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
             json={"password": "admin-reset-enrolled-password-long"},
         )
         assert admin_reset_after_enroll.status_code == 200
+        assert profiles.has_cached_api_token(sso_api_token) is False
         assert client.get("/auth/me", headers={"x-bookward-session": rotated_session}).status_code == 401
         token_after_reset = client.get(
             "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
         )
         assert token_after_reset.status_code == 200
         assert token_after_reset.json()["profile_id"] == sso_reader["profile_id"]
+        assert profiles.has_cached_api_token(sso_api_token) is True
 
 
 def test_legacy_oidc_prefixed_local_account_migrates_and_retains_login_and_reset(identity_store):
@@ -2266,6 +3730,11 @@ def test_update_password_integrity_error_rolls_back_without_revoking_sessions(id
     sso_reader = profiles.create_oidc_account(
         "https://identity.example", "integrity-subject", "integrity@example.test", "Integrity Reader"
     )
+    integrity_token = profiles.create_profile_api_token(
+        sso_reader["profile_id"], "Integrity Token"
+    )["token"]
+    assert profiles.authenticate_api_token(integrity_token) is not None
+    assert profiles.has_cached_api_token(integrity_token) is True
     original_username = sso_reader["username"]
     enroll_session, _ = profiles.create_session(sso_reader["id"])
     sibling_session, _ = profiles.create_session(sso_reader["id"])
@@ -2275,6 +3744,7 @@ def test_update_password_integrity_error_rolls_back_without_revoking_sessions(id
         profiles.update_password(
             sso_reader["id"], "candidate-password-long", username="Already-Taken"
         )
+    assert profiles.has_cached_api_token(integrity_token) is True
 
     with TestClient(app) as client:
         conflict = client.post(
@@ -2283,6 +3753,7 @@ def test_update_password_integrity_error_rolls_back_without_revoking_sessions(id
             json={"username": "Already-Taken", "new_password": "candidate-password-long"},
         )
         assert conflict.status_code == 409
+        assert profiles.has_cached_api_token(integrity_token) is True
 
         # Neither the account row nor active sessions were mutated or revoked on conflict.
         unchanged = profiles.account_by_id(sso_reader["id"])
@@ -2309,6 +3780,7 @@ def test_update_password_integrity_error_rolls_back_without_revoking_sessions(id
         assert retry.status_code == 200
         assert retry.json()["username"] == "available-reader"
         assert retry.json()["has_local_username"] is True
+        assert profiles.has_cached_api_token(integrity_token) is False
         assert profiles.resolve_session(sibling_session) is None
         assert profiles.resolve_session(enroll_session) is None
 
@@ -2339,4 +3811,3 @@ def test_admin_password_reset_blocks_sso_only_accounts_and_rejects_reserved_user
 
     reloaded = profiles.account_by_id(sso_reader["id"])
     assert reloaded["must_change_password"] is False
-

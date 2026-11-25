@@ -23,6 +23,50 @@ type BackupStatus = {
   last_error: string | null;
   next_backup_at: string | null;
   backups: Array<{ id: string; created_at: string; size_bytes: number }>;
+  retention_enabled?: boolean;
+  evidence_rotation_enabled?: boolean;
+  database_size_bytes?: number;
+  wal_size_bytes?: number;
+  live_size_bytes?: number;
+  reclaimable_bytes?: number;
+  backup_total_size_bytes?: number;
+  auto_vacuum_mode?: "none" | "full" | "incremental";
+  evidence_used_bytes?: number;
+  evidence_quota_bytes?: number;
+  evidence_high_watermark_bytes?: number;
+  evidence_low_watermark_bytes?: number;
+  evidence_usage_ratio?: number;
+  evidence_status?: "healthy" | "warning" | "exceeded";
+  evidence_complete_runs?: number;
+  evidence_incomplete_runs?: number;
+};
+
+type CatalogAuditStatus = {
+  status: "idle" | "queued" | "running" | "failed" | "paused" | "complete";
+  active: boolean;
+  mode: "incremental" | "full";
+  last_mode: "incremental" | "full" | null;
+  batch_size: number;
+  subbatch_size: number;
+  remaining: number;
+  progress: number;
+  started_at: string | null;
+  completed_at: string | null;
+  job_id: string | null;
+  last_error: string | null;
+  can_retry: boolean;
+};
+
+type CatalogQuality = {
+  statuses: Array<{ quality_status: string; count: number }>;
+  identifiers: {
+    total: number;
+    with_isbn13: number;
+    with_catalog_match: number;
+  };
+  flags: Record<string, number>;
+  version: string;
+  audit: CatalogAuditStatus;
 };
 
 type Overview = {
@@ -157,12 +201,31 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     last_error: null,
     next_backup_at: null,
     backups: [],
+    retention_enabled: false,
+    evidence_rotation_enabled: false,
+    database_size_bytes: 0,
+    wal_size_bytes: 0,
+    live_size_bytes: 0,
+    reclaimable_bytes: 0,
+    backup_total_size_bytes: 0,
+    auto_vacuum_mode: "incremental",
+    evidence_used_bytes: 0,
+    evidence_quota_bytes: 512 * 1024 * 1024,
+    evidence_high_watermark_bytes: Math.floor(512 * 1024 * 1024 * 0.8),
+    evidence_low_watermark_bytes: Math.floor(512 * 1024 * 1024 * 0.65),
+    evidence_usage_ratio: 0,
+    evidence_status: "healthy",
+    evidence_complete_runs: 0,
+    evidence_incomplete_runs: 0,
   };
   const overviewRequest = engine<Overview>(
     "/api/overview?recommendation_limit=24&decision_limit=24",
   );
-  const backupStatusRequest = engine<BackupStatus>("/api/backups").catch(
-    () => fallbackBackupStatus,
+  const backupStatusRequest = engine<BackupStatus>("/api/backups")
+    .then((status) => ({ ...fallbackBackupStatus, ...status }))
+    .catch(() => fallbackBackupStatus);
+  const catalogQualityRequest = engine<unknown>("/api/candidates/quality").catch(
+    () => null,
   );
   let digestPeriod = url.searchParams.get("digest_period");
   const digestReviewRequest = digestPeriod
@@ -183,7 +246,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       `Bookward's recommendation engine is unavailable. ${message(cause)}`,
     );
   }
-  const backupStatus = await backupStatusRequest;
+  const [backupStatus, rawCatalogQuality] = await Promise.all([
+    backupStatusRequest,
+    catalogQualityRequest,
+  ]);
+  const catalogQuality = normalizeCatalogQuality(rawCatalogQuality);
   const builtIn = overview.sources.find((source) => source.is_default);
   const runId = overview.recommendation_run_id ?? "";
   const books = overview.recommendations.map((book) =>
@@ -237,6 +304,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     history: overview.history,
     readCount: overview.counts?.reads ?? overview.history.length,
     backupStatus,
+    catalogQuality,
     digestReview: {
       requested: Boolean(digestPeriod),
       ids: digestReviewIds,
@@ -335,6 +403,74 @@ export const actions: Actions = {
         10 * 60_000,
       );
       return { message: `Backup created at ${result.backup.created_at}.` };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  compactStorage: async () => {
+    try {
+      const result = await engine<{
+        reclaimed_bytes?: number;
+        after_bytes?: number;
+        migrated_auto_vacuum?: boolean;
+      }>("/api/backups/compact", { method: "POST", body: "{}" }, 10 * 60_000);
+      const reclaimed = Math.max(0, Number(result.reclaimed_bytes ?? 0));
+      const afterBytes = Math.max(0, Number(result.after_bytes ?? 0));
+      const formatSize = (bytes: number) =>
+        bytes <= 0
+          ? "0 KB"
+          : bytes < 1024 * 1024
+            ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+            : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      const liveSummary = afterBytes > 0 ? ` Live database: ${formatSize(afterBytes)}.` : "";
+      return {
+        message:
+          reclaimed > 0
+            ? `Storage compacted; reclaimed ${formatSize(reclaimed)}.${liveSummary}`
+            : result.migrated_auto_vacuum
+              ? `Incremental vacuum enabled.${liveSummary}`
+              : `Database already compact.${liveSummary}`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setStorageRetention: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid storage retention setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/retention", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Automatic storage retention enabled."
+          : "Automatic storage retention paused.",
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  setEvidenceRotation: async ({ request }) => {
+    const data = await request.formData();
+    const raw = data.get("enabled");
+    if (raw !== "1" && raw !== "0" && raw !== "true" && raw !== "false")
+      return fail(400, { message: "Choose a valid evidence rotation setting." });
+    const enabled = raw === "1" || raw === "true";
+    try {
+      await engine("/api/backups/evidence-rotation", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      return {
+        message: enabled
+          ? "Replay evidence rotation enabled."
+          : "Replay evidence rotation paused.",
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -1044,6 +1180,82 @@ export const actions: Actions = {
       return fail(502, { message: message(error) });
     }
   },
+  auditCatalog: async ({ request }) => {
+    const data = await request.formData();
+    const rawMode = formText(data, "mode") || "incremental";
+    const parsedMode = z.enum(["incremental", "full"]).safeParse(rawMode);
+    if (!parsedMode.success)
+      return fail(400, { message: "Choose a valid catalog audit mode." });
+    const mode = parsedMode.data;
+    const modeLabel =
+      mode === "full" ? "Full catalog audit" : "Incremental catalog audit";
+    try {
+      const queued = await engine<{
+        job_id: string;
+        mode?: string;
+        remaining?: number;
+      }>("/api/candidates/audit", {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      const job = await waitForJob(queued.job_id, 2, 250);
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || `${modeLabel} failed.`,
+        });
+      if (job.status === "complete") {
+        const remaining = parseAuditRemaining(job.result);
+        if (remaining !== null && remaining > 0)
+          return {
+            message: `${modeLabel} batch finished; ${remaining} book${remaining === 1 ? "" : "s"} remaining in the background.`,
+          };
+        return {
+          message: `${modeLabel} complete and recommendations queued for refresh.`,
+        };
+      }
+      const remainingSuffix =
+        typeof queued.remaining === "number" && queued.remaining > 0
+          ? ` (${queued.remaining} book${queued.remaining === 1 ? "" : "s"} remaining)`
+          : "";
+      return {
+        message: `${modeLabel} queued in bounded 50-book batches${remainingSuffix}.`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  retryCatalogAudit: async () => {
+    try {
+      const queued = await engine<{
+        job_id: string;
+        mode?: string;
+        remaining?: number;
+      }>("/api/candidates/audit", {
+        method: "POST",
+        body: JSON.stringify({ retry: true }),
+      });
+      const job = await waitForJob(queued.job_id, 2, 250);
+      if (job.status === "failed")
+        return fail(502, {
+          message: job.error || "Catalog audit retry failed.",
+        });
+      if (job.status === "complete") {
+        const remaining = parseAuditRemaining(job.result);
+        if (remaining !== null && remaining > 0)
+          return {
+            message: `Catalog audit retry batch finished; ${remaining} book${remaining === 1 ? "" : "s"} remaining in the background.`,
+          };
+        return {
+          message: "Catalog audit complete and recommendations queued for refresh.",
+        };
+      }
+      return {
+        message: `Catalog audit retry queued (${queued.job_id.slice(0, 8)}).`,
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
   configureDigest: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
@@ -1250,9 +1462,9 @@ export const actions: Actions = {
   },
 };
 
-async function waitForJob(jobId: string, maxAttempts = 30) {
+async function waitForJob(jobId: string, maxAttempts = 30, delayMs = 500) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
     const job = await engine<{
       status: string;
       error: string | null;
@@ -1326,4 +1538,134 @@ function digestJobFailure(result: string | null) {
     return "Digest delivery reached the automatic retry limit.";
   }
   return "The digest channel could not deliver the message.";
+}
+
+function parseAuditRemaining(result: string | null): number | null {
+  if (!result) return null;
+  try {
+    const parsed = JSON.parse(result) as { remaining?: unknown };
+    return typeof parsed.remaining === "number" &&
+      Number.isFinite(parsed.remaining) &&
+      parsed.remaining >= 0
+      ? Math.floor(parsed.remaining)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCatalogQuality(raw: unknown): CatalogQuality {
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const auditRaw =
+    record.audit && typeof record.audit === "object"
+      ? (record.audit as Record<string, unknown>)
+      : {};
+  const validStatuses = new Set([
+    "idle",
+    "queued",
+    "running",
+    "failed",
+    "paused",
+    "complete",
+  ]);
+  const status = validStatuses.has(String(auditRaw.status ?? ""))
+    ? (String(auditRaw.status) as CatalogAuditStatus["status"])
+    : "idle";
+  const mode = auditRaw.mode === "full" ? "full" : "incremental";
+  const lastMode =
+    auditRaw.last_mode === "full" || auditRaw.last_mode === "incremental"
+      ? auditRaw.last_mode
+      : null;
+  const remaining =
+    typeof auditRaw.remaining === "number" &&
+    Number.isFinite(auditRaw.remaining) &&
+    auditRaw.remaining >= 0
+      ? Math.floor(auditRaw.remaining)
+      : 0;
+  const progress =
+    typeof auditRaw.progress === "number" && Number.isFinite(auditRaw.progress)
+      ? Math.max(0, Math.min(1, auditRaw.progress))
+      : 0;
+  const batchSize =
+    typeof auditRaw.batch_size === "number" &&
+    Number.isInteger(auditRaw.batch_size) &&
+    auditRaw.batch_size > 0
+      ? auditRaw.batch_size
+      : 50;
+  const subbatchSize =
+    typeof auditRaw.subbatch_size === "number" &&
+    Number.isInteger(auditRaw.subbatch_size) &&
+    auditRaw.subbatch_size > 0
+      ? auditRaw.subbatch_size
+      : 10;
+  const statuses = Array.isArray(record.statuses)
+    ? record.statuses
+        .filter(
+          (item): item is { quality_status: string; count: number } =>
+            Boolean(item && typeof item === "object") &&
+            typeof (item as Record<string, unknown>).quality_status === "string" &&
+            typeof (item as Record<string, unknown>).count === "number",
+        )
+        .map((item) => ({
+          quality_status: item.quality_status,
+          count: item.count,
+        }))
+    : [];
+  const identifiersRaw =
+    record.identifiers && typeof record.identifiers === "object"
+      ? (record.identifiers as Record<string, unknown>)
+      : {};
+  const flagsRaw =
+    record.flags && typeof record.flags === "object" && !Array.isArray(record.flags)
+      ? (record.flags as Record<string, unknown>)
+      : {};
+  const flags: Record<string, number> = {};
+  for (const [key, value] of Object.entries(flagsRaw)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      flags[key] = value;
+    }
+  }
+  return {
+    statuses,
+    identifiers: {
+      total: typeof identifiersRaw.total === "number" ? identifiersRaw.total : 0,
+      with_isbn13:
+        typeof identifiersRaw.with_isbn13 === "number"
+          ? identifiersRaw.with_isbn13
+          : 0,
+      with_catalog_match:
+        typeof identifiersRaw.with_catalog_match === "number"
+          ? identifiersRaw.with_catalog_match
+          : 0,
+    },
+    flags,
+    version: typeof record.version === "string" ? record.version : "",
+    audit: {
+      status,
+      active: Boolean(auditRaw.active),
+      mode,
+      last_mode: lastMode,
+      batch_size: batchSize,
+      subbatch_size: subbatchSize,
+      remaining,
+      progress,
+      started_at:
+        typeof auditRaw.started_at === "string" && auditRaw.started_at
+          ? auditRaw.started_at
+          : null,
+      completed_at:
+        typeof auditRaw.completed_at === "string" && auditRaw.completed_at
+          ? auditRaw.completed_at
+          : null,
+      job_id:
+        typeof auditRaw.job_id === "string" && auditRaw.job_id
+          ? auditRaw.job_id
+          : null,
+      last_error:
+        typeof auditRaw.last_error === "string" && auditRaw.last_error
+          ? auditRaw.last_error
+          : null,
+      can_retry: Boolean(auditRaw.can_retry || status === "failed"),
+    },
+  };
 }
